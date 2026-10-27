@@ -409,9 +409,10 @@ def test_reward_settings_reject_invalid_records(state):
         CaptureRewardSettings.from_state(state)
 
 
-def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():
+@pytest.mark.parametrize("attribution_key", ["agent", "math:train"])
+def test_final_reward_distribution_and_agent_tables_are_pooled_exactly(attribution_key):
     # Unequal groups: averaging their medians (0 and 2) would incorrectly give 1.
-    context = RewardLogContext("agent", '{"answer":"ok","reward":99}')
+    context = RewardLogContext(attribution_key, '{"answer":"ok","reward":99}')
     observations = [
         FinalizedReward(
             f"sample-{i}",
@@ -426,10 +427,10 @@ def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():
     assert metrics["total_reward/median"] == 2.0
     assert metrics["total_reward/histogram"] == [0.0, 2.0, 2.0, 8.0]
     assert metrics["other/reward/mean"] == 4.0
-    assert metrics["agent/reward/histogram"] == [0.0]
+    assert metrics[f"{attribution_key}/reward/histogram"] == [0.0]
     tables = capture_reward_result_tables(observations)
-    assert set(tables) == {"agent/full_result"}
-    assert json.loads(tables["agent/full_result"][0][0]) == {
+    assert set(tables) == {f"{attribution_key}/full_result"}
+    assert json.loads(tables[f"{attribution_key}/full_result"][0][0]) == {
         "answer": "ok",
         "reward": 0.0,
         "ng_rollout_id": "attempt-0",

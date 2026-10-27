@@ -853,6 +853,82 @@ def test_recovery_overrides_may_only_make_the_target_coarser() -> None:
 
 
 @pytest.mark.parametrize(
+    ("taskset", "expected"),
+    [
+        ("weather:train", RecoveryTargetLevel.PROMPT_GROUP),
+        ("weather:eval", RecoveryTargetLevel.SIBLING),
+        ("other:train", RecoveryTargetLevel.SIBLING),
+    ],
+)
+def test_recovery_config_resolves_materialized_taskset(
+    taskset: str, expected: RecoveryTargetLevel
+) -> None:
+    config = RolloutRecoveryConfig(
+        target_level=RecoveryTargetLevel.SIBLING,
+        task_source_target_level_overrides={
+            "weather:train": RecoveryTargetLevel.PROMPT_GROUP,
+            "weather:eval": RecoveryTargetLevel.SIBLING,
+            "stale_source": RecoveryTargetLevel.PROMPT_GROUP,
+        },
+        agent_target_level_overrides={
+            "shared_agent": RecoveryTargetLevel.PROMPT_GROUP,
+        },
+    )
+    policy = config.resolve_for_prompt(
+        {
+            "extra_env_info": {
+                "task_id": {"taskset": taskset, "task_id": "1"},
+                "task_input": {},
+                "task_source": "stale_source",
+                "agent_ref": {"name": "shared_agent"},
+            }
+        }
+    )
+
+    assert policy.task_source == taskset
+    assert policy.restore_level is expected
+    assert policy.granularity is expected.granularity
+
+
+@pytest.mark.parametrize("agent_ref", [None, {"name": "shared_agent"}])
+def test_recovery_config_materialized_task_uses_configured_default(
+    agent_ref: dict[str, str] | None,
+) -> None:
+    config = RolloutRecoveryConfig(
+        target_level=RecoveryTargetLevel.SIBLING,
+        task_source_target_level_overrides={
+            "another:train": RecoveryTargetLevel.PROMPT_GROUP,
+        },
+        agent_target_level_overrides={"shared_agent": RecoveryTargetLevel.PROMPT_GROUP},
+    )
+    policy = config.resolve_for_prompt(
+        {
+            "extra_env_info": {
+                "task_id": {"taskset": "weather:train", "task_id": "1"},
+                "task_input": {},
+                "agent_ref": agent_ref,
+            }
+        }
+    )
+
+    assert policy.task_source == "weather:train"
+    assert policy.restore_level is RecoveryTargetLevel.SIBLING
+
+
+@pytest.mark.parametrize("taskset", [None, "", 7])
+def test_recovery_config_rejects_malformed_materialized_taskset(taskset: Any) -> None:
+    with pytest.raises(ValueError, match="non-empty task_id.taskset"):
+        RolloutRecoveryConfig().resolve_for_prompt(
+            {
+                "extra_env_info": {
+                    "task_id": {"taskset": taskset, "task_id": "1"},
+                    "task_input": {},
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
     ("prompt", "error_fragment"),
     [
         (
@@ -1392,6 +1468,7 @@ def _pre_turn_recovery_state(state: dict[str, Any], version: int) -> dict[str, A
     old = copy.deepcopy(state)
     old["schema_version"] = version
     for group in old["groups"]:
+        group.pop("attribution_key", None)
         group["recovery_granularity"] = group.pop("restore_level")
         for sibling in group["siblings"]:
             for attempt in sibling["attempts"]:
@@ -1472,7 +1549,8 @@ def test_pre_turn_recovery_schemas_refuse_turn_recovery_state(
         RolloutRecoveryLedger.from_state_dict(state)
 
 
-def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
+@pytest.mark.parametrize("version", [6, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+def test_turn_restart_preserves_gym_owner_and_advances_attempt(version: int) -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
         ledger,
@@ -1495,11 +1573,15 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
     )
 
     state = ledger.state_dict()
+    state["schema_version"] = version
+    if version == 6:
+        state["groups"][0].pop("attribution_key")
     attempt_state = state["groups"][0]["siblings"][0]["attempts"][0]
     assert attempt_state["gym_instance_id"] == "tools/replica-1"
     assert attempt_state["gym_attempt"] == 0
 
     restored = RolloutRecoveryLedger.from_state_dict(state)
+    assert restored.get_group("g7").restore_level is RecoveryTargetLevel.TURN
     inventory = restored.gym_checkpoint_inventory(
         {"judge/replica-0", "tools/replica-1"}
     )
@@ -1873,7 +1955,7 @@ def test_restore_rejects_unsupported_schema_version(version: int) -> None:
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
     state = {
         "schema_version": version,
@@ -1881,7 +1963,7 @@ def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
         "batch_shortfall": {},
         "sampler_stamps_target_steps": False,
     }
-    if version == ROLLOUT_RECOVERY_SCHEMA_VERSION:
+    if version >= 3:
         state.update(
             reward_settings=None,
             finalizer_metrics_by_group={},
@@ -1896,13 +1978,16 @@ def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
     assert parsed.sampler_stamps_target_steps is False
 
 
-@pytest.mark.parametrize("version", [2, 3, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> None:
     state = _sealed_attempt_state()
-    if version != ROLLOUT_RECOVERY_SCHEMA_VERSION:
+    if version < 6:
         state = _pre_turn_recovery_state(state, version)
+    else:
+        state["schema_version"] = version
     for group in state["groups"]:
         group.pop("resolved_agent_name", None)
+        group.pop("attribution_key", None)
         if version < 5:
             for sibling in group["siblings"]:
                 for attempt in sibling["attempts"]:
@@ -1921,10 +2006,44 @@ def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> Non
     upgraded = ledger.state_dict()
     assert upgraded["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
     assert upgraded["groups"][0]["resolved_agent_name"] is None
+    assert upgraded["groups"][0]["attribution_key"] is None
+
+
+@pytest.mark.parametrize("version", [2, 3, 4, 5, 6])
+def test_legacy_flat_checkpoint_restores_attribution_from_agent_name(
+    version: int,
+) -> None:
+    state = _sealed_attempt_state()
+    if version < 6:
+        state = _written_by_schema(state, version)
+    else:
+        state["schema_version"] = version
+    group_state = state["groups"][0]
+    group_state["resolved_agent_name"] = "flat-agent"
+    group_state.pop("attribution_key", None)
+    if version < 4:
+        attempt = group_state["siblings"][0]["attempts"][0]
+        attempt["receipt"] = None
+        attempt["staging_keys"] = []
+    ledger = RolloutRecoveryLedger.from_state_dict(state)
+    group_id = group_state["group_id"]
+    before = ledger.finalization_inputs(group_id)
+    _mutate(lambda cut: ledger.prepare_for_restart(cut))
+    group = ledger.get_group(group_id)
+    assert group.resolved_agent_name == "flat-agent"
+    assert group.attribution_key == "flat-agent"
+    assert ledger.finalization_inputs(group_id) == before
+    _bind(ledger, group_id, _prompt())
+    upgraded = ledger.state_dict()
+    assert upgraded["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
+    assert upgraded["groups"][0]["attribution_key"] == "flat-agent"
 
 
 @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
-def test_seal_rejects_conflicting_agent_names_atomically(granularity) -> None:
+@pytest.mark.parametrize("materialized", [False, True])
+def test_seal_rejects_conflicting_attribution_atomically(
+    granularity, materialized
+) -> None:
     ledger = RolloutRecoveryLedger()
     group = _reserve(
         ledger,
@@ -1945,7 +2064,8 @@ def test_seal_rejects_conflicting_agent_names_atomically(granularity) -> None:
             receipt=None,
             reward=0.0,
             mask_sample=True,
-            resolved_agent_name=f"agent-{index}",
+            resolved_agent_name=None if materialized else f"agent-{index}",
+            attribution_key=f"usersim:split-{index}" if materialized else None,
         )
         for index in range(2)
     }
@@ -1958,9 +2078,15 @@ def test_seal_rejects_conflicting_agent_names_atomically(granularity) -> None:
         # Preserve the route even when only the first sibling survived restart.
         ledger = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
         _bind(ledger, "g7", _prompt())
-        assert ledger.get_group("g7").resolved_agent_name == "agent-0"
+        assert ledger.get_group("g7").resolved_agent_name == (
+            None if materialized else "agent-0"
+        )
+        assert ledger.get_group("g7").attribution_key == (
+            "usersim:split-0" if materialized else "agent-0"
+        )
     before = ledger.state_dict()
-    with pytest.raises(ValueError, match="siblings resolved to different agents"):
+    expected = "attribution keys" if materialized else "agents"
+    with pytest.raises(ValueError, match=f"siblings resolved to different {expected}"):
         _mutate(
             lambda cut: (
                 ledger.mark_group_sealed(cut, "g7", results)
@@ -1978,6 +2104,14 @@ def test_restore_rejects_invalid_resolved_agent_name(agent_name) -> None:
     state = _sealed_attempt_state()
     state["groups"][0]["resolved_agent_name"] = agent_name
     with pytest.raises(ValueError, match="resolved_agent_name"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+@pytest.mark.parametrize("attribution_key", ["", 42, {"name": "taskset"}])
+def test_restore_rejects_invalid_attribution_key(attribution_key) -> None:
+    state = _sealed_attempt_state()
+    state["groups"][0]["attribution_key"] = attribution_key
+    with pytest.raises(ValueError, match="attribution_key"):
         RolloutRecoveryLedger.from_state_dict(state)
 
 
