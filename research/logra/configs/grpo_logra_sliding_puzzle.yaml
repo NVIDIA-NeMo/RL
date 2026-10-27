@@ -1,0 +1,57 @@
+# Short, paired training-memory profile; not a convergence benchmark.
+defaults: grpo_logra_7b.yaml
+task: sliding_puzzle
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_steps: 20
+  max_rollout_turns: 8
+  val_period: -1
+  val_at_start: false
+  val_at_end: false
+policy:
+  model_name: Qwen/Qwen2.5-7B-Instruct
+  train_global_batch_size: 32
+  max_total_sequence_length: 2048
+  sequence_packing:
+    enabled: false
+  automodel_cfg:
+    cpu_offload: false
+    sequence_parallel: false
+  generation:
+    max_new_tokens: 96
+    top_p: 0.999
+    top_k: 10000
+    vllm_cfg:
+      max_model_len: ${policy.max_total_sequence_length}
+      gpu_memory_utilization: 0.6
+    colocated:
+      resources:
+        gpus_per_node: 2
+data:
+  add_system_prompt: false
+  shuffle: false
+  num_workers: 0
+  train:
+    _override_: true
+    env_name: sliding_puzzle_game
+  validation: null
+  default:
+    env_name: sliding_puzzle_game
+    prompt_file: null
+env:
+  _override_: true
+  sliding_puzzle_game:
+    cfg:
+      game_config:
+        size: 3
+        shuffle_moves: 3
+      max_moves: 8
+logger:
+  log_dir: logs/logra-sliding-puzzle
+  monitor_gpus: false
+checkpointing:
+  enabled: false
+cluster:
+  num_nodes: 1
+  gpus_per_node: 4
