@@ -264,18 +264,33 @@ class TestTQValueSplitFanout:
             "is_replica_leader": True,
         }
         twin = {**leader, "is_replica_leader": False}
-        with patch(
-            "nemo_rl.models.value.tq_value.ray.get", return_value=[leader, twin, leader]
+        trace_kwargs = {"_otel_carrier": {"traceparent": "test"}}
+        with (
+            patch(
+                "nemo_rl.models.value.tq_value.ray.get",
+                return_value=[leader, twin, leader],
+            ),
+            patch(
+                "nemo_rl.models.value.tq_value.trace_context_kwargs",
+                return_value=trace_kwargs,
+            ),
         ):
             value.begin_train_step(loss_fn, gbs=16, mbs=1)
             wg.run_all_workers_single_data.assert_called_with(
-                "begin_train_step_presharded", loss_fn=loss_fn, gbs=16, mbs=1
+                "begin_train_step_presharded",
+                loss_fn=loss_fn,
+                gbs=16,
+                mbs=1,
+                **trace_kwargs,
             )
             result = value.finish_train_step()
             assert result["all_mb_metrics"]["loss"] == [1.0, 1.0]
+            wg.run_all_workers_single_data.assert_called_with(
+                "finish_train_step_presharded", **trace_kwargs
+            )
             value.abort_train_step()
             wg.run_all_workers_single_data.assert_called_with(
-                "abort_train_step_presharded"
+                "abort_train_step_presharded", **trace_kwargs
             )
 
     def test_chunk_sharding_has_no_global_batch_constraint(self):
@@ -288,6 +303,10 @@ class TestTQValueSplitFanout:
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
                 return_value=([meta, meta], None),
             ) as shard,
+            patch(
+                "nemo_rl.models.value.tq_value.trace_context_kwargs",
+                return_value={"_otel_carrier": {"traceparent": "test"}},
+            ),
         ):
             value.train_microbatches_from_meta(meta)
         assert shard.call_args.kwargs["batch_size"] is None
@@ -295,4 +314,7 @@ class TestTQValueSplitFanout:
         assert wg.run_all_workers_sharded_data.call_args.args == (
             "train_microbatch_presharded",
         )
+        assert wg.run_all_workers_sharded_data.call_args.kwargs["common_kwargs"] == {
+            "_otel_carrier": {"traceparent": "test"}
+        }
         wg.get_all_worker_results.assert_called_once()
