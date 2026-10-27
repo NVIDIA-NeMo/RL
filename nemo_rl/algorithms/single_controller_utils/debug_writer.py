@@ -78,7 +78,7 @@ class DebugWriter(ABC):
     """Base class for writers that store a step's training rows chunk by chunk.
 
     Each shard calls add_chunk on its own instance, and the controller calls
-    finish_step on another once the step completes.
+    finish_step on another once the step completes and close once at shutdown.
     """
 
     def __init__(self, log_dir: str, *, shard_id: str = "0") -> None:
@@ -149,6 +149,9 @@ class DebugWriter(ABC):
         self._publish_step(step, receipts)
         self.step = None
         self.rows = 0
+
+    def close(self) -> None:
+        """Release anything the writer still holds; the base writer holds nothing."""
 
     @abstractmethod
     def _write_chunk(self, chunk: TrainChunk, *, replace: bool) -> ChunkReceipt:

@@ -951,6 +951,11 @@ class SingleControllerActor:
                 except Exception as error:
                     print(f"finalizer actor termination failed: {error}", flush=True)
             await stop_storage_units(self._storage_units)
+            if self._train_data_dump is not None:
+                try:
+                    await asyncio.to_thread(self._train_data_dump.close)
+                except Exception as e:  # teardown must not mask the original failure
+                    print(f"Error during debug-writer close: {e}", flush=True)
             try:
                 self._weight_synchronizer.shutdown()
             except Exception as e:  # teardown must not mask the original failure

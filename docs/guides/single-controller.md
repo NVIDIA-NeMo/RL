@@ -568,8 +568,9 @@ The files are written by `JsonDebugWriter`, which is what the default
 `my_pkg.my_module.MyWriter`; any other keys under `async_rl.debug_writer` are
 passed to its constructor after `log_dir` and `shard_id`. The class implements
 `_write_chunk`, which receives each validated chunk as tensors, and
-`_publish_step`. It is built on the controller and on every advantage shard,
-so it must be importable in each of those processes.
+`_publish_step`, and may override `close`, which the controller calls once at
+shutdown. It is built on the controller and on every advantage shard, so it
+must be importable in each of those processes.
 
 The per-step `timing/train/train_data_dump` metric reports wall-clock seconds
 summed across chunk preparation/writes and final-file publication. Chunk dump
