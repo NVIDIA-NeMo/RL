@@ -404,8 +404,6 @@ sft:
   val_period: 0
   val_at_start: false
   val_at_end: false
-checkpointing:
-  metric_name: null             # no validation metrics are produced by SFTv2
 data:
   _override_: true              # replace the exemplar's HF data block wholesale
   backend: energon
@@ -434,9 +432,7 @@ supplied by any exemplar config, so both must be set explicitly. The `sft`
 overrides are needed for a different reason: SFTv2 runs no validation pass, so it
 rejects `val_period`, `val_at_start` or `val_at_end` left at their exemplar
 values, and `data.validation` must be null — the loader is always built with
-`split_role="train"`. The exemplar's `checkpointing.metric_name: "val:val_loss"`
-is also rejected. Set it to `null`, as above, or to an available `train:<metric>`
-for training-metric checkpoint ranking.
+`split_role="train"`.
 
 The processor runs inside Energon loader workers and returns the same tokenized `message_log` representation as the Hugging Face path. `prepare_sft_batch` creates the assistant loss mask, flattens the messages, and pads the batch without checking which loader produced it.
 
@@ -592,17 +588,15 @@ Your JSONL files should contain one JSON object per line following the [OpenAI C
   "tools": [
     {
       "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Get current weather for a city",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "city": {"type": "string", "description": "City name"},
-            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-          },
-          "required": ["city"]
-        }
+      "name": "get_weather",
+      "description": "Get current weather for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string", "description": "City name"},
+          "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+        },
+        "required": ["city"]
       }
     }
   ]
@@ -618,21 +612,10 @@ When your dataset contains tools with different argument structures (heterogeneo
 
 ```yaml
 data:
-  train:
-    dataset_name: openai_format
-    data_path: <PathToTrainingDataset>
-    use_preserving_dataset: true
-  validation:
-    dataset_name: openai_format
-    data_path: <PathToValidationDataset>
-    use_preserving_dataset: true
+  dataset_name: openai_format
+  ...
+  use_preserving_dataset: true  # IMPORTANT: Enable this for tool calling datasets
 ```
-
-Set this flag on every applicable dataset entry, including each entry in a blend.
-Alternatively, set `data.default.use_preserving_dataset: true` and remove any
-entry-level `use_preserving_dataset: false` overrides from the basic example:
-dataset defaults only fill missing keys. A top-level
-`data.use_preserving_dataset` does not configure the dataset constructors.
 
 **Why this matters:** Standard HuggingFace dataset loading enforces uniform schemas by adding `None` values for missing keys. For example:
 - Tool A has arguments: `{"query": "search term"}`
