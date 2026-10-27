@@ -14,62 +14,90 @@
 
 """Full-conversation SFT formatting with automatic assistant loss ownership."""
 
-from collections.abc import Mapping
-from copy import deepcopy
+import inspect
+from collections.abc import Callable, Mapping
 from functools import lru_cache, partial
+from os.path import commonprefix
 from typing import Any
 
 import torch
 from jinja2 import Template, nodes
 from jinja2.visitor import NodeTransformer
 from transformers import PreTrainedTokenizerBase
-from transformers.utils.chat_template_utils import (
-    _compile_jinja_template,
-    render_jinja_template,
+
+_UNSUPPORTED_TEMPLATE = (
+    "Full-conversation SFT cannot locate the assistant turns in this chat "
+    "template; use processor: sft_processor instead."
 )
+
+# Named apply_chat_template parameters control tokenization, not rendering.
+# Transformers passes only its **kwargs to the template, so drop the rest.
+_TOKENIZATION_OPTIONS = frozenset(
+    inspect.signature(PreTrainedTokenizerBase.apply_chat_template).parameters
+) - {"self", "conversation", "tools", "documents", "kwargs"}
+
+# Like incremental SFT, only these turns end with a generation prompt.
+_GENERATION_PROMPT_ROLES = ("user", "tool")
+
+
+def _boundary_call(name: str, args: list[nodes.Expr], lineno: int) -> nodes.Output:
+    output = nodes.Output([nodes.Call(nodes.Name(name, "load"), args, [], None, None)])
+    output.set_lineno(lineno)
+    return output
+
+
+class _LoopExitTracker(NodeTransformer):
+    """Record a loop iteration's exit before each of its own break or continue."""
+
+    def __init__(self, exit_boundary: Callable[[], nodes.Output]) -> None:
+        self.exit_boundary = exit_boundary
+
+    def visit_For(self, node: nodes.For, *args: Any, **kwargs: Any) -> nodes.For:
+        # Nested loops own their break and continue statements.
+        return node
+
+    def visit_Break(
+        self, node: nodes.Break, *args: Any, **kwargs: Any
+    ) -> list[nodes.Node]:
+        return [self.exit_boundary(), node]
+
+    visit_Continue = visit_Break
 
 
 class _MessageLoopTracker(NodeTransformer):
-    """Insert empty-output boundary callbacks without changing Jinja whitespace."""
+    """Insert empty-output callbacks at the start and end of each loop iteration."""
 
     def visit_For(self, node: nodes.For, *args: Any, **kwargs: Any) -> nodes.For:
         self.generic_visit(node, *args, **kwargs)
-        if isinstance(node.target, nodes.Name):
-
-            def boundary(entering: bool) -> nodes.Output:
-                output = nodes.Output(
-                    [
-                        nodes.Call(
-                            nodes.Name("_nemo_sft_boundary", "load"),
-                            [
-                                nodes.Name(node.target.name, "load"),
-                                nodes.Const(entering),
-                            ],
-                            [],
-                            None,
-                            None,
-                        )
-                    ]
-                )
-                output.set_lineno(node.lineno)
-                return output
-
-            node.body = [boundary(True), *node.body, boundary(False)]
+        if not isinstance(node.target, nodes.Name):
+            return node
+        enter = _boundary_call(
+            "_nemo_sft_enter", [nodes.Name(node.target.name, "load")], node.lineno
+        )
+        exits = _LoopExitTracker(
+            partial(_boundary_call, "_nemo_sft_exit", [], node.lineno)
+        )
+        body: list[nodes.Node] = []
+        for child in node.body:
+            visited = exits.visit(child)
+            body.extend(visited if isinstance(visited, list) else [visited])
+        node.body = [enter, *body, exits.exit_boundary()]
         return node
 
 
-@lru_cache(maxsize=128)
-def _has_generation_blocks(template: str) -> bool:
-    environment = _compile_jinja_template(template).environment
-    generation_extensions = {
-        identifier
-        for identifier, extension in environment.extensions.items()
-        if "generation" in extension.tags
-    }
-    return any(
-        node.identifier in generation_extensions
-        for node in environment.parse(template).find_all(nodes.ExtensionAttribute)
-    )
+def _compile_jinja_template(template: str) -> Template:
+    """Compile a chat template exactly as Transformers does (cached by Transformers)."""
+    # Imported here, not at module top, because the helper is private. If a
+    # Transformers release removes it, only this opt-in processor fails.
+    try:
+        from transformers.utils.chat_template_utils import _compile_jinja_template
+    except ImportError as error:
+        raise ImportError(
+            "Full-conversation SFT requires transformers.utils.chat_template_utils."
+            "_compile_jinja_template, which this Transformers version does not "
+            "provide."
+        ) from error
+    return _compile_jinja_template(template)
 
 
 @lru_cache(maxsize=128)
@@ -84,144 +112,146 @@ def _render_with_message_spans(
     messages: list[dict[str, Any]],
     template_options: dict[str, Any],
 ) -> tuple[str, list[tuple[int, int]]]:
-    """Track streamed assistant loop iterations, including headers and terminators.
+    """Render once and return the text with each assistant turn's character span.
 
-    Rendering is unchanged: callbacks emit empty strings, not markers in message
-    content. Loops buffered inside macros, assignments or filters cannot be
-    tracked in stream coordinates and are rejected.
+    The inserted callbacks emit empty strings, so the output matches a normal
+    render. An iteration that emits nothing, such as a metadata scan, owns no
+    output. A break or continue ends the current iteration. The callbacks cannot
+    locate a loop that a macro, assignment or filter buffers, so templates with
+    such loops raise an error.
     """
     compiled = _compile_message_tracking_template(template)
-    spans: list[tuple[int, int]] = []
     assistant_messages = [m for m in messages if m["role"] == "assistant"]
+    spans: list[tuple[int, int]] = []
+    open_iterations: list[tuple[Any, int]] = []
     position = 0
-    active: list[tuple[Any, int]] = []
 
-    def boundary(value: Any, entering: bool) -> str:
-        if not isinstance(value, Mapping) or value.get("role") != "assistant":
+    def enter_iteration(value: Any) -> str:
+        open_iterations.append((value, position))
+        return ""
+
+    def leave_iteration() -> str:
+        value, start = open_iterations.pop()
+        is_assistant = isinstance(value, Mapping) and value.get("role") == "assistant"
+        if not is_assistant or start == position:
             return ""
-        if entering:
-            active.append((value, position))
-        else:
-            if not active:
-                raise ValueError(
-                    "Unbalanced assistant message loop; use explicit "
-                    "{% generation %} blocks."
-                )
-            entered_value, start = active.pop()
-            if entered_value is not value:
-                raise ValueError(
-                    "The template replaced an assistant message inside its loop; "
-                    "use explicit {% generation %} blocks."
-                )
-            # Templates may scan messages for validation or history metadata
-            # before rendering them. Such loops do not own any output.
-            if start == position:
-                return ""
-            if (
-                len(spans) >= len(assistant_messages)
-                or value is not assistant_messages[len(spans)]
-            ):
-                raise ValueError(
-                    "Cannot infer assistant ownership from nested, copied or reordered "
-                    "message loops; use explicit {% generation %} blocks."
-                )
-            spans.append((start, position))
+        expected = (
+            assistant_messages[len(spans)]
+            if len(spans) < len(assistant_messages)
+            else None
+        )
+        if value is not expected or (spans and start < spans[-1][1]):
+            raise ValueError(
+                "The chat template must render each assistant message once, in "
+                "order, in its own loop iteration over the messages list. "
+                + _UNSUPPORTED_TEMPLATE
+            )
+        spans.append((start, position))
         return ""
 
     blocks: list[str] = []
-    render_options = {
-        "tools": None,
-        "documents": None,
-        "add_generation_prompt": False,
-        **template_options,
-    }
     for block in compiled.generate(
-        **render_options, messages=messages, _nemo_sft_boundary=boundary
+        **template_options,
+        messages=messages,
+        _nemo_sft_enter=enter_iteration,
+        _nemo_sft_exit=leave_iteration,
     ):
         blocks.append(block)
         position += len(block)
-    if active or len(spans) != len(assistant_messages):
+    if open_iterations or len(spans) != len(assistant_messages):
         raise ValueError(
-            "Expected one rendered loop iteration per assistant message; "
-            "use explicit {% generation %} blocks for this template."
+            "The chat template must render each assistant message in one streamed "
+            "loop iteration; it skips one or renders it inside a macro, "
+            "{% set %} block or filter. " + _UNSUPPORTED_TEMPLATE
         )
     return "".join(blocks), spans
 
 
-def get_full_conversation_message_log(
+def _generation_prompt(
+    template: str,
     messages: list[dict[str, Any]],
-    tokenizer: PreTrainedTokenizerBase,
-    *,
-    prompt: str | None,
-    tools: list[dict[str, Any]] | None,
-    add_bos_token: bool,
-    add_eos_token: bool,
-) -> list[dict[str, str | torch.Tensor]]:
-    """Render and tokenize once, separating assistant targets from context.
+    template_options: dict[str, Any],
+) -> str:
+    """Return the text the template appends when asked for a generation prompt."""
+    compiled = _compile_jinja_template(template)
 
-    Explicit generation blocks select assistant targets when present. Otherwise,
-    streamed assistant message-loop iterations select whole assistant turns,
-    including headers, matching incremental SFT without generation prompts.
-    Returned segments are not source conversation turns;
-    their roles let the existing SFT mask helper select assistant targets without
-    changing, retokenizing, or shifting the token sequence.
-    Context segments are masked out of the training loss; assistant segments
-    are supervised unless SFT is configured to train only on the final target.
+    def render(add_generation_prompt: bool) -> str:
+        return compiled.render(
+            {**template_options, "add_generation_prompt": add_generation_prompt},
+            messages=messages,
+        )
 
-    Args:
-        messages: Text-only messages ending with an assistant target.
-        tokenizer: Fast tokenizer with a Jinja chat template.
-        prompt: Optional format string applied to the first user message.
-        tools: Tool schemas overriding configured defaults. None preserves the
-            defaults; an empty list explicitly disables tools.
-        add_bos_token: Prepend the configured BOS if not already present.
-        add_eos_token: Append the configured EOS if not already present.
+    without_prompt = render(False)
+    with_prompt = render(True)
+    if not with_prompt.startswith(without_prompt):
+        raise ValueError(
+            "The chat template's generation prompt changes earlier output. "
+            + _UNSUPPORTED_TEMPLATE
+        )
+    return with_prompt[len(without_prompt) :]
 
-    Returns:
-        Context/assistant segments containing contiguous slices of the full tokens.
 
-    Raises:
-        ValueError: Unsupported inputs or missing/ambiguous assistant spans.
-    """
-    if not tokenizer.is_fast:
-        raise ValueError("Full-conversation SFT requires a fast tokenizer.")
+def _is_text_message(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if isinstance(content, str):
+        return True
+    # Assistant tool-call messages may leave content null or missing.
+    return (
+        content is None
+        and message.get("role") == "assistant"
+        and bool(message.get("tool_calls"))
+    )
+
+
+def _prepare_messages(
+    messages: list[dict[str, Any]], prompt: str | None
+) -> list[dict[str, Any]]:
+    """Validate the conversation and apply the prompt to the first user message."""
     if not messages or messages[-1].get("role") != "assistant":
         raise ValueError("Full-conversation SFT must end with an assistant target.")
-    if any(
-        not isinstance(message.get("content"), str)
-        and not (
-            message.get("content") is None
-            and message.get("role") == "assistant"
-            and message.get("tool_calls")
-        )
-        for message in messages
-    ):
-        raise ValueError("Full-conversation SFT supports text-only messages.")
-    prepared = deepcopy(messages)
-    user_indices = [
-        index for index, message in enumerate(prepared) if message["role"] == "user"
-    ]
-    if not user_indices:
+    for index, message in enumerate(messages):
+        if not _is_text_message(message):
+            raise ValueError(
+                "Full-conversation SFT supports text-only messages; message "
+                f"{index} ({message.get('role')}) has non-text content."
+            )
+    first_user = next(
+        (index for index, message in enumerate(messages) if message["role"] == "user"),
+        None,
+    )
+    if first_user is None:
         raise ValueError("Full-conversation SFT requires a user message.")
+    # Templates cannot mutate their inputs, so a shallow copy is enough.
+    prepared = list(messages)
     if prompt:
-        prepared[user_indices[0]]["content"] = prompt.format(
-            prepared[user_indices[0]]["content"]
-        )
+        prepared[first_user] = {
+            **prepared[first_user],
+            "content": prompt.format(prepared[first_user]["content"]),
+        }
+    return prepared
+
+
+def _resolve_template(
+    tokenizer: PreTrainedTokenizerBase, tools: list[dict[str, Any]] | None
+) -> tuple[str, dict[str, Any]]:
+    """Return the chat template and the variables Transformers would render it with."""
+    options: dict[str, Any] = dict(tokenizer.special_tokens_map)
     # get_tokenizer binds defaults with partial; resolve them before selecting
     # the template because tools can select a different template.
-    template_options: dict[str, Any] = dict(tokenizer.special_tokens_map)
     if isinstance(tokenizer.apply_chat_template, partial):
-        template_options.update(tokenizer.apply_chat_template.keywords)
+        options.update(tokenizer.apply_chat_template.keywords)
     if tools is not None:
-        template_options["tools"] = tools
-    effective_tools = template_options.get("tools")
+        options["tools"] = tools
+    if options.get("continue_final_message"):
+        raise ValueError("Full-conversation SFT cannot continue the final message.")
+    effective_tools = options.get("tools")
     if effective_tools is not None and any(
         not isinstance(tool, dict) for tool in effective_tools
     ):
         raise ValueError(
             "Full-conversation SFT requires tool schemas to be dictionaries."
         )
-    documents = template_options.get("documents")
+    documents = options.get("documents")
     if documents is not None and any(
         not isinstance(document, dict) for document in documents
     ):
@@ -229,65 +259,84 @@ def get_full_conversation_message_log(
             "Documents should be a list of dicts with 'title' and 'text' keys!"
         )
     template = tokenizer.get_chat_template(
-        chat_template=template_options.get("chat_template"),
-        tools=template_options.get("tools"),
+        chat_template=options.get("chat_template"), tools=effective_tools
     )
-    if template_options.get("continue_final_message"):
-        raise ValueError("Full-conversation SFT cannot continue the final message.")
-    for key in (
-        "chat_template",
-        "tokenize",
-        "return_assistant_tokens_mask",
-        "continue_final_message",
-        "return_dict",
-        "return_tensors",
-        "tokenizer_kwargs",
-        "padding",
-        "truncation",
-        "max_length",
-    ):
-        template_options.pop(key, None)
-    template_options["add_generation_prompt"] = False
-    if _has_generation_blocks(template):
-        rendered_conversations, generation_spans = render_jinja_template(
-            conversations=[prepared],
-            chat_template=template,
-            return_assistant_tokens_mask=True,
-            **template_options,
-        )
-        text = rendered_conversations[0]
-        spans = generation_spans[0]
-    else:
-        text, spans = _render_with_message_spans(template, prepared, template_options)
-    if len(spans) != sum(message["role"] == "assistant" for message in prepared):
-        raise ValueError("Expected exactly one generation block per assistant target.")
-    previous_span_end = 0
-    for start, end in spans:
-        if not previous_span_end <= start < end <= len(text):
-            raise ValueError("Assistant generation spans must be nonempty and ordered.")
-        previous_span_end = end
+    template_options = {
+        "tools": None,
+        "documents": None,
+        **{
+            key: value
+            for key, value in options.items()
+            if key not in _TOKENIZATION_OPTIONS
+        },
+        "add_generation_prompt": False,
+    }
+    return template, template_options
+
+
+def _mask_generation_prompts(
+    template: str,
+    messages: list[dict[str, Any]],
+    template_options: dict[str, Any],
+    text: str,
+    spans: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Move the generation-prompt prefix of eligible assistant turns into context."""
+    assistant_indices = [
+        index
+        for index, message in enumerate(messages)
+        if message["role"] == "assistant"
+    ]
+    masked = []
+    for message_index, (start, end) in zip(assistant_indices, spans):
+        if (
+            message_index > 0
+            and messages[message_index - 1]["role"] in _GENERATION_PROMPT_ROLES
+        ):
+            # Like incremental SFT, mask only the prompt prefix the turn shares.
+            prompt = _generation_prompt(
+                template, messages[:message_index], template_options
+            )
+            start += len(commonprefix([prompt, text[start : start + len(prompt)]]))
+        masked.append((start, end))
+    return masked
+
+
+def _add_bos_eos(
+    tokenizer: PreTrainedTokenizerBase,
+    text: str,
+    spans: list[tuple[int, int]],
+    *,
+    add_bos_token: bool,
+    add_eos_token: bool,
+) -> tuple[str, list[tuple[int, int]]]:
+    """Add missing BOS/EOS tokens; the final span always runs to the end."""
     if text[spans[-1][1] :].strip():
         raise ValueError(
-            "Non-whitespace content follows the final assistant span; "
-            "include the assistant terminator in its generation block or message loop."
+            "The chat template renders non-whitespace content after the final "
+            "assistant message's loop iteration. " + _UNSUPPORTED_TEMPLATE
         )
-    spans[-1] = (spans[-1][0], len(text))
     if add_eos_token:
         if tokenizer.eos_token is None:
             raise ValueError("EOS requested but the tokenizer has no EOS token.")
-        # Match the incremental formatter: only newlines are ignored here.
+        # Like the incremental formatter, ignore only trailing newlines here.
         if not text.rstrip("\n").endswith(tokenizer.eos_token):
             text += tokenizer.eos_token
-            spans[-1] = (spans[-1][0], len(text))
+    spans = [*spans[:-1], (spans[-1][0], len(text))]
     if add_bos_token:
         if tokenizer.bos_token is None:
             raise ValueError("BOS requested but the tokenizer has no BOS token.")
         if not text.startswith(tokenizer.bos_token):
             text = tokenizer.bos_token + text
-            spans = [
-                (start + len(tokenizer.bos_token), end + len(tokenizer.bos_token))
-                for start, end in spans
-            ]
+            shift = len(tokenizer.bos_token)
+            spans = [(start + shift, end + shift) for start, end in spans]
+    return text, spans
+
+
+def _split_segments(
+    tokenizer: PreTrainedTokenizerBase, text: str, spans: list[tuple[int, int]]
+) -> list[dict[str, str | torch.Tensor]]:
+    """Tokenize once and cut the tokens into context and assistant segments."""
     encoded = tokenizer(
         text,
         add_special_tokens=False,
@@ -297,12 +346,13 @@ def get_full_conversation_message_log(
     )
     tokens: torch.Tensor = encoded["input_ids"][0]
     offsets: torch.Tensor = encoded["offset_mapping"][0]
-    has_character_offset = offsets[:, 0] < offsets[:, 1]
-    output: list[dict[str, str | torch.Tensor]] = []
+    # A token belongs to the segment where it starts.
+    token_starts = torch.where(offsets[:, 0] < offsets[:, 1], offsets[:, 0], -1)
+    segments: list[dict[str, str | torch.Tensor]] = []
 
     def append_segment(start_token: int, end_token: int, role: str) -> None:
         if start_token < end_token:
-            output.append(
+            segments.append(
                 {
                     "role": role,
                     "content": tokenizer.decode(
@@ -314,25 +364,91 @@ def get_full_conversation_message_log(
             )
 
     token_cursor = 0
-    next_token_targets = 0
-    for start, end in spans:
-        starts_in_span = (
-            has_character_offset & (offsets[:, 0] >= start) & (offsets[:, 0] < end)
-        )
-        token_indices = torch.nonzero(starts_in_span).flatten()
+    for turn, (start, end) in enumerate(spans, start=1):
+        token_indices = torch.nonzero(
+            (token_starts >= start) & (token_starts < end)
+        ).flatten()
         if not len(token_indices):
-            raise ValueError("An assistant generation span has no supervised tokens.")
+            raise ValueError(
+                f"Assistant turn {turn} has no tokens of its own: the generation "
+                "prompt covers it, or a token from the preceding text absorbs it. "
+                + _UNSUPPORTED_TEMPLATE
+            )
         first_token = int(token_indices[0])
         end_token = int(token_indices[-1]) + 1
-        if first_token < token_cursor:
-            raise ValueError("Assistant generation spans overlap in token space.")
         append_segment(token_cursor, first_token, "context")
         append_segment(first_token, end_token, "assistant")
-        # Position zero has no preceding token from which to predict it.
-        next_token_targets += max(0, end_token - max(first_token, 1))
         token_cursor = end_token
     if token_cursor != len(tokens):
-        raise ValueError("The final assistant span must cover the final token.")
-    if not next_token_targets:
-        raise ValueError("Full-conversation SFT has no trainable next-token targets.")
-    return output
+        raise ValueError(
+            "The tokenizer produced trailing tokens without character offsets."
+        )
+    if len(tokens) < 2:
+        raise ValueError(
+            "Full-conversation SFT has no trainable next-token targets; the "
+            "conversation is a single token."
+        )
+    return segments
+
+
+def get_full_conversation_message_log(
+    messages: list[dict[str, Any]],
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    prompt: str | None,
+    tools: list[dict[str, Any]] | None,
+    add_bos_token: bool,
+    add_eos_token: bool,
+    mask_generation_prompt: bool,
+) -> list[dict[str, str | torch.Tensor]]:
+    """Render and tokenize once, separating assistant targets from context.
+
+    The target for each assistant message is its streamed loop iteration, which
+    covers the whole turn with its header and terminator. This matches
+    incremental SFT without generation prompts. The chat template needs no
+    annotations. With ``mask_generation_prompt``, the part of an assistant turn
+    that the template's own generation prompt supplies after a user or tool
+    message, typically the assistant header, becomes context instead. This
+    matches incremental SFT with generation prompts.
+
+    The returned segments are not source conversation turns. Their roles let the
+    existing SFT mask helper select assistant targets without changing,
+    retokenizing or shifting the token sequence. The mask helper excludes context
+    segments from the loss. It trains on every assistant segment, or only on the
+    last one when SFT trains on the final target alone.
+
+    Args:
+        messages: Text-only messages ending with an assistant target.
+        tokenizer: Fast tokenizer with a Jinja chat template.
+        prompt: Optional format string applied to the first user message.
+        tools: Tool schemas overriding configured defaults. None preserves the
+            defaults; an empty list explicitly disables tools.
+        add_bos_token: Prepend the configured BOS if not already present.
+        add_eos_token: Append the configured EOS if not already present.
+        mask_generation_prompt: Mask the generation-prompt prefix of assistant
+            turns that follow a user or tool message.
+
+    Returns:
+        Context/assistant segments containing contiguous slices of the full tokens.
+
+    Raises:
+        ValueError: Unsupported inputs, or a chat template whose assistant turns
+            the formatter cannot track.
+    """
+    if not tokenizer.is_fast:
+        raise ValueError("Full-conversation SFT requires a fast tokenizer.")
+    prepared = _prepare_messages(messages, prompt)
+    template, template_options = _resolve_template(tokenizer, tools)
+    text, spans = _render_with_message_spans(template, prepared, template_options)
+    if mask_generation_prompt:
+        spans = _mask_generation_prompts(
+            template, prepared, template_options, text, spans
+        )
+    text, spans = _add_bos_eos(
+        tokenizer,
+        text,
+        spans,
+        add_bos_token=add_bos_token,
+        add_eos_token=add_eos_token,
+    )
+    return _split_segments(tokenizer, text, spans)

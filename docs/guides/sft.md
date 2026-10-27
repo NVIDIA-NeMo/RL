@@ -36,11 +36,11 @@ SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is e
 
 ### Full-conversation text formatting
 
-For templates that revise earlier turns (for example, templates grouping multiple
-tool responses into one turn), use full-conversation SFT to render and tokenize
-each complete conversation once. Keep the model's stock chat template; no manual
-generation annotations or model-family selection are needed for templates that
-render messages in a streaming loop:
+Some chat templates rewrite earlier turns. For example, a template may group
+several tool responses into one turn, or drop reasoning from earlier assistant
+turns. For these templates, use full-conversation SFT, which renders and
+tokenizes each complete conversation once. Keep the model's stock chat template.
+You do not need template annotations or a model-family setting:
 
 ```yaml
 policy:
@@ -54,69 +54,73 @@ data:
     processor: sft_full_conversation_processor
 ```
 
-Set the processor on both training and validation dataset entries if they override
-`data.default.processor`. Other processors and existing recipes are unchanged.
-When selecting a different chat model, keep `policy.tokenizer.name` tied to
-`policy.model_name` so the tokenizer and model remain compatible.
+If your training or validation dataset entries override `data.default.processor`,
+set the processor on those entries too. Other processors and existing recipes
+behave as before. When you select a different chat model, keep
+`policy.tokenizer.name` tied to `policy.model_name` so the tokenizer matches the
+model.
 
-Without `{% generation %}` blocks, the formatter tracks each assistant message's
-loop iteration while rendering the original template. The complete assistant
-turn, **including its header and terminator**, is supervised, matching incremental
-SFT with `add_generation_prompt=false`. System/user turns and tool responses are
-context only. Templates with explicit generation blocks retain their own target
-selection, allowing assistant headers to be masked. Each assistant message must
-produce exactly one nonempty span. Final whitespace outside that span is preserved
-and included in the final target.
+The formatter renders the original template and records where each assistant
+message's loop iteration starts and ends. With `add_generation_prompt: false`,
+the loss covers the complete assistant turn, including its header and
+terminator. With `add_generation_prompt: true`, the formatter masks the part of
+an assistant turn that the template's own generation prompt supplies after a
+user or tool message, which is typically the assistant header. Either way, the
+targets match incremental SFT with the same setting. System, user and tool turns
+are context only. Whitespace after the last turn stays in the text and belongs
+to the final target.
 
-Tokens are encoded from the full rendered text, with ownership determined by
-their start offsets. A token crossing a boundary belongs to the segment where
-it starts; no decode/encode round trip is required. Existing SFT masking, padding,
-next-token shifting, and `sft.only_unmask_final` continue to work. Configured
-template overrides and default tools are preserved; row-level tools take
-precedence, including an explicit empty list. Assistant tool-call messages may
-have missing/null content; these values are passed unchanged to the template,
-not replaced with empty strings. A template that cannot handle that message shape
-still raises its original error. Absent tools and documents are explicitly
-`None`, matching normal Transformers rendering. Tools must be dictionary schemas
-(not Python callables), and tool arguments must still use the format accepted by
-the model's template.
+The formatter tokenizes the full rendered text once and assigns each token to
+the segment where the token starts. No decode/encode round trip is needed.
+Existing SFT masking, padding, next-token shifting and `sft.only_unmask_final`
+work unchanged. The formatter keeps configured template overrides and default
+tools. Row-level tools take precedence, including an explicit empty list.
+Assistant tool-call messages may have missing or null content. The formatter
+passes these values to the template unchanged instead of replacing them with
+empty strings, so a template that cannot handle that message shape still raises
+its own error. As in Transformers, the formatter passes absent tools and
+documents as `None`. Tools must be dictionary schemas, not Python callables, and
+tool arguments must use the format the model's template accepts.
 
-This requires a fast tokenizer, text-only messages, and a final assistant target.
-Automatic ownership is not inference for arbitrary Jinja: templates that copy or
-reorder assistant messages, buffer the message loop inside a macro/filter/string
-assignment, or render messages without a loop require explicit generation blocks.
-Ambiguous ownership fails rather than silently falling back to prefix matching.
-Turn headers, bodies and terminators must be emitted within their corresponding
-loop iteration or generation block. The template still determines historical
-reasoning retention; for Nemotron, review `truncate_history_thinking` before
-switching an existing recipe.
+Full-conversation SFT requires a fast tokenizer, text-only messages and a final
+assistant message. The template must render each assistant message once, in
+order, in a streamed message loop, and the header, body and terminator must all
+come from that iteration. Loops that only scan messages are fine, including ones
+that use `break` or `continue`. The formatter rejects a template that copies,
+reorders or skips assistant messages, renders the message loop inside a macro,
+filter or `{% set %}` block, or renders messages without a loop. The error names
+the problem. Use `sft_processor` for those templates. The formatter never falls
+back to prefix matching. The template still decides how much earlier reasoning
+to keep. For Nemotron, check `truncate_history_thinking` before you switch an
+existing recipe.
 
-Loss ownership comes from the tracked loop iterations or explicit generation
-blocks, not token spelling. An EOS-looking prefix in context can belong to a
-turn header regardless of whether BOS and EOS are equal; it remains masked.
-The formatter does not infer missing terminators from such prefixes. Template
-authors must include the intended assistant targets and turn terminators in
-the corresponding spans; structural validation cannot prove their semantic
-completeness.
+The formatter assigns loss by loop iteration, not by matching token text. An
+EOS-looking token in a user or tool turn stays masked whether or not BOS and EOS
+are equal. The formatter does not infer missing terminators.
 
-Rows at or above `max_seq_length` retain their original diagnostic `length` and
-receive `loss_multiplier=0` with a short, masked batching placeholder. BOS/EOS
-insertion preserves the incremental convention: only trailing newlines are
-ignored when checking for an existing final EOS.
+Switching an existing recipe can change token IDs as well as masks. The
+incremental formatter tokenizes each turn separately, and this formatter
+tokenizes the whole conversation at once. Tokens can therefore merge across a
+turn boundary that no special token marks.
+
+A row at or above `max_seq_length` keeps its original `length` for diagnostics,
+gets `loss_multiplier=0`, and becomes a short, masked batching placeholder. Like
+the incremental formatter, BOS/EOS insertion ignores only trailing newlines when
+it checks for an existing final EOS.
 
 The deterministic formatter tests use a synthetic tokenizer and need no model
-downloads. Run this correctness gate separately from the supplemental stock
-tokenizer tests:
+downloads. Run them separately from the stock tokenizer tests:
 
 ```bash
 uv run --group test python -m pytest --noconftest -q -o addopts= \
   tests/unit/data/test_full_conversation.py -k 'not stock'
 ```
 
-Use `-k stock` instead to run the integration cases with pinned Hugging Face
-revisions. They require downloaded tokenizer assets or network access; a missing
-cache is not a formatter correctness result. Neither selector runs shared-Ray
-initialization or end-to-end training.
+Use `-k stock` instead to run the integration cases, which use pinned Hugging
+Face revisions. They need downloaded tokenizer files or network access. A
+failure caused by a missing cache says nothing about the formatter. The Mistral
+case is marked `hf_gated` and needs a Hugging Face token with access to the
+model. Neither selector starts Ray or runs end-to-end training.
 
 SFT datasets are expected to follow the HuggingFace chat format. Refer to the [chat dataset document](../design-docs/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [response_datasets/squad.py](../../nemo_rl/data/datasets/response_datasets/squad.py) has an example:
 

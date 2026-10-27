@@ -29,10 +29,8 @@ from tokenizers import (
     trainers,
 )
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
-from transformers.utils.chat_template_utils import render_jinja_template
 
 from nemo_rl.data.full_conversation import (
-    _has_generation_blocks,
     _render_with_message_spans,
     get_full_conversation_message_log,
 )
@@ -52,12 +50,10 @@ TEMPLATE = """{%- if tools %}{{ tools | tojson }}{% endif -%}
 {%- if loop.last or loop.nextitem.role != 'tool' %}{{ '<stop>\\n' }}{% endif -%}
 {%- elif m.role == 'assistant' -%}
 {{ '<start>assistant\\n' }}
-{%- generation -%}
 {%- if enable_thinking and m.reasoning_content %}{{ m.reasoning_content }}{% endif -%}
 {{ m.content }}
 {%- for call in m.tool_calls | default([]) %}{{ call | tojson }}{% endfor -%}
 {{ '<stop>\\n' }}
-{%- endgeneration -%}
 {%- else -%}
 {{ '<start>' + m.role + '\\n' + m.content + '<stop>\\n' }}
 {%- endif -%}
@@ -65,49 +61,7 @@ TEMPLATE = """{%- if tools %}{{ tools | tojson }}{% endif -%}
 {%- if add_generation_prompt %}{{ '<start>assistant\\n' }}{% endif -%}"""
 
 NEMOTRON_REVISION = "bf77c3174f68ad409e1c2aa60daeb46e32d1c606"
-
-
-@pytest.mark.parametrize(
-    "template,expected",
-    [
-        ("plain text", False),
-        ("{# {% generation %} #}", False),
-        ("{{ '{% generation %}' }}", False),
-        ("{% raw %}{% generation %}{% endraw %}", False),
-        ("{% generation %}answer{% endgeneration %}", True),
-        ("{%- generation -%}answer{%- endgeneration -%}", True),
-        ("{%\n generation\n%}answer{% endgeneration %}", True),
-        (
-            "{% if enabled %}{% generation %}answer{% endgeneration %}{% endif %}",
-            True,
-        ),
-    ],
-)
-def test_generation_detection_uses_jinja_syntax(template: str, expected: bool) -> None:
-    assert _has_generation_blocks(template) is expected
-
-
-@pytest.mark.parametrize(
-    "prefix",
-    [
-        "{# {% generation %} #}",
-        "{{ '{% generation %}' }}",
-        "{% raw %}{% generation %}{% endraw %}",
-    ],
-)
-def test_literal_generation_tags_do_not_disable_automatic_tracking(
-    tokenizer: PreTrainedTokenizerFast, prefix: str
-) -> None:
-    tokenizer.chat_template = prefix + TEMPLATE.replace(
-        "{%- generation -%}", ""
-    ).replace("{%- endgeneration -%}", "")
-    log = format_messages(tokenizer)
-    assert tokenizer.decode(torch.cat([m["token_ids"] for m in log])) == (
-        tokenizer.apply_chat_template(messages(), tokenize=False)
-    )
-    assistant = [m for m in log if m["role"] == "assistant"]
-    assert len(assistant) == 2
-    assert all(m["content"].startswith("<start>assistant\n") for m in assistant)
+UNSUPPORTED = "cannot locate the assistant turns"
 
 
 @pytest.fixture
@@ -160,6 +114,7 @@ def format_messages(
         "tools": None,
         "add_bos_token": False,
         "add_eos_token": True,
+        "mask_generation_prompt": False,
     }
     options.update(kwargs)
     return get_full_conversation_message_log(
@@ -167,7 +122,6 @@ def format_messages(
     )
 
 
-@pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize(
     "defaults",
     [
@@ -185,13 +139,10 @@ def format_messages(
 @pytest.mark.parametrize("row_tools", [None, [], [{"name": "row"}]])
 def test_standard_render_context_parity(
     tokenizer: PreTrainedTokenizerFast,
-    explicit: bool,
     defaults: dict[str, Any],
     row_tools: list[dict[str, Any]] | None,
 ) -> None:
     target = "{{ m.content + '<stop>' }}"
-    if explicit:
-        target = "{% generation %}" + target + "{% endgeneration %}"
     tokenizer.chat_template = (
         "{% if tools is defined %}TOOLS_DEFINED:{% endif %}"
         "{% if tools is none %}TOOLS_NONE:{% endif %}"
@@ -220,18 +171,15 @@ def test_standard_render_context_parity(
     )
 
 
-@pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("content_state", ["missing", "null", "empty"])
 def test_tool_call_content_state_parity(
-    tokenizer: PreTrainedTokenizerFast, explicit: bool, content_state: str
+    tokenizer: PreTrainedTokenizerFast, content_state: str
 ) -> None:
     target = (
         "{% if m.content is not defined %}MISSING"
         "{% elif m.content is none %}NULL{% else %}EMPTY{% endif %}"
         "{{ m.tool_calls | tojson }}<stop>"
     )
-    if explicit:
-        target = "{% generation %}" + target + "{% endgeneration %}"
     tokenizer.chat_template = (
         "{% for m in messages %}{{ '<start>' + m.role + '\\n' }}"
         "{% if m.role == 'assistant' %}"
@@ -255,9 +203,7 @@ def test_tool_call_content_state_parity(
     log = format_messages(tokenizer, source, add_eos_token=False)
     assert torch.cat([m["token_ids"] for m in log]).tolist() == encoded["input_ids"]
     assert source == original
-    target_start = reference.index(
-        content_state.upper() if explicit else "<start>assistant\n"
-    )
+    target_start = reference.index("<start>assistant\n")
     expected_mask = torch.tensor(
         [int(start >= target_start) for start, _ in encoded["offset_mapping"]]
     )
@@ -265,18 +211,15 @@ def test_tool_call_content_state_parity(
     assert torch.equal(torch.cat([m["token_loss_mask"] for m in log]), expected_mask)
 
 
-@pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("missing_content", [False, True])
 def test_tool_call_template_errors_remain_visible(
-    tokenizer: PreTrainedTokenizerFast, explicit: bool, missing_content: bool
+    tokenizer: PreTrainedTokenizerFast, missing_content: bool
 ) -> None:
     target = (
         "{% if m.content is not string %}"
         "{{ raise_exception('This template requires text content') }}{% endif %}"
         "{{ m.content }}<stop>"
     )
-    if explicit:
-        target = "{% generation %}" + target + "{% endgeneration %}"
     tokenizer.chat_template = (
         "{% for m in messages %}{% if m.role == 'assistant' %}"
         + target
@@ -294,7 +237,6 @@ def test_tool_call_template_errors_remain_visible(
     assert source == original
 
 
-@pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize(
     "options,error,match",
     [
@@ -303,17 +245,12 @@ def test_tool_call_template_errors_remain_visible(
         ({"tools": [len]}, ValueError, "tool schemas"),
     ],
 )
-def test_invalid_render_inputs_fail_in_both_paths(
+def test_invalid_render_inputs_are_rejected(
     tokenizer: PreTrainedTokenizerFast,
-    explicit: bool,
     options: dict[str, Any],
     error: type[Exception],
     match: str,
 ) -> None:
-    if not explicit:
-        tokenizer.chat_template = TEMPLATE.replace("{%- generation -%}", "").replace(
-            "{%- endgeneration -%}", ""
-        )
     tokenizer.apply_chat_template = partial(tokenizer.apply_chat_template, **options)
     with pytest.raises(error, match=match):
         format_messages(tokenizer)
@@ -357,31 +294,16 @@ def test_full_render_parity_and_loss_ownership(
     )
     assert target.count('"name": "check"') == results
     assert '"ok": true' in target and '"v": [null, false]' in target
-    assert "RESULT_" not in target and "<start>" not in target
+    assert "RESULT_" not in target and "<start>tool" not in target
+    assert target.count("<start>assistant\n") == 2
     assert ("REASONING" in target) == thinking
     assert target.count("<stop>") == 2
     assert source == original
     assert log[-1]["role"] == "assistant"
 
 
-def test_one_render_and_one_tokenization(tokenizer: PreTrainedTokenizerFast) -> None:
-    original_encode = type(tokenizer).__call__
-    with (
-        patch(
-            "nemo_rl.data.full_conversation.render_jinja_template",
-            wraps=render_jinja_template,
-        ) as render,
-        patch.object(
-            type(tokenizer), "__call__", autospec=True, side_effect=original_encode
-        ) as encode,
-    ):
-        format_messages(tokenizer)
-    assert render.call_count == 1
-    assert encode.call_count == 1
-
-
 def test_bound_template_override(tokenizer: PreTrainedTokenizerFast) -> None:
-    tokenizer.chat_template = "default without generation markers"
+    tokenizer.chat_template = "default template without a message loop"
     tokenizer.apply_chat_template = partial(
         tokenizer.apply_chat_template, chat_template="CUSTOM:" + TEMPLATE
     )
@@ -410,15 +332,14 @@ def test_bound_tools_and_row_precedence(
 
 
 @pytest.mark.parametrize("whitespace", ["", "\n"])
-def test_eos_in_context_respects_explicit_spans(
+def test_eos_in_context_stays_masked(
     tokenizer: PreTrainedTokenizerFast, whitespace: str
 ) -> None:
     tokenizer.chat_template = (
         "prefix{% for m in messages %}{% if m.role == 'assistant' %}"
-        "{% generation %}{{ m.content }}"
-        "{% if loop.last %}{{ '<stop>' }}{% endif %}{% endgeneration %}"
-        "{% if not loop.last %}{{ terminator_prefix + '<stop>' }}{% endif %}"
-        "{% else %}{{ m.content }}{% endif %}{% endfor %}"
+        "{{ m.content + '<stop>' }}"
+        "{% else %}{{ m.content + terminator_prefix + '<stop>' }}{% endif %}"
+        "{% endfor %}"
     )
     tokenizer.apply_chat_template = partial(
         tokenizer.apply_chat_template, terminator_prefix=whitespace
@@ -438,7 +359,7 @@ def test_eos_in_context_respects_explicit_spans(
     assert ids.tolist() == encoded["input_ids"]
     ranges = [
         (reference.index(text), reference.index(text) + len(text))
-        for text in ("answer", "last<stop>")
+        for text in ("answer<stop>", "last<stop>")
     ]
     expected_mask = [
         int(any(start <= token_start < end for start, end in ranges))
@@ -447,7 +368,7 @@ def test_eos_in_context_respects_explicit_spans(
     add_loss_mask_to_message_log([log])
     mask = torch.cat([m["token_loss_mask"] for m in log])
     assert mask.tolist() == expected_mask
-    assert mask[ids == tokenizer.eos_token_id].tolist() == [0, 1]
+    assert mask[ids == tokenizer.eos_token_id].tolist() == [0, 1, 0, 1]
 
 
 @pytest.mark.parametrize(
@@ -463,8 +384,8 @@ def test_shared_bos_eos_turn_headers(
     tokenizer.bos_token = tokenizer.eos_token
     tokenizer.chat_template = (
         "{% for m in messages %}{{ bos_token + m.role + '\\n' }}"
-        "{% if m.role == 'assistant' %}{% generation %}"
-        "{{ m.content + eos_token + target_whitespace }}{% endgeneration %}"
+        "{% if m.role == 'assistant' %}"
+        "{{ m.content + eos_token + target_whitespace }}"
         "{% else %}{{ m.content + '\\n' }}{% endif %}{% endfor %}"
     )
     tokenizer.apply_chat_template = partial(
@@ -483,15 +404,20 @@ def test_shared_bos_eos_turn_headers(
     )
     assistant_segments = [segment for segment in log if segment["role"] == "assistant"]
     assert [segment["content"] for segment in assistant_segments] == [
-        answer + tokenizer.eos_token + trailing_whitespace
+        tokenizer.eos_token
+        + "assistant\n"
+        + answer
+        + tokenizer.eos_token
+        + trailing_whitespace
         for answer in ("answer", "last")
     ]
     add_loss_mask_to_message_log([log], only_unmask_final=only_final)
     for index, segment in enumerate(assistant_segments):
+        # The shared BOS/EOS token opens the header and closes the turn.
         is_eos = segment["token_ids"] == tokenizer.eos_token_id
-        assert is_eos.sum() == 1
+        assert is_eos.sum() == 2
         should_train = not only_final or index == len(assistant_segments) - 1
-        assert segment["token_loss_mask"][is_eos].item() == int(should_train)
+        assert segment["token_loss_mask"][is_eos].tolist() == [int(should_train)] * 2
     for segment in log:
         if segment["role"] == "context":
             assert not segment["token_loss_mask"].any()
@@ -508,16 +434,14 @@ def test_text_and_unicode(tokenizer: PreTrainedTokenizerFast, content: str) -> N
             {"role": "assistant", "content": content},
         ],
     )
-    assert log[-1]["content"] == content + "<stop>\n"
+    assert log[-1]["content"] == "<start>assistant\n" + content + "<stop>\n"
 
 
-@pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("add_eos", [False, True])
 @pytest.mark.parametrize("only_final", [False, True])
 @pytest.mark.parametrize("shared_bos_eos", [False, True])
 def test_eos_turn_headers_with_distinct_turn_terminator(
     tokenizer: PreTrainedTokenizerFast,
-    explicit: bool,
     add_eos: bool,
     only_final: bool,
     shared_bos_eos: bool,
@@ -530,8 +454,6 @@ def test_eos_turn_headers_with_distinct_turn_terminator(
         {"additional_special_tokens": ["<start>", "<turn_end>"]}
     )
     target = "{{ m.content + '<turn_end>\\n' }}"
-    if explicit:
-        target = "{% generation %}" + target + "{% endgeneration %}"
     tokenizer.chat_template = (
         "{% for m in messages %}{{ eos_token + m.role + '\\n' }}"
         "{% if m.role == 'assistant' %}"
@@ -554,9 +476,10 @@ def test_eos_turn_headers_with_distinct_turn_terminator(
     )
     log = format_messages(tokenizer, source, add_bos_token=False, add_eos_token=add_eos)
     assert torch.cat([m["token_ids"] for m in log]).tolist() == encoded["input_ids"]
-    targets = [answer + "<turn_end>\n" for answer in ("answer", "last")]
-    if not explicit:
-        targets = [tokenizer.eos_token + "assistant\n" + text for text in targets]
+    targets = [
+        tokenizer.eos_token + "assistant\n" + answer + "<turn_end>\n"
+        for answer in ("answer", "last")
+    ]
     if add_eos:
         targets[-1] += tokenizer.eos_token
     assert [m["content"] for m in log if m["role"] == "assistant"] == targets
@@ -601,24 +524,26 @@ def test_invalid_input(
 @pytest.mark.parametrize(
     "template,match",
     [
-        ("plain text", "generation"),
-        ("prefix{% generation %}one<stop>{% endgeneration %}", "one generation"),
+        ("plain text", "each assistant message"),
         (
-            "prefix{% for m in messages if m.role == 'assistant' %}{% generation %}x<stop>{% endgeneration %}suffix{% endfor %}",
-            "Non-whitespace",
+            "{% for m in messages %}{{ m.content + '<stop>' }}{% endfor %}suffix",
+            "after the final assistant",
         ),
     ],
 )
-def test_invalid_generation_templates(
+def test_untrackable_templates_are_rejected(
     tokenizer: PreTrainedTokenizerFast, template: str, match: str
 ) -> None:
     tokenizer.chat_template = template
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ValueError, match=match) as error:
         format_messages(tokenizer)
+    assert UNSUPPORTED in str(error.value)
 
 
 def test_boundary_crossing_uses_token_start(tokenizer: PreTrainedTokenizerFast) -> None:
-    tokenizer.chat_template = "hel{% generation %}lo<stop>{% endgeneration %}"
+    tokenizer.chat_template = (
+        "hel{% for m in messages if m.role == 'assistant' %}lo<stop>{% endfor %}"
+    )
     log = format_messages(
         tokenizer,
         [{"role": "user", "content": "x"}, {"role": "assistant", "content": "x"}],
@@ -633,9 +558,13 @@ def test_boundary_crossing_uses_token_start(tokenizer: PreTrainedTokenizerFast) 
 def test_token_starting_in_assistant_can_cross_into_context(
     tokenizer: PreTrainedTokenizerFast,
 ) -> None:
+    # Each assistant message emits output in a different loop; scan iterations
+    # that emit nothing own no output.
     tokenizer.chat_template = (
-        "x{% generation %}hel{% endgeneration %}lo"
-        "{% generation %}<stop>{% endgeneration %}"
+        "x{% for m in messages if m.role == 'assistant' %}"
+        "{% if loop.first %}hel{% endif %}{% endfor %}lo"
+        "{% for m in messages if m.role == 'assistant' %}"
+        "{% if loop.last %}<stop>{% endif %}{% endfor %}"
     )
     source = [
         {"role": "user", "content": "x"},
@@ -651,20 +580,16 @@ def test_token_starting_in_assistant_can_cross_into_context(
     assert torch.cat([m["token_loss_mask"] for m in log]).tolist() == [0, 1, 1]
 
 
-@pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("only_final", [False, True])
 @pytest.mark.parametrize("normalize", [False, True])
 def test_reference_masks_and_normalization(
     tokenizer: PreTrainedTokenizerFast,
-    explicit: bool,
     only_final: bool,
     normalize: bool,
 ) -> None:
     if normalize:
         tokenizer.backend_tokenizer.normalizer = normalizers.NFC()
     target = "{{ m.content + '<stop>' }}"
-    if explicit:
-        target = "{% generation %}" + target + "{% endgeneration %}"
     tokenizer.chat_template = (
         "{% for m in messages %}{{ '<start>' + m.role + '\\n' }}"
         "{% if m.role == 'assistant' %}"
@@ -685,9 +610,7 @@ def test_reference_masks_and_normalization(
     reference_ids = torch.tensor(encoded["input_ids"])
     if normalize:
         assert tokenizer.decode(reference_ids) != reference
-    targets = ["CALL<stop>", "FINAL e\u0301<stop>"]
-    if not explicit:
-        targets = ["<start>assistant\n" + text for text in targets]
+    targets = ["<start>assistant\nCALL<stop>", "<start>assistant\nFINAL e\u0301<stop>"]
     if only_final:
         targets = targets[-1:]
     expected_ranges = [
@@ -719,7 +642,9 @@ def test_reference_masks_and_normalization(
 def test_zero_next_token_targets_are_rejected(
     tokenizer: PreTrainedTokenizerFast,
 ) -> None:
-    tokenizer.chat_template = "{% generation %}<stop>{% endgeneration %}"
+    tokenizer.chat_template = (
+        "{% for m in messages if m.role == 'assistant' %}<stop>{% endfor %}"
+    )
     with pytest.raises(ValueError, match="no trainable next-token"):
         format_messages(
             tokenizer,
@@ -743,13 +668,8 @@ def test_eos_addition_stays_supervised(tokenizer: PreTrainedTokenizerFast) -> No
     assert log[-1]["token_ids"][-1] == tokenizer.eos_token_id
 
 
-@pytest.mark.parametrize("explicit", [False, True])
-def test_adjacent_assistants_stay_separate(
-    tokenizer: PreTrainedTokenizerFast, explicit: bool
-) -> None:
+def test_adjacent_assistants_stay_separate(tokenizer: PreTrainedTokenizerFast) -> None:
     target = "{{ m.content + '<stop>' }}"
-    if explicit:
-        target = "{% generation %}" + target + "{% endgeneration %}"
     tokenizer.chat_template = (
         "prefix{% for m in messages if m.role == 'assistant' %}"
         + target
@@ -843,20 +763,26 @@ def test_registered_processor_and_exclusion(
         )
 
 
-def test_registered_processor_rejects_generation_prompt(
+def test_registered_processor_masks_generation_prompt(
     tokenizer: PreTrainedTokenizerFast,
 ) -> None:
-    with pytest.raises(ValueError, match="add_generation_prompt"):
-        PROCESSOR_REGISTRY["sft_full_conversation_processor"](
-            {"messages": messages(), "task_name": "test"},
-            TaskDataSpec(),
-            tokenizer,
-            16384,
-            0,
-            add_bos=False,
-            add_eos=True,
-            add_generation_prompt=True,
-        )
+    result = PROCESSOR_REGISTRY["sft_full_conversation_processor"](
+        {"messages": messages(), "task_name": "test"},
+        TaskDataSpec(),
+        tokenizer,
+        16384,
+        0,
+        add_bos=False,
+        add_eos=True,
+        add_generation_prompt=True,
+    )
+    log = result["message_log"]
+    assert tokenizer.decode(torch.cat([m["token_ids"] for m in log])) == (
+        tokenizer.apply_chat_template(messages(), tokenize=False)
+    )
+    assistant = [m for m in log if m["role"] == "assistant"]
+    assert len(assistant) == 2
+    assert not any(m["content"].startswith("<start>") for m in assistant)
 
 
 def test_default_processor_is_unchanged(tokenizer: PreTrainedTokenizerFast) -> None:
@@ -887,8 +813,8 @@ def test_final_eos_whitespace_matches_incremental_convention(
 ) -> None:
     tokenizer.chat_template = (
         "{% for m in messages %}{{ '<start>' + m.role + '\\n' }}"
-        "{% if m.role == 'assistant' %}{% generation %}"
-        "{{ m.content + eos_token + eos_suffix }}{% endgeneration %}"
+        "{% if m.role == 'assistant' %}"
+        "{{ m.content + eos_token + eos_suffix }}"
         "{% else %}{{ m.content + '<stop>\\n' }}{% endif %}{% endfor %}"
     )
     tokenizer.apply_chat_template = partial(
@@ -900,7 +826,9 @@ def test_final_eos_whitespace_matches_incremental_convention(
     ]
     log = format_messages(tokenizer, source, add_eos_token=add_eos)
     extra_eos = add_eos and bool(suffix.strip("\n"))
-    expected_target = "answer<stop>" + suffix + ("<stop>" if extra_eos else "")
+    expected_target = (
+        "<start>assistant\nanswer<stop>" + suffix + ("<stop>" if extra_eos else "")
+    )
     assert log[-1]["content"] == expected_target
     incremental = get_formatted_message_log(
         source,
@@ -965,7 +893,7 @@ def test_null_tool_call_content(
 
 
 @pytest.mark.parametrize("suffix", ["\n", " \n\t"])
-def test_whitespace_after_final_generation_is_preserved(
+def test_whitespace_after_final_turn_is_preserved(
     tokenizer: PreTrainedTokenizerFast, suffix: str
 ) -> None:
     tokenizer.chat_template = TEMPLATE + "{{ suffix }}"
@@ -983,9 +911,6 @@ def test_whitespace_after_final_generation_is_preserved(
 def test_automatic_message_tracking(
     tokenizer: PreTrainedTokenizerFast, only_final: bool
 ) -> None:
-    tokenizer.chat_template = TEMPLATE.replace("{%- generation -%}", "").replace(
-        "{%- endgeneration -%}", ""
-    )
     source = messages()
     expected = tokenizer.apply_chat_template(source, tokenize=False)
     original_encode = type(tokenizer).__call__
@@ -1055,7 +980,7 @@ def test_ambiguous_automatic_ownership_is_rejected(
     tokenizer: PreTrainedTokenizerFast, template: str
 ) -> None:
     tokenizer.chat_template = template
-    with pytest.raises(ValueError, match="generation"):
+    with pytest.raises(ValueError, match=UNSUPPORTED):
         format_messages(tokenizer)
 
 
@@ -1070,10 +995,11 @@ def test_ambiguous_automatic_ownership_is_rejected(
             "5a8abab4a5d6f164389b1079fb721cfab8d7126c",
             1,
         ),
-        (
+        pytest.param(
             "mistralai/Mistral-7B-Instruct-v0.3",
             "c170c708c41dac9275d15a8fff4eca08d52bab71",
             2,
+            marks=pytest.mark.hf_gated,
         ),
     ],
 )
@@ -1136,6 +1062,7 @@ def test_stock_tokenizer_full_render_and_loss(
         tools=tools if with_tools else None,
         add_bos_token=False,
         add_eos_token=False,
+        mask_generation_prompt=False,
     )
     expected = tokenizer.apply_chat_template(
         source,
@@ -1182,6 +1109,7 @@ def test_stock_nemotron_history_reasoning(truncate_history: bool) -> None:
         tools=None,
         add_bos_token=False,
         add_eos_token=False,
+        mask_generation_prompt=False,
     )
     expected = tokenizer.apply_chat_template(source, tokenize=False)
     assert (
@@ -1234,10 +1162,11 @@ def test_render_options_exclude_tokenizer_controls(
         tokenizer_kwargs={"padding": True},
     )
     with patch(
-        "nemo_rl.data.full_conversation.render_jinja_template",
-        wraps=render_jinja_template,
+        "nemo_rl.data.full_conversation._render_with_message_spans",
+        wraps=_render_with_message_spans,
     ) as render:
         format_messages(tokenizer)
+    template_options = render.call_args.args[2]
     assert not {
         "tokenize",
         "return_dict",
@@ -1246,4 +1175,190 @@ def test_render_options_exclude_tokenizer_controls(
         "max_length",
         "return_tensors",
         "tokenizer_kwargs",
-    }.intersection(render.call_args.kwargs)
+    }.intersection(template_options)
+
+
+def test_generation_prompt_masking_matches_incremental(
+    tokenizer: PreTrainedTokenizerFast,
+) -> None:
+    source = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "part one"},
+        {"role": "assistant", "content": "part two"},
+    ]
+    incremental = get_formatted_message_log(
+        source,
+        tokenizer,
+        TaskDataSpec(),
+        add_bos_token=False,
+        add_eos_token=True,
+        add_generation_prompt=True,
+    )
+    log = format_messages(tokenizer, source, mask_generation_prompt=True)
+    assert torch.equal(
+        torch.cat([m["token_ids"] for m in log]),
+        torch.cat([m["token_ids"] for m in incremental]),
+    )
+    # The header of an assistant turn that follows another assistant turn
+    # stays supervised, as in incremental SFT.
+    expected = [m["content"] for m in incremental if m["role"] == "assistant"]
+    assert expected == [
+        "answer<stop>\n",
+        "part one<stop>\n",
+        "<start>assistant\npart two<stop>\n",
+    ]
+    assert [m["content"] for m in log if m["role"] == "assistant"] == expected
+
+
+@pytest.mark.parametrize("only_final", [False, True])
+def test_generation_prompt_masking_after_tool_responses(
+    tokenizer: PreTrainedTokenizerFast, only_final: bool
+) -> None:
+    source = messages()
+    reference = tokenizer.apply_chat_template(source, tokenize=False)
+    log = format_messages(
+        tokenizer, source, add_eos_token=False, mask_generation_prompt=True
+    )
+    assert (
+        torch.cat([m["token_ids"] for m in log]).tolist()
+        == tokenizer(reference, add_special_tokens=False)["input_ids"]
+    )
+    assistant_indices = [i for i, m in enumerate(log) if m["role"] == "assistant"]
+    assert len(assistant_indices) == 2
+    for index in assistant_indices:
+        assert log[index - 1]["role"] == "context"
+        assert log[index - 1]["content"].endswith("<start>assistant\n")
+        assert not log[index]["content"].startswith("<start>")
+    assert log[-1]["content"] == "All checked<stop>\n"
+    assert not any("RESULT_" in log[index]["content"] for index in assistant_indices)
+    add_loss_mask_to_message_log([log], only_unmask_final=only_final)
+    for segment in log:
+        if segment["role"] == "context":
+            assert not segment["token_loss_mask"].any()
+    assert log[-1]["token_loss_mask"].all()
+
+
+@pytest.mark.parametrize("reasoning", [None, "R"])
+def test_generation_prompt_masks_only_the_shared_prefix(
+    tokenizer: PreTrainedTokenizerFast, reasoning: str | None
+) -> None:
+    # The generation prompt opens a thinking block that only some turns use.
+    tokenizer.chat_template = (
+        "{% for m in messages %}{{ '<start>' + m.role + '\\n' }}"
+        "{% if m.reasoning_content %}{{ '<think>' + m.reasoning_content + '</think>' }}"
+        "{% endif %}{{ m.content + '<stop>\\n' }}{% endfor %}"
+        "{% if add_generation_prompt %}{{ '<start>assistant\\n<think>' }}{% endif %}"
+    )
+    assistant_message: dict[str, Any] = {"role": "assistant", "content": "answer"}
+    if reasoning:
+        assistant_message["reasoning_content"] = reasoning
+    source = [{"role": "user", "content": "question"}, assistant_message]
+    log = format_messages(tokenizer, source, mask_generation_prompt=True)
+    assistant = [m["content"] for m in log if m["role"] == "assistant"]
+    assert assistant == ["R</think>answer<stop>\n" if reasoning else "answer<stop>\n"]
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        # A metadata scan that stops at the first assistant message.
+        "{% for m in messages %}{% if m.role == 'assistant' %}{% break %}"
+        "{% endif %}{% endfor %}"
+        "{% for m in messages %}{{ m.content + '<stop>' }}{% endfor %}",
+        # A metadata scan that skips assistant messages.
+        "{% set ns = namespace(n=0) %}{% for m in messages %}"
+        "{% if m.role == 'assistant' %}{% continue %}{% endif %}"
+        "{% set ns.n = ns.n + 1 %}{% endfor %}"
+        "{% for m in messages %}{{ m.content + '<stop>' }}{% endfor %}",
+        # Break and continue in a nested loop belong to that loop.
+        "{% for m in messages %}{{ m.content }}"
+        "{% for c in m.calls | default([1, 2]) %}{% if loop.first %}{% continue %}"
+        "{% endif %}{{ c }}{% break %}{% endfor %}{{ '<stop>' }}{% endfor %}",
+        # Break after rendering the final message still closes its turn.
+        "{% for m in messages %}{{ m.content + '<stop>' }}"
+        "{% if loop.last %}{% break %}{% endif %}{% endfor %}",
+    ],
+)
+def test_break_and_continue_are_tracked(
+    tokenizer: PreTrainedTokenizerFast, template: str
+) -> None:
+    tokenizer.chat_template = template
+    source = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "last"},
+    ]
+    reference = tokenizer.apply_chat_template(source, tokenize=False)
+    log = format_messages(tokenizer, source, add_eos_token=False)
+    assert (
+        torch.cat([m["token_ids"] for m in log]).tolist()
+        == tokenizer(reference, add_special_tokens=False)["input_ids"]
+    )
+    assistant = [m["content"] for m in log if m["role"] == "assistant"]
+    assert len(assistant) == 2
+    assert assistant[0].startswith("answer") and assistant[-1].startswith("last")
+
+
+def test_continue_that_skips_an_assistant_turn_is_rejected(
+    tokenizer: PreTrainedTokenizerFast,
+) -> None:
+    tokenizer.chat_template = (
+        "{% for m in messages %}{% if m.skip %}{% continue %}{% endif %}"
+        "{{ m.content + '<stop>' }}{% endfor %}"
+    )
+    source = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "hidden", "skip": True},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "last"},
+    ]
+    with pytest.raises(ValueError, match="each assistant message") as error:
+        format_messages(tokenizer, source)
+    assert UNSUPPORTED in str(error.value)
+
+
+def test_history_reasoning_truncation_regression(
+    tokenizer: PreTrainedTokenizerFast,
+) -> None:
+    """Issue #2821: prefix differencing duplicates history turns that lose reasoning."""
+    # Like Nemotron and OLMo templates, keep reasoning only after the last user turn.
+    tokenizer.chat_template = (
+        "{% set ns = namespace(last_user=-1) %}"
+        "{% for m in messages %}{% if m.role == 'user' %}"
+        "{% set ns.last_user = loop.index0 %}{% endif %}{% endfor %}"
+        "{% for m in messages %}{{ '<start>' + m.role + '\\n' }}"
+        "{% if m.role == 'assistant' and loop.index0 > ns.last_user %}"
+        "{{ '<think>' + m.reasoning_content + '</think>' }}{% endif %}"
+        "{{ m.content + '<stop>\\n' }}{% endfor %}"
+    )
+    source = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "ANSWER1", "reasoning_content": "THINK1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "ANSWER2", "reasoning_content": "THINK2"},
+    ]
+    one_shot = tokenizer.apply_chat_template(source, tokenize=False)
+    assert one_shot.count("ANSWER1") == 1 and "THINK1" not in one_shot
+    incremental = get_formatted_message_log(
+        source,
+        tokenizer,
+        TaskDataSpec(),
+        add_bos_token=False,
+        add_eos_token=False,
+        add_generation_prompt=False,
+    )
+    incremental_text = tokenizer.decode(
+        torch.cat([m["token_ids"] for m in incremental])
+    )
+    assert incremental_text.count("ANSWER1") == 2
+    log = format_messages(tokenizer, source, add_eos_token=False)
+    ids = torch.cat([m["token_ids"] for m in log])
+    assert ids.tolist() == tokenizer(one_shot, add_special_tokens=False)["input_ids"]
+    assistant = [m["content"] for m in log if m["role"] == "assistant"]
+    assert assistant == [
+        "<start>assistant\nANSWER1<stop>\n",
+        "<start>assistant\n<think>THINK2</think>ANSWER2<stop>\n",
+    ]

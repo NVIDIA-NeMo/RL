@@ -38,6 +38,8 @@ from nemo_rl.data.llm_message_utils import get_formatted_message_log
 
 TokenizerType = PreTrainedTokenizerBase
 
+logger = logging.getLogger(__name__)
+
 
 def helpsteer3_data_processor(
     datum_dict: dict[str, Any],
@@ -167,10 +169,6 @@ def sft_processor(
             raise ValueError(
                 "Full-conversation SFT requires a positive max_seq_length."
             )
-        if add_generation_prompt:
-            raise ValueError(
-                "Full-conversation SFT requires data.add_generation_prompt=false."
-            )
         message_log = get_full_conversation_message_log(
             datum_dict["messages"],
             tokenizer,
@@ -178,6 +176,7 @@ def sft_processor(
             tools=datum_dict.get("tools"),
             add_bos_token=add_bos,
             add_eos_token=add_eos,
+            mask_generation_prompt=add_generation_prompt,
         )
     else:
         message_log = get_formatted_message_log(
@@ -197,7 +196,7 @@ def sft_processor(
         if full_conversation:
             # Keep the row with zero loss and a short batching placeholder;
             # length below intentionally retains the original diagnostic count.
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "Excluding full-conversation SFT row idx=%d tokens=%d limit=%d",
                 idx,
                 length,
