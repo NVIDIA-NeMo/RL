@@ -32,6 +32,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     SHARD_INVARIANT_ESTIMATORS,
@@ -52,6 +53,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
@@ -72,6 +74,27 @@ def _config(**overrides) -> AdvantageStageConfig:
     )
     base.update(overrides)
     return AdvantageStageConfig(**base)
+
+
+@pytest.mark.parametrize("log_full_train_data", [False, True])
+def test_from_master_config_uses_typed_logger(
+    tmp_path: Path, log_full_train_data: bool
+) -> None:
+    master_config = SimpleNamespace(
+        grpo=GRPOConfig(num_generations_per_prompt=2),
+        ppo=None,
+        loss_fn=ClippedPGLossConfig(),
+        on_policy_distillation=None,
+        policy={"generation": {"top_k": None, "top_p": 1.0}},
+        logger=LoggerConfig(log_dir=str(tmp_path)),
+        async_rl=SimpleNamespace(log_full_train_data=log_full_train_data),
+    )
+
+    config = AdvantageStageConfig.from_master_config(master_config)
+
+    assert config.train_data_dump_dir == (
+        str(tmp_path) if log_full_train_data else None
+    )
 
 
 class TestInputFields:
