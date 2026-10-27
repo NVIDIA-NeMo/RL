@@ -2276,6 +2276,162 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
     assert moved == (["cpu"] if offload_optimizer else [])
 
 
+def _optimizer_for_state(state, *, chained):
+    from megatron.core.optimizer import ChainedOptimizer
+
+    if chained:
+        optimizer = object.__new__(ChainedOptimizer)
+        optimizer.chained_optimizers = [SimpleNamespace(state=state)]
+        return optimizer
+    return SimpleNamespace(_get_state=lambda: state)
+
+
+@pytest.mark.parametrize("chained", [False, True])
+def test_megatron_move_optimizer_offloads_into_pinned_destination(monkeypatch, chained):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    source = MagicMock(spec=torch.Tensor)
+    source.is_cuda = True
+    destination = MagicMock(spec=torch.Tensor)
+    destination.is_cuda = False
+    resident = torch.tensor(1)
+    state = {0: {"exp_avg": source, "step": resident, "metadata": 7}}
+    events = []
+
+    def allocate(value, **kwargs):
+        assert value is source
+        assert kwargs == {"device": "cpu", "pin_memory": True}
+        events.append("allocate")
+        return destination
+
+    def copy(value, *, non_blocking):
+        assert value is source
+        assert non_blocking is False
+        assert state[0]["exp_avg"] is source
+        events.append("copy")
+
+    destination.copy_.side_effect = copy
+    monkeypatch.setattr(torch, "empty_like", allocate)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.optimizer = _optimizer_for_state(state, chained=chained)
+
+    worker.move_optimizer("cpu")
+    worker.move_optimizer("cpu")
+
+    assert events == ["allocate", "copy"]
+    assert state[0]["exp_avg"] is destination
+    assert state[0]["step"] is resident
+    assert state[0]["metadata"] == 7
+    source.to.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["allocate", "copy"])
+def test_megatron_move_optimizer_keeps_state_on_offload_failure(monkeypatch, failure):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    source = MagicMock(spec=torch.Tensor)
+    source.is_cuda = True
+    destination = MagicMock(spec=torch.Tensor)
+    state = {0: {"exp_avg_sq": source}}
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("offload failed")
+
+    allocate = MagicMock(return_value=destination)
+    if failure == "allocate":
+        allocate.side_effect = fail
+    else:
+        destination.copy_.side_effect = fail
+    monkeypatch.setattr(torch, "empty_like", allocate)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.optimizer = _optimizer_for_state(state, chained=False)
+
+    with pytest.raises(RuntimeError, match="offload failed"):
+        worker.move_optimizer("cpu")
+
+    assert state[0]["exp_avg_sq"] is source
+
+
+@pytest.mark.parametrize("chained", [False, True])
+def test_megatron_move_optimizer_keeps_cuda_reload_path(monkeypatch, chained):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    source = MagicMock(spec=torch.Tensor)
+    source.is_cuda = False
+    loaded = MagicMock(spec=torch.Tensor)
+    loaded.is_cuda = True
+    source.to.return_value = loaded
+    state = {0: {"exp_avg": source, "metadata": 7}}
+    allocate = MagicMock()
+    monkeypatch.setattr(torch, "empty_like", allocate)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.optimizer = _optimizer_for_state(state, chained=chained)
+
+    worker.move_optimizer("cuda")
+    worker.move_optimizer("cuda")
+
+    assert state[0]["exp_avg"] is loaded
+    assert state[0]["metadata"] == 7
+    source.to.assert_called_once_with("cuda")
+    loaded.to.assert_not_called()
+    allocate.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("chained", [False, True])
+def test_megatron_move_optimizer_cuda_round_trip(chained):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    state = {
+        0: {
+            "exp_avg": torch.arange(77, device="cuda", dtype=torch.float32)
+            .reshape(7, 11)
+            .t(),
+            "exp_avg_sq": torch.arange(17, device="cuda", dtype=torch.bfloat16),
+            "empty": torch.empty(0, device="cuda"),
+            "scalar": torch.tensor(3.0, device="cuda"),
+            "step": torch.tensor(1),
+            "metadata": 7,
+        }
+    }
+    expected = {
+        key: value.cpu().clone()
+        for key, value in state[0].items()
+        if torch.is_tensor(value)
+    }
+    strides = {
+        key: value.stride() for key, value in state[0].items() if torch.is_tensor(value)
+    }
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.optimizer = _optimizer_for_state(state, chained=chained)
+
+    for _ in range(3):
+        worker.move_optimizer("cpu")
+        for key, reference in expected.items():
+            value = state[0][key]
+            assert value.device.type == "cpu"
+            assert value.dtype == reference.dtype
+            assert value.shape == reference.shape
+            assert value.stride() == strides[key]
+            if key != "step" and value.numel():
+                assert value.is_pinned()
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+        assert state[0]["metadata"] == 7
+        worker.move_optimizer("cuda")
+        for key, reference in expected.items():
+            value = state[0][key]
+            assert value.is_cuda
+            torch.testing.assert_close(value.cpu(), reference, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "generation_backend, colocated, has_inference_model, shared_buffer, "
     "expect_move_params, expect_move_grads",

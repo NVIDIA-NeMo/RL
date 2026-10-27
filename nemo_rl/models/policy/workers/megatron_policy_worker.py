@@ -5023,7 +5023,13 @@ class MegatronPolicyWorkerImpl(
                     # Move the tensor to device and update the state dictionary
                     if device == "cpu":
                         if v.is_cuda:
-                            state[k] = v.to("cpu")
+                            # Avoid pageable-host staging during CUDA offload.
+                            # Publish the state only after its copy has completed.
+                            destination = torch.empty_like(
+                                v, device="cpu", pin_memory=True
+                            )
+                            destination.copy_(v, non_blocking=False)
+                            state[k] = destination
                     elif device == "cuda":
                         if not v.is_cuda:
                             state[k] = v.to("cuda")
