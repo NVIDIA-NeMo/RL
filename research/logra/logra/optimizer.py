@@ -298,6 +298,7 @@ class LoGRAOptimizer(torch.optim.Optimizer):
                 projection_seed(self.config.seed, update, layer.name),
                 distribution=self.config.distribution,
             )
+            layer.refresh_cast()
 
     def state_dict(self) -> dict[str, Any]:
         return dict(
