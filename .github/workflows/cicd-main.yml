@@ -17,12 +17,18 @@ on:
   push:
     branches:
       - main
+      - "joyang/unittest-contexts-20261027-b00632b"
       - "r[0-9]+.[0-9]+.[0-9]+"
       - "pull-request/[0-9]+"
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
     inputs:
+      collect_test_contexts:
+        description: "Collect per-test driver coverage contexts for unittest refactoring"
+        required: false
+        default: false
+        type: boolean
       test_to_run:
         required: false
         default: L2
@@ -213,6 +219,14 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "Overriding test level from $TEST_LEVEL to $DISPATCH_TEST_LEVEL"
             TEST_LEVEL="$DISPATCH_TEST_LEVEL"
+          fi
+
+          # Dedicated coverage branch: full H100 L0, no FAST/image reuse.
+          if [[ "${{ github.ref_name }}" == "joyang/unittest-contexts-20261027-b00632b" ]]; then
+            TEST_LEVEL="L0"
+            TEST_PLATFORM="h100"
+            TEST_SCRIPT_PATTERN=""
+            DISPATCH_IMAGE_TAG=""
           fi
 
           if [[ -n "$MEGATRON_LM_COMMIT" && ! "$MEGATRON_LM_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
@@ -723,6 +737,7 @@ jobs:
           image: ${{ vars.CI_CONTAINER_NAME }}
           image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           is_unit_test: "true"
+          collect-test-contexts: ${{ inputs.collect_test_contexts || github.ref_name == 'joyang/unittest-contexts-20261027-b00632b' }}
           cpu-only: "false"
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
           megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}

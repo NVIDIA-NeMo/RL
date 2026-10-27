@@ -41,7 +41,11 @@ else
 fi
 
 set +e
-pytest $pytest_args
+if [[ "${NRL_TEST_CONTEXTS:-false}" == "true" ]]; then
+    uv run --active --no-sync python "$PROJECT_ROOT/tests/coverage_attribution/runner.py" $pytest_args
+else
+    pytest $pytest_args
+fi
 exit_code=$?
 set -e
 if [[ $exit_code -eq 5 ]]; then

@@ -37,6 +37,10 @@ inputs:
     description: "Image to use for test"
     required: false
     default: "nemo_rl_container"
+  collect-test-contexts:
+    description: "Capture isolated per-pytest contexts (unit tests only; driver coverage)"
+    required: false
+    default: "false"
   cpu-only:
     description: "Run tests on CPU only"
     required: false
@@ -183,6 +187,7 @@ runs:
           --env TRANSFORMERS_OFFLINE=0 \
           --env GHA_RUNNER=${{ inputs.runner }} \
           --env NEMO_RL_REQUIRE_ALLOY=1 \
+          --env NRL_TEST_CONTEXTS=${{ inputs.collect-test-contexts }} \
           --env HYDRA_FULL_ERROR=1 \
           --env HF_HOME=/home/TestData/nemo-rl/hf_home \
           --env HF_DATASETS_CACHE=/home/TestData/nemo-rl/hf_datasets_cache \
@@ -264,6 +269,15 @@ runs:
         path: |
           ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/unit/environments/nemo_gym_test_data/actual_test_nemo_gym_sanity.json
         if-no-files-found: ignore
+
+    - name: Upload per-test context evidence
+      uses: actions/upload-artifact@v6
+      if: always() && inputs.is_unit_test == 'true' && inputs.collect-test-contexts == 'true'
+      with:
+        name: test-contexts-${{ inputs.script }}-${{ github.run_id }}-${{ steps.uuid.outputs.id }}
+        path: ${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl/tests/test-contexts/
+        include-hidden-files: true
+        if-no-files-found: error
 
     - name: Container shutdown
       if: always()
