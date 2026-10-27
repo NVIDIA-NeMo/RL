@@ -781,6 +781,56 @@ class TestSetup:
             mc.policy["generation"]["nvfp4_pertoken_rollout"] = rollout
         validate_single_controller_config(mc)
 
+    def test_materializes_native_lora_before_build_factories(self, patched_factories):
+        mc = _make_master_config()
+        mc.policy.update(
+            {
+                "precision": "bfloat16",
+                "automodel_cfg": {
+                    "enabled": True,
+                    "lora_cfg": {"enabled": True, "dim": 16, "alpha": 64},
+                },
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "lora_refit_mode": "native",
+                "refit_transport": None,
+                "vllm_cfg": {
+                    "async_engine": False,
+                    "precision": "bfloat16",
+                    "load_format": "dummy",
+                },
+                "vllm_kwargs": {},
+            }
+        )
+
+        captured = {}
+        original_build = patched_factories["_build_generation"].return_value
+
+        def build_generation(inference_cluster, master_config, **kwargs):
+            del inference_cluster, kwargs
+            generation_config = master_config.policy["generation"]
+            captured["load_format"] = generation_config["vllm_cfg"]["load_format"]
+            captured["enable_lora"] = generation_config["vllm_kwargs"].get(
+                "enable_lora"
+            )
+            return original_build
+
+        patched_factories["_build_generation"].side_effect = build_generation
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert captured == {"load_format": "auto", "enable_lora": True}
+        generation_config = mc.policy["generation"]
+        assert generation_config["vllm_cfg"]["load_format"] == "auto"
+        assert generation_config["vllm_kwargs"]["enable_lora"] is True
+        assert generation_config["vllm_kwargs"]["additional_config"][
+            "nemo_rl_native_lora"
+        ] == {"rank": 16, "alpha": 64}
+        patched_factories["_build_generation"].assert_called_once()
+        patched_factories["_build_trainer"].assert_called_once()
+
     def test_reward_penalties_are_typed(self):
         assert isinstance(_make_master_config().reward_penalties, RewardPenaltyConfig)
 
