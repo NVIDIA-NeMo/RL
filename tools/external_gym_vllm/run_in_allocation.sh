@@ -678,7 +678,11 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   fi
   exit "${vllm_status}"
 else
-  for _ in $(seq 1 120); do
+  # The head node publishes its IP after copying the pool's compile cache, which
+  # can take minutes on a large cache; wait longer then.
+  head_ip_wait_s=120
+  [[ -n "${POOL_CACHE_DIR:-}" ]] && head_ip_wait_s=900
+  for _ in $(seq 1 "${head_ip_wait_s}"); do
     [[ -s "${HEAD_IP_FILE}" ]] && break
     sleep 1
   done
