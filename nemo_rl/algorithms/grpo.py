@@ -47,7 +47,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, make_objective_reduction
 from nemo_rl.algorithms.metric_utils import (
     GRAD_NORM_KEY,
     LOSS_KEY,
@@ -763,6 +763,13 @@ def setup(
         raise ValueError(
             "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
         )
+    megatron_cfg = policy_config.get("megatron_cfg")
+    make_objective_reduction(loss_config.resolved_normalization).validate_setup(
+        trainer="grpo",
+        algorithm="grpo",
+        megatron_enabled=megatron_cfg is not None and megatron_cfg["enabled"],
+        on_policy_distillation=opd_module.is_opd_enabled(master_config),
+    )
     env_configs = master_config.env
     data_config = master_config.data
     grpo_config = master_config.grpo

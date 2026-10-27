@@ -47,6 +47,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
@@ -1689,6 +1690,21 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         if is_ppo_run(master_config):
             raise ValueError("loss_fn.seq_logprob_error_in_loss requires GRPO")
         _validate_seq_logprob_error_in_loss(master_config)
+    megatron_cfg = master_config.policy.get("megatron_cfg")
+    loss_config = master_config.loss_fn
+    reduction = make_objective_reduction(loss_config.resolved_normalization)
+    reduction.validate_setup(
+        trainer="single_controller",
+        algorithm="ppo" if is_ppo_run(master_config) else "grpo",
+        megatron_enabled=megatron_cfg is not None and megatron_cfg["enabled"],
+        on_policy_distillation=opd_module.is_opd_enabled(master_config),
+    )
+    reduction.validate_loss_options(
+        sequence_level_importance_ratios=loss_config.sequence_level_importance_ratios,
+        opd_full=opd_module.get_opd_full_config(master_config) is not None,
+        positive_example_nll_weight=loss_config.positive_example_nll_weight,
+        seq_logprob_error_in_loss=loss_config.seq_logprob_error_in_loss,
+    )
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl
