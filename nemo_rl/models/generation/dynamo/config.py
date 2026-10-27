@@ -68,10 +68,10 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
         "device-aware-weighted",
     ] = "kv"
     # Idle TTL in seconds for keeping one session on one engine, or None to
-    # disable it. NeMo-Gym names the session on token-capture calls only (its
-    # rollout id), as the native backend pins each Gym session to one server; the
-    # engine splices a call's staged prefix after routing, so the KV router alone
-    # cannot see where that prefix is cached.
+    # disable it. NeMo-Gym names the session on every call (its rollout id, else
+    # its own session), as the native backend pins each Gym session to one
+    # server; the engine splices a call's echoed or staged prefix after routing,
+    # so the KV router alone cannot see where that prefix is cached.
     session_affinity_ttl_secs: PositiveInt | None = 1800
     extra_cli_args: list[str] = Field(default_factory=list)
 

@@ -617,27 +617,17 @@ def test_setup_nemo_gym_config_vllm_speaks_dynamo_dialect_only_with_dynamo(
 
 
 @pytest.mark.parametrize(
-    ("vllm_model", "expected"),
+    "vllm_model",
     [
-        ({}, {"enable_thinking": True, "truncate_history_thinking": False}),
-        (
-            {"chat_template_kwargs": {"enable_thinking": False}},
-            {"enable_thinking": False, "truncate_history_thinking": False},
-        ),
-        (
-            {"extra_body": {"chat_template_kwargs": {"force_nonempty_content": True}}},
-            {
-                "enable_thinking": True,
-                "truncate_history_thinking": False,
-                "force_nonempty_content": True,
-            },
-        ),
+        {},
+        {"chat_template_kwargs": {"enable_thinking": False}},
+        {"extra_body": {"chat_template_kwargs": {"force_nonempty_content": True}}},
     ],
 )
 def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
-    vllm_model: dict, expected: dict
+    vllm_model: dict,
 ) -> None:
-    """The native server's default template kwargs sit under the ones Gym sends."""
+    """The native server's default template kwargs go under every kwargs Gym has."""
     from nemo_rl.algorithms.grpo import MasterConfig
     from nemo_rl.environments.nemo_gym import (
         build_nemo_gym_config,
@@ -684,7 +674,14 @@ def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
     assert composed["dynamo_frontend"] is True
     # The frontend refuses reasoning under both of Gym's keys.
     assert composed["reasoning_field"] == "reasoning_content"
-    assert composed["chat_template_kwargs"] == expected
+    assert composed["default_chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "truncate_history_thinking": False,
+    }
+    # Gym applies the defaults under its own kwargs, which stay as written; its
+    # config merge would let a value written into them override a Gym YAML's.
+    for key in ("chat_template_kwargs", "extra_body"):
+        assert composed.get(key) == vllm_model.get(key)
     assert "dynamo_dialect" not in gym_config
     # The user's overlay is left as written.
     assert vllm_model == user_vllm_model

@@ -55,7 +55,7 @@ shows them all:
 | `worker_args.tool_call_parser`, `reasoning_parser` | null | Dynamo's built-in parser names. null follows the native server's settings; see [NeMo-Gym](#nemo-gym) |
 | `worker_args.custom_jinja_template` | null | A chat template that replaces the model's own. null follows the native server's |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
-| `frontend_args.session_affinity_ttl_secs` | 1800 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it |
+| `frontend_args.session_affinity_ttl_secs` | 1800 | Keeps a NeMo-Gym rollout on one engine while it is idle for up to this many seconds; null disables it |
 | `frontend_args.tokenizer`, `tokenizer_cache*` | `default`, off | Frontend tokenizer |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags |
 
@@ -114,9 +114,12 @@ chat endpoint does:
 With `token_capture.enabled`, Gym uses its `dynamo_worker` capture backend. The
 same vLLM workers stage each call's tokens, log probabilities, routed experts and
 processed media from their own process, exactly as the native endpoint does, and
-only the commit coordinates travel back through the frontend. The frontend keeps a rollout on
-one engine (`session_affinity_ttl_secs`), as the native backend pins each Gym
-session to one server.
+only the commit coordinates travel back through the frontend.
+
+Gym names each call's rollout, and the frontend keeps a rollout on one engine
+(`session_affinity_ttl_secs`), as the native backend pins each Gym session to
+one server. The engine splices the echoed prefix after the frontend has routed
+the call, so the KV router alone cannot see where that prefix is cached.
 
 The native server's chat settings carry over:
 
@@ -125,7 +128,7 @@ The native server's chat settings carry over:
 | `http_server_serving_chat_kwargs.tool_parser`, `reasoning_parser` | The frontend's parsers, under Dynamo's names: NeMo RL's `nano_v3` plugin is `nemotron_v3`, vLLM's `openai` tool parser is `harmony` |
 | `tool_parser_plugin`, `reasoning_parser_plugin` | Python plugins cannot run in the Rust frontend. A parser name the plugin provides fails engine registration, which asks for `dynamo_cfg.worker_args` to name a Dynamo parser, unless the name has a rename above. A vLLM built-in selected beside a plugin carries over |
 | `http_server_serving_chat_kwargs.chat_template` | The frontend's template, as a file, a vLLM template name or literal Jinja |
-| `http_server_serving_chat_kwargs.default_chat_template_kwargs` | Sent by Gym under its own `chat_template_kwargs` |
+| `http_server_serving_chat_kwargs.default_chat_template_kwargs` | Gym's `vllm_model.default_chat_template_kwargs`, which Gym applies under every other source of template kwargs, as the native server applies them under the request's |
 | `http_server_serving_chat_kwargs.chat_template_content_format` | The frontend detects the format itself: string content stays a string, and content arrays go to the template. For text, and for one media item per message, that renders what vLLM's `auto`, `string` and `openai` render. `string` needs `vllm_kwargs.limit_mm_per_prompt` to allow at most one item of each modality, because with several, vLLM puts their placeholders first while the template places them |
 | `http_server_serving_chat_kwargs.enable_auto_tools` | The frontend always parses `tool_choice: auto` calls, so only `true` is accepted |
 

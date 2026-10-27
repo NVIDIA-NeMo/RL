@@ -1067,12 +1067,17 @@ def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
             use_fastokens=False,
         )
 
-    thinking = [
-        cfg["initial_global_config_dict"]["policy_model"]["responses_api_models"][
-            "vllm_model"
-        ]["chat_template_kwargs"]["enable_thinking"]
-        for cfg in cluster.actor_configs
-    ]
+    thinking = []
+    for cfg in cluster.actor_configs:
+        vllm_model = cfg["initial_global_config_dict"]["policy_model"][
+            "responses_api_models"
+        ]["vllm_model"]
+        # Gym applies default_chat_template_kwargs under its own kwargs.
+        kwargs = {
+            **vllm_model["default_chat_template_kwargs"],
+            **(vllm_model.get("chat_template_kwargs") or {}),
+        }
+        thinking.append(kwargs["enable_thinking"])
     # judged, then the tools shard's two replicas with their own override.
     assert thinking == ([True, False, False] if sharded else [True])
     for cfg in cluster.actor_configs:

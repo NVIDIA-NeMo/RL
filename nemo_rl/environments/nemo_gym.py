@@ -2145,15 +2145,12 @@ def _apply_dynamo_dialect(
     # refuses an echoed assistant turn that carries both, Gym's default.
     vllm_model.setdefault("reasoning_field", "reasoning_content")
     # The native server merges these under every request's own template
-    # kwargs; the frontend has no such default, so Gym sends them. They sit
-    # under the kwargs Gym sends: vllm_model's own, else extra_body's.
+    # kwargs; the frontend has no such default, so Gym applies them, under
+    # every source of kwargs it has (its YAMLs, extra_body, the request's own).
     if default_chat_template_kwargs:
-        gym_kwargs = vllm_model.get("chat_template_kwargs") or (
-            (vllm_model.get("extra_body") or {}).get("chat_template_kwargs") or {}
-        )
-        vllm_model["chat_template_kwargs"] = {
+        vllm_model["default_chat_template_kwargs"] = {
             **default_chat_template_kwargs,
-            **gym_kwargs,
+            **(vllm_model.get("default_chat_template_kwargs") or {}),
         }
     models["vllm_model"] = vllm_model
     policy_model["responses_api_models"] = models
