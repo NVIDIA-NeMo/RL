@@ -1477,7 +1477,7 @@ async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnec
     assert id(request) not in worker._capture_calls
 
 
-def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
+def test_nano_v3_reasoning_parser_swaps_reasoning_when_content_is_required(
     monkeypatch,
 ):
     registered_reasoning_parsers = {}
@@ -1551,6 +1551,21 @@ def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
     )
 
     request.chat_template_kwargs["enable_thinking"] = False
+    assert parser.extract_reasoning(("reasoning", "final"), request) == (
+        "reasoning",
+        "final",
+    )
+
+    # force_nonempty_content returns a reasoning-only turn as content, as
+    # Dynamo's frontend does, and leaves a turn that has content alone.
+    request.chat_template_kwargs = {
+        "enable_thinking": True,
+        "force_nonempty_content": True,
+    }
+    assert parser.extract_reasoning(("reasoning", None), request) == (
+        None,
+        "reasoning",
+    )
     assert parser.extract_reasoning(("reasoning", "final"), request) == (
         "reasoning",
         "final",

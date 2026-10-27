@@ -369,6 +369,22 @@ def off_policy_sampling_error(
     )
 
 
+def import_parser_plugins(vllm_cfg: Mapping[str, Any]) -> None:
+    """Import ``vllm_cfg``'s tool and reasoning parser plugins into vLLM's registries.
+
+    The native OpenAI server resolves its parser names against them, and Dynamo
+    registration checks which names a plugin provides.
+    """
+    # vLLM is installed only in the generation workers' venv.
+    from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+    from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
+
+    if tool_parser_plugin := vllm_cfg.get("tool_parser_plugin"):
+        ToolParserManager.import_tool_parser(tool_parser_plugin)
+    if reasoning_parser_plugin := vllm_cfg.get("reasoning_parser_plugin"):
+        ReasoningParserManager.import_reasoning_parser(reasoning_parser_plugin)
+
+
 def validate_rollout_prompt(expected: list[int], actual: list[int] | None) -> None:
     """Reject rollouts generated from a different prompt than the learner's."""
     if actual != expected:

@@ -22,6 +22,7 @@ import base64
 import io
 import json
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -479,14 +480,28 @@ def test_every_worker_arg_reaches_the_dynamo_worker_config(
         assert getattr(config, key) == worker_args[key], key
 
 
-def test_the_native_servers_chat_settings_reach_the_frontend(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("reasoning_parser", "dynamo_reasoning_parser"),
+    [
+        # The plugin's own parser, which Dynamo ships as nemotron_v3.
+        ("nano_v3", "nemotron_v3"),
+        # A vLLM built-in that Dynamo also ships, beside an inherited plugin.
+        ("deepseek_r1", "deepseek_r1"),
+    ],
+)
+def test_the_native_servers_chat_settings_reach_the_frontend(
+    monkeypatch, reasoning_parser, dynamo_reasoning_parser
+) -> None:
     host = _host(_FakeLLM())
     host.cfg["vllm_cfg"] = {
         "max_model_len": MAX_MODEL_LEN,
-        "reasoning_parser_plugin": "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py",
+        "reasoning_parser_plugin": str(
+            Path(native_engine.__file__).parents[1]
+            / "vllm/reasoning_parsers/nano_v3_reasoning_parser.py"
+        ),
         "http_server_serving_chat_kwargs": {
             "tool_parser": "qwen3_coder",
-            "reasoning_parser": "nano_v3",
+            "reasoning_parser": reasoning_parser,
             # Literal Jinja, which the native server also accepts.
             "chat_template": "{{ messages }}\n",
         },
@@ -496,18 +511,45 @@ def test_the_native_servers_chat_settings_reach_the_frontend(monkeypatch) -> Non
 
     assert (config.tool_call_parser, config.reasoning_parser) == (
         "qwen3_coder",
-        "nemotron_v3",
+        dynamo_reasoning_parser,
     )
     with open(config.custom_jinja_template) as template_file:
         assert template_file.read() == "{{ messages }}\n"
 
 
-def test_a_parser_dynamo_lacks_fails_registration(monkeypatch) -> None:
-    host = _host(
-        _FakeLLM(), dynamo_cfg={"worker_args": {"tool_call_parser": "no_such_parser"}}
-    )
+_PLUGIN_PARSER = """
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 
-    with pytest.raises(ValueError, match="no tool call parser named 'no_such_parser'"):
+
+@ReasoningParserManager.register_module("nemo_rl_test_plugin_parser")
+class PluginParser(DeepSeekR1ReasoningParser):
+    pass
+"""
+
+
+@pytest.mark.parametrize("cause", ["unknown_name", "plugin_parser"])
+def test_a_parser_dynamo_lacks_fails_registration(monkeypatch, tmp_path, cause) -> None:
+    if cause == "unknown_name":
+        host = _host(
+            _FakeLLM(),
+            dynamo_cfg={"worker_args": {"tool_call_parser": "no_such_parser"}},
+        )
+        error = "no tool call parser named 'no_such_parser'"
+    else:
+        plugin = tmp_path / "nemo_rl_test_plugin.py"
+        plugin.write_text(_PLUGIN_PARSER)
+        host = _host(_FakeLLM())
+        host.cfg["vllm_cfg"] = {
+            "max_model_len": MAX_MODEL_LEN,
+            "reasoning_parser_plugin": str(plugin),
+            "http_server_serving_chat_kwargs": {
+                "reasoning_parser": "nemo_rl_test_plugin_parser"
+            },
+        }
+        error = "comes from vllm_cfg.reasoning_parser_plugin"
+
+    with pytest.raises(ValueError, match=error):
         _start_worker_config(monkeypatch, host)
 
 

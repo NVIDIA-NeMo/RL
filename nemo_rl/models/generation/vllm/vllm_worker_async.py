@@ -74,6 +74,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
+    import_parser_plugins,
     off_policy_sampling_error,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
@@ -1069,21 +1070,9 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.serve.utils.api_utils import with_cancellation
         from vllm.renderers.online_renderer import OnlineRenderer
         from vllm.exceptions import VLLMValidationError
-        from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
-        from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
-        maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
-        if maybe_tool_parser_plugin:
-            ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
-
-        maybe_reasoning_parser_plugin = self.cfg["vllm_cfg"].get(
-            "reasoning_parser_plugin"
-        )
-        if maybe_reasoning_parser_plugin:
-            ReasoningParserManager.import_reasoning_parser(
-                maybe_reasoning_parser_plugin
-            )
+        import_parser_plugins(self.cfg["vllm_cfg"])
 
         engine_client = self._http_engine_client
         if engine_client is None:

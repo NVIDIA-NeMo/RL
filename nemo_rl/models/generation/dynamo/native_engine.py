@@ -30,7 +30,7 @@ import logging
 import os
 import tempfile
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
@@ -57,11 +57,13 @@ from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.exceptions import GracefulHTTPError, VLLMClientError
 from vllm.inputs import TokensPrompt
 from vllm.multimodal.media import MEDIA_CONNECTOR_REGISTRY
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
 from vllm.sampling_params import (
     RequestOutputKind,
     SamplingParams,
     StructuredOutputsParams,
 )
+from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 from vllm.transformers_utils.processor import get_video_processor_cls_name
 from vllm.v1.kv_cache_interface import KVCacheSpecKind
 from vllm.v1.metrics.loggers import StatLoggerBase
@@ -72,6 +74,7 @@ from nemo_rl.models.generation.dynamo.config import (
     dynamo_cfg,
     dynamo_chat_template,
     dynamo_parsers,
+    plugin_parser_names,
 )
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     DYNAMO_COMPONENT,
@@ -90,6 +93,7 @@ from nemo_rl.models.generation.vllm.request_pipeline import (
 from nemo_rl.models.generation.vllm.utils import (
     chat_generation_tokens,
     chat_routed_experts,
+    import_parser_plugins,
     off_policy_sampling_error,
     remap_multimodal_placeholders,
     validate_rollout_prompt,
@@ -875,6 +879,41 @@ def _check_parser_name(name: Optional[str], known: list[str], field: str) -> Non
         )
 
 
+def _check_plugin_parsers(generation_config: Mapping[str, Any]) -> None:
+    """Refuse a native parser name that a vLLM parser plugin provides.
+
+    A plugin is Python that runs in vLLM's OpenAI server, so Dynamo's Rust
+    frontend cannot run its parsers. A plugin is often loaded alongside a vLLM
+    built-in that Dynamo also ships (a recipe inherits the plugin and selects
+    another parser); that name carries over.
+    """
+    import_parser_plugins(generation_config["vllm_cfg"])
+    # Each kind's registered classes and lazily registered (module, class) pairs.
+    registries: dict[str, tuple[Mapping[str, type], Mapping[str, tuple[str, str]]]] = {
+        "tool": (ToolParserManager.tool_parsers, ToolParserManager.lazy_parsers),
+        "reasoning": (
+            ReasoningParserManager.reasoning_parsers,
+            ReasoningParserManager.lazy_parsers,
+        ),
+    }
+    for kind, name, plugin, worker_arg in plugin_parser_names(generation_config):
+        classes, lazy = registries[kind]
+        # Resolved in the order vLLM's get_*_parser resolves it.
+        if name in classes:
+            module = classes[name].__module__
+        else:
+            module = lazy[name][0] if name in lazy else None
+        # vLLM imports a plugin as a module named after its file.
+        if module == os.path.splitext(os.path.basename(plugin))[0]:
+            raise ValueError(
+                "policy.generation.vllm_cfg.http_server_serving_chat_kwargs."
+                f"{kind}_parser={name!r} comes from vllm_cfg.{kind}_parser_plugin, "
+                "a Python parser for vLLM's OpenAI server that Dynamo's Rust "
+                "frontend cannot run. Set policy.generation.dynamo_cfg.worker_args."
+                f"{worker_arg} to the Dynamo built-in parser for {name!r}."
+            )
+
+
 def _chat_template_file(chat_template: Optional[str]) -> Optional[str]:
     """A file holding ``chat_template``, which Dynamo reads by path.
 
@@ -917,6 +956,7 @@ def start_dynamo_endpoint(
     # The Dynamo functional overlays check the router applied these.
     print(f"  [Dynamo] engine publishes KV events: {publishes}", flush=True)
     worker_args = dynamo_cfg(host.cfg).worker_args
+    _check_plugin_parsers(host.cfg)
     tool_call_parser, reasoning_parser = dynamo_parsers(host.cfg)
     _check_parser_name(tool_call_parser, get_tool_parser_names(), "tool_call_parser")
     _check_parser_name(

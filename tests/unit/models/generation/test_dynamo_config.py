@@ -26,6 +26,7 @@ from nemo_rl.models.generation.dynamo.config import (
     dynamo_chat_template,
     dynamo_parsers,
     native_default_chat_template_kwargs,
+    plugin_parser_names,
 )
 
 
@@ -167,19 +168,21 @@ def test_parsers_follow_the_native_server_under_dynamos_names() -> None:
     nano_v3 = _serving(reasoning_parser="nano_v3")
     nano_v3["vllm_cfg"]["reasoning_parser_plugin"] = "nano_v3_reasoning_parser.py"
     assert dynamo_parsers(nano_v3) == (None, "nemotron_v3")
+    assert plugin_parser_names(nano_v3) == []
     assert dynamo_parsers(_serving(tool_parser="openai")) == ("harmony", None)
     # dynamo_cfg names them explicitly.
     explicit = _serving(tool_parser="hermes")
     explicit["dynamo_cfg"] = {"worker_args": {"tool_call_parser": "qwen3_coder"}}
     assert dynamo_parsers(explicit) == ("qwen3_coder", None)
-
-
-def test_a_parser_plugin_without_a_dynamo_parser_is_rejected_at_startup() -> None:
-    config = _serving(tool_parser="my_parser")
-    config["vllm_cfg"]["tool_parser_plugin"] = "my_parser.py"
-
-    with pytest.raises(ValueError, match="worker_args.tool_call_parser"):
-        configure_generation_config(config, _Tokenizer())
+    # A plugin loaded beside a name it may not provide: startup passes the name
+    # on, and the engine, which has vLLM, checks it at registration.
+    plugin = _serving(tool_parser="my_parser")
+    plugin["vllm_cfg"]["tool_parser_plugin"] = "my_parser.py"
+    configure_generation_config(plugin, _Tokenizer())
+    assert dynamo_parsers(plugin) == ("my_parser", None)
+    assert plugin_parser_names(plugin) == [
+        ("tool", "my_parser", "my_parser.py", "tool_call_parser")
+    ]
 
 
 def test_chat_template_and_default_kwargs_follow_the_native_server() -> None:
@@ -196,22 +199,47 @@ def test_chat_template_and_default_kwargs_follow_the_native_server() -> None:
 
 
 @pytest.mark.parametrize(
-    ("serving_chat_kwargs", "error"),
+    ("serving_chat_kwargs", "media_limits", "error"),
     [
-        ({"chat_template_content_format": "string"}, "no content-format setting"),
-        ({"enable_auto_tools": False}, "always parses"),
+        # vLLM allows 999 items of a modality the limits leave out.
+        ({"chat_template_content_format": "string"}, None, "at most one item"),
+        (
+            {"chat_template_content_format": "string"},
+            {"image": 32, "video": {"count": 1, "num_frames": 32}},
+            "at most one item",
+        ),
+        ({"enable_auto_tools": False}, None, "always parses"),
+        (
+            {
+                "reasoning_parser": "deepseek_r1",
+                "default_chat_template_kwargs": {"enable_thinking": False},
+            },
+            None,
+            "returns it as content natively",
+        ),
     ],
 )
-def test_chat_settings_the_frontend_has_no_counterpart_for_are_rejected(
-    serving_chat_kwargs, error
+def test_chat_settings_the_frontend_would_not_reproduce_are_rejected(
+    serving_chat_kwargs, media_limits, error
 ) -> None:
+    config = _serving(**serving_chat_kwargs)
+    config["vllm_kwargs"] = {"limit_mm_per_prompt": media_limits}
     with pytest.raises(ValueError, match=error):
-        configure_generation_config(_serving(**serving_chat_kwargs), _Tokenizer())
-    # The native defaults are what the frontend does anyway.
-    configure_generation_config(
-        _serving(chat_template_content_format="auto", enable_auto_tools=True),
-        _Tokenizer(),
+        configure_generation_config(config, _Tokenizer())
+    # Settings the frontend renders and parses as the native server does.
+    for content_format in ("auto", "openai"):
+        configure_generation_config(
+            _serving(chat_template_content_format=content_format), _Tokenizer()
+        )
+    one_item_each = _serving(
+        chat_template_content_format="string",
+        enable_auto_tools=True,
+        reasoning_parser="deepseek_r1",
     )
+    one_item_each["vllm_kwargs"] = {
+        "limit_mm_per_prompt": {"image": 1, "video": {"count": 1, "num_frames": 32}}
+    }
+    configure_generation_config(one_item_each, _Tokenizer())
 
 
 def test_a_bearer_token_is_rejected_because_the_frontend_checks_none() -> None:

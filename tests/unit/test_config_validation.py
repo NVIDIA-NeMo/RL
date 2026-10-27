@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import ast
+import copy
 import glob
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Type
 
 import pytest
@@ -35,10 +37,19 @@ from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
+from nemo_rl.algorithms.single_controller_utils import (
+    MasterConfig as SingleControllerMasterConfig,
+)
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig as XTokenOffPolicyDistillationMasterConfig,
 )
+from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
+from nemo_rl.models.generation import (
+    configure_generation_config,
+    resolve_generation_class,
+)
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.utils.config import (
     load_config_with_inheritance,
     register_omegaconf_resolvers,
@@ -380,6 +391,105 @@ def test_no_shipped_config_is_outdated(config_file):
         check_outdated_config(config_dict)
     except ValueError as e:
         raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
+
+
+# Refusals that `dynamo: true` adds at startup where native SingleController
+# generation fails later, at runtime: data parallelism inside the async vLLM engine
+# (#1101) and native LoRA refit on it. Plus one documented gap: several media items
+# per message with the 'string' content format, until Dynamo has a content-format
+# option.
+_KNOWN_DYNAMO_REFUSALS = (
+    "does not run data parallelism inside vLLM",
+    "Native LoRA refit does not yet support vllm_cfg.async_engine=true",
+    "allow at most one item of each modality",
+)
+
+
+@pytest.fixture(scope="module")
+def single_controller_exemplar() -> dict[str, Any]:
+    config = load_config_with_inheritance(
+        str(configs_dir / "grpo_math_1B_megatron_single_controller.yaml")
+    )
+    return OmegaConf.to_container(config, resolve=True)
+
+
+def _single_controller_form(
+    config: dict[str, Any], exemplar: dict[str, Any]
+) -> dict[str, Any]:
+    """A recipe as a user runs it on the SingleController.
+
+    The data plane is on, the legacy async block is off and generation is
+    non-colocated; a recipe with no data_plane or async_rl block takes the SC
+    exemplar's.
+    """
+    config = copy.deepcopy(config)
+    for block in ("data_plane", "async_rl"):
+        if not config.get(block):
+            config[block] = copy.deepcopy(exemplar[block])
+    config["data_plane"]["enabled"] = True
+    for algo, legacy_async in (("grpo", "async_grpo"), ("ppo", "async_ppo")):
+        if isinstance(config.get(algo), dict) and legacy_async in config[algo]:
+            config[algo][legacy_async] = None
+    config["policy"]["generation"].setdefault("colocated", {})["enabled"] = False
+    return config
+
+
+def _single_controller_startup_checks(config: dict[str, Any]) -> None:
+    """The config checks run_grpo_single_controller.py runs before any GPU work.
+
+    validate_single_controller_config is left out: it checks SC tuning (batch
+    sizes, streaming), which most legacy recipes do not set, and never reads
+    `dynamo`.
+    """
+    check_outdated_config(config)
+    master_config = SingleControllerMasterConfig(**config)
+    policy = master_config.policy
+    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=1)
+    policy["generation"] = configure_generation_config(
+        policy["generation"],
+        tokenizer,
+        trains_mtp=bool((policy.get("megatron_cfg") or {}).get("mtp_num_layers")),
+    )
+    if master_config.env.get("should_use_nemo_gym"):
+        setup_nemo_gym_config(master_config, tokenizer)
+    configure_lora_refit(policy)
+    resolve_generation_class(policy["generation"]).validate_settings(master_config)
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_vllm_recipes_start_with_dynamo_where_they_start_natively(
+    config_file, single_controller_exemplar, monkeypatch
+):
+    """`policy.generation.dynamo: true` adds no startup refusal to a vLLM recipe.
+
+    Each recipe is checked in its SingleController form. A recipe the native
+    SingleController refuses is not Dynamo's to fix, nor is a refusal in
+    _KNOWN_DYNAMO_REFUSALS.
+    """
+    if "/evals/" in config_file:
+        pytest.skip("eval configs have a different structure from training configs")
+    for variable in ("HF_HOME", "PERSISTENT_CACHE"):
+        monkeypatch.setenv(variable, os.environ.get(variable, "/unset"))
+    recipe = OmegaConf.to_container(
+        load_config_with_inheritance(config_file), resolve=True
+    )
+    generation = (recipe.get("policy") or {}).get("generation")
+    if not isinstance(generation, dict) or generation.get("backend") != "vllm":
+        pytest.skip("not a vLLM generation recipe")
+
+    config = _single_controller_form(recipe, single_controller_exemplar)
+    try:
+        _single_controller_startup_checks(copy.deepcopy(config))
+    except (ValueError, NotImplementedError, AssertionError) as e:
+        pytest.skip(f"the native SingleController refuses it too: {e}")
+    config["policy"]["generation"]["dynamo"] = True
+    try:
+        _single_controller_startup_checks(config)
+    except ValueError as e:
+        if not any(known in str(e) for known in _KNOWN_DYNAMO_REFUSALS):
+            raise AssertionError(
+                f"{config_file} starts natively but not with dynamo: true: {e}"
+            ) from e
 
 
 # Keep only the regressions tracked in #4427 on DeepEP until they pass validation.
