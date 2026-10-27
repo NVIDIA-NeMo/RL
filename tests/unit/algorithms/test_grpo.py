@@ -14,6 +14,7 @@
 
 import math
 import os
+import warnings
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -4580,6 +4581,8 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
     from nemo_rl.algorithms import grpo as grpo_mod
 
     class DummyLogger:
+        base_log_dir = "/tmp/grpo-test-results"
+
         def log_hyperparams(self, *_args, **_kwargs):
             pass
 
@@ -4728,11 +4731,16 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
     assert master_config.grpo.skip_reference_policy_logprobs_calculation is True
 
 
-def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
+@pytest.mark.parametrize("configured_gym_log_dir", [None, "logs/nemo_gym"])
+def test_setup_starts_nemo_gym_for_trtllm(
+    monkeypatch, mock_grpo_components, configured_gym_log_dir
+):
     """Guard the TRT-LLM NeMo-Gym startup path in shared GRPO setup."""
     from nemo_rl.algorithms import grpo as grpo_mod
 
     class DummyLogger:
+        base_log_dir = "/tmp/grpo-test-results"
+
         def log_hyperparams(self, *_args, **_kwargs):
             pass
 
@@ -4831,6 +4839,8 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         },
     }
     master_config.env = {"should_use_nemo_gym": True}
+    if configured_gym_log_dir is not None:
+        master_config.env["nemo_gym"] = {"nemo_gym_log_dir": configured_gym_log_dir}
     master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
     master_config.grpo.val_period = 0
     master_config.grpo.batch_multiplier = 1
@@ -4841,9 +4851,26 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     dataset = MagicMock()
     dataset.__len__ = MagicMock(return_value=1)
     tokenizer = MagicMock()
-    result = grpo_mod.setup(master_config, tokenizer, dataset, None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = grpo_mod.setup(master_config, tokenizer, dataset, None)
 
     assert result[2] is nemo_gym_shard_set
+    assert master_config.env["nemo_gym"]["nemo_gym_log_dir"] == (
+        "/tmp/grpo-test-results/nemo_gym"
+    )
+    log_dir_warnings = [
+        str(warning.message)
+        for warning in caught
+        if "nemo_gym_log_dir" in str(warning.message)
+    ]
+    if configured_gym_log_dir is None:
+        assert log_dir_warnings == []
+    else:
+        # A configured log dir is still replaced, but no longer silently.
+        assert len(log_dir_warnings) == 1
+        assert "'logs/nemo_gym'" in log_dir_warnings[0]
+        assert "'/tmp/grpo-test-results/nemo_gym'" in log_dir_warnings[0]
     build_nemo_gym_actors.assert_called_once_with(
         master_config.env,
         base_urls=["http://trtllm.example/v1"],

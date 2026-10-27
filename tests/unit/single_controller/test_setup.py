@@ -1144,6 +1144,39 @@ class TestSetup:
 
         assert actor_args.finalizer_actors == fake_finalizers
 
+    def test_nemo_gym_log_dir_is_set_before_gym_build(
+        self, patched_factories, tmp_path
+    ):
+        """Gym's server logs go under this run's log dir, set before Gym is built."""
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        mc.logger.log_dir = str(tmp_path / "exp_001")
+        mc.env["nemo_gym"] = {"nemo_gym_log_dir": "logs/nemo_gym"}
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        gym_log_dirs_at_build = []
+
+        def record_gym_log_dir(env_configs, **_kwargs):
+            gym_log_dirs_at_build.append(env_configs["nemo_gym"]["nemo_gym_log_dir"])
+            return MagicMock(name="nemo_gym_shards")
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", side_effect=record_gym_log_dir
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            pytest.warns(UserWarning, match="nemo_gym_log_dir='logs/nemo_gym'"),
+        ):
+            tokenizer = MagicMock(pad_token_id=0)
+            processor = MagicMock(tokenizer=tokenizer)
+            setup_single_controller(mc, tokenizer, processor=processor)
+
+        assert gym_log_dirs_at_build == [str(tmp_path / "exp_001" / "nemo_gym")]
+
     def test_disabled_periodic_checkpointing_ignores_existing_snapshots(
         self,
         tmp_path: Path,
