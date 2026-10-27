@@ -181,10 +181,9 @@ def configure_generation_config(
 
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
-        # VLM training can require real startup weights for modules that are
-        # frozen and therefore never refitted (for example, the vision tower).
-        # Preserve an explicit recipe override while retaining the lightweight
-        # dummy default for ordinary training.
+        # Respect explicit checkpoint-loading overrides. Dummy loading relies
+        # on startup refit to initialize all generator weights, including frozen
+        # vision parameters; freezing alone does not exclude them from refit.
         config["vllm_cfg"].setdefault("load_format", "auto" if is_eval else "dummy")
         if dynamo_enabled(config):
             # Validate before any Ray allocation; dynamo_parsers also rejects

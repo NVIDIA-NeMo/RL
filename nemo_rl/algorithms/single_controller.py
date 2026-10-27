@@ -3863,6 +3863,10 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
+            # min sample version refers to the version each consumed sample was
+            # generated with; lag = training version - oldest sample version.
+            lag = version_during_step - min_sample_version  # type: ignore
+            step_metrics["weight_version_lag"] = lag
             # TODO: vllm metrics logger,
             #   histogram log, pretty-print "Training Results" block,
             #   print_performance_metrics.
@@ -3889,9 +3893,6 @@ class SingleControllerActor:
             )
             self._timer.reset()
 
-            # min sample version refers to the version each consumed sample was
-            # generated with; lag = training version - oldest sample version.
-            lag = version_during_step - min_sample_version  # type: ignore
             print(
                 f"train step {self._train_steps}/{self._algo_cfg.max_num_steps}  "
                 f"trainer_v={self._trainer_version}  "

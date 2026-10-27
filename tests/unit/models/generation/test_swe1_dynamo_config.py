@@ -41,7 +41,10 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
     configured_generation = configure_generation_config(generation, tokenizer)
     config["policy"]["generation"] = configured_generation
     setup_nemo_gym_config(
-        SimpleNamespace(policy=config["policy"], env=config["env"]), tokenizer
+        SimpleNamespace(
+            policy=config["policy"], env=config["env"], data=config["data"]
+        ),
+        tokenizer,
     )
     vllm_cfg = configured_generation["vllm_cfg"]
     assert configured_generation["backend"] == "vllm"

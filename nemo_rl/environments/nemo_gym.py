@@ -2008,6 +2008,20 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
+    # Validate before starting any workers. Capture preserves the generated
+    # media tensors but does not make the dynamic tiler honor this option.
+    for section in ("default", "train", "validation"):
+        datasets = config.data.get(section)
+        if datasets is None:
+            continue
+        for dataset in datasets if isinstance(datasets, list) else [datasets]:
+            if dataset.get("image_max_num_tiles") is not None:
+                raise ValueError(
+                    f"data.{section}.image_max_num_tiles is not supported by "
+                    "NeMo Gym, with or without token capture. Remove this "
+                    "setting; per-dataset image tile caps are not implemented."
+                )
+
     generation_config = config.policy["generation"]
 
     # Enable the backend's OpenAI-compatible server.

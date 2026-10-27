@@ -560,6 +560,7 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
 
     config = MasterConfig.model_construct(
         env={"should_use_nemo_gym": True},
+        data={},
         policy={
             "generation": {
                 "backend": "megatron",
@@ -589,6 +590,7 @@ def test_setup_nemo_gym_config_vllm_speaks_dynamo_dialect_only_with_dynamo(
 
     config = MasterConfig.model_construct(
         env={"should_use_nemo_gym": True},
+        data={},
         policy={
             "generation": {
                 "backend": "vllm",
@@ -651,6 +653,7 @@ def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
                 "policy_model": {"responses_api_models": {"vllm_model": vllm_model}}
             },
         },
+        data={},
         policy={
             "generation": {
                 "backend": "vllm",
