@@ -3,22 +3,90 @@
 # and each training MoE forward runs the same kernel on the same quantization
 # (moe_inference_training_forward) with the backward from the TE recompute pass.
 #
-# Needs Megatron-LM PR #7798 on top of the zero-kl-mxfp8 parent's requirements, and
-# flashinfer-python>=0.7.0 (the per-token NVFP4 Relu2 MoE kernels).
-defaults: grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8-flashinfer.yaml
+# Needs Megatron-LM PR #7798 and flashinfer-python>=0.7.0 (the per-token NVFP4 Relu2
+# MoE kernels).
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  max_num_steps: 5
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
 checkpointing:
+  enabled: false
   checkpoint_dir: results/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
 policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  hf_config_overrides:
+    router_aux_loss_coef: 0
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: 4
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 128
+  automodel_cfg:
+    enabled: false
   megatron_cfg:
+    enabled: true
+    zero_train_gen_mismatch: true
+    batch_invariant_mode: true
+    batch_invariant_backend: te_native
+    batch_invariant_collective: ordered
+    attention_backend: flash
+    flash_attention_version: 4
+    moe_permute_fusion: false
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      CUBLASLT_WORKSPACE_SIZE: '0'
+      CUBLAS_WORKSPACE_CONFIG: :0:0
+      MAMBA_DETERMINISTIC: '1'
+      TRITON_CACHE_AUTOTUNING: '1'
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    defer_fp32_logits: true
+    use_fused_weighted_squared_relu: true
+    transformer_impl: inference_optimized
+    inference_grouped_gemm_backend: flashinfer
+    inference_moe_token_dispatcher_type: nvls
     inference_moe_nvfp4_recipe: per_token
-    te_precision_config_file: null
-    fp8_cfg:
-      enabled: false
+    moe_inference_training_forward: true
+    activation_checkpointing: true
+    recompute_granularity: selective
+    recompute_modules:
+      - moe
   generation:
+    backend: megatron
+    refit_transport: mcore
     mcore_generation_config:
-      fp8_cfg:
-        enabled: false
+      refit_backend: nccl
+      transformer_impl: inference_optimized
+      inference_grouped_gemm_backend: flashinfer
+      inference_moe_token_dispatcher_type: nvls
+      tensor_model_parallel_size: 2
+      expert_model_parallel_size: 4
+      sequence_parallel: true
+      moe_router_dtype: fp32
+      logprobs_mode: raw_logprobs
+      mamba_inference_ssm_states_dtype: float32
+      max_tokens: 256
+      max_requests: 32
+      enable_prefix_caching: false
+      moe_pad_experts_for_cuda_graph_inference: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: ${cluster.gpus_per_node}
+        num_nodes: 1
 logger:
   log_dir: logs/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+  wandb_enabled: true
+  tensorboard_enabled: true
   wandb:
+    project: nemo-rl
     name: grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2
