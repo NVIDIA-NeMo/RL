@@ -186,32 +186,11 @@ On resume, Single-Controller validates the TQ snapshot against the trainer check
 
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
 
-### Forest recovery
+[Forest-training runs](./context-compaction.md) recover the same way and need no extra settings.
 
-[Forest-training runs](./context-compaction.md) use these same checkpoint
-settings and defaults, including buffered replay, unfinished groups and periodic
-rollout snapshots. No separate forest save-data option or buffer drain is required.
+Restart does not resume a Gym tool call that was in progress, and it does not guarantee that external side effects happen exactly once. In token-capture runs, if Gym reports capture writes it could not confirm, the run stops instead of retrying, so no uncertain write is cleared or repeated.
 
-The recovery ledger saves the ordinary attempt receipt and RL's `RolloutSelection`,
-not a segment plan. On restart, the existing planner reconstructs unfinished
-groups from that evidence and captured tokens/media in TQ. Already-published
-training rows restore directly, including their logical-owner metadata and masked
-execution padding. Replay capacity and advantages count logical groups/owners,
-not physical segments.
-
-Recovery schema 4 is required for forest training. Earlier experimental CC
-snapshots are rejected; there is no migration. Ordinary schema-3 recovery
-remains readable, including its reward-validation settings and pending checks.
-The independent capture schema and its paired Gym/RL requirements are unchanged.
-
-Existing sibling/prompt-group policies apply to controller retries and cold
-restart. The default sibling policy preserves sealed siblings and regenerates
-only unfinished ones. This does not resume an in-progress Gym tool or guarantee
-exactly-once external side effects. A receipt reporting unresolved capture
-acknowledgements stops the run without retrying or clearing uncertain writes;
-other retries use a fresh attempt identity, never replay the old HTTP request.
-Megatron training resume loads policy RNG and preserves it across reference-model/wrapper initialization;
-fresh initialization is unchanged.
+Every Megatron training resume (all algorithms, not only forest training) loads the saved RNG when the parallel layout supports it, and preserves it through reference-model and wrapper setup. Changing `seed` before a resume no longer reseeds the restored Megatron RNG. Fresh runs and PEFT warm starts are unchanged.
 
 ### Periodic rollout snapshots
 

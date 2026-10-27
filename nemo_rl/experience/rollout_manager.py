@@ -1843,6 +1843,11 @@ class RolloutManager:
         self._consecutive_infra_drops: int = 0
 
     @property
+    def execution_row_multiple(self) -> int:
+        """Return the resolved row divisibility used to publish forest groups."""
+        return self._execution_row_multiple
+
+    @property
     def stats(self) -> RolloutStats:
         """Counters describing retry/skip activity so far."""
         return self._stats

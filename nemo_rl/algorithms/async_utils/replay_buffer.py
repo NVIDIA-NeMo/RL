@@ -144,8 +144,50 @@ class DataPlaneCheckpointMetadata(TypedDict):
     rollout_recovery_schema_version: NotRequired[int]
     rollout_recovery_payload_sha256: NotRequired[str]
     rollout_recovery_group_count: NotRequired[int]
+    forest_training: NotRequired[bool]
+    forest_execution_row_multiple: NotRequired[int | None]
     # opd_full only: checkpoint path per teacher_index.
     opd_full_teacher_checkpoints: NotRequired[list[str]]
+
+
+def validate_forest_checkpoint_metadata(
+    metadata: DataPlaneCheckpointMetadata,
+    *,
+    forest_training: bool,
+    execution_row_multiple: int | None,
+) -> None:
+    """Reject changes to the interpretation or padding of restored rollout rows."""
+    schema = metadata.get("rollout_recovery_schema_version")
+    if forest_training and schema == 3:
+        raise ValueError(
+            "forest_training needs rollout recovery schema >= 4; "
+            f"checkpoint has schema {schema}. Start a fresh run."
+        )
+    if "forest_training" not in metadata:
+        # Before schema 4, only ordinary recovery was supported.
+        if forest_training or (type(schema) is int and schema >= 4):
+            raise ValueError(
+                "Checkpoint is missing forest_training compatibility metadata; "
+                f"schema={schema!r}, current forest_training={forest_training}. "
+                "Start a fresh run."
+            )
+        return
+    saved_mode = metadata["forest_training"]
+    if type(saved_mode) is not bool or saved_mode != forest_training:
+        raise ValueError(
+            "Checkpoint forest_training mismatch: "
+            f"saved={saved_mode!r}, current={forest_training}"
+        )
+    saved_multiple = metadata.get("forest_execution_row_multiple")
+    if (
+        "forest_execution_row_multiple" not in metadata
+        or (forest_training and (type(saved_multiple) is not int or saved_multiple < 1))
+        or saved_multiple != execution_row_multiple
+    ):
+        raise ValueError(
+            "Checkpoint forest execution padding mismatch: "
+            f"saved={saved_multiple!r}, current={execution_row_multiple!r}"
+        )
 
 
 def _canonical_manifest_value(value: Any, *, path: str) -> Any:
@@ -1910,7 +1952,8 @@ class TQReplayBuffer:
                 )
                 if set(owners) != {group["group_id"]}:
                     raise ValueError(
-                        "Forest replay group_id disagrees with owner metadata"
+                        "Forest replay group_id disagrees with owner metadata: "
+                        f"group_id={group['group_id']!r}, owners={sorted(set(owners))}"
                     )
             for sid in meta.sample_ids:
                 if sid in seen_sample_ids:

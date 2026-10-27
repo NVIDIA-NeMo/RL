@@ -30,6 +30,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.experience import rollout_reassembler
 from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, RolloutSelection
 from nemo_rl.experience.rollout_recovery import (
     _ATTEMPT_STATE_FIELDS,
@@ -47,11 +48,28 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutSiblingRecord,
     SiblingSealResult,
+    _selection_from_state,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
 
 _T = TypeVar("_T")
+
+
+def test_selection_restore_preserves_new_defaulted_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection_type = dataclasses.make_dataclass(
+        "ExtendedSelection",
+        [("extra_state", int, dataclasses.field(default=0))],
+        bases=(RolloutSelection,),
+        frozen=True,
+    )
+    monkeypatch.setattr(rollout_reassembler, "RolloutSelection", selection_type)
+    selection = selection_type(
+        ("response0",), (ActionOutputFlags(False, False),), extra_state=7
+    )
+    assert _selection_from_state(dataclasses.asdict(selection)) == selection
 
 
 def _forest_sealed_ledger() -> RolloutRecoveryLedger:
