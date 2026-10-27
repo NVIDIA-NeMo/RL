@@ -357,6 +357,20 @@ class Fp4Config(BaseModel, extra="forbid"):
     fp4_param: bool = False
 
 
+def provider_override_allowed(megatron_cfg: Any, key: str) -> bool:
+    """Whether a megatron_cfg key may be applied onto the model provider.
+
+    Student configs carry no allowlist and every key applies (status quo).
+    Teacher configs allow only explicit teacher overrides plus ``mtp_num_layers``,
+    which defaults to zero because scoring does not use MTP outputs. Other
+    architecture settings come from the teacher checkpoint; inherited student
+    keys must not reach its provider (for example, VLM tower keys on a text
+    teacher).
+    """
+    allowlist = megatron_cfg.get("_provider_override_allowlist")
+    return allowlist is None or key in allowlist
+
+
 # Type exists to be lax if not specified
 class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]

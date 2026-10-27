@@ -32,6 +32,7 @@ import requests
 import swanlab
 import torch
 import wandb
+from hydra.utils import get_class
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
@@ -59,7 +60,6 @@ _rich_logging_configured = False
 # catch-all ``*`` definition is intentionally avoided because wandb-core does
 # not deterministically resolve overlapping glob definitions.
 WANDB_CALLER_STEP_METRIC = "nemo_rl/step"
-TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 
 
 class WandbConfig(BaseModel, extra="allow"):
@@ -108,6 +108,8 @@ class LoggerConfig(BaseModel, extra="allow"):
     monitor_gpus: bool = True
     gpu_monitoring: GPUMonitoringConfig = Field(default_factory=GPUMonitoringConfig)
     num_val_samples_to_print: int = 0
+    # LoggerInterface subclasses as "pkg.module.Class", constructed without arguments.
+    extra_backends: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _require_block_for_enabled_backends(self) -> "LoggerConfig":
@@ -1296,6 +1298,9 @@ class Logger(LoggerInterface):
                 os.makedirs(mlflow_log_dir, exist_ok=True)
             mlflow_logger = MLflowLogger(cfg.mlflow, log_dir=mlflow_log_dir)
             self.loggers.append(mlflow_logger)
+
+        for name in cfg.extra_backends:
+            self.loggers.append(get_class(name)())
 
         # Initialize GPU monitoring if requested
         self.gpu_monitor = None

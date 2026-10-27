@@ -1369,7 +1369,7 @@ def test_nemo_gym_stub_module():
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
     master_config = MasterConfig.model_construct(
-        policy={"generation": generation_config}
+        policy={"generation": generation_config}, data={}
     )
     setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 
