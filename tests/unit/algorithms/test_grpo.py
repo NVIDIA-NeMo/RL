@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import multiprocessing
 import os
 import warnings
 from concurrent.futures import Future
@@ -7509,6 +7510,33 @@ def test_reinforce_plus_plus_global_normalization():
 # ============================================================================
 
 
+def _single_sample_val_batch() -> BatchedDataDict[DatumSpec]:
+    return BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {"role": "user", "content": "q", "token_ids": torch.tensor([1, 2])},
+                    {
+                        "role": "assistant",
+                        "content": "a",
+                        "token_ids": torch.tensor([3]),
+                    },
+                ]
+            ],
+            "task_name": ["math"],
+            "extra_env_info": [{}],
+            "loss_multiplier": torch.tensor([1.0]),
+            "idx": torch.tensor([0]),
+            "length": torch.tensor([3]),
+            "total_reward": torch.tensor([1.0]),
+        }
+    )
+
+
+def _single_sample_val_collate(_items: list[int]) -> BatchedDataDict[DatumSpec]:
+    return _single_sample_val_batch()
+
+
 class TestValidateFunction:
     """Tests for the validate() function."""
 
@@ -7820,6 +7848,50 @@ class TestValidateFunction:
 
         with pytest.raises(AssertionError, match="only supported for vLLM NeMo-Gym"):
             setup(master_config, MagicMock(), MagicMock(), None)
+
+    def test_validate_stops_val_dataloader_workers_after_max_batches(
+        self, mock_grpo_components
+    ):
+        """A partial validation pass must not leave forked loader workers behind."""
+        val_batch = _single_sample_val_batch()
+        val_dataloader = StatefulDataLoader(
+            list(range(8)),
+            batch_size=1,
+            collate_fn=_single_sample_val_collate,
+            num_workers=1,
+        )
+        mock_env = MagicMock(spec=EnvironmentInterface)
+        mock_env.global_post_process_and_metrics.return_value = (val_batch, {})
+
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.max_val_samples = 2
+        mock_config.grpo.val_batch_size = 1
+        mock_config.logger.num_val_samples_to_print = 1
+
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                return_value=(val_batch, {"mean_gen_tokens_per_sample": 3.0}),
+            ) as mock_rollout,
+            patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=False),
+            patch(
+                "nemo_rl.algorithms.grpo.should_use_async_rollouts", return_value=False
+            ),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            validate(
+                MagicMock(),
+                val_dataloader,
+                MagicMock(pad_token_id=0),
+                {"math": mock_env},
+                step=5,
+                master_config=mock_config,
+                logger=None,
+            )
+
+        assert mock_rollout.call_count == 2
+        assert val_dataloader._iterator is None
+        assert multiprocessing.active_children() == []
 
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""

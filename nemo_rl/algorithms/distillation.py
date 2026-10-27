@@ -34,6 +34,7 @@ from nemo_rl.algorithms.loss import (
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.dataloader import shutdown_dataloader_workers
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
@@ -1325,6 +1326,7 @@ def validate(
         validation_rollout_metrics: dict[str, list[Any]] = {}
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
+                shutdown_dataloader_workers(val_dataloader)
                 break
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
