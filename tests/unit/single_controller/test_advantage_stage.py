@@ -45,7 +45,10 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
-from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    DebugWriterConfig,
+    JsonDebugWriter,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -87,7 +90,10 @@ def test_from_master_config_uses_typed_logger(
         on_policy_distillation=None,
         policy={"generation": {"top_k": None, "top_p": 1.0}},
         logger=LoggerConfig(log_dir=str(tmp_path)),
-        async_rl=SimpleNamespace(log_full_train_data=log_full_train_data),
+        async_rl=SimpleNamespace(
+            log_full_train_data=log_full_train_data,
+            debug_writer=DebugWriterConfig(),
+        ),
     )
 
     config = AdvantageStageConfig.from_master_config(master_config)
