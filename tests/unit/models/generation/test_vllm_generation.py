@@ -2461,7 +2461,8 @@ def _dynamo_master_config(*, router=False, fleet_health=False):
     [
         ({}, None),
         ({"router": True}, "routes the whole fleet behind one URL"),
-        ({"fleet_health": True}, "Disable fleet health"),
+        # The frontend routes only to the shards fleet health has in service.
+        ({"fleet_health": True}, None),
     ],
 )
 def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error):
@@ -2471,6 +2472,97 @@ def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error
         return
     with pytest.raises(ValueError, match=error):
         VllmGeneration.validate_settings(master_config)
+
+
+def test_vllm_dynamo_routes_only_the_shards_in_service(monkeypatch):
+    generation = object.__new__(VllmGeneration)
+    leaders = [MagicMock() for _ in range(4)]
+    generation.worker_group = types.SimpleNamespace(
+        workers=leaders, get_dp_leader_worker_idx=lambda shard: shard
+    )
+    # Without Dynamo, native dispatch reads the fleet selector instead.
+    generation.set_serving_shards({0}, timeout_s=1.0)
+    leaders[0].set_dynamo_routed_async.remote.assert_not_called()
+
+    generation.dynamo_frontend_url = "http://frontend/v1"
+    generation._dynamo_namespace = "ns"
+    generation._dynamo_engine_env = {"DYN_REQUEST_PLANE": "tcp"}
+    generation._dynamo_routed_shards = frozenset({0, 1, 2})
+    refs = [leader.set_dynamo_routed_async.remote.return_value for leader in leaders]
+    # Shard 1's engine died; shard 2's does not answer in time.
+    monkeypatch.setattr(
+        ray,
+        "wait",
+        lambda pending, **_: (
+            [ref for ref in pending if ref is not refs[2]],
+            [refs[2]],
+        ),
+    )
+
+    def get(ref):
+        if ref is refs[1]:
+            raise ray.exceptions.ActorDiedError()
+
+    monkeypatch.setattr(ray, "get", get)
+
+    # Shards 1 and 2 left service, and restarted shard 3 returned.
+    generation.set_serving_shards({0, 3}, timeout_s=1.0)
+
+    leaders[0].set_dynamo_routed_async.remote.assert_not_called()
+    for shard, routed in ((1, False), (2, False), (3, True)):
+        leaders[shard].set_dynamo_routed_async.remote.assert_called_once_with(
+            routed,
+            namespace="ns",
+            engine_env={"DYN_REQUEST_PLANE": "tcp"},
+            leader_worker_idx=shard,
+        )
+    # A dead engine's registration goes with it; shard 2 is retried next time.
+    assert generation._dynamo_routed_shards == {0, 2, 3}
+
+
+def test_vllm_worker_enters_and_leaves_dynamo_routing(monkeypatch):
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._dynamo_endpoint_task = None
+    worker._dynamo_engine = None
+    worker._dynamo_routed = False
+    started = []
+
+    async def start_dynamo_endpoint_async(**endpoint_args):
+        started.append(endpoint_args)
+        worker._dynamo_endpoint_task = asyncio.get_running_loop().create_future()
+        worker._dynamo_engine = types.SimpleNamespace(endpoint=None)
+        worker._dynamo_routed = True
+
+    monkeypatch.setattr(
+        worker, "start_dynamo_endpoint_async", start_dynamo_endpoint_async
+    )
+    endpoint_args = {"namespace": "ns", "engine_env": {}, "leader_worker_idx": 0}
+
+    async def run():
+        # A restarted shard's first time in service starts its endpoint.
+        await worker.set_dynamo_routed_async(True, **endpoint_args)
+        assert started == [endpoint_args]
+        with pytest.raises(RuntimeError, match="not started serving yet"):
+            await worker.set_dynamo_routed_async(False, **endpoint_args)
+
+        endpoint = types.SimpleNamespace(
+            register_endpoint_instance=AsyncMock(),
+            unregister_endpoint_instance=AsyncMock(),
+        )
+        worker._dynamo_engine.endpoint = endpoint
+        await worker.set_dynamo_routed_async(False, **endpoint_args)
+        await worker.set_dynamo_routed_async(False, **endpoint_args)
+        await worker.set_dynamo_routed_async(True, **endpoint_args)
+        endpoint.unregister_endpoint_instance.assert_awaited_once()
+        endpoint.register_endpoint_instance.assert_awaited_once()
+
+        assert worker.is_alive()
+        # An engine whose endpoint stopped gets no requests: its probe fails.
+        worker._dynamo_endpoint_task.set_exception(RuntimeError("etcd lost"))
+        with pytest.raises(RuntimeError, match="etcd lost"):
+            worker.is_alive()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("dynamo", [False, True])

@@ -92,6 +92,18 @@ LOGGER = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from nemo_gym.token_id_capture.staging.capture import ActiveCall
 
+    from nemo_rl.models.generation.dynamo.native_engine import NativeVllmEngine
+
+
+def _endpoint_task_error(task: Optional[asyncio.Task]) -> Optional[str]:
+    """Why a Dynamo endpoint task stopped serving; None before it starts or while it serves."""
+    if task is None or not task.done():
+        return None
+    if task.cancelled():
+        return "cancelled"
+    error = task.exception()
+    return "exited" if error is None else repr(error)
+
 
 @dataclass
 class CapturedRequest:
@@ -280,8 +292,12 @@ class VllmAsyncGenerationWorkerImpl(
         self.http_server = None
         self._engine_loop = None
         self._http_engine_client = None
-        # The task serving this engine through Dynamo, when it is registered.
+        # The task serving this engine through Dynamo, when it is registered, and
+        # the engine adapter whose endpoint takes it in and out of routing.
         self._dynamo_endpoint_task: Optional[asyncio.Task] = None
+        self._dynamo_engine: Optional["NativeVllmEngine"] = None
+        # Whether the frontend routes to this engine; it registers as it starts.
+        self._dynamo_routed = False
 
         # Ledger-authoritative token capture (dormant until the
         # setup_token_capture fan-out runs). The weight
@@ -627,22 +643,64 @@ class VllmAsyncGenerationWorkerImpl(
             start_dynamo_endpoint,
         )
 
-        self._dynamo_endpoint_task = start_dynamo_endpoint(
+        self._dynamo_endpoint_task, self._dynamo_engine = start_dynamo_endpoint(
             self,
             namespace=namespace,
             engine_env=engine_env,
             leader_worker_idx=leader_worker_idx,
         )
+        self._dynamo_routed = True
+
+    async def set_dynamo_routed_async(
+        self,
+        routed: bool,
+        *,
+        namespace: str,
+        engine_env: dict[str, str],
+        leader_worker_idx: int,
+    ) -> None:
+        """Put this engine in or out of the Dynamo frontend's routing.
+
+        Out removes only its discovery record, so requests in flight finish. In
+        registers it again, and an engine Dynamo has not served yet (a restarted
+        shard) starts its endpoint, which registers it.
+        """
+        if self._dynamo_engine is None:
+            if routed:
+                await self.start_dynamo_endpoint_async(
+                    namespace=namespace,
+                    engine_env=engine_env,
+                    leader_worker_idx=leader_worker_idx,
+                )
+            return
+        if routed == self._dynamo_routed:
+            return
+        endpoint = self._dynamo_engine.endpoint
+        if endpoint is None:
+            raise RuntimeError(
+                "The Dynamo endpoint has not started serving yet; it registers when "
+                "it does."
+            )
+        if routed:
+            await endpoint.register_endpoint_instance()
+        else:
+            await endpoint.unregister_endpoint_instance()
+        self._dynamo_routed = routed
 
     async def dynamo_endpoint_error(self) -> Optional[str]:
         """Why this engine's Dynamo endpoint stopped serving; None while it serves."""
-        task = self._dynamo_endpoint_task
-        if task is None or not task.done():
-            return None
-        if task.cancelled():
-            return "cancelled"
-        error = task.exception()
-        return "exited" if error is None else repr(error)
+        return _endpoint_task_error(self._dynamo_endpoint_task)
+
+    def is_alive(self) -> bool:
+        """Alive, and still serving through Dynamo when Dynamo serves the fleet.
+
+        An engine whose Dynamo endpoint stopped gets no requests, so fleet health
+        must count it as failing rather than serving.
+        """
+        error = _endpoint_task_error(self._dynamo_endpoint_task)
+        if error is not None:
+            raise RuntimeError(f"The Dynamo endpoint stopped serving: {error}")
+        return True
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""

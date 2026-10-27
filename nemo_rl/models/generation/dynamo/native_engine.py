@@ -334,10 +334,16 @@ class NativeVllmEngine(LLMEngine):
         self._gym_sampling_profile = {
             key: _as_f32(host.cfg[key]) for key in _GYM_SAMPLING_KEYS
         }
+        # The Dynamo endpoint serving this engine, once the Worker hands it over;
+        # it takes the engine in and out of the frontend's routing.
+        self.endpoint: Optional[Any] = None
 
     @classmethod
     async def from_args(cls, argv=None):
         raise NotImplementedError("constructed in-process by the vLLM worker")
+
+    async def on_endpoint_ready(self, endpoint: Any) -> None:
+        self.endpoint = endpoint
 
     async def start(self, worker_id: int) -> EngineConfig:
         del worker_id
@@ -942,12 +948,16 @@ def start_dynamo_endpoint(
     namespace: str,
     engine_env: dict[str, str],
     leader_worker_idx: int,
-) -> asyncio.Task:
+) -> tuple[asyncio.Task, NativeVllmEngine]:
     """Register ``host``'s engine with Dynamo and serve it on the running loop.
 
     The Rust Worker serves until the process gets SIGTERM. It installs a chained
     handler, so Ray's actor handler still runs and the actor exits as usual;
     discovery drops the engine with its process.
+
+    Returns:
+        The task serving the engine, and the engine, whose ``endpoint`` takes it
+        in and out of the frontend's routing once it serves.
     """
     # The Rust runtime reads these when the first Worker is constructed.
     os.environ.update(engine_env)
@@ -982,6 +992,5 @@ def start_dynamo_endpoint(
         structural_tag_scope=worker_args.structural_tag_scope,
         structural_tag_schema=worker_args.structural_tag_schema,
     )
-    return asyncio.get_running_loop().create_task(
-        Worker(NativeVllmEngine(host, leader_worker_idx), config).run()
-    )
+    engine = NativeVllmEngine(host, leader_worker_idx)
+    return asyncio.get_running_loop().create_task(Worker(engine, config).run()), engine

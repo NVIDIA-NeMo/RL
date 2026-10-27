@@ -145,6 +145,18 @@ Where the behavior differs from the native endpoint:
   reports a reasoning-only turn as content for every reasoning parser. Natively,
   only NeMo RL's `nano_v3` parser does.
 
+## Fleet health
+
+`async_rl.generation_fleet_health` works as natively, except that the frontend
+picks engines itself. On every probe, the SingleController takes the shards out
+of service out of the frontend's routing and puts the returning ones back.
+Requests already in flight on a shard that leaves finish. A restarted shard
+registers with the frontend only after a refit gives it current weights. An
+engine whose Dynamo endpoint stops fails its probe.
+
+Rollouts through the frontend report no per-shard outcome, so the probes alone
+judge the shards.
+
 ## Not supported
 
 Startup rejects these with `dynamo: true`:
@@ -152,10 +164,8 @@ Startup rejects these with `dynamo: true`:
 - `colocated.enabled: true`: a colocated engine sleeps while the policy trains,
   and the frontend would keep routing to it. The SingleController never runs
   colocated vLLM; the other entrypoints need non-colocated generation.
-- `async_rl.generation_fleet_health.enabled`: the frontend picks engines itself,
-  and a restarted shard does not register with it yet.
 - `async_rl.generation_router`: the frontend already routes the fleet behind one
-  URL.
+  URL and, with fleet health, only to the shards in service.
 - `vllm_cfg.http_server_api_key_required`: the frontend checks no bearer token.
 - `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data
   parallelism inside vLLM, which the async engine Dynamo serves does not.

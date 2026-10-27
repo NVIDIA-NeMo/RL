@@ -4035,6 +4035,7 @@ class SingleControllerActor:
                 # Pushed here rather than on the watchdog's clock so a membership change
                 # reaches the router at detection speed.
                 await self._push_router_membership()
+                await self._push_serving_shards()
             except Exception as error:  # noqa: BLE001 - best-effort, retried next tick
                 print(
                     f"fleet probe: router update failed, retrying next tick: "
@@ -4135,6 +4136,23 @@ class SingleControllerActor:
             self._generation_router.set_serving_backends.remote(
                 self._gen_fleet.serving_base_urls()
             )
+        )
+
+    async def _push_serving_shards(self) -> None:
+        """Tell the generation backend which shards are in service.
+
+        Native dispatch reads the fleet selector on every request and needs
+        nothing. A backend behind its own router, vLLM behind Dynamo's frontend,
+        takes a shard out of routing when it leaves service and back in when it
+        returns. Each push sends the whole serving set, so one that misses a shard
+        converges on the next.
+        """
+        if self._gen_fleet is None:
+            return
+        await asyncio.to_thread(
+            self._gen.set_serving_shards,
+            set(self._gen_fleet.serving_shards()),
+            timeout_s=self._async_cfg.generation_fleet_health.probe_timeout_s,
         )
 
     async def _drain_router_failures(self) -> None:
@@ -5614,6 +5632,9 @@ class SingleControllerActor:
             # promoted inside its window, and everything below this must still run on
             # both paths.
             self._record_refit_landed(participants)
+        # Before resuming: a shard that just returned to service (a restarted one
+        # holding its first weights) takes requests from the first one after.
+        await self._push_serving_shards()
 
         print("▶️ Requesting generation resume after refit", flush=True)
         generation_resumed_after_refit = await asyncio.to_thread(

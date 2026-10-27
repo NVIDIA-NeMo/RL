@@ -438,9 +438,10 @@ def _start_worker_config(monkeypatch, host) -> SimpleNamespace:
         monkeypatch.setenv(key, value)
 
     async def start():
-        await native_engine.start_dynamo_endpoint(
+        task, _ = native_engine.start_dynamo_endpoint(
             host, namespace="ns", engine_env=env, leader_worker_idx=0
         )
+        await task
 
     asyncio.run(start())
     (config,) = configs
