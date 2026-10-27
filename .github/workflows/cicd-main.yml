@@ -664,6 +664,11 @@ jobs:
           )
         ) && !cancelled()
       }}
+    env:
+      # pytest runs as a direct child of `uv run` here (in the GPU containers a bash
+      # script launches it), which makes Ray try to ship the uv project to its workers
+      # and fail because pyproject.toml is not in the test working directory.
+      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
     runs-on: ubuntu-latest
     steps:
       - name: Free up disk space
@@ -736,6 +741,11 @@ jobs:
         ) &&
         !cancelled()
       }}
+    env:
+      # pytest runs as a direct child of `uv run` here (in the GPU containers a bash
+      # script launches it), which makes Ray try to ship the uv project to its workers
+      # and fail because pyproject.toml is not in the test working directory.
+      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
     runs-on: ubuntu-latest
     steps:
       - name: Free up disk space
