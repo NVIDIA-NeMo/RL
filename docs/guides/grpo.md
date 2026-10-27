@@ -530,10 +530,11 @@ where:
 
 The formulas above are written with a bare expectation $E_t[\cdot]$, which leaves one detail unspecified: the loss is computed per token, but the optimizer needs a single number, so those per-token values have to be averaged. The `loss_fn.normalization` parameter chooses how that average is taken. It does not change the per-token objective itself — only how the per-token values are combined into the scalar that is differentiated.
 
-There are two choices:
+There are three choices:
 
 - **`normalization: global_token_mean`** (default) — average over every token in the batch. Every token counts the same, so a response contributes to the update in proportion to how many tokens it has.
 - **`normalization: sequence_mean`** — average within each response first, then average those per-response values. Every *response* counts the same regardless of length.
+- **`normalization: group_token_mean`** — average all valid response tokens within each prompt group, then average groups equally. See [Equal prompt-group token means](#equal-prompt-group-token-means) for supported training paths.
 
 The deprecated `token_level_loss` flag remains compatible: `true` selects
 `global_token_mean`, and `false` selects `sequence_mean`. Leave both selectors
@@ -545,7 +546,7 @@ change a custom parent that sets the old flag, clear it explicitly:
 ```yaml
 loss_fn:
   token_level_loss: null
-  normalization: sequence_mean
+  normalization: group_token_mean
 ```
 
 The resolved mode is internal: saving and reloading a config preserves the
@@ -567,11 +568,44 @@ Both denominators — $\sum_i |o_i|$ and $N$ — are counts over the whole globa
 
 The same choice also normalizes the KL penalty term, so `reference_policy_kl_penalty` is applied on whichever scale you select.
 
+#### Equal prompt-group token means
+
+`loss_fn.normalization: group_token_mean` opts into a token mean within each
+complete rollout prompt group, followed by an equal mean over groups with
+positive valid token mass. The default `global_token_mean` gives every valid
+token equal weight; `sequence_mean` gives every response equal weight.
+
+| Reduction | Weighting |
+| --- | --- |
+| Global token mean | Every valid token has equal weight across the batch. |
+| Sequence mean | Every response has equal weight; its tokens share that weight. |
+| Group token mean | Every prompt group has equal weight; all valid tokens across its responses share that weight. |
+
 SingleController's Megatron streaming path rejects active MoE balancing losses
-and router z-loss with sequence normalization: their mixed gradients cannot
-receive a separate token denominator at step completion. Detached MTP heads
-retain their independent token normalization; attached MTP with a nonzero loss
-weight remains unsupported. Draft training retains its independent normalization.
+and router z-loss with either sequence or group normalization: their mixed
+gradients cannot receive a separate denominator at step completion.
+
+This mode requires v2 SingleController GRPO, Megatron, token-level importance
+ratios, and masks finalized in the advantage stage. Detached MTP heads are supported:
+the worker normalizes their gradients by valid tokens independently of the
+policy's group denominator. It rejects attached MTP with a nonzero loss weight,
+active MoE auxiliary losses, in-loss sequence filtering, positive-example NLL,
+and OPD. Draft training retains its existing independent normalization and
+backend restrictions, including the prohibition on packed deferred draft loss.
+
+`GroupTokenMeanReduction` declares one extra field,
+`group_token_mean_inverse_tokens`. Setup registers the declared fields before
+producers start, and the controller requests the same fields for training. The
+advantage stage calls `prepare_batch` after finalizing masks; the group reducer
+checks complete rollout groups and returns a float32 `1 / T_g` scalar per
+response. Global-token and sequence reducers declare no extra fields and return
+no prepared tensors. `T_g` includes all valid generated tokens before IS
+filtering, including zero-advantage tokens. Excluded groups receive zero.
+Packing preserves these row weights. The split worker accumulates `L_i / T_g`
+across chunks and DP ranks, recovering the group count once at optimizer-step
+finish; TP/CP/PP replicas do not add group counts. Actor and reference-KL
+objectives use this denominator, while token diagnostics retain their original
+token denominator. IcePop filtering never changes the group denominator.
 
 #### An example of what this changes
 
@@ -621,7 +655,7 @@ The table below covers the metrics reported by `ClippedPGLossFn` (the GRPO/PPO f
 
 | Behavior | Metrics |
 | --- | --- |
-| **Follows `normalization`** — global token mean or sequence mean | `loss`, `kl_penalty` |
+| **Follows `normalization`** — global token mean, sequence mean, or group token mean | `loss`, `kl_penalty` |
 | **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy` |
 | **Keyed on a different parameter** | `sampling_importance_ratio` follows `sequence_level_importance_ratios`; `is_oob_ratio` is sequence-normalized only for `truncated_importance_sampling_type: seq-mask-tis` |
 | **Not normalized** — raw counts, per-microbatch means, or extrema combined with min/max | `num_valid_samples`, `positive_nll_loss`, `probs_ratio_min`, `probs_ratio_max`, `probs_ratio_clamped_min`, `probs_ratio_clamped_max`, `num_masked_seqs_by_logprob_error`, `seq_logprob_error_valid_tokens`, `seq_logprob_error_valid_seqs` |
@@ -630,7 +664,7 @@ The authoritative list is the [`metric_normalizations` table in `ClippedPGLossFn
 
 #### Choosing a setting
 
-GSPO requires sequence mean, and CISPO requires global token mean. Vanilla GRPO and PPO support both. The tradeoff is the weighting described above.
+GSPO requires sequence mean. CISPO supports global token mean and, on the supported SingleController path, group token mean. Vanilla GRPO supports all three; PPO supports global token and sequence means. The tradeoff is the weighting described above.
 
 The argument most often made for token-level normalization comes from the [DAPO paper](https://arxiv.org/abs/2503.14476) (§3.3, "Token-Level Policy Gradient Loss"), in the context of long chain-of-thought training. Their reasoning is that under sequence-level normalization, "since all samples are assigned the same weight in the loss calculation, tokens within longer responses (which contain more tokens) may have a disproportionately lower contribution to the overall loss." They argue this cuts both ways: for high-quality long responses, "this effect can impede the model's ability to learn reasoning-relevant patterns within them." For low-quality ones, "excessively long samples often exhibit low-quality patterns such as gibberish and repetitive words. Thus, sample-level loss calculation, due to its inability to effectively penalize those undesirable patterns in long samples, leads to an unhealthy increase in entropy and response length."
 

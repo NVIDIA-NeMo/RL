@@ -52,6 +52,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_grpo_save_state,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import (
@@ -263,6 +264,7 @@ def _stamp_advantage_stage_config(
         opd_full_enabled=opd_full_enabled,
         message_level_advantage_penalties_enabled=penalties_enabled,
         shardable=shardable,
+        objective_reduction=make_objective_reduction("global_token_mean"),
         train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
     )
     ctrl._advantage_computer = AdvantageComputer(

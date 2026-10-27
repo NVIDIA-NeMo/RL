@@ -88,7 +88,7 @@ loss_fn:
   truncated_importance_sampling_adaptive_k_max: 1.0
   truncated_importance_sampling_adaptive_outer_bound: 50.0
   sequence_level_importance_ratios: false
-  # global_token_mean (default) or sequence_mean.
+  # global_token_mean (default), sequence_mean, or group_token_mean (SC GRPO/Megatron).
   normalization: null
   token_level_loss: null  # Deprecated true/false alias; do not set with normalization.
   force_on_policy_ratio: false

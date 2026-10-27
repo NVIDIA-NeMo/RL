@@ -169,13 +169,14 @@ class DraftCrossEntropyLossFn(LossFunction):
         )
 
 
-LossNormalization = Literal["global_token_mean", "sequence_mean"]
+LossNormalization = Literal["global_token_mean", "sequence_mean", "group_token_mean"]
 
 
 class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- Loss type ---
     disable_ppo_ratio: bool = False
     # Select one reduction; when both selectors are unset, use global_token_mean.
+    # group_token_mean requires SingleController GRPO with Megatron.
     normalization: LossNormalization | None = None
     # Deprecated: True selects global_token_mean, False selects sequence_mean.
     # Must remain unset when normalization is supplied.
@@ -292,6 +293,7 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    group_token_mean_inverse_tokens: NotRequired[torch.Tensor]
     __extra__: Any
 
 
@@ -457,6 +459,12 @@ class ClippedPGLossFn(LossFunction):
         self._compiled_actor_objective = None
         self.objective_reduction = make_objective_reduction(self.normalization)
         self.loss_type = self.objective_reduction.loss_type
+        self.objective_reduction.validate_loss_options(
+            sequence_level_importance_ratios=cfg.sequence_level_importance_ratios,
+            opd_full=self.opd_full is not None,
+            positive_example_nll_weight=cfg.positive_example_nll_weight,
+            seq_logprob_error_in_loss=cfg.seq_logprob_error_in_loss,
+        )
         if self.sequence_level_importance_ratios:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
@@ -483,7 +491,7 @@ class ClippedPGLossFn(LossFunction):
                 "silently overwrite it. Set ratio_clip_c=null when use_cispo=True."
             )
             assert self.loss_type == LossType.TOKEN_LEVEL, (
-                "use_cispo requires global_token_mean normalization "
+                "use_cispo requires global_token_mean or group_token_mean normalization "
                 "(legacy token_level_loss=True)."
             )
         if self.truncated_importance_sampling_type is not None:

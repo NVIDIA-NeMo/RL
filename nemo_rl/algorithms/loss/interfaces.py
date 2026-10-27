@@ -13,12 +13,13 @@
 # limitations under the License.
 
 import enum
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, Protocol
 
 import torch
 
+from nemo_rl.data_plane.schema import GROUP_TOKEN_MEAN_WEIGHT
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -60,6 +61,39 @@ class ObjectiveReduction:
     metric_normalizer: ClassVar[MetricNormalizer]
     requires_explicit_denominator: ClassVar[bool] = False
     token_normalized: ClassVar[bool] = False
+    extra_fields: ClassVar[tuple[str, ...]] = ()
+
+    def prepare_batch(
+        self,
+        *,
+        sample_ids: Sequence[str],
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        group_indices: torch.Tensor,
+        expected_group_size: int | None,
+    ) -> dict[str, torch.Tensor]:
+        """Prepare declared fields while final masks and complete groups coexist."""
+        return {}
+
+    def validate_setup(
+        self,
+        *,
+        trainer: str,
+        algorithm: str,
+        megatron_enabled: bool,
+        on_policy_distillation: bool,
+    ) -> None:
+        """Validate the execution path before model construction."""
+
+    def validate_loss_options(
+        self,
+        *,
+        sequence_level_importance_ratios: bool,
+        opd_full: bool,
+        positive_example_nll_weight: float,
+        seq_logprob_error_in_loss: bool,
+    ) -> None:
+        """Validate loss options that could change the reduction's meaning."""
 
     def per_response_weights(
         self, data: Mapping[str, torch.Tensor]
@@ -217,12 +251,138 @@ class SequenceMeanReduction(ObjectiveReduction):
         )
 
 
+@dataclass(frozen=True)
+class GroupTokenMeanReduction(GlobalTokenMeanReduction):
+    """Average valid tokens within each prompt group, then average groups equally."""
+
+    requires_explicit_denominator: ClassVar[bool] = True
+    token_normalized: ClassVar[bool] = False
+    extra_fields: ClassVar[tuple[str, ...]] = (GROUP_TOKEN_MEAN_WEIGHT,)
+
+    def validate_setup(
+        self,
+        *,
+        trainer: str,
+        algorithm: str,
+        megatron_enabled: bool,
+        on_policy_distillation: bool,
+    ) -> None:
+        if (
+            trainer != "single_controller"
+            or algorithm != "grpo"
+            or not megatron_enabled
+            or on_policy_distillation
+        ):
+            raise ValueError(
+                "group_token_mean requires SingleController GRPO with "
+                "on_policy_distillation.enabled=false and policy.megatron_cfg.enabled=true."
+            )
+
+    def validate_loss_options(
+        self,
+        *,
+        sequence_level_importance_ratios: bool,
+        opd_full: bool,
+        positive_example_nll_weight: float,
+        seq_logprob_error_in_loss: bool,
+    ) -> None:
+        if sequence_level_importance_ratios:
+            raise ValueError(
+                "group_token_mean requires sequence_level_importance_ratios=False"
+            )
+        if opd_full or positive_example_nll_weight != 0:
+            raise ValueError("group_token_mean does not support OPD-full or NLL")
+        if seq_logprob_error_in_loss:
+            raise ValueError(
+                "group_token_mean requires masks finalized before training"
+            )
+
+    def prepare_batch(
+        self,
+        *,
+        sample_ids: Sequence[str],
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        group_indices: torch.Tensor,
+        expected_group_size: int | None,
+    ) -> dict[str, torch.Tensor]:
+        # The numerical helper also imports the reduction interfaces.
+        from nemo_rl.algorithms.loss.utils import group_token_mean_weights
+
+        return {
+            GROUP_TOKEN_MEAN_WEIGHT: group_token_mean_weights(
+                sample_ids,
+                token_mask,
+                sample_mask,
+                group_indices=group_indices,
+                expected_group_size=expected_group_size,
+            )
+        }
+
+    def per_response_weights(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Return each response's inverse group-token mass, shape [B]."""
+        weights = data[GROUP_TOKEN_MEAN_WEIGHT]
+        if weights.ndim != 1 or weights.shape != data["sample_mask"].shape:
+            raise ValueError(
+                f"{GROUP_TOKEN_MEAN_WEIGHT} row weights must match sample_mask[B]"
+            )
+        return weights.float()
+
+    def denominator_contribution(
+        self,
+        data: Mapping[str, torch.Tensor],
+        *,
+        valid_tokens_per_response: torch.Tensor,
+        sequence_count: torch.Tensor,
+        token_count: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return this batch's scalar share of complete nonempty groups."""
+        return (valid_tokens_per_response * self.per_response_weights(data)).sum()
+
+    def loss_divisor(
+        self,
+        *,
+        global_valid_toks: torch.Tensor,
+        global_valid_seqs: torch.Tensor,
+        global_objective_denominator: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return this call's scalar divisor; streaming supplies one."""
+        if global_objective_denominator is None:
+            raise ValueError(
+                "group_token_mean requires the split training path or an explicit "
+                "global_objective_denominator"
+            )
+        return global_objective_denominator
+
+    def reduce(
+        self,
+        values: torch.Tensor,
+        *,
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        mask: torch.Tensor,
+        denominator: torch.Tensor,
+        per_response_weights: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert per_response_weights is not None
+        return super().reduce(
+            values * per_response_weights.unsqueeze(-1),
+            token_mask=token_mask,
+            sample_mask=sample_mask,
+            mask=mask,
+            denominator=denominator,
+            per_response_weights=None,
+        )
+
+
 def make_objective_reduction(normalization: str) -> ObjectiveReduction:
     """Resolve the configured formula once, before training."""
     if normalization == "global_token_mean":
         return GlobalTokenMeanReduction()
     if normalization == "sequence_mean":
         return SequenceMeanReduction()
+    if normalization == "group_token_mean":
+        return GroupTokenMeanReduction()
     raise ValueError(f"Unsupported loss normalization: {normalization}")
 
 
