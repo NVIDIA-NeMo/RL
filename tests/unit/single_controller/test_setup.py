@@ -3755,6 +3755,123 @@ class TestRewardScalingValidation:
         config.grpo.reward_scaling.source_max = 1.0
         config.grpo.reward_scaling.target_max = math.inf
 
+
+class TestRewardShapingValidation:
+    """``_validate_reward_shaping`` rejects at startup, not one rollout in.
+
+    The advantage stage applies the block, so it is supported -- but
+    ``apply_reward_shaping`` only rejects a bad one at the first advantage
+    call, a whole round of rollouts and logprobs later. Every check mirrors one
+    there, so these cover the accepting side too: a check stricter than the one
+    it mirrors would reject configs that work, which is harder to notice than a
+    missing check.
+
+    ``_validate_reward_shaping`` takes the shaping block rather than the master
+    config, so the surrounding algorithm block cannot change what it accepts
+    and GRPO alone covers the boundaries. That a PPO run reaches it at all is
+    covered by ``test_accepts_dapo_reward_shaping_on_a_ppo_run`` in
+    test_ppo_setup.py, which is where the PPO config fixture lives.
+    """
+
+    @staticmethod
+    def _dapo_config() -> MasterConfig:
+        config = _make_master_config()
+        shaping = config.grpo.reward_shaping
+        shaping.enabled = True
+        shaping.stop_properly_penalty_coef = None
+        shaping.overlong_buffer_length = 512
+        shaping.overlong_buffer_penalty = 1
+        shaping.max_response_length = 4096
+        return config
+
+    def test_accepts_a_complete_dapo_block(self):
+        validate_single_controller_config(self._dapo_config())
+
+    def test_accepts_the_stop_properly_mode_without_the_dapo_trio(self):
+        """It short-circuits before the DAPO block, so the three are not read."""
+        config = _make_master_config()
+        config.grpo.reward_shaping.enabled = True
+        config.grpo.reward_shaping.stop_properly_penalty_coef = 0.0
+
+        validate_single_controller_config(config)
+
+    @pytest.mark.parametrize(
+        "present",
+        [
+            (),
+            ("overlong_buffer_length",),
+            ("overlong_buffer_length", "max_response_length"),
+        ],
+        ids=["none_set", "one_set", "two_set"],
+    )
+    def test_rejects_an_incomplete_dapo_block(self, present: tuple[str, ...]):
+        config = self._dapo_config()
+        for name in (
+            "overlong_buffer_length",
+            "overlong_buffer_penalty",
+            "max_response_length",
+        ):
+            if name not in present:
+                setattr(config.grpo.reward_shaping, name, None)
+
+        with pytest.raises(ValueError, match="reward_shaping is enabled but"):
+            validate_single_controller_config(config)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            # The divisor, and it is evaluated for every row rather than only
+            # overlong ones, so 0 raises ZeroDivisionError on the first row.
+            ("overlong_buffer_length", 0),
+            # Negative inverts the shaping: the ratio's sign flips, so
+            # min(..., 0) zeroes the penalty for overlong rows and penalizes
+            # short ones instead.
+            ("overlong_buffer_length", -1),
+            # Asserted in apply_reward_shaping, one rollout too late.
+            ("overlong_buffer_penalty", -1),
+        ],
+        ids=["zero_buffer", "negative_buffer", "negative_penalty"],
+    )
+    def test_rejects_a_dapo_block_that_is_complete_but_out_of_range(
+        self, field: str, value: int
+    ):
+        config = self._dapo_config()
+        setattr(config.grpo.reward_shaping, field, value)
+
+        with pytest.raises(ValueError, match=field):
+            validate_single_controller_config(config)
+
+    def test_accepts_a_zero_overlong_penalty(self):
+        """0 disables the penalty without disabling the block; `>= 0` there."""
+        config = self._dapo_config()
+        config.grpo.reward_shaping.overlong_buffer_penalty = 0
+
+        validate_single_controller_config(config)
+
+    @pytest.mark.parametrize("coef", [-0.1, 1.1], ids=["below_zero", "above_one"])
+    def test_rejects_a_stop_properly_coef_outside_the_unit_interval(self, coef: float):
+        config = _make_master_config()
+        config.grpo.reward_shaping.enabled = True
+        config.grpo.reward_shaping.stop_properly_penalty_coef = coef
+
+        with pytest.raises(ValueError, match="stop_properly_penalty_coef"):
+            validate_single_controller_config(config)
+
+    @pytest.mark.parametrize("coef", [0.0, 0.5, 1.0], ids=["zero", "half", "one"])
+    def test_accepts_the_endpoints_of_the_stop_properly_interval(self, coef: float):
+        """The bound is inclusive in apply_reward_shaping; do not narrow it."""
+        config = _make_master_config()
+        config.grpo.reward_shaping.enabled = True
+        config.grpo.reward_shaping.stop_properly_penalty_coef = coef
+
+        validate_single_controller_config(config)
+
+    def test_ignores_a_broken_block_while_disabled(self):
+        """A stale block is not a reason to refuse to start."""
+        config = self._dapo_config()
+        config.grpo.reward_shaping.enabled = False
+        config.grpo.reward_shaping.overlong_buffer_length = 0
+
         validate_single_controller_config(config)
 
 

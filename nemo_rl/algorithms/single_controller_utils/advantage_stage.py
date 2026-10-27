@@ -49,6 +49,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
+from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
@@ -363,6 +364,21 @@ class AdvantageComputer:
         truncated = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.truncated_field)
         ).bool()
+
+        # After scale_rewards, as v1 orders them: the penalty is subtracted, so
+        # it only means something against the scaled range. token_mask.sum(-1)
+        # is response_token_lengths on payload.py's path only (see
+        # test_token_mask_sum_is_the_response_token_length).
+        rewards = apply_reward_shaping(
+            BatchedDataDict(
+                {
+                    "total_reward": rewards,
+                    "response_token_lengths": token_mask.sum(dim=-1).long(),
+                    "truncated": truncated,
+                }
+            ),
+            cfg.algo.reward_shaping,
+        )["total_reward"]
 
         num_mask_sample_filtered = int(mask_sample.sum().item())
         final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
