@@ -115,6 +115,7 @@ def _forest_sealed_ledger() -> RolloutRecoveryLedger:
     return ledger
 
 
+@pytest.mark.nemo_gym
 def test_forest_recovery_disk_round_trip_retains_completed_evidence(
     tmp_path: Path,
 ) -> None:
@@ -144,6 +145,7 @@ def test_forest_recovery_disk_round_trip_retains_completed_evidence(
 
 
 @pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.nemo_gym
 def test_masked_forest_sibling_round_trip_preserves_pending_custody(
     tmp_path: Path, pending: bool
 ) -> None:
@@ -190,6 +192,7 @@ def test_masked_forest_sibling_round_trip_preserves_pending_custody(
     assert f"{owner}/failed" not in restored.expected_staging_keys(required_only=True)
 
 
+@pytest.mark.nemo_gym
 def test_empty_forest_selection_requires_poisoned_receipt_on_seal_and_restore() -> None:
     ledger = _forest_sealed_ledger()
     group = ledger.get_group("g7")
@@ -238,6 +241,7 @@ def test_empty_forest_selection_requires_poisoned_receipt_on_seal_and_restore() 
         "pending",
     ],
 )
+@pytest.mark.nemo_gym
 def test_forest_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
     state = _forest_sealed_ledger().state_dict()
     attempt = state["groups"][0]["siblings"][0]["attempts"][0]
@@ -299,6 +303,7 @@ def test_legacy_ordinary_recovery_still_loads(schema: int) -> None:
     )
 
 
+@pytest.mark.nemo_gym
 def test_obsolete_cc_snapshot_has_explicit_error() -> None:
     state = _forest_sealed_ledger().state_dict()
     state["schema_version"] = 3
