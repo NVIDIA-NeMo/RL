@@ -368,8 +368,11 @@ apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
-# The ray install will include the older aiohttp version in its cache
-find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+# Ray bundles an older aiohttp and yarl; remove both so the installed aiohttp
+# uses a compatible yarl instead of Ray's bundled copy.
+find /root/.cache/uv -type d \
+    \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
+       -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
 # Remove setuptools < 80.10.2 from the uv cache. Megatron-Bridge's [build-system] requires
 # setuptools<80, and [tool.uv] override-dependencies does not apply to isolated build
@@ -500,7 +503,9 @@ rm -rf /tmp/trtllm-build-venv
 
 # The syncs above can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.
-find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+find /root/.cache/uv -type d \
+    \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
+       -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
 # Same for stale setuptools (see the comment in the preceding dependency layer).
 bash /usr/local/libexec/prune_setuptools_cache.sh /root/.cache/uv
