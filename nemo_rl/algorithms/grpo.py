@@ -200,6 +200,8 @@ from nemo_rl.utils.path_utils import (
 from nemo_rl.utils.timer import (
     TimeoutChecker,
     Timer,
+    append_record,
+    calibrate_cluster_clocks,
     set_training_timeline_path,
     timeline_collection_enabled,
 )
@@ -3444,6 +3446,7 @@ def _grpo_train_impl(
 ) -> None:
     """Run GRPO training algorithm."""
     _default_timeline_paths(master_config)
+    _record_timeline_run_context(master_config, policy_generation)
     timer = Timer(context={"worker": "driver"})
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
@@ -4728,6 +4731,28 @@ def _default_timeline_paths(master_config: MasterConfig) -> Optional[str]:
     return os.path.join(log_dir, "rollout_lifecycle.jsonl")
 
 
+def _record_timeline_run_context(
+    master_config: MasterConfig, policy_generation: Optional[GenerationInterface]
+) -> None:
+    """Write the clock calibration and the engine layout next to the timeline.
+
+    Only under NRL_COLLECT_TIMELINE_FIELDS. ``clock_calibration.jsonl`` gives each
+    host's wall-clock offset from the driver, so spans from different hosts can be
+    aligned. ``generation_topology.jsonl`` maps each generation engine to its
+    replica, role and host; it is empty for a backend that reports no layout, and
+    for TRT-LLM disaggregation it needs the disagg servers to be up already.
+    """
+    if not timeline_collection_enabled():
+        return
+    log_dir = os.path.abspath(str(master_config.logger.log_dir))
+    os.makedirs(log_dir, exist_ok=True)
+    calibrate_cluster_clocks(os.path.join(log_dir, "clock_calibration.jsonl"))
+    if policy_generation is None:
+        return
+    for record in policy_generation.timeline_topology():
+        append_record(os.path.join(log_dir, "generation_topology.jsonl"), record)
+
+
 @umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.grpo.job")
 def grpo_train(
     policy: ColocatablePolicyInterface,
@@ -5202,6 +5227,7 @@ def async_grpo_train(
     # Rollout lifecycle JSONL for the collect-training-timeline skill; resolved
     # before the Timer so the training timeline path is already set.
     rollout_lifecycle_path = _default_timeline_paths(master_config)
+    _record_timeline_run_context(master_config, policy_generation)
     timer = Timer(context={"worker": "driver"})
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None

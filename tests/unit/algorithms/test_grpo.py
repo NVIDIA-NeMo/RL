@@ -9456,3 +9456,73 @@ def test_trainers_never_let_over_length_prompts_vote(
     counterfactual = all_rows[response] / all_rows[response].var(correction=0).sqrt()
     assert counterfactual.abs().max().item() == pytest.approx(2.236, abs=1e-3)
     assert not torch.allclose(counterfactual[:2], advantages[0][response[0]])
+
+
+class TestRecordTimelineRunContext:
+    """Clock calibration and engine layout for the collect-training-timeline skill."""
+
+    @staticmethod
+    def _master_config(log_dir):
+        return SimpleNamespace(logger=SimpleNamespace(log_dir=str(log_dir)))
+
+    def test_does_nothing_without_the_opt_in(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("NRL_COLLECT_TIMELINE_FIELDS", raising=False)
+        monkeypatch.setattr(
+            grpo_mod,
+            "calibrate_cluster_clocks",
+            lambda path: pytest.fail("clocks were calibrated without the opt-in"),
+        )
+        generation = MagicMock()
+
+        grpo_mod._record_timeline_run_context(self._master_config(tmp_path), generation)
+
+        generation.timeline_topology.assert_not_called()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_calibrates_clocks_and_writes_the_engine_topology(
+        self, tmp_path, monkeypatch
+    ):
+        import json
+
+        monkeypatch.setenv("NRL_COLLECT_TIMELINE_FIELDS", "1")
+        calibrated = []
+        monkeypatch.setattr(
+            grpo_mod, "calibrate_cluster_clocks", lambda path: calibrated.append(path)
+        )
+        generation = SimpleNamespace(
+            timeline_topology=lambda: [{"engine_index": 0}, {"engine_index": 1}]
+        )
+
+        grpo_mod._record_timeline_run_context(self._master_config(tmp_path), generation)
+
+        assert calibrated == [str(tmp_path / "clock_calibration.jsonl")]
+        topology = (tmp_path / "generation_topology.jsonl").read_text().splitlines()
+        assert [json.loads(line) for line in topology] == [
+            {"engine_index": 0},
+            {"engine_index": 1},
+        ]
+
+    def test_without_a_generation_backend_only_the_clocks_are_calibrated(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("NRL_COLLECT_TIMELINE_FIELDS", "1")
+        calibrated = []
+        monkeypatch.setattr(
+            grpo_mod, "calibrate_cluster_clocks", lambda path: calibrated.append(path)
+        )
+
+        grpo_mod._record_timeline_run_context(self._master_config(tmp_path), None)
+
+        assert len(calibrated) == 1
+        assert not (tmp_path / "generation_topology.jsonl").exists()
+
+    def test_a_backend_that_reports_no_layout_writes_no_topology_file(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("NRL_COLLECT_TIMELINE_FIELDS", "1")
+        monkeypatch.setattr(grpo_mod, "calibrate_cluster_clocks", lambda path: 0)
+        generation = SimpleNamespace(timeline_topology=lambda: [])
+
+        grpo_mod._record_timeline_run_context(self._master_config(tmp_path), generation)
+
+        assert not (tmp_path / "generation_topology.jsonl").exists()

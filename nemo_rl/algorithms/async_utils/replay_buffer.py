@@ -60,6 +60,7 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.path_utils import load_checkpoint_object, save_checkpoint_object
 from nemo_rl.utils.r3_trace import trace_rollout_payload
+from nemo_rl.utils.timer import timeline_clock_id
 
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"
 REPLAY_BUFFER_METADATA_FILENAME = "replay_buffer_metadata.pt"
@@ -468,6 +469,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             record: dict[str, Any] = {
                 "event": event,
                 "ts": timestamp_us,
+                "clock_id": timeline_clock_id(),
                 "rollout_id": f"{task_index}-{sample_idx}",
                 "prompt_idx": task_index,
                 "sample_idx": sample_idx,

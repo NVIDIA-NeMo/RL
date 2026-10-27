@@ -69,6 +69,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.timer import timeline_clock_id
 
 
 @ray.remote(num_cpus=0)
@@ -4302,6 +4303,8 @@ class TestReplayBufferRolloutLifecycle:
         assert buffered[0]["target_display_step"] == 6
         assert consumed[0]["consumed_display_step"] == 6
         assert consumed[0]["disposition"] == "consumed_as_targeted"
+        # Keys the host's clock_calibration.jsonl offset for these records.
+        assert {r["clock_id"] for r in records} == {timeline_clock_id()}
 
     def test_groups_without_a_task_index_write_nothing(self, tmp_path):
         path = str(tmp_path / "rollout_lifecycle.jsonl")
