@@ -397,12 +397,6 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
         )
         return
 
-    if generation["colocated"]["enabled"]:
-        out.violations.append(
-            "zero_train_gen_mismatch does not support colocated generation; set "
-            "policy.generation.colocated.enabled=false."
-        )
-
     inference_cfg = merged_inference_megatron_cfg(config)
     impl = inference_cfg.get("transformer_impl")
     if impl != "inference_optimized":
