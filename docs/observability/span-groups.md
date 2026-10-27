@@ -609,61 +609,25 @@ exists to fence off. Gating it on `rollout` instead would put that volume in
 dataset size. The group has to describe the volume, not the phase, even though
 these spans sit inside the rollout.
 
-Completing the trace on the server side needs Gym's own servers to export.
-Gym's app already calls `nemo.lens.contrib.fastapi.instrument_fastapi` from
-`instrument_app_for_telemetry`, and Gym already installs `nemo-lens` into every
-per-server venv — but both hang off the `telemetry:` block in Gym's global
-config, which `NemoGym._spinup` projects only when this process is itself
-exporting. Without that block the actor exports while every server stays
-silent, which is the one configuration that yields a trace with a hole in the
-middle of it.
+Gym's servers export their own spans whenever NeMo-RL is exporting; you don't
+need to set anything. To pass options to Gym's `telemetry:` block, set
+`env.nemo_gym.telemetry`, for example `{span_groups: "default,sandbox"}`.
 
-Set `env.nemo_gym.telemetry` to pass options through to that block, for example
-`{span_groups: "default,sandbox"}`; `enabled` defaults to true and an explicit
-`false` opts the Gym side out without disabling NeMo-RL's own telemetry.
-
-One thing to watch: `nemo-lens` reaches a server through its venv, and
-`skip_venv_if_present` — set in many shipped recipes, and by
-`examples/nemo_gym/prefetch_venvs.py` — reuses an existing venv without
-resolving dependencies again. A venv built before telemetry was enabled is
-therefore reused without `nemo-lens` in it, and those servers stay silent no
-matter what this block says. Rebuild or re-prefetch the venvs after turning
-telemetry on.
-
-Alongside the block, `_spinup` publishes this actor's job identity —
-`nv.dl.campaign.stage`, the slurm ids, `nemo.run.id` — into
-`OTEL_RESOURCE_ATTRIBUTES`, which Gym's servers inherit. Gym builds its
-servers' resource from `nemo.gym.*` and little else, so without this their
-spans carry no campaign stage and a pipeline keyed on it drops them while this
-actor's sail through.
-
-Per-process keys — `service.name`, `service.instance.id`, `nv.dl.rank`,
-`nv.dl.local_rank`, `nv.dl.world_size`, `process.pid` — are withheld, because
-Gym sets them for itself and nemo-lens resolves caller attributes over
-environment ones. So are `nv.dl.software.*`, which describe the training
-process's stack rather than a server venv's. Note that Gym reports every server
-as rank 0 of a world of 1, and lens then derives `service.instance.id` as
-`<run id>-rank0` for all of them, so every Gym server shares one
-`service.instance.id` until [Gym#5048](https://github.com/NVIDIA-NeMo/Gym/issues/5048)
-lands.
-
-The settings in this block configure the servers only. The actor's own span
-groups, exporter and endpoint come from `NEMO_RL_OTEL_*` as usual, and the two
-are set independently — a server-side `span_groups` does not change what the
-actor emits, or vice versa. Note also that `enabled: false` here stops NeMo-RL
-projecting the block, but does not override a `NEMO_LENS_ENABLED=1` already in
-the environment, which Gym reads directly.
-
-Gym's own span groups are a separate concern from its exporters, and one this
-repository does control. `GymSpanGroup` registers into nemo-lens's
-`SpanRegistry` as an import side effect, so `NemoGym.__init__` imports
-`nemo_gym.telemetry` before calling `init_telemetry_worker`. Registering later
-still resolves correctly — `SpanRegistry.register` re-resolves the spec against
-the updated registry — but lens warns that the namespace was not selectable when
-the spec was validated, and that warning reads like a fault. Group names share one flat namespace across
-libraries, so Gym's groups are named directly in `NEMO_RL_OTEL_SPAN_GROUPS` with
-no prefix — and `job` and `rollout` are registered by both libraries, so naming
-either enables it on both sides.
+- `enabled: false` turns off Gym's servers only. A `NEMO_LENS_ENABLED=1`
+  already in the environment still turns them on.
+- `span_groups` in this block controls Gym's servers and
+  `NEMO_RL_OTEL_SPAN_GROUPS` controls NeMo-RL's processes. A
+  `NEMO_GYM_OTEL_SPAN_GROUPS` or `NEMO_LENS_SPAN_GROUPS` in the environment
+  overrides the block.
+- `job` and `rollout` exist in both libraries, so naming either turns it on
+  for both.
+- Gym servers are named `nemo-rl/<server name>`; `service_name` in this block
+  has no effect.
+- If your recipe sets `skip_venv_if_present`, rebuild or re-prefetch Gym's
+  venvs after turning telemetry on. An older venv has no `nemo-lens`, so its
+  server sends nothing.
+- Known issue: all Gym servers share one `service.instance.id` until
+  [Gym#5100](https://github.com/NVIDIA-NeMo/Gym/pull/5100) merges.
 
 Two failure modes degrade quietly rather than breaking a rollout. Without
 `nemo-lens[aiohttp]` installed the constructor logs a warning once and Gym's
