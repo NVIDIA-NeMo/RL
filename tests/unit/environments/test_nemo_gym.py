@@ -2518,8 +2518,10 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
 def test_gym_span_groups_are_registered_before_telemetry_is_configured():
     """``nemo_gym.telemetry`` has to be imported before ``init_telemetry_worker``.
 
-    Groups that register after the spec is validated are never selectable, and
-    lens only warns, so the regression is silent at runtime.
+    Registering later still works -- ``SpanRegistry.register`` re-resolves the
+    spec -- but lens warns that the namespace was not selectable when the spec
+    was validated, which reads like a fault and sent one investigation down the
+    wrong path already.
 
     Asserted on the source because ``nemo_gym`` is an optional extra: where it
     is absent a runtime check would pass for the wrong reason.
@@ -2550,20 +2552,11 @@ def test_gym_span_groups_are_registered_before_telemetry_is_configured():
     )
 
 
-def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkeypatch):
-    """Gym's server venvs and per-server telemetry both hang off this block.
-
-    Omitting it is why the actor exported while all 100+ servers stayed silent.
-    It must stay omitted when this process is not exporting, so a telemetry-off
-    run resolves the same venvs it resolves today.
-    """
+def _fake_gym_run_helper(monkeypatch, gym_mod, gym_cli, gym_rollout_collection):
+    """Capture the global config `_spinup` hands to Gym, without starting one."""
     from unittest.mock import MagicMock
 
-    import nemo_gym.cli as gym_cli
-    import nemo_gym.rollout_collection as gym_rollout_collection
     from omegaconf import OmegaConf
-
-    import nemo_rl.environments.nemo_gym as nemo_gym_mod
 
     started = []
 
@@ -2578,16 +2571,44 @@ def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkey
 
     monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
     monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
-    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    monkeypatch.setattr(gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    return started
 
-    def spin_up(handle, **extra):
+
+@pytest.mark.nemo_gym
+def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkeypatch):
+    """Gym's server venvs and per-server telemetry both hang off this block.
+
+    Omitting it is why the actor exported while all 100+ servers stayed silent.
+    It must stay omitted when this process is not exporting, so a telemetry-off
+    run resolves the same venvs it resolves today.
+    """
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = _fake_gym_run_helper(
+        monkeypatch, nemo_gym_mod, gym_cli, gym_rollout_collection
+    )
+    # No resource, so no run id rides along and nothing is published to the
+    # environment. Stubbed rather than left to chance: an SDK tracer provider
+    # installed by an earlier test would otherwise change this test's result.
+    monkeypatch.setattr(nemo_gym_mod, "_actor_resource_attributes", dict)
+
+    def spin_up(handle, gym_config=None):
         monkeypatch.setattr(nemo_gym_mod, "get_telemetry_handle", lambda: handle)
-        cfg = {
-            "initial_global_config_dict": {},
-            "model_name": "policy",
-            "base_urls": ["http://127.0.0.1:1/v1"],
-            **extra,
-        }
+        # Through the real builder, because `env.nemo_gym.telemetry` reaches the
+        # actor inside the Gym config dict rather than as a NemoGymConfig field.
+        # A test that injected it at the top level would pass against a `_spinup`
+        # that never reads the user's block at all.
+        cfg = nemo_gym_mod._build_gym_actor_config(
+            dict(gym_config or {}),
+            base_urls=["http://127.0.0.1:1/v1"],
+            model_name="policy",
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
         NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
         return started[-1]
 
@@ -2598,18 +2619,20 @@ def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkey
     exporting = SimpleNamespace(is_exporting=True)
     assert spin_up(exporting)["telemetry"] == {"enabled": True}
 
-    # Overrides ride along, and win over the default -- an explicit
-    # enabled: false is how a run opts out without turning off RL's own.
-    configured = spin_up(exporting, telemetry={"span_groups": "default,sandbox"})
+    # A user block must be merged into, not replaced by, the projected one --
+    # Gym's `enabled` defaults to false, so dropping it silences every server.
+    configured = spin_up(exporting, {"telemetry": {"span_groups": "default,sandbox"}})
     assert configured["telemetry"] == {
         "enabled": True,
         "span_groups": "default,sandbox",
     }
-    assert spin_up(exporting, telemetry={"enabled": False})["telemetry"] == {
+    # An explicit false is how a run opts out without turning off RL's own.
+    assert spin_up(exporting, {"telemetry": {"enabled": False}})["telemetry"] == {
         "enabled": False
     }
 
 
+@pytest.mark.nemo_gym
 def test_spinup_forwards_job_identity_to_gym_servers_but_not_rank(monkeypatch):
     """Gym servers build their resource from `nemo.gym.*` and little else.
 
@@ -2619,48 +2642,49 @@ def test_spinup_forwards_job_identity_to_gym_servers_but_not_rank(monkeypatch):
     """
     import os
     from types import SimpleNamespace as NS
-    from unittest.mock import MagicMock
 
     import nemo_gym.cli as gym_cli
     import nemo_gym.rollout_collection as gym_rollout_collection
-    from opentelemetry import trace as otel_trace
 
     import nemo_rl.environments.nemo_gym as nemo_gym_mod
 
-    monkeypatch.setattr(gym_cli, "RunHelper", MagicMock())
-    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
-    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    started = _fake_gym_run_helper(
+        monkeypatch, nemo_gym_mod, gym_cli, gym_rollout_collection
+    )
     monkeypatch.setattr(
         nemo_gym_mod, "get_telemetry_handle", lambda: NS(is_exporting=True)
     )
     monkeypatch.setattr(
-        otel_trace,
-        "get_tracer_provider",
-        lambda: NS(
-            resource=NS(
-                attributes={
-                    "nv.dl.campaign.stage": "RL",
-                    "slurm.job.id": "1416252",
-                    "nemo.run.id": "a-run",
-                    "host.name": "node-0",
-                    "service.name": "nemo-rl",
-                    "service.instance.id": "a-run-rank0",
-                    "nv.dl.rank": "0",
-                    "nv.dl.world_size": "16",
-                    "process.pid": "2538227",
-                }
-            )
-        ),
+        nemo_gym_mod,
+        "_actor_resource_attributes",
+        lambda: {
+            "nv.dl.campaign.stage": "RL",
+            "slurm.job.id": "1416252",
+            "nemo.run.id": "a-run",
+            "host.name": "node-0",
+            "service.name": "nemo-rl",
+            "service.instance.id": "a-run-rank0",
+            "nv.dl.rank": "0",
+            "nv.dl.local_rank": "0",
+            "nv.dl.world_size": "16",
+            "process.pid": "2538227",
+            "nv.dl.software.torch": "2.9.0",
+        },
     )
-    monkeypatch.delenv("OTEL_RESOURCE_ATTRIBUTES", raising=False)
+    # setenv first: monkeypatch records nothing for a delenv of an unset name, and
+    # `_publish_gym_resource_identity` assigns os.environ directly, so without a
+    # recorded value the write would outlive this test and reach every later one.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+    monkeypatch.delenv("OTEL_RESOURCE_ATTRIBUTES")
 
-    NemoGym.__ray_metadata__.modified_class(
-        {
-            "initial_global_config_dict": {},
-            "model_name": "policy",
-            "base_urls": ["http://127.0.0.1:1/v1"],
-        }
-    )._spinup()
+    cfg = nemo_gym_mod._build_gym_actor_config(
+        {},
+        base_urls=["http://127.0.0.1:1/v1"],
+        model_name="policy",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+    NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
 
     from nemo.lens.resources.attributes import parse_otel_resource_attributes
 
@@ -2675,3 +2699,8 @@ def test_spinup_forwards_job_identity_to_gym_servers_but_not_rank(monkeypatch):
     # Everything a server must determine for itself stays behind.
     for per_process in nemo_gym_mod._GYM_PER_PROCESS_RESOURCE_KEYS:
         assert per_process not in published, per_process
+    assert "nv.dl.software.torch" not in published
+
+    # The same run id is handed to Gym, which otherwise mints its own and would
+    # group the servers under a different run than the actor.
+    assert started[-1]["telemetry"]["run_id"] == "a-run"

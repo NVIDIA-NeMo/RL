@@ -436,9 +436,6 @@ class NemoGymConfig(TypedDict):
     # nemo_rl.distributed.virtual_cluster.  See the port layout there.
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
-    # Merged into the `telemetry:` block _spinup projects into Gym's global
-    # config. Ignored unless this process is exporting.
-    telemetry: NotRequired[Dict[str, Any]]
     invalid_tool_call_patterns: NotRequired[
         List[str] | None
     ]  # Substrings in assistant text content that indicate an invalid tool call
@@ -800,18 +797,41 @@ def _shut_down_gym_servers(run_helper: Any) -> None:
                     raise
 
 
-# Withheld from the servers; everything else describes the job and is forwarded.
-# Gym sets rank, world size and pid for itself, and lens resolves caller
-# attributes over environment ones, so forwarding ours would be ignored anyway.
+# Withheld from the servers; everything else describes the job and is equally
+# true of its servers. Rank, world size and pid are Gym's to set -- it already
+# does, and lens resolves caller attributes over environment ones, so ours would
+# lose anyway. The service identity is withheld so each server keeps its own.
 _GYM_PER_PROCESS_RESOURCE_KEYS = frozenset(
     {
         "service.name",
         "service.instance.id",
         "nv.dl.rank",
+        "nv.dl.local_rank",
         "nv.dl.world_size",
         "process.pid",
     }
 )
+# Versions of the training process's stack, which a Gym server venv does not
+# share: it installs nemo-gym and its own dependencies, often without torch.
+_GYM_WITHHELD_RESOURCE_PREFIXES = ("nv.dl.software.",)
+
+
+def _actor_resource_attributes() -> Dict[str, str]:
+    """This actor's exported resource, or empty when telemetry is unavailable."""
+    try:
+        from opentelemetry import trace as otel_trace
+    except ImportError:
+        return {}
+
+    resource = getattr(otel_trace.get_tracer_provider(), "resource", None)
+    if resource is None:
+        return {}
+    return {str(key): str(value) for key, value in resource.attributes.items()}
+
+
+def _actor_run_id() -> str:
+    """The run id this actor reports, read back off the resource lens built."""
+    return _actor_resource_attributes().get("nemo.run.id", "")
 
 
 def _publish_gym_resource_identity() -> None:
@@ -825,17 +845,14 @@ def _publish_gym_resource_identity() -> None:
     """
     try:
         from nemo.lens.resources.attributes import extend_otel_resource_attributes
-        from opentelemetry import trace as otel_trace
     except ImportError:
         return
 
-    resource = getattr(otel_trace.get_tracer_provider(), "resource", None)
-    if resource is None:
-        return
     forwarded = {
-        key: str(value)
-        for key, value in resource.attributes.items()
+        key: value
+        for key, value in _actor_resource_attributes().items()
         if key not in _GYM_PER_PROCESS_RESOURCE_KEYS
+        and not key.startswith(_GYM_WITHHELD_RESOURCE_PREFIXES)
     }
     if not forwarded:
         return
@@ -854,9 +871,11 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         # Registers GymSpanGroup before init_telemetry_worker validates the
-        # span-group spec. Groups registered after that are never selectable,
-        # so every Gym span gate would return False for this process's life.
-        # Guarded: nemo_gym is an optional extra.
+        # span-group spec, which is what keeps lens from warning that Gym's
+        # namespace arrived late. The gates themselves recover either way --
+        # SpanRegistry.register re-resolves the spec -- so this is about not
+        # printing a warning that reads like a fault. Guarded: nemo_gym is an
+        # optional extra.
         try:
             import nemo_gym.telemetry  # noqa: F401
         except ImportError:
@@ -985,14 +1004,24 @@ class NemoGym(EnvironmentInterface):
         # servers stay silent while this actor exports. Omitted unless this
         # process is exporting, so telemetry-off runs build today's venvs. The
         # endpoint is inherited, so it is not restated here.
+        #
+        # Merged rather than setdefault: `env.nemo_gym.telemetry` arrives inside
+        # this dict, so a user who sets any option at all would otherwise own the
+        # whole block -- and `enabled` defaults to false on Gym's side, which is
+        # exactly the silence this is here to prevent. `enabled` goes under the
+        # user's keys so an explicit false still opts the Gym side out.
         telemetry_handle = get_telemetry_handle()
         if telemetry_handle is not None and telemetry_handle.is_exporting:
             from nemo_gym.telemetry.setup import TELEMETRY_KEY_NAME
 
-            initial_global_config_dict.setdefault(
-                TELEMETRY_KEY_NAME,
-                {"enabled": True, **(self.cfg.get("telemetry") or {})},
-            )
+            initial_global_config_dict[TELEMETRY_KEY_NAME] = {
+                "enabled": True,
+                # Gym mints its own run id from SLURM_JOB_ID or a random hex, and
+                # reads none of NeMo-RL's NEMO_RL_OTEL_* vars, so off SLURM the
+                # servers would group under a different run than the actor.
+                **({"run_id": run_id} if (run_id := _actor_run_id()) else {}),
+                **(initial_global_config_dict.get(TELEMETRY_KEY_NAME) or {}),
+            }
             _publish_gym_resource_identity()
 
         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
