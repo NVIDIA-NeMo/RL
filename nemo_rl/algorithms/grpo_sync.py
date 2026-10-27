@@ -46,6 +46,7 @@ import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
@@ -58,6 +59,7 @@ from nemo_rl.algorithms.grpo import (
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
+    _raise_if_per_turn_length_reweight,
     _resolve_logprob_skip_flags,
     _save_adaptive_loss_state,
     _should_log_nemo_gym_responses,
@@ -547,6 +549,7 @@ def grpo_train_sync(
             "want TransferQueue."
         )
     _raise_if_message_level_advantage_penalties_enabled(master_config)
+    _raise_if_per_turn_length_reweight(master_config)
     adv_estimator = _create_advantage_estimator(master_config)
 
     # Driver-side pad-value dict for materialize() — the wire emits
@@ -1099,6 +1102,9 @@ def grpo_train_sync(
                         env_baseline=env_baseline_for_log,
                         valid_mask=advantage_valid_mask,
                     )
+                    if isinstance(adv_estimator, GRPOAdvantageEstimator):
+                        # Positive length reweighting metrics; empty while disabled.
+                        metrics.update(adv_estimator.last_metrics)
                     del baseline_for_log, env_baseline_for_log
 
                 # ── Driver delta-write: advantages + (post-masking)

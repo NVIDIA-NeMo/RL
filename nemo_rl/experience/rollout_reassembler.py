@@ -44,7 +44,14 @@ import torch
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
+from nemo_rl.data_plane.schema import (
+    ACTION_MASK,
+    ASSISTANT_TURN_ID,
+    MASK_SAMPLE,
+    ROUTE_PLAN_TAG,
+    THINKING_MASK,
+    TRUNCATED,
+)
 from nemo_rl.data_plane.tq_token_sink import (
     FetchedStagedCall,
     StagedMediaTensors,
@@ -243,6 +250,57 @@ def _media_fields_for_group(rows: list[FinalizedRollout]) -> dict[str, PackedTen
     return stacked
 
 
+def resolve_turn_text_ids(
+    tokenizer: Any,
+    *,
+    think_open: str,
+    think_close: str,
+    tool_call_open: str,
+    tool_call_close: str,
+    end_of_turn: str,
+    require_thinking_tags: bool,
+) -> dict[str, Optional[int]]:
+    """Ids of the tags ``turn_text.turn_text_columns`` matches; each must be one token.
+
+    The capture path scans sampled token ids, so a tag the tokenizer splits into several tokens
+    could never match. The tool-call tags and the end-of-turn token are required. The thinking
+    tags are optional (None: no thinking span, so prose is all content) unless
+    ``require_thinking_tags`` (scope thinking_per_turn).
+    """
+
+    def single(tag: str) -> Optional[int]:
+        tid = tokenizer.convert_tokens_to_ids(tag)
+        unk = getattr(tokenizer, "unk_token_id", None)
+        if tid is None or (unk is not None and tid == unk):
+            return None
+        if list(tokenizer.encode(tag, add_special_tokens=False)) != [tid]:
+            return None
+        return int(tid)
+
+    ids = {
+        "think_open": single(think_open),
+        "think_close": single(think_close),
+        "tool_call_open": single(tool_call_open),
+        "tool_call_close": single(tool_call_close),
+        "end_of_turn": single(end_of_turn),
+    }
+    tags = {
+        "tool_call_open": tool_call_open,
+        "tool_call_close": tool_call_close,
+        "end_of_turn": end_of_turn,
+    }
+    if require_thinking_tags:
+        tags["think_close"] = think_close
+    missing = [tag for key, tag in tags.items() if ids[key] is None]
+    if missing:
+        raise ValueError(
+            "positive_length_reweight per-turn scopes need these tags to be single tokens of "
+            f"the policy tokenizer: {missing}. The token-capture path classifies sampled token "
+            "ids, so a tag split into several tokens cannot be located."
+        )
+    return ids
+
+
 class RolloutReassembler:
     """Receipts -> verified rows -> N-row publish, off the generation hot path."""
 
@@ -260,10 +318,19 @@ class RolloutReassembler:
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
         media_columns: Optional[MediaColumnSpec] = None,
+        turn_text_tokenizer: Optional[str] = None,
+        require_thinking_tags: bool = False,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
         self._effort_config = effort_config
         self._dp_client = dp_client
+        # grpo.adv_estimator.positive_length_reweight per-turn scopes: with a tokenizer name,
+        # every published group carries the assistant_turn_id / thinking_mask / action_mask
+        # columns (turn_text.turn_text_columns). require_thinking_tags (thinking_per_turn)
+        # makes a tokenizer without single-token thinking tags an error instead of "no thinking".
+        self._turn_text_tokenizer_name = turn_text_tokenizer
+        self._require_thinking_tags = require_thinking_tags
+        self._turn_text_ids: Optional[dict[str, Optional[int]]] = None
         self._partition_id = partition_id
         # Whether the staging partition carries media columns (setup's
         # ``token_capture.enabled and processor is not None``). Text-only runs
@@ -296,6 +363,73 @@ class RolloutReassembler:
         self._staging = TQTokenSink(
             dp_client, staging_partition=staging_partition, capture_media=capture_media
         )
+
+    def _resolve_turn_text_ids(self) -> dict[str, Optional[int]]:
+        """Single-token ids of the tags turn_text_columns scans for, checked once."""
+        if self._turn_text_ids is not None:
+            return self._turn_text_ids
+        from transformers import AutoTokenizer
+
+        from nemo_rl.experience.turn_text import END_OF_TURN, THINK_CLOSE, THINK_OPEN
+
+        tok = AutoTokenizer.from_pretrained(
+            self._turn_text_tokenizer_name, trust_remote_code=True
+        )
+        self._turn_text_ids = resolve_turn_text_ids(
+            tok,
+            think_open=THINK_OPEN,
+            think_close=THINK_CLOSE,
+            tool_call_open="<tool_call>",
+            tool_call_close="</tool_call>",
+            end_of_turn=END_OF_TURN,
+            require_thinking_tags=self._require_thinking_tags,
+        )
+        return self._turn_text_ids
+
+    def _turn_text_columns(
+        self,
+        rows: list[FinalizedRollout],
+        n: int,
+        max_len: int,
+        metrics: dict[str, float],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """[n, max_len] assistant_turn_id (int32, -1 outside turns) / thinking / action columns."""
+        from nemo_rl.experience.turn_text import turn_text_columns
+
+        ids = self._resolve_turn_text_ids()
+        turn_id = torch.full((n, max_len), -1, dtype=torch.int32)
+        thinking = torch.zeros((n, max_len), dtype=torch.bool)
+        action = torch.zeros((n, max_len), dtype=torch.bool)
+        totals = {
+            "turns": 0.0,
+            "thinking_tokens": 0.0,
+            "action_tokens": 0.0,
+            "content_tokens": 0.0,
+        }
+        for i, row in enumerate(rows):
+            if not row.valid:
+                continue
+            turns, think, act = turn_text_columns(
+                row.token_ids,
+                row.token_mask,
+                think_open_id=ids["think_open"],
+                think_close_id=ids["think_close"],
+                tool_call_open_id=cast(int, ids["tool_call_open"]),
+                tool_call_close_id=cast(int, ids["tool_call_close"]),
+                end_of_turn_id=cast(int, ids["end_of_turn"]),
+            )
+            length = len(row.token_ids)
+            turn_id[i, :length] = torch.tensor(turns, dtype=torch.int32)
+            thinking[i, :length] = torch.tensor(think, dtype=torch.bool)
+            action[i, :length] = torch.tensor(act, dtype=torch.bool)
+            in_turn = sum(1 for t in turns if t >= 0)
+            totals["turns"] += float(max(turns) + 1) if turns else 0.0
+            totals["thinking_tokens"] += float(sum(think))
+            totals["action_tokens"] += float(sum(act))
+            totals["content_tokens"] += float(in_turn - sum(think) - sum(act))
+        for key, value in totals.items():
+            metrics[f"finalize/turn_text/{key}"] = value
+        return turn_id, thinking, action
 
     # ── per rollout ─────────────────────────────────────────────────────────
 
@@ -821,6 +955,12 @@ class RolloutReassembler:
                 dtype=torch.bool,
             ),
         }
+        if self._turn_text_tokenizer_name:
+            (
+                train_batch[ASSISTANT_TURN_ID],
+                train_batch[THINKING_MASK],
+                train_batch[ACTION_MASK],
+            ) = self._turn_text_columns(rows, n, max_len, metrics)
         if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
             has_routed_row = any(r.valid and r.routed_experts is not None for r in rows)
             if not has_routed_row and self._routed_dims is None and not valid_rows:

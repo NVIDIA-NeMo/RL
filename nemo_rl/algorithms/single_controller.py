@@ -75,6 +75,7 @@ from ray.exceptions import RayActorError
 from wandb import Table
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import PositiveLengthReweightStats
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
     DATA_PLANE_CHECKPOINT_DIR,
@@ -783,6 +784,9 @@ class SingleControllerActor:
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
+        # This step's grpo.adv_estimator.positive_length_reweight statistics, merged from every
+        # advantage-stage call; None until a call reports some (the reweighting is off).
+        self._length_reweight_stats: Optional[PositiveLengthReweightStats] = None
         self._train_data_dump = (
             TrainDataDump(self._logger.base_log_dir)
             if self._async_cfg.log_full_train_data
@@ -3670,6 +3674,9 @@ class SingleControllerActor:
                 self._opd_stat_sum = 0.0
                 self._opd_stat_sumsq = 0.0
                 self._opd_stat_count = 0
+                if self._length_reweight_stats is not None:
+                    step_metrics.update(self._length_reweight_stats.to_metrics())
+                    self._length_reweight_stats = None
                 if self._teacher_coordinator is not None:
                     step_metrics.update(self._teacher_coordinator.drain_metrics())
 
@@ -5813,6 +5820,10 @@ class SingleControllerActor:
         self._opd_stat_sumsq += outcome.opd_stat_sumsq
         self._opd_stat_count += outcome.opd_stat_count
         self._opd_gap_sum += outcome.opd_gap_sum
+        if outcome.positive_length_reweight_stats is not None:
+            if self._length_reweight_stats is None:
+                self._length_reweight_stats = PositiveLengthReweightStats.empty()
+            self._length_reweight_stats.merge(outcome.positive_length_reweight_stats)
         if outcome.train_data_dump_s:
             # Recorded rather than timed here: the serialization ran wherever
             # the stage ran, which with a pool is not this process.

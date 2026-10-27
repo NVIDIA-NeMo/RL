@@ -1839,3 +1839,91 @@ def test_effort_uses_terminal_call_with_carries_and_abandoned_branch(
         assert actual.token_ids == full_tokens
         assert actual.token_mask == masks
         assert actual.logprobs == logprobs
+
+
+def test_finalize_group_publishes_turn_text_columns(tq_client):
+    """With a turn-text tokenizer, every published group carries the per-turn token classes."""
+    from nemo_rl.data_plane.schema import ACTION_MASK, ASSISTANT_TURN_ID, THINKING_MASK
+
+    fields = [
+        "input_ids",
+        "input_lengths",
+        "generation_logprobs",
+        "token_mask",
+        "sample_mask",
+        "prompt_ids_for_adv",
+        "total_reward",
+        "mask_sample",
+        "truncated",
+        ASSISTANT_TURN_ID,
+        THINKING_MASK,
+        ACTION_MASK,
+    ]
+    tq_client.register_partition(
+        partition_id=STAGING_PARTITION,
+        fields=list(STAGING_FIELDS),
+        num_samples=64,
+        consumer_tasks=["finalize"],
+    )
+    tq_client.register_partition(
+        partition_id=CANONICAL_PARTITION,
+        fields=fields,
+        num_samples=64,
+        consumer_tasks=["train"],
+    )
+    try:
+        group_id = "grpt"
+        receipt, expected = _stage_fixture(
+            tq_client, "worked_example", rollout_id=f"{group_id}_g0"
+        )
+        receipt["rollout_id"] = f"{group_id}_g0"
+        finalizer = _finalizer(tq_client, turn_text_tokenizer="fake")
+        # The fixture's last generated token of every turn plays end-of-turn; no thinking tags.
+        ids, mask = list(expected.token_ids), list(expected.token_mask)
+        ends = [
+            k
+            for k in range(len(ids))
+            if mask[k] and (k + 1 == len(ids) or not mask[k + 1])
+        ]
+        eos = ids[ends[0]]
+        finalizer._turn_text_ids = {
+            "think_open": None,
+            "think_close": None,
+            "tool_call_open": -1,
+            "tool_call_close": -2,
+            "end_of_turn": eos,
+        }
+        finalized = finalizer.finalize_group(
+            group_id,
+            [f"{group_id}_g0", f"{group_id}_g1"],
+            [receipt, None],
+            [1.0, 0.0],
+            mask_sample=[False, False],
+            fallback_weight_version=1,
+            prompt_idx=0,
+            loss_multiplier=1.0,
+        )
+        assert finalized.metrics["finalize/turn_text/turns"] >= 1
+        assert finalized.metrics["finalize/turn_text/thinking_tokens"] == 0
+        rows = tq_client.get_samples(
+            sample_ids=[f"{group_id}_g0", f"{group_id}_g1"],
+            partition_id=CANONICAL_PARTITION,
+            select_fields=["token_mask", ASSISTANT_TURN_ID, THINKING_MASK, ACTION_MASK],
+        )
+        n = len(ids)
+        token_mask = torch.as_tensor(rows["token_mask"][0]).flatten()[:n].bool()
+        turn = torch.as_tensor(rows[ASSISTANT_TURN_ID][0]).flatten()[:n]
+        action = torch.as_tensor(rows[ACTION_MASK][0]).flatten()[:n].bool()
+        assert torch.equal(turn >= 0, token_mask)
+        assert not torch.as_tensor(rows[THINKING_MASK][0]).bool().any()
+        expected_action = torch.tensor(
+            [
+                bool(mask[k]) and ids[k] == eos and (k + 1 == n or not mask[k + 1])
+                for k in range(n)
+            ]
+        )
+        assert torch.equal(action, expected_action)
+        # The placeholder row has no turns.
+        assert not (torch.as_tensor(rows[ASSISTANT_TURN_ID][1]) >= 0).any()
+    finally:
+        tq_client.clear_samples(sample_ids=None, partition_id=STAGING_PARTITION)

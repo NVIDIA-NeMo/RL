@@ -506,6 +506,9 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         # disk shard-side.
         "train_data_dump_s",
         "train_data_dump_rows",
+        # A fixed dozen numbers (group counts, weight sum/min/max, three
+        # bucket masses before and after), not per-row data.
+        "positive_length_reweight_stats",
     }
 
 
