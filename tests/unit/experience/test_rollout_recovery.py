@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 from collections.abc import Callable
 from typing import Any, TypeVar
@@ -1054,10 +1055,26 @@ def test_turn_restore_target_is_persisted_separately_from_live_retry() -> None:
     assert restored.restore_level is RecoveryTargetLevel.TURN
 
 
+def _pre_turn_recovery_state(state: dict[str, Any], version: int) -> dict[str, Any]:
+    """Return ``state`` as schema 2 or 3 wrote it, before turn-level recovery."""
+    old = copy.deepcopy(state)
+    old["schema_version"] = version
+    for group in old["groups"]:
+        group["recovery_granularity"] = group.pop("restore_level")
+        for sibling in group["siblings"]:
+            for attempt in sibling["attempts"]:
+                del attempt["gym_instance_id"], attempt["gym_attempt"]
+    return old
+
+
 @pytest.mark.parametrize("schema_version", [2, 3])
-def test_old_rollout_recovery_schemas_are_rejected(
-    schema_version: int,
+@pytest.mark.parametrize(
+    "level", [RecoveryTargetLevel.SIBLING, RecoveryTargetLevel.PROMPT_GROUP]
+)
+def test_pre_turn_recovery_schemas_upgrade(
+    schema_version: int, level: RecoveryTargetLevel
 ) -> None:
+    """A checkpoint from before turn-level recovery keeps its retry unit."""
     ledger = RolloutRecoveryLedger()
     _reserve(
         ledger,
@@ -1068,15 +1085,47 @@ def test_old_rollout_recovery_schemas_are_rejected(
         expected_generations=1,
         target_step=7,
         start_weight_version=6,
-        restore_level=RecoveryTargetLevel.SIBLING,
+        restore_level=level,
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    current = ledger.state_dict()
 
-    state = ledger.state_dict()
-    state["schema_version"] = schema_version
+    restored = RolloutRecoveryLedger.from_state_dict(
+        _pre_turn_recovery_state(current, schema_version)
+    )
 
-    with pytest.raises(ValueError, match="Unsupported rollout-recovery schema"):
+    group = restored.get_group("g7")
+    assert group.restore_level is level
+    attempt = group.siblings[0].current_attempt
+    assert (attempt.gym_instance_id, attempt.gym_attempt) == (None, 0)
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict() == current
+
+
+@pytest.mark.parametrize("schema_version", [2, 3])
+@pytest.mark.parametrize(
+    "damage, match",
+    [
+        ("restore_level", "must record recovery_granularity"),
+        ("gym_attempt", "cannot carry Gym turn state"),
+        ("turn", "invalid recovery_granularity"),
+    ],
+)
+def test_pre_turn_recovery_schemas_refuse_turn_recovery_state(
+    schema_version: int, damage: str, match: str
+) -> None:
+    """Turn-level state cannot come from a schema that predates it."""
+    state = _pre_turn_recovery_state(_sealed_attempt_state(), schema_version)
+    group = state["groups"][0]
+    if damage == "restore_level":
+        group["restore_level"] = group["recovery_granularity"]
+    elif damage == "gym_attempt":
+        group["siblings"][0]["attempts"][0]["gym_attempt"] = 0
+    else:
+        group["recovery_granularity"] = "turn"
+
+    with pytest.raises(ValueError, match=match):
         RolloutRecoveryLedger.from_state_dict(state)
 
 
@@ -1507,7 +1556,8 @@ def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
 @pytest.mark.parametrize("version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> None:
     state = _sealed_attempt_state()
-    state["schema_version"] = version
+    if version != ROLLOUT_RECOVERY_SCHEMA_VERSION:
+        state = _pre_turn_recovery_state(state, version)
     for group in state["groups"]:
         group.pop("resolved_agent_name", None)
     ledger = RolloutRecoveryLedger.from_state_dict(state)
