@@ -42,6 +42,8 @@ set -euo pipefail
 #   EXTERNAL_VLLM_SEGMENT_SIZE=             Segment size for the external
 #                                          service hetgroup; legacy
 #                                          GENRM_SEGMENT_SIZE is also accepted
+#   GENRM_FLASHINFER_ALLREDUCE_BACKEND=     Defaults to mnnvl for multi-node TP,
+#                                          trtllm for single-node TP (GB200)
 #   NL2BASH_REPLICAS=4                      Independent external judge servers
 #   NL2BASH_TENSOR_PARALLEL_SIZE=4          TP per external judge server
 #   BATCH_SCRIPT=ray.sub                    Slurm entrypoint; external services
@@ -155,9 +157,18 @@ register_external_vllm_pool GENRM \
   --lb-port "${GENRM_LB_PORT}" \
   --startup-timeout "${GENRM_STARTUP_TIMEOUT}" \
   --url-placeholder "${GENRM_BASE_URL}"
+# trtllm all-reduce is single-node only. These GB200 replicas use MNNVL
+# when TP spans nodes; keep the single-node default and allow an override.
+if [[ -z "${GENRM_FLASHINFER_ALLREDUCE_BACKEND:-}" ]]; then
+  if (( GENRM_TENSOR_PARALLEL_SIZE > ${GPUS_PER_NODE:-4} )); then
+    GENRM_FLASHINFER_ALLREDUCE_BACKEND=mnnvl
+  else
+    GENRM_FLASHINFER_ALLREDUCE_BACKEND=trtllm
+  fi
+fi
 external_vllm_pool_env GENRM \
   "FLASHINFER_WORKSPACE_BASE=/tmp" \
-  "VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm" \
+  "VLLM_FLASHINFER_ALLREDUCE_BACKEND=${GENRM_FLASHINFER_ALLREDUCE_BACKEND}" \
   "VLLM_ALLREDUCE_USE_SYMM_MEM=0"
 genrm_vllm_args=(
   --trust-remote-code

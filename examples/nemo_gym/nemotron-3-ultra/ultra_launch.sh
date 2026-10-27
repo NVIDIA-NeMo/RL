@@ -48,6 +48,8 @@ set -euo pipefail
 #                                          Slurm hetgroup instead of inside Gym
 #   GENRM_REPLICAS=4                       External GenRM servers (DP=1 each)
 #   GENRM_TENSOR_PARALLEL_SIZE=4           TP per external GenRM server
+#   GENRM_FLASHINFER_ALLREDUCE_BACKEND=    Defaults to mnnvl for multi-node TP,
+#                                         trtllm for single-node TP (GB200)
 #   GENRM_REASONING_PARSER=                Reasoning-parser plugin .py; only
 #                                          needed for a parser vLLM lacks
 #   GENRM_REASONING_PARSER_NAME=nemotron_v3
@@ -228,9 +230,18 @@ if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
     --startup-timeout "${GENRM_STARTUP_TIMEOUT}" \
     --url-placeholder "${GENRM_BASE_URL}" \
     ${GENRM_REASONING_PARSER:+--shared-path "${GENRM_REASONING_PARSER}"}
+  # trtllm all-reduce is single-node only. These GB200 replicas use MNNVL
+  # when TP spans nodes; keep the single-node default and allow an override.
+  if [[ -z "${GENRM_FLASHINFER_ALLREDUCE_BACKEND:-}" ]]; then
+    if (( GENRM_TENSOR_PARALLEL_SIZE > GPUS_PER_NODE )); then
+      GENRM_FLASHINFER_ALLREDUCE_BACKEND=mnnvl
+    else
+      GENRM_FLASHINFER_ALLREDUCE_BACKEND=trtllm
+    fi
+  fi
   external_vllm_pool_env GENRM \
     "FLASHINFER_WORKSPACE_BASE=/tmp" \
-    "VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm" \
+    "VLLM_FLASHINFER_ALLREDUCE_BACKEND=${GENRM_FLASHINFER_ALLREDUCE_BACKEND}" \
     "VLLM_ALLREDUCE_USE_SYMM_MEM=0"
   genrm_vllm_args=(
     --trust-remote-code
