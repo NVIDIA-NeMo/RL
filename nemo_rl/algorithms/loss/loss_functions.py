@@ -205,6 +205,8 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     #   "adaptive-ppo-clip" – advantage-aware token filtering with an
     #                         entropy-adaptive upper bound
     #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
+    #   "ipo"          – zero out tokens whose train/inference probability gap exceeds the ratio
+    #                    https://github.com/PrimeIntellect-ai/prime-rl/blob/2eb8e83aaf0db0a6ac51a095f20a43572731c479/docs/ipo.md
     truncated_importance_sampling_type: Optional[str] = None
     truncated_importance_sampling_ratio: Optional[float] = None
     # Lower bound for TIS clipping, or ICE-POP / adaptive-ppo-clip /
@@ -380,7 +382,7 @@ class ClippedPGLossFn(LossFunction):
         self.kl_output_clamp_value = cfg.kl_output_clamp_value
         self.use_importance_sampling_correction = cfg.use_importance_sampling_correction
         # Type of truncated importance sampling:
-        # "tis" | "icepop" | "adaptive-ppo-clip" | "seq-mask-tis"
+        # "tis" | "icepop" | "adaptive-ppo-clip" | "seq-mask-tis" | "ipo"
         self.truncated_importance_sampling_type = cfg.truncated_importance_sampling_type
         self.truncated_importance_sampling_ratio = (
             cfg.truncated_importance_sampling_ratio
@@ -445,6 +447,9 @@ class ClippedPGLossFn(LossFunction):
             assert self.loss_type == LossType.TOKEN_LEVEL, (
                 "use_cispo requires token_level_loss=True (LossType.TOKEN_LEVEL)."
             )
+            assert self.truncated_importance_sampling_type != "ipo", (
+                "use_cispo does not support truncated_importance_sampling_type='ipo'"
+            )
         if self.truncated_importance_sampling_type is not None:
             assert self.use_importance_sampling_correction, (
                 "truncated importance sampling is only supported when use_importance_sampling_correction is True"
@@ -454,9 +459,10 @@ class ClippedPGLossFn(LossFunction):
                 "icepop",
                 "adaptive-ppo-clip",
                 "seq-mask-tis",
+                "ipo",
             ), (
                 "truncated_importance_sampling_type must be 'tis', 'icepop', "
-                "'adaptive-ppo-clip', or 'seq-mask-tis', "
+                "'adaptive-ppo-clip', 'seq-mask-tis', or 'ipo', "
                 f"got {self.truncated_importance_sampling_type}"
             )
             assert (
@@ -480,6 +486,10 @@ class ClippedPGLossFn(LossFunction):
                     "truncated_importance_sampling_ratio_min should be set when "
                     "truncated_importance_sampling_type is 'icepop', "
                     "'adaptive-ppo-clip', or 'seq-mask-tis'"
+                )
+            if self.truncated_importance_sampling_type == "ipo":
+                assert not self.sequence_level_importance_ratios, (
+                    "ipo does not support sequence_level_importance_ratios=True"
                 )
             if self.truncated_importance_sampling_type == "seq-mask-tis":
                 assert not self.sequence_level_importance_ratios, (
@@ -575,7 +585,7 @@ class ClippedPGLossFn(LossFunction):
             }
         if self.truncated_importance_sampling_type is not None:
             # Keyed on the TIS type, NOT loss_type: seq-mask-tis masks whole
-            # sequences (÷ global_valid_seqs); tis/icepop/adaptive-ppo-clip
+            # sequences (÷ global_valid_seqs); tis/icepop/adaptive-ppo-clip/ipo
             # are token-level.
             self.metric_normalizations["is_oob_ratio"] = (
                 MetricNormalizer.SEQUENCES
@@ -839,7 +849,7 @@ class ClippedPGLossFn(LossFunction):
         # -------------------------------------------------------------
         # Off-policy (actor) importance-sampling correction
         # -------------------------------------------------------------
-        _is_filter_metrics: dict = {}  # populated for tis / icepop / adaptive-ppo-clip / seq-mask-tis
+        _is_filter_metrics: dict = {}  # populated for tis / icepop / adaptive-ppo-clip / seq-mask-tis / ipo
         # See: docs/guides/grpo.md#importance-sampling-correction
         if not need_importance_weights:
             # No objective or emitted metric needs the actor/generation
@@ -874,7 +884,9 @@ class ClippedPGLossFn(LossFunction):
         #                  IS ratio ∉ [min, max]; retained sequences keep
         #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.999–1.002)
         #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
-        # is_oob_ratio: fraction of tokens (tis/icepop/adaptive-ppo-clip) or sequences (seq-mask-tis)
+        # "ipo"          – zero out tokens whose probability gap exceeds max   (ref: 0.3)
+        #   Docs: https://github.com/PrimeIntellect-ai/prime-rl/blob/2eb8e83aaf0db0a6ac51a095f20a43572731c479/docs/ipo.md
+        # is_oob_ratio: fraction of tokens (tis/icepop/adaptive-ppo-clip/ipo) or sequences (seq-mask-tis)
         # whose importance weight falls outside the truncation bounds. Each microbatch
         # contributes its out-of-bounds count divided by the *global* valid token/seq
         # count, so the np.sum aggregation in grpo.py recovers the correct global fraction.
@@ -906,6 +918,28 @@ class ClippedPGLossFn(LossFunction):
                 ) & (
                     actor_importance_weights_expanded
                     <= self.truncated_importance_sampling_ratio
+                )
+                _is_filter_metrics = {
+                    "is_oob_ratio": masked_mean(
+                        (~token_kept_mask).float(),
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ),
+                }
+                actor_importance_weights_expanded = torch.where(
+                    token_kept_mask,
+                    actor_importance_weights_expanded,
+                    torch.zeros_like(actor_importance_weights_expanded),
+                )
+            elif self.truncated_importance_sampling_type == "ipo":
+                # |exp(a) - exp(b)| without cancellation, as in prime-rl
+                larger_logprobs = torch.maximum(prev_logprobs, generation_logprobs)
+                smaller_logprobs = torch.minimum(prev_logprobs, generation_logprobs)
+                probs_gap = torch.exp(larger_logprobs) * -torch.expm1(
+                    smaller_logprobs - larger_logprobs
+                )
+                token_kept_mask = ~(
+                    probs_gap > self.truncated_importance_sampling_ratio
                 )
                 _is_filter_metrics = {
                     "is_oob_ratio": masked_mean(
