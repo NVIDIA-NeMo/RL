@@ -17,6 +17,7 @@
 import json
 import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -34,6 +35,45 @@ class DebugWriterConfig(BaseModel, extra="allow"):
     target: str = "json"
 
 
+@dataclass(frozen=True)
+class TrainChunk:
+    """One chunk of per-sample training columns handed to a DebugWriter.
+
+    Attributes:
+        step: Optimizer step the rows belong to.
+        sample_ids: One id per sample in the chunk.
+        tags: Per-sample metadata dicts, or None for empty metadata.
+        input_lengths: Valid token count per sample, used to trim sequence columns.
+        sequences: Per-sample columns trimmed to input_lengths, such as token ids
+            and advantages.
+        scalars: Per-sample columns written as given; variable-length values must
+            be jagged tensors rather than padded.
+    """
+
+    step: int
+    sample_ids: list[str]
+    tags: list[dict[str, Any]] | None
+    input_lengths: torch.Tensor
+    sequences: dict[str, torch.Tensor]
+    scalars: dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class ChunkReceipt:
+    """What one add_chunk call stored, handed to the controller for finish_step.
+
+    Attributes:
+        shard_id: Id of the shard whose writer stored the chunk.
+        rows: Number of rows stored.
+        ref: Writer-specific location of the stored rows, such as a part file path
+            or an object key.
+    """
+
+    shard_id: str
+    rows: int
+    ref: Any
+
+
 class DebugWriter(ABC):
     """Base class for writers that store a step's training rows chunk by chunk.
 
@@ -48,97 +88,90 @@ class DebugWriter(ABC):
         self.step: int | None = None
         self.rows: int = 0
 
-    def add_chunk(
-        self,
-        *,
-        step: int,
-        sample_ids: list[str],
-        tags: list[dict[str, Any]] | None,
-        input_lengths: torch.Tensor,
-        sequences: dict[str, torch.Tensor],
-        scalars: dict[str, torch.Tensor],
-    ) -> None:
+    def add_chunk(self, chunk: TrainChunk) -> ChunkReceipt:
         """Validate one chunk of per-sample rows and write it to storage.
 
         The first chunk of a step replaces any rows already stored for it; later
         chunks append to them.
 
         Args:
-            step: Optimizer step the rows belong to.
-            sample_ids: One id per sample in the chunk.
-            tags: Per-sample metadata dicts, or None for empty metadata.
-            input_lengths: Valid token count per sample, used to trim sequence columns.
-            sequences: Per-sample columns trimmed to input_lengths, such as token ids
-                and advantages.
-            scalars: Per-sample columns written as given; variable-length values must
-                be jagged tensors rather than padded.
+            chunk: The chunk's step and per-sample columns.
+
+        Returns:
+            The receipt for the stored rows, to be passed on to finish_step.
         """
         # unbind() splits dense and jagged columns alike into per-row tensors.
         columns = {
             k: list(v.detach().cpu().unbind())
-            for k, v in {**sequences, **scalars}.items()
+            for k, v in {**chunk.sequences, **chunk.scalars}.items()
         }
 
         # Validate column lengths
-        lengths = input_lengths.detach().cpu().reshape(-1).tolist()
+        lengths = chunk.input_lengths.detach().cpu().reshape(-1).tolist()
         if (
-            len(lengths) != len(sample_ids)
-            or any(len(v) != len(sample_ids) for v in columns.values())
-            or (tags is not None and len(tags) != len(sample_ids))
+            len(lengths) != len(chunk.sample_ids)
+            or any(len(v) != len(chunk.sample_ids) for v in columns.values())
+            or (chunk.tags is not None and len(chunk.tags) != len(chunk.sample_ids))
         ):
             raise ValueError("Training dump column lengths do not match sample ids")
         for i, length in enumerate(lengths):
-            if length < 0 or any(length > columns[k][i].shape[0] for k in sequences):
+            if length < 0 or any(
+                length > columns[k][i].shape[0] for k in chunk.sequences
+            ):
                 raise ValueError("Training dump input length exceeds a sequence column")
 
         # Truncate on the first chunk of a step so a retried step replaces its
         # rows instead of appending a second copy to the previous attempt's.
-        is_first_chunk = self.step != step
+        is_first_chunk = self.step != chunk.step
         if is_first_chunk:
             self.rows = 0
-        self.step = step
+        self.step = chunk.step
 
         # Write rows
         def _iter_rows() -> Iterable[dict[str, Any]]:
             for i, length in enumerate(lengths):
                 row = {
-                    "step": step + 1,
-                    "sample_id": [sample_ids[i]],
+                    "step": chunk.step + 1,
+                    "sample_id": [chunk.sample_ids[i]],
                     "input_lengths": [length],
-                    "metadata": [tags[i] if tags is not None else {}],
+                    "metadata": [chunk.tags[i] if chunk.tags is not None else {}],
                 }
-                for key in sequences:
+                for key in chunk.sequences:
                     row[key] = [columns[key][i][:length].tolist()]
-                for key in scalars:
+                for key in chunk.scalars:
                     row[key] = [columns[key][i].tolist()]
                 yield row
 
-        self.rows += self._write_rows(
-            step=step,
+        receipt = self._write_rows(
+            step=chunk.step,
             rows=_iter_rows(),
             replace=is_first_chunk,
         )
+        self.rows += receipt.rows
+        return receipt
 
-    def finish_step(self, step: int, expected_rows: int | None = None) -> None:
+    def finish_step(
+        self, step: int, receipts: list[ChunkReceipt] | None = None
+    ) -> None:
         """Publish a completed optimizer step and reset the per-step state.
 
         Args:
             step: The completed optimizer step.
-            expected_rows: Rows the shards reported writing, checked against the
-                rows published.
+            receipts: Receipts of the chunks the shards stored for this step, whose
+                row counts are checked against the rows published.
         """
-        self._publish_step(step, expected_rows)
+        self._publish_step(step, receipts)
         self.step = None
         self.rows = 0
 
     @abstractmethod
     def _write_rows(
         self, step: int, rows: Iterable[dict[str, Any]], replace: bool
-    ) -> int:
-        """Write one chunk's rows to storage and return how many were written."""
+    ) -> ChunkReceipt:
+        """Write one chunk's rows to storage and return the receipt for them."""
 
     @abstractmethod
-    def _publish_step(self, step: int, expected_rows: int | None) -> None:
+    def _publish_step(self, step: int, receipts: list[ChunkReceipt] | None) -> None:
         """Publish a completed step's rows, raising on a row-count mismatch."""
 
 
@@ -152,7 +185,7 @@ class JsonDebugWriter(DebugWriter):
 
     def _write_rows(
         self, step: int, rows: Iterable[dict[str, Any]], replace: bool
-    ) -> int:
+    ) -> ChunkReceipt:
         """Write the rows to this shard's part file, starting it over if replace is set."""
         self.log_dir.mkdir(parents=True, exist_ok=True)
         part = self.log_dir / f"train_data_step{step + 1}.jsonl.part-{self.shard_id}"
@@ -165,9 +198,9 @@ class JsonDebugWriter(DebugWriter):
                     json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n"
                 )
                 num_rows += 1
-        return num_rows
+        return ChunkReceipt(shard_id=self.shard_id, rows=num_rows, ref=str(part))
 
-    def _publish_step(self, step: int, expected_rows: int | None) -> None:
+    def _publish_step(self, step: int, receipts: list[ChunkReceipt] | None) -> None:
         """Merge the shards' part files into one JSONL file and publish it atomically."""
         parts = sorted(self.log_dir.glob(f"train_data_step{step + 1}.jsonl.part-*"))
         if not parts:
@@ -186,6 +219,9 @@ class JsonDebugWriter(DebugWriter):
         if not rows:
             partial.unlink()
             raise RuntimeError("Completed optimizer step has no training dump")
+        expected_rows = (
+            sum(receipt.rows for receipt in receipts) if receipts is not None else None
+        )
         if expected_rows is not None and rows != expected_rows:
             partial.unlink()
             raise RuntimeError(

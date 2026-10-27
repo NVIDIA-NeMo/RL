@@ -127,7 +127,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
 )
-from nemo_rl.algorithms.single_controller_utils.debug_writer import make_debug_writer
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    ChunkReceipt,
+    make_debug_writer,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
@@ -788,8 +791,8 @@ class SingleControllerActor:
             if self._async_cfg.log_full_train_data
             else None
         )
-        # Rows the stage reported writing this step, across every shard.
-        self._train_data_dump_rows = 0
+        # Receipts of the chunks the stage stored this step, across every shard.
+        self._train_data_dump_receipts: list[ChunkReceipt] = []
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -3678,9 +3681,9 @@ class SingleControllerActor:
                         await asyncio.to_thread(
                             self._train_data_dump.finish_step,
                             self._train_steps,
-                            self._train_data_dump_rows,
+                            self._train_data_dump_receipts,
                         )
-                    self._train_data_dump_rows = 0
+                    self._train_data_dump_receipts = []
 
                 if not early_refit_done:
                     self._trainer_version += 1
@@ -5820,7 +5823,8 @@ class SingleControllerActor:
             self._timer.record(
                 "train_data_dump", outcome.train_data_dump_s, should_log=False
             )
-        self._train_data_dump_rows += outcome.train_data_dump_rows
+        if outcome.train_data_dump_receipt is not None:
+            self._train_data_dump_receipts.append(outcome.train_data_dump_receipt)
 
     # ── utility helpers ────────────────────────────────────────────────────
 

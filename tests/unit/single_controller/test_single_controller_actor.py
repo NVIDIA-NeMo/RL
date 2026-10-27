@@ -68,7 +68,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    JsonDebugWriter,
+    TrainChunk,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
@@ -271,7 +274,7 @@ def _stamp_advantage_stage_config(
         advantage_estimator=ctrl._advantage_estimator,
     )
     ctrl._train_data_dump = dump
-    ctrl._train_data_dump_rows = 0
+    ctrl._train_data_dump_receipts = []
     # _absorb_advantage_outcome accumulates into these unconditionally, so they
     # have to exist even for the non-OPD tests. Tests that assert on them set
     # their own values after this call.
@@ -4241,19 +4244,21 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
     final = tmp_path / "train_data_step1.jsonl"
     if dump_enabled:
         ctrl._train_data_dump = JsonDebugWriter(str(tmp_path))
-        ctrl._train_data_dump.add_chunk(
-            step=0,
-            sample_ids=meta.sample_ids,
-            tags=meta.tags,
-            input_lengths=torch.tensor([1, 1]),
-            sequences={"token_ids": torch.tensor([[10], [20]])},
-            scalars={},
+        receipt = ctrl._train_data_dump.add_chunk(
+            TrainChunk(
+                step=0,
+                sample_ids=meta.sample_ids,
+                tags=meta.tags,
+                input_lengths=torch.tensor([1, 1]),
+                sequences={"token_ids": torch.tensor([[10], [20]])},
+                scalars={},
+            )
         )
         # Seed chunk-write time to verify publication adds to the per-step sum.
         ctrl._timer.record("train_data_dump", 2.0)
         # The chunk above stands in for the stage's write, so stand in for the
-        # row count it would have reported alongside it too.
-        ctrl._train_data_dump_rows = len(meta.sample_ids)
+        # receipt it would have reported alongside it too.
+        ctrl._train_data_dump_receipts = [receipt]
 
     def finish_training() -> dict:
         assert not final.exists()

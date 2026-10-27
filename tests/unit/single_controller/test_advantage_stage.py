@@ -502,10 +502,10 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "opd_stat_sumsq",
         "opd_stat_count",
         "opd_gap_sum",
-        # A duration and a count, not the rows: the dump itself went to
+        # A duration and a receipt, not the rows: the dump itself went to
         # disk shard-side.
         "train_data_dump_s",
-        "train_data_dump_rows",
+        "train_data_dump_receipt",
     }
 
 
@@ -656,7 +656,7 @@ def _controller(
     )
     ctrl._train_data_dump = JsonDebugWriter(dump_dir) if dump_dir is not None else None
     ctrl._timer = Timer()
-    ctrl._train_data_dump_rows = 0
+    ctrl._train_data_dump_receipts = []
     ctrl._train_steps = 0
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._advantage_actors = [
@@ -789,7 +789,7 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     store = _RowStore(_rows())
     ctrl = _controller("grpo", num_actors, store, dump_dir=str(tmp_path))
     asyncio.run(ctrl._advantage_stage(_pool_meta()))
-    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_rows)
+    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
 
     rows = [
         json.loads(line)
