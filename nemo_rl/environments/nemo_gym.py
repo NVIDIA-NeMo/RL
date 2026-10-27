@@ -1412,21 +1412,24 @@ Depending on your data shape, you may want to change these values."""
         chain.
 
         Poisoning is fail-closed with one carve-out. A failure row whose
-        reason is ``request_finished_without_staged_coordinates`` is a call
-        that never returned a completion (the ledger commit precedes the
-        response leaving the server) and can never be a lineage parent (an
-        uncommitted call has no row to resolve against) — e.g. the doomed
-        final call of a rollout that exhausted the model's context window.
-        Such rows are structurally off-chain and do not poison; if the
-        *terminal* request itself died this way, the missing-terminal-row
-        check below still masks the rollout. Every other failure reason
-        (for example ``worker_capture_failed``,
+        reason is one of Gym's ``UNSERVED_CALL_FAILURE_REASONS`` marks a call
+        that never returned a completion: the call finished without staged
+        coordinates (the ledger commit precedes the response leaving the
+        server), or the engine refused the request before generating, for
+        example because the prompt no longer fit the context window. Such a
+        call can never be a lineage parent (an unserved call has no row to
+        resolve against), so these rows are structurally off-chain and do not
+        poison; if the *terminal* request itself ended this way, the
+        missing-terminal-row check below still masks the rollout. A Gym that
+        exports no such set names only the uncommitted-call reason, and the
+        fallback below applies that rule on such a Gym. Every other failure
+        reason (for example ``worker_capture_failed``,
         ``invalid_worker_commit_coordinates``, or ``unresolved_parent``; a
         reason-less failure row poisons as ``capture_failed``) marks a call
         whose completion WAS served — a hole in the chain — and poisons.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
+        from nemo_gym import token_id_capture
         from nemo_gym.token_id_capture.staging import resolve_terminal
         from nemo_gym.token_id_capture.staging.records import CallRecord
         from nemo_gym.token_id_capture.staging.terminal import select_terminal_call
@@ -1475,10 +1478,18 @@ Depending on your data shape, you may want to change these values."""
                     terminal_record = deduped[selection.terminal_model_call_id]
                 else:
                     selection_reason = selection.reason
+        # Gym names the ledger reasons of a call that served no completion in
+        # one set; a Gym that exports no set has only the uncommitted-call
+        # reason, so the fallback applies that rule there.
+        unserved_reasons = getattr(
+            token_id_capture,
+            "UNSERVED_CALL_FAILURE_REASONS",
+            frozenset({token_id_capture.UNCOMMITTED_CALL_REASON}),
+        )
         poisoning_failures = [
             failure
             for failure in failures
-            if str(failure.get("reason") or "") != UNCOMMITTED_CALL_REASON
+            if str(failure.get("reason") or "") not in unserved_reasons
         ]
         failure_reason = None
         if poisoning_failures:
