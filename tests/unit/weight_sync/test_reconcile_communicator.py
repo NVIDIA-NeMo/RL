@@ -131,6 +131,7 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
             workers.append(_FakeWorker(len(workers), dead=shard in set(dead_shards)))
     generation = SimpleNamespace(
         cfg={"vllm_cfg": {"async_engine": True}},
+        dp_size=dp_size,
         vllm_dp_size=1,
         worker_group=SimpleNamespace(
             workers=workers,

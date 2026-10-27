@@ -165,14 +165,47 @@ def _no_ray(monkeypatch):
 
 
 class TestPlanRegeneration:
-    def test_vllm_dp_rebuild_is_rejected(self):
-        sync, generation, _, _, _ = _reshard(dp_size=4)
+    def test_vllm_dp_partial_shard_rebuild_is_rejected(self):
+        sync, generation, workers, _, kill = _reshard(dp_size=4, dead_shards=(1,))
         generation.vllm_dp_size = 2
+        sync.init_communicator()
+        kill()
+        for worker in workers:
+            worker.calls.clear()
 
         with pytest.raises(
             RuntimeError, match="Partial-shard rebuild is not supported with vLLM DP"
         ):
-            sync.init_communicator()
+            sync.reconcile_communicator([1])
+        assert all(not worker.calls for worker in workers)
+
+    @pytest.mark.parametrize(
+        "dp_size,workers_per_shard,vllm_dp_size",
+        [(8, 1, 4), (16, 2, 8)],
+    )
+    def test_vllm_dp_full_fleet_uses_instance_prefixes_for_both_groups(
+        self, dp_size, workers_per_shard, vllm_dp_size
+    ):
+        sync, generation, workers, _, _ = _reshard(
+            dp_size=dp_size, workers_per_shard=workers_per_shard
+        )
+        generation.vllm_dp_size = vllm_dp_size
+
+        sync.init_communicator()
+
+        workers_per_instance = workers_per_shard * vllm_dp_size
+        for dp_rank in range(dp_size):
+            calls = workers[dp_rank * workers_per_shard].calls
+            prefixes = {
+                name: kwargs["rank_prefix"]
+                for name, kwargs in calls
+                if name in {"init_collective", "init_nccl_reshard_comm_group"}
+            }
+            expected = dp_rank // vllm_dp_size * workers_per_instance
+            assert prefixes == {
+                "init_collective": expected,
+                "init_nccl_reshard_comm_group": expected,
+            }
 
     def test_the_plan_is_rebuilt_for_the_smaller_fleet(self):
         """The whole reason reshard could not simply resize."""
@@ -210,6 +243,34 @@ class TestPlanRegeneration:
 
 
 class TestBothCommunicatorFamilies:
+    def test_direct_bulk_group_init_uses_instance_prefixes(self):
+        from nemo_rl.models.generation.vllm import vllm_generation
+
+        calls = []
+        generation = SimpleNamespace(
+            cfg={"vllm_cfg": {"async_engine": True}},
+            dp_size=8,
+            vllm_dp_size=4,
+            worker_group=SimpleNamespace(
+                workers=[object()] * 8,
+                run_all_workers_multiple_data=lambda method_name, **kwargs: (
+                    calls.append((method_name, kwargs)) or []
+                ),
+            ),
+        )
+
+        vllm_generation.VllmGeneration.init_nccl_reshard_comm_group(
+            generation,
+            pp_ips=["10.0.0.1"],
+            pp_ports=[9001],
+            pp_size=1,
+            train_ranks_per_stage=8,
+            sub_world_size=16,
+        )
+
+        assert calls[0][0] == "init_nccl_reshard_comm_group_async"
+        assert calls[0][1]["rank_prefix"] == [0, 0, 0, 0, 4, 4, 4, 4]
+
     def test_the_dead_shard_receives_neither_family(self):
         sync, _, workers, _, kill = _reshard(dp_size=4, dead_shards=(3,))
         sync.init_communicator()  # whole fleet, including shard 3
