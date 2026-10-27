@@ -764,7 +764,7 @@ def _build_value(
         train_cluster: Ray virtual cluster the critic shares with the trainer.
         master_config: SC MasterConfig.
         tokenizer: Tokenizer used by the value model.
-        seed: Algorithm seed applied before critic model construction.
+        seed: Algorithm seed forwarded to the critic; the Megatron critic ignores it.
         weights_path: Checkpointed value weights to resume from, or None.
         optimizer_path: Checkpointed value optimizer state to resume from, or None.
 

@@ -595,7 +595,7 @@ def test_value_worker_seeded_fresh_initialization_equivalence(
     """Fresh DB-OFF and DB-ON workers must initialize the same value head.
 
     The base causal-LM checkpoint has no regression ``score`` head, so each
-    DTensor value actor creates it locally. This regression test deliberately
+    Automodel value actor creates it locally. This regression test deliberately
     does not share a checkpoint: matching valid-token values prove the PPO seed
     reaches both Ray workers before model construction.
     """
@@ -604,7 +604,7 @@ def test_value_worker_seeded_fresh_initialization_equivalence(
     try:
         tp = 2
         cluster = RayVirtualCluster(
-            name="test-dtensor-value-seeded-fresh-init",
+            name="test-automodel-value-seeded-fresh-init",
             bundle_ct_per_node_list=[tp],
             use_gpus=True,
             num_gpus_per_node=tp,
@@ -748,7 +748,7 @@ def test_value_worker_dynamic_batching_train_forward_equivalence(
     cluster = None
     try:
         cluster = RayVirtualCluster(
-            name=f"test-dtensor-value-train-equiv-{feature_id}",
+            name=f"test-automodel-value-train-equiv-{feature_id}",
             bundle_ct_per_node_list=[equiv_gpus],
             use_gpus=True,
             num_gpus_per_node=equiv_gpus,

@@ -59,7 +59,8 @@ class Value(ValueInterface):
             cluster: Ray virtual cluster for distributed training
             config: Configuration for the value model
             tokenizer: Tokenizer for the model
-            seed: Seed applied by value workers before model construction
+            seed: Seed applied by Automodel value workers before model construction;
+                Megatron ignores it
             name_prefix: Prefix for worker names
             workers_per_node: Number of workers per node
             init_optimizer: Whether to initialize the optimizer
