@@ -19,7 +19,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
 import torch
 from hydra.utils import get_class
@@ -100,25 +100,7 @@ class DebugWriter(ABC):
         Returns:
             The receipt for the stored rows, to be passed on to finish_step.
         """
-        # unbind() splits dense and jagged columns alike into per-row tensors.
-        columns = {
-            k: list(v.detach().cpu().unbind())
-            for k, v in {**chunk.sequences, **chunk.scalars}.items()
-        }
-
-        # Validate column lengths
-        lengths = chunk.input_lengths.detach().cpu().reshape(-1).tolist()
-        if (
-            len(lengths) != len(chunk.sample_ids)
-            or any(len(v) != len(chunk.sample_ids) for v in columns.values())
-            or (chunk.tags is not None and len(chunk.tags) != len(chunk.sample_ids))
-        ):
-            raise ValueError("Training dump column lengths do not match sample ids")
-        for i, length in enumerate(lengths):
-            if length < 0 or any(
-                length > columns[k][i].shape[0] for k in chunk.sequences
-            ):
-                raise ValueError("Training dump input length exceeds a sequence column")
+        self._validate(chunk)
 
         # Truncate on the first chunk of a step so a retried step replaces its
         # rows instead of appending a second copy to the previous attempt's.
@@ -127,28 +109,34 @@ class DebugWriter(ABC):
             self.rows = 0
         self.step = chunk.step
 
-        # Write rows
-        def _iter_rows() -> Iterable[dict[str, Any]]:
-            for i, length in enumerate(lengths):
-                row = {
-                    "step": chunk.step + 1,
-                    "sample_id": [chunk.sample_ids[i]],
-                    "input_lengths": [length],
-                    "metadata": [chunk.tags[i] if chunk.tags is not None else {}],
-                }
-                for key in chunk.sequences:
-                    row[key] = [columns[key][i][:length].tolist()]
-                for key in chunk.scalars:
-                    row[key] = [columns[key][i].tolist()]
-                yield row
-
-        receipt = self._write_rows(
-            step=chunk.step,
-            rows=_iter_rows(),
-            replace=is_first_chunk,
-        )
+        receipt = self._write_chunk(chunk, replace=is_first_chunk)
         self.rows += receipt.rows
         return receipt
+
+    def _validate(self, chunk: TrainChunk) -> None:
+        """Raise ValueError if the chunk's columns disagree in length or a sequence is too short."""
+        num_samples = len(chunk.sample_ids)
+        lengths = chunk.input_lengths.detach().cpu().reshape(-1).tolist()
+
+        if len(lengths) != num_samples or (
+            chunk.tags is not None and len(chunk.tags) != num_samples
+        ):
+            raise ValueError("Training dump column lengths do not match sample ids")
+        for values in [*chunk.sequences.values(), *chunk.scalars.values()]:
+            if values.size(0) != num_samples:
+                raise ValueError("Training dump column lengths do not match sample ids")
+
+        # unbind() returns per-row views of dense and jagged columns alike, so
+        # each row is checked against its own length without copying data.
+        sequence_rows = [values.unbind() for values in chunk.sequences.values()]
+        for i, length in enumerate(lengths):
+            if length < 0:
+                raise ValueError("Training dump input length exceeds a sequence column")
+            for rows in sequence_rows:
+                if length > rows[i].shape[0]:
+                    raise ValueError(
+                        "Training dump input length exceeds a sequence column"
+                    )
 
     def finish_step(
         self, step: int, receipts: list[ChunkReceipt] | None = None
@@ -165,10 +153,12 @@ class DebugWriter(ABC):
         self.rows = 0
 
     @abstractmethod
-    def _write_rows(
-        self, step: int, rows: Iterable[dict[str, Any]], replace: bool
-    ) -> ChunkReceipt:
-        """Write one chunk's rows to storage and return the receipt for them."""
+    def _write_chunk(self, chunk: TrainChunk, *, replace: bool) -> ChunkReceipt:
+        """Write one validated chunk to storage and return the receipt for its rows.
+
+        The first chunk of a step comes with replace set, telling the writer to drop
+        any rows already stored for that step.
+        """
 
     @abstractmethod
     def _publish_step(self, step: int, receipts: list[ChunkReceipt] | None) -> None:
@@ -183,17 +173,34 @@ class JsonDebugWriter(DebugWriter):
     completed-looking JSONL file. Shards must share a filesystem with the controller.
     """
 
-    def _write_rows(
-        self, step: int, rows: Iterable[dict[str, Any]], replace: bool
-    ) -> ChunkReceipt:
-        """Write the rows to this shard's part file, starting it over if replace is set."""
+    def _write_chunk(self, chunk: TrainChunk, *, replace: bool) -> ChunkReceipt:
+        """Write the chunk's rows to this shard's part file, starting it over if replace is set."""
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        part = self.log_dir / f"train_data_step{step + 1}.jsonl.part-{self.shard_id}"
+        part = (
+            self.log_dir / f"train_data_step{chunk.step + 1}.jsonl.part-{self.shard_id}"
+        )
         mode = "w" if replace else "a"
+
+        # unbind() splits dense and jagged columns alike into per-row tensors.
+        columns = {
+            k: list(v.detach().cpu().unbind())
+            for k, v in {**chunk.sequences, **chunk.scalars}.items()
+        }
+        lengths = chunk.input_lengths.detach().cpu().reshape(-1).tolist()
 
         num_rows = 0
         with part.open(mode) as stream:
-            for row in rows:
+            for i, length in enumerate(lengths):
+                row = {
+                    "step": chunk.step + 1,
+                    "sample_id": [chunk.sample_ids[i]],
+                    "input_lengths": [length],
+                    "metadata": [chunk.tags[i] if chunk.tags is not None else {}],
+                }
+                for key in chunk.sequences:
+                    row[key] = [columns[key][i][:length].tolist()]
+                for key in chunk.scalars:
+                    row[key] = [columns[key][i].tolist()]
                 stream.write(
                     json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n"
                 )

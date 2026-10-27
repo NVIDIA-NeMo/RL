@@ -3,7 +3,6 @@
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
 
 import pytest
 import torch
@@ -401,15 +400,17 @@ class _RecordingWriter(DebugWriter):
         super().__init__(log_dir, shard_id=shard_id)
         self.label = label
 
-    def _write_rows(self, step: int, rows: Any, replace: bool) -> ChunkReceipt:
-        return ChunkReceipt(shard_id=self.shard_id, rows=sum(1 for _ in rows), ref=None)
+    def _write_chunk(self, chunk: TrainChunk, *, replace: bool) -> ChunkReceipt:
+        return ChunkReceipt(
+            shard_id=self.shard_id, rows=len(chunk.sample_ids), ref=None
+        )
 
     def _publish_step(self, step: int, receipts: list[ChunkReceipt] | None) -> None:
         pass
 
 
 class _IncompleteWriter(DebugWriter):
-    def _write_rows(self, step: int, rows: Any, replace: bool) -> ChunkReceipt:
+    def _write_chunk(self, chunk: TrainChunk, *, replace: bool) -> ChunkReceipt:
         return ChunkReceipt(shard_id=self.shard_id, rows=0, ref=None)
 
 
