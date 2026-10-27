@@ -281,6 +281,31 @@ class _AsyncLLMHTTPClient:
     async def is_tracing_enabled(self) -> bool:
         return await self._engine_client.is_tracing_enabled()
 
+    async def notify_kv_transfer_request_rejected(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        *,
+        data_parallel_rank: Optional[int] = None,
+    ) -> None:
+        """Free the KV-transfer resources of a request that will never run.
+
+        vLLM >= 0.29 wraps every response in
+        ``_with_kv_transfer_rejection_cleanup``: when a request carrying
+        ``kv_transfer_params`` fails or is cancelled before the engine ran it
+        (a client disconnect, a shutdown), the serving layer calls this so the
+        KV connector's ``request_finished`` hook releases what the handshake
+        already pinned, e.g. the prefill engine's blocks a decode engine would
+        have pulled. Without it the blocks stay leased until the lease expires
+        and every such request logs a traceback. Engine-loop bound: AsyncLLM
+        implements it by adding a pre-aborted request to the engine core.
+        """
+        await self._run_on_engine_loop(
+            lambda: self._engine_client.notify_kv_transfer_request_rejected(
+                request_id, kv_transfer_params, data_parallel_rank=data_parallel_rank
+            )
+        )
+
 
 class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker

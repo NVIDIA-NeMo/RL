@@ -4692,3 +4692,41 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
         client.check_admission(3, request_id="req-3")
 
     assert calls == [(1, None), (2, "req-2"), (3, "req-3")]
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_http_client_forwards_kv_transfer_rejections() -> None:
+    """vLLM 0.29's serving layer frees a rejected request's pinned KV through
+    the engine client; the call touches engine state, so it must run on the
+    engine loop like generate/abort, not on the HTTP thread's loop."""
+    engine_loop = asyncio.get_running_loop()
+    calls = []
+
+    class FakeEngine:
+        model_config = renderer = input_processor = vllm_config = None
+
+        async def notify_kv_transfer_request_rejected(
+            self, request_id, kv_transfer_params, *, data_parallel_rank=None
+        ):
+            calls.append(
+                (
+                    request_id,
+                    kv_transfer_params,
+                    data_parallel_rank,
+                    asyncio.get_running_loop(),
+                )
+            )
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+    params = {"do_remote_prefill": True, "remote_block_ids": [1, 2]}
+
+    def notify_from_http_thread():
+        return asyncio.run(
+            client.notify_kv_transfer_request_rejected(
+                "req-1", params, data_parallel_rank=0
+            )
+        )
+
+    await asyncio.to_thread(notify_from_http_thread)
+
+    assert calls == [("req-1", params, 0, engine_loop)]
