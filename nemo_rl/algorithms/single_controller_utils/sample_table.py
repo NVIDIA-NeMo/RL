@@ -15,16 +15,19 @@
 """Per-step sample table: one row of ids and summaries per trained sample.
 
 The advantage stage summarizes each chunk from the tensors it already holds and
-returns the columns in its result; the controller concatenates a step's chunks
-into a W&B table and NeMo Lens log records (async_rl.sample_table).
+returns the columns in its result; the controller hands a step's chunks to
+log_sample_table in a pool thread (async_rl.sample_table).
 """
 
+import logging
 from typing import Any
 
 import torch
 from opentelemetry._logs import get_logger
 
 from nemo_rl.utils.train_data_dump import json_safe_nonfinite
+
+_log = logging.getLogger(__name__)
 
 # One chunk's summary: column name -> one value per sample.
 TableChunk = dict[str, list[Any]]
@@ -89,21 +92,29 @@ def merge_table_chunks(chunks: list[TableChunk]) -> tuple[list[str], list[list[A
     return columns, rows
 
 
-def build_table(columns: list[str], rows: list[list[Any]], step: int) -> Any:
-    """Emit the rows as NeMo Lens log records and return them as a W&B table.
+def log_sample_table(logger: Any, chunks: list[TableChunk], step: int) -> None:
+    """Log one step's sample table to NeMo Lens and W&B. Runs in a pool thread.
 
-    Each row becomes one OTel log record named ``train/samples``, with
-    ``rl.step`` and ``rl.row.<column>`` attributes; with Lens logs off, the OTel
-    API makes every emit a no-op. Backends without a table type skip the Table.
+    Lens gets one OTel log record per row (a no-op when Lens logs are off). W&B
+    gets a Table on its own axis, train/samples_step, so it may land after the
+    step's metrics were committed. Never raises: the table is diagnostics.
     """
-    logger = get_logger(__name__)
-    keys = [f"rl.row.{column}" for column in columns]
-    for row in rows:
-        attributes: dict[str, Any] = {"rl.step": step}
-        attributes.update({k: v for k, v in zip(keys, row) if v is not None})
-        logger.emit(event_name="train/samples", attributes=attributes)
-    # Deferred: only the controller builds the table, and the advantage shards
-    # that import this module should not pay for importing wandb.
-    from wandb import Table
+    try:
+        columns, rows = merge_table_chunks(chunks)
+        lens = get_logger(__name__)
+        keys = [f"rl.row.{column}" for column in columns]
+        for row in rows:
+            attributes: dict[str, Any] = {"rl.step": step}
+            attributes.update({k: v for k, v in zip(keys, row) if v is not None})
+            lens.emit(event_name="train/samples", attributes=attributes)
+        # Deferred: the advantage shards import this module and never need wandb.
+        from wandb import Table
 
-    return Table(columns=columns, data=rows)
+        logger.log_metrics(
+            {"samples": Table(columns=columns, data=rows), "train/samples_step": step},
+            step,
+            prefix="train",
+            step_metric="train/samples_step",
+        )
+    except Exception:  # noqa: BLE001 - a debug table must not stop training
+        _log.warning("sample table for step %d not logged", step, exc_info=True)

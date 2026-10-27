@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import MagicMock
+
 import torch
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import (
@@ -21,7 +23,7 @@ from opentelemetry.sdk._logs.export import (
 
 import nemo_rl.algorithms.single_controller_utils.sample_table as sample_table_mod
 from nemo_rl.algorithms.single_controller_utils.sample_table import (
-    build_table,
+    log_sample_table,
     merge_table_chunks,
     summarize_chunk,
 )
@@ -109,17 +111,19 @@ def test_merge_concatenates_chunks_in_arrival_order() -> None:
     assert merge_table_chunks([]) == ([], [])
 
 
-def test_build_table_returns_a_wandb_table_and_one_lens_record_per_row(
-    monkeypatch,
-) -> None:
+def test_a_step_logs_one_lens_record_per_row_and_a_wandb_table(monkeypatch) -> None:
     exporter = InMemoryLogRecordExporter()
     provider = LoggerProvider()
     provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
     monkeypatch.setattr(sample_table_mod, "get_logger", provider.get_logger)
+    logger = MagicMock()
+    chunks = [
+        {"sample_id": ["a"], "rollout_id": ["r0"]},
+        {"sample_id": ["b"], "rollout_id": [None]},
+    ]
 
-    table = build_table(["sample_id", "rollout_id"], [["a", "r0"], ["b", None]], step=3)
+    log_sample_table(logger, chunks, step=3)
 
-    assert table.columns == ["sample_id", "rollout_id"] and len(table.data) == 2
     records = [log.log_record for log in exporter.get_finished_logs()]
     assert [r.event_name for r in records] == ["train/samples"] * 2
     assert dict(records[0].attributes) == {
@@ -129,3 +133,14 @@ def test_build_table_returns_a_wandb_table_and_one_lens_record_per_row(
     }
     # None cells are left out rather than exported as null attributes.
     assert dict(records[1].attributes) == {"rl.step": 3, "rl.row.sample_id": "b"}
+    (call,) = logger.log_metrics.call_args_list
+    metrics, step = call.args
+    assert step == 3 and metrics["train/samples_step"] == 3
+    assert metrics["samples"].columns == ["sample_id", "rollout_id"]
+    assert call.kwargs == {"prefix": "train", "step_metric": "train/samples_step"}
+
+
+def test_a_failing_table_never_raises() -> None:
+    logger = MagicMock()
+    logger.log_metrics.side_effect = RuntimeError("wandb down")
+    log_sample_table(logger, [{"sample_id": ["a"]}], step=1)

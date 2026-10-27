@@ -115,8 +115,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 )
 from nemo_rl.algorithms.single_controller_utils.sample_table import (
     TableChunk,
-    build_table,
-    merge_table_chunks,
+    log_sample_table,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -3647,13 +3646,15 @@ class SingleControllerActor:
                     ).items():
                         step_metrics[name] = Table(data=data, columns=["Full result"])
                 if self._sample_table_chunks:
-                    columns, rows = merge_table_chunks(self._sample_table_chunks)
-                    self._sample_table_chunks = []
-                    # Off the event loop: wandb.Table validates every cell. The
-                    # step's metrics are logged after the increment below.
-                    step_metrics["samples"] = await asyncio.to_thread(
-                        build_table, columns, rows, self._train_steps + 1
+                    # Not awaited: logs in a pool thread while training goes on.
+                    asyncio.get_running_loop().run_in_executor(
+                        None,
+                        log_sample_table,
+                        self._logger,
+                        self._sample_table_chunks,
+                        self._train_steps + 1,
                     )
+                    self._sample_table_chunks = []
                 try:
                     step_metrics.update(
                         await asyncio.to_thread(self._gen.get_step_metrics)
