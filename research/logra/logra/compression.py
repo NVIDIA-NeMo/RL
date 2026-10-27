@@ -152,6 +152,21 @@ class SketchState:
     sketch: Tensor
     handles: list[RemovableHandle]
     swapped_weight: Tensor | None
+    # Persistent copy of the projection in the activation dtype. Allocated on
+    # first use and refreshed in place, so forward hooks never allocate.
+    projection_cast: Tensor | None = None
+
+    def projection_as(self, dtype: torch.dtype) -> Tensor:
+        if dtype == self.projection.dtype:
+            return self.projection
+        if self.projection_cast is None or self.projection_cast.dtype != dtype:
+            self.projection_cast = self.projection.to(dtype)
+        return self.projection_cast
+
+    def refresh_cast(self) -> None:
+        """Mirror a refreshed ``projection`` into the low-precision buffer."""
+        if self.projection_cast is not None:
+            self.projection_cast.copy_(self.projection)
 
     @property
     def weight(self) -> nn.Parameter:
@@ -169,7 +184,7 @@ class SketchState:
             activation = inputs[0]
             projected = (
                 activation.reshape(-1, activation.shape[-1])
-                @ self.projection.to(activation.dtype).T
+                @ self.projection_as(activation.dtype).T
             )
         return _AccumulateSketch.apply(output, projected, self.sketch)
 
