@@ -14,13 +14,15 @@ when_to_use: collect a training timeline for a SWE task; plot the timeline for t
 > The trainer phases and rollout lifecycle work for any GRPO run, but a task
 > that does not go through the SWE agent gets no per-rollout view.
 
-A timeline is three kinds of Chrome-trace JSONL (one `ph: "X"` complete event
-per line, epoch-microsecond `ts`, microsecond `dur`):
+A timeline is Chrome-trace JSONL (one `ph: "X"` complete event per line,
+epoch-microsecond `ts`, microsecond `dur`) plus two small side files:
 
 | File | Written by | Location |
 |---|---|---|
 | `training_timeline.jsonl` | NeMo-RL `Timer` (every stopped timer) | `logger.log_dir` |
 | `rollout_lifecycle.jsonl` | NeMo-RL replay buffer (buffered/consumed records, async GRPO) | `logger.log_dir` |
+| `clock_calibration.jsonl` | NeMo-RL GRPO driver, once at startup: each Ray host's clock offset from the driver | `logger.log_dir` |
+| `generation_topology.jsonl` | NeMo-RL GRPO driver: each generation engine's replica, role and host (TRT-LLM PD disaggregation) | `logger.log_dir` |
 | `timeline.jsonl`, one per rollout | NeMo Gym SWE agent and OpenHands | the rollout's dir under the Gym `results_dir` |
 
 **Applicability.** Only the first two files exist for every GRPO run. The
@@ -114,6 +116,37 @@ python skills/collect-training-timeline/scripts/plot_rl_timeline.py \
 - Check that the rollout count shown matches the number of `timeline.jsonl`
   files found under `--rollout-root`.
 
+## Export to Perfetto
+
+```bash
+python skills/collect-training-timeline/scripts/export_perfetto.py \
+  --training-timeline $LOG_DIR/training_timeline.jsonl \
+  --rollout-root $GYM_RESULTS_DIR \
+  --output timeline.json.gz [--max-rollouts 64] [--no-model-phases]
+```
+
+Open the result in [ui.perfetto.dev](https://ui.perfetto.dev). `--rollout-root`
+is optional; without it only the trainer, lifecycle and counter tracks are drawn.
+The lifecycle, clock calibration and topology files default to the ones beside
+`--training-timeline`.
+
+Tracks:
+- **Trainer / driver**: trainer phases, with overlapping spans on parallel lanes.
+- **Rollout lifecycle**: buffered and consumed markers and a buffered-rollout
+  counter.
+- **Rollouts (SWE agent)**: one lane per rollout, named with its step when the
+  lifecycle file maps it, and a second lane with that rollout's `model_call`
+  phases cut at the engine milestones. `--max-rollouts` keeps the earliest N
+  (`0` keeps all); `--no-model-phases` drops the second lane.
+- **Generation replica N**: in-flight counters (client, engine queued, engine
+  running), named with each engine's role and host when the topology file exists.
+
+Spans from a host listed in `clock_calibration.jsonl` are shifted onto the
+driver's clock. A host with no calibration keeps its raw timestamps, and the
+trace metadata lists those clocks. The engine milestones inside the phase lane
+and the engine counters are not shifted, because a request does not record which
+clock stamped them, so they can sit a few milliseconds off the spans around them.
+
 ## Read per-turn metrics
 
 Each OpenHands `model_call` event (`cat: "model"`, `args.turn`) carries these
@@ -167,7 +200,9 @@ timeline supports and how it is computed, and explains how to read the
 
 Segments that cross hosts (`client_to_frontend`, `kv_handoff`, `llm_to_gym`)
 include wall-clock skew. The script reports how many came out negative; a
-non-zero count means skew.
+non-zero count means skew. It does not apply `clock_calibration.jsonl`: a
+request's milestones do not record which clock stamped them, so there is no
+offset to subtract.
 
 ## Rules
 

@@ -236,6 +236,44 @@ stateDiagram-v2
 The `ctx_*` and `frontend_*` states exist only under PD disaggregation. Without
 it the path is `client_to_frontend` straight to `gen_submit`.
 
+## Supporting files
+
+Two small files, written next to `training_timeline.jsonl` when
+`NRL_COLLECT_TIMELINE_FIELDS=1`, let a reader align and place the rest.
+
+**`clock_calibration.jsonl`**: one record per live Ray host, written once by the
+GRPO driver at startup.
+
+| Field | Meaning |
+|---|---|
+| `reference_clock_id` | The driver's clock; every offset is relative to it |
+| `host_clock_id` | The host's clock id (its host name) |
+| `offset_us` | Host clock minus driver clock. A host timestamp maps to the driver clock as `ts - offset_us` |
+| `uncertainty_us` | Half the network round trip of the kept sample; the offset is good to about this |
+| `sample_count`, `measured_at_us`, `ray_node_id` | Round trips taken (the least uncertain is kept), when, and which node |
+| `expected_ray_node_count` | Live nodes at startup, to spot a host that went unprobed |
+
+Each record in `training_timeline.jsonl` (in `args.clock_id`) and in
+`rollout_lifecycle.jsonl` (`clock_id`) names the clock that stamped it, so its
+offset can be looked up. Rollout spans from OpenHands carry `args.hostname` and
+are looked up by that. The offset is measured once, so it does not track drift
+over a long run.
+
+**`generation_topology.jsonl`**: one record per generation engine, written under
+TRT-LLM PD disaggregation once the disagg servers are up (a backend with nothing
+to report writes no file).
+
+| Field | Meaning |
+|---|---|
+| `engine_index`, `replica_idx` | The engine and the DP replica it belongs to; `replica_idx` is the `generation_replica_idx` a `model_call` carries |
+| `role` | `prefill` or `decode` |
+| `tensor_parallel_size` | The engine's TP width |
+| `host`, `port`, `ray_node_id` | Where the engine's HTTP server listens |
+| `frontend_urls` | The replica's disagg frontends, replica-major |
+
+Join `model_call.generation_replica_idx` to `replica_idx` to say which engines
+and hosts served a call, and to split prefill load from decode load.
+
 ## Statistics you can derive
 
 | Question | How | Needs |
@@ -253,6 +291,8 @@ it the path is `client_to_frontend` straight to `gen_submit`.
 | Prefix hit rate | Token-weighted `Σ(prompt - ctx_computed) / Σ prompt` under disaggregation, else `Σ cached_prompt_tokens / Σ prompt_tokens` | `model_call` |
 | TPOT | `(last_token - first_scheduled) / (decode_tokens - 1)` | LLM milestones |
 | Replica balance | In-flight and token counts grouped by `generation_replica_idx` | replica index |
+| Which engines and hosts served a call | Join `generation_replica_idx` to `replica_idx` | `generation_topology.jsonl` |
+| Host clock offset | `offset_us` and `uncertainty_us` per host | `clock_calibration.jsonl` |
 | Trainer idle share | `idle/buffer_starvation`, `idle/refit_bubble` over `total_step_time` | `training_timeline.jsonl` |
 | Rollout staleness | `consumed_weight_version - generation_weight_version` | `rollout_lifecycle.jsonl` |
 | Wait before a rollout is consumed | `rollout_consumed.ts - rollout_buffered.ts` | `rollout_lifecycle.jsonl` |
@@ -317,6 +357,8 @@ Cross-host segments (`client_to_frontend`, `kv_handoff`, `llm_to_gym`) are
 differences of timestamps taken on different machines, so they include
 wall-clock skew. The script reports how many segments came out negative; a
 non-zero count means skew, and the cross-host segments are then unreliable.
+`clock_calibration.jsonl` (below) measures each host's offset, but it cannot fix
+these segments: the milestones carry no owning clock id.
 
 ### Of the tracing itself
 
