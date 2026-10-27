@@ -14,6 +14,7 @@
 
 """Research worker. Native batching/loss logic pinned to main 26e2b802."""
 
+import gc
 import os
 import warnings
 from contextlib import AbstractContextManager, nullcontext
@@ -184,6 +185,13 @@ class LoGRAWorkerImpl(AutomodelPolicyWorkerImpl):
             self.load_checkpoint(weights_path, optimizer_path)
         if self.cua_config is not None:
             self.cua_update = CuaUpdate(self, self.cua_config)
+        # Setup leaves a large, long-lived Python heap (model, FSDP state,
+        # transformers). The per-step hooks allocate enough short-lived objects
+        # to promote survivors and trigger full collections mid-forward, each
+        # stalling the step by hundreds of milliseconds. Freezing the setup heap
+        # keeps later collections confined to per-step garbage.
+        gc.collect()
+        gc.freeze()
 
     def logra_manifest(self, sample_weights=False):
         """Record targets; optional tiny expert samples support checkpoint audits."""
