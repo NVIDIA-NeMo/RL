@@ -380,7 +380,66 @@ def test_run_polls_before_each_step_and_finalizes_at_exit() -> None:
         call.finish(blocking=False),
         call.step(),
         call.finish(blocking=True),
+        # Teardown's publish; a no-op once the exit path has published.
+        call.finish(blocking=True),
     ]
+
+
+def _failing_run_controller(tmp_path: Path) -> object:
+    """Deferred-save controller whose step after a pending save raises."""
+    controller = _deferred_save_controller(tmp_path)
+    controller._pending_checkpoint_path = str(tmp_path)
+    controller._max_steps = 3
+    controller._logger = MagicMock()
+    controller._close_loaders = MagicMock()
+    controller._timeout = MagicMock()
+    controller._run_train_step = MagicMock(
+        side_effect=RuntimeError("injected train failure")
+    )
+    # The writes are still running at the step's poll.
+    controller._trainer.poll_async_save.return_value = False
+    return controller
+
+
+def test_run_failure_still_publishes_the_pending_save(tmp_path: Path) -> None:
+    controller = _failing_run_controller(tmp_path)
+    order = MagicMock()
+    order.attach_mock(controller._trainer.finalize_async_save, "finalize")
+    order.attach_mock(controller._checkpointer.begin_finalization, "publish")
+    order.attach_mock(controller._checkpointer.shutdown, "close")
+
+    with (
+        patch("nemo_rl.algorithms.sft_v2.shutdown_telemetry"),
+        pytest.raises(RuntimeError, match="injected train failure"),
+    ):
+        controller.run()
+
+    # Published before checkpoint close, which joins the rename.
+    assert order.mock_calls == [
+        call.finalize(),
+        call.publish(str(tmp_path)),
+        call.close(),
+    ]
+    assert controller._pending_checkpoint_path is None
+
+
+def test_failed_teardown_publish_does_not_mask_the_run_failure(
+    tmp_path: Path,
+) -> None:
+    controller = _failing_run_controller(tmp_path)
+    controller._trainer.finalize_async_save.side_effect = RuntimeError(
+        "injected finalize failure"
+    )
+
+    with (
+        patch("nemo_rl.algorithms.sft_v2.shutdown_telemetry"),
+        pytest.raises(RuntimeError, match="injected train failure"),
+        pytest.warns(UserWarning, match="pending checkpoint publish failed"),
+    ):
+        controller.run()
+
+    controller._checkpointer.begin_finalization.assert_not_called()
+    controller._checkpointer.shutdown.assert_called_once()
 
 
 def test_checkpoint_metric_tags_the_configured_train_metric() -> None:

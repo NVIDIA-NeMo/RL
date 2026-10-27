@@ -256,6 +256,13 @@ class SFTSingleControllerActor:
                 return vars(self._save_state).copy()
         finally:
             for cleanup, name in (
+                # A save deferred by defer_async_checkpoint_finalize is published only
+                # here when the run raised after it. Before checkpoint close, so that
+                # close joins the rename this starts.
+                (
+                    lambda: self._finish_pending_save(blocking=True),
+                    "pending checkpoint publish",
+                ),
                 (self._close_loaders, "loader close"),
                 (self._logger.finish, "logger close"),
                 (self._checkpointer.shutdown, "checkpoint close"),
@@ -471,8 +478,9 @@ class SFTSingleControllerActor:
     def _finish_pending_save(self, *, blocking: bool) -> None:
         """Finalize and publish an async save deferred by defer_async_checkpoint_finalize.
 
-        Runs between steps. A non-blocking poll finalizes the save on every policy
-        worker only once all ranks' background writes are done, so the write
+        Runs between steps, and once more at teardown so a run that raises after a
+        save still publishes it. A non-blocking poll finalizes the save on every
+        policy worker only once all ranks' background writes are done, so the write
         overlaps training rather than holding back the next step. Finalization runs
         collectives on the training communicator, so it stays on the workers' step
         boundaries rather than in a background thread. tmp_step_N becomes step_N only

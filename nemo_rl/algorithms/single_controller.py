@@ -941,6 +941,14 @@ class SingleControllerActor:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                # With the train pump stopped, publish a save that
+                # defer_async_checkpoint_finalize left pending: a failure or an
+                # orderly rollout-checkpoint stop ends the pump before its own
+                # blocking finalize. Before checkpoint close, which joins the rename.
+                await self._finish_pending_save(blocking=True)
+            except Exception as e:  # teardown must not mask the original failure
+                print(f"Error publishing the pending checkpoint: {e}", flush=True)
             if self._engine_supervisor is not None:
                 # Not in `tasks`: the supervisor creates a task per restart, on demand, so
                 # there is nothing to cancel in that list. Without this an in-flight
@@ -5405,9 +5413,9 @@ class SingleControllerActor:
     async def _finish_pending_save(self, *, blocking: bool) -> None:
         """Finalize and publish a save deferred by defer_async_checkpoint_finalize.
 
-        Called only from the train pump, between policy-worker calls: the finalize
-        runs collectives on the training communicator, so every rank must reach it
-        at the same point. A non-blocking poll finalizes the save on every worker
+        Called from the train pump between policy-worker calls, and once at teardown
+        after the pumps stop: the finalize runs collectives on the training
+        communicator, so every rank must reach it at the same point. A non-blocking poll finalizes the save on every worker
         only once all ranks' background writes are done; until then the write
         overlaps training. tmp_step_N becomes step_N after the finalize, under the
         same lock as every other checkpoint publication.

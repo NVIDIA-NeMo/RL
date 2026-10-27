@@ -234,11 +234,23 @@ class _PollingTrainer(_FakeTrainer):
         self._poll_answers = list(poll_answers)
         self._checkpoint_dir = checkpoint_dir
         self.poll_calls = 0
+        self._train_step_open = False
+        self.polled_inside_a_train_step = False
         # Published step_N dirs at each save_checkpoint call, in call order. The
         # tmp_step_N of the save in progress already exists then, so it's excluded.
         self.published_at_save: list[set[str]] = []
 
+    def begin_train_step(self, loss_fn: Any) -> None:
+        self._train_step_open = True
+
+    def finish_train_step(self) -> dict[str, Any]:
+        self._train_step_open = False
+        return super().finish_train_step()
+
     def poll_async_save(self) -> bool:
+        # The finalize runs collectives on the training communicator, so the poll
+        # has to land between steps, never inside an open one.
+        self.polled_inside_a_train_step |= self._train_step_open
         self.poll_calls += 1
         return self._poll_answers.pop(0) if self._poll_answers else False
 
@@ -1479,6 +1491,7 @@ class TestSaveTrigger:
         _run_train_pump(mc, _make_actor_args(trainer=trainer))
 
         assert trainer.poll_calls == 2
+        assert not trainer.polled_inside_a_train_step
         # step_2 was published by the poll, before the step-4 save started.
         assert trainer.published_at_save == [set(), {"step_2"}]
         # Only the save left pending at exit was finalized blocking.
@@ -1499,10 +1512,49 @@ class TestSaveTrigger:
         _run_train_pump(mc, _make_actor_args(trainer=trainer))
 
         assert trainer.poll_calls == 2
+        assert not trainer.polled_inside_a_train_step
         # The step-4 save first finalized and published step_2 itself.
         assert trainer.published_at_save == [set(), {"step_2"}]
         assert trainer.finalize_calls == 2
         assert _step_dir_names(ckpt_dir) == {"step_2", "step_4"}
+
+    @staticmethod
+    def _run_with_pending_save_and_failing_pump(mc, trainer) -> None:
+        async def _main():
+            actor = _ACTOR_CLS(
+                mc, _make_actor_args(trainer=trainer), SetupTimingMetrics()
+            )
+            # A step-1 save is still pending when the train pump fails.
+            path = actor._checkpointer.init_tmp_checkpoint(1, {}, mc)
+            actor._pending_checkpoint = (path, 1)
+
+            async def _failing_train_pump():
+                raise RuntimeError("injected train failure")
+
+            actor._train_pump = _failing_train_pump
+            await asyncio.wait_for(actor.run(), timeout=60.0)
+
+        with pytest.raises(RuntimeError, match="injected train failure"):
+            asyncio.run(_main())
+
+    def test_deferred_finalize_publishes_the_pending_save_when_the_run_fails(
+        self, tmp_path
+    ):
+        mc = _actor_master_config(tmp_path, max_num_steps=0, defer_finalize=True)
+        trainer = _FakeTrainer()
+
+        self._run_with_pending_save_and_failing_pump(mc, trainer)
+
+        assert trainer.finalize_calls == 1
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
+
+    def test_failed_teardown_publish_does_not_mask_the_run_failure(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=0, defer_finalize=True)
+
+        # Raises the train failure, not the finalize one.
+        self._run_with_pending_save_and_failing_pump(mc, _FailingFinalizeTrainer())
+
+        assert _step_dir_names(tmp_path / "checkpoints") == {"tmp_step_1"}
 
     def test_deferred_finalize_requires_megatron_async_save(self, tmp_path):
         mc = _actor_master_config(tmp_path, defer_finalize=True)
