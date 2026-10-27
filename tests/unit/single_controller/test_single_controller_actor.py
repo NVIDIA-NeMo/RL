@@ -4177,13 +4177,9 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
     ctrl._is_ppo = True
-    # model_construct rather than a SimpleNamespace: the stage reads fields off
-    # the algo block that this test does not care about, and a namespace listing
-    # only the interesting ones raises AttributeError every time one is added.
-    # model_construct fills every default, including default_factory ones, and
-    # still skips validation. Its defaults already are the three this test
-    # wants: adv_estimator.name "gae", overlong_filtering False,
-    # seq_logprob_error_threshold None.
+    # model_construct, not a SimpleNamespace: it fills every default the stage
+    # reads -- including the three this test wants -- without validating, so a
+    # field added later does not raise AttributeError here.
     ctrl._master_config = SimpleNamespace(ppo=PPOConfig.model_construct())
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False

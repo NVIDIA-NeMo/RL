@@ -1155,13 +1155,33 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     # divides by the source interval, and an empty or inverted one surfaces as
     # inf/nan or sign-flipped advantages a rollout later, naming nothing.
     scaling_cfg = algo_cfg.reward_scaling
-    if scaling_cfg.enabled and scaling_cfg.source_min >= scaling_cfg.source_max:
-        raise ValueError(
-            f"reward_scaling.source_min={scaling_cfg.source_min} must be less "
-            f"than reward_scaling.source_max={scaling_cfg.source_max}. The "
-            "scale divides by (source_max - source_min), so an empty or "
-            "inverted interval produces inf/nan rewards and advantages."
-        )
+    if scaling_cfg.enabled:
+        # Ahead of the interval check, which neither case reaches: an infinite
+        # bound orders fine and then makes the division inf/inf, and a nan one
+        # compares False against everything.
+        non_finite = [
+            f"{name}={value}"
+            for name, value in (
+                ("source_min", scaling_cfg.source_min),
+                ("source_max", scaling_cfg.source_max),
+                ("target_min", scaling_cfg.target_min),
+                ("target_max", scaling_cfg.target_max),
+            )
+            if not math.isfinite(value)
+        ]
+        if non_finite:
+            raise ValueError(
+                f"reward_scaling bounds must be finite, got {', '.join(non_finite)}. "
+                "The scale maps through (r - source_min) / (source_max - "
+                "source_min), which turns every finite reward into inf/nan."
+            )
+        if scaling_cfg.source_min >= scaling_cfg.source_max:
+            raise ValueError(
+                f"reward_scaling.source_min={scaling_cfg.source_min} must be less "
+                f"than reward_scaling.source_max={scaling_cfg.source_max}. The "
+                "scale divides by (source_max - source_min), so an empty or "
+                "inverted interval produces inf/nan rewards and advantages."
+            )
 
     # Rejected here rather than at the first advantage call, which is a whole
     # round of rollouts and logprobs later: gdpo needs one reward column per

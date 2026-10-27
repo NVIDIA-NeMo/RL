@@ -803,7 +803,9 @@ def test_unshardable_estimator_sends_the_whole_batch_to_one_actor() -> None:
     ]
 
 
-def _run_with_scaling(reward_scaling, num_actors: int):
+def _run_with_scaling(
+    reward_scaling: RewardScalingConfig | None, num_actors: int
+) -> tuple[_RowStore, torch.Tensor, dict[str, float]]:
     """One advantage stage under a reward_scaling block, local or sharded."""
     store = _RowStore(_rows())
     ctrl = _controller("grpo", num_actors, store, reward_scaling=reward_scaling)
@@ -890,7 +892,7 @@ class TestRewardScaling:
         assert metrics_pool == pytest.approx(metrics_local)
 
 
-def _raw_rewards():
+def _raw_rewards() -> list[torch.Tensor]:
     """The fixture's unscaled rewards, in sample-id order."""
     rows = _rows()
     return [rows[f"s{i}"]["total_reward"] for i in range(NUM_GROUPS * GROUP_SIZE)]

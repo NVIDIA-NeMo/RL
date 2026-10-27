@@ -347,11 +347,9 @@ class AdvantageComputer:
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
-        # Ahead of every other reader of `rewards` -- baseline, logged reward,
-        # masked_correct_pct -- which is where v1 applies it. Per-row, so the
-        # stage stays shardable. Unconditional: scale_rewards gates on its own
-        # `enabled`. DataPlane keeps the env's raw reward; this scales only
-        # the stage's view of it.
+        # Ahead of every other reader of `rewards`, as v1 orders it. Called
+        # unconditionally: scale_rewards gates on its own `enabled`. DataPlane
+        # keeps the env's raw reward; this scales the stage's view of it.
         rewards = scale_rewards(
             BatchedDataDict({"total_reward": rewards}), cfg.algo.reward_scaling
         )["total_reward"]
