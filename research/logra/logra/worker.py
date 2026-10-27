@@ -230,6 +230,7 @@ class LoGRAWorkerImpl(AutomodelPolicyWorkerImpl):
     def move_optimizer_to_device(self, device):
         super().move_optimizer_to_device(device)
         if isinstance(self.optimizer, LoGRAOptimizer):
+            self.optimizer.move_row_moments(device)
             for state in self.optimizer.native.state.values():
                 for key, value in state.items():
                     if isinstance(value, torch.Tensor):

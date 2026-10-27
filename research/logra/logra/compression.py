@@ -137,7 +137,13 @@ class _ProjectWeightGradient(torch.autograd.Function):
 
 @dataclass
 class SketchState:
-    """Per-weight sketch; model parameter names and checkpoint keys stay unchanged."""
+    """Per-weight sketch; model parameter names and checkpoint keys stay unchanged.
+
+    ``sketch`` is a ``[rows, rank]`` view into one buffer shared by all targets
+    (see ``install_sketches``) so the trainer can reduce, scale and zero every
+    sketch with a single kernel or collective. ``rows`` is the product of all
+    but the last weight dimension, so fused 3-D expert banks are flattened.
+    """
 
     name: str
     module: nn.Module
@@ -244,15 +250,28 @@ def install_sketches(model: nn.Module, config: LoGRAConfig) -> list[SketchState]
         if weight is None:
             raise ValueError(f"Selected parameter is empty: {weight_name}")
         local_weight_rows(weight)
+    weights = [module._parameters[weight_name] for _, module, weight_name, _ in targets]
+    device = cast(Tensor, weights[0]).device
+    if any(cast(Tensor, weight).device != device for weight in weights):
+        raise ValueError("LoGRA targets must share one device")
+    # All sketches live in one [total_rows, rank] buffer; each target's sketch
+    # is a row-block view of it (see ``sketch_buffer``).
+    row_counts = [math.prod(cast(Tensor, weight).shape[:-1]) for weight in weights]
+    buffer = torch.zeros(
+        sum(row_counts), config.rank, device=device, dtype=torch.float32
+    )
     states = []
-    for name, module, weight_name, fused in targets:
+    row = 0
+    for (name, module, weight_name, fused), rows in zip(
+        targets, row_counts, strict=True
+    ):
         weight = module._parameters[weight_name]
         assert weight is not None  # Validated above before installing any hooks.
         projection = make_projection(
             config.rank,
             weight.shape[-1],
             projection_seed(config.seed, 0, name),
-            device=weight.device,
+            device=device,
             dtype=torch.float32,
             distribution=config.distribution,
         )
@@ -261,15 +280,11 @@ def install_sketches(model: nn.Module, config: LoGRAConfig) -> list[SketchState]
             module,
             weight_name,
             projection,
-            torch.zeros(
-                math.prod(weight.shape[:-1]),
-                config.rank,
-                device=weight.device,
-                dtype=torch.float32,
-            ),
+            buffer[row : row + rows],
             [],
             None,
         )
+        row += rows
         weight.requires_grad_(False)
         if fused:
             state.handles = [
@@ -280,6 +295,18 @@ def install_sketches(model: nn.Module, config: LoGRAConfig) -> list[SketchState]
             state.handles = [module.register_forward_hook(state.forward_hook)]
         states.append(state)
     return states
+
+
+def sketch_buffer(states: list[SketchState]) -> Tensor:
+    """Return the shared buffer that every ``SketchState.sketch`` is a view of."""
+    base = states[0].sketch
+    total_rows = sum(state.sketch.shape[0] for state in states)
+    if base.storage_offset() != 0 or any(
+        state.sketch.untyped_storage().data_ptr() != base.untyped_storage().data_ptr()
+        for state in states
+    ):
+        raise ValueError("Sketches are not views of one shared buffer")
+    return base.as_strided((total_rows, base.shape[1]), base.stride())
 
 
 def local_weight_rows(weight: Tensor) -> tuple[Tensor, int]:
