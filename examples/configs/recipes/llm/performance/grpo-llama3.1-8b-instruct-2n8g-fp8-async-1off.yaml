@@ -5,6 +5,7 @@ policy:
   megatron_cfg:
     fp8_cfg:
       enabled: true
+      fp8_param: true
     env_vars:
       NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"
   generation:
