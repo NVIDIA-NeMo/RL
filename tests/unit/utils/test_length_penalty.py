@@ -851,6 +851,95 @@ class TestProfiledLengthZeroOverMax:
                 }
             )
 
+    @pytest.mark.parametrize(
+        "default, override, match",
+        [
+            pytest.param(
+                {"profiled_length_penalty_type": "zero_over_max"},
+                {"profiled_length_penalty": 0.2},
+                "profiled_length_penalty=0.2",
+                id="override_constant_under_default_zero_over_max",
+            ),
+            pytest.param(
+                {"profiled_length_penalty": 0.2},
+                {"profiled_length_penalty_type": "zero_over_max"},
+                "profiled_length_penalty=0.2",
+                id="override_zero_over_max_under_default_constant",
+            ),
+            pytest.param(
+                {
+                    "profiled_length_penalty_type": "zero_over_max",
+                    "profiled_length_allow_non_binary_rewards": True,
+                },
+                {
+                    "profiled_length_penalty_type": "constant_over_n_std",
+                    "profiled_length_penalty": 0.2,
+                },
+                "profiled_length_allow_non_binary_rewards",
+                id="override_constant_inherits_allow_non_binary",
+            ),
+        ],
+    )
+    def test_profiled_settings_rejected_when_merged(self, default, override, match):
+        # Each block is fine alone; the agent runs on default merged with its
+        # override, and that is not.
+        with pytest.raises(ValueError, match=f"{AGENT}.*{match}"):
+            LengthPenaltyConfig.model_validate(
+                {"default": default, "agent_overrides": {AGENT: override}}
+            )
+
+    @pytest.mark.parametrize(
+        "default, override",
+        [
+            pytest.param(
+                {"profiled_length_penalty_type": "zero_over_max"},
+                {"profiled_length_allow_non_binary_rewards": True},
+                id="override_allows_non_binary_under_default_zero_over_max",
+            ),
+            pytest.param(
+                {"profiled_length_penalty": 0.2},
+                {
+                    "profiled_length_penalty_type": "zero_over_max",
+                    "profiled_length_penalty": 0.0,
+                },
+                id="override_switches_to_zero_over_max_and_clears_constant",
+            ),
+            pytest.param(
+                {
+                    "profiled_length_penalty_type": "zero_over_max",
+                    "profiled_length_allow_non_binary_rewards": True,
+                },
+                {
+                    "profiled_length_penalty_type": "constant_over_n_std",
+                    "profiled_length_allow_non_binary_rewards": False,
+                },
+                id="documented_opt_out",
+            ),
+            pytest.param(
+                {"profiled_length_penalty_type": "zero_over_max"},
+                {"enabled": False, "profiled_length_penalty": 0.2},
+                id="disabled_agent",
+            ),
+        ],
+    )
+    def test_profiled_settings_accepted_when_merged(self, default, override):
+        # Checked on the merged settings the agent runs with, whatever each
+        # block looks like alone.
+        LengthPenaltyConfig.model_validate(
+            {"default": default, "agent_overrides": {AGENT: override}}
+        )
+
+    def test_override_allows_non_binary_under_default_zero_over_max(self):
+        # The type comes from default and the option from the override: the
+        # agent's graded group is capped instead of skipped.
+        results = self.make_group([0.5, 0.5], [5, 50], [1, 1], [10, 10])
+        cfg = self.cfg(num_gens=2)
+        cfg["grpo"]["length_penalty"]["agent_overrides"] = {
+            AGENT: {"profiled_length_allow_non_binary_rewards": True}
+        }
+        apply(results, cfg)
+        assert rewards_of(results) == [0.5, 0.0]
+
     def test_metrics_count_zeroed_rollouts(self):
         results = self.make_group(
             [1.0, 1.0, 0.0, 0.0], [5, 50, 50, 5], [1, 1], [10, 10]

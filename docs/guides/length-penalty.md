@@ -35,8 +35,9 @@ agent (e.g. a genrm judge) produces no warning.
 
 The one exception is the `zero_over_max` profiled cap: with
 `profiled_length_allow_non_binary_rewards: true` it also caps groups with graded (non-negative)
-scalar rewards instead of skipping them, and a negative reward or `reward_components` is an error
-rather than a skip. See [Profiled Length Penalty](#5-profiled-length-penalty).
+scalar rewards instead of skipping them, and a negative reward is then an error rather than a
+skip. Independently of that option, `zero_over_max` raises on `reward_components` instead of
+skipping the group. See [Profiled Length Penalty](#5-profiled-length-penalty).
 
 Consequences of binariness worth knowing:
 
@@ -433,13 +434,20 @@ The negative-reward error fires for any negative reward in the group, not only a
 whether a run fails does not depend on rollout lengths. Multi-component rewards are always an error
 with `zero_over_max`, because zeroing the scalar alone would break
 `reward == sum(reward_components)`; turn the cap off for such agents under `agent_overrides`.
-Low-effort groups are skipped before either check, as for every other length penalty.
+Low-effort groups are skipped before the negative-reward check, as for every other length penalty;
+the `reward_components` check runs first, so it raises for them too.
 `profiled_length_allow_non_binary_rewards` is rejected at config load unless the type is
 `zero_over_max`, since every other length penalty requires binary rewards.
 
-`zero_over_max` ignores `profiled_length_penalty` and `profiled_length_n_std`. Setting a nonzero
-`profiled_length_penalty` in the same block as `profiled_length_penalty_type: zero_over_max` is
-rejected when the config is loaded.
+`zero_over_max` ignores `profiled_length_penalty` and `profiled_length_n_std`. A nonzero
+`profiled_length_penalty` together with `profiled_length_penalty_type: zero_over_max` is rejected
+when the config is loaded.
+
+Both config checks run on `default` and on each enabled agent's settings after its
+`agent_overrides` entry is merged into `default`, because those merged settings are what the agent
+runs with. So `default` setting `zero_over_max` and an override setting only
+`profiled_length_allow_non_binary_rewards: true` is accepted, while an override setting only
+`profiled_length_penalty: 0.2` under that `default` is rejected.
 
 While either type is on for an agent, every row of that agent must carry `profiled_rewards` and
 `profiled_output_lengths` as top-level lists of equal length. A row that lacks them (forgotten,
@@ -448,8 +456,10 @@ misspelled, or nested under `extra_env_info`) or carries something else fails th
 and data-plane drivers this stops the run; the async collector counts it as a batch-worker failure
 and aborts once failures exceed `max_generation_failures`. For mixed data where some agents have
 no profiles, turn the profiled penalty off for those agents under `agent_overrides` (for example
-`profiled_length_penalty_type: constant_over_n_std` with `profiled_length_penalty` left at 0, or
-`enabled: false`).
+`profiled_length_penalty_type: constant_over_n_std` and
+`profiled_length_allow_non_binary_rewards: false`, with `profiled_length_penalty` left at 0; or
+`enabled: false`). The `profiled_length_allow_non_binary_rewards: false` keeps the override valid
+when `default` turns that option on.
 
 `profiled_output_lengths` should be in the same unit as `length_type`. If they record the
 profiled responses' generated token counts, use `length_type: all_generated_tokens`; then
