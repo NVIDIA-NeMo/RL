@@ -46,6 +46,23 @@ _SEQ_METRIC_MAX: frozenset[str] = frozenset(
 )
 
 
+class StreamingObjectiveLoss:
+    """Accumulate objective sums until the split worker knows the denominator."""
+
+    def __init__(self, loss_fn: LossFunction) -> None:
+        self.loss_fn = loss_fn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.loss_fn, name)
+
+    def __call__(self, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        # Existing forward callbacks already supply placeholder token/sequence
+        # counts of one; the objective has its own finish-time denominator.
+        return self.loss_fn(
+            global_objective_denominator=kwargs["global_valid_toks"], **kwargs
+        )
+
+
 class SequencePackingLossWrapper:
     def __init__(
         self,
