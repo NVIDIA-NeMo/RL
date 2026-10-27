@@ -920,6 +920,11 @@ done
 # Wait for the head to signal that its GCS is listening before connecting.
 echo "[INFO] Worker \$SLURM_PROCID: waiting for Ray head GCS to be ready..."
 while true; do
+  # Re-list the directory before the existence checks: on this cluster's shared
+  # filesystem a bare [[ -f ]] can read a stale negative dentry for minutes
+  # after the head creates the sentinel (observed: 52/128 workers stuck 8+ min
+  # while the file existed), and readdir forces revalidation.
+  ls "$LOG_DIR" > /dev/null 2>&1
   if [[ -f "$LOG_DIR/STARTED_RAY_HEAD" ]]; then
     log_phase "worker \$SLURM_PROCID connecting to Ray head"
     break
