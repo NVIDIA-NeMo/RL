@@ -98,6 +98,10 @@ from nemo_rl.models.megatron.draft.step_state import (
     DraftStepPayload,
     DraftStepState,
 )
+from nemo_rl.models.megatron.golden_values import (
+    fingerprint_named_tensors,
+    scalar_config_fields,
+)
 from nemo_rl.models.megatron.hybridep import uses_hybridep_flex_dispatcher
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
@@ -3441,6 +3445,26 @@ class MegatronPolicyWorkerImpl(
         elif hasattr(model, "config"):
             return model.config
         return None
+
+    @torch.no_grad()
+    def get_golden_snapshot(self) -> Optional[dict[str, Any]]:
+        """Weight fingerprints and model config for a golden-value check.
+
+        Every rank must call this, because the HF export gathers across
+        model-parallel ranks; rank 0 returns the snapshot and the others None.
+        See ``nemo_rl.models.megatron.golden_values``.
+        """
+        weights = self.megatron_bridge.export_hf_weights(
+            [self.model], show_progress=False
+        )
+        if torch.distributed.get_rank() != 0:
+            for _ in weights:
+                pass
+            return None
+        return {
+            "weights": fingerprint_named_tensors(weights),
+            "model_config": scalar_config_fields(get_model_config(self.model)),
+        }
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/init_remote_sparse_delta_baseline")
