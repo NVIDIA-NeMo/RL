@@ -1852,7 +1852,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     assert len(dump_timings) == 1
     assert math.isfinite(dump_timings[0]) and dump_timings[0] > 0
 
-    ctrl._train_data_dump.finish_step(0)
+    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
     dumped = [
         json.loads(line)
         for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()

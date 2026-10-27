@@ -138,15 +138,13 @@ class DebugWriter(ABC):
                         "Training dump input length exceeds a sequence column"
                     )
 
-    def finish_step(
-        self, step: int, receipts: list[ChunkReceipt] | None = None
-    ) -> None:
+    def finish_step(self, step: int, receipts: list[ChunkReceipt]) -> None:
         """Publish a completed optimizer step and reset the per-step state.
 
         Args:
             step: The completed optimizer step.
-            receipts: Receipts of the chunks the shards stored for this step, whose
-                row counts are checked against the rows published.
+            receipts: Receipts add_chunk returned for this step's chunks, naming
+                what to publish and how many rows it must hold.
         """
         self._publish_step(step, receipts)
         self.step = None
@@ -161,7 +159,7 @@ class DebugWriter(ABC):
         """
 
     @abstractmethod
-    def _publish_step(self, step: int, receipts: list[ChunkReceipt] | None) -> None:
+    def _publish_step(self, step: int, receipts: list[ChunkReceipt]) -> None:
         """Publish a completed step's rows, raising on a row-count mismatch."""
 
 
@@ -173,12 +171,18 @@ class JsonDebugWriter(DebugWriter):
     completed-looking JSONL file. Shards must share a filesystem with the controller.
     """
 
+    def _dump_path(self, step: int) -> Path:
+        """Return the published JSONL path."""
+        return self.log_dir / f"train_data_step{step + 1}.jsonl"
+
+    def _shard_path(self, step: int) -> Path:
+        """Return this shard's part file path."""
+        return self.log_dir / f"train_data_step{step + 1}.jsonl.part-{self.shard_id}"
+
     def _write_chunk(self, chunk: TrainChunk, *, replace: bool) -> ChunkReceipt:
         """Write the chunk's rows to this shard's part file, starting it over if replace is set."""
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        part = (
-            self.log_dir / f"train_data_step{chunk.step + 1}.jsonl.part-{self.shard_id}"
-        )
+        part = self._shard_path(chunk.step)
         mode = "w" if replace else "a"
 
         # unbind() splits dense and jagged columns alike into per-row tensors.
@@ -207,12 +211,22 @@ class JsonDebugWriter(DebugWriter):
                 num_rows += 1
         return ChunkReceipt(shard_id=self.shard_id, rows=num_rows, ref=str(part))
 
-    def _publish_step(self, step: int, receipts: list[ChunkReceipt] | None) -> None:
-        """Merge the shards' part files into one JSONL file and publish it atomically."""
-        parts = sorted(self.log_dir.glob(f"train_data_step{step + 1}.jsonl.part-*"))
+    def _publish_step(self, step: int, receipts: list[ChunkReceipt]) -> None:
+        """Merge the part files the receipts name into one JSONL file and publish it atomically."""
+        # A shard appends every chunk of a step to one part file, so its
+        # receipts repeat the same ref.
+        parts = [Path(ref) for ref in dict.fromkeys(r.ref for r in receipts)]
         if not parts:
             raise RuntimeError("Completed optimizer step has no training dump")
-        partial = self.log_dir / f"train_data_step{step + 1}.jsonl.partial"
+        missing = [str(part) for part in parts if not part.exists()]
+        if missing:
+            raise RuntimeError(
+                f"Training dump part file(s) {missing} not found; the advantage "
+                "pool must share this filesystem with the controller"
+            )
+
+        # Merge the part files into a partial JSONL file.
+        partial = Path(f"{self._dump_path(step)}.partial")
         rows = 0
         with partial.open("w") as merged:
             for part in parts:
@@ -226,17 +240,18 @@ class JsonDebugWriter(DebugWriter):
         if not rows:
             partial.unlink()
             raise RuntimeError("Completed optimizer step has no training dump")
-        expected_rows = (
-            sum(receipt.rows for receipt in receipts) if receipts is not None else None
-        )
-        if expected_rows is not None and rows != expected_rows:
+
+        # Check that the merged file has the same number of rows as the receipts report.
+        expected_rows = sum(receipt.rows for receipt in receipts)
+        if rows != expected_rows:
             partial.unlink()
             raise RuntimeError(
-                f"Training dump merged {rows} row(s) from {len(parts)} shard(s) "
-                f"but the stage reported writing {expected_rows}; the advantage "
-                "pool must share this filesystem with the controller"
+                f"Training dump merged {rows} row(s) from {len(parts)} part file(s) "
+                f"but the receipts report {expected_rows}"
             )
-        os.replace(partial, self.log_dir / f"train_data_step{step + 1}.jsonl")
+
+        # Replace the partial file with the completed JSONL file.
+        os.replace(partial, self._dump_path(step))
         for part in parts:
             part.unlink()
 

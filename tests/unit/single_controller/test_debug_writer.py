@@ -21,7 +21,7 @@ def test_chunks_keep_masked_rows_and_long_sequences_until_commit(tmp_path):
     writer = JsonDebugWriter(str(tmp_path))
     size = 262144
     tokens = torch.arange(size).reshape(1, -1)
-    for sid, length, mask in [("long", size, 1), ("masked", 3, 0)]:
+    receipts = [
         writer.add_chunk(
             TrainChunk(
                 step=4,
@@ -32,9 +32,11 @@ def test_chunks_keep_masked_rows_and_long_sequences_until_commit(tmp_path):
                 scalars={"sample_loss_mask": torch.tensor([mask])},
             )
         )
+        for sid, length, mask in [("long", size, 1), ("masked", 3, 0)]
+    ]
     final = tmp_path / "train_data_step5.jsonl"
     assert not final.exists()
-    writer.finish_step(4)
+    writer.finish_step(4, receipts)
     rows = [json.loads(line) for line in final.read_text().splitlines()]
     assert [r["idx"] for r in rows] == [0, 1]
     assert rows[0]["token_ids"][0] == list(range(size))
@@ -43,7 +45,7 @@ def test_chunks_keep_masked_rows_and_long_sequences_until_commit(tmp_path):
     assert rows[1]["metadata"] == [{"prompt_idx": 12}]
     assert not final.with_suffix(".jsonl.partial").exists()
     with pytest.raises(RuntimeError, match="no training dump"):
-        writer.finish_step(5)
+        writer.finish_step(5, [])
 
 
 def test_resume_replaces_partial_and_keeps_steps_apart(tmp_path: Path) -> None:
@@ -60,7 +62,7 @@ def test_resume_replaces_partial_and_keeps_steps_apart(tmp_path: Path) -> None:
         sequences={"token_ids": torch.tensor([[9]])},
         scalars={},
     )
-    writer.add_chunk(chunk)
+    receipt = writer.add_chunk(chunk)
     part = tmp_path / "train_data_step8.jsonl.part-0"
     assert json.loads(part.read_text())["token_ids"] == [[9]]
     # Each step owns its own part file, so moving on neither publishes nor
@@ -69,8 +71,8 @@ def test_resume_replaces_partial_and_keeps_steps_apart(tmp_path: Path) -> None:
     assert (tmp_path / "train_data_step9.jsonl.part-0").exists()
     assert part.exists()
     with pytest.raises(RuntimeError, match="no training dump"):
-        writer.finish_step(42)
-    writer.finish_step(7)
+        writer.finish_step(42, [])
+    writer.finish_step(7, [receipt])
     published = tmp_path / "train_data_step8.jsonl"
     assert json.loads(published.read_text())["idx"] == 0
     assert not part.exists()
@@ -84,7 +86,7 @@ def test_shards_write_separate_parts_and_merge_in_order(tmp_path: Path) -> None:
     a per-writer counter would hand the same index to every shard.
     """
     shards = [JsonDebugWriter(str(tmp_path), shard_id=str(i)) for i in range(3)]
-    for i, shard in enumerate(shards):
+    receipts = [
         shard.add_chunk(
             TrainChunk(
                 step=0,
@@ -95,12 +97,14 @@ def test_shards_write_separate_parts_and_merge_in_order(tmp_path: Path) -> None:
                 scalars={},
             )
         )
+        for i, shard in enumerate(shards)
+    ]
     assert sorted(p.name for p in tmp_path.glob("*.part-*")) == [
         f"train_data_step1.jsonl.part-{i}" for i in range(3)
     ]
-    # Any shard can publish: the merge reads the parts off disk rather than
-    # whatever that writer happens to have buffered.
-    shards[1].finish_step(0)
+    # Any shard can publish: the merge reads the parts the receipts name
+    # rather than whatever that writer happens to have buffered.
+    shards[1].finish_step(0, receipts)
     rows = [
         json.loads(line)
         for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
@@ -115,9 +119,9 @@ def test_unreachable_shard_fails_instead_of_publishing_a_short_dump(
 ) -> None:
     """A pool off the controller's filesystem writes parts it cannot see.
 
-    Those shards still run and still report their row counts, so without the
-    count check the merge would publish whatever happened to be local and the
-    dump would look complete while silently missing a shard.
+    Those shards still run and still return receipts, so without checking that
+    every named part exists the merge would publish whatever happened to be
+    local and the dump would look complete while silently missing a shard.
     """
     reachable = JsonDebugWriter(str(tmp_path), shard_id="0")
     here = reachable.add_chunk(
@@ -137,7 +141,7 @@ def test_unreachable_shard_fails_instead_of_publishing_a_short_dump(
         controller.finish_step(0, [here, elsewhere])
     assert not list(tmp_path.glob("*.jsonl"))
     assert not list(tmp_path.glob("*.partial"))
-    # The honest count still publishes.
+    # The reachable receipt alone still publishes.
     controller.finish_step(0, [here])
     assert (tmp_path / "train_data_step1.jsonl").exists()
 
@@ -149,7 +153,7 @@ def test_controller_publishes_a_step_it_never_wrote(tmp_path: Path) -> None:
     pre-pool writer rejected because it keyed off its own row counter.
     """
     worker = JsonDebugWriter(str(tmp_path), shard_id="7")
-    worker.add_chunk(
+    receipt = worker.add_chunk(
         TrainChunk(
             step=2,
             sample_ids=["only"],
@@ -160,7 +164,7 @@ def test_controller_publishes_a_step_it_never_wrote(tmp_path: Path) -> None:
         )
     )
     controller = JsonDebugWriter(str(tmp_path))
-    controller.finish_step(2)
+    controller.finish_step(2, [receipt])
     rows = (tmp_path / "train_data_step3.jsonl").read_text().splitlines()
     assert [json.loads(line)["sample_id"] for line in rows] == [["only"]]
 
@@ -196,8 +200,7 @@ def test_dump_preserves_singleton_batch_schema(
 ) -> None:
     original_advantages = chunk.sequences["advantages"].detach().clone()
     writer = JsonDebugWriter(str(tmp_path / "nested" / "logs"))
-    writer.add_chunk(chunk)
-    writer.finish_step(0)
+    writer.finish_step(0, [writer.add_chunk(chunk)])
     rows = [
         json.loads(line)
         for line in (writer.log_dir / "train_data_step1.jsonl").read_text().splitlines()
@@ -298,8 +301,8 @@ def test_jagged_columns_dump_real_rows_without_padding(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="input length"):
         # Validation is per row: 5 fits row 0 but exceeds jagged row 3.
         writer.add_chunk(chunk)
-    writer.add_chunk(replace(chunk, input_lengths=torch.tensor([5, 4, 3, 4])))
-    writer.finish_step(0)
+    receipt = writer.add_chunk(replace(chunk, input_lengths=torch.tensor([5, 4, 3, 4])))
+    writer.finish_step(0, [receipt])
     rows = [
         json.loads(line)
         for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
@@ -319,8 +322,7 @@ def test_zero_length_and_missing_optional_columns(
         scalars={},
         sequences={"token_ids": chunk.sequences["token_ids"]},
     )
-    writer.add_chunk(chunk)
-    writer.finish_step(0)
+    writer.finish_step(0, [writer.add_chunk(chunk)])
     rows = [
         json.loads(line)
         for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
@@ -336,13 +338,11 @@ def test_consecutive_steps_reset_row_indices_and_preserve_prior_dump(
     tmp_path: Path, chunk: TrainChunk
 ) -> None:
     writer = JsonDebugWriter(str(tmp_path))
-    writer.add_chunk(chunk)
-    writer.finish_step(0)
+    writer.finish_step(0, [writer.add_chunk(chunk)])
     first = tmp_path / "train_data_step1.jsonl"
     original = first.read_bytes()
-    writer.add_chunk(replace(chunk, step=1))
-    writer.add_chunk(replace(chunk, step=1))
-    writer.finish_step(1)
+    receipts = [writer.add_chunk(replace(chunk, step=1)) for _ in range(2)]
+    writer.finish_step(1, receipts)
     rows = [
         json.loads(line)
         for line in (tmp_path / "train_data_step2.jsonl").read_text().splitlines()
@@ -356,7 +356,7 @@ def test_consecutive_steps_reset_row_indices_and_preserve_prior_dump(
 
 def test_empty_chunk_cannot_publish_completed_step(tmp_path: Path) -> None:
     writer = JsonDebugWriter(str(tmp_path))
-    writer.add_chunk(
+    receipt = writer.add_chunk(
         TrainChunk(
             step=0,
             sample_ids=[],
@@ -367,14 +367,35 @@ def test_empty_chunk_cannot_publish_completed_step(tmp_path: Path) -> None:
         )
     )
     with pytest.raises(RuntimeError, match="no training dump"):
-        writer.finish_step(0)
+        writer.finish_step(0, [receipt])
     assert not list(tmp_path.glob("*.jsonl"))
+
+
+def test_publish_merges_only_the_parts_the_receipts_name(tmp_path: Path) -> None:
+    """A part left behind by a shard that reported nothing this step stays out."""
+    leftover = tmp_path / "train_data_step1.jsonl.part-9"
+    leftover.write_text('{"sample_id": ["stale"]}\n')
+    writer = JsonDebugWriter(str(tmp_path))
+    receipt = writer.add_chunk(
+        TrainChunk(
+            step=0,
+            sample_ids=["fresh"],
+            tags=None,
+            input_lengths=torch.tensor([1]),
+            sequences={"token_ids": torch.tensor([[1]])},
+            scalars={},
+        )
+    )
+    writer.finish_step(0, [receipt])
+    rows = (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
+    assert [json.loads(line)["sample_id"] for line in rows] == [["fresh"]]
+    assert leftover.exists()
 
 
 def test_nonfinite_logprobs_are_null_in_strict_json(tmp_path):
     values = torch.tensor([[0.0, -torch.inf, torch.inf, torch.nan]])
     writer = JsonDebugWriter(str(tmp_path))
-    writer.add_chunk(
+    receipt = writer.add_chunk(
         TrainChunk(
             step=0,
             sample_ids=["sample"],
@@ -384,7 +405,7 @@ def test_nonfinite_logprobs_are_null_in_strict_json(tmp_path):
             scalars={},
         )
     )
-    writer.finish_step(0)
+    writer.finish_step(0, [receipt])
     text = (tmp_path / "train_data_step1.jsonl").read_text()
 
     def reject_nonfinite(value):
@@ -405,7 +426,7 @@ class _RecordingWriter(DebugWriter):
             shard_id=self.shard_id, rows=len(chunk.sample_ids), ref=None
         )
 
-    def _publish_step(self, step: int, receipts: list[ChunkReceipt] | None) -> None:
+    def _publish_step(self, step: int, receipts: list[ChunkReceipt]) -> None:
         pass
 
 
