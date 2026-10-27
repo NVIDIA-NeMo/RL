@@ -353,7 +353,7 @@ These parameters are added under the `policy` section:
 | Parameter | Description |
 |---|---|
 | `quant_cfg` | Quantization config. Accepts: a built-in ModelOpt config name (e.g. `"NVFP4_DEFAULT_CFG"`), a built-in ModelOpt PTQ recipe name (e.g. `"general/ptq/nvfp4_default-fp8_kv"`, suffix optional), or the path to a custom YAML recipe (e.g. `"examples/modelopt/quant_configs/nvfp4_a16.yaml"`). Use absolute paths for user-authored recipes in Ray/container workers. See `examples/modelopt/quant_configs/` for an example and `modelopt_recipes/general/ptq/` in Model-Optimizer for the canonical YAML format. |
-| `quant_calib_data` | Dataset name used for calibration. See the [ModelOpt PTQ examples](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq) for supported datasets. |
+| `quant_calib_data` | Dataset name used for calibration. See the [ModelOpt PTQ examples](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/hf_ptq) for supported datasets. |
 | `quant_calib_size` | Number of samples for the calibration pass |
 | `quant_batch_size` | Batch size during calibration |
 | `quant_sequence_length` | Sequence length for calibration data |
