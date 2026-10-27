@@ -21,6 +21,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
+    merge_policy_hf_overrides,
     validate_vllm_quantization_config,
 )
 
@@ -147,3 +148,38 @@ def test_configure_generation_config_validates_refit_prequantize() -> None:
 
     with pytest.raises(ValueError, match="requires precision='fp8' and is_mx=true"):
         configure_generation_config(generation_config, tokenizer)
+
+
+@pytest.mark.parametrize(
+    ("generation_config", "policy_overrides", "expected"),
+    [
+        ({}, None, {}),
+        (
+            {"vllm_kwargs": {"hf_overrides": None}},
+            {"rope_theta": 1.0},
+            {"rope_theta": 1.0},
+        ),
+        (
+            {"vllm_kwargs": {"hf_overrides": {"head_dtype": "float32"}}},
+            {"rope_theta": 1.0},
+            {"head_dtype": "float32", "rope_theta": 1.0},
+        ),
+        # The same key with the same value is not a conflict (setup may run twice).
+        (
+            {"vllm_kwargs": {"hf_overrides": {"rope_theta": 1.0}}},
+            {"rope_theta": 1.0},
+            {"rope_theta": 1.0},
+        ),
+    ],
+)
+def test_merge_policy_hf_overrides(generation_config, policy_overrides, expected):
+    merge_policy_hf_overrides(generation_config, policy_overrides)
+
+    assert generation_config["vllm_kwargs"]["hf_overrides"] == expected
+
+
+def test_merge_policy_hf_overrides_rejects_conflicting_key() -> None:
+    generation_config = {"vllm_kwargs": {"hf_overrides": {"rope_theta": 2.0}}}
+
+    with pytest.raises(ValueError, match=r"\['rope_theta'\]"):
+        merge_policy_hf_overrides(generation_config, {"rope_theta": 1.0})

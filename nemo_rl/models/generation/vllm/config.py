@@ -575,3 +575,31 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
         VllmCheckpointEnginePluginConfig.model_validate(plugin_config)
     config["refit_cfg"] = refit_config
     return refit_config
+
+
+def merge_policy_hf_overrides(
+    generation_config: Mapping[str, Any],
+    policy_hf_config_overrides: Mapping[str, Any] | None,
+) -> None:
+    """Merge policy.hf_config_overrides into generation.vllm_kwargs.hf_overrides.
+
+    The policy's overrides always reach vLLM so the trainer and the rollout
+    engine load the same HF config. vLLM-only keys set directly in
+    vllm_kwargs.hf_overrides are kept; a key set in both with different
+    values is rejected.
+    """
+    vllm_kwargs = cast(dict[str, Any], generation_config).setdefault("vllm_kwargs", {})
+    policy_overrides = dict(policy_hf_config_overrides or {})
+    user_overrides = dict(vllm_kwargs.get("hf_overrides") or {})
+    conflicts = sorted(
+        key
+        for key in user_overrides.keys() & policy_overrides.keys()
+        if user_overrides[key] != policy_overrides[key]
+    )
+    if conflicts:
+        raise ValueError(
+            f"policy.generation.vllm_kwargs.hf_overrides sets {conflicts} to values "
+            "that differ from policy.hf_config_overrides. The trainer and vLLM must "
+            "load the same HF config; set these keys only in policy.hf_config_overrides."
+        )
+    vllm_kwargs["hf_overrides"] = {**user_overrides, **policy_overrides}

@@ -4230,6 +4230,51 @@ def test_setup_automodel_fp8_kv_cache_guard(
     policy_init.assert_not_called()
 
 
+def test_setup_keeps_user_vllm_hf_overrides(mock_grpo_components, monkeypatch):
+    import nemo_rl.algorithms.grpo as grpo_mod
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.data.update(shuffle=False, num_workers=0)
+    master_config.policy.update(
+        model_name="test-model",
+        automodel_cfg={"enabled": True},
+        megatron_cfg={"enabled": False},
+        hf_config_overrides={"rope_theta": 1_000_000.0},
+    )
+    generation_config = master_config.policy["generation"]
+    generation_config["vllm_cfg"].update(
+        async_engine=False, precision="bfloat16", kv_cache_dtype="auto"
+    )
+    generation_config["vllm_kwargs"] = {"hf_overrides": {"head_dtype": "float32"}}
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.load_training_info.return_value = None
+    checkpointer.get_resume_paths.return_value = (None, None)
+    monkeypatch.setattr(grpo_mod, "Logger", MagicMock())
+    monkeypatch.setattr(grpo_mod, "CheckpointManager", lambda _config: checkpointer)
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", MagicMock())
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", MagicMock())
+    monkeypatch.setattr(
+        grpo_mod, "prepare_segment_topology", lambda *_args: (None, [], {})
+    )
+
+    class GenerationInitReached(Exception):
+        pass
+
+    generation_init = MagicMock(side_effect=GenerationInitReached)
+    monkeypatch.setattr(grpo_mod, "VllmGeneration", generation_init)
+    monkeypatch.setattr(grpo_mod, "Policy", MagicMock())
+
+    with pytest.raises(GenerationInitReached):
+        grpo_mod.setup(master_config, MagicMock(), MagicMock(), None)
+
+    assert generation_init.call_args.kwargs["config"]["vllm_kwargs"][
+        "hf_overrides"
+    ] == {"head_dtype": "float32", "rope_theta": 1_000_000.0}
+
+
 def test_setup_rejects_megatron_router_replay_before_side_effects(
     mock_grpo_components,
 ):
