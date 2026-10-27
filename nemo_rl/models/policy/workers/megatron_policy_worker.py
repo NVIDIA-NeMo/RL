@@ -886,7 +886,9 @@ class MegatronPolicyWorkerImpl(
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
-        self._maybe_enable_manual_gc()
+        # Fail on a bad manual_gc config before the expensive setup below; GC itself
+        # is disabled at the end of __init__ (_maybe_enable_manual_gc).
+        self._manual_gc_interval_from_cfg()
 
         # Store the reserved HTTP server port for inference server initialization.
         # Megatron-LLM's hosts an inference server on every MP coordinator rank,
@@ -1156,6 +1158,7 @@ class MegatronPolicyWorkerImpl(
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
         )
+        self._maybe_enable_manual_gc()
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -1563,6 +1566,9 @@ class MegatronPolicyWorkerImpl(
                     # policy so their large early gradients don't shrink the
                     # policy update. None when no draft model is attached.
                     draft_grad_norm = self.optimizer.grad_norms_by_group.get("draft")
+                    # Once per optimizer step, so manual_gc_interval means the same
+                    # here as on the split-step path (finish_train_step).
+                    self._maybe_run_manual_gc()
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
                     mtp_grad_norm = None
@@ -2267,29 +2273,51 @@ class MegatronPolicyWorkerImpl(
         self._maybe_run_manual_gc()
         return result
 
+    def _manual_gc_interval_from_cfg(self) -> Optional[int]:
+        """Return megatron_cfg.manual_gc_interval if manual GC is on, else None.
+
+        Raises:
+            ValueError: if manual_gc is True and manual_gc_interval is missing or not
+                a positive number of optimizer steps. NeMo-RL has no equivalent of
+                Megatron's ``manual_gc_eval`` collections, so a non-positive interval
+                would disable automatic GC with no collection ever running.
+        """
+        megatron_cfg = self.cfg["megatron_cfg"]
+        if not megatron_cfg.get("manual_gc"):
+            return None
+        interval = megatron_cfg.get("manual_gc_interval")
+        if not isinstance(interval, int) or isinstance(interval, bool) or interval <= 0:
+            raise ValueError(
+                "megatron_cfg.manual_gc is True, so megatron_cfg.manual_gc_interval "
+                f"must be a positive number of optimizer steps, got {interval!r}. "
+                "Otherwise automatic GC is disabled with no collection ever running."
+            )
+        return interval
+
     def _maybe_enable_manual_gc(self) -> None:
         """Disable automatic Python GC when megatron_cfg.manual_gc is set.
 
         Mirrors Megatron's ``manual_gc``: collections then run on every rank at the
         same point (see ``_maybe_run_manual_gc``) instead of stalling the other
-        ranks one at a time. Forked children re-enable GC so subprocesses such as
-        data workers keep the default behavior.
+        ranks one at a time. Called at the end of ``__init__``, so model, optimizer
+        and checkpoint setup run with automatic GC on and the collection here frees
+        their garbage. Forked children re-enable GC so subprocesses such as data
+        workers keep the default behavior.
         """
-        megatron_cfg = self.cfg["megatron_cfg"]
-        if not megatron_cfg.get("manual_gc"):
+        interval = self._manual_gc_interval_from_cfg()
+        if interval is None:
             return
-        interval = megatron_cfg["manual_gc_interval"]
-        if interval < 0:
-            raise ValueError(
-                f"megatron_cfg.manual_gc_interval must be >= 0, got {interval}"
-            )
+        gc.collect()
         gc.disable()
         os.register_at_fork(after_in_child=gc.enable)
-        gc.collect()
         self._manual_gc_interval = interval
 
     def _maybe_run_manual_gc(self) -> None:
-        """Collect every manual_gc_interval finished steps; every rank runs it in lockstep."""
+        """Collect every manual_gc_interval optimizer steps; every rank runs it in lockstep.
+
+        Called after each optimizer step on both training paths: per global batch in
+        ``train()`` and at the end of ``finish_train_step``.
+        """
         if not self._manual_gc_interval:
             return
         self._manual_gc_steps += 1

@@ -127,9 +127,9 @@ policy:
     env_vars: {}
     empty_unused_memory_level: 1
     # Megatron-style manual GC: disable automatic Python GC and collect on every rank
-    # together every manual_gc_interval optimizer steps (0 = never collect).
+    # together every manual_gc_interval optimizer steps (a positive integer).
     manual_gc: false
-    manual_gc_interval: 0
+    manual_gc_interval: 10
     activation_checkpointing: false
     # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
     cuda_graph_impl: "none"

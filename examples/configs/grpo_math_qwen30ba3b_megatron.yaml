@@ -32,9 +32,9 @@ policy:
     enabled: true
     empty_unused_memory_level: 1
     # Megatron-style manual GC: disable automatic Python GC and collect on every rank
-    # together every manual_gc_interval optimizer steps (0 = never collect).
+    # together every manual_gc_interval optimizer steps (a positive integer).
     manual_gc: false
-    manual_gc_interval: 0
+    manual_gc_interval: 10
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1
     context_parallel_size: 1

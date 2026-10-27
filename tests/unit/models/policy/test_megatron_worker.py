@@ -2514,14 +2514,23 @@ def _manual_gc_worker(monkeypatch, megatron_cfg):
     return worker, events
 
 
-def test_megatron_manual_gc_is_off_without_the_config_key(monkeypatch):
-    worker, events = _manual_gc_worker(monkeypatch, {})
+@pytest.mark.parametrize(
+    "megatron_cfg",
+    [{}, {"manual_gc": False}, {"manual_gc": False, "manual_gc_interval": 10}],
+    ids=["no_keys", "manual_gc_false", "exemplar_defaults"],
+)
+def test_megatron_manual_gc_is_off_unless_enabled(monkeypatch, megatron_cfg):
+    worker, events = _manual_gc_worker(monkeypatch, megatron_cfg)
 
+    assert worker._manual_gc_interval_from_cfg() is None
     worker._maybe_enable_manual_gc()
     for _ in range(3):
         worker._maybe_run_manual_gc()
 
     assert events == []
+    # Nothing was written to the instance; this is the class-level default.
+    assert "_manual_gc_interval" not in vars(worker)
+    assert "_manual_gc_steps" not in vars(worker)
     assert worker._manual_gc_interval is None
 
 
@@ -2533,8 +2542,9 @@ def test_megatron_manual_gc_collects_every_interval(monkeypatch):
     )
 
     worker._maybe_enable_manual_gc()
-    # Automatic GC goes off, forked children get it back, one collection up front.
-    assert events == ["disable", ("register_at_fork", gc.enable), "collect"]
+    # Setup garbage is collected first, then automatic GC goes off and forked
+    # children get it back.
+    assert events == ["collect", "disable", ("register_at_fork", gc.enable)]
 
     events.clear()
     for _ in range(5):
@@ -2542,27 +2552,119 @@ def test_megatron_manual_gc_collects_every_interval(monkeypatch):
     assert events == ["collect", "collect"]  # after steps 2 and 4
 
 
-def test_megatron_manual_gc_interval_zero_never_collects(monkeypatch):
-    worker, events = _manual_gc_worker(
-        monkeypatch, {"manual_gc": True, "manual_gc_interval": 0}
-    )
+@pytest.mark.parametrize(
+    "megatron_cfg",
+    [
+        {"manual_gc": True},
+        {"manual_gc": True, "manual_gc_interval": None},
+        {"manual_gc": True, "manual_gc_interval": 0},
+        {"manual_gc": True, "manual_gc_interval": -1},
+        {"manual_gc": True, "manual_gc_interval": True},
+        {"manual_gc": True, "manual_gc_interval": "10"},
+    ],
+    ids=["missing", "none", "zero", "negative", "bool", "str"],
+)
+def test_megatron_manual_gc_rejects_a_non_positive_interval(monkeypatch, megatron_cfg):
+    worker, events = _manual_gc_worker(monkeypatch, megatron_cfg)
 
-    worker._maybe_enable_manual_gc()
-    events.clear()
-    for _ in range(5):
-        worker._maybe_run_manual_gc()
-
-    assert events == []
-
-
-def test_megatron_manual_gc_rejects_a_negative_interval(monkeypatch):
-    worker, events = _manual_gc_worker(
-        monkeypatch, {"manual_gc": True, "manual_gc_interval": -1}
-    )
-
-    with pytest.raises(ValueError, match="manual_gc_interval"):
+    with pytest.raises(ValueError, match="manual_gc_interval must be a positive"):
+        worker._manual_gc_interval_from_cfg()
+    with pytest.raises(ValueError, match="manual_gc_interval must be a positive"):
         worker._maybe_enable_manual_gc()
+    # GC is left untouched: the error is raised before any gc call.
     assert events == []
+
+
+def _megatron_worker_method_ast(name):
+    """AST of a MegatronPolicyWorkerImpl method, parsed from the module file.
+
+    Parsed from the file rather than via ``inspect.getsource`` because decorators
+    such as ``wrap_with_nvtx_name`` may hide the original function.
+    """
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    with open(worker_module.__file__) as f:
+        module = ast.parse(f.read())
+    (cls,) = [
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "MegatronPolicyWorkerImpl"
+    ]
+    (method,) = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    return method
+
+
+def test_megatron_worker_init_validates_manual_gc_early_and_enables_it_last():
+    """__init__ fails on a bad config before setup and disables GC only at the end.
+
+    The worker constructor needs GPUs and a model, so this checks the call sites in
+    the source: validation right after the Timer, enabling as the last statement.
+    """
+    init_fn = _megatron_worker_method_ast("__init__")
+    calls = [
+        node.func.attr
+        for node in ast.walk(init_fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr
+        in ("_manual_gc_interval_from_cfg", "_maybe_enable_manual_gc")
+    ]
+    assert calls.count("_manual_gc_interval_from_cfg") == 1
+    assert calls.count("_maybe_enable_manual_gc") == 1
+    last = init_fn.body[-1]
+    assert (
+        isinstance(last, ast.Expr)
+        and isinstance(last.value, ast.Call)
+        and last.value.func.attr == "_maybe_enable_manual_gc"
+    ), "_maybe_enable_manual_gc must be the last statement of __init__"
+
+
+def test_megatron_train_runs_manual_gc_after_each_optimizer_step():
+    """The monolithic train() (v1 SFT/RM/DPO) must reach the manual GC hook.
+
+    Checked in the source because train() needs GPUs; the GPU test
+    test_megatron_policy_training_manual_gc covers it end to end. The hook must sit
+    in the same block as optimizer.step(), so it runs once per optimizer step and
+    never in eval mode.
+    """
+    tree = _megatron_worker_method_ast("train")
+
+    def calls_in(stmts, attr):
+        return [
+            node
+            for stmt in stmts
+            for node in ast.walk(stmt)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == attr
+        ]
+
+    def is_optimizer_step(stmt):
+        # `... = self.optimizer.step()` as a statement of this block itself, not
+        # of a nested one (enclosing blocks contain it too).
+        return (
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr == "step"
+            and isinstance(stmt.value.func.value, ast.Attribute)
+            and stmt.value.func.value.attr == "optimizer"
+        )
+
+    blocks_with_step = [
+        node.body
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If) and any(is_optimizer_step(s) for s in node.body)
+    ]
+    assert len(blocks_with_step) == 1, (
+        "expected one `if not eval_mode:` optimizer block"
+    )
+    assert len(calls_in(blocks_with_step[0], "_maybe_run_manual_gc")) == 1
+    assert len(calls_in(tree.body, "_maybe_run_manual_gc")) == 1
 
 
 @pytest.mark.parametrize("body_fails", [False, True])
@@ -2572,12 +2674,15 @@ def test_megatron_finish_train_step_runs_manual_gc_only_after_success(
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
-    worker._assert_step_open = lambda: {}
-    worker._set_mtp_grad_scale_func = lambda func: None
-    worker._restore_saved_mcore_hooks = lambda state: None
-    worker._maybe_run_manual_gc = MagicMock()
+    events = []
+    state = {"step": "open"}
+    worker._assert_step_open = lambda: state
+    worker._set_mtp_grad_scale_func = lambda func: events.append(("mtp_scale", func))
+    worker._restore_saved_mcore_hooks = lambda s: events.append(("restore_hooks", s))
+    worker._maybe_run_manual_gc = lambda: events.append("manual_gc")
 
-    def body(state):
+    def body(s):
+        assert s is state
         if body_fails:
             raise RuntimeError("finish failed")
         return {"loss": 1.0}
@@ -2587,11 +2692,13 @@ def test_megatron_finish_train_step_runs_manual_gc_only_after_success(
     if body_fails:
         with pytest.raises(RuntimeError, match="finish failed"):
             worker_module.MegatronPolicyWorkerImpl.finish_train_step(worker)
-        worker._maybe_run_manual_gc.assert_not_called()
+        # The error path restores MTP scaling and the saved mcore hooks, and does
+        # not collect.
+        assert events == [("mtp_scale", None), ("restore_hooks", state)]
     else:
         result = worker_module.MegatronPolicyWorkerImpl.finish_train_step(worker)
         assert result == {"loss": 1.0}
-        worker._maybe_run_manual_gc.assert_called_once_with()
+        assert events == ["manual_gc"]
 
 
 def test_megatron_move_model_does_not_serialize_extra_state():
@@ -3705,6 +3812,76 @@ def test_megatron_policy_training(training_setup):
             assert results["theoretical_tflops"] > 0, (
                 "theoretical_tflops should be positive"
             )
+
+
+def _manual_gc_state(worker):
+    import gc
+
+    return {
+        "gc_enabled": gc.isenabled(),
+        "interval": worker._manual_gc_interval,
+        "steps": worker._manual_gc_steps,
+    }
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_policy_training_manual_gc(tiny_llama_model_path):
+    """manual_gc on the monolithic train() path (v1 SFT/RM/DPO): GC is off after
+    worker setup and the hook runs once per optimizer step, not once per call."""
+    cluster = None
+    policy = None
+    try:
+        cluster = RayVirtualCluster(
+            name="test-megatron-train-manual-gc",
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+        config = create_megatron_test_config(model_name=tiny_llama_model_path)
+        config["megatron_cfg"]["manual_gc"] = True
+        config["megatron_cfg"]["manual_gc_interval"] = 2
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        before = policy.run_all_workers_single_data("__ray_call__", _manual_gc_state)
+        assert before == [{"gc_enabled": False, "interval": 2, "steps": 0}] * 2
+
+        # 16 rows at train_global_batch_size 8: two optimizer steps per train().
+        assert config["train_global_batch_size"] == 8
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 32000, (16, 128))
+        attention_mask = torch.ones(16, 128)
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": attention_mask.sum(dim=1).to(torch.int32),
+                "attention_mask": attention_mask,
+                "labels": torch.randint(0, 32000, (16, 128)),
+                "sample_mask": torch.ones(16),
+            }
+        )
+        policy.prepare_for_training()
+        for _ in range(2):
+            policy.train(data, SimpleLossFn())
+        policy.finish_training()
+
+        after = policy.run_all_workers_single_data("__ray_call__", _manual_gc_state)
+        assert after == [{"gc_enabled": False, "interval": 2, "steps": 4}] * 2
+    finally:
+        if policy:
+            policy.shutdown()
+        if cluster:
+            cluster.shutdown()
 
 
 @pytest.fixture
