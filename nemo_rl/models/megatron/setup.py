@@ -67,6 +67,7 @@ from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import TEQuantizationParams
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.num_microbatches_calculator import update_num_microbatches
+from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.quantization.utils import load_quantization_recipe
@@ -3153,6 +3154,53 @@ def load_teacher_output_layer_weight(
     return loaded.detach().to(device="cpu", dtype=dtype, copy=True)
 
 
+def install_grad_sync_callbacks(
+    model: MegatronModule,
+    megatron_cfg: ConfigContainer,
+    optimizer: Optional[MegatronOptimizer],
+) -> None:
+    """Bind Megatron's gradient-sync callbacks to the config its scheduler reads.
+
+    The scheduler looks the callbacks up on ``get_model_config(model)``, which
+    need not be ``megatron_cfg.model``: the Nemotron Omni provider deep-copies
+    its config into the model it builds.
+    """
+    _update_model_config_funcs(
+        [model],
+        get_model_config(model),
+        megatron_cfg.ddp,
+        optimizer,
+        align_grad_reduce=megatron_cfg.dist.align_grad_reduce,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
+    if optimizer is not None:
+        check_grad_sync_callbacks(model)
+
+
+def check_grad_sync_callbacks(model: MegatronModule) -> None:
+    """Raise if the config Megatron's scheduler reads lacks the gradient-sync callbacks.
+
+    Without ``finalize_model_grads_func`` the scheduler skips gradient
+    finalization: the data-parallel reduction and the sequence-parallel,
+    shared-embedding and expert-bias updates. Each rank then updates from its own
+    local gradient, and nothing errors.
+    """
+    config = get_model_config(model)
+    missing = [
+        name
+        for name in ("finalize_model_grads_func", "grad_scale_func")
+        if getattr(config, name, None) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            f"{' and '.join(missing)} not set on get_model_config(model), the "
+            "config Megatron's training schedule reads, so gradients would not "
+            "be reduced across ranks. Install the callbacks on that config, not "
+            "on the model provider (which may have copied it while building the "
+            "model)."
+        )
+
+
 def finalize_megatron_setup(
     config: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -3166,14 +3214,7 @@ def finalize_megatron_setup(
     Returns:
         Tuple of (megatron_tokenizer, megatron_bridge, should_disable_forward_pre_hook, dp_size)
     """
-    _update_model_config_funcs(
-        [model],
-        get_model_config(model),
-        megatron_cfg.ddp,
-        optimizer,
-        align_grad_reduce=megatron_cfg.dist.align_grad_reduce,
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-    )
+    install_grad_sync_callbacks(model, megatron_cfg, optimizer)
 
     tokenizer_config = TokenizerConfig(
         tokenizer_type="HuggingFaceTokenizer",
