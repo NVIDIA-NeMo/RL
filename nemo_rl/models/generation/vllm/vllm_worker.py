@@ -50,6 +50,7 @@ from nemo_rl.models.generation.vllm.config import (
     validate_nvfp4_pertoken_model,
     vllm_fp32_lm_head_enabled,
 )
+from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     FINISHED_REASON_LABEL,
@@ -512,6 +513,7 @@ class BaseVllmGenerationWorker:
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
         self._extra_env_vars = extra_env_vars
+        self._native_lora_request: Any = None
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -560,6 +562,7 @@ class BaseVllmGenerationWorker:
             import vllm
 
             self.SamplingParams = vllm.SamplingParams
+            self._native_lora_request = make_native_lora_request(self.cfg)
         except ImportError:
             raise ImportError(
                 "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
@@ -1184,7 +1187,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         prompts = format_prompt_for_vllm_generation(data)
         prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in prompts]
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
-        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
+        outputs = self.llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=use_tqdm,
+            lora_request=self._native_lora_request,
+        )
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
@@ -1386,7 +1394,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
         prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in data["prompts"]]
-        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
+        outputs = self.llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=use_tqdm,
+            lora_request=self._native_lora_request,
+        )
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict
