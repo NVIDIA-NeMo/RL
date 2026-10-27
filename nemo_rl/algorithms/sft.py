@@ -118,7 +118,9 @@ class SFTConfig(BaseModel, extra="allow"):
     # the next step until an async checkpoint's disk write lands, finalize it at a
     # later step boundary once every rank's write is done, so the write overlaps
     # training. tmp_step_N is renamed to step_N after that finalize; the next save and
-    # training exit still finalize blocking.
+    # training exit still finalize blocking. Cost: until the finalize, only tmp_step_N
+    # exists and resume ignores it, so a crash in that window (typically one step)
+    # resumes from the previous checkpoint. Teardown after a failure still publishes it.
     defer_async_checkpoint_finalize: bool = False
 
 
@@ -284,7 +286,8 @@ def setup(
     set_seed(master_config.sft.seed)
     if master_config.sft.defer_async_checkpoint_finalize:
         raise ValueError(
-            "sft.defer_async_checkpoint_finalize is only supported by SFT v2."
+            "sft.defer_async_checkpoint_finalize is only supported by SFT v2. "
+            "Set it to false, or run SFT v2 (examples/run_sft_v2.py)."
         )
 
     # Extract individual configs for easier access

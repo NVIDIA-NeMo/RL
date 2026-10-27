@@ -53,7 +53,8 @@ async_rl:
   # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
   log_full_train_data: false
   # With policy.megatron_cfg.checkpoint.async_save: finalize async checkpoints at a
-  # later step boundary so the disk write overlaps training (non-colocated generation).
+  # later step boundary so the disk write overlaps training. The overlap is shorter
+  # here than for GRPO: the critic handoff blocks on the finalize once per chunk.
   defer_async_checkpoint_finalize: false
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
