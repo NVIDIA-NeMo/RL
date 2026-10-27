@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
 from nemo_rl.telemetry.vocabulary import WORKER_GROUP_ENV
 
 if TYPE_CHECKING:
-    from nemo.lens import TelemetryHandle
+    from nemo.lens import NemoLensConfig, TelemetryHandle
 
 logger = logging.getLogger(__name__)
 
@@ -589,6 +589,33 @@ def _worker_resource_attributes(
         attrs[_WORKER_GROUP_ATTR] = group
     if extra:
         attrs.update(extra)
+    return attrs
+
+
+def rl_telemetry_config() -> "NemoLensConfig":
+    """NeMo-RL's telemetry settings, as the driver exported them to the env."""
+    from nemo.lens import NemoLensConfig
+
+    return NemoLensConfig.from_env(
+        prefix=_OTEL_PREFIX, fallback_prefix=_OTEL_FALLBACK_PREFIX
+    )
+
+
+def job_resource_attributes() -> dict[str, str]:
+    """Job-level attributes a child process RL spawns cannot set for itself.
+
+    The campaign stage and run uuid, so the child's spans correlate to this run;
+    everything per-process is left for the child to determine.
+    """
+    from nemo.lens import derive_nv_dl_run_uuid
+    from nemo.lens.semconv import NV_DL_RUN_UUID
+
+    attrs: dict[str, str] = {
+        _CAMPAIGN_STAGE_ATTR: os.environ.get(_CAMPAIGN_STAGE_ENV, "").strip()
+        or _DEFAULT_CAMPAIGN_STAGE,
+    }
+    if run_id := rl_telemetry_config().run_id:
+        attrs[NV_DL_RUN_UUID] = derive_nv_dl_run_uuid(run_id=run_id)
     return attrs
 
 
