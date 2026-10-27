@@ -104,6 +104,7 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -382,6 +383,7 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+    configure_lora_refit(policy_config)
     if generation_config["backend"] == "vllm":
         if generation_config.get("real_quant"):
             raise ValueError(

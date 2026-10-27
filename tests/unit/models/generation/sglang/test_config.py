@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from nemo_rl.models.generation.sglang import sglang_worker
 from nemo_rl.models.generation.sglang.config import (
     SGLangFaultToleranceConfig,
     SGLangHttpClientConfig,
@@ -31,6 +32,33 @@ from nemo_rl.models.generation.sglang.config import (
 )
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.utils.config import load_config
+
+
+@pytest.mark.parametrize(
+    "setting, expected", [(None, True), (True, True), (False, False)]
+)
+def test_worker_outlines_cache_default_and_opt_in(monkeypatch, setting, expected):
+    config = load_config(
+        Path(__file__).resolve().parents[5]
+        / "examples/configs/grpo_math_1B_sglang.yaml"
+    ).policy.generation
+    # Exercise the worker fallback independently of the recipe's default.
+    config.sglang_cfg.pop("disable_outlines_disk_cache")
+    if setting is not None:
+        config.sglang_cfg.disable_outlines_disk_cache = setting
+    monkeypatch.setattr(sglang_worker, "_apply_sglang_compat_patches", lambda: None)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    worker_class = sglang_worker.SGLangGenerationWorker.__ray_metadata__.modified_class
+    worker = worker_class(gpus_per_node=1, sglang_cfg=config, rank=0, base_gpu_id=0)
+
+    args = worker._compute_server_args(
+        dist_init_addr="127.0.0.1:1500",
+        nccl_port=1501,
+        host="127.0.0.1",
+        port=1502,
+    )
+
+    assert args["disable_outlines_disk_cache"] is expected
 
 
 def test_fault_tolerance_defaults_are_centralized_and_disabled():

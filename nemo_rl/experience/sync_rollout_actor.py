@@ -60,6 +60,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
+    should_mask_flagged_samples,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
@@ -211,7 +212,7 @@ class SyncRolloutActor:
         """
         # Lazy imports keep rollout-specific dependencies off the actor startup path.
         # ``_policy_dtype`` sizes the VLM pixel tensors below.
-        from nemo_rl.algorithms.grpo import _policy_dtype
+        from nemo_rl.algorithms.grpo import _dynamic_sampling_valid_mask, _policy_dtype
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import decompose_message_log
         from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -263,6 +264,10 @@ class SyncRolloutActor:
                     cfg.grpo.length_penalty if apply_length_penalty else None
                 ),
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
+                # Honour env.should_mask_flagged_samples as the other trainers
+                # do: the driver zeroes the loss weight of every mask_sample
+                # row this actor carries, so the flag must gate the carry.
+                mask_env_flagged_samples=should_mask_flagged_samples(cfg.env),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,
             )
@@ -315,7 +320,13 @@ class SyncRolloutActor:
                 "input_lengths": input_lengths,
                 "generation_logprobs": flat["generation_logprobs"],
                 "token_mask": flat["token_loss_mask"],
-                "sample_mask": fb["loss_multiplier"],
+                # Read only by the worker logprob passes, which zero logprobs
+                # outside token_mask * sample_mask under top-k/top-p filtering:
+                # the rows that vote in the advantage statistics under
+                # grpo.masked_reward_policy keep real logprobs. The loss weights
+                # travel in driver_carry; the driver writes the final training
+                # sample_mask back after computing advantages.
+                "sample_mask": _dynamic_sampling_valid_mask(fb, cfg.grpo),
             }
         )
         if ROUTED_EXPERTS_FIELD in flat:
@@ -363,6 +374,10 @@ class SyncRolloutActor:
         # ran); feeds the driver's baseline_reward/pct_* diagnostics.
         if "env_reward" in fb:
             driver_carry["env_reward"] = fb["env_reward"]
+        if "mask_sample" in fb:
+            driver_carry["mask_sample"] = torch.as_tensor(
+                fb["mask_sample"], dtype=torch.bool
+            )
         # GDPO multi-reward components: scale_rewards iterates these
         # keys driver-side and the GDPO advantage estimator reads them
         # from ``adv_inputs``. Plumb them through ``driver_carry``

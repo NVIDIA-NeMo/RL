@@ -151,9 +151,8 @@ launch:
     WANDB_NAME=ultra-v3-grpo-pipeclean-$(date +%Y%m%d-%H%M%S)
     TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
     LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
-    NEMO_GYM_LOG_DIR=/mnt/rl-workspace/terryk/gym_logs/${user:}-ultra-pipeclean-training-\${TIMESTAMP}
     LOG=\${LOG_DIR}/${user:}-ultra-pipeclean-training-\${TIMESTAMP}.log
-    mkdir -p "\${LOG_DIR}" "\${CHECKPOINT_DIR}" "\${NEMO_GYM_LOG_DIR}"
+    mkdir -p "\${LOG_DIR}" "\${CHECKPOINT_DIR}"
 
     export RAY_enable_infeasible_task_early_exit=true
     export PYTHONPATH=.:3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
@@ -184,7 +183,6 @@ launch:
       policy.generation.colocated.enabled=False \
       policy.generation.colocated.resources.num_nodes=26 \
       policy.generation.colocated.resources.gpus_per_node=4 \
-      env.nemo_gym.nemo_gym_log_dir=\${NEMO_GYM_LOG_DIR} \
       env.nemo_gym.genrm_model.responses_api_models.genrm_model.model=\${NRL_GENRM_MODEL_PATH} \
       env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.model=\${NRL_NL2BASH_JUDGE_MODEL_PATH} \
       env.nemo_gym.safety_judge_model.responses_api_models.local_vllm_model.model=\${NRL_SAFETY_MODEL_PATH} \

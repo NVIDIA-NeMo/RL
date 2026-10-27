@@ -240,7 +240,10 @@ def test_base_ipc_data_ack_fence_synchronizes_current_stream_once(monkeypatch):
     assert calls == ["current_stream", "sync"]
 
 
-def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, tmp_path):
+@pytest.mark.parametrize("llm_kwargs", [{}, {"moe_backend": "triton"}])
+def test_configure_quant_engine_kwargs_for_fake_quant(
+    monkeypatch, tmp_path, llm_kwargs
+):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
     )
@@ -250,7 +253,7 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, tmp_path):
     (tmp_path / quant_cfg).touch()
     monkeypatch.chdir(tmp_path)
 
-    llm_kwargs = {}
+    llm_kwargs = dict(llm_kwargs)
     worker_mod._configure_quant_engine_kwargs(
         {"quant_cfg": quant_cfg},
         llm_kwargs,
@@ -263,7 +266,29 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, tmp_path):
         "nemo_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
     )
     assert os.environ["VLLM_QUANT_CFG"] == os.path.abspath(quant_cfg)
+    assert llm_kwargs["moe_backend"] == "triton"
     assert "quantization" not in llm_kwargs
+
+
+@pytest.mark.parametrize(
+    "moe_backend", ["auto", "flashinfer_trtllm", "flashinfer_cutlass", None]
+)
+def test_configure_fake_quant_rejects_non_triton_backend(monkeypatch, moe_backend):
+    worker_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
+    )
+    monkeypatch.delenv("VLLM_QUANT_CFG", raising=False)
+    llm_kwargs = {"moe_backend": moe_backend}
+
+    with pytest.raises(
+        ValueError, match="fake quantization requires moe_backend='triton'"
+    ):
+        worker_mod._configure_quant_engine_kwargs(
+            {"quant_cfg": "NVFP4_DEFAULT_CFG"}, llm_kwargs
+        )
+
+    assert llm_kwargs["moe_backend"] == moe_backend
+    assert "VLLM_QUANT_CFG" not in os.environ
 
 
 def test_quant_worker_forwards_snapshot_pythonpath_to_inner_vllm_workers():
@@ -594,6 +619,7 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     monkeypatch.delenv("VLLM_QUANT_CFG", raising=False)
     quantization_config = {"quant_method": "modelopt", "quant_algo": "FP8"}
     llm_kwargs = {
+        "moe_backend": "flashinfer_trtllm",
         "kv_cache_dtype": "auto",
         "hf_overrides": {
             "trust_remote_code": True,
@@ -606,6 +632,7 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     )
 
     assert "VLLM_QUANT_CFG" not in os.environ
+    assert llm_kwargs["moe_backend"] == "flashinfer_trtllm"
     assert llm_kwargs["worker_cls"] == (
         "nemo_rl.modelopt.models.generation.vllm_quant_patch.RealQuantWorker"
     )
@@ -723,15 +750,20 @@ def test_prepare_real_quant_generation_config_validates_policy(policy_config, er
         modelopt_utils.prepare_real_quant_generation_config(policy, {})
 
 
-def test_configure_quant_engine_kwargs_for_fake_quant_without_quant_cfg(monkeypatch):
+@pytest.mark.parametrize("llm_kwargs", [{}, {"moe_backend": "flashinfer_trtllm"}])
+def test_configure_quant_engine_kwargs_for_fake_quant_without_quant_cfg(
+    monkeypatch, llm_kwargs
+):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
     )
     monkeypatch.delenv("VLLM_QUANT_CFG", raising=False)
 
-    llm_kwargs = {}
+    llm_kwargs = dict(llm_kwargs)
+    expected_backend = llm_kwargs.get("moe_backend", "triton")
     worker_mod._configure_quant_engine_kwargs({"quant_cfg": None}, llm_kwargs)
 
+    assert llm_kwargs["moe_backend"] == expected_backend
     assert "VLLM_QUANT_CFG" not in os.environ
     assert llm_kwargs["worker_cls"] == (
         "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
