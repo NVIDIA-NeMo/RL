@@ -70,8 +70,8 @@ def test_rollout_capture_key_matches_gym_episode_identity(gym_attempt: int) -> N
                     RolloutAttemptRecord(
                         attempt_uuid=uuid.UUID(int=1),
                         status=RolloutAttemptStatus.DISPATCHED,
-                        gym_instance_id="tools/replica-0",
-                        gym_attempt=gym_attempt,
+                        environment_instance_id="tools/replica-0",
+                        environment_attempt=gym_attempt,
                     )
                 ],
             )
@@ -80,7 +80,7 @@ def test_rollout_capture_key_matches_gym_episode_identity(gym_attempt: int) -> N
         status=PromptGroupStatus.GENERATING,
     )
 
-    episode = group.gym_episode(0)
+    episode = group.environment_episode(0)
     rollout_id, attempt = episode.rollout_id, episode.attempt
     gym_episode = EpisodeId(rollout_id=rollout_id, attempt=attempt)
     capture_key = group.gate_rollout_id(0)

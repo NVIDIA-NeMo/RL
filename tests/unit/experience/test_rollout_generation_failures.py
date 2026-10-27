@@ -1234,7 +1234,9 @@ class TestGymAdmissionClosedRows:
             manager._recovery_ledger = ledger
             manager._data_plane_checkpoint_barrier = barrier
             recorder = _LedgerDispatchRecorder(
-                manager=manager, group_id="g7", gym_instance_id="tools/replica-0"
+                manager=manager,
+                group_id="g7",
+                environment_instance_id="tools/replica-0",
             )
 
             def status(index: int) -> RolloutAttemptStatus:
@@ -1264,14 +1266,14 @@ class TestGymAdmissionClosedRows:
             async def checkpoint() -> tuple:
                 async with gate.checkpoint():
                     async with barrier.checkpoint():
-                        inventory = ledger.gym_checkpoint_inventory(
-                            {"tools/replica-0"}
-                        )["tools/replica-0"]
+                        inventory = ledger.environment_inventory({"tools/replica-0"})[
+                            "tools/replica-0"
+                        ]
                     await asyncio.sleep(0.05)
                     return inventory, status(1)
 
             inventory, held_status = await asyncio.wait_for(checkpoint(), timeout=5.0)
-            assert inventory == (group.gym_episode(0),)
+            assert inventory == (group.environment_episode(0),)
             assert held_status is RolloutAttemptStatus.RESERVED
 
             method.release_admitted.set()
@@ -1496,9 +1498,11 @@ class TestGymEarlyStreamEnd:
             for index in range(3)
         ]
         recorder = _LedgerDispatchRecorder(
-            manager=manager, group_id="g7", gym_instance_id="tools/replica-0"
+            manager=manager,
+            group_id="g7",
+            environment_instance_id="tools/replica-0",
         )
-        episodes = {index: group.gym_episode(index) for index in range(3)}
+        episodes = {index: group.environment_episode(index) for index in range(3)}
 
         async def run():
             return await impl._run_rollouts(
@@ -1519,7 +1523,7 @@ class TestGymEarlyStreamEnd:
     @staticmethod
     def _queued(ledger) -> set:
         return set(
-            ledger.gym_checkpoint_retirements({"tools/replica-0"})["tools/replica-0"]
+            ledger.environment_retirements({"tools/replica-0"})["tools/replica-0"]
         )
 
     def test_rows_still_running_are_queued_for_retirement_and_resent_under_new_ids(
@@ -1666,7 +1670,7 @@ class TestGymEarlyStreamEnd:
         async def exercise():
             task = asyncio.create_task(run())
             await asyncio.wait_for(parked.wait(), timeout=2)
-            held = ledger.gym_episodes_still_held(
+            held = ledger.environment_episodes_still_held(
                 {"tools/replica-0": list(episodes.values())}
             )["tools/replica-0"]
             resume.set()

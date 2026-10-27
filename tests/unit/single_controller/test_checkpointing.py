@@ -110,7 +110,10 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     GymCheckpointOperationError,
 )
 from nemo_rl.environments.gym_environment_checkpoint import GymEnvironmentCheckpoint
-from nemo_rl.experience.environment_checkpoint import NoEnvironmentCheckpoint
+from nemo_rl.experience.environment_checkpoint import (
+    EnvironmentSnapshot,
+    NoEnvironmentCheckpoint,
+)
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -138,7 +141,7 @@ from tests.unit.single_controller.test_setup import (
 _ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
 
 
-class _FakeEnvironmentSnapshot:
+class _FakeEnvironmentSnapshot(EnvironmentSnapshot):
     """An environment's part of a snapshot that records its check and its pause."""
 
     restarted_rollouts = 0

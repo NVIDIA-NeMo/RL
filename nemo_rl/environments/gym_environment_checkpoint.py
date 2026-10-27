@@ -46,7 +46,11 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     write_gym_checkpoint_manifest,
 )
 from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
-from nemo_rl.experience.environment_checkpoint import RestoredEnvironmentRollouts
+from nemo_rl.experience.environment_checkpoint import (
+    EnvironmentCheckpoint,
+    EnvironmentSnapshot,
+    RestoredEnvironmentRollouts,
+)
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
@@ -117,7 +121,7 @@ def build_gym_environment_checkpoint(
 
 
 @dataclass
-class GymEnvironmentSnapshot:
+class GymEnvironmentSnapshot(EnvironmentSnapshot):
     """Gym's committed part of one rollout snapshot."""
 
     checkpoint: GymEnvironmentCheckpoint
@@ -141,7 +145,7 @@ class GymEnvironmentSnapshot:
         }
 
 
-class GymEnvironmentCheckpoint:
+class GymEnvironmentCheckpoint(EnvironmentCheckpoint):
     """Pause, commit, validate and restore Gym's episodes for RL's snapshots."""
 
     def __init__(
@@ -185,14 +189,14 @@ class GymEnvironmentCheckpoint:
 
     def inventory(self) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
         """Return the Gym-owned episode attempts of every live deployment."""
-        return self._ledger.gym_checkpoint_inventory(self.coordinator.instance_ids)
+        return self._ledger.environment_inventory(self.coordinator.instance_ids)
 
     def _queued_retirements(self) -> dict[str, frozenset[GymCheckpointEpisode]]:
         """Return dropped episodes Gym may still hold, awaiting their retire."""
         return {
             instance_id: frozenset(episodes)
             for instance_id, episodes in (
-                self._ledger.gym_checkpoint_retirements(
+                self._ledger.environment_retirements(
                     self.coordinator.instance_ids
                 ).items()
             )
@@ -249,11 +253,11 @@ class GymEnvironmentCheckpoint:
         leaves it out of the saved manifest, and a later retire stops it.
         """
         ledger = self._ledger
-        retirements = ledger.gym_checkpoint_retirements(self.coordinator.instance_ids)
+        retirements = ledger.environment_retirements(self.coordinator.instance_ids)
         if any(retirements.values()):
             await self.coordinator.retire(checkpoint_id, retirements)
             # Only what was retired: a drop recorded meanwhile stays for next time.
-            ledger.mark_gym_retired(retirements)
+            ledger.mark_environment_retired(retirements)
         await self._forget_finished_rollouts(checkpoint_id)
 
     async def _forget_finished_rollouts(self, checkpoint_id: str) -> None:
@@ -270,7 +274,7 @@ class GymEnvironmentCheckpoint:
         """
         coordinator = self.coordinator
         ledger = self._ledger
-        forgets = ledger.gym_checkpoint_forgets(coordinator.instance_ids)
+        forgets = ledger.environment_forgets(coordinator.instance_ids)
         if not any(forgets.values()):
             return
         try:
@@ -279,7 +283,7 @@ class GymEnvironmentCheckpoint:
             refused = {
                 instance_id: forgets[instance_id] for instance_id in error.failures
             }
-            ledger.mark_gym_forgotten(
+            ledger.mark_environment_forgotten(
                 {
                     instance_id: episodes
                     for instance_id, episodes in forgets.items()
@@ -303,9 +307,9 @@ class GymEnvironmentCheckpoint:
                     stacklevel=2,
                 )
                 return
-            ledger.mark_gym_forgotten(refused)
+            ledger.mark_environment_forgotten(refused)
             return
-        ledger.mark_gym_forgotten(forgets)
+        ledger.mark_environment_forgotten(forgets)
 
     async def _drain_non_exported_candidates(
         self,
@@ -349,7 +353,7 @@ class GymEnvironmentCheckpoint:
         waiting = pending
         deadline = time.monotonic() + coordinator.control_timeout_s
         while True:
-            waiting = ledger.gym_episodes_still_held(waiting)
+            waiting = ledger.environment_episodes_still_held(waiting)
             if not any(waiting.values()):
                 return
             remaining = deadline - time.monotonic()

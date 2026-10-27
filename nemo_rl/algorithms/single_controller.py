@@ -1293,7 +1293,7 @@ class SingleControllerActor:
 
                 recovery_ledger.prepare_for_restart(
                     cut,
-                    restored_gym_episodes=set(restored.continued_attempts),
+                    continued_attempts=set(restored.continued_attempts),
                 )
                 self._batch_shortfall = parsed_state.batch_shortfall
                 canonical_state = self._buffer.metadata_state_dict(
