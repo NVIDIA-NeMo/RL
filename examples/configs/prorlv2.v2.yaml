@@ -80,7 +80,9 @@ loss_fn:
   # DAPO: Token-level Loss
   # Compute loss per-token instead of per-sequence
   # ============================================================================
-  token_level_loss: true
+  # global_token_mean (default) or sequence_mean.
+  normalization: null
+  token_level_loss: null  # Deprecated true/false alias; do not set with normalization.
 
   # ============================================================================
   # Truncated Importance Sampling (TIS / ICE-POP)
