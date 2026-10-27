@@ -818,12 +818,23 @@ def _rows_with_response_lengths(
     return rows
 
 
-def _run_with_shaping(reward_shaping, num_actors: int, lengths=None):
+def _run_with_shaping(
+    reward_shaping: RewardShapingConfig | None,
+    num_actors: int,
+    lengths: Sequence[int] | None = None,
+    scaling: RewardScalingConfig | None = None,
+) -> tuple[_RowStore, torch.Tensor, dict[str, float]]:
     """One advantage stage under a reward_shaping block, local or sharded."""
     store = _RowStore(
         _rows() if lengths is None else _rows_with_response_lengths(lengths)
     )
-    ctrl = _controller("grpo", num_actors, store, reward_shaping=reward_shaping)
+    ctrl = _controller(
+        "grpo",
+        num_actors,
+        store,
+        reward_shaping=reward_shaping,
+        reward_scaling=scaling,
+    )
     asyncio.run(ctrl._advantage_stage(_pool_meta()))
     advantages = torch.stack(
         [store.rows[f"s{i}"]["advantages"] for i in range(NUM_GROUPS * GROUP_SIZE)]
@@ -1002,6 +1013,36 @@ class TestRewardShaping:
                 ]
             ),
         )
+
+    def test_scaling_is_applied_before_shaping(self) -> None:
+        # The penalty is subtracted, so it is only meaningful against the
+        # scaled range. With source [0, 1] -> target [0, 10], scaling first
+        # gives 10 * reward + penalty. Shaping first would hand reward +
+        # penalty to the scale, whose clamp to [0, 1] drops the penalty
+        # entirely on a reward of 0 (0 - 1.5 -> 0) and whose map multiplies it
+        # by 10 on a reward of 1 (-0.5 -> -5). Both means are spelled out
+        # below, so swapping the two calls in the stage fails here.
+        scaling = RewardScalingConfig(
+            enabled=True,
+            source_min=0.0,
+            source_max=1.0,
+            target_min=0.0,
+            target_max=10.0,
+        )
+        _, _, metrics = _run_with_shaping(self.DAPO, 0, self.LENGTHS, scaling)
+
+        raw = torch.stack(
+            [
+                _rows_with_response_lengths(self.LENGTHS)[f"s{i}"]["total_reward"]
+                for i in range(NUM_GROUPS * GROUP_SIZE)
+            ]
+        ).float()
+        penalty = self._expected_penalty()
+        scale_then_shape = float((raw * 10.0 + penalty).mean())
+        shape_then_scale = float(((raw + penalty).clamp(0.0, 1.0) * 10.0).mean())
+
+        assert scale_then_shape != pytest.approx(shape_then_scale)
+        assert metrics[REWARD_KEY] == pytest.approx(scale_then_shape)
 
     def test_sharding_is_unaffected(self) -> None:
         # Per-row, so it must not make the stage shard-dependent.
