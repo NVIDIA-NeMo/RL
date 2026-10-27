@@ -586,6 +586,10 @@ class SingleControllerActor:
             advantage_estimator=self._advantage_estimator,
         )
         self._loss_fn = actor_args.loss_fn
+        self._train_fields = (
+            *self._train_fields,
+            *self._advantage_stage_config.objective_reduction.extra_fields,
+        )
         self._value_loss_fn: LossFunction | None = getattr(
             actor_args, "value_loss_fn", None
         )

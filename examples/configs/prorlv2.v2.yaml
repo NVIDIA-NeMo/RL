@@ -80,7 +80,7 @@ loss_fn:
   # DAPO: Token-level Loss
   # Compute loss per-token instead of per-sequence
   # ============================================================================
-  # global_token_mean (default) or sequence_mean.
+  # global_token_mean (default), sequence_mean, or group_token_mean (SC GRPO/Megatron).
   normalization: null
   token_level_loss: null  # Deprecated true/false alias; do not set with normalization.
 
