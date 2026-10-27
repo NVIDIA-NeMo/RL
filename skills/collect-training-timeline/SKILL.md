@@ -79,7 +79,9 @@ OpenHands event loop, checked against its code.
    working directory, which inside a container is often not persistent.
 3. The rollout side needs NeMo Gym and OpenHands support. Check for it with
    `rg -n "NEMO_GYM_TIMELINE_FPATH|nemo_gym_timeline_span" 3rdparty/Gym-workspace/Gym`.
-   If it is missing, add it as described in
+   If it is missing, apply the reference patches in
+   [patches/](patches/README.md) (they apply to a matching baseline) or port
+   them as described in
    [references/rollout-instrumentation.md](references/rollout-instrumentation.md).
 
 The NeMo-RL side is already in the tree. `nemo_rl/utils/timer.py` handles

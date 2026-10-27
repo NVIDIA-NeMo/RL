@@ -18,7 +18,8 @@ LLM server (nemo_llm_*, nemo_ctx_*, nemo_fe_*, usage)
 Make the changes below against the Gym and OpenHands revisions you actually
 run. OpenHands is cloned by Gym from `agent_framework_repo` /
 `agent_framework_commit` (see `responses_api_agents/swe_agents/configs/`), so
-patch that checkout.
+patch that checkout. [`../patches/`](../patches/README.md) holds these changes
+as ready-to-apply patches for one baseline.
 
 ## Shared span writer
 
