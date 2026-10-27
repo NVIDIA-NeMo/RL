@@ -144,6 +144,7 @@ from nemo_rl.models.policy.utils import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
     get_runtime_env_for_policy_worker,
+    make_empty_cache_best_effort_under_expandable_segments,
     send_hf_buckets_via_ipc_actor_impl,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -835,6 +836,7 @@ class MegatronPolicyWorkerImpl(
         # Resume loads from weights_path/optimizer_path during setup, before any
         # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
         maybe_enable_msc(weights_path, optimizer_path)
+        make_empty_cache_best_effort_under_expandable_segments()
         self.is_refit_destination = is_refit_destination
         self._bulk_refit_conversion_tasks: list[Any] = []
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does

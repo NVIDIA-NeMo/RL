@@ -236,6 +236,8 @@ policy: &POLICY_BASE
         val_top_k: ${.top_k}
         stop_token_ids: null
         stop_strings: null
+        # LoRA refit representation for vLLM. Use merged only as an explicit opt-in.
+        lora_refit_mode: native
         vllm_cfg:
             async_engine: false
             precision: ${...precision}
@@ -297,6 +299,7 @@ env:
 logger:
     log_dir: "logs/distillation"
     num_val_samples_to_print: 5
+    extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
     wandb_enabled: true
     tensorboard_enabled: true
     mlflow_enabled: false
