@@ -31,7 +31,9 @@ class GPQADataset:
         system_prompt_file: Optional[str] = None,
     ):
         ds = load_dataset("Idavidrein/gpqa", f"gpqa_{variant}", split="train")
-        self._rng = random.Random()
+        # Derive the private stream from the seeded application RNG. An unseeded
+        # Random() reads system entropy even when random.seed() was called.
+        self._rng = random.Random(random.getrandbits(64))
         self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
         self.task_spec = TaskDataSpec(
             task_name=f"GPQA_{variant}",
