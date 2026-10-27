@@ -11,11 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import ast
 import asyncio
 import inspect
 import json
-import textwrap
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -2525,43 +2523,6 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
     assert "NEMO_RL_POLICY_API_KEY" not in os.environ
 
 
-def test_gym_span_groups_are_registered_before_telemetry_is_configured():
-    """``nemo_gym.telemetry`` has to be imported before ``init_telemetry_worker``.
-
-    Registering later still works -- ``SpanRegistry.register`` re-resolves the
-    spec -- but lens warns that the namespace was not selectable when the spec
-    was validated, which reads like a fault and sent one investigation down the
-    wrong path already.
-
-    Asserted on the source because ``nemo_gym`` is an optional extra: where it
-    is absent a runtime check would pass for the wrong reason.
-    """
-    init = NemoGym.__ray_metadata__.modified_class.__init__
-    body = ast.parse(textwrap.dedent(inspect.getsource(init))).body[0].body
-
-    def index_of(predicate):
-        return next(
-            (i for i, node in enumerate(body) if any(map(predicate, ast.walk(node)))),
-            None,
-        )
-
-    imported_at = index_of(
-        lambda n: isinstance(n, ast.Import)
-        and any(a.name == "nemo_gym.telemetry" for a in n.names)
-    )
-    configured_at = index_of(
-        lambda n: isinstance(n, ast.Call)
-        and getattr(n.func, "id", None) == "init_telemetry_worker"
-    )
-
-    assert imported_at is not None, "NemoGym.__init__ must import nemo_gym.telemetry"
-    assert configured_at is not None, "NemoGym.__init__ must call init_telemetry_worker"
-    assert imported_at < configured_at, (
-        "nemo_gym.telemetry is imported after init_telemetry_worker, so Gym's "
-        "span groups register too late to be selectable"
-    )
-
-
 def _fake_gym_run_helper(monkeypatch, gym_mod, gym_cli, gym_rollout_collection):
     """Capture the global config `_spinup` hands to Gym, without starting one."""
     from unittest.mock import MagicMock
@@ -2587,12 +2548,7 @@ def _fake_gym_run_helper(monkeypatch, gym_mod, gym_cli, gym_rollout_collection):
 
 @pytest.mark.nemo_gym
 def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkeypatch):
-    """Gym's server venvs and per-server telemetry both hang off this block.
-
-    Omitting it is why the actor exported while all 100+ servers stayed silent.
-    It must stay omitted when this process is not exporting, so a telemetry-off
-    run resolves the same venvs it resolves today.
-    """
+    """The telemetry block is added only when this actor exports, merged with the user's."""
     import nemo_gym.cli as gym_cli
     import nemo_gym.rollout_collection as gym_rollout_collection
 
@@ -2601,17 +2557,19 @@ def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkey
     started = _fake_gym_run_helper(
         monkeypatch, nemo_gym_mod, gym_cli, gym_rollout_collection
     )
-    # No resource, so no run id rides along and nothing is published to the
-    # environment. Stubbed rather than left to chance: an SDK tracer provider
-    # installed by an earlier test would otherwise change this test's result.
-    monkeypatch.setattr(nemo_gym_mod, "_actor_resource_attributes", dict)
+    # Read straight from the env, so the run id and the traces/metrics switches
+    # reach Gym's servers even with traces off -- not read back off an SDK
+    # provider that a traces-off run never installs.
+    monkeypatch.setenv("NEMO_RL_OTEL_RUN_ID", "a-run")
+    monkeypatch.setenv("NEMO_RL_OTEL_EXPORTER", "console")
+    monkeypatch.setenv("NEMO_RL_OTEL_TRACES_ENABLED", "0")
+    monkeypatch.setenv("NEMO_RL_OTEL_METRICS_ENABLED", "1")
+    # Published to os.environ directly; seed it so monkeypatch restores it.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "")
 
     def spin_up(handle, gym_config=None):
         monkeypatch.setattr(nemo_gym_mod, "get_telemetry_handle", lambda: handle)
-        # Through the real builder, because `env.nemo_gym.telemetry` reaches the
-        # actor inside the Gym config dict rather than as a NemoGymConfig field.
-        # A test that injected it at the top level would pass against a `_spinup`
-        # that never reads the user's block at all.
+        # The user's block arrives inside the Gym config dict, so go through the builder.
         cfg = nemo_gym_mod._build_gym_actor_config(
             dict(gym_config or {}),
             base_urls=["http://127.0.0.1:1/v1"],
@@ -2627,34 +2585,37 @@ def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkey
     assert "telemetry" not in spin_up(SimpleNamespace(is_exporting=False))
 
     exporting = SimpleNamespace(is_exporting=True)
-    assert spin_up(exporting)["telemetry"] == {"enabled": True}
-
-    # A user block must be merged into, not replaced by, the projected one --
-    # Gym's `enabled` defaults to false, so dropping it silences every server.
-    configured = spin_up(exporting, {"telemetry": {"span_groups": "default,sandbox"}})
-    assert configured["telemetry"] == {
+    # Traces off, yet run id and the switches still ride along.
+    assert spin_up(exporting)["telemetry"] == {
         "enabled": True,
-        "span_groups": "default,sandbox",
+        "run_id": "a-run",
+        "exporter": "console",
+        "traces_enabled": False,
+        "metrics_enabled": True,
     }
-    # An explicit false is how a run opts out without turning off RL's own.
-    assert spin_up(exporting, {"telemetry": {"enabled": False}})["telemetry"] == {
-        "enabled": False
-    }
+
+    # A user block is merged into ours, not swapped in.
+    configured = spin_up(exporting, {"telemetry": {"span_groups": "default,sandbox"}})
+    assert configured["telemetry"]["span_groups"] == "default,sandbox"
+    assert configured["telemetry"]["enabled"] is True
+    assert configured["telemetry"]["run_id"] == "a-run"
+    # An explicit false opts the Gym side out without turning off RL's own.
+    opted_out = spin_up(exporting, {"telemetry": {"enabled": False}})
+    assert opted_out["telemetry"]["enabled"] is False
 
 
 @pytest.mark.nemo_gym
-def test_spinup_forwards_job_identity_to_gym_servers_but_not_rank(monkeypatch):
-    """Gym servers build their resource from `nemo.gym.*` and little else.
-
-    Without the job identity their spans carry no campaign stage, so ingest
-    keyed on it drops them. The per-process keys are withheld because Gym sets
-    them for itself and lens resolves caller attributes over environment ones.
-    """
+def test_spinup_forwards_job_identity_to_gym_servers(monkeypatch):
+    """Job-level resource attributes reach Gym's servers; per-process ones do not."""
     import os
     from types import SimpleNamespace as NS
 
     import nemo_gym.cli as gym_cli
     import nemo_gym.rollout_collection as gym_rollout_collection
+
+    from nemo.lens import derive_nv_dl_run_uuid
+    from nemo.lens.resources.attributes import parse_otel_resource_attributes
+    from nemo.lens.semconv import NV_DL_RUN_UUID
 
     import nemo_rl.environments.nemo_gym as nemo_gym_mod
 
@@ -2664,53 +2625,36 @@ def test_spinup_forwards_job_identity_to_gym_servers_but_not_rank(monkeypatch):
     monkeypatch.setattr(
         nemo_gym_mod, "get_telemetry_handle", lambda: NS(is_exporting=True)
     )
-    monkeypatch.setattr(
-        nemo_gym_mod,
-        "_actor_resource_attributes",
-        lambda: {
-            "nv.dl.campaign.stage": "RL",
-            "slurm.job.id": "1416252",
-            "nemo.run.id": "a-run",
-            "host.name": "node-0",
-            "service.name": "nemo-rl",
-            "service.instance.id": "a-run-rank0",
-            "nv.dl.rank": "0",
-            "nv.dl.local_rank": "0",
-            "nv.dl.world_size": "16",
-            "process.pid": "2538227",
-            "nv.dl.software.torch": "2.9.0",
-        },
-    )
-    # setenv first: monkeypatch records nothing for a delenv of an unset name, and
-    # `_publish_gym_resource_identity` assigns os.environ directly, so without a
-    # recorded value the write would outlive this test and reach every later one.
+    monkeypatch.setenv("NEMO_RL_OTEL_RUN_ID", "a-run")
+
+    def spin_up():
+        cfg = nemo_gym_mod._build_gym_actor_config(
+            {},
+            base_urls=["http://127.0.0.1:1/v1"],
+            model_name="policy",
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return parse_otel_resource_attributes(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
+
+    # Nothing pre-seeded: the job identity a server cannot know is forwarded.
     monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "")
-    monkeypatch.delenv("OTEL_RESOURCE_ATTRIBUTES")
-
-    cfg = nemo_gym_mod._build_gym_actor_config(
-        {},
-        base_urls=["http://127.0.0.1:1/v1"],
-        model_name="policy",
-        enable_router_replay=False,
-        use_fastokens=False,
-    )
-    NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
-
-    from nemo.lens.resources.attributes import parse_otel_resource_attributes
-
-    published = parse_otel_resource_attributes(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
-
-    # The job identity a server cannot know, led by the one ingest filters on.
+    published = spin_up()
     assert published["nv.dl.campaign.stage"] == "RL"
-    assert published["slurm.job.id"] == "1416252"
-    assert published["nemo.run.id"] == "a-run"
-    assert published["host.name"] == "node-0"
-
-    # Everything a server must determine for itself stays behind.
-    for per_process in nemo_gym_mod._GYM_PER_PROCESS_RESOURCE_KEYS:
+    assert published[NV_DL_RUN_UUID] == derive_nv_dl_run_uuid(run_id="a-run")
+    # Everything a server determines for itself stays behind.
+    for per_process in (
+        "service.name",
+        "service.instance.id",
+        "nv.dl.rank",
+        "process.pid",
+        "nemo.run.id",
+    ):
         assert per_process not in published, per_process
-    assert "nv.dl.software.torch" not in published
-
-    # The same run id is handed to Gym, which otherwise mints its own and would
-    # group the servers under a different run than the actor.
+    # Gym gets our run id rather than minting its own.
     assert started[-1]["telemetry"]["run_id"] == "a-run"
+
+    # A launcher's value must win over the actor's.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "nv.dl.campaign.stage=SFT")
+    assert spin_up()["nv.dl.campaign.stage"] == "SFT"

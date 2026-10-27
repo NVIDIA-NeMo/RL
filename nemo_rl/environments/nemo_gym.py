@@ -44,6 +44,11 @@ from ray.util.scheduling_strategies import (
 )
 from transformers import PreTrainedTokenizerBase
 
+from nemo.lens.resources.attributes import (
+    OTEL_RESOURCE_ATTRIBUTES_ENV,
+    extend_otel_resource_attributes,
+)
+
 from nemo_rl.data.interfaces import NemoGymSourceIdentity
 from nemo_rl.data.multimodal_utils import (
     ROLLOUT_MATCHED_MEDIA_KEY,
@@ -112,6 +117,8 @@ from nemo_rl.telemetry.setup import (
     get_telemetry_handle,
     init_telemetry_worker,
     instrument_aiohttp_client,
+    job_resource_attributes,
+    rl_telemetry_config,
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
@@ -511,8 +518,6 @@ def _mask_undrained_receipt(receipt: dict) -> dict:
 # the token-capture secret: as an environment interpolation each server
 # resolves in its own process, never as a value in the serialized config.
 _POLICY_API_KEY_ENV = "NEMO_RL_POLICY_API_KEY"
-# Spelled out rather than imported from nemo-lens, which may not be installed.
-_OTEL_RESOURCE_ATTRIBUTES_ENV = "OTEL_RESOURCE_ATTRIBUTES"
 
 
 def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
@@ -827,67 +832,11 @@ def _shut_down_gym_servers(run_helper: Any) -> None:
                     raise
 
 
-# Withheld from the servers; everything else describes the job and is equally
-# true of its servers. Rank, world size and pid are Gym's to set -- it already
-# does, and lens resolves caller attributes over environment ones, so ours would
-# lose anyway. The service identity is withheld so each server keeps its own.
-_GYM_PER_PROCESS_RESOURCE_KEYS = frozenset(
-    {
-        "service.name",
-        "service.instance.id",
-        "nv.dl.rank",
-        "nv.dl.local_rank",
-        "nv.dl.world_size",
-        "process.pid",
-    }
-)
-# Versions of the training process's stack, which a Gym server venv does not
-# share: it installs nemo-gym and its own dependencies, often without torch.
-_GYM_WITHHELD_RESOURCE_PREFIXES = ("nv.dl.software.",)
-
-
-def _actor_resource_attributes() -> Dict[str, str]:
-    """This actor's exported resource, or empty when telemetry is unavailable."""
-    try:
-        from opentelemetry import trace as otel_trace
-    except ImportError:
-        return {}
-
-    resource = getattr(otel_trace.get_tracer_provider(), "resource", None)
-    if resource is None:
-        return {}
-    return {str(key): str(value) for key, value in resource.attributes.items()}
-
-
-def _actor_run_id() -> str:
-    """The run id this actor reports, read back off the resource lens built."""
-    return _actor_resource_attributes().get("nemo.run.id", "")
-
-
 def _publish_gym_resource_identity() -> None:
-    """Forward this actor's job identity to Gym's servers through the environment.
-
-    Gym builds its servers' resource from ``nemo.gym.*`` and little else, so
-    their spans carry no campaign stage and ingest keyed on it drops them.
-
-    Composed with ``defaults=`` so a launcher that already published an
-    attribute keeps its value. Silent if telemetry is unavailable.
-    """
-    try:
-        from nemo.lens.resources.attributes import extend_otel_resource_attributes
-    except ImportError:
-        return
-
-    forwarded = {
-        key: value
-        for key, value in _actor_resource_attributes().items()
-        if key not in _GYM_PER_PROCESS_RESOURCE_KEYS
-        and not key.startswith(_GYM_WITHHELD_RESOURCE_PREFIXES)
-    }
-    if not forwarded:
-        return
-    os.environ[_OTEL_RESOURCE_ATTRIBUTES_ENV] = extend_otel_resource_attributes(
-        os.environ.get(_OTEL_RESOURCE_ATTRIBUTES_ENV), defaults=forwarded
+    """Add this actor's job attributes to OTEL_RESOURCE_ATTRIBUTES; existing values win."""
+    os.environ[OTEL_RESOURCE_ATTRIBUTES_ENV] = extend_otel_resource_attributes(
+        os.environ.get(OTEL_RESOURCE_ATTRIBUTES_ENV),
+        defaults=job_resource_attributes(),
     )
 
 
@@ -900,16 +849,8 @@ class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: NemoGymConfig):
-        # Registers GymSpanGroup before init_telemetry_worker validates the
-        # span-group spec, which is what keeps lens from warning that Gym's
-        # namespace arrived late. The gates themselves recover either way --
-        # SpanRegistry.register re-resolves the spec -- so this is about not
-        # printing a warning that reads like a fault. Guarded: nemo_gym is an
-        # optional extra.
-        try:
-            import nemo_gym.telemetry  # noqa: F401
-        except ImportError:
-            pass
+        # Import first so lens sees Gym's span groups when it validates the spec.
+        import nemo_gym.telemetry  # noqa: F401
         # Named explicitly: built from the environment registry rather than
         # by RayWorkerGroup, so nothing sets NRL_WORKER_GROUP for it.
         init_telemetry_worker(worker_group="nemo_gym")
@@ -1039,27 +980,20 @@ class NemoGym(EnvironmentInterface):
         # their own loopback interface instead of the actor-hosted service.
         initial_global_config_dict.setdefault("default_host", self.node_ip)
 
-        # Gym translates this block into NEMO_GYM_OTEL_* before spawning, which
-        # is what adds nemo-lens to every per-server venv; without it the
-        # servers stay silent while this actor exports. Omitted unless this
-        # process is exporting, so telemetry-off runs build today's venvs. The
-        # endpoint is inherited, so it is not restated here.
-        #
-        # Merged rather than setdefault: `env.nemo_gym.telemetry` arrives inside
-        # this dict, so a user who sets any option at all would otherwise own the
-        # whole block -- and `enabled` defaults to false on Gym's side, which is
-        # exactly the silence this is here to prevent. `enabled` goes under the
-        # user's keys so an explicit false still opts the Gym side out.
+        # Gym turns this block into NEMO_GYM_OTEL_* and adds nemo-lens to each
+        # server venv. Merge, not setdefault: Gym's `enabled` defaults to false,
+        # so the user's keys go last and an explicit `enabled: false` still wins.
         telemetry_handle = get_telemetry_handle()
         if telemetry_handle is not None and telemetry_handle.is_exporting:
             from nemo_gym.telemetry.setup import TELEMETRY_KEY_NAME
 
+            rl = rl_telemetry_config()
             initial_global_config_dict[TELEMETRY_KEY_NAME] = {
                 "enabled": True,
-                # Gym mints its own run id from SLURM_JOB_ID or a random hex, and
-                # reads none of NeMo-RL's NEMO_RL_OTEL_* vars, so off SLURM the
-                # servers would group under a different run than the actor.
-                **({"run_id": run_id} if (run_id := _actor_run_id()) else {}),
+                "run_id": rl.run_id,
+                "exporter": rl.exporter,
+                "traces_enabled": rl.traces_enabled,
+                "metrics_enabled": rl.metrics_enabled,
                 **(initial_global_config_dict.get(TELEMETRY_KEY_NAME) or {}),
             }
             _publish_gym_resource_identity()
