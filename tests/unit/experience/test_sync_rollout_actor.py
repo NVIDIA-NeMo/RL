@@ -44,7 +44,13 @@ def test_actor_stamps_distinct_groups_and_preserves_multimodal_tags(
             "precision": "float32",
             "generation": {},
         },
-        grpo=SimpleNamespace(max_rollout_turns=1, deduplicate_multimodal_data=False),
+        grpo=SimpleNamespace(
+            max_rollout_turns=1,
+            deduplicate_multimodal_data=False,
+            # Read by the bulk sample_mask (grpo._dynamic_sampling_valid_mask).
+            masked_reward_policy="include",
+            overlong_filtering=False,
+        ),
     )
     batch = BatchedDataDict(
         {
