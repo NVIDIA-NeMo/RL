@@ -340,20 +340,37 @@ def test_vllm_generation_selects_worker_extension(
     )
 
 
-def test_vllm_generation_rejects_worker_extension_with_quantization() -> None:
+@pytest.mark.parametrize("async_engine", [False, True])
+@pytest.mark.parametrize(("quant_cfg", "real_quant"), [("NVFP4", False), (None, True)])
+def test_vllm_generation_rejects_worker_extension_with_quantization(
+    async_engine: bool, quant_cfg: str | None, real_quant: bool
+) -> None:
     config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = async_engine
     config["worker_extension_cls_fqn"] = "tests.extensions.CustomGenerationWorker"
-    config["quant_cfg"] = "NVFP4"
+    config["quant_cfg"] = quant_cfg
+    config["real_quant"] = real_quant
     cluster = MagicMock()
     cluster.world_size.return_value = 1
     cluster.num_gpus_per_node = 1
 
-    with pytest.raises(
-        ValueError,
-        match="worker_extension_cls_fqn and quant_cfg are mutually exclusive",
+    with (
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.get_actor_python_env",
+            return_value="python",
+        ) as actor_environment,
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerBuilder",
+            side_effect=AssertionError("must reject before worker construction"),
+        ) as worker_builder,
+        pytest.raises(
+            ValueError, match="cannot be combined with ModelOpt quantization"
+        ),
     ):
         VllmGeneration(cluster, config, defer_model_load=True)
 
+    actor_environment.assert_not_called()
+    worker_builder.assert_not_called()
     cluster._init_placement_groups.assert_not_called()
 
 

@@ -157,6 +157,18 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             for buf in attached:
                 del buf.weight_loader
 
+    def _prepare_reload_weight_iterator(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        skip_fp8_conversion: bool = False,
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Keep canonical real-quant tensors out of legacy FP8 conversion."""
+        return super()._prepare_reload_weight_iterator(
+            weights,
+            skip_fp8_conversion=skip_fp8_conversion or self._is_real_quant_model(),
+        )
+
     def _load_weights(self, weights):
         if self._is_real_quant_model():
             # Native reload owns placement. A default-device mode here also

@@ -383,6 +383,11 @@ def setup(
         "A generation config in the PolicyConfig is required for PPO"
     )
     if generation_config["backend"] == "vllm":
+        if generation_config.get("real_quant"):
+            raise ValueError(
+                "ModelOpt real-quant rollout is not supported by PPO: setup "
+                "requires policy-first initialization. Use GRPO or distillation."
+            )
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="ppo")
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)

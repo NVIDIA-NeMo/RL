@@ -293,11 +293,12 @@ class VllmGeneration(GenerationInterface):
         assert_reload_refit_config_supported(self.cfg)
 
         extension_fqn = self.cfg.get("worker_extension_cls_fqn")
-        if extension_fqn is not None and self.cfg.get("quant_cfg") is not None:
+        if extension_fqn is not None and (
+            self.cfg.get("quant_cfg") is not None or self.cfg.get("real_quant")
+        ):
             raise ValueError(
-                "worker_extension_cls_fqn and quant_cfg are mutually exclusive: "
-                "a custom generation worker cannot be combined with ModelOpt "
-                "quantization"
+                "worker_extension_cls_fqn cannot be combined with ModelOpt "
+                "quantization (quant_cfg or real_quant)"
             )
         if extension_fqn is not None:
             # Validate registration before allocating workers or placement groups.

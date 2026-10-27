@@ -11,6 +11,11 @@ There are two vLLM rollout modes:
 - **Fake-quant rollout**: vLLM receives folded full-precision weights and runs fake-quantized layers. This is the default when `policy.generation.quant_cfg` is set.
 - **Real-quant rollout**: vLLM receives canonical packed weights and format-owned sidecars during every refit. Enable this with `policy.generation.real_quant: true`; `policy.quant_cfg` is the sole source of the rollout quantization format. ModelOpt owns packing and scale semantics, Megatron-Bridge owns distributed topology and Hugging Face naming, and vLLM selects the native runtime method.
 
+Real-quant rollout is supported by the non-streaming GRPO and distillation
+entrypoints. PPO and SingleController do not yet initialize the policy before
+the rollout engine to obtain its deployment metadata; those entrypoints reject
+real-quant mode at setup. This restriction does not apply to fake quantization.
+
 See [Verified Configurations](#verified-configurations) for the workflow + recipe combinations that have been empirically validated, and [Supported Quantization Formats](#supported-quantization-formats) for the full set of available formats. Results are recipe- and model-specific: the generic W4A4 `NVFP4_DEFAULT_CFG` has known GRPO convergence issues, while the routed-expert Qwen3 W4A4 real-quant recipe below completed the documented single-seed campaign.
 
 ## Verified Configurations

@@ -250,6 +250,22 @@ class TestAlgoConfigSelection:
         assert algo_config(mc) is mc.grpo
 
 
+@pytest.mark.parametrize("make_config", [_make_master_config, _ppo_master_config])
+@pytest.mark.parametrize("real_quant", [False, True])
+def test_single_controller_real_quant_support(make_config, real_quant: bool) -> None:
+    mc = make_config(megatron_enabled=True)
+    mc.policy["quant_cfg"] = "W4A16_NVFP4_CFG"
+    mc.policy["generation"].update(quant_cfg=None, real_quant=real_quant)
+
+    if real_quant:
+        with pytest.raises(
+            ValueError, match="real-quant.*SingleController.*GRPO or distillation"
+        ):
+            validate_single_controller_config(mc)
+    else:
+        validate_single_controller_config(mc)
+
+
 class TestPPOValidation:
     @pytest.mark.parametrize(
         "make_config",

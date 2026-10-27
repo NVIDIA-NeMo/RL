@@ -20,6 +20,7 @@ from copy import deepcopy
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -409,6 +410,50 @@ def test_real_quant_refit_detection_requires_vllm_and_flag():
     worker.cfg["generation"]["real_quant"] = True
     worker.cfg["generation"]["backend"] = "megatron"
     assert not worker._use_real_quant_refit()
+
+
+@requires_weight_folding
+@pytest.mark.parametrize("generation", [{}, {"generation": None}])
+def test_training_only_quant_worker_does_not_initialize_refit(
+    monkeypatch: pytest.MonkeyPatch, generation: dict
+) -> None:
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    config = {
+        "quant_cfg": _NVFP4_A16_RECIPE,
+        "megatron_cfg": {"gradient_accumulation_fusion": False},
+        **generation,
+    }
+    monkeypatch.setenv("ENABLE_BRIDGE_QUANT_MAPPING", "1")
+    monkeypatch.setattr(worker_cls, "_patch_validate_model_paths", lambda _self: None)
+    monkeypatch.setattr(
+        worker_cls, "_patch_setup_model_and_optimizer", lambda _self: None
+    )
+    monkeypatch.setattr(
+        megatron_quant_policy_worker.MegatronPolicyWorkerImpl,
+        "__init__",
+        lambda self, config: setattr(self, "cfg", config),
+    )
+    monkeypatch.setattr(
+        megatron_quant_policy_worker, "get_quantization_layer_spec", lambda _: None
+    )
+    monkeypatch.setattr(
+        megatron_quant_policy_worker,
+        "get_quantization_mamba_stack_spec",
+        lambda _: None,
+    )
+    new_group = MagicMock()
+    get_world_size = MagicMock()
+    monkeypatch.setattr(torch.distributed, "new_group", new_group)
+    monkeypatch.setattr(torch.distributed, "get_world_size", get_world_size)
+
+    worker = worker_cls(config)
+
+    assert not worker._use_real_quant_refit()
+    assert worker._real_quant_refit_sync_group is None
+    new_group.assert_not_called()
+    get_world_size.assert_not_called()
 
 
 def test_policy_requires_real_quant_config_agreement():

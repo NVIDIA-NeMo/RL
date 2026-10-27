@@ -468,9 +468,11 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             return super().save_checkpoint(*args, **kwargs)
 
     def _use_real_quant_refit(self) -> bool:
-        generation_cfg = self.cfg["generation"]
-        return generation_cfg["backend"] == "vllm" and bool(
-            generation_cfg.get("real_quant")
+        generation_cfg = self.cfg.get("generation")
+        return (
+            generation_cfg is not None
+            and generation_cfg["backend"] == "vllm"
+            and bool(generation_cfg.get("real_quant"))
         )
 
     def _build_refit_conversion_tasks(

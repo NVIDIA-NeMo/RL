@@ -1349,6 +1349,17 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    generation_config = master_config.policy.get("generation")
+    if (
+        generation_config is not None
+        and generation_config["backend"] == "vllm"
+        and generation_config.get("real_quant")
+    ):
+        raise ValueError(
+            "ModelOpt real-quant rollout is not supported by SingleController: "
+            "setup requires policy-first initialization. Use the non-streaming "
+            "GRPO or distillation entrypoint."
+        )
     if master_config.loss_fn.seq_logprob_error_in_loss:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "

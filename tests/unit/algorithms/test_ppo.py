@@ -1773,6 +1773,31 @@ def test_ppo_rejects_explicit_vllm_refit_transport_before_cluster_creation(
     cluster_cls.assert_not_called()
 
 
+@pytest.mark.parametrize("colocated", [False, True])
+def test_ppo_rejects_real_quant_before_cluster_creation(
+    monkeypatch: pytest.MonkeyPatch, colocated: bool
+) -> None:
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    generation_cls = MagicMock(
+        side_effect=AssertionError("must reject before generation construction")
+    )
+    monkeypatch.setattr(ppo_mod, "VllmGeneration", generation_cls)
+    config = _make_noncolocated_setup_config()
+    config.policy["megatron_cfg"]["enabled"] = True
+    config.policy["automodel_cfg"]["enabled"] = False
+    config.policy["quant_cfg"] = "W4A16_NVFP4_CFG"
+    config.policy["generation"].update(quant_cfg=None, real_quant=True)
+    config.policy["generation"]["colocated"]["enabled"] = colocated
+
+    with pytest.raises(ValueError, match="real-quant.*PPO.*GRPO or distillation"):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+    generation_cls.assert_not_called()
+
+
 def test_ppo_rejects_in_loss_filter_before_cluster_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -26,10 +26,9 @@ import torch
 from safetensors.torch import save_file
 
 
-def _make_collective_update_extension(backend):
-    ext = backend.VllmInternalWorkerExtension.__new__(
-        backend.VllmInternalWorkerExtension
-    )
+def _make_collective_update_extension(backend, *, extension_cls: type | None = None):
+    extension_cls = extension_cls or backend.VllmInternalWorkerExtension
+    ext = extension_cls.__new__(extension_cls)
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
@@ -1343,7 +1342,13 @@ def test_update_weights_from_collective_uses_native_reload_when_enabled(monkeypa
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
 
     def packed_broadcast_consumer(
-        iterator, group, src, post_unpack_func, return_iterator=False
+        iterator,
+        group,
+        src,
+        post_unpack_func,
+        return_iterator=False,
+        *,
+        num_buffers=None,
     ):
         call_order.append("broadcast")
         assert list(iterator) == [("model.weight", expected_state_info)]
@@ -1351,6 +1356,7 @@ def test_update_weights_from_collective_uses_native_reload_when_enabled(monkeypa
         assert src == 0
         assert post_unpack_func is None
         assert return_iterator is True
+        assert num_buffers is None
         return iter([("model.weight", "weight-value")])
 
     def reload_weights(*, weights_iterator):
@@ -1402,7 +1408,13 @@ def test_update_weights_from_collective_reload_closes_abandoned_iterator(monkeyp
     weight_iterator = CloseableIterator()
 
     def packed_broadcast_consumer(
-        iterator, group, src, post_unpack_func, return_iterator=False
+        iterator,
+        group,
+        src,
+        post_unpack_func,
+        return_iterator=False,
+        *,
+        num_buffers=None,
     ):
         call_order.append("broadcast")
         assert list(iterator) == [("model.weight", expected_state_info)]
@@ -1410,6 +1422,7 @@ def test_update_weights_from_collective_reload_closes_abandoned_iterator(monkeyp
         assert src == 0
         assert post_unpack_func is None
         assert return_iterator is True
+        assert num_buffers is None
         return weight_iterator
 
     def reload_weights(*, weights_iterator):
@@ -1458,7 +1471,113 @@ def test_collective_fp8_uses_native_reload_iterator(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_prepare_reload_weight_iterator_fixes_gemma3_vision_names(monkeypatch):
+def test_real_quant_mxfp8_collective_reload_preserves_canonical_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("modelopt.torch.quantization")
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+    from nemo_rl.modelopt.models.generation.vllm_quant_backend import (
+        VllmQuantInternalWorkerExtension,
+    )
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext, _ = _make_collective_update_extension(
+        vllm_backend, extension_cls=VllmQuantInternalWorkerExtension
+    )
+    ext.model_runner.vllm_config.model_config.quantization = "modelopt_mxfp8"
+    ext.model_runner.vllm_config.quant_config = ModelOptMxFp8Config.from_config(
+        {"quant_method": "modelopt", "quant_algo": "MXFP8", "ignore": []}
+    )
+    assert fp8.is_fp8_model(ext.model_runner.vllm_config)
+    monkeypatch.setattr(fp8, "global_fp8_config", None)
+    legacy_converter = MagicMock(side_effect=AssertionError("legacy FP8 conversion"))
+    monkeypatch.setattr(fp8, "get_quantized_weight_iterator", legacy_converter)
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    loaded_batches = []
+    receiver_buffer_counts = []
+    ext.model_runner.reload_weights = lambda *, weights_iterator: loaded_batches.append(
+        list(weights_iterator)
+    )
+
+    for value in (1.0, 2.0):
+        weights = [
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                torch.full((2, 32), value).to(torch.float8_e4m3fn),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight_scale",
+                torch.full((2, 1), 127, dtype=torch.uint8),
+            ),
+        ]
+        ext.state_dict_info = {
+            name: (tuple(tensor.shape), tensor.dtype) for name, tensor in weights
+        }
+        expected_values = [tensor.float().clone() for _, tensor in weights]
+
+        def consume(
+            iterator, group, src, post_unpack_func, return_iterator, *, num_buffers=None
+        ):
+            assert dict(iterator) == ext.state_dict_info
+            assert group is ext.model_update_group
+            assert src == 0
+            assert post_unpack_func is None
+            assert return_iterator is True
+            receiver_buffer_counts.append(num_buffers)
+            return iter(weights)
+
+        monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", consume)
+
+        assert ext.update_weights_from_collective(refit_with_reload_api=True) is True
+        assert len(loaded_batches) == int(value)
+        for (name, loaded), (expected_name, expected), expected_value in zip(
+            loaded_batches[-1], weights, expected_values, strict=True
+        ):
+            assert name == expected_name
+            assert loaded is expected
+            assert loaded.dtype == expected.dtype
+            torch.testing.assert_close(loaded.float(), expected_value)
+
+    assert receiver_buffer_counts == [1, 1]
+    legacy_converter.assert_not_called()
+    assert fp8.global_fp8_config is None
+
+
+@pytest.mark.vllm
+def test_fake_quant_reload_retains_legacy_fp8_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("modelopt.torch.quantization")
+    from nemo_rl.modelopt.models.generation.vllm_quant_backend import (
+        VllmQuantInternalWorkerExtension,
+    )
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext, _ = _make_collective_update_extension(
+        vllm_backend, extension_cls=VllmQuantInternalWorkerExtension
+    )
+    ext.model_runner.vllm_config.model_config.quantization = None
+    source_weights = iter([("model.weight", object())])
+    converted_weights = iter([("model.weight", object())])
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: True)
+    converter = MagicMock(return_value=converted_weights)
+    monkeypatch.setattr(fp8, "get_quantized_weight_iterator", converter)
+
+    assert ext._prepare_reload_weight_iterator(source_weights) is converted_weights
+    converter.assert_called_once_with(
+        source_weights, ext.model_runner, refit_with_reload_api=True
+    )
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("skip_fp8_conversion", [False, True])
+def test_prepare_reload_weight_iterator_fixes_gemma3_vision_names(
+    monkeypatch, skip_fp8_conversion: bool
+):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -1469,7 +1588,10 @@ def test_prepare_reload_weight_iterator_fixes_gemma3_vision_names(monkeypatch):
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: False)
 
     result = list(
-        ext._prepare_reload_weight_iterator([("vision_tower.patch_embed.w", "w")])
+        ext._prepare_reload_weight_iterator(
+            [("vision_tower.patch_embed.w", "w")],
+            skip_fp8_conversion=skip_fp8_conversion,
+        )
     )
 
     assert result == [("vision_tower.vision_model.patch_embed.w", "w")]
@@ -3412,7 +3534,10 @@ def test_load_weights_keeps_everything_when_vllm_reports_no_aliases(monkeypatch)
 
 
 @pytest.mark.vllm
-def test_prepare_reload_weight_iterator_drops_tied_aliases(monkeypatch):
+@pytest.mark.parametrize("skip_fp8_conversion", [False, True])
+def test_prepare_reload_weight_iterator_drops_tied_aliases(
+    monkeypatch, skip_fp8_conversion: bool
+):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -3433,7 +3558,11 @@ def test_prepare_reload_weight_iterator_drops_tied_aliases(monkeypatch):
     )
     weights = iter([("lm_head.weight", "head"), ("model.norm.weight", "norm")])
 
-    kept = list(ext._prepare_reload_weight_iterator(weights))
+    kept = list(
+        ext._prepare_reload_weight_iterator(
+            weights, skip_fp8_conversion=skip_fp8_conversion
+        )
+    )
 
     assert kept == [("model.norm.weight", "norm")]
 

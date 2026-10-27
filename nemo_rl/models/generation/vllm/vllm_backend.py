@@ -713,7 +713,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         return kept
 
     def _prepare_reload_weight_iterator(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        skip_fp8_conversion: bool = False,
     ) -> Iterable[tuple[str, torch.Tensor]]:
         """Prepare checkpoint-format weights for vLLM's native reload API."""
         model_config = self.model_runner.vllm_config.model_config
@@ -730,6 +733,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             weights = _drop_tied_embedding_aliases(
                 weights, aliases, getattr(model, "hf_to_vllm_mapper", None)
             )
+
+        if skip_fp8_conversion:
+            return weights
 
         from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -1933,6 +1939,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     src=0,
                     post_unpack_func=None,
                     return_iterator=True,
+                    # Native loaders can retain earlier tensors until a later
+                    # batch completes the layer; keep their stream ordered.
+                    num_buffers=1
+                    if self._uses_native_layerwise_refit("collective")
+                    else None,
                 )
                 assert weight_iterator is not None
                 reload_weight_iterator = self._prepare_reload_weight_iterator(
