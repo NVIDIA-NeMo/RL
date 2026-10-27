@@ -258,7 +258,23 @@ def _disable_opd_full(teacher) -> None:
     teacher.teacher_index = 0
 
 
-def test_get_logprobs_from_meta_dispatches_tq_shards_to_teacher_workers():
+@pytest.mark.parametrize(
+    "media_shapes,keep_packed",
+    [
+        (None, True),
+        ([[], []], False),
+        ([[[0, 3, 2, 2]], [[0, 3, 2, 2]]], False),
+        ([[[1, 3, 2, 2]], []], True),
+        ([[], [[1, 3, 2, 2]]], True),
+        ([[], None], True),
+        ([[], "invalid"], True),
+        ([[], [[0, -1]]], True),
+    ],
+)
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_get_logprobs_from_meta_dispatches_tq_shards_to_teacher_workers(
+    multimodal, media_shapes, keep_packed
+):
     """TeacherWorkerGroup sends metadata, not token tensors, to each DP rank."""
     from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
 
@@ -282,9 +298,21 @@ def test_get_logprobs_from_meta_dispatches_tq_shards_to_teacher_workers():
         partition_id="rollout_data",
         task_name="train",
         sample_ids=["a", "b"],
-        fields=["input_ids", "input_lengths"],
+        fields=["input_ids", "input_lengths", "content", "generation_logprobs"]
+        + (
+            ["pixel_values", "imgs_sizes", "num_frames", "token_type_ids"]
+            if multimodal
+            else []
+        ),
         sequence_lengths=[3, 5],
+        tags=[{"row": "a"}, {"row": "b"}],
     )
+    if multimodal and media_shapes is not None:
+        for tag, shapes in zip(meta.tags, media_shapes):
+            for field in ("pixel_values", "imgs_sizes", "num_frames"):
+                tag[f"{field}__row_shapes"] = (
+                    {"shapes": shapes} if shapes is not None else {}
+                )
 
     teacher.get_logprobs_from_meta(meta)
 
@@ -292,7 +320,14 @@ def test_get_logprobs_from_meta_dispatches_tq_shards_to_teacher_workers():
     kwargs = call.kwargs
     assert call.args == ("get_teacher_logprobs_presharded",)
     assert [shard.sample_ids for shard in kwargs["meta"]] == [["a"], ["b"]]
-    assert all(shard.fields == list(TEACHER_LP_FIELDS) for shard in kwargs["meta"])
+    expected_fields = list(TEACHER_LP_FIELDS) + (
+        (["imgs_sizes", "num_frames", "pixel_values"] if keep_packed else [])
+        + ["token_type_ids"]
+        if multimodal
+        else []
+    )
+    assert all(shard.fields == expected_fields for shard in kwargs["meta"])
+    assert [shard.tags for shard in kwargs["meta"]] == [[tag] for tag in meta.tags]
     assert all(
         shard.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == 6 for shard in kwargs["meta"]
     )
