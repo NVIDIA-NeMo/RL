@@ -4177,15 +4177,10 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
     ctrl._is_ppo = True
-    ctrl._master_config = SimpleNamespace(
-        ppo=SimpleNamespace(
-            seq_logprob_error_threshold=None,
-            overlong_filtering=False,
-            # The shard-decline log names the estimator, so an unshardable
-            # stub has to carry one even though the assertions below ignore it.
-            adv_estimator=SimpleNamespace(name="gae"),
-        )
-    )
+    # model_construct, not a SimpleNamespace: it fills every default the stage
+    # reads -- including the three this test wants -- without validating, so a
+    # field added later does not raise AttributeError here.
+    ctrl._master_config = SimpleNamespace(ppo=PPOConfig.model_construct())
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
     # gae normalizes over the whole batch, so it is not shard-invariant.

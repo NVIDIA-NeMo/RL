@@ -1115,7 +1115,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     Both directions on the critic: one the PPO path needs and does not have, and
     one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knobs SC reads on neither path.
+    sampling knobs SC reads on neither path, and a range check on the one it
+    does read.
     """
     algo_cfg = algo_config(master_config)
 
@@ -1136,7 +1137,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         name
         for name, enabled in (
             ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
-            ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
             # getattr: PPO's config has no length_penalty field.
             ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
@@ -1150,6 +1150,38 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "implements none of them -- the run would silently skip the "
             "shaping. Disable them."
         )
+
+    # The advantage stage applies reward_scaling, so it is accepted -- but it
+    # divides by the source interval, and an empty or inverted one surfaces as
+    # inf/nan or sign-flipped advantages a rollout later, naming nothing.
+    scaling_cfg = algo_cfg.reward_scaling
+    if scaling_cfg.enabled:
+        # Ahead of the interval check, which neither case reaches: an infinite
+        # bound orders fine and then makes the division inf/inf, and a nan one
+        # compares False against everything.
+        non_finite = [
+            f"{name}={value}"
+            for name, value in (
+                ("source_min", scaling_cfg.source_min),
+                ("source_max", scaling_cfg.source_max),
+                ("target_min", scaling_cfg.target_min),
+                ("target_max", scaling_cfg.target_max),
+            )
+            if not math.isfinite(value)
+        ]
+        if non_finite:
+            raise ValueError(
+                f"reward_scaling bounds must be finite, got {', '.join(non_finite)}. "
+                "The scale maps through (r - source_min) / (source_max - "
+                "source_min), which turns every finite reward into inf/nan."
+            )
+        if scaling_cfg.source_min >= scaling_cfg.source_max:
+            raise ValueError(
+                f"reward_scaling.source_min={scaling_cfg.source_min} must be less "
+                f"than reward_scaling.source_max={scaling_cfg.source_max}. The "
+                "scale divides by (source_max - source_min), so an empty or "
+                "inverted interval produces inf/nan rewards and advantages."
+            )
 
     # Rejected here rather than at the first advantage call, which is a whole
     # round of rollouts and logprobs later: gdpo needs one reward column per
