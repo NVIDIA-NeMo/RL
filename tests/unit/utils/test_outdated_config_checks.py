@@ -352,3 +352,31 @@ def test_removed_mcore_generation_keys_report_the_first_and_current_keys_pass():
             }
         }
     )
+
+
+# ============================================================================
+# reject_outdated_dynamo_router_reset_states
+# ============================================================================
+
+
+def _dynamo_frontend_config(frontend_args: dict) -> dict:
+    return {"policy": {"generation": {"dynamo_cfg": {"frontend_args": frontend_args}}}}
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_dynamo_router_reset_states_is_rejected(value):
+    with pytest.raises(
+        ValueError,
+        match=r"frontend_args\.router_reset_states was removed.*--router-reset-states",
+    ):
+        check_outdated_config(
+            _dynamo_frontend_config({"router_mode": "kv", "router_reset_states": value})
+        )
+
+
+def test_dynamo_frontend_args_without_router_reset_states_pass():
+    check_outdated_config(_dynamo_frontend_config({"router_mode": "kv"}))
+
+
+def test_generation_without_dynamo_cfg_passes():
+    check_outdated_config({"policy": {"generation": {"backend": "vllm"}}})
