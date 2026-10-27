@@ -26,12 +26,15 @@ def row_adam_direction(
     step: int,
     beta2: float,
     epsilon: float,
+    inplace: bool = False,
 ) -> Tensor:
     """Normalize each row by its bias-corrected running RMS.
 
     The state is indexed by the original weight's output rows, not by the
     changing projection coordinates. Ordinary learning rate controls the update;
     there is no layer-norm restoration or external update-magnitude controller.
+    With ``inplace`` the sketch itself is overwritten with the direction, which
+    avoids a full-size temporary when the sketch is no longer needed.
     """
     if step < 1 or not 0 <= beta2 < 1 or epsilon <= 0:
         raise ValueError("Invalid RowAdam step, decay, or epsilon")
@@ -42,5 +45,7 @@ def row_adam_direction(
     second_moment.mul_(beta2).add_(
         sketch.square().mean(dim=1, keepdim=True), alpha=1 - beta2
     )
-    corrected = second_moment / (1 - beta2**step)
-    return sketch / (corrected.sqrt() + epsilon)
+    denominator = (second_moment / (1 - beta2**step)).sqrt_().add_(epsilon)
+    if inplace:
+        return sketch.div_(denominator)
+    return sketch / denominator
