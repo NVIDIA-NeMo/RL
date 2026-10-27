@@ -26,8 +26,8 @@ import pytest
 import torch
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
+from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
 from nemo_rl.utils.logger import (
-    TELEMETRY_WALL_TIME_METRIC,
     WANDB_CALLER_STEP_METRIC,
     GPUMonitoringConfig,
     Logger,

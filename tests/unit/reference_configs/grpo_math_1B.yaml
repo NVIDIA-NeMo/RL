@@ -6,6 +6,10 @@ grpo:
   max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
+  # Rows that vote in the advantage statistics (group baseline/std, GDPO/Reinforce++
+  # batch normalization, dynamic-sampling admission): include (default) every row,
+  # masked rewards too; exclude only rows with a nonzero loss weight. Loss masks unchanged.
+  masked_reward_policy: include
   use_leave_one_out_baseline: true
   val_period: 10
   val_start_at: -1
@@ -442,6 +446,7 @@ policy:
     # mcore for native refit.
     # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
     refit_transport: null
+    lora_refit_mode: native
     worker_extension_cls_fqn: null
     # Keep real-quant export tensors on CPU by default. Set false only for
     # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
