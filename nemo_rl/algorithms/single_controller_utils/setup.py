@@ -83,6 +83,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
 )
+from nemo_rl.algorithms.swe_privileged_critic import SwePrivilegePrefixStore
+from nemo_rl.algorithms.swe_privileged_critic import (
+    resolve_config as resolve_swe_privileged_critic_config,
+)
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import (
@@ -206,6 +210,8 @@ class SingleControllerActorArgs:
     # the MSE loss it trains under.
     value_handle: Optional[TQValue] = None
     value_loss_fn: Optional[LossFunction] = None
+    # SWE privileged critic (value.swe_privileged_critic.enabled); None otherwise.
+    privilege_store: Optional[SwePrivilegePrefixStore] = None
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -2306,6 +2312,16 @@ def setup_single_controller(
     setup_timing_metrics.other_setup_time_s = total_setup_time - worker_setup_time
     print_setup_timing_summary(setup_timing_metrics)
 
+    # SWE privileged critic: the controller caches one reference-block prefix
+    # per instance and stamps it onto rows at commit.
+    # None on a GRPO run, which validation already kept free of a value block.
+    privilege_cfg = resolve_swe_privileged_critic_config(master_config.value)
+    privilege_store = (
+        SwePrivilegePrefixStore(tokenizer, privilege_cfg)
+        if privilege_cfg is not None
+        else None
+    )
+
     # Build actor args and return
     actor_args = SingleControllerActorArgs(
         gen_handle=generation,
@@ -2337,5 +2353,6 @@ def setup_single_controller(
         # PPO extras
         value_handle=value,
         value_loss_fn=value_loss_fn,
+        privilege_store=privilege_store,
     )
     return actor_args, setup_timing_metrics

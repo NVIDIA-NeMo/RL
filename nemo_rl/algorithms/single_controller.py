@@ -250,6 +250,7 @@ from nemo_rl.utils.path_utils import (
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 if TYPE_CHECKING:
+    from nemo_rl.algorithms.swe_privileged_critic import SwePrivilegePrefixStore
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
@@ -263,6 +264,10 @@ log = logging.getLogger(__name__)
 # budget: at this point the run is over, so the only thing a completed restart buys is a
 # cleaner exit. Not configurable for the same reason.
 _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
+
+# SWE privileged critic prefix cache, saved with a checkpointed replay buffer so the
+# restored groups keep their reference blocks.
+PRIVILEGE_PREFIXES_FILENAME = "privilege_prefixes.pt"
 
 
 @dataclass(frozen=True)
@@ -282,6 +287,9 @@ class _RolloutCheckpointCut:
     next_nemo_gym_task_index: int
     replacement_reserve: list[DatumSpec]
     replay_metadata: Optional[TQReplayMetadataState]
+    # SWE privileged critic prefixes the replay groups reference; None without
+    # a privileged critic.
+    privilege_state: Optional[dict[str, Any]]
     rollout_recovery_payload: Optional[bytes]
     rollout_recovery_group_count: Optional[int]
     replay_row_count: int
@@ -390,6 +398,10 @@ class SingleControllerActor:
     # handle, so an instance built without running __init__ emits no spans
     # rather than raising out of the training loop.
     _tracer: Any = None
+
+    # SWE privileged critic prefix cache, declared on the class for the same
+    # reason: an instance built without __init__ runs with a blind critic.
+    _privilege_store: Optional[SwePrivilegePrefixStore] = None
 
     def __init__(
         self,
@@ -587,6 +599,17 @@ class SingleControllerActor:
             self._buffer.set_post_write_enricher(self._teacher_coordinator.enrich)
         else:
             self._teacher_coordinator = None
+        # SWE privileged critic: stamp each group with its reference-block prefix
+        # before it becomes selectable. The buffer takes a single enricher.
+        self._privilege_store = getattr(actor_args, "privilege_store", None)
+        if self._privilege_store is not None:
+            if self._teacher_coordinator is not None:
+                raise ValueError(
+                    "value.swe_privileged_critic cannot be combined with "
+                    "on-policy distillation teachers: both need the replay "
+                    "buffer's single post-write enricher."
+                )
+            self._buffer.set_post_write_enricher(self._privilege_store.enrich)
         # Only with fleet health: without a ledger nothing ever reaches DEAD, so there
         # is nothing for a supervisor to restart.
         _fleet_health_cfg = master_config.async_rl.generation_fleet_health
@@ -861,6 +884,7 @@ class SingleControllerActor:
 
         replay_restore_started = time.monotonic()
         restored_replay_groups = await self._maybe_restore_replay_buffer()
+        await self._maybe_restore_privilege_prefixes(restored_replay_groups)
         replay_restore_seconds = time.monotonic() - replay_restore_started
         recovery_prepare_started = time.monotonic()
         await self._maybe_restore_rollout_recovery(
@@ -1083,6 +1107,30 @@ class SingleControllerActor:
                     else None
                 ),
             )
+
+    async def _maybe_restore_privilege_prefixes(self, restored_groups: int) -> None:
+        """Re-cache the reference blocks the restored replay groups reference."""
+        privilege_store = self._privilege_store
+        if privilege_store is None or not restored_groups:
+            return
+        # Replay groups are only ever restored from a checkpoint.
+        assert self._last_checkpoint_path is not None
+        path = os.path.join(self._last_checkpoint_path, PRIVILEGE_PREFIXES_FILENAME)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Restored {restored_groups} replay group(s) for the SWE privileged "
+                f"critic, but the checkpoint has no {PRIVILEGE_PREFIXES_FILENAME}."
+            )
+        # weights_only=False: prefix tensors plus plain stats dicts, a trusted
+        # same-job artifact like the replay metadata.
+        state = await asyncio.to_thread(torch.load, path, weights_only=False)
+        metas = [meta for meta in self._buffer.meta_list if meta is not None]
+        privilege_store.restore(state, metas)
+        print(
+            f"📦 Restored {len(privilege_store)} privileged-critic prefix(es) for "
+            f"{len(metas)} restored replay group(s)",
+            flush=True,
+        )
 
     async def _maybe_restore_replay_buffer(self) -> int:
         """Restore the local replay index for the native TQ checkpoint.
@@ -1988,10 +2036,40 @@ class SingleControllerActor:
             # drop its slot in the same cut, or the sampler could still select
             # it with its rows cleared.
             await self._buffer.drop_committed_group(cut, request.group_id)
+        if self._privilege_store is not None:
+            self._privilege_store.release_groups([request.group_id])
         # The group left the buffer unconsumed, so the post-step release for
         # consumed groups never reaches its pending metrics and observations.
         self._finalizer_metrics_by_group.pop(request.group_id, None)
         self._finalizer_rewards_by_group.pop(request.group_id, None)
+
+    async def _finalized_env_info(
+        self, request: "ReassemblyRequest"
+    ) -> Optional[dict[str, Any]]:
+        """The ``extra_env_info`` the replay buffer's enricher sees for a finalized group.
+
+        Teachers route on the Gym-resolved agent alone. The SWE privileged critic
+        needs the prompt's own env info (its golden patch), which the
+        metadata-only request does not carry, so the prompt is looked up.
+        """
+        env_info = (
+            {"agent_ref": {"name": request.resolved_agent_name}}
+            if request.resolved_agent_name is not None
+            else None
+        )
+        if self._privilege_store is None:
+            return env_info
+        prompt = await self._load_recovery_prompt(
+            group_id=request.group_id, sample_id=str(request.prompt_idx)
+        )
+        if prompt.get("idx") != request.prompt_idx:
+            # The block would describe another instance: fail, not mislabel.
+            raise ValueError(
+                "SWE privileged critic: dataset position "
+                f"{request.prompt_idx} holds prompt idx={prompt.get('idx')!r} "
+                f"(group={request.group_id!r})"
+            )
+        return {**dict(prompt.get("extra_env_info") or {}), **(env_info or {})}
 
     async def _finalize_with_actor(
         self, request: "ReassemblyRequest"
@@ -2093,11 +2171,7 @@ class SingleControllerActor:
                             finalized.group_min_wv,
                             finalized.group_max_wv,
                             staging_keys=finalized.staging_keys,
-                            extra_env_info=(
-                                {"agent_ref": {"name": request.resolved_agent_name}}
-                                if request.resolved_agent_name is not None
-                                else None
-                            ),
+                            extra_env_info=await self._finalized_env_info(request),
                         )
                     except BaseException as commit_error:
                         try:
@@ -3753,11 +3827,20 @@ class SingleControllerActor:
                     _update_adaptive_loss_state(self._loss_fn, step_metrics)
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
+                if self._privilege_store is not None:
+                    step_metrics.update(
+                        self._privilege_store.step_metrics(consumed_metas)
+                    )
                 async with self._data_plane_checkpoint_barrier.mutation(
                     "sample_clears"
                 ) as cut:
                     await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
                     self._buffer.release_training_claims(consumed_training_claim_ids)
+                    # In the same cut as the training claims: a rollout snapshot
+                    # re-persists claimed groups, so it must still find their
+                    # prefixes.
+                    if self._privilege_store is not None:
+                        self._privilege_store.release(consumed_metas)
                     for group_id in step_finalizer_group_ids:
                         self._finalizer_metrics_by_group.pop(group_id, None)
                         self._finalizer_rewards_by_group.pop(group_id, None)
@@ -4697,13 +4780,18 @@ class SingleControllerActor:
         return len(stale_tasks)
 
     def _prune_finalizer_state(self, selected_group_ids: set[str]) -> None:
-        """Release pending finalizer state for groups evicted before training.
+        """Release pending per-group state for groups evicted before training.
+
+        Covers the finalizer metrics and rewards and the privileged critic's
+        prefix references.
 
         Eviction reports only a count, so reconcile against the groups that can
         still be consumed: those in the buffer plus those already selected by
         the step in progress.
         """
         live = set(self._buffer.group_ids) | selected_group_ids
+        if self._privilege_store is not None:
+            self._privilege_store.retain(live)
         for group_id in (
             self._finalizer_metrics_by_group.keys()
             | self._finalizer_rewards_by_group.keys()
@@ -4784,6 +4872,11 @@ class SingleControllerActor:
             next_nemo_gym_task_index=next_nemo_gym_task_index,
             replacement_reserve=replacement_reserve,
             replay_metadata=replay_metadata,
+            privilege_state=(
+                self._privilege_store.state_dict()
+                if self._privilege_store is not None
+                else None
+            ),
             rollout_recovery_payload=recovery_payload,
             rollout_recovery_group_count=len(recovery_state["groups"]),
             replay_row_count=replay_row_count,
@@ -4820,6 +4913,14 @@ class SingleControllerActor:
                 replay_metadata_path,
             )
             written_paths.append(replay_metadata_path)
+        if cut.privilege_state is not None:
+            privilege_prefixes_path = checkpoint_path / PRIVILEGE_PREFIXES_FILENAME
+            await asyncio.to_thread(
+                torch.save,
+                cut.privilege_state,
+                privilege_prefixes_path,
+            )
+            written_paths.append(privilege_prefixes_path)
         if cut.rollout_recovery_payload is not None:
             rollout_recovery_path = checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME
             await asyncio.to_thread(
@@ -5361,6 +5462,7 @@ class SingleControllerActor:
 
         print(f"Saving checkpoint for step {self._train_steps}...")
         replay_metadata: Optional[TQReplayMetadataState] = None
+        privilege_state: Optional[dict[str, Any]] = None
         rollout_recovery_state: Optional[RolloutRecoveryState] = None
         rollout_recovery_payload: Optional[bytes] = None
         rollout_recovery_payload_sha256: Optional[str] = None
@@ -5408,6 +5510,10 @@ class SingleControllerActor:
                     )
                 if replay_metadata is not None:
                     await self._validate_replay_inventory(replay_metadata)
+                    # The privileged critic's prefixes travel with the replay
+                    # groups that reference them.
+                    if self._privilege_store is not None:
+                        privilege_state = self._privilege_store.state_dict()
 
                 if self._rollout_recovery_enabled:
                     rollout_recovery_state = build_rollout_recovery_state(
@@ -5512,6 +5618,12 @@ class SingleControllerActor:
                 save_checkpoint_object,
                 replay_metadata,
                 os.path.join(checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME),
+            )
+        if privilege_state is not None:
+            await asyncio.to_thread(
+                save_checkpoint_object,
+                privilege_state,
+                os.path.join(checkpoint_path, PRIVILEGE_PREFIXES_FILENAME),
             )
         if rollout_recovery_payload is not None:
             await asyncio.to_thread(
@@ -5864,9 +5976,23 @@ class SingleControllerActor:
         """
         if not already_prepared:
             await asyncio.to_thread(self._value.prepare_for_inference)
-        await asyncio.to_thread(self._value.get_values_from_meta, meta)
+        await asyncio.to_thread(
+            self._value.get_values_from_meta,
+            meta,
+            **self._privilege_kwargs(meta),
+        )
         await asyncio.to_thread(self._value.finish_inference)
         return meta.with_fields([self._advantage_cfg.values_field])
+
+    def _privilege_kwargs(self, meta: KVBatchMeta) -> dict[str, Any]:
+        """Critic-call kwargs carrying the batch's reference-block prefixes.
+
+        Empty unless the critic is privileged, so a blind critic's calls are
+        unchanged.
+        """
+        if self._privilege_store is None:
+            return {}
+        return {"privilege_prefixes": self._privilege_store.prefixes_for(meta)}
 
     async def _value_train_epochs(
         self, meta: KVBatchMeta, *, num_epochs: int
@@ -5878,12 +6004,14 @@ class SingleControllerActor:
             results are discarded.
         """
         await asyncio.to_thread(self._value.prepare_for_training)
+        privilege_kwargs = self._privilege_kwargs(meta)
         result: dict[str, Any] | None = None
         for _ in range(num_epochs):
             result = await asyncio.to_thread(
                 self._value.train_from_meta,
                 meta,
                 self._value_loss_fn,  # pyrefly: ignore
+                **privilege_kwargs,
             )
         await asyncio.to_thread(self._value.finish_training)
         assert result is not None
