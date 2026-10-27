@@ -299,6 +299,23 @@ rollout_recovery:
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.
 
+value:
+  # SWE privileged critic (asymmetric actor-critic): prefix every critic row with a
+  # reference block holding the instance's accepted fix and grading tests, which the
+  # policy never sees. Needs SWE rows whose extra_env_info carries a golden patch
+  # (see nemo_rl/algorithms/swe_privileged_critic.py); a row without one fails the
+  # run. value.max_total_sequence_length and any enabled value packing/dynamic
+  # batching token budget must cover policy.max_total_sequence_length +
+  # max_total_tokens + 256. Cannot be combined with on-policy distillation teachers.
+  swe_privileged_critic:
+    enabled: false
+    # Token budget for the whole reference block, spent in priority order
+    # fail_to_pass > golden_patch > test_patch > pass_to_pass.
+    max_total_tokens: 32768
+    # Per-field ceilings within the budget; omitted keys keep the defaults
+    # (golden_patch 24576, test_patch 16384, pass_to_pass 4096, fail_to_pass 4096).
+    caps: {}
+
 cluster:
   # Master ports inherit the shared 1400-1999 band from ppo_math_1B.yaml.
   gpus_per_node: 2

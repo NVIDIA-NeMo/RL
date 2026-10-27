@@ -473,6 +473,49 @@ class TestPPOValidation:
             self._warmup_ckpt_config(constant_structure=False)
         )
 
+    @staticmethod
+    def _privileged_config(*, value_seq_len: int) -> MasterConfig:
+        mc = _ppo_master_config()
+        mc.value["max_total_sequence_length"] = value_seq_len
+        mc.value["swe_privileged_critic"] = {"enabled": True, "max_total_tokens": 64}
+        return mc
+
+    def test_accepts_a_privileged_critic_with_room_for_the_block(self):
+        # policy 32 + budget (64 + 256 template slack)
+        validate_single_controller_config(self._privileged_config(value_seq_len=352))
+
+    def test_rejects_a_privileged_critic_without_room_for_the_block(self):
+        mc = self._privileged_config(value_seq_len=351)
+
+        with pytest.raises(ValueError, match="value.max_total_sequence_length"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_privileged_critic_packing_budget_without_room(self):
+        mc = self._privileged_config(value_seq_len=352)
+        mc.value["sequence_packing"] = {
+            "enabled": True,
+            "train_mb_tokens": 352,
+            "logprob_mb_tokens": 351,
+        }
+
+        with pytest.raises(
+            ValueError, match="value.sequence_packing.logprob_mb_tokens"
+        ):
+            validate_single_controller_config(mc)
+
+    def test_rejects_an_unknown_privileged_critic_key(self):
+        mc = self._privileged_config(value_seq_len=352)
+        mc.value["swe_privileged_critic"]["max_tokens"] = 64
+
+        with pytest.raises(ValueError, match="max_tokens"):
+            validate_single_controller_config(mc)
+
+    def test_disabled_privileged_critic_needs_no_extra_room(self):
+        mc = self._privileged_config(value_seq_len=32)
+        mc.value["swe_privileged_critic"]["enabled"] = False
+
+        validate_single_controller_config(mc)
+
     @pytest.mark.parametrize(
         "enable",
         [
