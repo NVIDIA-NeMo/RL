@@ -18,6 +18,7 @@ import inspect
 import logging
 import os
 import sys
+from collections.abc import Mapping
 from typing import Any, Optional, cast
 
 import ray
@@ -42,7 +43,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineRpcMixin,
 )
-from nemo_rl.models.generation.disagg_layout import engine_key
+from nemo_rl.models.generation.disagg_layout import deep_merge, engine_key
 from nemo_rl.models.generation.vllm.config import (
     vllm_kv_transfer_config_for_role,
     vllm_role_engine_config,
@@ -299,6 +300,25 @@ def _resolve_disagg_engine(
             "in sync."
         )
     return entry
+
+
+def effective_vllm_kwargs(
+    cfg: Mapping[str, Any], engine_cfg: Mapping[str, Any], *, disaggregated: bool
+) -> dict[str, Any]:
+    """The ``vllm_kwargs`` this engine is built with.
+
+    Without disaggregation that is the shared block. Under it, a role's block
+    was deep-merged over the shared one when the roles were resolved
+    (``resolve_vllm_role_overrides``, inside ``configure_generation_config``);
+    keys the driver adds to the shared block *after* that -- ``grpo.setup``
+    writes ``hf_overrides`` there, router replay its own kwargs -- would be
+    missing from that snapshot, so the shared block as it stands now is merged
+    underneath it again. Role values keep precedence.
+    """
+    shared = copy.deepcopy(dict(cfg.get("vllm_kwargs") or {}))
+    if not disaggregated:
+        return shared
+    return deep_merge(shared, copy.deepcopy(dict(engine_cfg.get("vllm_kwargs") or {})))
 
 
 class BaseVllmGenerationWorker:
@@ -620,13 +640,8 @@ class BaseVllmGenerationWorker:
                 "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
-        # A role's vllm_kwargs are already deep-merged over the shared ones
-        # (resolve_vllm_role_overrides); without disaggregation there is only
-        # the shared block.
-        vllm_kwargs: dict[str, Any] = copy.deepcopy(
-            self.engine_cfg["vllm_kwargs"]
-            if self._disagg_role is not None
-            else self.cfg.get("vllm_kwargs", {})
+        vllm_kwargs: dict[str, Any] = effective_vllm_kwargs(
+            self.cfg, self.engine_cfg, disaggregated=self._disagg_role is not None
         )
         if self._disagg_role is not None:
             seed = self._apply_disagg_engine_identity(seed)

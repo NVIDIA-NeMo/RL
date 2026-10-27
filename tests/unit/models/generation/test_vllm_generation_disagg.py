@@ -448,3 +448,35 @@ def test_disagg_engine_env_defaults_keep_nccl_plugin_out_of_nixl_engines():
         )
         == {}
     )
+
+
+def test_effective_vllm_kwargs_merges_late_shared_keys_under_the_role_block():
+    from nemo_rl.models.generation.vllm.vllm_worker import effective_vllm_kwargs
+
+    # Roles were resolved while the shared block was {"a": 1, "nested": {"x": 1}};
+    # the driver then added hf_overrides to the shared block.
+    cfg = {
+        "vllm_kwargs": {
+            "a": 1,
+            "nested": {"x": 1},
+            "hf_overrides": {"max_position_embeddings": 131072},
+        }
+    }
+    engine_cfg = {
+        "vllm_kwargs": {"a": 1, "nested": {"x": 1, "y": 2}, "role_only": True}
+    }
+    merged = effective_vllm_kwargs(cfg, engine_cfg, disaggregated=True)
+    assert merged == {
+        "a": 1,
+        "nested": {"x": 1, "y": 2},
+        "role_only": True,
+        "hf_overrides": {"max_position_embeddings": 131072},
+    }
+    # Role values keep precedence over the shared block.
+    assert effective_vllm_kwargs(
+        {"vllm_kwargs": {"a": 1}}, {"vllm_kwargs": {"a": 2}}, disaggregated=True
+    ) == {"a": 2}
+    # Without disaggregation only the shared block counts, copied.
+    shared = {"vllm_kwargs": {"a": 1}}
+    out = effective_vllm_kwargs(shared, {"vllm_kwargs": {"a": 9}}, disaggregated=False)
+    assert out == {"a": 1} and out is not shared["vllm_kwargs"]

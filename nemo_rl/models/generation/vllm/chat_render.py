@@ -27,6 +27,7 @@ Everything vLLM is imported lazily: the module is also imported by the driver,
 whose environment does not carry vLLM.
 """
 
+import copy
 import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -227,10 +228,12 @@ class FrontendChatRenderer:
             )
         }
         render_fields.setdefault("model", self._settings.model_name)
-        messages = [dict(m) for m in body.get("messages") or []]
-        for message in messages:
-            if message.get("tool_calls"):
-                message["tool_calls"] = list(message["tool_calls"])
+        # A deep copy: vLLM's renderer rewrites the conversation in place
+        # (``_postprocess_messages`` turns each tool call's JSON-string
+        # ``arguments`` into a dict for the chat template), and the body is
+        # relayed to the prefill engine afterwards, whose request validation
+        # requires the string form.
+        messages = copy.deepcopy(body.get("messages") or [])
         request = ChatCompletionRequest(**render_fields)
 
         full_ids = await self._render(
