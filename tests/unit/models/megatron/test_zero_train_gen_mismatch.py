@@ -941,6 +941,17 @@ def test_shipped_recipes_train_and_generate_with_the_same_tp(name):
     assert inference["context_parallel_size"] == 1
 
 
+def test_nano_zero_kl_recipe_covers_packing_and_chunked_prefill():
+    # The recipe inherits both settings from grpo_math_1B.yaml (minimize-check
+    # strips them from the recipe), and its nightly is what proves zero KL with them on.
+    policy = _load_policy(
+        "recipes/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8.yaml"
+    )
+    generation = policy["generation"]["mcore_generation_config"]
+    assert policy["sequence_packing"]["enabled"] is True
+    assert generation["enable_chunked_prefill"] is True
+
+
 @pytest.mark.parametrize(
     ("tp_size", "expected"), [(1, 64), (2, 64), (3, 66), (128, 128)]
 )
