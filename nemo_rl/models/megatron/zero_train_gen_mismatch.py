@@ -61,8 +61,6 @@ _ZERO_KL_MEGATRON_REQUIRED: dict[str, Any] = {
     "batch_invariant_collective": "ordered",
 }
 
-_ZERO_KL_GENERATION_REQUIRED: dict[str, Any] = {}
-
 # Workspace-free cuBLAS (fixed reduction order) for the te_native backend.
 _TE_NATIVE_ENV_VARS = {
     "CUBLASLT_WORKSPACE_SIZE": "0",
@@ -463,17 +461,6 @@ def _validate_required_values(
             out.violations.append(
                 f"policy.megatron_cfg.{key} must be {value!r} "
                 f"(got {megatron_cfg.get(key)!r})."
-            )
-
-    generation = config.get("generation")
-    if generation is None or generation.get("backend") != "megatron":
-        return  # reported by _validate_backend
-    mcore_generation_config = generation["mcore_generation_config"]
-    for key, value in _ZERO_KL_GENERATION_REQUIRED.items():
-        if mcore_generation_config.get(key) != value:
-            out.violations.append(
-                f"policy.generation.mcore_generation_config.{key} must be "
-                f"{value!r} (got {mcore_generation_config.get(key)!r})."
             )
 
 
