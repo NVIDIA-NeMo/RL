@@ -338,6 +338,7 @@ guides/deepseek.md
 guides/models/index.md
 model-quirks.md
 guides/async-grpo.md
+guides/deterministic-grpo.md
 guides/single-controller.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md

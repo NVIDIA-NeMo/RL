@@ -85,6 +85,12 @@ policy:
 
   megatron_cfg:
     enabled: true
+    # For grpo.deterministic=true, set these explicitly for your installed stack:
+    # flash_attention_version: 4  # 3 for a compatible Hopper stack
+    # batch_invariant_backend: te_native
+    # batch_invariant_collective: ordered
+    # Strict GRPO resolves deterministic_mode=true, batch_invariant_mode=true,
+    # and seed=grpo.seed before worker creation.
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false

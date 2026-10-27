@@ -907,7 +907,9 @@ def test_async_vlm_multiturn_drops_stale_vllm_content(
         *,
         sample_multimodal_data=None,
         deduplicate_multimodal_data=False,
+        sampling_seed=None,
     ):
+        assert sampling_seed is None
         calls.append(
             {
                 "message_log": deepcopy(sample_message_log),

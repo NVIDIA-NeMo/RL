@@ -24,7 +24,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import ray
@@ -93,6 +93,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationSamplingParams,
 )
 from nemo_rl.telemetry.instrumentation import dispatch_with_trace_context
+from nemo_rl.utils.determinism import keyed_seed
 from nemo_rl.utils.length_penalty import (
     LengthPenaltyConfig,
     apply_group_length_penalties,
@@ -1102,6 +1103,14 @@ def run_multi_turn_rollout(
                 "stop_strings": active_stop_strings,
             }
         )
+        if "sampling_seed" in active_batch:
+            generation_input_data["sampling_seed"] = torch.tensor(
+                [
+                    keyed_seed(int(seed), "turn", turn)
+                    for seed in active_batch["sampling_seed"]
+                ],
+                dtype=torch.int64,
+            )
         _add_multimodal_generation_payload(
             generation_input_data,
             active_flat_messages,
@@ -1278,6 +1287,7 @@ async def async_generate_response_for_sample_turn(
     *,
     sample_multimodal_data: dict[str, Any] | None = None,
     deduplicate_multimodal_data: bool = False,
+    sampling_seed: int | None = None,
 ) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
     """Generate a response for a single sample's turn using async generation.
 
@@ -1316,6 +1326,11 @@ async def async_generate_response_for_sample_turn(
     )
 
     # Create a dummy batch for generate_responses_async
+    if sampling_seed is not None:
+        generation_input_data["sampling_seed"] = torch.tensor(
+            [sampling_seed], dtype=torch.int64
+        )
+
     dummy_batch = BatchedDataDict[DatumSpec](
         {
             "message_log": batch_message_logs,
@@ -1360,6 +1375,7 @@ async def run_sample_multi_turn_rollout(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    on_generation_complete: Callable[[int], None] | None = None,
 ) -> tuple[dict, dict[str, Any]]:
     """Run a multi-turn rollout for a single sample.
 
@@ -1377,6 +1393,10 @@ async def run_sample_multi_turn_rollout(
         greedy: Whether to use greedy decoding
         deduplicate_multimodal_data: Avoid redundant media at generation
             boundaries while preserving compact policy media in the trajectory.
+        on_generation_complete: Optional callback with the input sample index,
+            invoked once no further generation calls can occur. At a known final
+            turn this precedes terminal reward processing; errors do not release
+            unfinished generation.
 
     Returns:
         Tuple of (final_sample_state, sample_metrics)
@@ -1411,6 +1431,7 @@ async def run_sample_multi_turn_rollout(
     # Track per-turn per-worker token accounting if available
     per_worker_token_counts = {}  # worker_idx -> token_count
 
+    generation_released = False
     for turn in range(max_rollout_turns):
         if terminated or truncated:
             break
@@ -1438,6 +1459,11 @@ async def run_sample_multi_turn_rollout(
                 greedy=greedy,
                 sample_multimodal_data=turn_multimodal_data,
                 deduplicate_multimodal_data=deduplicate_multimodal_data,
+                sampling_seed=(
+                    keyed_seed(int(initial_sample_state["sampling_seed"]), "turn", turn)
+                    if "sampling_seed" in initial_sample_state
+                    else None
+                ),
             )
             current_message_log = updated_message_log
 
@@ -1461,8 +1487,16 @@ async def run_sample_multi_turn_rollout(
                 )
 
         except Exception as e:
+            if "sampling_seed" in initial_sample_state:
+                raise
             print(f"Error generating response for sample {sample_idx}: {e}")
             break
+
+        if on_generation_complete is not None and (
+            truncated or turn + 1 == max_rollout_turns
+        ):
+            on_generation_complete(sample_idx)
+            generation_released = True
 
         # Create single-sample batch for environment interaction
         sample_batch = BatchedDataDict[DatumSpec](
@@ -1532,6 +1566,9 @@ async def run_sample_multi_turn_rollout(
                 current_stop_strings = env_output.next_stop_strings[0]
             if env_output.metadata[0] is not None:
                 current_extra_env_info = env_output.metadata[0]
+
+    if on_generation_complete is not None and not generation_released:
+        on_generation_complete(sample_idx)
 
     # Check if max turns reached
     if turn_count >= max_rollout_turns:
@@ -1675,6 +1712,7 @@ async def _run_multi_turn_rollout_async(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    on_generation_complete: Callable[[int], None] | None = None,
 ) -> tuple[BatchedDataDict[DatumSpec], list[dict[str, Any]]]:
     """Run one native rollout batch and retain metrics at sample granularity."""
     batch_size = len(input_batch["message_log"])
@@ -1691,6 +1729,8 @@ async def _run_multi_turn_rollout_async(
         for key in VLLM_PROMPT_KEYS:
             if key in input_batch:
                 sample_state[key] = input_batch[key][i]
+        if "sampling_seed" in input_batch:
+            sample_state["sampling_seed"] = int(input_batch["sampling_seed"][i])
         sample_initial_states.append(sample_state)
 
     async def run_single_sample_with_error_handling(i, sample_state):
@@ -1705,6 +1745,7 @@ async def _run_multi_turn_rollout_async(
                 max_rollout_turns=max_rollout_turns,
                 greedy=greedy,
                 deduplicate_multimodal_data=deduplicate_multimodal_data,
+                on_generation_complete=on_generation_complete,
             )
         except Exception as error:
             raise RuntimeError(f"Error in sample {i} rollout: {error}") from error
@@ -1820,6 +1861,7 @@ async def run_async_multi_turn_rollout_groups(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    on_generation_complete: Callable[[int], None] | None = None,
 ) -> AsyncGenerator[RolloutGroupResult, None]:
     """Run one native batch, then yield prompt groups with group-local metrics.
 
@@ -1836,6 +1878,8 @@ async def run_async_multi_turn_rollout_groups(
         num_generations: Number of contiguous rollout samples in each prompt group.
         max_rollout_turns: Maximum number of agent-environment interaction turns.
         greedy: Whether policy generation should use greedy decoding.
+        on_generation_complete: Optional per-sample notification that releases
+            inference weights independently of terminal reward completion.
 
     Yields:
         Complete prompt groups in input order. Each ``RolloutGroupResult`` contains
@@ -1863,6 +1907,7 @@ async def run_async_multi_turn_rollout_groups(
         max_rollout_turns=max_rollout_turns,
         greedy=greedy,
         deduplicate_multimodal_data=deduplicate_multimodal_data,
+        on_generation_complete=on_generation_complete,
     )
     for group_index, start in enumerate(range(0, final_batch.size, num_generations)):
         end = start + num_generations

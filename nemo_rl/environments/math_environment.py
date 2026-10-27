@@ -15,15 +15,17 @@ import contextlib
 import io
 import itertools
 import logging
+import random
 import re
 from typing import Any, NotRequired, TypedDict, Union
 
 import ray
 import torch
 from math_verify import grader
+from math_verify import parser as math_parser
 from math_verify.errors import TimeoutException
 from math_verify.metric import math_metric
-from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -38,9 +40,11 @@ from nemo_rl.environments.metrics import (
 )
 from nemo_rl.environments.utils import chunk_list_to_workers
 from nemo_rl.evals import answer_parsing
+from nemo_rl.utils.determinism import keyed_seed
 
 
 class MathEnvConfig(TypedDict):
+    deterministic: NotRequired[bool]  # Disable wall-clock cutoffs in strict GRPO.
     num_workers: int
     stop_strings: NotRequired[list[str] | None]  # Default stop strings for this env
     # The verifier type. None defaults to "math".
@@ -59,7 +63,7 @@ def _mute_output():
 
 
 def _select_extracted_answer(
-    extracted_answer: Any, math_verify_impl: str
+    extracted_answer: Any, math_verify_impl: str, deterministic: bool = False
 ) -> str | None:
     """Pick the answer to record for a sample, or ``None`` if none is usable.
 
@@ -75,7 +79,8 @@ def _select_extracted_answer(
         return None
     extracted_gold, extracted_prediction = extracted_answer
     for pred in extracted_prediction:
-        if any(grader.verify(gold, pred) for gold in extracted_gold):
+        verify_kwargs = {"timeout_seconds": None} if deterministic else {}
+        if any(grader.verify(gold, pred, **verify_kwargs) for gold in extracted_gold):
             return pred
     # Nothing matched, so every prediction is wrong; record the first one.
     # ``extracted_prediction`` is a flat list[str] -- indexing it twice would
@@ -122,6 +127,22 @@ class HFVerifyWorker:
         for response, ground_truth in zip(pred_responses, ground_truths):
             score: float = 0.0
             extracted: str | None = None
+            if kwargs.get("deterministic"):
+                # Import inside the actor: clear_cache is a bound cache-list
+                # method whose contents must not enter Ray's actor serialization.
+                from sympy.core.cache import clear_cache as clear_sympy_cache
+                from sympy.core.random import seed as seed_sympy
+
+                # SymPy owns separate RNGs for symbolic tests and assumption
+                # evaluation. Neither actor placement nor previous responses may
+                # select their streams or leave cached expression assumptions.
+                seed = keyed_seed(0, "math_verify", ground_truth, response)
+                random.seed(seed)
+                seed_sympy(seed)
+                clear_sympy_cache()
+                math_parser.parse_latex_cached.cache_clear()
+                math_parser.parse_expr_cached.cache_clear()
+                math_parser.extract_latex.cache_clear()
             try:
                 with _mute_output():
                     math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
@@ -132,9 +153,28 @@ class HFVerifyWorker:
                         extracted_answer = reward_dict["pred"]
                     elif kwargs.get("math_verify_impl") == "hf_math_verify":
                         ground_truth_parsable = "\\boxed{" + ground_truth + "}"
-                        ret_score, extracted_answer = self.verify_func(
-                            [ground_truth_parsable], [response]
-                        )
+                        if kwargs.get("deterministic"):
+                            gold = parse(
+                                ground_truth_parsable,
+                                (LatexExtractionConfig(),),
+                                parsing_timeout=None,
+                            )
+                            prediction = parse(
+                                response,
+                                (ExprExtractionConfig(), LatexExtractionConfig()),
+                                parsing_timeout=None,
+                            )
+                            ret_score = float(
+                                grader.verify(gold, prediction, timeout_seconds=None)
+                            )
+                            extracted_answer = (
+                                [str(x) for x in gold],
+                                [str(x) for x in prediction],
+                            )
+                        else:
+                            ret_score, extracted_answer = self.verify_func(
+                                [ground_truth_parsable], [response]
+                            )
                     else:
                         raise ValueError(
                             f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify' or 'dapo_math_verify'."
@@ -146,13 +186,17 @@ class HFVerifyWorker:
             # it actually subclasses from BaseException and math-verify itself does not
             # to catch it.
             except (Exception, TimeoutException):
+                if kwargs.get("deterministic"):
+                    raise
                 score = 0.0
             else:
                 # Outside the try on purpose: failing to record an answer must
                 # not retract a score the verifier already returned.
                 if return_extracted_answer:
                     extracted = _select_extracted_answer(
-                        extracted_answer, math_verify_impl
+                        extracted_answer,
+                        math_verify_impl,
+                        deterministic=kwargs.get("deterministic", False),
                     )
 
             # Exactly one score and one answer per sample, on every path: both
@@ -503,6 +547,7 @@ class MathEnvironment(BaseMathEnvironment):
                 ground_truth_chunk,
                 return_extracted_answer,
                 math_verify_impl=self.cfg.get("math_verify_impl", "hf_math_verify"),
+                deterministic=self.cfg.get("deterministic"),
             )
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)

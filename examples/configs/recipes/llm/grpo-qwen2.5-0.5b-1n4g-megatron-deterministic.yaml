@@ -1,0 +1,49 @@
+defaults: ../../grpo_math_1B_megatron.yaml
+grpo:
+  deterministic: true
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 4
+  max_num_steps: 3
+  val_period: 2
+  val_at_start: true
+  max_val_samples: 4
+  val_batch_size: 4
+policy:
+  model_name: Qwen/Qwen2.5-0.5B-Instruct
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 768
+  megatron_cfg:
+    flash_attention_version: 4
+    batch_invariant_backend: te_native
+    batch_invariant_collective: ordered
+    checkpoint:
+      async_save: false
+  generation:
+    backend: megatron
+    refit_transport: mcore
+    max_new_tokens: 384
+    mcore_generation_config:
+      enable_prefix_caching: true
+      refit_backend: nccl
+      buffer_size_gb: 1
+      max_tokens: 1024
+  sequence_packing:
+    enabled: false
+data:
+  max_input_seq_length: 192
+  train:
+    dataset_name: GSM8K
+  validation:
+    dataset_name: GSM8K
+    split: test
+checkpointing:
+  checkpoint_dir: results/grpo-deterministic
+  metric_name: null
+  save_period: 1
+  keep_top_k: null
+logger:
+  log_dir: logs/grpo-deterministic
+cluster:
+  gpus_per_node: 4

@@ -373,6 +373,7 @@ class GenerationDatumSpec(TypedDict):
 
     input_ids: torch.Tensor
     input_lengths: torch.Tensor
+    sampling_seed: NotRequired[torch.Tensor]  # Stable logical trajectory/turn seed.
     stop_strings: NotRequired[list[str]]
     __extra__: Any
 

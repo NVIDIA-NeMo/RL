@@ -15,6 +15,7 @@
 import argparse
 import os
 import pprint
+import sys
 import time
 
 from omegaconf import OmegaConf
@@ -45,6 +46,7 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.determinism import configure_grpo_determinism
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
 from nemo_rl.utils.timer import Timer
@@ -90,6 +92,12 @@ def main() -> None:
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
         config = MasterConfig(**config)
+        restart_for_hash_seed = config.grpo.deterministic and os.environ.get(
+            "PYTHONHASHSEED"
+        ) != str(config.grpo.seed)
+        configure_grpo_determinism(config)
+        if restart_for_hash_seed:
+            os.execv(sys.executable, [sys.executable, *sys.argv])
         print("Applied CLI overrides")
 
     # Print config

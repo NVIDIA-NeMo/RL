@@ -157,6 +157,9 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
+from nemo_rl.utils.determinism import (
+    configure_torch_determinism,
+)
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -851,7 +854,8 @@ class MegatronPolicyWorkerImpl(
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
         enable_batch_invariant_mode(config)
         torch.cuda.set_device(local_rank)
-
+        if config["megatron_cfg"].get("deterministic_mode"):
+            configure_torch_determinism()
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
 
