@@ -84,6 +84,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
+from nemo_rl.data.processors import (
+    nemo_gym_capture_data_processor,
+    nemo_gym_data_processor,
+)
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -1588,6 +1592,26 @@ def setup_single_controller(
             assert len(response_data) == 2
             train_dataset, val_dataset = response_data
             train_env_handles: dict[str, EnvironmentInterface] = {}
+            if capture_media:
+                # Configure training processors before any dataloader fetch or
+                # dispatch copy. Leave legacy/custom and validation paths alone.
+                capture_datasets = (
+                    train_dataset.values()
+                    if isinstance(train_dataset, dict)
+                    else (train_dataset,)
+                )
+                for capture_dataset in capture_datasets:
+                    capture_dataset.task_data_processors = {
+                        task_name: (
+                            task_spec,
+                            nemo_gym_capture_data_processor
+                            if task_processor is nemo_gym_data_processor
+                            else task_processor,
+                        )
+                        for task_name, (task_spec, task_processor) in (
+                            capture_dataset.task_data_processors.items()
+                        )
+                    }
         else:
             response_data = setup_response_data(
                 data_tokenizer,

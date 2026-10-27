@@ -33,7 +33,7 @@ from nemo_rl.data.interfaces import (
     VLMMessageLogType,
 )
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
-from nemo_rl.data.multimodal_utils import VIDEO_CONTENT_TYPES
+from nemo_rl.data.multimodal_utils import VIDEO_CONTENT_TYPES, PackedTensor
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -1043,6 +1043,29 @@ def nemo_gym_data_processor(
         "length": 0,
     }
     return output
+
+
+def nemo_gym_capture_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec | None,
+    tokenizer: TokenizerType | None,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Prepare Gym requests without retaining unused policy media for capture.
+
+    Preserve video sampling, request normalization, token lengths and overlength
+    filtering. Receipt-mode training obtains its policy media from captured
+    inference inputs, so the dataset's precomputed PackedTensors are unused.
+    """
+    datum = nemo_gym_data_processor(
+        datum_dict, task_data_spec, tokenizer, max_seq_length, idx
+    )
+    for message in datum["message_log"]:
+        for key, value in list(message.items()):
+            if isinstance(value, PackedTensor):
+                del message[key]
+    return datum
 
 
 def kd_data_processor(
