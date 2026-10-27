@@ -24,7 +24,7 @@ from typing import (
 )
 
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.algorithms.loss.clipped_pg import (
     adaptive_ppo_clip_kept_mask,
@@ -42,6 +42,7 @@ from nemo_rl.algorithms.loss.interfaces import (
     LossInputType,
     LossType,
     MetricNormalizer,
+    make_objective_reduction,
 )
 from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
 from nemo_rl.algorithms.utils import (
@@ -170,10 +171,17 @@ class DraftCrossEntropyLossFn(LossFunction):
         )
 
 
+LossNormalization = Literal["global_token_mean", "sequence_mean"]
+
+
 class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- Loss type ---
     disable_ppo_ratio: bool = False
-    token_level_loss: bool = True
+    # Select one reduction; when both selectors are unset, use global_token_mean.
+    normalization: LossNormalization | None = None
+    # Deprecated: True selects global_token_mean, False selects sequence_mean.
+    # Must remain unset when normalization is supplied.
+    token_level_loss: bool | None = None
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
     # If False (default), correction is applied at the token level as in the
@@ -259,6 +267,27 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # token-level untruncated IS, TIS, ICEPOP and adaptive-ppo-clip.
     score_centering: bool = False
 
+    @model_validator(mode="after")
+    def validate_normalization(self) -> "ClippedPGLossConfig":
+        # Validate without storing a second selector in serialized configs.
+        _ = self.resolved_normalization
+        return self
+
+    @property
+    def resolved_normalization(self) -> LossNormalization:
+        """Resolve the new selector or its legacy alias into one concrete mode."""
+        if self.normalization is not None:
+            if self.token_level_loss is not None:
+                raise ValueError(
+                    "Set only one of loss_fn.normalization and "
+                    "loss_fn.token_level_loss; set token_level_loss=null "
+                    "to override an inherited legacy value."
+                )
+            return self.normalization
+        if self.token_level_loss is False:
+            return "sequence_mean"
+        return "global_token_mean"
+
 
 class ClippedPGLossDataDict(TypedDict):
     """Required keys for the Clipped Policy Gradient loss function."""
@@ -283,7 +312,7 @@ class ClippedPGLossFn(LossFunction):
     - PPO (Clipped) - https://arxiv.org/abs/1707.06347
     - GRPO - https://arxiv.org/abs/2402.03300
     - REINFORCE/RLOO (set disable_ppo_ratio = True and ignores ratio_clip_min/ratio_clip_max) - https://arxiv.org/abs/2402.14740
-    - GSPO (set sequence_level_importance_ratios = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
+    - GSPO (set sequence_level_importance_ratios = True and normalization = "sequence_mean") - https://arxiv.org/abs/2507.18071
     - CISPO (set use_cispo = True) - https://arxiv.org/abs/2506.13585
     - Truly on-policy (set force_on_policy_ratio = True to force ratio = 1.0, requires one update per rollout)
 
@@ -346,6 +375,15 @@ class ClippedPGLossFn(LossFunction):
                 rescale gradients and normalized metrics before clipping or
                 stepping the optimizer. See ``requires_survivor_normalization``.
         """
+        self.normalization = cfg.resolved_normalization
+        if cfg.token_level_loss is not None:
+            warnings.warn(
+                "loss_fn.token_level_loss is deprecated; use "
+                f"loss_fn.normalization={self.normalization!r} and remove "
+                "token_level_loss (or set it to null).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.seq_logprob_error_in_loss = cfg.seq_logprob_error_in_loss
         self.seq_logprob_error_threshold = seq_logprob_error_threshold
         if self.seq_logprob_error_in_loss:
@@ -353,10 +391,13 @@ class ClippedPGLossFn(LossFunction):
                 raise ValueError(
                     "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
                 )
-            if not cfg.force_on_policy_ratio or not cfg.token_level_loss:
+            if (
+                not cfg.force_on_policy_ratio
+                or self.normalization != "global_token_mean"
+            ):
                 raise ValueError(
                     "In-loss sequence filtering requires force_on_policy_ratio "
-                    "and token_level_loss"
+                    "and normalization=global_token_mean (legacy token_level_loss=True)"
                 )
             if cfg.positive_example_nll_weight != 0:
                 raise ValueError("In-loss sequence filtering does not support NLL")
@@ -423,9 +464,8 @@ class ClippedPGLossFn(LossFunction):
         # Compile the actor objective lazily on the worker after Ray has
         # serialized the loss function.
         self._compiled_actor_objective = None
-        self.loss_type = (
-            LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
-        )
+        self.objective_reduction = make_objective_reduction(self.normalization)
+        self.loss_type = self.objective_reduction.loss_type
         if self.sequence_level_importance_ratios:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
@@ -452,7 +492,8 @@ class ClippedPGLossFn(LossFunction):
                 "silently overwrite it. Set ratio_clip_c=null when use_cispo=True."
             )
             assert self.loss_type == LossType.TOKEN_LEVEL, (
-                "use_cispo requires token_level_loss=True (LossType.TOKEN_LEVEL)."
+                "use_cispo requires global_token_mean normalization "
+                "(legacy token_level_loss=True)."
             )
         if self.truncated_importance_sampling_type is not None:
             assert self.use_importance_sampling_correction, (
@@ -539,11 +580,7 @@ class ClippedPGLossFn(LossFunction):
         # that pick the denominators — so split-API trainers can undo the
         # placeholder global_valid_*=1 normalization without maintaining a
         # consumer-side table. Keep in sync with __call__'s return dict.
-        grad_normalizer = (
-            MetricNormalizer.TOKENS
-            if self.loss_type == LossType.TOKEN_LEVEL
-            else MetricNormalizer.SEQUENCES
-        )
+        grad_normalizer = self.objective_reduction.metric_normalizer
         self.metric_normalizations: dict[str, MetricNormalizer] = {
             # Normalized like the gradient (loss_type-dependent).
             "loss": grad_normalizer,
@@ -614,6 +651,11 @@ class ClippedPGLossFn(LossFunction):
             self.metric_normalizations["score_centering_head_mass"] = (
                 MetricNormalizer.TOKENS
             )
+        if self.objective_reduction.requires_explicit_denominator:
+            # Missing entries use the worker's objective denominator. Keep
+            # token diagnostics explicitly token-normalized.
+            self.metric_normalizations.pop("loss")
+            self.metric_normalizations.pop(KL_PENALTY_KEY)
         if self.opd_full is not None:
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
@@ -706,6 +748,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_cross_entropy: Optional[Tensor] = None,
         policy_support_mask: Optional[Tensor] = None,
         policy_logprobs_at_sampler_topk: Optional[Tensor] = None,
+        global_objective_denominator: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
 
@@ -843,6 +886,14 @@ class ClippedPGLossFn(LossFunction):
         if self.seq_logprob_error_in_loss:
             seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
             seq_error_metrics["seq_logprob_error_valid_seqs"] = sample_mask.sum().item()
+
+        per_response_weights = self.objective_reduction.per_response_weights(data)
+        objective_denominator = self.objective_reduction.loss_divisor(
+            global_valid_toks=global_valid_toks,
+            global_valid_seqs=global_valid_seqs,
+            global_objective_denominator=global_objective_denominator,
+        )
+
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
             # When top-k/top-p filtering is enabled, we need special handling for KL:
@@ -881,16 +932,14 @@ class ClippedPGLossFn(LossFunction):
             )
 
             # Reduce KL loss
-            if self.loss_type == LossType.TOKEN_LEVEL:
-                kl = masked_mean(
-                    kl, kl_mask, global_normalization_factor=global_valid_toks
-                )
-            else:
-                kl = masked_mean(
-                    masked_mean(kl, kl_token_mask, dim=-1),
-                    kl_sample_mask,
-                    global_normalization_factor=global_valid_seqs,
-                )
+            kl = self.objective_reduction.reduce(
+                kl,
+                token_mask=kl_token_mask,
+                sample_mask=kl_sample_mask,
+                mask=kl_mask,
+                denominator=objective_denominator,
+                per_response_weights=per_response_weights,
+            )
         else:
             kl = curr_logprobs.new_zeros(())
 
@@ -1055,8 +1104,7 @@ class ClippedPGLossFn(LossFunction):
             mask=mask,
             sample_mask=sample_mask,
             importance_weights=importance_weights_to_use,
-            global_valid_toks=global_valid_toks,
-            global_valid_seqs=global_valid_seqs,
+            objective_denominator=objective_denominator,
             ratio_clip_min=self.ratio_clip_min,
             ratio_clip_max=self.ratio_clip_max,
             ratio_clip_c=(self.ratio_clip_c if self.ratio_clip_c is not None else -1.0),
@@ -1064,7 +1112,8 @@ class ClippedPGLossFn(LossFunction):
             force_on_policy_ratio=self.force_on_policy_ratio,
             sequence_level_importance_ratios=self.sequence_level_importance_ratios,
             use_cispo=self.use_cispo,
-            token_level_loss=self.loss_type == LossType.TOKEN_LEVEL,
+            reduction=self.objective_reduction,
+            per_response_weights=per_response_weights,
         )
 
         score_centering_metrics: dict[str, Tensor] = {}
