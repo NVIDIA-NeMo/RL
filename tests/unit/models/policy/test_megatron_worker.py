@@ -2562,6 +2562,15 @@ def test_megatron_poll_async_save_keeps_blocking_finalize_for_unsafe_ipc_cache(
     assert events == []
 
 
+def test_megatron_poll_async_save_rejects_an_open_train_step(monkeypatch):
+    worker_module, worker, events = _poll_worker(monkeypatch, queue_sizes=(1, 0))
+    worker._train_step_state = {}
+
+    with pytest.raises(RuntimeError, match="inside an open train step"):
+        worker_module.MegatronPolicyWorkerImpl.poll_async_save(worker)
+    assert events == []
+
+
 def test_megatron_move_model_does_not_serialize_extra_state():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,

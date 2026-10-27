@@ -5163,6 +5163,11 @@ class MegatronPolicyWorkerImpl(
         with an all-reduce over the default group, so every rank must call this at
         the same point between steps, never concurrently with training.
         """
+        if self._train_step_state is not None:
+            raise RuntimeError(
+                "poll_async_save must not run inside an open train step: its "
+                "finalize all-reduces on the default process group."
+            )
         ckpt_cfg = self.mcore_state.cfg.checkpoint
         if not ckpt_cfg.async_save or is_empty_async_queue(self.mcore_state):
             return True
