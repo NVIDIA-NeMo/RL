@@ -16,7 +16,6 @@ from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
-from omegaconf import OmegaConf
 
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
@@ -29,6 +28,7 @@ from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
     classify_rollout_failure,
+    is_terminal_gym_episode_failure,
 )
 
 pytest.importorskip(
@@ -54,31 +54,8 @@ def _row() -> dict:
     }
 
 
-def _config():
-    return OmegaConf.create(
-        {
-            "weather_environment": {
-                "environment_servers": {
-                    "single_agent_turn": {
-                        "entrypoint": "app.py",
-                        "agent_server": {
-                            "type": "responses_api_agents",
-                            "name": "weather_agent",
-                        },
-                    }
-                }
-            },
-            "weather_agent": {
-                "responses_api_agents": {"simple_agent": {"entrypoint": "app.py"}}
-            },
-        }
-    )
-
-
 def _prepare(rows):
-    _prepare_materialized_nemo_gym_rows(
-        rows, _config(), {"weather:train": "weather_environment"}
-    )
+    _prepare_materialized_nemo_gym_rows(rows, {"weather:train": "weather_environment"})
 
 
 def _reply(row: dict) -> dict:
@@ -99,14 +76,13 @@ def _reply(row: dict) -> dict:
     }
 
 
-def test_materialized_task_preparation_preserves_payload_and_resolves_actual_agent():
+def test_materialized_task_preparation_preserves_payload_without_adding_agent_ref():
     row = _row()
     original_payload = deepcopy(row["task_input"])
-    row["agent_ref"] = {"name": "stale_dataset_agent"}
     row["_ng_group_attempt"] = 3
     _prepare([row])
     assert row["_ng_environment_server"] == "weather_environment"
-    assert row["agent_ref"] == {"type": "responses_api_agents", "name": "weather_agent"}
+    assert "agent_ref" not in row
     assert row["task_input"] == original_payload
     assert row["_ng_rollout_id"] == "caller-owned-rollout"
     assert "_ng_attempt_index" not in row
@@ -128,23 +104,13 @@ def test_flat_row_preparation_and_result_are_opaque():
 def test_materialized_task_keeps_flat_compatibility_results_opaque() -> None:
     row = _row()
     _prepare([row])
-    reply = {"reward": 0.75, "result": {"benchmark_specific": True}}
+    reply = {"reward": 0.75, "response": {}, "result": {"benchmark_specific": True}}
     assert _normalize_nemo_gym_episode_result(row, reply) is reply
 
 
-def test_materialized_task_preparation_rejects_bad_destination_and_agent_reference():
+def test_materialized_task_preparation_rejects_missing_destination():
     with pytest.raises(ValueError, match="No environment server route"):
-        _prepare_materialized_nemo_gym_rows([_row()], _config(), {})
-    with pytest.raises(ValueError, match="exactly one Environment Server"):
-        _prepare_materialized_nemo_gym_rows(
-            [_row()], _config(), {"weather:train": "weather_agent"}
-        )
-    config = _config()
-    del config.weather_environment.environment_servers.single_agent_turn.agent_server
-    with pytest.raises(ValueError, match="agent_server reference"):
-        _prepare_materialized_nemo_gym_rows(
-            [_row()], config, {"weather:train": "weather_environment"}
-        )
+        _prepare_materialized_nemo_gym_rows([_row()], {})
 
 
 def test_episode_success_retains_reward_components_observations_and_identity():
@@ -219,6 +185,28 @@ def test_episode_training_requires_a_finite_scalar_reward(reward):
         _normalize_nemo_gym_episode_result(row, reply)
 
 
+@pytest.mark.parametrize("compatibility_response", [False, True])
+def test_response_free_result_requires_token_capture(compatibility_response):
+    row = _row()
+    _prepare([row])
+    reply = _reply(row)
+    del reply["result"]["response"]
+    if compatibility_response:
+        reply = reply["result"]
+    with pytest.raises(
+        GymTerminalEpisodeFailure,
+        match="weather:train.*weather_environment.*token_capture.enabled: true",
+    ) as error:
+        _normalize_nemo_gym_episode_result(row, reply)
+    assert is_terminal_gym_episode_failure(error.value)
+    assert (
+        _normalize_nemo_gym_episode_result(row, reply, token_capture_enabled=True)[
+            "reward"
+        ]
+        == 0.75
+    )
+
+
 @pytest.mark.parametrize("attempt,capture_key", [(0, "17-0"), (2, "17-0-a2")])
 def test_episode_receipt_uses_fallback_identity_without_response(attempt, capture_key):
     row = _row()
@@ -231,7 +219,7 @@ def test_episode_receipt_uses_fallback_identity_without_response(attempt, captur
     reply["episode_id"] = {"rollout_id": "17-0", "attempt": attempt}
     del reply["result"]["response"]
     del reply["result"]["responses_create_params"]
-    result = _normalize_nemo_gym_episode_result(row, reply)
+    result = _normalize_nemo_gym_episode_result(row, reply, token_capture_enabled=True)
     env_class = NemoGym.__ray_metadata__.modified_class
     env = object.__new__(env_class)
     env._control = AsyncMock(return_value={"records": [], "failures": []})

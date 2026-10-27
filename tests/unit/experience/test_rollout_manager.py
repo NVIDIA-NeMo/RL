@@ -1045,6 +1045,11 @@ def _nemo_gym_impl(
             "task-source:shared_resources_server",
         ),
         ({"agent_ref": {"name": "legacy_agent"}}, "legacy_agent"),
+        (
+            {"task_id": {"taskset": "usersim:train"}, "task_input": {}},
+            "usersim:train",
+        ),
+        ({"attribution_key": "usersim:train"}, "usersim:train"),
         ({}, "nemo_gym"),
     ],
 )
@@ -1170,9 +1175,14 @@ def test_result_to_completion_truncated_on_length_incomplete_response(
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
+@pytest.mark.parametrize("materialized", [False, True])
 def test_streamed_receipt_callback_uses_current_completion_conversion(
     log_full_result_tables,
+    materialized,
 ):
+    attribution_key = "usersim:train" if materialized else "resolved-agent"
+    agent_ref = None if materialized else {"name": "resolved-agent"}
+
     class _RunRolloutsRemote:
         def options(self, *, num_returns):
             assert num_returns == "streaming"
@@ -1184,8 +1194,8 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
             async def result_ref():
                 return (
                     0,
-                    {"name": "resolved-agent"},
-                    _mask_gate_receipt_result(),
+                    agent_ref,
+                    {**_mask_gate_receipt_result(), "attribution_key": attribution_key},
                     None,
                 )
 
@@ -1199,6 +1209,9 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     results = [None]
     shaping = [None]
     streamed = []
+    pending_row = {"_rowidx": 0}
+    if materialized:
+        pending_row.update(task_id={"taskset": "usersim:train"}, task_input={})
 
     async def on_completion(generation_index, completion):
         streamed.append((generation_index, completion))
@@ -1206,7 +1219,7 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     _run(
         impl._stream_rows(
             env,
-            [{"_rowidx": 0}],
+            [pending_row],
             results,
             shaping,
             1,
@@ -1219,10 +1232,16 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     generation_index, completion = streamed[0]
     assert generation_index == 0
     assert completion.env_extras["ng_rollout_id"] == "r0"
-    assert completion.env_extras["agent_ref"] == {"name": "resolved-agent"}
+    assert completion.env_extras["attribution_key"] == attribution_key
+    assert pending_row["attribution_key"] == attribution_key
+    if materialized:
+        assert "agent_ref" not in completion.env_extras
+        assert "agent_ref" not in pending_row
+    else:
+        assert completion.env_extras["agent_ref"] == agent_ref
     assert "mask_sample" not in completion.env_extras["instance_config"]
     context = completion.env_extras["ng_reward_log_context"]
-    assert context.agent_name == "resolved-agent"
+    assert context.agent_name == attribution_key
     assert (context.full_result_json is not None) is log_full_result_tables
     if log_full_result_tables:
         assert "reward" not in json.loads(context.full_result_json)
@@ -2333,18 +2352,35 @@ def _make_capture_manager(
 
 class TestGenerateForFinalizationFlow:
     @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
-    def test_resolved_route_survives_all_sealed_restore(self, granularity):
+    @pytest.mark.parametrize("materialized", [False, True])
+    def test_resolved_route_survives_all_sealed_restore(
+        self, granularity, materialized
+    ):
         prompt = {
             "prompt": "p",
             "idx": 9,
             "extra_env_info": {"task_source": "source-not-agent-name"},
         }
+        attribution_key = "usersim:train" if materialized else "resolved-agent"
+        if materialized:
+            prompt["extra_env_info"] = {
+                "task_id": {"taskset": "usersim:train", "task_id": "1"},
+                "task_input": {},
+            }
         first = _make_capture_manager(
             _FakeCaptureBuffer(),
             recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+            verify_fields=(
+                [{"agent_ref": None, "attribution_key": attribution_key}] * 2
+                if materialized
+                else None
+            ),
         )
         request = _run(first.generate_for_finalization(prompt))
-        assert request.resolved_agent_name == "resolved-agent"
+        assert request.attribution_key == attribution_key
+        assert request.resolved_agent_name == (
+            None if materialized else "resolved-agent"
+        )
         assert "agent_ref" not in prompt["extra_env_info"]
 
         async def unexpected_rollout(_sample):
@@ -2368,7 +2404,8 @@ class TestGenerateForFinalizationFlow:
                 prompt, lineage_group_id=request.group_id
             )
         )
-        assert recovered.resolved_agent_name == "resolved-agent"
+        assert recovered.attribution_key == attribution_key
+        assert recovered.resolved_agent_name == request.resolved_agent_name
         assert recovered.receipts == request.receipts
         assert restored._impl.seen_generation_indices is None
 

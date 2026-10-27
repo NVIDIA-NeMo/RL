@@ -281,7 +281,11 @@ class CaptureRewardSettings:
 
 @dataclass(frozen=True)
 class RewardLogContext:
-    """Agent identity and optional full-result table data, without raw reward."""
+    """Attribution and optional full-result table data, without raw reward.
+
+    ``agent_name`` retains its checkpoint field name and holds the taskset for
+    materialized tasks or the resolved agent name for flat rows.
+    """
 
     agent_name: str
     full_result_json: str | None

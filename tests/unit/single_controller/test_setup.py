@@ -93,10 +93,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
-from nemo_rl.environments.nemo_gym import (
-    ShardSetupError,
-    validate_dataset_agent_coverage,
-)
+from nemo_rl.environments.nemo_gym import validate_dataset_agent_coverage
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -2522,7 +2519,6 @@ class TestSetup:
         mock_validate.assert_called_once_with(
             fake_gym_shards,
             {"training": list(range(8)), "validation": None},
-            reject_materialized_tasks=False,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
@@ -2553,12 +2549,17 @@ class TestSetup:
         "override_name",
         ["agent_granularity_overrides", "task_source_granularity_overrides"],
     )
-    def test_nemo_gym_rejects_recovery_overrides_for_materialized_tasks(
+    def test_nemo_gym_accepts_recovery_overrides_for_materialized_tasks(
         self, patched_factories, override_name: str
     ) -> None:
         mc = _make_master_config(env={"should_use_nemo_gym": True})
         mc.token_capture.enabled = True
-        getattr(mc.rollout_recovery, override_name)["weather_agent"] = (
+        override_key = (
+            "weather:train"
+            if override_name == "task_source_granularity_overrides"
+            else "weather_agent"
+        )
+        getattr(mc.rollout_recovery, override_name)[override_key] = (
             RecoveryGranularity.PROMPT_GROUP
         )
         mc.policy["generation"].update(
@@ -2592,15 +2593,24 @@ class TestSetup:
                 sc_setup_mod,
                 "validate_dataset_agent_coverage",
                 side_effect=validate_dataset_agent_coverage,
-            ),
+            ) as mock_validate,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
-            pytest.raises(
-                ShardSetupError, match="training.*Materialized.*" + override_name
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[MagicMock(), MagicMock()],
             ),
         ):
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        fake_gym_shards.shutdown.assert_called_once_with()
+        mock_validate.assert_called_once_with(
+            fake_gym_shards,
+            {
+                "training": patched_factories["setup_response_data"].return_value[0],
+                "validation": None,
+            },
+        )
+        assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
+        fake_gym_shards.shutdown.assert_not_called()
 
     @pytest.mark.parametrize("with_processor", [True, False])
     @pytest.mark.parametrize("with_opd", [True, False])

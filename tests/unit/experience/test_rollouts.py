@@ -2161,11 +2161,20 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     assert rollout_results[-1].rollout_metrics["timing/rollout/total"] == 4.0
 
 
-def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
+@pytest.mark.parametrize("materialized", [False, True])
+def test_nemo_gym_stream_accumulator_validates_rows_and_completion(materialized):
     rows = [
         {"task_source": "workplace_assistant"},
         {"task_source": "workplace_assistant"},
     ]
+    if materialized:
+        rows = [
+            {
+                "task_id": {"taskset": "workplace:train", "task_id": "first"},
+                "task_input": {},
+            }
+            for _ in rows
+        ]
     accumulator = rollouts_mod._NemoGymStreamAccumulator(
         rows=rows,
         num_generations=2,
@@ -2176,6 +2185,8 @@ def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
         "type": "responses_api_agents",
         "name": "workplace_assistant_simple_agent",
     }
+    if materialized:
+        resolved_agent_ref = None
     assert accumulator.add(0, {"row": 0}, resolved_agent_ref=resolved_agent_ref) is None
     with pytest.raises(ValueError, match="duplicate row index 0"):
         accumulator.add(0, {"row": 0}, resolved_agent_ref=resolved_agent_ref)
@@ -2197,21 +2208,25 @@ def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
         ).add(2, {"row": 2}, resolved_agent_ref=resolved_agent_ref)
 
 
-def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
+@pytest.mark.parametrize("materialized", [False, True])
+def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group(materialized):
+    rows = [{"task_source": "task"}, {"task_source": "task"}]
+    references = [{"name": "agent-a"}, {"name": "agent-b"}]
+    if materialized:
+        rows = [
+            {"task_id": {"taskset": name, "task_id": "first"}, "task_input": {}}
+            for name in ("taskset-a", "taskset-b")
+        ]
+        references = [None, None]
     accumulator = rollouts_mod._NemoGymStreamAccumulator(
-        rows=[
-            {"task_source": "task"},
-            {"task_source": "task"},
-        ],
+        rows=rows,
         num_generations=2,
         allow_mixed_agents=False,
     )
 
-    assert (
-        accumulator.add(0, {"row": 0}, resolved_agent_ref={"name": "agent-a"}) is None
-    )
-    with pytest.raises(ValueError, match="one NeMo-Gym agent"):
-        accumulator.add(1, {"row": 1}, resolved_agent_ref={"name": "agent-b"})
+    assert accumulator.add(0, {"row": 0}, resolved_agent_ref=references[0]) is None
+    with pytest.raises(ValueError, match="one NeMo-Gym attribution key"):
+        accumulator.add(1, {"row": 1}, resolved_agent_ref=references[1])
 
 
 def test_group_reward_diagnostics_reports_ties_and_skips_incomplete_scores():
@@ -2412,6 +2427,7 @@ def test_postprocess_nemo_gym_group_reads_profile_metadata_from_task_rows(
         if row_format == "flat":
             row.update(task_input)
         else:
+            del row["agent_ref"]
             row["task_id"] = {"taskset": "math:train", "task_id": "first"}
             row["task_input"] = task_input
         rows.append(row)
@@ -2471,11 +2487,15 @@ def test_postprocess_nemo_gym_group_reads_profile_metadata_from_task_rows(
         [0.4, 0.0]
     )
     assert rollout_result.final_batch["env_reward"].tolist() == [1.0, 0.0]
-    assert rollout_result.final_batch["agent_ref"] == [{"name": "agent"}] * 2
+    attribution_key = "agent" if row_format == "flat" else "math:train"
+    expected_agent_ref = {"name": "agent"} if row_format == "flat" else None
+    assert rollout_result.final_batch["agent_ref"] == [expected_agent_ref] * 2
+    assert rollout_result.final_batch["attribution_key"] == [attribution_key] * 2
     assert (
-        "agent/full_result" in rollout_result.rollout_metrics
+        f"{attribution_key}/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
-    assert rollout_result.rollout_metrics["agent/truncation_rate"] == 0.0
+    assert rollout_result.rollout_metrics[f"{attribution_key}/truncation_rate"] == 0.0
+    assert rollout_result.rollout_metrics[f"{attribution_key}/reward/mean"] == 0.2
 
 
 def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
@@ -3245,6 +3265,10 @@ def test_run_async_nemo_gym_rollout(
                     "name": "example_multi_step_simple_agent",
                     "type": "responses_api_agents",
                 },
+            ],
+            "attribution_key": [
+                "example_multi_step_simple_agent",
+                "example_multi_step_simple_agent",
             ],
             "length": torch.tensor([3080, 3048]),
             "loss_multiplier": torch.tensor([1.0, 1.0]),

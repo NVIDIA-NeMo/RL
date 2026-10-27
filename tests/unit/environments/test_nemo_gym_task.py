@@ -20,9 +20,42 @@ from nemo_rl.environments.nemo_gym_request import (
     _metadata_extra_body,
 )
 from nemo_rl.environments.nemo_gym_task import (
+    get_nemo_gym_attribution_key,
     get_nemo_gym_task_input,
     is_nemo_gym_task,
 )
+
+
+@pytest.mark.parametrize(
+    "row,expected",
+    [
+        (
+            {
+                "task_id": {"taskset": "workplace:train"},
+                "task_input": {},
+                "agent_ref": {"name": "stale"},
+                "attribution_key": "stale",
+            },
+            "workplace:train",
+        ),
+        (
+            {"agent_ref": {"name": "actual_agent"}, "attribution_key": "stale"},
+            "actual_agent",
+        ),
+        ({"attribution_key": "workplace:train"}, "workplace:train"),
+        (
+            {
+                "task_id": {"taskset": ""},
+                "task_input": {},
+                "agent_ref": {"name": "stale"},
+            },
+            None,
+        ),
+        ({}, None),
+    ],
+)
+def test_attribution_uses_taskset_or_actual_flat_agent(row, expected):
+    assert get_nemo_gym_attribution_key(row) == expected
 
 
 @pytest.mark.parametrize(

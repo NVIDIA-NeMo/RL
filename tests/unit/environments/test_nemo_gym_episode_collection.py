@@ -30,7 +30,7 @@ from omegaconf import OmegaConf
 from nemo_rl.environments.nemo_gym import NemoGym
 from nemo_rl.experience.rollouts import _prepare_nemo_gym_rows
 
-pytest.importorskip("nemo_gym.episode_types")
+gym_episode = pytest.importorskip("nemo_gym.episode_types")
 gym_config = pytest.importorskip("nemo_gym.global_config")
 gym_resources = pytest.importorskip("nemo_gym.base_resources_server")
 gym_rollouts = pytest.importorskip("nemo_gym.rollout_collection")
@@ -72,13 +72,14 @@ def _model_response(*, episode_protocol: bool) -> gym_openai.NeMoGymResponse:
 
 
 @pytest.mark.parametrize(
-    ("token_capture", "group_attempt", "compatibility_response"),
+    ("token_capture", "group_attempt", "compatibility_response", "multi_agent"),
     [
-        (False, 0, False),
-        (False, 2, False),
-        (True, 3, False),
-        (False, 0, True),
-        (True, 3, True),
+        (False, 0, False, False),
+        (False, 2, False, False),
+        (True, 3, False, False),
+        (False, 0, True, False),
+        (True, 3, True, False),
+        (True, 0, False, True),
     ],
 )
 def test_real_collector_streams_episode_and_flat_http_results(
@@ -86,6 +87,7 @@ def test_real_collector_streams_episode_and_flat_http_results(
     token_capture: bool,
     group_attempt: int,
     compatibility_response: bool,
+    multi_agent: bool,
 ) -> None:
     async def run() -> None:
         received_episode = []
@@ -93,8 +95,18 @@ def test_real_collector_streams_episode_and_flat_http_results(
 
         async def episode_run(request: web.Request) -> web.Response:
             body = await request.json()
-            episode = gym_protocol.SingleAgentTurnRequest.model_validate(body)
             received_episode.append(body)
+            if multi_agent:
+                # Isolate adaptation to a generic response-free result from
+                # harness behavior; the collector only requires the base contract.
+                episode = gym_episode.BaseEpisodeRequest[dict].model_validate(body)
+                reply = gym_episode.BaseEpisodeResponse[dict](
+                    episode_id=episode.episode_id,
+                    task_id=episode.task.task_id,
+                    result={"reward": 0.75, "terminal_response_id": "response-episode"},
+                )
+                return web.json_response(reply.model_dump(mode="json"))
+            episode = gym_protocol.SingleAgentTurnRequest.model_validate(body)
             reply = gym_protocol.SingleAgentTurnResponse(
                 episode_id=episode.episode_id,
                 task_id=episode.task.task_id,
@@ -168,6 +180,21 @@ def test_real_collector_streams_episode_and_flat_http_results(
                     },
                 }
             )
+            if multi_agent:
+                global_config.episode_environment.environment_servers = {
+                    "test_multi_agent": {
+                        "host": episode_server.host,
+                        "port": episode_server.port,
+                        "user_agent": {
+                            "type": "responses_api_agents",
+                            "name": "user_agent",
+                        },
+                        "assistant_agent": {
+                            "type": "responses_api_agents",
+                            "name": "episode_agent",
+                        },
+                    }
+                }
             # Use Gym's normal injected-config bootstrap and actual ServerClient.
             # Isolate only the process globals so other tests keep their clients.
             monkeypatch.setenv(
@@ -305,10 +332,8 @@ def test_real_collector_streams_episode_and_flat_http_results(
         assert sum(timing is not None for _, _, _, timing in streamed) == 1
         for index in (0, 1):
             agent_ref, result = by_index[index]
-            assert agent_ref == {
-                "type": "responses_api_agents",
-                "name": "episode_agent",
-            }
+            assert agent_ref is None
+            assert result["attribution_key"] == "weather:train"
             assert result["full_result"]["reward"] == 0.75
             if not compatibility_response:
                 assert (
@@ -332,6 +357,7 @@ def test_real_collector_streams_episode_and_flat_http_results(
         for index in range(2, len(rows)):
             flat_ref, flat_result = by_index[index]
             assert flat_ref["name"] == "legacy_agent"
+            assert flat_result["attribution_key"] == "legacy_agent"
             assert flat_result["full_result"]["reward"] == 0.25
             if not token_capture:
                 assert flat_result["message_log"][1]["token_ids"].tolist() == [21]
@@ -362,7 +388,9 @@ def test_real_collector_streams_episode_and_flat_http_results(
                 assert result["receipt"]["rollout_id"] == capture_key
                 assert result["receipt"]["reward"] == reward
                 assert result["receipt"]["terminal_model_call_id"] == "call-1"
-                assert result["receipt"]["terminal_selection"] == "response_id"
+                assert result["receipt"]["terminal_selection"] == (
+                    "declared" if multi_agent and index < 2 else "response_id"
+                )
                 assert result["receipt"]["capture_poisoned"] is False
         else:
             actor._control.assert_not_awaited()

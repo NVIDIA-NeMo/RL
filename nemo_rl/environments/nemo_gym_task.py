@@ -28,6 +28,22 @@ def is_nemo_gym_task(row: Mapping[str, Any]) -> bool:
     return isinstance(row.get("task_id"), Mapping) and "task_input" in row
 
 
+def get_nemo_gym_attribution_key(row: Mapping[str, Any]) -> str | None:
+    """Return a taskset for materialized tasks or the resolved agent for flat rows.
+
+    Processed rollout results retain this identity in ``attribution_key`` when
+    the original task envelope is no longer present.
+    """
+    if is_nemo_gym_task(row):
+        key = row["task_id"].get("taskset")
+    else:
+        agent_ref = row.get("agent_ref")
+        key = agent_ref.get("name") if isinstance(agent_ref, Mapping) else None
+        if not isinstance(key, str) or not key:
+            key = row.get("attribution_key")
+    return key if isinstance(key, str) and key else None
+
+
 def get_nemo_gym_task_input(row: dict[str, Any]) -> dict[str, Any]:
     """Return mutable input from a materialized task row or the entire flat row.
 
