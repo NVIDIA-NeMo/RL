@@ -34,12 +34,13 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
+    _binary_participation,
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
 )
@@ -412,6 +413,21 @@ class AdvantageComputer:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
+        # Statistics participation is binary and independent of the loss
+        # weights (grpo._binary_participation). ``include`` lets every row with
+        # a nonzero data-plane sample_mask vote, so token-capture placeholders
+        # and datums with a dataset-level loss_multiplier of 0 never do; the
+        # legacy and TransferQueue loops read the same dataset weight
+        # (grpo._include_valid_mask), so every trainer normalizes over the same
+        # rows. ``exclude`` lets the rows with a nonzero final loss weight vote.
+        # PPO's GAE ignores valid_mask.
+        participation = final_sample_mask
+        if (
+            not cfg.is_ppo
+            and cast(GRPOConfig, cfg.algo).masked_reward_policy == "include"
+        ):
+            participation = sample_mask
+        advantage_valid_mask = _binary_participation(participation)
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -453,10 +469,8 @@ class AdvantageComputer:
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
-                # Real validity (token-capture placeholders carry sample_mask 0,
-                # and mask_sample/overlong/seq-logprob-error rows are folded in
-                # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                valid_mask=advantage_valid_mask,
+                normalization_mask=token_mask * advantage_valid_mask.unsqueeze(-1),
                 **kwargs,
             )
             if cfg.is_ppo:
