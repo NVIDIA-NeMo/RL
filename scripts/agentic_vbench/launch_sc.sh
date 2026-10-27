@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Submit AgenticVBench SingleController GRPO (token capture, optional context
+# Submit AgenticVBench SingleController GRPO/PPO (token capture, optional context
 # compaction) on Slurm with the container built for this checkout.
 # Adapted from pivot-rl-video/RL/scripts/run_crop_video_pivot.sh.
 # DRY_RUN=1 writes the driver/setup commands and previews the dependency chain.
@@ -31,6 +31,11 @@ export WANDB_MODE=online
 # this Gym accepts >=2.56.1), so the x86 cc-pr4200 image is the equivalent.
 container="${CONTAINER:-/lustre/fsw/portfolios/nemotron/users/arushig/images/nemo-rl-cc-pr4200.sqsh}"
 config_in_container="${CONFIG_IN_CONTAINER:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-8n8g-megatron-agentic-vbench-sc.v2.yaml}"
+case "${config_in_container##*/}" in
+  vlm_grpo-*) algorithm_block=grpo ;;
+  vlm_ppo-*) algorithm_block=ppo ;;
+  *) echo "ERROR: cannot select the algorithm from recipe ${config_in_container}; expected vlm_grpo-* or vlm_ppo-*" >&2; exit 1 ;;
+esac
 : "${MODEL_PATH:?MODEL_PATH must point to a complete Hugging Face checkpoint visible on every node}"
 model_path="${MODEL_PATH}"
 export MODEL_PATH="${model_path}"
@@ -158,7 +163,7 @@ if [[ -n $generation_tensor_parallel_size && ! $generation_tensor_parallel_size 
   echo "ERROR: GENERATION_TENSOR_PARALLEL_SIZE must be a positive integer when set" >&2
   exit 1
 fi
-# Keep the production GRPO horizon. The controller still stops at the data-epoch
+# Keep the production training horizon. The controller still stops at the data-epoch
 # or Slurm/checkpoint boundary; this must not become a one-step smoke cap.
 max_steps="${MAX_STEPS:-1000000}"
 save_period="${SAVE_PERIOD:-10}"
@@ -370,6 +375,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 (
     output,
@@ -439,7 +445,7 @@ def resolved(value: str) -> str:
     return str(Path(value).resolve())
 
 
-def optional_int(value: str) -> int | None:
+def optional_int(value: str) -> Optional[int]:
     return int(value) if value else None
 
 
@@ -713,10 +719,10 @@ fi
   ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.chat_template="${vllm_chat_template}" \
   data.train.data_path="${TRAIN_PATH}" \
   data.validation.data_path="${VAL_PATH}" \
-  grpo.num_prompts_per_step="${num_prompts}" \
-  grpo.num_generations_per_prompt="${num_generations}" \
-  grpo.max_num_epochs=null \
-  grpo.max_num_steps="${max_steps}" \
+  ${algorithm_block}.num_prompts_per_step="${num_prompts}" \
+  ${algorithm_block}.num_generations_per_prompt="${num_generations}" \
+  ${algorithm_block}.max_num_epochs=null \
+  ${algorithm_block}.max_num_steps="${max_steps}" \
   checkpointing.checkpoint_must_save_by="${checkpoint_must_save_by}" \
   policy.train_global_batch_size="${train_global_batch_size}" \
   checkpointing.save_period="${save_period}" \
@@ -779,8 +785,8 @@ fi
 echo "candidate=${candidate_name}"
 echo "sbatch_comment=${sbatch_comment}"
 echo "time_limit=${slurm_time_limit} checkpoint_must_save_by=${checkpoint_must_save_by}"
-echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} qos=${SLURM_QOS:-default} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
-echo "allocation_boundary_seconds=${slurm_time_seconds} controller_boundary_seconds=${checkpoint_budget_seconds} grpo_horizon_steps=${max_steps} continuation_chain=afterany cycles=${job_cycles}"
+echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} qos=${SLURM_QOS:-default} algorithm=${algorithm_block} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
+echo "allocation_boundary_seconds=${slurm_time_seconds} controller_boundary_seconds=${checkpoint_budget_seconds} ${algorithm_block}_horizon_steps=${max_steps} continuation_chain=afterany cycles=${job_cycles}"
 echo "slurm_dependency=${SLURM_DEPENDENCY:-singleton}"
 echo "context_compaction=${context_compaction}"
 if [[ $launch_benchmark == claweval ]]; then
