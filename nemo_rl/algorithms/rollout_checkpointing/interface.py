@@ -20,7 +20,9 @@ the TQ part of a trainer checkpoint, the lock that keeps the two from publishing
 at once, the window in which a train step's optimizer update has landed but
 its counters have not, and restoring what a checkpoint saved. The controller
 never names the environment backend; the component reaches it through
-``EnvironmentCheckpoint``.
+``EnvironmentCheckpoint``. The rollout pump reserves, admits and gives up
+prompt groups through ``reservation``, which records them in the recovery
+ledger only when this run needs it.
 
 The component never reads controller fields. It asks through
 ``RolloutCheckpointingHost``, and the controller answers with a
@@ -34,9 +36,10 @@ from __future__ import annotations
 
 import abc
 import contextlib
-from collections.abc import AsyncIterator, Coroutine
-from typing import TYPE_CHECKING, Any
+from collections.abc import AsyncIterator, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, Optional
 
+from nemo_rl.algorithms.async_utils.replay_buffer import CheckpointMutationKind
 from nemo_rl.algorithms.rollout_checkpointing.controller_state import (
     ControllerRolloutState,
     ControllerSidecars,
@@ -44,13 +47,75 @@ from nemo_rl.algorithms.rollout_checkpointing.controller_state import (
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
+    from nemo_rl.algorithms.async_utils.staleness_sampler import PromptGroupSampler
+    from nemo_rl.algorithms.rollout_checkpointing.dispatch import PromptDispatch
     from nemo_rl.algorithms.rollout_checkpointing.restore import (
         AdmitFn,
         LaunchFn,
         RestoreReport,
         RolloutRestorer,
     )
+    from nemo_rl.data.interfaces import DatumSpec
     from nemo_rl.utils.checkpoint import PathLike
+
+
+class PromptReservation(abc.ABC):
+    """Prompt-group changes the rollout pump makes as one step.
+
+    With ledger dispatch, the reservation holds a data-plane mutation cut, so
+    a checkpoint sees all of its changes or none of them, and every group gets
+    an ID the recovery ledger owns. Without it nothing is recorded:
+    ``reserve_prompt_group`` returns ``None`` and the rollout manager mints the
+    group ID when it runs the rollout.
+    """
+
+    @abc.abstractmethod
+    def reserve_prompt_group(
+        self,
+        prompt: DatumSpec,
+        *,
+        target_step: Optional[int],
+        admitted: bool = True,
+        admission_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Own a prompt before dispatch can yield or checkpoint.
+
+        Returns:
+            The group ID the ledger owns, or ``None`` when nothing is recorded.
+        """
+        ...
+
+    @abc.abstractmethod
+    async def admit(
+        self,
+        sampler: PromptGroupSampler,
+        *,
+        trainer_version_fn: Callable[[], int],
+    ) -> Optional[int]:
+        """Run one sampler admission and return its target-step stamp.
+
+        For a ``TransactionalAdmissionSampler``, wait for its gate with
+        ``wait_until_admissible`` before entering the reservation: a
+        checkpoint drains mutation slots while it blocks the train pump.
+        """
+        ...
+
+    @abc.abstractmethod
+    def mark_prompt_group_admitted(
+        self, group_id: Optional[str], *, target_step: Optional[int]
+    ) -> None:
+        """Attach the sampler's admission to a group ``reserve_prompt_group`` returned."""
+        ...
+
+    @abc.abstractmethod
+    def discard_prompt_group(self, group_id: Optional[str]) -> None:
+        """Release a group that will never be dispatched, or whose rollout is aborted."""
+        ...
+
+    @abc.abstractmethod
+    async def discard_recovery_group(self, group_id: str) -> None:
+        """Clear a dropped group's staged rows and its ledger record."""
+        ...
 
 
 class RolloutCheckpointingHost(abc.ABC):
@@ -170,6 +235,29 @@ class RolloutCheckpointing(abc.ABC):
         """Launch the unfinished groups ``restore`` loaded, before new work.
 
         Call it once from the rollout pump, before it reads the dataloader.
+        Does nothing when dispatch records no prompt groups.
+        """
+        ...
+
+    @property
+    @abc.abstractmethod
+    def records_prompt_groups(self) -> bool:
+        """Whether dispatch records each prompt group in the recovery ledger.
+
+        On when this run saves recovery state, or when the checkpoint it
+        resumed from holds unfinished groups. In the second case ``restore``
+        turns it on, so it does not depend on which implementation was built.
+        """
+        ...
+
+    @abc.abstractmethod
+    def reservation(
+        self, kind: CheckpointMutationKind
+    ) -> contextlib.AbstractAsyncContextManager[PromptReservation]:
+        """Reserve, admit or discard prompt groups as one step.
+
+        With ledger dispatch this holds a data-plane mutation slot counted as
+        ``kind``. Without it, it holds nothing and costs nothing.
         """
         ...
 
@@ -184,9 +272,10 @@ class NoRolloutCheckpointing(RolloutCheckpointing):
     none.
     """
 
-    def __init__(self, *, restorer: RolloutRestorer) -> None:
-        """Store the restorer that ``restore`` hands off to."""
+    def __init__(self, *, restorer: RolloutRestorer, dispatch: PromptDispatch) -> None:
+        """Store the restorer ``restore`` hands off to and the dispatch mode."""
         self._restorer = restorer
+        self._dispatch = dispatch
 
     def background_tasks(self) -> list[Coroutine[Any, Any, None]]:
         return []
@@ -217,7 +306,17 @@ class NoRolloutCheckpointing(RolloutCheckpointing):
         )
 
     async def restore(self) -> RestoreReport:
-        return await self._restorer.restore()
+        return self._dispatch.apply_restore_report(await self._restorer.restore())
 
     async def redispatch_restored(self, launch: LaunchFn, admit: AdmitFn) -> None:
-        await self._restorer.redispatch_restored(launch, admit)
+        if self._dispatch.records_prompt_groups:
+            await self._restorer.redispatch_restored(launch, admit)
+
+    @property
+    def records_prompt_groups(self) -> bool:
+        return self._dispatch.records_prompt_groups
+
+    def reservation(  # pyrefly: ignore[bad-override]  pyrefly 0.24 reads a Literal parameter of an abstractmethod as str
+        self, kind: CheckpointMutationKind
+    ) -> contextlib.AbstractAsyncContextManager[PromptReservation]:
+        return self._dispatch.reservation(kind)

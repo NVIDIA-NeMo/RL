@@ -135,7 +135,10 @@ from nemo_rl.utils.logger import LoggerConfig
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
 from tests.unit.environments.gym_checkpoint_fakes import FakeGymActor, gym_coordinator
-from tests.unit.single_controller._restore_helpers import restorer_for
+from tests.unit.single_controller._restore_helpers import (
+    dispatch_for,
+    restorer_for,
+)
 from tests.unit.single_controller.test_setup import (
     _native_tq_metadata,
     patched_factories,  # noqa: F401
@@ -3063,9 +3066,10 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
 
     actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     # save_data_plane=False saves no rollout state, so the run gets no component.
-    # A save never restores.
+    # A save never restores, and its dispatch records nothing.
     actor._rollout_checkpointing = NoRolloutCheckpointing(
-        restorer=None  # type: ignore[arg-type]
+        restorer=None,  # type: ignore[arg-type]
+        dispatch=dispatch_for(actor, records_prompt_groups=False),
     )
     actor._save_state = SimpleNamespace()
     actor._train_steps = 1
@@ -3076,7 +3080,6 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._replacement_reserve = []
     actor._batch_shortfall = {}
     actor._sampler_stamps_target_steps = False
-    actor._rollout_recovery_enabled = False
     actor._finalizer_metrics_by_group = {}
     actor._finalizer_rewards_by_group = {}
     actor._async_cfg = SimpleNamespace(
@@ -3902,17 +3905,25 @@ class TestReplayBufferPersistence:
                 SetupTimingMetrics(),
             )
             # The two restore steps this test is about, without the cursor
-            # check that the full restore adds.
+            # check that the full restore adds. The report still goes through
+            # the component, which turns on ledger dispatch for the queued
+            # group even when this run saves no rollout state.
             restorer = actor._rollout_checkpointing._restorer
-            restored = await restorer._maybe_restore_replay_buffer()
-            await restorer._maybe_restore_rollout_recovery(
-                restored_replay_groups=restored
-            )
-            await actor._apply_restore_report(
-                restorer._report(
+
+            async def _two_restore_steps() -> Any:
+                restored = await restorer._maybe_restore_replay_buffer()
+                await restorer._maybe_restore_rollout_recovery(
+                    restored_replay_groups=restored
+                )
+                return restorer._report(
                     restored_replay_groups=restored, replacement_reserve=[]
                 )
+
+            restorer.restore = _two_restore_steps
+            await actor._apply_restore_report(
+                await actor._rollout_checkpointing.restore()
             )
+            assert actor._rollout_checkpointing.records_prompt_groups
             assert actor._buffer_capacity._value == 4
             actor._rollout_permitted.set()
             try:

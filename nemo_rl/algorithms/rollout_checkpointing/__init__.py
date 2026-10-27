@@ -24,8 +24,14 @@ from nemo_rl.algorithms.rollout_checkpointing.data_plane import (
     RolloutCheckpointCut,
     RolloutCheckpointSaveResult,
 )
+from nemo_rl.algorithms.rollout_checkpointing.dispatch import (
+    LedgerReservation,
+    PromptDispatch,
+    UnrecordedReservation,
+)
 from nemo_rl.algorithms.rollout_checkpointing.interface import (
     NoRolloutCheckpointing,
+    PromptReservation,
     RolloutCheckpointing,
     RolloutCheckpointingHost,
 )
@@ -45,13 +51,17 @@ __all__ = [
     "ControllerRolloutState",
     "ControllerSidecars",
     "DataPlaneRolloutCheckpointing",
+    "LedgerReservation",
     "NoRolloutCheckpointing",
+    "PromptDispatch",
+    "PromptReservation",
     "RestoreReport",
     "RolloutCheckpointCut",
     "RolloutCheckpointSaveResult",
     "RolloutCheckpointing",
     "RolloutCheckpointingHost",
     "RolloutRestorer",
+    "UnrecordedReservation",
     "capture_reward_settings",
     "validate_replay_inventory",
     "validate_rollout_recovery_inventory",

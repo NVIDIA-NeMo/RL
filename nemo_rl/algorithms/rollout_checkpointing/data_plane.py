@@ -40,6 +40,7 @@ import torch
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     DataPlaneCheckpointMetadata,
     DataPlaneMutationCut,
@@ -50,7 +51,9 @@ from nemo_rl.algorithms.rollout_checkpointing.controller_state import (
     ControllerSidecars,
     write_controller_sidecars,
 )
+from nemo_rl.algorithms.rollout_checkpointing.dispatch import PromptDispatch
 from nemo_rl.algorithms.rollout_checkpointing.interface import (
+    PromptReservation,
     RolloutCheckpointing,
     RolloutCheckpointingHost,
 )
@@ -160,6 +163,7 @@ class DataPlaneRolloutCheckpointing(RolloutCheckpointing):
         bootstrap_identity: Optional[BootstrapCompatibilityIdentity],
         teacher_coordinator: Optional[TQTeacherLogprobCoordinator],
         restorer: RolloutRestorer,
+        dispatch: PromptDispatch,
     ) -> None:
         """Store the parts this component saves and coordinates with.
 
@@ -178,6 +182,8 @@ class DataPlaneRolloutCheckpointing(RolloutCheckpointing):
                 checkpoint; needed for snapshots taken before step 1.
             teacher_coordinator: Records which teacher tagged the rows, if any.
             restorer: Restores what the resumed checkpoint saved.
+            dispatch: Whether the rollout pump records prompt groups in the
+                ledger, and the reservations it does that through.
         """
         self._host = host
         self._master_config = master_config
@@ -192,6 +198,7 @@ class DataPlaneRolloutCheckpointing(RolloutCheckpointing):
         self._bootstrap_identity = bootstrap_identity
         self._teacher_coordinator = teacher_coordinator
         self._restorer = restorer
+        self._dispatch = dispatch
 
         # Full trainer checkpoints and lightweight rollout snapshots share one
         # namespace and must never publish concurrently.
@@ -288,10 +295,20 @@ class DataPlaneRolloutCheckpointing(RolloutCheckpointing):
         )
 
     async def restore(self) -> RestoreReport:
-        return await self._restorer.restore()
+        return self._dispatch.apply_restore_report(await self._restorer.restore())
 
     async def redispatch_restored(self, launch: LaunchFn, admit: AdmitFn) -> None:
-        await self._restorer.redispatch_restored(launch, admit)
+        if self._dispatch.records_prompt_groups:
+            await self._restorer.redispatch_restored(launch, admit)
+
+    @property
+    def records_prompt_groups(self) -> bool:
+        return self._dispatch.records_prompt_groups
+
+    def reservation(  # pyrefly: ignore[bad-override]  pyrefly 0.24 reads a Literal parameter of an abstractmethod as str
+        self, kind: CheckpointMutationKind
+    ) -> contextlib.AbstractAsyncContextManager[PromptReservation]:
+        return self._dispatch.reservation(kind)
 
     # ── data-plane save ────────────────────────────────────────────────────
 
