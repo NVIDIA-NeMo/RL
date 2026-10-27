@@ -218,16 +218,17 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             dp_size=worker_group.dp_size,
             total_gen_workers=len(worker_group.workers),
             train_world_size=train_world_size,
-        )
+        ).with_actor_ids(worker_group.workers)
 
     def init_communicator(self) -> None:
+        train_world_size = self._train_cluster.world_size()
+        membership = self._desired_membership([], train_world_size)
         # prepare_refit_info is called before init_collective. This matches
         # distillation.py ordering. Neither call depends on the other today,
         # but we document this as the canonical ordering for future reference.
         initialize_refit_metadata(self._policy, self._generation)
 
         ip, port = self._train_cluster.get_master_address_and_port()
-        train_world_size = self._train_cluster.world_size()
         inference_world_size = self._generation.get_inference_world_size()
         if inference_world_size is None:
             inference_world_size = self._inference_cluster.world_size()
@@ -246,7 +247,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         )
         ray.get(futures_train + futures_inference)
         # Recorded so the first reconcile can tell "unchanged" from "never built".
-        self._built_membership = self._desired_membership([], train_world_size)
+        if membership is not None:
+            membership.validate_actor_ids(self._generation.worker_group.workers)
+        self._built_membership = membership
 
     def _settle_budget_s(self) -> float:
         """How long to let stragglers unwind: their own deadline, plus a little.
@@ -319,7 +322,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         print(
             f"  refit: rebuilding communicator over shards "
             f"{membership.surviving_shards}; world_size {membership.world_size}, "
-            f"port {port}",
+            f"port {port}; actor identities changed={membership.actor_ids != built.actor_ids}",
             flush=True,
         )
 
@@ -356,6 +359,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         )
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)
+        membership.validate_actor_ids(self._generation.worker_group.workers)
         self._built_membership = membership
         return True
 

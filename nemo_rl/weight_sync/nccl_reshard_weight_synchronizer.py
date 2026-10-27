@@ -253,7 +253,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 dp_size=self._generation.worker_group.dp_size,
                 total_gen_workers=len(self._generation.worker_group.workers),
                 train_world_size=self._train_cluster.world_size(),
-            )
+            ).with_actor_ids(self._generation.worker_group.workers)
         )
 
     def _build(self, membership: RefitMembership) -> None:
@@ -374,6 +374,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             nccl_reshard_refit_info
         )
         self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
+        membership.validate_actor_ids(self._generation.worker_group.workers)
         self._built_membership = membership
 
     def _settle_budget_s(self) -> float:
@@ -410,7 +411,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             dp_size=self._generation.worker_group.dp_size,
             total_gen_workers=len(self._generation.worker_group.workers),
             train_world_size=self._train_cluster.world_size(),
-        )
+        ).with_actor_ids(self._generation.worker_group.workers)
         # An unrecorded membership means the full fleet -- see should_rebuild's docstring,
         # which owns the rest of this rule for both hardened transports.
         if self._built_membership is None:
@@ -419,7 +420,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 dp_size=self._generation.worker_group.dp_size,
                 total_gen_workers=len(self._generation.worker_group.workers),
                 train_world_size=membership.train_world_size,
-            )
+            ).with_actor_ids(self._generation.worker_group.workers)
         if not should_rebuild(
             desired=membership,
             built=self._built_membership,
@@ -430,7 +431,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         print(
             f"  refit: rebuilding nccl_reshard communicators over shards "
             f"{membership.surviving_shards}; gen world "
-            f"{membership.world_size - membership.train_world_size}",
+            f"{membership.world_size - membership.train_world_size}; actor identities "
+            f"changed={membership.actor_ids != self._built_membership.actor_ids}",
             flush=True,
         )
         self._build(membership)

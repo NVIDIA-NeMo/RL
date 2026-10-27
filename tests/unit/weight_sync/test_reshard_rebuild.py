@@ -26,6 +26,7 @@ Two failures are pinned here, both silent rather than loud:
 from types import SimpleNamespace
 
 import pytest
+from ray import ActorID
 
 from nemo_rl.weight_sync.membership import plan_refit_membership
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
@@ -36,6 +37,7 @@ from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
 class _Worker:
     def __init__(self, idx, *, dead=False):
         self.idx = idx
+        self._actor_id = ActorID.from_random()
         self.dead = dead
         self.calls = []
 

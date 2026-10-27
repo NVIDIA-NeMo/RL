@@ -22,7 +22,11 @@ generation shards, so that losing one still leaves a fleet). The dispatch is a h
 """
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ray.actor import ActorHandle
 
 
 @dataclass(frozen=True)
@@ -36,16 +40,48 @@ class RefitMembership:
         shard_prefixes: surviving shard index -> its rank prefix within the generation
             block. Insertion-ordered by shard index.
         workers_per_shard: Ray workers backing one shard (tp x pp).
+        actor_ids: identities of the included workers, in shard/rank order. Empty
+            for a layout-only plan; synchronizers snapshot these before bootstrap.
     """
 
     world_size: int
     train_world_size: int
     shard_prefixes: dict[int, int]
     workers_per_shard: int
+    actor_ids: tuple[str, ...] = ()
 
     @property
     def surviving_shards(self) -> list[int]:
         return list(self.shard_prefixes)
+
+    def with_actor_ids(self, workers: Sequence["ActorHandle"]) -> "RefitMembership":
+        """Snapshot all included actors, including non-leader TP/PP workers.
+
+        A shard can restart between refits without ever leaving the desired rank
+        layout. Its new actors still need refit metadata and new communicators.
+        Copy the list first: restart_shard replaces its entries in the background.
+        """
+        snapshot = tuple(workers)
+        return replace(
+            self,
+            actor_ids=tuple(
+                snapshot[shard * self.workers_per_shard + rank]._actor_id.hex()
+                for shard in self.surviving_shards
+                for rank in range(self.workers_per_shard)
+            ),
+        )
+
+    def validate_actor_ids(self, workers: Sequence["ActorHandle"]) -> None:
+        """Reject a bootstrap whose participants were replaced while it ran.
+
+        Never record newly sampled identities as successfully initialized: metadata
+        and communicator dispatch may have addressed their predecessors.
+        """
+        if self.with_actor_ids(workers).actor_ids != self.actor_ids:
+            raise RuntimeError(
+                "generation actors changed during refit communicator initialization; "
+                "the replacement actors have not been initialized"
+            )
 
 
 class NoSurvivingShards(RuntimeError):
@@ -114,7 +150,9 @@ def should_rebuild(
         absent_shards: shards currently absent, as the caller sees them.
         force: the caller knows the communicator is gone rather than stale.
     """
-    unchanged = desired.shard_prefixes == built.shard_prefixes
+    # Equal shard indices do not imply equal communicator participants. In particular,
+    # a fast restart can go DEAD -> RESTARTING -> STALE between two reconciliations.
+    unchanged = desired == built
     return not (unchanged and not (force and absent_shards))
 
 

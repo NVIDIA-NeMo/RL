@@ -25,6 +25,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from ray import ActorID
 
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
@@ -34,7 +35,7 @@ from nemo_rl.models.generation.fleet_health import (
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
-from nemo_rl.weight_sync.membership import NoSurvivingShards
+from nemo_rl.weight_sync.membership import NoSurvivingShards, desired_membership
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
     NcclReshardWeightSynchronizer,
 )
@@ -49,7 +50,7 @@ def _minimal_generation(dp_size=2):
     """
     return SimpleNamespace(
         worker_group=SimpleNamespace(
-            workers=[object()] * dp_size,
+            workers=[_FakeWorker(idx) for idx in range(dp_size)],
             dp_size=dp_size,
             get_dp_leader_worker_idx=lambda shard: shard,
         ),
@@ -101,6 +102,7 @@ class _FakeWorker:
 
     def __init__(self, idx: int, *, dead: bool = False) -> None:
         self.idx = idx
+        self._actor_id = ActorID.from_random()
         self.dead = dead
         self.calls: list[dict] = []
 
@@ -140,6 +142,7 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
         # asks the backend which one that is. A stand-in has to carry every hook the code
         # under test reads, or it tests a shape the product never has.
         get_collective_sender_spec=lambda: SimpleNamespace(nccl_peer="nemo"),
+        get_inference_world_size=lambda: dp_size * workers_per_shard,
     )
     from nemo_rl.models.generation.vllm import vllm_generation
 
@@ -154,6 +157,18 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     generation.rebuild_collective = lambda membership, ip, port: (
         vllm_generation.VllmGeneration.rebuild_collective(
             generation, membership, ip, port
+        )
+    )
+    generation.init_collective = (
+        lambda ip, port, world_size, train_world_size: generation.rebuild_collective(
+            desired_membership(
+                absent_shards=[],
+                dp_size=dp_size,
+                total_gen_workers=len(workers),
+                train_world_size=train_world_size,
+            ),
+            ip,
+            port,
         )
     )
     policy_calls = []
@@ -666,7 +681,7 @@ class TestBackendsWithoutAWorkerGroup:
         generation = SimpleNamespace()
         if has_worker_group:
             generation.worker_group = SimpleNamespace(
-                dp_size=2, workers=[object(), object()]
+                dp_size=2, workers=[_FakeWorker(0), _FakeWorker(1)]
             )
         sync._generation = generation
         sync._train_cluster = SimpleNamespace(world_size=lambda: 2)
