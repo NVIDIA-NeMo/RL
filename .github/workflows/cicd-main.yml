@@ -33,7 +33,7 @@ on:
           - L0
           - L1
           - L2
-        description: Test level to run. docs = doc tests only (reuses main container, or the release branch's container for PRs to a release branch), Lfast = fast subset (reuses main container, or the release branch's container for PRs to a release branch), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
+        description: Test level to run. docs = doc tests only (GitHub-hosted runner, no container), Lfast = fast subset (reuses main container, or the release branch's container for PRs to a release branch), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
       test_script_pattern:
         description: "Case-insensitive substring used to select unit and functional test script names (for example, Megatron_1 or Vllm)."
         required: false
@@ -288,7 +288,9 @@ jobs:
             echo "megatron_lm_commit=${MEGATRON_LM_COMMIT,,}"
           } | tee -a "$GITHUB_OUTPUT"
 
-          # Determine image tag: Lfast and docs reuse a prebuilt container, workflow_dispatch can override.
+          # Determine image tag: Lfast reuses a prebuilt container, workflow_dispatch can override.
+          # docs runs no container job (doc tests run on a GitHub-hosted runner); a non-empty tag
+          # is still set for it because that is what skips the container build.
           # Lfast and docs on a release-branch PR reuse that branch's container (published only by builds of
           # the release branch itself after merges) because the main container carries main's TRT-LLM wheel,
           # not the release branch's. PR builds never overwrite it.
@@ -638,14 +640,16 @@ jobs:
         TRTLLM_BUILD_JOBS=8
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
 
+  # Doc tests are a Sphinx doctest build. None of them need a GPU, so they run on a
+  # GitHub-hosted runner against a plain `uv sync` instead of the GPU test image.
+  # No GPU job waits for them; on a PR run, a failure cancels the rest of the run.
   cicd-doc-tests:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - script: Docs_Tests
-            runner: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
-    needs: [pre-flight, build-container, org-member-pre-flight, cicd-wait-in-queue]
+    name: Docs_Tests
+    needs: [pre-flight, cicd-wait-in-queue]
+    permissions:
+      contents: read
+      actions: write # cancel the run on failure
+    timeout-minutes: 45
     if: >-
       ${{
         (
@@ -653,31 +657,139 @@ jobs:
           contains('docs Lfast L0 L1 L2', needs.pre-flight.outputs.test_level) &&
           needs.pre-flight.outputs.test_script_pattern == '' &&
           needs.pre-flight.result == 'success' &&
-          needs.org-member-pre-flight.result == 'success' &&
           (
             needs.cicd-wait-in-queue.result == 'success' ||
             needs.pre-flight.outputs.test_level == 'docs' ||
             !startsWith(github.ref, 'refs/heads/pull-request/')
-          ) &&
-          (needs.build-container.result == 'success' || needs.build-container.result == 'skipped')
+          )
         ) && !cancelled()
       }}
-    runs-on: ${{ matrix.runner }}
-    name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
+    env:
+      # pytest runs as a direct child of `uv run` here (in the GPU containers a bash
+      # script launches it), which makes Ray try to ship the uv project to its workers
+      # and fail because pyproject.toml is not in the test working directory.
+      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/dotnet /opt/az || true
+      - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: main
-        uses: ./.github/actions/test-template
         with:
-          runner: ${{ matrix.runner }}
-          registry: ${{ needs.org-member-pre-flight.outputs.registry }}
-          image: ${{ vars.CI_CONTAINER_NAME }}
-          image-tag: ${{ needs.pre-flight.outputs.image_tag }}
-          test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
-          script: ${{ matrix.script }}
-          is_doc_test: "true"
-          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
+          ref: ${{ needs.pre-flight.outputs.test_sha }}
+          submodules: recursive
+          persist-credentials: false
+      - name: Read uv version from Dockerfile
+        id: uv-version
+        run: |
+          uv_version="$(sed -nE 's/^ARG[[:space:]]+UV_VERSION=([^[:space:]#]+).*$/\1/p' docker/Dockerfile)"
+          if [[ ! "$uv_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid UV_VERSION from docker/Dockerfile: $uv_version" >&2
+            exit 1
+          fi
+          echo "version=$uv_version" >> "$GITHUB_OUTPUT"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: ${{ steps.uv-version.outputs.version }}
+          enable-cache: false
+      - name: "Set up Python"
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: ".python-version"
+      - name: Install dependencies
+        run: uv sync --locked --group docs --group test
+      - name: Run doc tests
+        env:
+          # Some doctests load tokenizers of gated Hugging Face models.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: bash tests/docs/Docs_Tests.sh
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: coverage-doc-test-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tests/.coverage
+          include-hidden-files: true
+          if-no-files-found: ignore
+      - name: Cancel the rest of the run
+        if: ${{ failure() && startsWith(github.ref, 'refs/heads/pull-request/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}"
+
+  # CPU-only config and test-suite checks (recipe configs resolve, nightly GPU-hour
+  # budget, schema validation). They are the most frequent cause of red unit runs and
+  # need no GPU, so they run on a GitHub-hosted runner in parallel with the container
+  # build. No GPU job waits for them; on a PR run, a failure cancels the rest of the run.
+  cpu-config-tests:
+    name: CPU config checks
+    needs: [pre-flight, cicd-wait-in-queue]
+    permissions:
+      contents: read
+      actions: write # cancel the run on failure
+    timeout-minutes: 45
+    if: >-
+      ${{
+        always() &&
+        contains('Lfast L0 L1 L2', needs.pre-flight.outputs.test_level) &&
+        needs.pre-flight.result == 'success' &&
+        (
+          needs.cicd-wait-in-queue.result == 'success' ||
+          !startsWith(github.ref, 'refs/heads/pull-request/')
+        ) &&
+        !cancelled()
+      }}
+    env:
+      # pytest runs as a direct child of `uv run` here (in the GPU containers a bash
+      # script launches it), which makes Ray try to ship the uv project to its workers
+      # and fail because pyproject.toml is not in the test working directory.
+      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/dotnet /opt/az || true
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.pre-flight.outputs.test_sha }}
+          submodules: recursive
+          persist-credentials: false
+      - name: Read uv version from Dockerfile
+        id: uv-version
+        run: |
+          uv_version="$(sed -nE 's/^ARG[[:space:]]+UV_VERSION=([^[:space:]#]+).*$/\1/p' docker/Dockerfile)"
+          if [[ ! "$uv_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid UV_VERSION from docker/Dockerfile: $uv_version" >&2
+            exit 1
+          fi
+          echo "version=$uv_version" >> "$GITHUB_OUTPUT"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: ${{ steps.uv-version.outputs.version }}
+          enable-cache: false
+      - name: "Set up Python"
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: ".python-version"
+      - name: Install dependencies
+        run: uv sync --locked --group test
+      - name: Run CPU config checks
+        working-directory: tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          uv run --no-sync pytest \
+            unit/test_recipes_and_test_suites.py \
+            unit/test_config_validation.py
+      - name: Cancel the rest of the run
+        if: ${{ failure() && startsWith(github.ref, 'refs/heads/pull-request/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}"
 
   cicd-unit-tests:
     strategy:
@@ -685,7 +797,7 @@ jobs:
       max-parallel: 16
       matrix:
         script: ${{ fromJSON(needs.pre-flight.outputs.unit_test_scripts) }}
-    needs: [pre-flight, prepare-megatron-lock, build-container, cicd-doc-tests, org-member-pre-flight, cicd-wait-in-queue]
+    needs: [pre-flight, prepare-megatron-lock, build-container, org-member-pre-flight, cicd-wait-in-queue]
     if: >-
       ${{
         (
@@ -700,8 +812,7 @@ jobs:
             needs.cicd-wait-in-queue.result == 'success' ||
             !startsWith(github.ref, 'refs/heads/pull-request/')
           ) &&
-          (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
-          (needs.cicd-doc-tests.result == 'success' || needs.cicd-doc-tests.result == 'skipped')
+          (needs.build-container.result == 'success' || needs.build-container.result == 'skipped')
         ) && !cancelled()
       }}
 
@@ -978,6 +1089,7 @@ jobs:
       - build-container
       - build-container-gb200
       - cicd-doc-tests
+      - cpu-config-tests
       - cicd-unit-tests
       - unit-test-script-check
       - functional-test-script-check
@@ -1015,6 +1127,10 @@ jobs:
                     (
                       !contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
                       needs.unit-test-script-check.result == 'success'
+                    ) &&
+                    (
+                      !contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
+                      needs.cpu-config-tests.result == 'success'
                     ) &&
                     (
                       !contains('L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
@@ -1093,6 +1209,7 @@ jobs:
       - build-container
       - build-container-gb200
       - cicd-doc-tests
+      - cpu-config-tests
       - cicd-unit-tests
       - unit-test-script-check
       - functional-test-script-check
