@@ -277,6 +277,7 @@ policy:
     bias_activation_fusion: True
     defer_fp32_logits: False
     fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
+    super_vision_exact_gelu: false # Super-only: match vLLM RADIO with exact GELU in the 32 unfused vision MLPs.
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
