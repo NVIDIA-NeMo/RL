@@ -1,11 +1,18 @@
 ---
 name: collect-training-timeline
 license: Apache-2.0
-description: "Collect and plot end-to-end NeMo-RL GRPO timelines (training or generation-only): trainer phases, rollout lifecycle, and per-rollout NeMo Gym/OpenHands spans with per-turn token, prefix-cache, generation-replica and LLM-server scheduling metrics. Covers enabling collection, instrumenting NeMo Gym and OpenHands, rendering the interactive HTML, and reading per-turn metrics such as prefix hit rate and TPOT. Do NOT use for: OpenTelemetry/OTLP setup, Nsight profiling, launching jobs, or changes unrelated to timeline tracing."
-when_to_use: collect a training timeline; plot the timeline for this run; why is the rollout timeline empty; add timeline tracing to NeMo Gym or OpenHands; per-turn prefix hit rate or TPOT from a rollout timeline; NRL_COLLECT_TIMELINE_FIELDS.
+description: "Collect and plot end-to-end NeMo-RL GRPO timelines (training or generation-only): trainer phases, rollout lifecycle, and per-rollout NeMo Gym/OpenHands spans with per-turn token, prefix-cache, generation-replica and LLM-server scheduling metrics. Covers enabling collection, instrumenting NeMo Gym and OpenHands, rendering the interactive HTML, and reading per-turn metrics such as prefix hit rate and TPOT, and deriving in-flight batch size, per-trajectory time shares and the OpenHands-to-engine latency breakdown. Per-rollout spans exist only for NeMo Gym SWE-agent/OpenHands workloads. Do NOT use for: OpenTelemetry/OTLP setup, Nsight profiling, launching jobs, or changes unrelated to timeline tracing."
+when_to_use: collect a training timeline for a SWE task; plot the timeline for this run; why is the rollout timeline empty; add timeline tracing to NeMo Gym or OpenHands; per-turn prefix hit rate or TPOT from a rollout timeline; in-flight batch size from a timeline; model_call time share or number of turns; overhead between OpenHands and the model call; NRL_COLLECT_TIMELINE_FIELDS.
 ---
 
 # Collect Training Timeline
+
+> **Scope: SWE tasks.** The per-rollout half of this skill (rollout lanes,
+> per-turn metrics, the `model_call` breakdown, in-flight batch size, turns and
+> time shares) is for **SWE-agent tasks**: rollouts run by the NeMo Gym SWE
+> agent with OpenHands. Their spans are written only by those two components.
+> The trainer phases and rollout lifecycle work for any GRPO run, but a task
+> that does not go through the SWE agent gets no per-rollout view.
 
 A timeline is three kinds of Chrome-trace JSONL (one `ph: "X"` complete event
 per line, epoch-microsecond `ts`, microsecond `dur`):
@@ -15,6 +22,49 @@ per line, epoch-microsecond `ts`, microsecond `dur`):
 | `training_timeline.jsonl` | NeMo-RL `Timer` (every stopped timer) | `logger.log_dir` |
 | `rollout_lifecycle.jsonl` | NeMo-RL replay buffer (buffered/consumed records, async GRPO) | `logger.log_dir` |
 | `timeline.jsonl`, one per rollout | NeMo Gym SWE agent and OpenHands | the rollout's dir under the Gym `results_dir` |
+
+**Applicability.** Only the first two files exist for every GRPO run. The
+per-rollout `timeline.jsonl` is written only by the NeMo Gym SWE agent and
+OpenHands, and almost every rollout state (`ray_queue`, container spin-ups,
+`create_runtime`, `run_controller`, `model_call`, tool actions, `extract_patch`,
+`final_eval`) belongs to one of those two. A recipe that does not run through
+them, such as the single-step `swe_pivot_*` environment, gets the trainer view
+but no per-rollout or per-turn view. See
+[references/analysis.md](references/analysis.md) for the state machines.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> ray_queue
+    ray_queue --> spinup
+    spinup --> openhands_run
+    state openhands_run {
+        [*] --> runtime_setup
+        runtime_setup --> run_controller
+        state run_controller {
+            [*] --> agent_step
+            state agent_step {
+                [*] --> model_call
+                model_call --> [*]
+            }
+            agent_step --> run_action: Action event
+            run_action --> agent_step: Observation event
+            agent_step --> [*]: AgentFinishAction
+        }
+        run_controller --> extract_patch
+        extract_patch --> runtime_cleanup
+    }
+    openhands_run --> final_eval
+    final_eval --> [*]
+```
+
+Gym writes everything outside `openhands_run`; OpenHands writes everything
+inside it. `runtime_setup` is `create_runtime`, `connect_runtime`,
+`initialize_runtime` and `prepare_instruction`. `run_action` is any OpenHands
+action class (`CmdRunAction`, `FileReadAction`, `FileEditAction`, ...), each its
+own `tool` span. One `model_call` can return several actions, so the two are not
+one-to-one. [references/analysis.md](references/analysis.md) has the full
+OpenHands event loop, checked against its code.
 
 ## Enable
 
@@ -94,6 +144,30 @@ Other events, all with `args.rollout_id` and `args.status`:
   `initialize_runtime`, `runtime_cleanup`.
 - OpenHands `agent`: `prepare_instruction`, `run_controller`, `extract_patch`.
 - `tool`: one event per action, named after the action class.
+
+## Analyze
+
+```bash
+python skills/collect-training-timeline/scripts/analyze_rollout_timeline.py \
+  --rollout-root $GYM_RESULTS_DIR [--bin-seconds 10] [--output-json stats.json]
+```
+
+It reads every non-empty `timeline.jsonl` and prints:
+- per trajectory: turns, `model_call` / tool / agent-loop time share, tokens,
+  prefix hit rate;
+- the `model_call` breakdown from OpenHands down to the engine and back, with
+  each segment classed as compute, queue or plumbing;
+- system in-flight counts over time: clients waiting, engine queued, engine
+  running (the generation batch), prefill running, and running per replica;
+- the size of the trace itself.
+
+[references/analysis.md](references/analysis.md) lists every statistic the
+timeline supports and how it is computed, and explains how to read the
+`model_call` breakdown and estimate the cost of the tracing itself.
+
+Segments that cross hosts (`client_to_frontend`, `kv_handoff`, `llm_to_gym`)
+include wall-clock skew. The script reports how many came out negative; a
+non-zero count means skew.
 
 ## Rules
 
