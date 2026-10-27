@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import math
 import pickle
 
 import pytest
@@ -2337,16 +2338,25 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
     torch.testing.assert_close(actual_loss, expected_actor_loss, atol=1e-4, rtol=1e-3)
 
 
-def setup_distillation_test_data(batch_size=2, seq_len=4, vocab_size=8, topk=64):
-    """Setup test data for distillation loss function tests."""
-    if not torch.cuda.is_available():
-        pytest.skip("No GPU available")
+def setup_distillation_test_data(
+    batch_size=2, seq_len=4, vocab_size=8, topk=64, device=None
+):
+    """Setup test data for distillation loss function tests.
 
-    device = "cuda"
+    Args:
+        device: Where to place the tensors. ``None`` keeps the historical
+            behaviour of requiring CUDA and skipping without it. Pass "cpu"
+            for branches that are pure tensor math and need no GPU.
+    """
+    if device is None:
+        if not torch.cuda.is_available():
+            pytest.skip("No GPU available")
+        device = "cuda"
 
     # Set seed for reproducibility
     torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
+    if device == "cuda":
+        torch.cuda.manual_seed_all(42)
 
     # Create input data
     input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
@@ -2375,7 +2385,23 @@ def setup_distillation_test_data(batch_size=2, seq_len=4, vocab_size=8, topk=64)
     return data, student_logits
 
 
-@pytest.mark.parametrize("kl_type", ["forward", "reverse", "mixed"])
+def _run_distillation_loss(loss_fn, student_logits, data, loss_input_overrides=None):
+    """Prepare inputs and invoke a distillation loss, returning the scalar loss."""
+    loss_input, loss_data = prepare_loss_input(student_logits, data, loss_fn)
+    if loss_input_overrides:
+        loss_input = {**loss_input, **loss_input_overrides}
+    loss, _ = loss_fn(
+        data=loss_data,
+        global_valid_seqs=torch.sum(loss_data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            loss_data["sample_mask"].unsqueeze(-1) * loss_data["token_mask"]
+        ),
+        **loss_input,
+    )
+    return loss, loss_input, loss_data
+
+
+@pytest.mark.parametrize("kl_type", ["forward", "reverse", "mixed", "jsd"])
 @pytest.mark.parametrize("zero_outside_topk", [True, False])
 def test_distillation_loss_different_settings(kl_type, zero_outside_topk):
     """Test different distillation loss settings."""
@@ -2385,6 +2411,7 @@ def test_distillation_loss_different_settings(kl_type, zero_outside_topk):
         DistillationLossConfig(
             kl_type=kl_type,
             mixed_kl_weight=0.3,
+            jsd_beta=0.3,
             zero_outside_topk=zero_outside_topk,
         )
     )
@@ -2399,7 +2426,9 @@ def test_distillation_loss_different_settings(kl_type, zero_outside_topk):
         **loss_input,
     )
 
-    # Verify loss
+    # Verify loss. jsd's exact value isn't pinned like the others above (no
+    # hand-derivable closed form for random top-k data) -- its correctness is
+    # covered by the boundary/symmetry/gradient tests below instead.
     if zero_outside_topk:
         if kl_type == "forward":
             assert torch.allclose(loss, torch.tensor(-0.9636520743370056))
@@ -2414,6 +2443,9 @@ def test_distillation_loss_different_settings(kl_type, zero_outside_topk):
             assert torch.allclose(loss, torch.tensor(0.5811167359352112))
         elif kl_type == "mixed":
             assert torch.allclose(loss, torch.tensor(0.5802732110023499))
+    if kl_type == "jsd":
+        assert not torch.isnan(loss)
+        assert not torch.isinf(loss)
 
     # Verify metrics dictionary
     assert isinstance(metrics, dict)
@@ -2565,6 +2597,202 @@ def test_distillation_loss_edge_cases():
     )
     assert not torch.isnan(loss)
     assert not torch.isinf(loss)
+
+
+@pytest.mark.parametrize("zero_outside_topk", [True, False])
+def test_distillation_loss_jsd_matches_forward_reverse_at_boundaries(
+    zero_outside_topk,
+):
+    """kl_type="jsd" must reduce to forward KL at beta=0 and reverse KL at beta=1."""
+    data, student_logits = setup_distillation_test_data(device="cpu")
+
+    def run(kl_type, jsd_beta=0.5):
+        loss_fn = DistillationLossFn(
+            DistillationLossConfig(
+                kl_type=kl_type,
+                jsd_beta=jsd_beta,
+                zero_outside_topk=zero_outside_topk,
+            )
+        )
+        return _run_distillation_loss(loss_fn, student_logits, data)[0]
+
+    torch.testing.assert_close(
+        run("jsd", jsd_beta=0.0), run("forward"), atol=1e-5, rtol=1e-4
+    )
+    torch.testing.assert_close(
+        run("jsd", jsd_beta=1.0), run("reverse"), atol=1e-5, rtol=1e-4
+    )
+
+
+def test_distillation_loss_jsd_symmetric_beta():
+    """Generalized JSD at beta=0.5 is symmetric.
+
+    Swapping the student and teacher top-k distributions must give the same
+    loss, which forward and reverse KL do not.
+    """
+    data, student_logits = setup_distillation_test_data(device="cpu")
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(kl_type="jsd", jsd_beta=0.5, zero_outside_topk=False)
+    )
+
+    loss, loss_input, _ = _run_distillation_loss(loss_fn, student_logits, data)
+    swapped_loss, _, _ = _run_distillation_loss(
+        loss_fn,
+        student_logits,
+        data,
+        loss_input_overrides={
+            "student_topk_logprobs": loss_input["teacher_topk_logprobs"],
+            "teacher_topk_logprobs": loss_input["student_topk_logprobs"],
+            "student_teacher_logit_delta": -loss_input["student_teacher_logit_delta"],
+        },
+    )
+
+    torch.testing.assert_close(loss, swapped_loss, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("jsd_beta", [0.1, 0.5, 0.9])
+def test_distillation_loss_jsd_zero_outside_topk_matches_full_vocab(jsd_beta):
+    """zero_outside_topk jsd must equal the full-vocab JSD with a top-k teacher."""
+    torch.manual_seed(0)
+    batch_size, seq_len, vocab_size, k = 2, 5, 32, 4
+    student_logprobs = torch.randn(
+        batch_size, seq_len, vocab_size, dtype=torch.float64
+    ).log_softmax(-1)
+    teacher_logits = 2 * torch.randn(
+        batch_size, seq_len, vocab_size, dtype=torch.float64
+    )
+    topk_indices = teacher_logits.topk(k, dim=-1).indices
+    student_topk_logprobs = student_logprobs.gather(-1, topk_indices)
+    teacher_topk_logprobs = teacher_logits.gather(-1, topk_indices).log_softmax(-1)
+    H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
+
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(kl_type="jsd", jsd_beta=jsd_beta, zero_outside_topk=True)
+    )
+    loss, _ = loss_fn(
+        student_topk_logprobs=student_topk_logprobs,
+        teacher_topk_logprobs=teacher_topk_logprobs,
+        H_all=H_all,
+        data={"input_ids": torch.zeros(batch_size, seq_len + 1, dtype=torch.long)},
+        global_valid_seqs=None,
+        global_valid_toks=None,
+    )
+
+    teacher_logprobs = torch.full_like(
+        student_logprobs, float(loss_fn.log_infinitesimal)
+    ).scatter(-1, topk_indices, teacher_topk_logprobs)
+    mixture_logprobs = torch.logaddexp(
+        teacher_logprobs + math.log(jsd_beta),
+        student_logprobs + math.log1p(-jsd_beta),
+    )
+    expected = (
+        (
+            jsd_beta * teacher_logprobs.exp() * (teacher_logprobs - mixture_logprobs)
+            + (1 - jsd_beta)
+            * student_logprobs.exp()
+            * (student_logprobs - mixture_logprobs)
+        )
+        .sum(-1)
+        .mean()
+    )
+
+    torch.testing.assert_close(loss, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_distillation_loss_jsd_gradient_flow():
+    """Test gradient flow through the generalized JSD branch."""
+    data, student_logits = setup_distillation_test_data(device="cpu")
+    student_logits.requires_grad_(True)
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(kl_type="jsd", jsd_beta=0.5, zero_outside_topk=False)
+    )
+
+    loss, _, _ = _run_distillation_loss(loss_fn, student_logits, data)
+    loss.backward()
+
+    assert student_logits.grad is not None
+    assert not torch.allclose(
+        student_logits.grad, torch.zeros_like(student_logits.grad)
+    )
+
+
+@pytest.mark.parametrize("jsd_beta", [0.3, 0.7])
+def test_distillation_loss_jsd_zero_gradient_when_student_matches_teacher(jsd_beta):
+    """Test the jsd gradient is exactly zero when the student matches the teacher.
+
+    Autograd leaves a small nonzero gradient here from separately rounded
+    softmaxes, which Adam turns into full-size steps away from the teacher
+    (see https://jonbarron.info/softmaxfix/).
+    """
+    data, student_logits = setup_distillation_test_data(device="cpu")
+    data["teacher_topk_logits"] = student_logits.gather(
+        -1, data["teacher_topk_indices"]
+    )
+    student_logits.requires_grad_(True)
+
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(
+            kl_type="jsd", jsd_beta=jsd_beta, zero_outside_topk=False
+        )
+    )
+
+    loss, _, _ = _run_distillation_loss(loss_fn, student_logits, data)
+    loss.backward()
+
+    # Verify the gradient vanishes exactly
+    assert torch.count_nonzero(student_logits.grad) == 0
+
+
+def test_distillation_loss_jsd_gradient_matches_fp64_reference():
+    """Test the jsd gradient against an fp64 autograd reference."""
+    data, student_logits = setup_distillation_test_data(topk=3, device="cpu")
+    data["teacher_topk_indices"][0, 0] = torch.arange(3)
+    data["teacher_topk_logits"][0, 0] = torch.tensor([2.0, 0.01, 0.0])
+    student_logits[0, 0, :3] = data["teacher_topk_logits"][0, 0]
+    student_logits[0, 0, 1] += 1e-8
+    student_logits.requires_grad_(True)
+    jsd_beta = 0.3
+
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(
+            kl_type="jsd", jsd_beta=jsd_beta, zero_outside_topk=False
+        )
+    )
+
+    loss, _, loss_data = _run_distillation_loss(loss_fn, student_logits, data)
+    loss.backward()
+
+    # fp64 reference, aligned to next-token prediction and normalized like the loss
+    student_logits_ref = student_logits.detach().double().requires_grad_(True)
+    student_logprobs = student_logits_ref.gather(
+        -1, data["teacher_topk_indices"]
+    ).log_softmax(-1)[:, :-1]
+    teacher_logprobs = data["teacher_topk_logits"].double().log_softmax(-1)[:, :-1]
+    mixture_logprobs = torch.logaddexp(
+        teacher_logprobs + math.log(jsd_beta),
+        student_logprobs + math.log1p(-jsd_beta),
+    )
+    expected_loss = (
+        jsd_beta * teacher_logprobs.exp() * (teacher_logprobs - mixture_logprobs)
+        + (1 - jsd_beta)
+        * student_logprobs.exp()
+        * (student_logprobs - mixture_logprobs)
+    ).sum() / torch.sum(
+        loss_data["sample_mask"].unsqueeze(-1) * loss_data["token_mask"]
+    )
+    expected_loss.backward()
+
+    # Verify the loss value is unchanged and the gradient matches
+    torch.testing.assert_close(loss.double(), expected_loss, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(
+        student_logits.grad.double(), student_logits_ref.grad, atol=1e-7, rtol=1e-4
+    )
+    torch.testing.assert_close(
+        student_logits.grad[0, 0, :3].double(),
+        student_logits_ref.grad[0, 0, :3],
+        atol=1e-15,
+        rtol=1e-5,
+    )
 
 
 def test_distillation_loss_fn_initialization():
