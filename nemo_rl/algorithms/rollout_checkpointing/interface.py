@@ -17,15 +17,17 @@
 The controller runs a train pump and a rollout pump. Everything that saves
 rollout state sits behind ``RolloutCheckpointing``: periodic rollout snapshots,
 the TQ part of a trainer checkpoint, the lock that keeps the two from publishing
-at once, and the window in which a train step's optimizer update has landed but
-its counters have not. The controller never names the environment backend; the
-component reaches it through ``EnvironmentCheckpoint``.
+at once, the window in which a train step's optimizer update has landed but
+its counters have not, and restoring what a checkpoint saved. The controller
+never names the environment backend; the component reaches it through
+``EnvironmentCheckpoint``.
 
 The component never reads controller fields. It asks through
 ``RolloutCheckpointingHost``, and the controller answers with a
 ``ControllerRolloutState`` built under the data-plane cut.
 
-A run that saves no rollout state gets ``NoRolloutCheckpointing``.
+A run that saves no rollout state gets ``NoRolloutCheckpointing``. It still
+restores: the checkpoint it resumes from may hold rollout state.
 """
 
 from __future__ import annotations
@@ -42,6 +44,12 @@ from nemo_rl.algorithms.rollout_checkpointing.controller_state import (
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
+    from nemo_rl.algorithms.rollout_checkpointing.restore import (
+        AdmitFn,
+        LaunchFn,
+        RestoreReport,
+        RolloutRestorer,
+    )
     from nemo_rl.utils.checkpoint import PathLike
 
 
@@ -146,14 +154,39 @@ class RolloutCheckpointing(abc.ABC):
         """
         ...
 
+    @abc.abstractmethod
+    async def restore(self) -> RestoreReport:
+        """Restore the rollout state the resumed checkpoint saved.
+
+        Call it once, after the weights are in sync and before the pumps start.
+        Restores the replay buffer, the recovery ledger and the spare prompts,
+        checks the sampler cursor against them and logs restore timings. The
+        controller applies the returned report to its own state.
+        """
+        ...
+
+    @abc.abstractmethod
+    async def redispatch_restored(self, launch: LaunchFn, admit: AdmitFn) -> None:
+        """Launch the unfinished groups ``restore`` loaded, before new work.
+
+        Call it once from the rollout pump, before it reads the dataloader.
+        """
+        ...
+
 
 class NoRolloutCheckpointing(RolloutCheckpointing):
     """For a run that saves no rollout state.
 
     No snapshot pump, no lock and no commit window. A trainer checkpoint still
     gets the dataloader state and spare prompts every checkpoint needs, and
-    nothing from the data plane.
+    nothing from the data plane. Restore still runs in full, because the
+    checkpoint being resumed may hold rollout state even when this run saves
+    none.
     """
+
+    def __init__(self, *, restorer: RolloutRestorer) -> None:
+        """Store the restorer that ``restore`` hands off to."""
+        self._restorer = restorer
 
     def background_tasks(self) -> list[Coroutine[Any, Any, None]]:
         return []
@@ -182,3 +215,9 @@ class NoRolloutCheckpointing(RolloutCheckpointing):
             dataloader_state=state.dataloader_state,
             replacement_reserve=state.replacement_reserve,
         )
+
+    async def restore(self) -> RestoreReport:
+        return await self._restorer.restore()
+
+    async def redispatch_restored(self, launch: LaunchFn, admit: AdmitFn) -> None:
+        await self._restorer.redispatch_restored(launch, admit)

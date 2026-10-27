@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Optional
@@ -31,11 +32,14 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
 )
 from nemo_rl.algorithms.rollout_checkpointing import (
+    CheckpointToRestore,
     ControllerRolloutState,
     ControllerSidecars,
     DataPlaneRolloutCheckpointing,
     NoRolloutCheckpointing,
+    RestoreReport,
     RolloutCheckpointing,
+    RolloutRestorer,
     write_controller_sidecars,
 )
 from nemo_rl.algorithms.single_controller import SingleControllerActor
@@ -45,7 +49,10 @@ from nemo_rl.experience.environment_checkpoint import (
     NoEnvironmentCheckpoint,
     RestoredEnvironmentRollouts,
 )
-from nemo_rl.experience.rollout_recovery import ROLLOUT_RECOVERY_STATE_FILENAME
+from nemo_rl.experience.rollout_recovery import (
+    ROLLOUT_RECOVERY_STATE_FILENAME,
+    RolloutRecoveryLedger,
+)
 
 _ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
 
@@ -95,6 +102,7 @@ def _component(
         environment_checkpoint=environment_checkpoint or NoEnvironmentCheckpoint(),
         bootstrap_identity=None,
         teacher_coordinator=None,
+        restorer=None,  # type: ignore[arg-type]
     )
 
 
@@ -127,7 +135,8 @@ def test_an_implementation_missing_a_member_fails_when_built() -> None:
 
 
 def test_no_rollout_checkpointing_runs_nothing_and_keeps_plain_sidecars() -> None:
-    component = NoRolloutCheckpointing()
+    # A save never restores.
+    component = NoRolloutCheckpointing(restorer=None)  # type: ignore[arg-type]
 
     async def exercise() -> ControllerSidecars:
         async with component.trainer_checkpoint():
@@ -268,6 +277,8 @@ def test_controller_gets_no_component_when_it_saves_no_rollout_state(
     for name in (
         "_dp_client",
         "_buffer",
+        "_sampler",
+        "_dataloader",
         "_rollout_manager",
         "_checkpointer",
         "_timeout",
@@ -279,4 +290,153 @@ def test_controller_gets_no_component_when_it_saves_no_rollout_state(
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._environment_checkpoint = NoEnvironmentCheckpoint()
 
-    assert type(controller._build_rollout_checkpointing()) is expected
+    assert (
+        type(controller._build_rollout_checkpointing(CheckpointToRestore())) is expected
+    )
+
+
+class _RecordingRestorer:
+    """Stands in for RolloutRestorer and records what it was asked to do."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.report = RestoreReport(restored_replay_groups=2)
+
+    async def restore(self) -> RestoreReport:
+        self.calls.append("restore")
+        return self.report
+
+    async def redispatch_restored(self, launch: Any, admit: Any) -> None:
+        del launch, admit
+        self.calls.append("redispatch_restored")
+
+
+@pytest.mark.parametrize("saves_rollout_state", [False, True])
+def test_both_implementations_hand_restore_to_the_restorer(
+    saves_rollout_state: bool,
+) -> None:
+    """Restore does not depend on whether this run saves rollout state."""
+    restorer = _RecordingRestorer()
+    if saves_rollout_state:
+        component: RolloutCheckpointing = _component()
+        component._restorer = restorer  # type: ignore[attr-defined]
+    else:
+        component = NoRolloutCheckpointing(restorer=restorer)  # type: ignore[arg-type]
+
+    async def exercise() -> RestoreReport:
+        report = await component.restore()
+        await component.redispatch_restored(None, None)  # type: ignore[arg-type]
+        return report
+
+    assert asyncio.run(exercise()) is restorer.report
+    assert restorer.calls == ["restore", "redispatch_restored"]
+
+
+class _RecordingHost:
+    """The controller as the restorer sees it, recording logged metrics."""
+
+    def __init__(self) -> None:
+        self.logged: list[tuple[dict[str, float], int, str]] = []
+
+    @property
+    def train_steps(self) -> int:
+        return 5
+
+    def log_telemetry_metrics(
+        self, metrics: dict[str, float], *, step: int, prefix: str
+    ) -> None:
+        self.logged.append((metrics, step, prefix))
+
+
+def _restorer(checkpoint: CheckpointToRestore, host: Any) -> RolloutRestorer:
+    """A restorer over a sampler without replay restore and an empty ledger."""
+    return RolloutRestorer(
+        host=host,
+        master_config=SimpleNamespace(  # type: ignore[arg-type]
+            async_rl=SimpleNamespace(
+                max_buffered_rollouts=4, sampler=SimpleNamespace(name="windowed")
+            ),
+            checkpointing={},
+            token_capture=SimpleNamespace(enabled=False),
+        ),
+        dp_client=None,
+        partition_id="rollout_data",
+        buffer=SimpleNamespace(target_step_list=[]),  # type: ignore[arg-type]
+        sampler=SimpleNamespace(  # type: ignore[arg-type]
+            supports_buffer_checkpoint=False, dispatch_index=0
+        ),
+        dataloader=None,
+        rollout_manager=SimpleNamespace(  # type: ignore[arg-type]
+            recovery_ledger=RolloutRecoveryLedger()
+        ),
+        data_plane_barrier=DataPlaneCheckpointBarrier(),
+        environment_checkpoint=NoEnvironmentCheckpoint(),
+        checkpoint=checkpoint,
+    )
+
+
+def test_restore_without_rollout_checkpointing_still_returns_spare_prompts(
+    tmp_path: Path,
+) -> None:
+    """A run that saves no rollout state still resumes what its checkpoint holds."""
+    torch.save([{"idx": 3}, {"idx": 4}], tmp_path / REPLACEMENT_RESERVE_FILENAME)
+    host = _RecordingHost()
+    component = NoRolloutCheckpointing(
+        restorer=_restorer(
+            CheckpointToRestore(
+                path=str(tmp_path), load_metrics={"tq_load_seconds": 1.0}
+            ),
+            host,
+        )
+    )
+
+    report = asyncio.run(component.restore())
+
+    assert report == RestoreReport(replacement_reserve=[{"idx": 3}, {"idx": 4}])
+    ((metrics, step, prefix),) = host.logged
+    assert metrics["tq_load_seconds"] == 1.0
+    assert metrics["groups_complete_restored"] == 0.0
+    assert step == 5
+    assert prefix == "timing/rollout_recovery"
+
+
+def test_restore_of_a_fresh_run_reports_nothing() -> None:
+    host = _RecordingHost()
+
+    report = asyncio.run(_restorer(CheckpointToRestore(), host).restore())
+
+    assert report == RestoreReport()
+    # No restore timers were measured, so there is nothing to log.
+    assert host.logged == []
+
+
+def test_controller_takes_back_what_the_restore_report_says() -> None:
+    controller = object.__new__(_ACTOR_CLS)
+    controller._buffer_capacity = asyncio.Semaphore(4)
+    controller._batch_shortfall = {1: 1}
+    controller._finalizer_metrics_by_group = {"kept": {"m": 1.0}}
+    controller._finalizer_rewards_by_group = {"kept": []}
+    controller._sampler_stamps_target_steps = False
+    controller._replacement_reserve = deque([{"idx": 1}])
+    controller._rollout_recovery_enabled = False
+
+    asyncio.run(
+        controller._apply_restore_report(
+            RestoreReport(
+                restored_replay_groups=3,
+                replacement_reserve=[{"idx": 2}],  # type: ignore[list-item]
+                batch_shortfall={6: 1},
+                requires_recovery_dispatch=True,
+            )
+        )
+    )
+
+    # One replay-capacity permit per restored group.
+    assert controller._buffer_capacity._value == 1
+    assert controller._batch_shortfall == {6: 1}
+    # Fields the report leaves as None keep the controller's own value.
+    assert controller._finalizer_metrics_by_group == {"kept": {"m": 1.0}}
+    assert controller._finalizer_rewards_by_group == {"kept": []}
+    assert controller._sampler_stamps_target_steps is False
+    assert list(controller._replacement_reserve) == [{"idx": 1}, {"idx": 2}]
+    assert controller._rollout_recovery_enabled is True

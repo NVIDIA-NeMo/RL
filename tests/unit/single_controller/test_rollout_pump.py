@@ -43,6 +43,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.rollout_checkpointing import NoRolloutCheckpointing
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -69,6 +70,7 @@ from tests.unit.experience.test_rollouts import (
     rollout_cluster,  # noqa: F401
     rollout_tokenizer,  # noqa: F401
 )
+from tests.unit.single_controller._restore_helpers import restorer_for
 from tests.unit.single_controller._dp_fakes import (
     _BULK_FIELDS,
     _PARTITION_ID,
@@ -1315,6 +1317,10 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         _init_pump_ledgers(ctrl)
         ctrl._finalizer_actors = [object()]
         ctrl._rollout_recovery_enabled = True
+        # Nothing was restored, so the pump has nothing to redispatch.
+        ctrl._rollout_checkpointing = NoRolloutCheckpointing(
+            restorer=restorer_for(ctrl)
+        )
 
         async def _finalize(
             request: Any,
