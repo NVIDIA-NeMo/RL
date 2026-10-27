@@ -15,7 +15,6 @@
 
 import atexit
 import glob
-import importlib
 import json
 import logging
 import os
@@ -33,6 +32,7 @@ import requests
 import swanlab
 import torch
 import wandb
+from hydra.utils import get_class
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
@@ -1300,9 +1300,7 @@ class Logger(LoggerInterface):
             self.loggers.append(mlflow_logger)
 
         for name in cfg.extra_backends:
-            module_name, class_name = name.rsplit(".", 1)
-            backend_cls = getattr(importlib.import_module(module_name), class_name)
-            self.loggers.append(backend_cls())
+            self.loggers.append(get_class(name)())
 
         # Initialize GPU monitoring if requested
         self.gpu_monitor = None
