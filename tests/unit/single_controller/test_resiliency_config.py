@@ -21,6 +21,7 @@ hour three of a run.
 """
 
 import warnings
+from types import SimpleNamespace
 from typing import get_args
 
 import pytest
@@ -81,6 +82,13 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
         env={"should_use_nemo_gym": True},
         checkpointing={"enabled": False, "metric_name": None},
     )
+
+
+def test_train_data_to_wandb_needs_wandb() -> None:
+    cfg = _master_config(log_train_data_to_wandb=True)
+    cfg.logger = SimpleNamespace(wandb_enabled=False)
+    with pytest.raises(ValueError, match="wandb_enabled=true"):
+        validate_single_controller_config(cfg)
 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])

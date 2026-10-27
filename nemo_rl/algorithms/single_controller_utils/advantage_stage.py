@@ -48,10 +48,6 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
-from nemo_rl.algorithms.single_controller_utils.sample_table import (
-    TableChunk,
-    summarize_chunk,
-)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -65,7 +61,7 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.utils.train_data_dump import TrainDataDump
+from nemo_rl.utils.train_data_dump import TrainDataDump, WandbTrainData
 
 if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
@@ -106,8 +102,9 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
-    # async_rl.sample_table: summarize each call's rows for the per-step table.
-    sample_table: bool = False
+    # async_rl.log_train_data_to_wandb: the controller's W&B run (id, project,
+    # entity) each stage process logs its rows to.
+    wandb_run: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -162,7 +159,13 @@ class AdvantageStageConfig:
                 if master_config.async_rl.log_full_train_data
                 else None
             ),
-            sample_table=master_config.async_rl.sample_table,
+            wandb_run=(
+                master_config.logger.wandb.model_dump(
+                    include={"id", "project", "entity"}
+                )
+                if master_config.async_rl.log_train_data_to_wandb
+                else None
+            ),
         )
 
     def input_fields(self) -> list[str]:
@@ -192,8 +195,8 @@ class AdvantageStageConfig:
             fields.append(adv_cfg.teacher_logprobs_field)
         if self.is_ppo:
             fields.append(adv_cfg.values_field)
-        if self.train_data_dump_dir is not None:
-            # The dump is the only remaining reader of the raw prompt tokens:
+        if self.train_data_dump_dir is not None or self.wandb_run is not None:
+            # The dump (and its W&B table) is the only remaining reader of the raw prompt tokens:
             # the baseline keys on the group-id tag now, so prompt_ids is not
             # otherwise fetched.
             fields.extend(
@@ -204,8 +207,6 @@ class AdvantageStageConfig:
                     adv_cfg.generation_logprobs_field,
                 ]
             )
-        if self.sample_table:
-            fields.extend([INPUT_LENGTHS, adv_cfg.generation_logprobs_field])
         return list(dict.fromkeys(fields))
 
 
@@ -219,8 +220,8 @@ class AdvantageRequest:
 
     meta: KVBatchMeta
     # Optimizer step these rows belong to, carried because the training dump
-    # names its file after it and the pool has no view of the controller's
-    # counter. Unset when the dump is off, which is the default.
+    # and the W&B table are labelled by it and the pool has no view of the
+    # controller's counter.
     train_step: Optional[int] = None
 
 
@@ -299,9 +300,6 @@ class AdvantageOutcome:
     # Rows this call wrote to its shard's part file, so the controller's merge
     # can tell a missing part from an empty one.
     train_data_dump_rows: int = 0
-    # These rows' sample-table columns when async_rl.sample_table is on: a few
-    # scalars per row, never tensors.
-    sample_table: Optional[TableChunk] = None
 
 
 class AdvantageComputer:
@@ -330,6 +328,11 @@ class AdvantageComputer:
         self._train_data_dump = (
             TrainDataDump(config.train_data_dump_dir, shard_id=shard_id)
             if config.train_data_dump_dir is not None
+            else None
+        )
+        self._train_data_wandb = (
+            WandbTrainData(config.wandb_run, label=f"advantage-{shard_id}")
+            if config.wandb_run is not None
             else None
         )
 
@@ -527,11 +530,10 @@ class AdvantageComputer:
 
         train_data_dump_s = 0.0
         train_data_dump_rows = 0
-        sample_table = None
-        if self._train_data_dump is not None or cfg.sample_table:
-            # What the dump writes and the sample table summarizes.
-            input_lengths = tensor_field(data, INPUT_LENGTHS)
+        if self._train_data_dump is not None or self._train_data_wandb is not None:
+            # The rows the dump writes and the W&B table logs.
             sequences = {
+                "token_ids": tensor_field(data, INPUT_IDS),
                 "token_loss_mask": token_mask,
                 "advantages": advantages,
                 "generation_logprobs": tensor_field(
@@ -544,42 +546,29 @@ class AdvantageComputer:
                 )
             if cfg.teacher_logprobs_required:
                 sequences["teacher_logprobs"] = kwargs["teacher_logprobs"]
-            scalars = {
-                "sample_loss_mask": final_sample_mask,
-                "pre_seq_error_sample_loss_mask": pre_seq_error_sample_mask,
-                "rewards": rewards,
-            }
+            chunk = dict(
+                step=request.train_step,
+                sample_ids=list(meta.sample_ids),
+                tags=meta.tags,
+                input_lengths=tensor_field(data, INPUT_LENGTHS),
+                sequences=sequences,
+                scalars={
+                    "sample_loss_mask": final_sample_mask,
+                    "pre_seq_error_sample_loss_mask": pre_seq_error_sample_mask,
+                    "rewards": rewards,
+                    # Raw column: jagged when the chunk mixes prompt
+                    # lengths, so rows carry no zero padding. Not the
+                    # group-index key the estimator reduces over.
+                    "prompt_ids": data[adv_cfg.prompt_ids_field],
+                },
+            )
             if self._train_data_dump is not None:
-                assert request.train_step is not None
                 dump_started = time.perf_counter()
-                await asyncio.to_thread(
-                    self._train_data_dump.add_chunk,
-                    step=request.train_step,
-                    sample_ids=list(meta.sample_ids),
-                    tags=meta.tags,
-                    input_lengths=input_lengths,
-                    sequences={"token_ids": tensor_field(data, INPUT_IDS), **sequences},
-                    scalars={
-                        **scalars,
-                        # Raw column: jagged when the chunk mixes prompt
-                        # lengths, so rows carry no zero padding. Not the
-                        # group-index key the estimator reduces over.
-                        "prompt_ids": data[adv_cfg.prompt_ids_field],
-                    },
-                )
+                await asyncio.to_thread(self._train_data_dump.add_chunk, **chunk)
                 train_data_dump_s = time.perf_counter() - dump_started
                 train_data_dump_rows = len(meta.sample_ids)
-            if cfg.sample_table:
-                sample_table = summarize_chunk(
-                    sample_ids=list(meta.sample_ids),
-                    tags=meta.tags,
-                    input_lengths=input_lengths,
-                    token_mask=token_mask,
-                    sequences={
-                        k: v for k, v in sequences.items() if k != "token_loss_mask"
-                    },
-                    scalars=scalars,
-                )
+            if self._train_data_wandb is not None:
+                self._train_data_wandb.add_chunk(**chunk)
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
@@ -610,5 +599,4 @@ class AdvantageComputer:
             opd_gap_sum=opd_gap_sum,
             train_data_dump_s=train_data_dump_s,
             train_data_dump_rows=train_data_dump_rows,
-            sample_table=sample_table,
         )

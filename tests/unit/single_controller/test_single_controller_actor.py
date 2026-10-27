@@ -267,8 +267,9 @@ def _stamp_advantage_stage_config(
         advantage_estimator=ctrl._advantage_estimator,
     )
     ctrl._train_data_dump = dump
-    ctrl._sample_table_chunks = []
     ctrl._train_data_dump_rows = 0
+    # Every advantage request carries the trainer step.
+    ctrl._train_steps = getattr(ctrl, "_train_steps", 0)
     # _absorb_advantage_outcome accumulates into these unconditionally, so they
     # have to exist even for the non-OPD tests. Tests that assert on them set
     # their own values after this call.
@@ -1211,7 +1212,6 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._sample_table_chunks = []
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
@@ -1314,7 +1314,6 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._sample_table_chunks = []
     ctrl._is_ppo = False
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._algo_cfg = GRPOConfig(
@@ -1389,7 +1388,6 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._sample_table_chunks = []
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=None)
@@ -1490,7 +1488,6 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._sample_table_chunks = []
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
@@ -1561,7 +1558,6 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._sample_table_chunks = []
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=2.0)
@@ -1626,7 +1622,6 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._sample_table_chunks = []
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=None)
@@ -1737,7 +1732,6 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
     ctrl._train_data_dump = TrainDataDump(str(tmp_path))
-    ctrl._sample_table_chunks = []
     ctrl._timer = Timer()
     ctrl._train_steps = 0
     ctrl._is_ppo = False
@@ -1895,7 +1889,6 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
     ctrl._train_data_dump = None
-    ctrl._sample_table_chunks = []
     ctrl._is_ppo = False
     ctrl._dp_client = FakeDataPlane()
     ctrl._master_config = SimpleNamespace(
@@ -2274,7 +2267,6 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._sample_table_chunks = []
     ctrl._train_fields = single_controller._train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
@@ -4161,7 +4153,6 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._sample_table_chunks = []
     ctrl._is_ppo = True
     ctrl._master_config = SimpleNamespace(
         ppo=SimpleNamespace(
@@ -4227,7 +4218,6 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
     final = tmp_path / "train_data_step1.jsonl"
     if dump_enabled:
         ctrl._train_data_dump = TrainDataDump(str(tmp_path))
-        ctrl._sample_table_chunks = []
         ctrl._train_data_dump.add_chunk(
             step=0,
             sample_ids=meta.sample_ids,

@@ -113,10 +113,6 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     row_group_ids,
     split_meta_by_prompt_group,
 )
-from nemo_rl.algorithms.single_controller_utils.sample_table import (
-    TableChunk,
-    log_sample_table,
-)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
@@ -780,8 +776,6 @@ class SingleControllerActor:
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
-        # async_rl.sample_table: this step's per-sample summary chunks.
-        self._sample_table_chunks: list[TableChunk] = []
         self._train_data_dump = (
             TrainDataDump(self._logger.base_log_dir)
             if self._async_cfg.log_full_train_data
@@ -3645,16 +3639,6 @@ class SingleControllerActor:
                         step_finalizer_rewards
                     ).items():
                         step_metrics[name] = Table(data=data, columns=["Full result"])
-                if self._sample_table_chunks:
-                    # Not awaited: logs in a pool thread while training goes on.
-                    asyncio.get_running_loop().run_in_executor(
-                        None,
-                        log_sample_table,
-                        self._logger,
-                        self._sample_table_chunks,
-                        self._train_steps + 1,
-                    )
-                    self._sample_table_chunks = []
                 try:
                     step_metrics.update(
                         await asyncio.to_thread(self._gen.get_step_metrics)
@@ -5756,9 +5740,7 @@ class SingleControllerActor:
                 meta=shard,
                 # Only the stage still holds the untruncated tensors, so it
                 # writes the dump and needs the step to name the file by.
-                train_step=(
-                    self._train_steps if self._train_data_dump is not None else None
-                ),
+                train_step=self._train_steps,
             )
             for shard in (shards if shards is not None else [meta])
         ]
@@ -5824,8 +5806,6 @@ class SingleControllerActor:
                 "train_data_dump", outcome.train_data_dump_s, should_log=False
             )
         self._train_data_dump_rows += outcome.train_data_dump_rows
-        if outcome.sample_table is not None:
-            self._sample_table_chunks.append(outcome.sample_table)
 
     # ── utility helpers ────────────────────────────────────────────────────
 

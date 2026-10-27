@@ -15,8 +15,10 @@
 """Stream untruncated training tensors without retaining a second step batch."""
 
 import json
+import logging
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -75,21 +77,14 @@ class TrainDataDump:
         sequences: dict[str, torch.Tensor],
         scalars: dict[str, torch.Tensor],
     ) -> None:
-        lengths = input_lengths.detach().cpu().reshape(-1).tolist()
-        # unbind() splits dense and jagged columns alike into per-row tensors.
-        columns = {
-            k: list(v.detach().cpu().unbind())
-            for k, v in {**sequences, **scalars}.items()
-        }
-        if (
-            len(lengths) != len(sample_ids)
-            or any(len(v) != len(sample_ids) for v in columns.values())
-            or (tags is not None and len(tags) != len(sample_ids))
-        ):
-            raise ValueError("Training dump column lengths do not match sample ids")
-        for i, length in enumerate(lengths):
-            if length < 0 or any(length > columns[k][i].shape[0] for k in sequences):
-                raise ValueError("Training dump input length exceeds a sequence column")
+        rows = train_data_rows(
+            step=step,
+            sample_ids=sample_ids,
+            tags=tags,
+            input_lengths=input_lengths,
+            sequences=sequences,
+            scalars=scalars,
+        )
         self.log_dir.mkdir(parents=True, exist_ok=True)
         part = self._part_path(step, self.shard_id)
         # Truncate on the first chunk of a step so a retried step replaces its
@@ -99,17 +94,7 @@ class TrainDataDump:
         mode = "a" if self.step == step else "w"
         self.step = step
         with part.open(mode) as stream:
-            for i, length in enumerate(lengths):
-                row = {
-                    "step": step + 1,
-                    "sample_id": [sample_ids[i]],
-                    "input_lengths": [length],
-                    "metadata": [tags[i] if tags is not None else {}],
-                }
-                for key in sequences:
-                    row[key] = [columns[key][i][:length].tolist()]
-                for key in scalars:
-                    row[key] = [columns[key][i].tolist()]
+            for row in rows:
                 stream.write(
                     json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n"
                 )
@@ -157,3 +142,107 @@ class TrainDataDump:
             part.unlink()
         self.step = None
         self.rows = 0
+
+
+def train_data_rows(
+    *,
+    step: int,
+    sample_ids: list[str],
+    tags: list[dict[str, Any]] | None,
+    input_lengths: torch.Tensor,
+    sequences: dict[str, torch.Tensor],
+    scalars: dict[str, torch.Tensor],
+) -> list[dict[str, Any]]:
+    """One chunk's training-data rows in the legacy singleton-batch shape.
+
+    Sequence columns are trimmed to each row's input length; scalars are kept as
+    given. Shared by the JSONL dump and the W&B table, so both hold the same rows.
+    """
+    lengths = input_lengths.detach().cpu().reshape(-1).tolist()
+    # unbind() splits dense and jagged columns alike into per-row tensors.
+    columns = {
+        k: list(v.detach().cpu().unbind()) for k, v in {**sequences, **scalars}.items()
+    }
+    if (
+        len(lengths) != len(sample_ids)
+        or any(len(v) != len(sample_ids) for v in columns.values())
+        or (tags is not None and len(tags) != len(sample_ids))
+    ):
+        raise ValueError("Training dump column lengths do not match sample ids")
+    for i, length in enumerate(lengths):
+        if length < 0 or any(length > columns[k][i].shape[0] for k in sequences):
+            raise ValueError("Training dump input length exceeds a sequence column")
+    rows = []
+    for i, length in enumerate(lengths):
+        row = {
+            "step": step + 1,
+            "sample_id": [sample_ids[i]],
+            "input_lengths": [length],
+            "metadata": [tags[i] if tags is not None else {}],
+        }
+        for key in sequences:
+            row[key] = [columns[key][i][:length].tolist()]
+        for key in scalars:
+            row[key] = [columns[key][i].tolist()]
+        rows.append(row)
+    return rows
+
+
+_log = logging.getLogger(__name__)
+
+
+class WandbTrainData:
+    """Log this process's training-data rows to the controller's W&B run (shared mode).
+
+    ``add_chunk`` takes ``TrainDataDump.add_chunk``'s arguments and returns at once;
+    one background thread attaches to the run and logs each chunk as a table. Array
+    cells are JSON strings: wandb.Table type-checks every element of a list cell.
+    """
+
+    def __init__(self, run: dict[str, Any], *, label: str) -> None:
+        self._target = run  # id, project, entity of the controller's run
+        self._label = label
+        self._run: Any = None
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=label)
+
+    def add_chunk(self, **chunk: Any) -> None:
+        self._executor.submit(self._log, chunk)
+
+    def _log(self, chunk: dict[str, Any]) -> None:
+        try:
+            # Deferred: wandb loads only in processes that log the table.
+            import wandb
+
+            if self._run is None:
+                if wandb.run is not None and wandb.run.id == self._target["id"]:
+                    self._run = wandb.run  # the controller, which owns the run
+                else:
+                    self._run = wandb.init(
+                        **self._target,
+                        settings=wandb.Settings(
+                            mode="shared",
+                            x_primary=False,
+                            x_label=self._label,
+                            x_update_finish_state=False,
+                        ),
+                    )
+                self._run.define_metric(
+                    "train/train_data", step_metric="train/train_data_step"
+                )
+            rows = train_data_rows(**chunk)
+            columns = list(rows[0])
+            table = wandb.Table(
+                columns=columns,
+                data=[[_cell(row[column]) for column in columns] for row in rows],
+            )
+            self._run.log(
+                {"train/train_data": table, "train/train_data_step": rows[0]["step"]}
+            )
+        except Exception:  # noqa: BLE001 - a debug table must not stop training
+            _log.warning("training-data rows not logged to W&B", exc_info=True)
+
+
+def _cell(value: Any) -> Any:
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]  # the dump's singleton-batch shape
+    return json.dumps(value) if isinstance(value, (list, dict)) else value

@@ -479,9 +479,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
     log_full_train_data: bool = False
-    # Log a per-step table of trained samples (ids, rewards, response-token
-    # means of logprobs and advantages) to W&B and NeMo Lens logs.
-    sample_table: bool = False
+    # Log the log_full_train_data rows to W&B (train/train_data) from each
+    # advantage-stage process. Needs logger.wandb_enabled.
+    log_train_data_to_wandb: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
@@ -1390,6 +1390,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             f"({train_global_batch_size}) so that one RL step maps to exactly one "
             "optimizer.step. Multi-mini-step inside a single RL step is not "
             "supported on the SC split path."
+        )
+
+    if async_config.log_train_data_to_wandb and not master_config.logger.wandb_enabled:
+        raise ValueError(
+            "async_rl.log_train_data_to_wandb logs training data to the run's W&B "
+            "run; set logger.wandb_enabled=true as well."
         )
 
     required_capacity = required_buffer_capacity_for_config(

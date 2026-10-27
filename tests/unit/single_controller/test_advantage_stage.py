@@ -33,6 +33,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils import advantage_stage
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     SHARD_INVARIANT_ESTIMATORS,
     AdvantageComputer,
@@ -44,7 +45,6 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
-from nemo_rl.algorithms.single_controller_utils.sample_table import merge_table_chunks
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -484,8 +484,6 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         # disk shard-side.
         "train_data_dump_s",
         "train_data_dump_rows",
-        # The sample table's per-row scalars, not the tensors they summarize.
-        "sample_table",
     }
 
 
@@ -593,7 +591,7 @@ def _controller(
     *,
     fail: bool = False,
     dump_dir: str | None = None,
-    sample_table: bool = False,
+    wandb_run: dict | None = None,
     opd_full_enabled: bool = False,
     seq_logprob_error_threshold: float | None = None,
 ):
@@ -628,7 +626,7 @@ def _controller(
         message_level_advantage_penalties_enabled=False,
         shardable=estimator_name in SHARD_INVARIANT_ESTIMATORS,
         train_data_dump_dir=dump_dir,
-        sample_table=sample_table,
+        wandb_run=wandb_run,
     )
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
     ctrl._advantage_estimator = estimator
@@ -639,7 +637,6 @@ def _controller(
     ctrl._train_data_dump = TrainDataDump(dump_dir) if dump_dir is not None else None
     ctrl._timer = Timer()
     ctrl._train_data_dump_rows = 0
-    ctrl._sample_table_chunks = []
     ctrl._train_steps = 0
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._advantage_actors = [
@@ -796,31 +793,30 @@ def test_training_dump_is_complete_however_the_stage_was_split(
 
 
 @pytest.mark.parametrize("num_actors", [0, 3])
-def test_sample_table_has_every_row_however_the_stage_was_split(
-    num_actors: int,
+def test_each_stage_process_logs_its_own_rows_to_wandb(
+    monkeypatch, num_actors: int
 ) -> None:
-    """Each shard summarizes its own rows; together they are the whole cohort once."""
-    rows = _rows()
-    rows["s0"]["token_mask"][:2] = 0  # prompt-like positions stay out of the means
-    store = _RowStore(rows)
-    ctrl = _controller("grpo", num_actors, store, sample_table=True)
+    """Every row reaches W&B once, from the call that computed it, labelled by shard."""
+    logged = []
+    monkeypatch.setattr(
+        advantage_stage.WandbTrainData,
+        "add_chunk",
+        lambda self, **chunk: logged.append((self._target["id"], self._label, chunk)),
+    )
+    store = _RowStore(_rows())
+    ctrl = _controller(
+        "grpo", num_actors, store, wandb_run={"id": "r", "project": "p", "entity": None}
+    )
     asyncio.run(ctrl._advantage_stage(_pool_meta()))
 
-    columns, table = merge_table_chunks(ctrl._sample_table_chunks)
-    by_id = {row[0]: dict(zip(columns, row)) for row in table}
-    total = NUM_GROUPS * GROUP_SIZE
-    assert sorted(by_id) == sorted(f"s{i}" for i in range(total))
-    for sample_id, row in by_id.items():
-        source = store.rows[sample_id]
-        keep = source["token_mask"].bool()
-        assert row["response_tokens"] == int(keep.sum())
-        assert row["mean_advantages"] == pytest.approx(
-            float(source["advantages"][keep].mean())
-        )
-        assert row["mean_generation_logprobs"] == pytest.approx(
-            float(source["generation_logprobs"][keep].mean())
-        )
-        assert row["rewards"] == pytest.approx(float(source["total_reward"]))
+    sample_ids = sorted(s for _, _, chunk in logged for s in chunk["sample_ids"])
+    assert sample_ids == sorted(f"s{i}" for i in range(NUM_GROUPS * GROUP_SIZE))
+    labels = {label for _, label, _ in logged}
+    assert labels == ({f"advantage-{i}" for i in range(num_actors)} or {"advantage-0"})
+    assert all(
+        chunk["step"] == 0 and "token_ids" in chunk["sequences"]
+        for _, _, chunk in logged
+    )
 
 
 def test_unshardable_estimator_sends_the_whole_batch_to_one_actor() -> None:

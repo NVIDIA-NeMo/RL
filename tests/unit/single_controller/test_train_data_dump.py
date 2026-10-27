@@ -3,11 +3,12 @@
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
-from nemo_rl.utils.train_data_dump import TrainDataDump
+from nemo_rl.utils.train_data_dump import TrainDataDump, WandbTrainData
 
 
 def test_chunks_keep_masked_rows_and_long_sequences_until_commit(tmp_path):
@@ -361,3 +362,49 @@ def test_nonfinite_logprobs_are_null_in_strict_json(tmp_path):
     row = json.loads(text, parse_constant=reject_nonfinite)
     assert row["prev_logprobs"] == [[0.0, None, None, None]]
     assert torch.isneginf(values[0, 1])
+
+
+def _chunk() -> dict:
+    return dict(
+        step=0,
+        sample_ids=["s0"],
+        tags=[{"group_id": "g"}],
+        input_lengths=torch.tensor([3]),
+        sequences={
+            "token_ids": torch.tensor([[7, 8, 9, 0]]),
+            "advantages": torch.tensor([[0.0, 0.5, float("nan"), 0.0]]),
+        },
+        scalars={"rewards": torch.tensor([1.0])},
+    )
+
+
+def test_wandb_rows_equal_the_dump_rows_from_memory(monkeypatch):
+    import wandb
+
+    init = MagicMock()
+    init.return_value.id = "run1"
+    monkeypatch.setattr(wandb, "init", init)
+    monkeypatch.setattr(wandb, "run", None)
+    writer = WandbTrainData(
+        {"id": "run1", "project": "p", "entity": None}, label="advantage-1"
+    )
+
+    writer.add_chunk(**_chunk())
+    writer.add_chunk(**_chunk())
+    writer._executor.shutdown(wait=True)
+
+    # One shared-mode attachment per process, labelled by the shard.
+    assert init.call_count == 1
+    settings = init.call_args.kwargs["settings"]
+    assert init.call_args.kwargs["id"] == "run1" and settings.mode == "shared"
+    assert settings.x_primary is False and settings.x_label == "advantage-1"
+    first = init.return_value.log.call_args_list[0].args[0]
+    assert first["train/train_data_step"] == 1
+    table = first["train/train_data"]
+    (row,) = [dict(zip(table.columns, data)) for data in table.data]
+    # The dump's row for the same chunk: singleton lists unwrapped, arrays as
+    # JSON strings, sequences trimmed to the row's length.
+    assert row["sample_id"] == "s0" and row["rewards"] == 1.0
+    assert json.loads(row["token_ids"]) == [7, 8, 9]
+    assert json.loads(row["advantages"].replace("NaN", "null")) == [0.0, 0.5, None]
+    assert json.loads(row["metadata"]) == {"group_id": "g"}

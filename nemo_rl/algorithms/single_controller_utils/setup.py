@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -1102,6 +1103,18 @@ def setup_single_controller(
         logged by the SC actor).
     """
     validate_single_controller_config(master_config)
+    if master_config.async_rl.log_train_data_to_wandb:
+        # Each advantage-stage process attaches to the controller's W&B run in
+        # shared mode, so the run id is fixed here, before any of them is built,
+        # and the controller's run is the shared-mode primary.
+        wandb_cfg = master_config.logger.wandb
+        wandb_cfg.id = wandb_cfg.id or uuid.uuid4().hex[:8]
+        wandb_cfg.settings = {
+            **(getattr(wandb_cfg, "settings", None) or {}),
+            "mode": "shared",
+            "x_primary": True,
+            "x_label": "controller",
+        }
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         master_config.reward_penalties,
         tokenizer,
