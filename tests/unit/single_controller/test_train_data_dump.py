@@ -361,3 +361,36 @@ def test_nonfinite_logprobs_are_null_in_strict_json(tmp_path):
     row = json.loads(text, parse_constant=reject_nonfinite)
     assert row["prev_logprobs"] == [[0.0, None, None, None]]
     assert torch.isneginf(values[0, 1])
+
+
+def _chunk(step: int, sample_id: str) -> dict[str, Any]:
+    return dict(
+        step=step,
+        sample_ids=[sample_id],
+        tags=[{"group_id": "g"}],
+        input_lengths=torch.tensor([3]),
+        sequences={"token_ids": torch.tensor([[7, 8, 9, 0]])},
+        scalars={"rewards": torch.tensor([1.0])},
+    )
+
+
+def test_background_dump_writes_what_the_sync_dump_writes(tmp_path: Path) -> None:
+    sync, background = tmp_path / "sync", tmp_path / "background"
+    TrainDataDump(str(sync)).add_chunk(**_chunk(0, "s0"))
+    writer = TrainDataDump(str(background), background=True)
+    # Three chunks: the third waits for the first (at most two pending), and
+    # a retried step still truncates the previous attempt's part.
+    for step, sample_id in [(0, "stale"), (1, "x"), (0, "s0")]:
+        writer.add_chunk(**_chunk(step, sample_id))
+    writer.flush()
+    for root in (sync, background):
+        TrainDataDump(str(root)).finish_step(0, expected_rows=1)
+    assert (background / "train_data_step1.jsonl").read_text() == (
+        sync / "train_data_step1.jsonl"
+    ).read_text()
+
+
+def test_background_dump_still_rejects_a_bad_chunk_at_once(tmp_path: Path) -> None:
+    writer = TrainDataDump(str(tmp_path), background=True)
+    with pytest.raises(ValueError, match="input length exceeds"):
+        writer.add_chunk(**{**_chunk(0, "s0"), "input_lengths": torch.tensor([9])})

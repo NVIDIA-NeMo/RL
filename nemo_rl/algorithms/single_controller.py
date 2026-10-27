@@ -3675,6 +3675,19 @@ class SingleControllerActor:
 
                 if self._train_data_dump is not None:
                     with self._timer.time("train_data_dump"):
+                        # The stage writes its chunks in the background: every
+                        # writer finishes this step's parts before the merge.
+                        if self._advantage_actors:
+                            await asyncio.gather(
+                                *(
+                                    actor.flush_train_data_dump.remote()
+                                    for actor in self._advantage_actors
+                                )
+                            )
+                        else:
+                            await asyncio.to_thread(
+                                self._advantage_computer.flush_train_data_dump
+                            )
                         await asyncio.to_thread(
                             self._train_data_dump.finish_step,
                             self._train_steps,
