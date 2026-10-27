@@ -224,6 +224,7 @@ class TQValue(TQDriverMixin, Value):
                 loss_fn=loss_fn,
                 gbs=self.cfg["train_global_batch_size"] if gbs is None else gbs,
                 mbs=self.cfg["train_micro_batch_size"] if mbs is None else mbs,
+                **trace_context_kwargs(),
             )
         )
 
@@ -252,6 +253,7 @@ class TQValue(TQDriverMixin, Value):
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=_REPLICATED_AXES,
             output_is_replicated=_REPLICATED_AXES,
+            common_kwargs=trace_context_kwargs(),
         )
         self.worker_group.get_all_worker_results(futures)
 
@@ -260,6 +262,7 @@ class TQValue(TQDriverMixin, Value):
         results = ray.get(
             self.worker_group.run_all_workers_single_data(
                 "finish_train_step_presharded",
+                **trace_context_kwargs(),
             )
         )
         return _aggregate_train_results([r for r in results if r["is_replica_leader"]])
@@ -267,5 +270,7 @@ class TQValue(TQDriverMixin, Value):
     def abort_train_step(self) -> None:
         """Discard the open update on every worker without stepping."""
         ray.get(
-            self.worker_group.run_all_workers_single_data("abort_train_step_presharded")
+            self.worker_group.run_all_workers_single_data(
+                "abort_train_step_presharded", **trace_context_kwargs()
+            )
         )
