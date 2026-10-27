@@ -134,6 +134,22 @@ def test_check_nccl_reshard_refit_support_accepts_vllm_native_dp(
     check_nccl_reshard_refit_support(config)
 
 
+@pytest.mark.parametrize("tensor_parallel_size,expert_parallel_size", [(2, 3), (4, 2)])
+def test_check_nccl_reshard_refit_support_rejects_invalid_vllm_native_dp(
+    tensor_parallel_size: int, expert_parallel_size: int
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update(
+        {
+            "tensor_parallel_size": tensor_parallel_size,
+            "expert_parallel_size": expert_parallel_size,
+        }
+    )
+
+    with pytest.raises(ValueError, match="expert_parallel_size must be a multiple"):
+        check_nccl_reshard_refit_support(config)
+
+
 def test_check_nccl_reshard_refit_support_rejects_megatron_etp_with_vllm() -> None:
     config = _valid_nccl_reshard_config()
     config.policy["megatron_cfg"]["expert_tensor_parallel_size"] = 2
