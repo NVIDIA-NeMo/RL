@@ -27,6 +27,7 @@ from ray import cloudpickle
 from nemo_rl.environments.nemo_gym import NemoGymShardSet, as_nemo_gym_shard_set
 from nemo_rl.environments.nemo_gym_shards import ShardSetupError
 from nemo_rl.experience.failures import GymRowFailure, GymTransportError
+from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 from nemo_rl.experience.rollouts import (
     _bucket_nemo_gym_rows_by_instance,
     _merge_nemo_gym_instance_streams,
@@ -265,6 +266,34 @@ def test_materialized_sharded_dispatch_requires_an_explicit_taskset_route():
             shard_set,
             num_generations=2,
         )
+
+
+def test_materialized_checkpoint_selection_keeps_stable_replica_ownership() -> None:
+    first, second, other = (
+        _FakeActor("first"),
+        _FakeActor("second"),
+        _FakeActor("other"),
+    )
+    shard_set = _shard_set(
+        {"tools": [first, second], "other": [other]},
+        {"workplace_environment": "tools", "other_environment": "other"},
+    )
+    shard_set.environment_server_routes = {"workplace:train": "workplace_environment"}
+    impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._task_to_env = {"nemo_gym": shard_set}
+    prompt = {
+        "extra_env_info": _materialized_rows(["workplace:train"], num_generations=1)[0]
+    }
+
+    first_owner = impl.select_checkpoint_instance(prompt)
+    second_owner = impl.select_checkpoint_instance(prompt)
+
+    assert first_owner == "tools/replica-0"
+    assert second_owner == "tools/replica-1"
+    assert shard_set.handle_for_checkpoint_instance(first_owner) is first
+    assert shard_set.handle_for_checkpoint_instance(second_owner) is second
+    assert impl.select_checkpoint_instance(prompt) == first_owner
+    assert "agent_ref" not in prompt["extra_env_info"]
 
 
 def test_groups_follow_their_agent_to_its_shard():

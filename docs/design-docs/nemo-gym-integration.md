@@ -74,6 +74,8 @@ NeMo RL accepts Gym's materialized task rows, which contain `task_id` and `task_
 
 RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn` or `single_agent_turn_legacy`. Existing flat rows remain supported through `agent_ref.name` or `task_source`, including through `legacy_agent`.
 
+For materialized rows, use `task_id.taskset` as the key in `on_policy_distillation.teacher_model_by_agent_name`, `grpo.length_penalty.agent_overrides`, and `rollout_recovery.task_source_granularity_overrides`. Quote taskset names containing a colon in YAML, for example `"weather:train"`. Length and recovery overrides may be sparse: unmatched tasksets keep the configured defaults. Teacher selection uses `default_teacher_alias` when configured, unless `strict_agent_name_match` requires an explicit match. Recovery ignores agent overrides for materialized rows; flat rows retain agent-over-task-source precedence.
+
 ### Shard NeMo Gym across nodes
 
 NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.

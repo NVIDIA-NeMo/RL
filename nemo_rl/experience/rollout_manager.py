@@ -44,7 +44,10 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
-from nemo_rl.environments.nemo_gym_task import get_nemo_gym_task_input
+from nemo_rl.environments.nemo_gym_task import (
+    get_nemo_gym_attribution_key,
+    get_nemo_gym_task_input,
+)
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -181,11 +184,9 @@ _MAX_PARKED_REDISPATCH_BACKOFF_S = 5.0
 
 def _nemo_gym_metric_namespace(row: Mapping[str, Any]) -> str:
     """Return the best available namespace for NeMo-Gym rollout metrics."""
-    agent_ref = row.get("agent_ref")
-    if isinstance(agent_ref, Mapping):
-        agent_name = agent_ref.get("name")
-        if isinstance(agent_name, str) and agent_name:
-            return agent_name
+    attribution_key = get_nemo_gym_attribution_key(row)
+    if attribution_key is not None:
+        return attribution_key
 
     task_source = row.get("task_source")
     if isinstance(task_source, str) and task_source:
@@ -1177,17 +1178,23 @@ class AsyncNemoGymRolloutImpl:
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
 
-        resolved_agent_ref = rollout_inputs[0].get("agent_ref")
-        if not isinstance(resolved_agent_ref, dict):
-            raise ValueError("NeMo-Gym did not return a resolved agent_ref")
+        attribution_key = get_nemo_gym_attribution_key(rollout_inputs[0])
+        if attribution_key is None:
+            raise ValueError("NeMo-Gym did not return a resolved attribution key")
         if any(
-            row.get("agent_ref") != resolved_agent_ref for row in rollout_inputs[1:]
+            get_nemo_gym_attribution_key(row) != attribution_key
+            for row in rollout_inputs[1:]
         ):
             raise ValueError(
-                "NeMo-Gym resolved one prompt group to inconsistent agent_ref values"
+                "NeMo-Gym resolved one prompt group to inconsistent attribution keys"
             )
         record_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
-        record_extra_env_info["agent_ref"] = copy.deepcopy(resolved_agent_ref)
+        record_extra_env_info["attribution_key"] = attribution_key
+        resolved_agent_ref = rollout_inputs[0].get("agent_ref")
+        if resolved_agent_ref is not None:
+            record_extra_env_info["agent_ref"] = copy.deepcopy(resolved_agent_ref)
+        else:
+            record_extra_env_info.pop("agent_ref", None)
 
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
@@ -1467,7 +1474,22 @@ class AsyncNemoGymRolloutImpl:
                 if rowidx in received:
                     raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
                 received.add(rowidx)
-                inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
+                input_row = inputs_by_rowidx[rowidx]
+                if resolved_agent_ref is not None:
+                    input_row["agent_ref"] = resolved_agent_ref
+                    result["agent_ref"] = copy.deepcopy(resolved_agent_ref)
+                else:
+                    input_row.pop("agent_ref", None)
+                    result.pop("agent_ref", None)
+                attribution_key = get_nemo_gym_attribution_key(result)
+                if attribution_key is None:
+                    attribution_key = get_nemo_gym_attribution_key(input_row)
+                if attribution_key is None:
+                    raise ValueError(
+                        "NeMo-Gym did not return a resolved attribution key"
+                    )
+                input_row["attribution_key"] = attribution_key
+                result["attribution_key"] = attribution_key
                 if "receipt" in result:
                     result["reward_checks"] = compute_reward_checks(
                         result["full_result"],
@@ -1498,10 +1520,6 @@ class AsyncNemoGymRolloutImpl:
                     # Completion callbacks are token-capture receipt-only, making this
                     # conversion lightweight and safe to repeat during group metrics.
                     row_completions, _ = self._results_to_completions([result])
-                    assert row_completions[0].env_extras is not None
-                    row_completions[0].env_extras["agent_ref"] = copy.deepcopy(
-                        resolved_agent_ref
-                    )
                     await on_completion(rowidx, row_completions[0])
                 if timing_metrics is not None:
                     env_timing_metrics = timing_metrics
@@ -1842,8 +1860,15 @@ class AsyncNemoGymRolloutImpl:
         )
         completions = []
         for result in results:
+            env_extras = dict(completion_extras(result["full_result"]))
+            attribution_key = get_nemo_gym_attribution_key(result)
+            if attribution_key is not None:
+                env_extras["attribution_key"] = attribution_key
+            if result.get("agent_ref") is not None:
+                env_extras["agent_ref"] = copy.deepcopy(result["agent_ref"])
+            else:
+                env_extras.pop("agent_ref", None)
             if "receipt" in result:
-                env_extras = dict(completion_extras(result["full_result"]))
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
                 if self._forest_training:
@@ -1874,7 +1899,7 @@ class AsyncNemoGymRolloutImpl:
             completions.append(
                 Completion(
                     message_log=result["message_log"],
-                    env_extras=completion_extras(result["full_result"]),
+                    env_extras=env_extras,
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
                 )
@@ -2906,10 +2931,9 @@ class RolloutManager:
             resolved_agent_name = (
                 agent_ref.get("name") if isinstance(agent_ref, dict) else None
             )
-            if not isinstance(resolved_agent_name, str) or not resolved_agent_name:
-                raise ValueError(
-                    "token-capture completion requires resolved agent_ref.name"
-                )
+            attribution_key = get_nemo_gym_attribution_key(env_extras)
+            if attribution_key is None:
+                raise ValueError("token-capture completion requires an attribution key")
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
@@ -2965,6 +2989,7 @@ class RolloutManager:
                     reward=completion.reward,
                     mask_sample=mask_sample,
                     resolved_agent_name=resolved_agent_name,
+                    attribution_key=attribution_key,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
                     logical_selection=selection,
@@ -2998,6 +3023,7 @@ class RolloutManager:
                     reward=completion.reward,
                     mask_sample=mask_sample,
                     resolved_agent_name=resolved_agent_name,
+                    attribution_key=attribution_key,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
                     logical_selection=selection,
@@ -3077,6 +3103,9 @@ class RolloutManager:
                 resolved_agent_name=self._recovery_ledger.get_group(
                     group_id
                 ).resolved_agent_name,
+                attribution_key=self._recovery_ledger.get_group(
+                    group_id
+                ).attribution_key,
             )
             assert_metadata_only(request)
             return request, rollout_metrics
