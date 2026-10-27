@@ -2602,7 +2602,6 @@ def test_spinup_forwards_job_identity_to_gym_servers(monkeypatch):
 
     import nemo_gym.cli as gym_cli
     import nemo_gym.rollout_collection as gym_rollout_collection
-
     from nemo.lens import derive_nv_dl_run_uuid
     from nemo.lens.resources.attributes import parse_otel_resource_attributes
     from nemo.lens.semconv import NV_DL_RUN_UUID
