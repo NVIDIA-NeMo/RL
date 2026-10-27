@@ -1474,6 +1474,21 @@ class TQReplayBuffer:
         )
         return meta
 
+    async def drop_committed_group(
+        self, cut: DataPlaneMutationCut, group_id: str
+    ) -> None:
+        """Drop a committed (ready) slot under the caller's mutation cut.
+
+        For a group the caller declines to train on after it committed:
+        :meth:`abort` keeps ready slots, and :meth:`remove_group` takes its own
+        cut. The caller has already cleared the group's canonical and staging
+        rows in the same cut, so no snapshot sees the slot without its rows.
+
+        Raises:
+            ValueError: ``group_id`` has no live slot.
+        """
+        await self._remove_groups_unlocked(cut, [group_id], clear_data_plane=False)
+
     def abort(self, group_id: str) -> bool:
         """Drop an unready slot whose dispatch failed or was cancelled.
 
