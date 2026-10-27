@@ -53,9 +53,8 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import _initial_grpo_save_state
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
-from nemo_rl.algorithms.single_controller import (
-    SingleControllerActor,
-)
+from nemo_rl.algorithms.rollout_checkpointing import DataPlaneRolloutCheckpointing
+from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
@@ -327,6 +326,26 @@ def _controller_for(
         allow_restart_only_servers=allow_restart_only_servers,
     )
     return controller
+
+
+def _environment_phase_checkpointing(
+    environment_checkpoint: Any,
+) -> DataPlaneRolloutCheckpointing:
+    """Rollout checkpointing with only what the environment phase and commit use."""
+    return DataPlaneRolloutCheckpointing(
+        host=None,  # type: ignore[arg-type]
+        master_config=None,  # type: ignore[arg-type]
+        dp_client=None,
+        partition_id="rollout_data",
+        buffer=None,  # type: ignore[arg-type]
+        rollout_manager=None,  # type: ignore[arg-type]
+        checkpointer=None,  # type: ignore[arg-type]
+        timeout=None,  # type: ignore[arg-type]
+        data_plane_barrier=DataPlaneCheckpointBarrier(),
+        environment_checkpoint=environment_checkpoint,
+        bootstrap_identity=None,
+        teacher_coordinator=None,
+    )
 
 
 def _gym_environment_for(
@@ -749,6 +768,7 @@ def test_turn_trainer_checkpoint_leaves_gym_state_to_the_rollout_snapshot(
         controller._environment_checkpoint = _gym_environment_for(
             controller, gym_coordinator(gym_actor)
         )
+        controller._rollout_checkpointing = controller._build_rollout_checkpointing()
         try:
             await controller._save_checkpoint(
                 {"loss": 1.0},
@@ -766,8 +786,11 @@ def test_turn_trainer_checkpoint_leaves_gym_state_to_the_rollout_snapshot(
     # A trainer checkpoint never holds Gym state, and never calls Gym.
     assert gym_actor.calls == []
     assert not list(checkpoint.glob("gym*"))
-    assert controller._rollout_checkpoint_wakeup.is_set()
-    assert controller._last_rollout_snapshot_mutation_version is None
+    assert controller._rollout_checkpointing._rollout_checkpoint_wakeup.is_set()
+    assert (
+        controller._rollout_checkpointing._last_rollout_snapshot_mutation_version
+        is None
+    )
 
 
 def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> None:
@@ -833,11 +856,12 @@ def test_gym_phase_stops_when_a_train_step_starts_committing(
     async def exercise() -> None:
         actor = FakeGymActor(exported_episodes=(), block_commit=True)
         controller = _controller_for(gym_coordinator(actor))
-        controller._optimizer_commit_in_progress = False
-        controller._optimizer_commit_started = asyncio.Event()
+        rollout_checkpointing = _environment_phase_checkpointing(
+            controller._environment_checkpoint
+        )
         async with contextlib.AsyncExitStack() as stack:
             phase = asyncio.create_task(
-                controller._enter_environment_phase_unless_a_step_commits(
+                rollout_checkpointing._enter_environment_phase_unless_a_step_commits(
                     stack,
                     _gym_commit(controller, tmp_path, checkpoint_id="save-1"),
                 )
@@ -846,7 +870,7 @@ def test_gym_phase_stops_when_a_train_step_starts_committing(
                 actor.commit_started.wait(), timeout=_ASYNC_TEST_TIMEOUT_S
             )
             if step_commits:
-                controller._begin_optimizer_commit()
+                rollout_checkpointing._begin_optimizer_commit()
             else:
                 actor.release_commit.set()
             entered, gym_commit = await asyncio.wait_for(

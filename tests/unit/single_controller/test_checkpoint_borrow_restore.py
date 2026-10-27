@@ -27,19 +27,22 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DATA_PLANE_CHECKPOINT_DIR,
     REPLAY_BUFFER_METADATA_FILENAME,
     DataPlaneCheckpointBarrier,
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.rollout_checkpointing import DataPlaneRolloutCheckpointing
 from nemo_rl.algorithms.single_controller import (
-    DATA_PLANE_CHECKPOINT_DIR,
     SingleControllerActor,
+    _ControllerRolloutHost,
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.environment_checkpoint import NoEnvironmentCheckpoint
 from nemo_rl.experience.failures import RolloutDataFailure
 from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.experience.rollout_manager import (
@@ -264,6 +267,27 @@ def _controller(
     return controller
 
 
+def _snapshot_writer(controller: Any) -> DataPlaneRolloutCheckpointing:
+    """Rollout checkpointing over ``controller``, with what a snapshot cut reads."""
+    return DataPlaneRolloutCheckpointing(
+        host=_ControllerRolloutHost(controller),
+        master_config=SimpleNamespace(  # type: ignore[arg-type]
+            async_rl=controller._async_cfg,
+            token_capture=controller._master_config.token_capture,
+        ),
+        dp_client=controller._dp_client,
+        partition_id=controller._partition_id,
+        buffer=controller._buffer,
+        rollout_manager=controller._rollout_manager,
+        checkpointer=None,  # type: ignore[arg-type]
+        timeout=None,  # type: ignore[arg-type]
+        data_plane_barrier=controller._data_plane_checkpoint_barrier,
+        environment_checkpoint=NoEnvironmentCheckpoint(),
+        bootstrap_identity=None,
+        teacher_coordinator=controller._teacher_coordinator,
+    )
+
+
 async def _wait_for(predicate, description: str, pump: asyncio.Task[None]) -> None:
     deadline = asyncio.get_running_loop().time() + _TIMEOUT_S
     while not predicate():
@@ -341,8 +365,11 @@ async def _exercise_round_trip(
 
     checkpoint_path = tmp_path / "step_0"
     checkpoint_path.mkdir()
+    rollout_checkpointing = _snapshot_writer(first)
     async with first._data_plane_checkpoint_barrier.checkpoint() as cut:
-        snapshot = await first._capture_rollout_checkpoint_cut(cut, checkpoint_path)
+        snapshot = await rollout_checkpointing._capture_rollout_checkpoint_cut(
+            cut, checkpoint_path
+        )
     assert snapshot.replay_metadata is not None
     assert snapshot.rollout_recovery_payload is not None
     torch.save(
