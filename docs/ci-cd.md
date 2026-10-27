@@ -11,7 +11,7 @@ Tests are organized into levels of increasing scope and cost:
 | **docs** | Doctests only, reuses pre-built main container (skips build); PRs to a release branch (e.g. `r0.8.0`) reuse that branch's container, same as Lfast | `CI:docs` label |
 | **L0** | Doctests + unit tests (3 parallel suites: Generation, Policy, Other) | `CI:L0` label |
 | **L1** | Doctests + unit tests + functional tests (GPU) | `CI:L1` label, push to main/merge-group |
-| **L2** | Same as L1 today (planned: L1 + convergence tests) | `CI:L2` label |
+| **L2** | Same as L1 today (plan to add convergence tests) | `CI:L2` label |
 | **Lfast** | Fast unit + functional tests, reuses pre-built main container (skips build); PRs to a release branch (e.g. `r0.8.0`) reuse that branch's container, which is published only by builds of the release branch itself (pushes after merges), never by PR builds; until the first such build exists, Lfast on that branch cannot pull its image | `CI:Lfast` label |
 
 **Defaults:**
