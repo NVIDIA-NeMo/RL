@@ -307,7 +307,7 @@ loss_fn:
   ratio_clip_min: 0.2
   ratio_clip_max: 0.28
   ratio_clip_c: 10
-  token_level_loss: true
+  normalization: global_token_mean
   positive_example_nll_weight: 0.0
 
 value_loss_fn:

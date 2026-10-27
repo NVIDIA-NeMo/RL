@@ -564,10 +564,13 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
             "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
         )
     loss = master_config.loss_fn
-    if not loss.force_on_policy_ratio or not loss.token_level_loss:
+    if (
+        not loss.force_on_policy_ratio
+        or loss.resolved_normalization != "global_token_mean"
+    ):
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
-            "and token_level_loss=true"
+            "and normalization=global_token_mean (legacy token_level_loss=true)"
         )
     if master_config.grpo.adv_estimator.name != "grpo" or loss.use_kl_in_reward:
         raise ValueError(
