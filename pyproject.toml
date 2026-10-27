@@ -469,6 +469,9 @@ override-dependencies = [
   "llguidance>=1.7.0,<1.8.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
+  # Security fix in filelock 4.2.1. multi-storage-client (via megatron-core[dev]) caps filelock<4 but only
+  # uses the basic FileLock/Timeout API, which is unchanged in 4.x; an override is needed to lift that cap.
+  "filelock>=4.2.1",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
