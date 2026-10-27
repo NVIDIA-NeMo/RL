@@ -296,6 +296,8 @@ env:
     uv_venv_dir: "${oc.env:PERSISTENT_CACHE}/gym_venvs"
     skip_venv_if_present: true
     num_gpu_nodes: 7
+    # Gym defaults to 600 s; the nl2bash judge (Qwen3-235B FP8) takes ~760 s to start on H100.
+    server_spinup_timeout_seconds: 1800
     port_range_low: 5000
     port_range_high: 5999
     invalid_tool_call_patterns:
