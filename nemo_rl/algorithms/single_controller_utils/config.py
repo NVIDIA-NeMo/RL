@@ -479,6 +479,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
     log_full_train_data: bool = False
+    # Log a per-step table of trained samples (ids, rewards, response-token
+    # means of logprobs and advantages) to W&B and NeMo Lens logs.
+    sample_table: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
