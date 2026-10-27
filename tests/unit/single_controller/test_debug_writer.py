@@ -484,3 +484,44 @@ def test_external_writer_missing_a_hook_fails_at_construction(tmp_path: Path) ->
     cfg = DebugWriterConfig(target=f"{__name__}._IncompleteWriter")
     with pytest.raises(TypeError, match="_publish_step"):
         make_debug_writer(cfg, str(tmp_path))
+
+
+def test_background_dump_writes_what_the_sync_dump_writes(
+    tmp_path: Path, chunk: TrainChunk
+) -> None:
+    sync, background = tmp_path / "sync", tmp_path / "background"
+    sync_receipt = JsonDebugWriter(str(sync)).add_chunk(chunk)
+    writer = make_debug_writer(DebugWriterConfig(), str(background), background=True)
+    # Three chunks: the third waits for the first (at most two pending), and
+    # a retried step still truncates the previous attempt's part.
+    stale = replace(chunk, sample_ids=["stale", "stale2"])
+    for item in [stale, replace(chunk, step=1), chunk]:
+        receipt = writer.add_chunk(item)
+    writer.close()
+    assert receipt == replace(sync_receipt, ref=str(Path(receipt.ref)))
+    JsonDebugWriter(str(sync)).finish_step(0, [sync_receipt])
+    JsonDebugWriter(str(background)).finish_step(0, [receipt])
+    assert (background / "train_data_step1.jsonl").read_text() == (
+        sync / "train_data_step1.jsonl"
+    ).read_text()
+
+
+def test_background_dump_still_rejects_a_bad_chunk_at_once(
+    tmp_path: Path, chunk: TrainChunk
+) -> None:
+    writer = JsonDebugWriter(str(tmp_path), background=True)
+    with pytest.raises(ValueError, match="input length exceeds"):
+        writer.add_chunk(replace(chunk, input_lengths=torch.tensor([9, 1])))
+    assert writer._executor is None
+
+
+def test_make_debug_writer_passes_background_only_to_json_writers(
+    tmp_path: Path,
+) -> None:
+    cfg = DebugWriterConfig(target=f"{__name__}._RecordingWriter", label="x")
+    assert isinstance(
+        make_debug_writer(cfg, str(tmp_path), background=True), _RecordingWriter
+    )
+    assert make_debug_writer(
+        DebugWriterConfig(), str(tmp_path), background=True
+    )._background

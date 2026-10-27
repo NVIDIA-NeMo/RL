@@ -15,8 +15,10 @@
 """Stream untruncated training tensors without retaining a second step batch."""
 
 import json
+import multiprocessing
 import os
 from abc import ABC, abstractmethod
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -150,6 +152,9 @@ class DebugWriter(ABC):
         self.step = None
         self.rows = 0
 
+    def flush(self) -> None:
+        """Wait until every accepted chunk is stored; the base writer stores at once."""
+
     def close(self) -> None:
         """Release anything the writer still holds; the base writer holds nothing."""
 
@@ -174,6 +179,18 @@ class JsonDebugWriter(DebugWriter):
     completed-looking JSONL file. Shards must share a filesystem with the controller.
     """
 
+    def __init__(
+        self, log_dir: str, *, shard_id: str = "0", background: bool = False
+    ) -> None:
+        """Set background to write each chunk in a separate process; see flush."""
+        super().__init__(log_dir, shard_id=shard_id)
+        # background: add_chunk hands the JSON writing to its own process (off
+        # the caller's GIL) and returns; flush() waits for it. At most two
+        # chunks are pending, which bounds the memory held for them.
+        self._background = background
+        self._executor: ProcessPoolExecutor | None = None
+        self._pending: list[Future] = []
+
     def _dump_path(self, step: int) -> Path:
         """Return the published JSONL path."""
         return self.log_dir / f"train_data_step{step + 1}.jsonl"
@@ -187,32 +204,34 @@ class JsonDebugWriter(DebugWriter):
         self.log_dir.mkdir(parents=True, exist_ok=True)
         part = self._shard_path(chunk.step)
         mode = "w" if replace else "a"
+        receipt = ChunkReceipt(
+            shard_id=self.shard_id, rows=len(chunk.sample_ids), ref=str(part)
+        )
+        if not self._background:
+            _write_part(part, mode, chunk)
+            return receipt
+        if self._executor is None:
+            # spawn: never fork a process holding Ray and CUDA state.
+            self._executor = ProcessPoolExecutor(
+                max_workers=1, mp_context=multiprocessing.get_context("spawn")
+            )
+        if len(self._pending) == 2:
+            self._pending.pop(0).result()
+        self._pending.append(self._executor.submit(_write_part, part, mode, chunk))
+        return receipt
 
-        # unbind() splits dense and jagged columns alike into per-row tensors.
-        columns = {
-            k: list(v.detach().cpu().unbind())
-            for k, v in {**chunk.sequences, **chunk.scalars}.items()
-        }
-        lengths = chunk.input_lengths.detach().cpu().reshape(-1).tolist()
+    def flush(self) -> None:
+        """Wait until every chunk handed to the background is written."""
+        pending, self._pending = self._pending, []
+        for future in pending:
+            future.result()
 
-        num_rows = 0
-        with part.open(mode) as stream:
-            for i, length in enumerate(lengths):
-                row = {
-                    "step": chunk.step + 1,
-                    "sample_id": [chunk.sample_ids[i]],
-                    "input_lengths": [length],
-                    "metadata": [chunk.tags[i] if chunk.tags is not None else {}],
-                }
-                for key in chunk.sequences:
-                    row[key] = [columns[key][i][:length].tolist()]
-                for key in chunk.scalars:
-                    row[key] = [columns[key][i].tolist()]
-                stream.write(
-                    json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n"
-                )
-                num_rows += 1
-        return ChunkReceipt(shard_id=self.shard_id, rows=num_rows, ref=str(part))
+    def close(self) -> None:
+        """Finish the pending chunks and stop the background process."""
+        self.flush()
+        if self._executor is not None:
+            self._executor.shutdown()
+            self._executor = None
 
     def _publish_step(self, step: int, receipts: list[ChunkReceipt]) -> None:
         """Merge the part files the receipts name into one JSONL file and publish it atomically."""
@@ -259,13 +278,41 @@ class JsonDebugWriter(DebugWriter):
             part.unlink()
 
 
+def _write_part(part: Path, mode: str, chunk: TrainChunk) -> None:
+    """Write one validated chunk's rows to its part file (maybe in the background)."""
+    # unbind() splits dense and jagged columns alike into per-row tensors.
+    columns = {
+        k: list(v.detach().cpu().unbind())
+        for k, v in {**chunk.sequences, **chunk.scalars}.items()
+    }
+    lengths = chunk.input_lengths.detach().cpu().reshape(-1).tolist()
+
+    with part.open(mode) as stream:
+        for i, length in enumerate(lengths):
+            row = {
+                "step": chunk.step + 1,
+                "sample_id": [chunk.sample_ids[i]],
+                "input_lengths": [length],
+                "metadata": [chunk.tags[i] if chunk.tags is not None else {}],
+            }
+            for key in chunk.sequences:
+                row[key] = [columns[key][i][:length].tolist()]
+            for key in chunk.scalars:
+                row[key] = [columns[key][i].tolist()]
+            stream.write(json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n")
+
+
 DEBUG_WRITER_REGISTRY: dict[str, Callable[..., DebugWriter]] = {
     "json": JsonDebugWriter,
 }
 
 
 def make_debug_writer(
-    cfg: DebugWriterConfig, log_dir: str, *, shard_id: str = "0"
+    cfg: DebugWriterConfig,
+    log_dir: str,
+    *,
+    shard_id: str = "0",
+    background: bool = False,
 ) -> DebugWriter:
     """Build the debug writer that cfg selects for one shard.
 
@@ -276,6 +323,8 @@ def make_debug_writer(
         cfg: Debug writer config naming the writer and any constructor keys.
         log_dir: Base log directory handed to the writer.
         shard_id: Identifier of the shard that owns the returned writer.
+        background: Write chunks in a separate process when the writer supports
+            it (JsonDebugWriter); other writers ignore it.
 
     Returns:
         The constructed writer.
@@ -295,4 +344,11 @@ def make_debug_writer(
             f"{sorted(DEBUG_WRITER_REGISTRY)} or to an importable dotted path to a "
             "DebugWriter subclass."
         )
-    return writer_cls(log_dir, shard_id=shard_id, **(cfg.model_extra or {}))
+    kwargs = dict(cfg.model_extra or {})
+    if (
+        background
+        and isinstance(writer_cls, type)
+        and issubclass(writer_cls, JsonDebugWriter)
+    ):
+        kwargs["background"] = True
+    return writer_cls(log_dir, shard_id=shard_id, **kwargs)
