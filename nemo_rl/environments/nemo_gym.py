@@ -32,6 +32,10 @@ from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, Typed
 
 import ray
 import torch
+from nemo.lens.resources.attributes import (
+    OTEL_RESOURCE_ATTRIBUTES_ENV,
+    extend_otel_resource_attributes,
+)
 from pydantic import BaseModel, Field, field_validator, model_validator
 from ray.util.placement_group import (
     PlacementGroup,
@@ -43,11 +47,6 @@ from ray.util.scheduling_strategies import (
     PlacementGroupSchedulingStrategy,
 )
 from transformers import PreTrainedTokenizerBase
-
-from nemo.lens.resources.attributes import (
-    OTEL_RESOURCE_ATTRIBUTES_ENV,
-    extend_otel_resource_attributes,
-)
 
 from nemo_rl.data.interfaces import NemoGymSourceIdentity
 from nemo_rl.data.multimodal_utils import (
@@ -851,6 +850,7 @@ class NemoGym(EnvironmentInterface):
     def __init__(self, cfg: NemoGymConfig):
         # Import first so lens sees Gym's span groups when it validates the spec.
         import nemo_gym.telemetry  # noqa: F401
+
         # Named explicitly: built from the environment registry rather than
         # by RayWorkerGroup, so nothing sets NRL_WORKER_GROUP for it.
         init_telemetry_worker(worker_group="nemo_gym")
