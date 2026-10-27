@@ -4183,6 +4183,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
         ppo=SimpleNamespace(
             seq_logprob_error_threshold=None,
             overlong_filtering=False,
+            num_generations_per_prompt=batch_size,
             # The shard-decline log names the estimator, so an unshardable
             # stub has to carry one even though the assertions below ignore it.
             adv_estimator=SimpleNamespace(name="gae"),
