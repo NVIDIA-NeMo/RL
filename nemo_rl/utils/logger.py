@@ -59,7 +59,6 @@ _rich_logging_configured = False
 # catch-all ``*`` definition is intentionally avoided because wandb-core does
 # not deterministically resolve overlapping glob definitions.
 WANDB_CALLER_STEP_METRIC = "nemo_rl/step"
-TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 
 
 class WandbConfig(BaseModel, extra="allow"):
