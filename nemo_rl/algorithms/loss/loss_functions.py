@@ -55,6 +55,8 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     get_sparse_projection_matrix,
     next_token_accuracy,
     project_student_to_teacher_vocab,
+    same_tokenizer_full_vocab_kl,
+    same_tokenizer_topk_kl,
     select_teacher_topk_indices,
     slice_sparse_projection_cols,
     student_next_token_ce,
@@ -62,12 +64,10 @@ from nemo_rl.algorithms.x_token.loss_utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    cp_shift_next,
     group_all_reduce_sum,
     group_all_reduce_sum_with_grad,
     to_local_if_dtensor,
     vocab_parallel_full_log_softmax,
-    vocab_parallel_gather_columns,
     vocab_parallel_log_softmax,
 )
 from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
@@ -2207,9 +2207,11 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             still contribute exact maps. Requires ``gold_loss=True``.
         temperature: Softmax temperature applied symmetrically to student
             and teacher logits before KL.
-        vocab_topk: Microbatch-global top-k size used by the P-KL path
-            (``gold_loss=False``). Computed inside the loss fn from full
-            teacher logits. Inert when ``gold_loss=True``.
+        vocab_topk: Microbatch-global top-k size. Used by the P-KL path
+            (``gold_loss=False``) and by every same-tokenizer teacher, whatever
+            ``gold_loss`` is, except the all-same-tokenizer ``averaged_logits``
+            path, which uses the full vocab. Computed inside the loss fn from
+            full teacher logits.
         uncommon_topk: Cap on the L1 uncommon-tail sort in the gold path.
             Defaults to 8192. Inert when ``gold_loss=False``.
         reverse_kl: If True, compute KL(student || teacher) instead of
@@ -2676,138 +2678,21 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         matches CE: masked next-token mean normalized by ``global_valid_toks``,
         scaled by ``T**2``.
         """
-        kd = self._direct_topk_kl(
+        assert align.student_token_mask is not None
+        kd = same_tokenizer_topk_kl(
             student_logits_contig,
             teacher_full_logits,
-            align,
-            global_valid_toks,
+            kd_mask=align.student_token_mask,
+            sample_mask=align.sample_mask,
+            num_kd_tokens=global_valid_toks,
+            vocab_size=self.student_vocab_size,
+            vocab_topk=self.vocab_topk,
+            temperature=self.temperature,
+            reverse_kl=self.reverse_kl,
             tp_group=tp_group,
             cp_group=cp_group,
         )
         return kd, {"kl_loss": kd.item()}
-
-    def _direct_topk_kl(
-        self,
-        student_logits: torch.Tensor,
-        teacher_full_logits: torch.Tensor,
-        align: LocalizedAlignment,
-        global_valid_toks: torch.Tensor,
-        *,
-        tp_group: Optional[torch.distributed.ProcessGroup],
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> torch.Tensor:
-        """Top-K per-position KL on a shared vocab (same tokenizer), TP/CP-aware.
-
-        Top-K columns are selected at the student from the reassembled full-vocab
-        teacher logits (``select_teacher_topk_indices`` MAX-reduces across CP so
-        every CP rank agrees on the same columns). The student's K columns are
-        gathered TP-aware (``vocab_parallel_gather_columns``) and softmaxed
-        within the subset directly: because both sides renormalize within K,
-        the full-vocab partition function cancels, so
-        ``log_softmax_K(logits[..., idx] / T)`` equals the previous
-        full-vocab-log-softmax-then-renorm form exactly — without materializing
-        the all-gathered ``[B, T, V]`` student log-probs. The masked next-token
-        mean is normalized by the CP/DP-global valid-token count, exactly like
-        the CE term; at CP=1 the ``cp_shift_next`` mask reduces to the
-        ``token_mask[:, 1:]`` next-token shift.
-        """
-        T = self.temperature
-        # Drop HF lm_head padding beyond the shared tokenizer vocab.
-        v_s = self.student_vocab_size
-        teacher = teacher_full_logits
-        if teacher.shape[-1] > v_s:
-            teacher = teacher[..., :v_s]
-        vocab_topk = min(self.vocab_topk, teacher.shape[-1])
-        topk_idx = select_teacher_topk_indices(teacher, vocab_topk, cp_group=cp_group)
-
-        # [B, T, K] instead of the all-gathered [B, T, V]: the K-subset
-        # renormalization cancels the full-vocab partition function, so the
-        # subset log_softmax is exactly equivalent (see docstring).
-        student_topk_logits = vocab_parallel_gather_columns(
-            student_logits, topk_idx, tp_group=tp_group
-        )
-        student_log_probs_k = torch.log_softmax(student_topk_logits / T, dim=-1)
-        teacher_log_probs_k = torch.log_softmax(
-            teacher[..., topk_idx].float() / T, dim=-1
-        )
-        if self.reverse_kl:
-            per_pos = torch.nn.functional.kl_div(
-                teacher_log_probs_k,
-                student_log_probs_k,
-                reduction="none",
-                log_target=True,
-            ).sum(dim=-1)
-        else:
-            per_pos = torch.nn.functional.kl_div(
-                student_log_probs_k,
-                teacher_log_probs_k,
-                reduction="none",
-                log_target=True,
-            ).sum(dim=-1)
-        return self._same_vocab_masked_kl(per_pos, align, global_valid_toks, cp_group)
-
-    def _direct_full_vocab_kl(
-        self,
-        student_logits: torch.Tensor,
-        teacher_logits: torch.Tensor,
-        align: LocalizedAlignment,
-        global_valid_toks: torch.Tensor,
-        *,
-        tp_group: Optional[torch.distributed.ProcessGroup],
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> torch.Tensor:
-        """Full-vocab per-position KL on a shared vocab (same tokenizer), TP/CP-aware.
-
-        Used by ``averaged_logits`` over the convex-averaged teacher logits. The
-        student is gathered to full vocab across TP; the teacher (already full
-        vocab) is sliced to the student width to drop HF lm_head padding.
-        """
-        T = self.temperature
-        student_log_probs = vocab_parallel_full_log_softmax(
-            student_logits, T, tp_group=tp_group
-        )
-        v_s = student_log_probs.shape[-1]
-        teacher = teacher_logits.float()
-        if teacher.shape[-1] > v_s:
-            teacher = teacher[..., :v_s]
-        teacher_log_probs = torch.log_softmax(teacher / T, dim=-1)
-        if self.reverse_kl:
-            per_pos = torch.nn.functional.kl_div(
-                teacher_log_probs, student_log_probs, reduction="none", log_target=True
-            ).sum(dim=-1)
-        else:
-            per_pos = torch.nn.functional.kl_div(
-                student_log_probs, teacher_log_probs, reduction="none", log_target=True
-            ).sum(dim=-1)
-        return self._same_vocab_masked_kl(per_pos, align, global_valid_toks, cp_group)
-
-    def _same_vocab_masked_kl(
-        self,
-        per_pos: torch.Tensor,
-        align: LocalizedAlignment,
-        global_valid_toks: torch.Tensor,
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> torch.Tensor:
-        """Masked next-token mean of a per-position KL (same-tokenizer reduction).
-
-        ``per_pos`` is the per-position KL on this CP rank's contiguous window
-        (student and teacher are position-aligned). The CP-aware next-token shift
-        (:func:`cp_shift_next`) selects positions whose target token (p+1) is a
-        valid label — at CP=1 this is the plain ``token_mask[:, 1:]`` shift, the
-        global-last position dropped via ``fill=0``. Reduction matches CE:
-        ``masked_mean`` over ``global_valid_toks``, scaled by ``T**2``.
-        """
-        T = self.temperature
-        next_mask = cp_shift_next(
-            to_local_if_dtensor(align.student_token_mask), cp_group, fill=0
-        )
-        sample_mask = to_local_if_dtensor(align.sample_mask)
-        mask = next_mask.float() * sample_mask.unsqueeze(-1).float()
-        return (
-            masked_mean(per_pos, mask, global_normalization_factor=global_valid_toks)
-            * T
-            * T
-        )
 
     def _sum_kd(
         self,
@@ -2936,11 +2821,17 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             contrib = f.float() * (self.teacher_weights[i] / total_w)
             avg = contrib if avg is None else avg + contrib
         assert avg is not None
-        kd = self._direct_full_vocab_kl(
+        align = aligns_by_idx[0]
+        assert align.student_token_mask is not None
+        kd = same_tokenizer_full_vocab_kl(
             student_logits_contig,
             avg,
-            aligns_by_idx[0],
-            global_valid_toks,
+            kd_mask=align.student_token_mask,
+            sample_mask=align.sample_mask,
+            num_kd_tokens=global_valid_toks,
+            vocab_size=self.student_vocab_size,
+            temperature=self.temperature,
+            reverse_kl=self.reverse_kl,
             tp_group=tp_group,
             cp_group=cp_group,
         )

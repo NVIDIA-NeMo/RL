@@ -21,14 +21,18 @@ after its normal fan-out to the file/wandb/mlflow backends.
 
 Every series is declared by NeMo-RL rather than by lens, via lens's
 consumer-driven metric registry: NeMo-RL owns the ``rl.*`` metric names, so a
-new series needs no lens release and no negotiation over field names. Four
+new series needs no lens release and no negotiation over field names. Five
 families are teed — the async ``efficiency/*`` phase durations, the training
-scalars, the ``vllm/*`` engine deltas, and the ``timing/setup`` startup phases.
-The first three ride the per-step ``train`` dicts; the last arrives once, at
-step 0.
+scalars, the ``vllm/*`` engine deltas, the ``timing/setup`` startup phases, and
+the rollout checkpoint dicts -- completed saves and restores under
+``timing/rollout_checkpoint`` / ``timing/rollout_recovery``, and every snapshot
+attempt under ``rollout/checkpoint_outcome``. The first three ride the per-step
+``train`` dicts; the setup dict arrives once, at step 0; the checkpoint dicts
+arrive once per save, restore or attempt on the wall-clock axis.
 
-This module names no logger key of its own beyond the ``efficiency/*`` family
-it also produces. The scalar rows come from the modules that log them, through
+The checkpoint mapping explicitly enumerates the controller's completed phase
+keys, and a source-drift test holds it to the keys the controller logs under
+both prefixes. The scalar rows come from the modules that log them, through
 :mod:`nemo_rl.telemetry.vocabulary`, so adding an algorithm does not mean
 editing telemetry.
 
@@ -40,20 +44,37 @@ only the prefixes those dicts actually arrive under are teed.
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
-from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX, SetupTimingMetrics
+from nemo_rl.algorithms.metric_utils import (
+    ROLLOUT_CHECKPOINT_ATTEMPT_DURATION_KEY,
+    ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
+    ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
+    ROLLOUT_CHECKPOINT_OUTCOME_PREFIX,
+    ROLLOUT_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_KEY,
+    SETUP_TIMING_PREFIX,
+    RolloutCheckpointAttemptOutcome,
+    SetupTimingMetrics,
+    rollout_checkpoint_reason_key,
+)
 from nemo_rl.telemetry.instrumentation import (
     COLLECTOR_LOOP_CATEGORIES,
     RL_BUCKET_ATTR,
     RL_EFFICIENCY_CATEGORY_ATTR,
+    RL_ITERATION_ATTR,
     bucket_for_efficiency_category,
+    is_span_group_enabled,
+    safe_set_span_attributes,
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.telemetry.vocabulary import (
     EFFICIENCY_PCT_KEY,
     EFFICIENCY_PCT_PER_STEP_KEY,
     RUN_WINDOW_WALL_CLOCK_CATEGORIES,
+    TELEMETRY_TRAIN_STEP_KEY,
+    TELEMETRY_WALL_TIME_METRIC,
     as_scalar,
     freeze_metrics,
     recorded_metrics,
@@ -64,6 +85,7 @@ from nemo_rl.telemetry.vocabulary import (
 if TYPE_CHECKING:
     from nemo.lens.instruments import MetricSpec
     from opentelemetry.metrics import Meter
+    from opentelemetry.trace import Tracer
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +93,8 @@ logger = logging.getLogger(__name__)
 # vLLM dicts all arrive under the driver's train prefixes, and a key is only
 # reachable from the prefix its own dict is logged under, so looking anywhere
 # else would be dead work per step. ``SETUP_TIMING_PREFIX`` is the one
-# non-per-step prefix teed.
+# startup prefix teed; rollout checkpoint/recovery prefixes are dispatched
+# separately below.
 _TRAIN_PREFIXES: tuple[Optional[str], ...] = ("train", "")
 
 # One dimensioned gauge rather than an instrument per category, so adding a
@@ -122,6 +145,29 @@ RUN_WINDOW = "run"
 RL_SETUP_DURATION_METRIC = "rl.setup.duration"
 RL_SETUP_PHASE_ATTR = "rl.setup.phase"
 
+# ``operation`` separates save from restore; both have ``total`` and ``tq``.
+RL_CHECKPOINT_DURATION_METRIC = "rl.checkpoint.duration"
+RL_CHECKPOINT_ROWS_METRIC = "rl.checkpoint.rows"
+RL_CHECKPOINT_GROUPS_METRIC = "rl.checkpoint.groups"
+RL_CHECKPOINT_SIBLINGS_METRIC = "rl.checkpoint.siblings"
+RL_CHECKPOINT_SIDECAR_BYTES_METRIC = "rl.checkpoint.sidecar_bytes"
+RL_CHECKPOINT_OPERATION_ATTR = "rl.checkpoint.operation"
+RL_CHECKPOINT_PHASE_ATTR = "rl.checkpoint.phase"
+RL_CHECKPOINT_CATEGORY_ATTR = "rl.checkpoint.category"
+
+# Rebuilt from the logged timings, not opened around the save. Why it has no
+# rl.bucket and no child spans: docs/observability/span-groups.md.
+RL_CHECKPOINT_SAVE_SPAN = "rl.sc.rollout_checkpoint.save"
+
+# One point per periodic snapshot attempt: saved, skipped or failed.
+RL_CHECKPOINT_ATTEMPTS_METRIC = "rl.checkpoint.attempts"
+RL_CHECKPOINT_ATTEMPT_DURATION_METRIC = "rl.checkpoint.attempt_duration"
+RL_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_METRIC = (
+    "rl.checkpoint.seconds_since_last_success"
+)
+RL_CHECKPOINT_OUTCOME_ATTR = "rl.checkpoint.outcome"
+RL_CHECKPOINT_REASON_ATTR = "rl.checkpoint.reason"
+
 # Keys that ``print_efficiency_summary`` puts in the Logger dict.
 _EFFICIENCY_KEY_PREFIX = "efficiency/"
 _EFFICIENCY_SECONDS_SUFFIX = "_s"
@@ -142,6 +188,50 @@ RL_METRIC_GROUP = "rl"
 _EFFICIENCY_SECONDS_KEY = registry_key(RL_EFFICIENCY_SECONDS_METRIC)
 _EFFICIENCY_PCT_KEY_REGISTRY = registry_key(RL_EFFICIENCY_PCT_METRIC)
 _SETUP_DURATION_KEY = registry_key(RL_SETUP_DURATION_METRIC)
+_CHECKPOINT_DURATION_KEY = registry_key(RL_CHECKPOINT_DURATION_METRIC)
+_CHECKPOINT_ROWS_KEY = registry_key(RL_CHECKPOINT_ROWS_METRIC)
+_CHECKPOINT_GROUPS_KEY = registry_key(RL_CHECKPOINT_GROUPS_METRIC)
+_CHECKPOINT_SIBLINGS_KEY = registry_key(RL_CHECKPOINT_SIBLINGS_METRIC)
+_CHECKPOINT_SIDECAR_BYTES_KEY = registry_key(RL_CHECKPOINT_SIDECAR_BYTES_METRIC)
+_CHECKPOINT_ATTEMPTS_KEY = registry_key(RL_CHECKPOINT_ATTEMPTS_METRIC)
+_CHECKPOINT_ATTEMPT_DURATION_KEY = registry_key(RL_CHECKPOINT_ATTEMPT_DURATION_METRIC)
+_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_KEY = registry_key(
+    RL_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_METRIC
+)
+
+_CHECKPOINT_COMPLETED: RolloutCheckpointAttemptOutcome = "completed"
+_CHECKPOINT_SAVE = "save"
+_CHECKPOINT_PREFIXES = {
+    "timing/rollout_checkpoint": _CHECKPOINT_SAVE,
+    "timing/rollout_recovery": "restore",
+}
+_CHECKPOINT_DURATION_PHASES = {
+    "total_save_seconds": "total",
+    "tq_save_seconds": "tq",
+    "barrier_wait_seconds": "barrier_wait",
+    "exclusive_hold_seconds": "exclusive_hold",
+    "sidecar_save_seconds": "sidecar_save",
+    "snapshot_commit_seconds": "publication",
+    "total_load_seconds": "total",
+    "snapshot_resolution_seconds": "snapshot_resolution",
+    "dataloader_load_seconds": "dataloader_load",
+    "tq_load_seconds": "tq",
+    "replay_metadata_load_seconds": "replay_metadata_load",
+    "recovery_prepare_seconds": "recovery_prepare",
+    "redispatch_schedule_seconds": "redispatch_schedule",
+}
+_CHECKPOINT_LEVELS = {
+    "replay_rows": (_CHECKPOINT_ROWS_KEY, "replay"),
+    "staging_rows": (_CHECKPOINT_ROWS_KEY, "staging"),
+    "snapshot_rows": (_CHECKPOINT_ROWS_KEY, "snapshot"),
+    "replay_groups": (_CHECKPOINT_GROUPS_KEY, "replay"),
+    "ledger_groups": (_CHECKPOINT_GROUPS_KEY, "ledger"),
+    "groups_complete_restored": (_CHECKPOINT_GROUPS_KEY, "complete_restored"),
+    "groups_unfinished_found": (_CHECKPOINT_GROUPS_KEY, "unfinished"),
+    "siblings_reused": (_CHECKPOINT_SIBLINGS_KEY, "reused"),
+    "siblings_rerun": (_CHECKPOINT_SIBLINGS_KEY, "rerun"),
+    "controller_sidecar_bytes": (_CHECKPOINT_SIDECAR_BYTES_KEY, "controller"),
+}
 
 # Registration is process-global in lens, so it has to happen once per process
 # and in every process that records -- driver and workers alike. Doing it lazily
@@ -210,6 +300,61 @@ def _metric_specs() -> list[MetricSpec]:
             description=(
                 "Wall clock spent in one startup phase, named by the "
                 "rl.setup.phase attribute."
+            ),
+        )
+    )
+    specs.extend(
+        MetricSpec(registry_key(name), name, kind, unit=unit, description=description)
+        for name, kind, unit, description in (
+            (
+                RL_CHECKPOINT_DURATION_METRIC,
+                "histogram",
+                "s",
+                "One completed rollout save/restore phase; save phases nest "
+                "inside total.",
+            ),
+            (
+                RL_CHECKPOINT_ROWS_METRIC,
+                "gauge",
+                "{row}",
+                "Rows in the latest completed rollout checkpoint.",
+            ),
+            (
+                RL_CHECKPOINT_GROUPS_METRIC,
+                "gauge",
+                "{group}",
+                "Groups saved or restored, by category.",
+            ),
+            (
+                RL_CHECKPOINT_SIBLINGS_METRIC,
+                "gauge",
+                "{rollout}",
+                "Sealed siblings reused or unfinished siblings redispatched.",
+            ),
+            (
+                RL_CHECKPOINT_SIDECAR_BYTES_METRIC,
+                "gauge",
+                "By",
+                "Controller sidecar bytes in the latest completed snapshot.",
+            ),
+            (
+                RL_CHECKPOINT_ATTEMPTS_METRIC,
+                "counter",
+                "{attempt}",
+                "Periodic rollout snapshot attempts, by outcome and reason.",
+            ),
+            (
+                RL_CHECKPOINT_ATTEMPT_DURATION_METRIC,
+                "histogram",
+                "s",
+                "Duration of one periodic rollout snapshot attempt, by outcome.",
+            ),
+            (
+                RL_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_METRIC,
+                "gauge",
+                "s",
+                "Seconds since this controller's last completed rollout snapshot, "
+                "recorded when an attempt finishes; absent until the first one.",
             ),
         )
     )
@@ -423,6 +568,130 @@ def _tee_setup_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
         _record(meter, {_SETUP_DURATION_KEY: value}, {RL_SETUP_PHASE_ATTR: phase})
 
 
+def _checkpoint_value(metrics: dict[str, Any], key: str) -> Optional[float]:
+    """*key* as a finite, non-negative scalar, or None."""
+    value = as_scalar(metrics.get(key))
+    if value is None or not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def _emit_checkpoint_save_span(
+    tracer: Optional[Tracer], metrics: dict[str, Any]
+) -> None:
+    """Emit :data:`RL_CHECKPOINT_SAVE_SPAN` for one completed rollout save."""
+    if not is_span_group_enabled(RLSpanGroup.CHECKPOINT):
+        return
+    total = _checkpoint_value(metrics, "total_save_seconds")
+    end = _checkpoint_value(metrics, TELEMETRY_WALL_TIME_METRIC)
+    if total is None or end is None:
+        return
+    attributes: dict[str, Any] = {}
+    for key in (
+        *_CHECKPOINT_DURATION_PHASES,
+        *_CHECKPOINT_LEVELS,
+        "snapshot_sequence",
+    ):
+        value = _checkpoint_value(metrics, key)
+        if value is not None:
+            attributes[f"rl.checkpoint.{key}"] = (
+                int(value) if value.is_integer() else value
+            )
+    # Explicit: the pump task runs outside every iteration_scope.
+    step = _checkpoint_value(metrics, TELEMETRY_TRAIN_STEP_KEY)
+    if step is not None:
+        attributes[RL_ITERATION_ATTR] = int(step)
+
+    if tracer is None:
+        from opentelemetry import trace as otel_trace
+
+        tracer = otel_trace.get_tracer(__name__)
+    end_ns = int(end * 1e9)
+    # start_span: the save is over, so nothing may nest under this span.
+    span = tracer.start_span(
+        RL_CHECKPOINT_SAVE_SPAN, start_time=end_ns - int(total * 1e9)
+    )
+    safe_set_span_attributes(span, attributes)
+    span.end(end_time=end_ns)
+
+
+def _tee_checkpoint_metrics(
+    meter: Meter, metrics: dict[str, Any], *, operation: str
+) -> None:
+    """Emit one completed rollout save/restore dict as ``rl.checkpoint.*``.
+
+    No ``rl.bucket``: save phases nest inside ``total``, so summing them would
+    count the checkpoint several times over. Non-finite or negative values and
+    keys outside the fixed mapping (``snapshot_sequence``, ``train_step``, the
+    wall-time axis) are dropped so no identity ever becomes a label.
+    """
+    for key, phase in _CHECKPOINT_DURATION_PHASES.items():
+        value = _checkpoint_value(metrics, key)
+        if value is not None:
+            _record(
+                meter,
+                {_CHECKPOINT_DURATION_KEY: value},
+                {
+                    RL_CHECKPOINT_OPERATION_ATTR: operation,
+                    RL_CHECKPOINT_PHASE_ATTR: phase,
+                },
+            )
+    for key, (instrument, category) in _CHECKPOINT_LEVELS.items():
+        value = _checkpoint_value(metrics, key)
+        if value is not None:
+            _record(
+                meter,
+                {instrument: value},
+                {
+                    RL_CHECKPOINT_OPERATION_ATTR: operation,
+                    RL_CHECKPOINT_CATEGORY_ATTR: category,
+                },
+            )
+
+
+def _one_hot(metrics: dict[str, Any], flags: dict[str, str]) -> Optional[str]:
+    """The single label whose flag key is set to 1, or None if not exactly one."""
+    hot = [label for key, label in flags.items() if as_scalar(metrics.get(key)) == 1]
+    return hot[0] if len(hot) == 1 else None
+
+
+def _tee_checkpoint_outcome(meter: Meter, metrics: dict[str, Any]) -> None:
+    """Count one snapshot attempt; skip a dict without exactly one outcome and one reason."""
+    outcome = _one_hot(metrics, {o: o for o in ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES})
+    reason = _one_hot(
+        metrics,
+        {
+            rollout_checkpoint_reason_key(r): r
+            for r in ROLLOUT_CHECKPOINT_ATTEMPT_REASONS
+        },
+    )
+    if outcome is None or reason is None:
+        return
+    _record(
+        meter,
+        {_CHECKPOINT_ATTEMPTS_KEY: 1.0},
+        {RL_CHECKPOINT_OUTCOME_ATTR: outcome, RL_CHECKPOINT_REASON_ATTR: reason},
+    )
+    duration = _checkpoint_value(metrics, ROLLOUT_CHECKPOINT_ATTEMPT_DURATION_KEY)
+    if duration is not None:
+        _record(
+            meter,
+            {_CHECKPOINT_ATTEMPT_DURATION_KEY: duration},
+            {RL_CHECKPOINT_OUTCOME_ATTR: outcome},
+        )
+    # A completed attempt is itself the newest snapshot; otherwise the
+    # controller reports the age of the last one, once there has been one.
+    staleness = (
+        0.0
+        if outcome == _CHECKPOINT_COMPLETED
+        else _checkpoint_value(
+            metrics, ROLLOUT_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_KEY
+        )
+    )
+    if staleness is not None:
+        _record(meter, {_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_KEY: staleness})
+
+
 def map_teed_scalars(metrics: dict[str, Any]) -> dict[str, float]:
     """Extract ``{registry key: value}`` for every declared scalar present.
 
@@ -484,12 +753,15 @@ def _tee_efficiency_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
 
 
 def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> None:
-    """Mirror the per-step metrics into OTel (no-op unless exporting).
+    """Mirror logged metrics into OTel (no-op unless exporting).
 
-    Three families ride the driver's per-step ``train`` dicts and are teed: the
-    ``efficiency/*`` durations, the training scalars, and the ``vllm/*`` engine
-    deltas. The OTel instruments are touched only when telemetry is actively
-    exporting; everything else short-circuits to a no-op.
+    Teed prefixes: the per-step ``train`` dicts (the ``efficiency/*``
+    durations, the training scalars and the ``vllm/*`` engine deltas), the
+    ``timing/setup`` dict at step 0, and the Single-Controller's
+    ``timing/rollout_checkpoint``, ``timing/rollout_recovery`` and
+    ``rollout/checkpoint_outcome`` dicts. The OTel instruments are touched only
+    when telemetry is actively exporting; everything else short-circuits to a
+    no-op.
 
     Never raises. ``Logger.log_metrics`` calls this unguarded on every step, so
     the guarantee has to live here: each emit path below has its own handler, and
@@ -506,12 +778,44 @@ def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> No
 def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> None:
     """Body of :func:`tee_rl_metrics_to_otel`, inside its exception guard."""
     is_setup = prefix == SETUP_TIMING_PREFIX
-    if not is_setup and prefix not in _TRAIN_PREFIXES:
+    is_checkpoint_outcome = prefix == ROLLOUT_CHECKPOINT_OUTCOME_PREFIX
+    checkpoint_operation = _CHECKPOINT_PREFIXES.get(prefix) if prefix else None
+    if (
+        not is_setup
+        and not is_checkpoint_outcome
+        and checkpoint_operation is None
+        and prefix not in _TRAIN_PREFIXES
+    ):
         return
     telemetry = get_telemetry_handle()
     if telemetry is None or not telemetry.is_exporting:
         return
+
+    # Before the registry check: the span needs only the tracer, so a lens
+    # without the metric registry, or a failed registration, must not cost it.
+    if checkpoint_operation == _CHECKPOINT_SAVE:
+        try:
+            _emit_checkpoint_save_span(telemetry.tracer, metrics)
+        except Exception:
+            warn_once("checkpoint_span", "failed to emit rollout save span")
+
     if not ensure_metric_group_registered():
+        return
+
+    if checkpoint_operation is not None:
+        try:
+            _tee_checkpoint_metrics(
+                telemetry.meter, metrics, operation=checkpoint_operation
+            )
+        except Exception:
+            warn_once("checkpoint", "failed to tee rollout checkpoint metrics")
+        return
+
+    if is_checkpoint_outcome:
+        try:
+            _tee_checkpoint_outcome(telemetry.meter, metrics)
+        except Exception:
+            warn_once("checkpoint_outcome", "failed to tee rollout checkpoint outcome")
         return
 
     if is_setup:

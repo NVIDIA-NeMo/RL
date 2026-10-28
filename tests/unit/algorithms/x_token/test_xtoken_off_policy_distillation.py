@@ -993,7 +993,7 @@ def _bare_averaged_logits_loss_fn(projection_matrix_paths):
     return fn
 
 
-def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
+def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path(monkeypatch):
     # Two cross-tokenizer teachers (non-null projection paths) whose logits
     # happen to share a shape must NOT take the direct per-position KL fast
     # path: it assumes the student's tokenizer and would mismatch the
@@ -1011,11 +1011,14 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
 
     def _fast_path(*args, **kwargs):
         raise AssertionError(
-            "direct_full_vocab_kl reached for cross-tokenizer teachers"
+            "same_tokenizer_full_vocab_kl reached for cross-tokenizer teachers"
         )
 
     fn._compute_teacher_kd = _fallback
-    fn._direct_full_vocab_kl = _fast_path
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.loss_functions.same_tokenizer_full_vocab_kl",
+        _fast_path,
+    )
 
     # Equal-shaped teacher logits (the misleading signal) but teacher length 13
     # vs the student's length 10.
@@ -1037,35 +1040,47 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
     assert total_kd.item() == pytest.approx(2.0 * 1.0 + 3.0 * 2.0)
 
 
-def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path():
+def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
     # All-null projection paths => genuine same-tokenizer teachers, so the
     # averaging + single direct-KL fast path is the correct branch.
     fn = _bare_averaged_logits_loss_fn([None, None])
+    fn.temperature = 2.0
+    fn.reverse_kl = True
+    fn.student_vocab_size = 30
 
-    fast_calls = []
+    seen = []
 
-    def _fast_path(*args, **kwargs):
-        fast_calls.append(1)
+    def _fast_path(student, teacher, **kwargs):
+        seen.append(kwargs)
         return torch.tensor(1.23)
 
-    fn._direct_full_vocab_kl = _fast_path
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.loss_functions.same_tokenizer_full_vocab_kl",
+        _fast_path,
+    )
     fn._compute_teacher_kd = MagicMock(
         side_effect=AssertionError("fallback reached for same-tokenizer teachers")
     )
 
     logits = torch.zeros(2, 10, 32)
     teacher_full = {0: logits.clone(), 1: logits.clone()}
+    align, global_valid_toks = MagicMock(), torch.tensor(20.0)
 
     kd, metrics = fn._averaged_logits_kd(
         logits,
         {},
         teacher_full,
-        {0: MagicMock()},
-        torch.tensor(20.0),
+        {0: align},
+        global_valid_toks,
         tp_group=None,
         cp_group=None,
     )
-    assert fast_calls == [1]  # fast path taken exactly once
+    (kwargs,) = seen  # fast path taken exactly once
+    assert kwargs["kd_mask"] is align.student_token_mask
+    assert kwargs["sample_mask"] is align.sample_mask
+    assert kwargs["num_kd_tokens"] is global_valid_toks
+    assert kwargs["vocab_size"] == 30
+    assert (kwargs["temperature"], kwargs["reverse_kl"]) == (2.0, True)
     assert "kl_loss" in metrics
     assert kd.item() == pytest.approx(1.23)
 
