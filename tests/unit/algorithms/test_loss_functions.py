@@ -1847,6 +1847,63 @@ def test_clipped_pg_loss_seq_mask_tis():
     assert not torch.isinf(actual_loss2), "Loss is inf — nan_to_num fix not working"
 
 
+@pytest.mark.parametrize(
+    "dtype,extreme_log_ratio",
+    [
+        (torch.float16, 12.0),
+        (torch.bfloat16, 100.0),
+        (torch.float32, 100.0),
+        (torch.float64, 800.0),
+    ],
+)
+def test_seq_mask_tis_rejects_nonfinite_active_weights_on_cpu(dtype, extreme_log_ratio):
+    # Even a geometric-mean IS ratio of one may conceal a token-level overflow.
+    data, _, _, _ = _setup_clipped_pg_test_data(batch_size=2, seq_len=4, device="cpu")
+    curr = torch.tensor(
+        [[-1.0, -1.0 - extreme_log_ratio, -1.0], [-1.0, -1.0, -1.0]],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    generation = torch.zeros((2, 4), dtype=dtype)
+    generation[:, 1:] = torch.tensor(
+        [[-1.0 - extreme_log_ratio, -1.0, -1.0], [-1.0, -1.0, -1.0]],
+        dtype=dtype,
+    )
+    data["generation_logprobs"] = generation
+    data["advantages"] = torch.ones((2, 4), dtype=dtype)
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            force_on_policy_ratio=True,
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type="seq-mask-tis",
+            truncated_importance_sampling_ratio_min=0.999,
+            truncated_importance_sampling_ratio=1.002,
+            metrics_level="minimal",
+        )
+    )
+
+    raw_weights = (curr.detach() - generation[:, 1:]).exp()
+    assert torch.isinf(raw_weights[0, 0])
+    torch.testing.assert_close((curr.detach() - generation[:, 1:]).mean(-1)[0], curr.new_zeros(()))
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=curr,
+        data=data,
+        global_valid_seqs=torch.tensor(2),
+        global_valid_toks=torch.tensor(6),
+    )
+    loss.backward()
+
+    torch.testing.assert_close(loss, torch.tensor(-0.5, dtype=dtype))
+    assert metrics["is_oob_ratio"] == pytest.approx(0.5)
+    assert torch.isfinite(curr.grad).all()
+    assert torch.all(curr.grad[0] == 0)
+    torch.testing.assert_close(
+        curr.grad[1], torch.full((3,), -1.0 / 6.0, dtype=dtype), atol=1e-3, rtol=1e-2
+    )
+
+
 def test_masked_mean_all_zeros():
     """Test masked_mean function with all zeros mask."""
     values = torch.tensor([1.0, 2.0, 3.0, 4.0])
