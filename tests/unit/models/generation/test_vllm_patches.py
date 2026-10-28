@@ -720,7 +720,7 @@ def test_compact_capturer_allocates_and_preserves_global_layer_routes(
     else:
         capturer.capture(1, first)
         capturer.capture(3, second)
-    # Dense/Mamba backbone blocks and the MTP layer cannot overwrite routes.
+    # Non-MoE backbone blocks (0, 2) and an unmapped ID (4) cannot overwrite routes.
     for layer_id in (0, 2, 4):
         capturer.capture(layer_id, torch.full_like(first, 99))
     expected = torch.stack((first, second), dim=1).to(torch.int32)

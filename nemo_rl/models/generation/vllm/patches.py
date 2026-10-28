@@ -1197,7 +1197,8 @@ def _compact_routed_experts_capturer_source(content: str) -> str:
             """def _get_routed_experts_layer_indices(
     vllm_config: VllmConfig,
 ) -> tuple[int, ...] | None:
-    # NeMo-RL: compact explicit hybrid backbone MoE layers, excluding MTP.
+    # NeMo-RL: compact explicit hybrid backbone MoE layers.
+    # vLLM 0.29 binds capture to the target model only, excluding the MTP drafter.
     layer_types = getattr(vllm_config.model_config.hf_text_config, "layers_block_type", None)
     if isinstance(layer_types, (list, tuple)) and layer_types:
         layer_ids = tuple(
@@ -1242,7 +1243,7 @@ def _get_routed_experts_shape(vllm_config: VllmConfig) -> tuple[int, int, int]:
         if self.layer_id_to_capture_index is not None:
             capture_index = self.layer_id_to_capture_index.get(layer_id)
             if capture_index is None:
-                # Non-MoE backbone blocks and MTP routers have no payload slot.
+                # Layer IDs outside the backbone MoE map have no payload slot.
                 return
 
         ctx = get_forward_context()
