@@ -28,8 +28,24 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import (
     RayWorkerBuilder,
     RayWorkerGroup,
+    _check_dp_leader_worker_indices,
     _get_initializer_env_vars,
 )
+
+
+def test_dp_leaders_may_be_an_ascending_subset_of_the_group_leaders():
+    # A disaggregated replica routes through its first engine only.
+    _check_dp_leader_worker_indices([0, 6], tied_group_leaders=[0, 2, 4, 6, 8])
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [[0, 3], [6, 0]],
+    ids=["not-a-group-leader", "out-of-order"],
+)
+def test_dp_leaders_outside_the_group_leaders_are_rejected(requested):
+    with pytest.raises(ValueError, match="ascending subset"):
+        _check_dp_leader_worker_indices(requested, tied_group_leaders=[0, 2, 4, 6])
 
 
 def test_initializer_env_adds_hf_modules_cache_to_pythonpath(monkeypatch):

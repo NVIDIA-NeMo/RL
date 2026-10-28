@@ -17,6 +17,7 @@ import os
 import sys
 import tempfile
 from collections import defaultdict
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -42,6 +43,7 @@ from nemo_rl.data.datasets.response_datasets import (
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import (
     PROCESSOR_REGISTRY,
+    _gym_row_has_video_media,
     helpsteer3_data_processor,
     kd_data_processor,
     math_data_processor,
@@ -94,6 +96,130 @@ def test_nemo_gym_data_processor_without_task_data_spec():
     assert result["idx"] == 3
     assert result["task_name"] == "nemo_gym"
     assert result["length"] == 0
+    # Placeholder token_ids must share the dtype of real tokenizer output so a
+    # mixed still-image/video Gym batch can be collated.
+    assert result["message_log"][0]["token_ids"].dtype == torch.long
+
+
+@pytest.mark.parametrize(
+    ("content_part", "expected"),
+    [
+        ({"type": "input_image", "image_url": "frame.png"}, False),
+        (
+            {
+                "type": "input_image",
+                "image_url": "frame.png",
+                "_is_video_frame": True,
+            },
+            True,
+        ),
+        ({"type": "input_video", "video_url": "clip.mp4"}, True),
+        ({"type": "video", "video": "clip.mp4"}, True),
+        ({"type": "video_url", "video_url": "clip.mp4"}, True),
+        ({"type": "output_text", "text": "not media"}, False),
+    ],
+)
+def test_gym_row_has_video_media_is_row_specific(content_part, expected):
+    extra_env_info = {
+        "responses_create_params": {
+            "input": [{"role": "user", "content": [content_part]}]
+        }
+    }
+
+    assert _gym_row_has_video_media(extra_env_info) is expected
+
+
+def test_video_defaults_do_not_route_still_image_rows_to_video_processor():
+    extra_env_info = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": "frame.png"}],
+                }
+            ]
+        }
+    }
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps(extra_env_info),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=TaskDataSpec(
+            task_name="nemo_gym", video_sampling_style="nemotron_vl"
+        ),
+        tokenizer=None,
+        max_seq_length=128,
+        idx=7,
+    )
+
+    assert result["idx"] == 7
+    assert result["extra_env_info"] == extra_env_info
+
+
+def test_video_defaults_still_route_cached_video_rows_to_video_processor():
+    extra_env_info = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "frame.png",
+                            "_is_video_frame": True,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(TypeError, match="Gym video data requires"):
+        nemo_gym_data_processor(
+            datum_dict={
+                "extra_env_info": json.dumps(extra_env_info),
+                "task_name": "nemo_gym",
+            },
+            task_data_spec=TaskDataSpec(
+                task_name="nemo_gym", video_sampling_style="nemotron_vl"
+            ),
+            tokenizer=None,
+            max_seq_length=128,
+            idx=8,
+        )
+
+
+def test_nemo_gym_data_processor_allows_nonvideo_rows_with_video_defaults(
+    monkeypatch,
+):
+    import nemo_rl.environments.nemo_gym_multimodal as multimodal
+
+    monkeypatch.setattr(
+        multimodal,
+        "nemo_gym_example_to_video_datum_spec",
+        lambda *args, **kwargs: None,
+    )
+    processor = SimpleNamespace(
+        apply_chat_template=lambda *args, **kwargs: None,
+        tokenizer=object(),
+    )
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps({"agent_ref": {"name": "sav_tracks"}}),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=TaskDataSpec(video_sampling_style="nemotron_vl"),
+        tokenizer=processor,
+        max_seq_length=4096,
+        idx=4,
+    )
+
+    assert result["extra_env_info"]["agent_ref"]["name"] == "sav_tracks"
+    assert result["message_log"][0]["token_ids"].dtype == torch.long
+    assert result["message_log"][0]["token_ids"].numel() == 0
 
 
 def test_nemo_gym_video_config_preserves_non_video_rows(monkeypatch):
@@ -138,6 +264,24 @@ def test_nemo_gym_video_config_preserves_non_video_rows(monkeypatch):
     assert result["extra_env_info"] == extra_env_info
     assert result["idx"] == 7
     assert result["length"] == 0
+
+
+def test_nemo_gym_data_processor_forwards_per_row_image_tile_cap():
+    processor = SimpleNamespace(image_processor=SimpleNamespace(max_num_tiles=12))
+
+    result = nemo_gym_data_processor(
+        datum_dict={"extra_env_info": "{}", "task_name": "nemo_gym"},
+        task_data_spec=TaskDataSpec(image_max_num_tiles=6),
+        tokenizer=processor,
+        max_seq_length=4096,
+        idx=5,
+    )
+
+    extra_env_info = result["extra_env_info"]
+    metadata = extra_env_info["responses_create_params"]["metadata"]
+    assert json.loads(metadata["extra_body"])["mm_processor_kwargs"] == {
+        "max_num_tiles": 6
+    }
 
 
 def test_math_data_processor():

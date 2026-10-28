@@ -1,0 +1,255 @@
+# Explicit legacy Environment Servers shared by the Ultra RLVR recipes and prefetch config.
+env:
+  nemo_gym:
+    math_with_judge_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: math_with_judge_simple_agent
+    code_gen_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: code_gen_simple_agent
+    workplace_assistant_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: workplace_assistant_simple_agent
+    mcqa_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: mcqa_simple_agent
+    instruction_following_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: instruction_following_simple_agent
+    lc_judge_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: lc_judge_simple_agent
+    calendar_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: calendar_simple_agent
+    genrm_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: genrm_simple_agent
+    genrm_simple_agent_reasoning_off_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: genrm_simple_agent_reasoning_off
+    equivalence_llm_judge_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: equivalence_llm_judge_simple_agent
+    single_step_tool_use_with_argument_comparison_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: single_step_tool_use_with_argument_comparison_agent
+    reasoning_gym_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: reasoning_gym_simple_agent
+    terminus_judge_string_only_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminus_judge_string_only_simple_agent
+    ns_tools_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: ns_tools_simple_agent
+    math_formal_lean_refinement_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: math_formal_lean_refinement_agent
+    multichallenge_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: multichallenge_simple_agent
+    inverse_if_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: inverse_if_simple_agent
+    search_pivot_single_step_tool_use_with_argument_comparison_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: search_pivot_single_step_tool_use_with_argument_comparison_agent
+    toolcall_schema_single_step_tool_use_with_argument_comparison_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: toolcall_schema_single_step_tool_use_with_argument_comparison_agent
+    swe_pivot_single_step_tool_use_with_argument_comparison_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_pivot_single_step_tool_use_with_argument_comparison_agent
+    abstention_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: abstention_simple_agent
+    nvarc_inductive_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: nvarc_inductive_simple_agent
+    nvarc_transductive_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: nvarc_transductive_simple_agent
+    droid_pivot_single_step_tool_use_with_argument_comparison_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: droid_pivot_single_step_tool_use_with_argument_comparison_agent
+    lc_equivalence_rule_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: lc_equivalence_rule_simple_agent
+    ether0_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: ether0_simple_agent
+    structured_outputs_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: structured_outputs_simple_agent
+    structured_outputs_v3_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: structured_outputs_v3_simple_agent
+    freeform_formatting_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: freeform_formatting_simple_agent
+    citation_format_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: citation_format_simple_agent
+    jailbreak_detection_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: jailbreak_detection_simple_agent
+    jailbreak_engagement_with_disclaimer_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: jailbreak_engagement_with_disclaimer
+    jailbreak_refusal_with_explanation_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: jailbreak_refusal_with_explanation
+    jailbreak_hard_refusal_no_redirection_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: jailbreak_hard_refusal_no_redirection
+    jailbreak_hard_refusal_with_helplines_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: jailbreak_hard_refusal_with_helplines
+    indirect_prompt_injection_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: indirect_prompt_injection_simple_agent

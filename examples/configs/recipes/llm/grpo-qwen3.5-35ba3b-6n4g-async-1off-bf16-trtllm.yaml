@@ -22,7 +22,6 @@ policy:
       precision: bfloat16
       expert_parallel_size: 4
       gpu_memory_utilization: 0.8
-      enforce_eager: false
     vllm_kwargs:
       moe_backend: flashinfer_trtllm
       expert_placement_strategy: linear

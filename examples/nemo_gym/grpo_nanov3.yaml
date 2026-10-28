@@ -172,6 +172,7 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
+    speculator_type: "eagle3"
     num_layers: null
     aux_layer_indices: null
 
@@ -196,7 +197,7 @@ policy:
   make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}}, 2}
   max_grad_norm: 1.0
 
-  optimizer: null # remove default FSDP optimizer
+  optimizer: null # remove default Automodel optimizer
   scheduler: null
 
   offload_optimizer_for_logprob: False
@@ -240,7 +241,7 @@ policy:
       context_parallel_size: 1
       tensor_model_parallel_size: 2
       buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
-      num_cuda_graphs: -1  # Number of CUDA graphs to pre-compile for different batch sizes
+      num_cuda_graphs: -1  # Number of CUDA graphs to build; -1 autotunes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true
@@ -328,6 +329,49 @@ env:
   # false: ignore env mask_sample flags so the loss trains on every sample.
   should_mask_flagged_samples: true
   nemo_gym:
+    math_with_judge_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: math_with_judge_simple_agent
+    code_gen_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: code_gen_simple_agent
+    workplace_assistant_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: workplace_assistant_simple_agent
+    mcqa_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: mcqa_simple_agent
+    instruction_following_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: instruction_following_simple_agent
+    structured_outputs_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: structured_outputs_simple_agent
+
     # Port range for Gym HTTP servers, kept below the OS ephemeral range
     # (below the 9000 ephemeral floor on some GB200 nodes) and non-overlapping with NeMo
     # RL (3000-4999) or vLLM (7000-8999). See ray.sub for the full port layout.

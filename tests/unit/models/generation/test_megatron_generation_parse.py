@@ -376,16 +376,34 @@ def test_http_server_port_reservation(monkeypatch):
 
 @pytest.mark.mcore
 @pytest.mark.parametrize(
-    ("gen_cfg_extra", "expected_num_replicas"),
+    ("gen_cfg_extra", "expected", "absent"),
     [
-        ({}, None),
-        ({"http_server_num_replicas": 8}, 8),
+        # Replica count reaches MCore, and stays absent when unconfigured.
+        pytest.param({}, {}, ["num_replicas"], id="num-replicas-unset"),
+        pytest.param(
+            {"http_server_num_replicas": 8},
+            {"num_replicas": 8},
+            [],
+            id="num-replicas-forwarded",
+        ),
     ],
 )
-def test_http_server_num_replicas_is_forwarded_only_when_set(
-    monkeypatch, gen_cfg_extra, expected_num_replicas
+def test_http_server_kwargs_follow_policy_config(
+    monkeypatch, gen_cfg_extra, expected, absent
 ):
-    """Replica count reaches MCore, and stays absent when unconfigured."""
+    started = _start_stubbed_http_server(monkeypatch, gen_cfg_extra=gen_cfg_extra)
+
+    assert {key: started[key] for key in expected} == expected
+    assert not set(absent) & set(started)
+
+
+def _start_stubbed_http_server(
+    monkeypatch,
+    *,
+    gen_cfg_extra: dict | None = None,
+    sampling_cfg: dict | None = None,
+) -> dict:
+    """Run ``_setup_openai_api_server`` against a stubbed MCore server; return its kwargs."""
     started = {}
     monkeypatch.setattr(
         mlm_text_gen_server,
@@ -415,14 +433,12 @@ def test_http_server_num_replicas_is_forwarded_only_when_set(
         rank=0,
         cfg={
             "generation": {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": None,
+                **(sampling_cfg or {"temperature": 1.0, "top_p": 1.0, "top_k": None}),
                 "mcore_generation_config": {
                     "block_size_tokens": 64,
                     "enable_prefix_caching": False,
                     "parsers": [],
-                    **gen_cfg_extra,
+                    **(gen_cfg_extra or {}),
                 },
             }
         },
@@ -431,11 +447,7 @@ def test_http_server_num_replicas_is_forwarded_only_when_set(
     )
 
     MegatronGenerationMixin._setup_openai_api_server(worker)
-
-    if expected_num_replicas is None:
-        assert "num_replicas" not in started
-    else:
-        assert started["num_replicas"] == expected_num_replicas
+    return started
 
 
 @pytest.mark.mcore
@@ -492,46 +504,6 @@ def test_http_server_defaults_follow_generation_sampling(
     the model's generation_config.json, which can differ from the parameters the
     policy recomputes log probabilities with.
     """
-    started = {}
-    monkeypatch.setattr(
-        mlm_text_gen_server,
-        "start_text_gen_server",
-        lambda **kwargs: started.update(kwargs),
-    )
-    monkeypatch.setattr(
-        "nemo_rl.distributed.virtual_cluster._get_node_ip_local",
-        lambda: "10.0.0.5",
-    )
-    monkeypatch.setattr(
-        "nemo_rl.distributed.virtual_cluster._get_free_port_local",
-        lambda *_args, **_kwargs: 12345,
-    )
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-    requests_mock = MagicMock()
-    health_get = requests_mock.Session.return_value.__enter__.return_value.get
-    health_get.return_value.status_code = 200
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.megatron.megatron_worker.requests",
-        requests_mock,
-    )
-
-    worker = SimpleNamespace(
-        coordinator_addr="tcp://127.0.0.1:5555",
-        megatron_tokenizer=object(),
-        rank=0,
-        cfg={
-            "generation": {
-                **sampling,
-                "mcore_generation_config": {
-                    "block_size_tokens": 64,
-                    "enable_prefix_caching": False,
-                    "parsers": [],
-                },
-            }
-        },
-        _reserved_http_server_port=None,
-        inference_wrapped_model=SimpleNamespace(multimodal_prompt_config=None),
-    )
-    MegatronGenerationMixin._setup_openai_api_server(worker)
+    started = _start_stubbed_http_server(monkeypatch, sampling_cfg=sampling)
 
     assert {key: started[key] for key in expected} == expected

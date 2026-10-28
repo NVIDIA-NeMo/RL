@@ -70,7 +70,10 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 2
       gpu_memory_utilization: 0.7
-      enforce_eager: true
+      # PIECEWISE CUDA graphs instead of enforce_eager: ~2x faster generation, metrics unchanged (H100 A/B in #4568).
+    vllm_kwargs:
+      compilation_config:
+        cudagraph_mode: PIECEWISE
 data:
   max_input_seq_length: 2048
   train:

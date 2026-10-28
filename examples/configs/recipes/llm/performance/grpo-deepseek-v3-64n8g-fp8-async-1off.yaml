@@ -24,6 +24,7 @@ policy:
       NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
       NRL_REFIT_NUM_BUFFERS: "1"
   generation:
+    refit_transport: null
     vllm_cfg:
       tensor_parallel_size: 16
       precision: "fp8"
@@ -38,6 +39,7 @@ policy:
       ]
     vllm_kwargs:
       max_num_seqs: 32
+      moe_backend: triton
 logger:
   log_dir: logs/grpo-deepseek-v3-64n8g-fp8-async-1off
   wandb:
