@@ -389,11 +389,13 @@ class MegatronConfig(TypedDict):
     empty_unused_memory_level: int
     # Megatron-style manual garbage collection. An automatic full Python GC lands on
     # whichever rank crosses its threshold, and every other rank then waits for it
-    # in the next collective. When True, the Megatron policy workers disable
-    # automatic GC (from the end of worker setup) and collect on every rank after
-    # every manual_gc_interval-th optimizer step, on both the monolithic train()
-    # and split-step (finish_train_step) paths. Recommended: false; see
-    # docs/design-docs/training-backends.md for when to enable it.
+    # in the next collective. When True, the Megatron policy workers (and, under
+    # value.megatron_cfg, the PPO Megatron value workers) disable automatic GC
+    # (from the end of worker setup) and collect on every rank after every
+    # manual_gc_interval-th optimizer step, on both the monolithic train() and
+    # split-step (finish_train_step) paths. Not supported on distillation teachers,
+    # which never train: the student's value is reset for them. Recommended: false;
+    # see docs/design-docs/training-backends.md for when to enable it.
     manual_gc: NotRequired[bool]
     # Optimizer steps between manual collections; must be a positive integer when
     # manual_gc is True (validated at worker setup).

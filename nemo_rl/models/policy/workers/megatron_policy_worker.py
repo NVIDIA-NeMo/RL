@@ -99,6 +99,7 @@ from nemo_rl.models.megatron.draft.step_state import (
     DraftStepState,
 )
 from nemo_rl.models.megatron.hybridep import uses_hybridep_flex_dispatcher
+from nemo_rl.models.megatron.manual_gc import ManualGCMixin
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -684,6 +685,7 @@ def _reserved_http_server_port_for_rank(
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
+    ManualGCMixin,
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
     TQWorkerMixin,
@@ -702,9 +704,6 @@ class MegatronPolicyWorkerImpl(
     _train_step_state: Optional[dict[str, Any]] = None
     _remote_sparse_refit: Any = None
     _async_checkpoint_cuda_cache_active: bool = False
-    # megatron_cfg.manual_gc_interval when manual GC is on, else None.
-    _manual_gc_interval: Optional[int] = None
-    _manual_gc_steps: int = 0
 
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -2272,57 +2271,6 @@ class MegatronPolicyWorkerImpl(
             raise
         self._maybe_run_manual_gc()
         return result
-
-    def _manual_gc_interval_from_cfg(self) -> Optional[int]:
-        """Return megatron_cfg.manual_gc_interval if manual GC is on, else None.
-
-        Raises:
-            ValueError: if manual_gc is True and manual_gc_interval is missing or not
-                a positive number of optimizer steps. NeMo-RL has no equivalent of
-                Megatron's ``manual_gc_eval`` collections, so a non-positive interval
-                would disable automatic GC with no collection ever running.
-        """
-        megatron_cfg = self.cfg["megatron_cfg"]
-        if not megatron_cfg.get("manual_gc"):
-            return None
-        interval = megatron_cfg.get("manual_gc_interval")
-        if not isinstance(interval, int) or isinstance(interval, bool) or interval <= 0:
-            raise ValueError(
-                "megatron_cfg.manual_gc is True, so megatron_cfg.manual_gc_interval "
-                f"must be a positive number of optimizer steps, got {interval!r}. "
-                "Otherwise automatic GC is disabled with no collection ever running."
-            )
-        return interval
-
-    def _maybe_enable_manual_gc(self) -> None:
-        """Disable automatic Python GC when megatron_cfg.manual_gc is set.
-
-        Mirrors Megatron's ``manual_gc``: collections then run on every rank at the
-        same point (see ``_maybe_run_manual_gc``) instead of stalling the other
-        ranks one at a time. Called at the end of ``__init__``, so model, optimizer
-        and checkpoint setup run with automatic GC on and the collection here frees
-        their garbage. Forked children re-enable GC so subprocesses such as data
-        workers keep the default behavior.
-        """
-        interval = self._manual_gc_interval_from_cfg()
-        if interval is None:
-            return
-        gc.collect()
-        gc.disable()
-        os.register_at_fork(after_in_child=gc.enable)
-        self._manual_gc_interval = interval
-
-    def _maybe_run_manual_gc(self) -> None:
-        """Collect every manual_gc_interval optimizer steps; every rank runs it in lockstep.
-
-        Called after each optimizer step on both training paths: per global batch in
-        ``train()`` and at the end of ``finish_train_step``.
-        """
-        if not self._manual_gc_interval:
-            return
-        self._manual_gc_steps += 1
-        if self._manual_gc_steps % self._manual_gc_interval == 0:
-            gc.collect()
 
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType

@@ -166,6 +166,11 @@ policy:
   first manual collection, at the end of setup, frees their garbage.
 - Processes forked from the worker, such as data loader workers, get automatic
   collection back.
+- For PPO, the Megatron value workers have the same stall and take the same keys
+  under `value.megatron_cfg`; set them there separately.
+- Distillation teachers never run a training step, so they do not inherit the
+  student's `manual_gc`, and setting it in a teacher's `megatron_cfg_overrides`
+  is rejected.
 
 Choosing the interval is a trade between step-time consistency and host memory.
 Reference counting still frees most objects immediately; only garbage held in
@@ -176,7 +181,7 @@ on every rank at the same point. Start with `10`, then compare runs with
 `manual_gc` off and on: mean and p99 step time, and the peak host RSS of the
 policy workers. Raise the interval if the collection time is visible in every
 tenth step; lower it if host memory keeps climbing. The option only changes the
-Megatron policy workers; vLLM and other actors keep the default collector.
+Megatron workers that train; vLLM and other actors keep the default collector.
 
 ### Automodel Backend
 To enable Automodel training:

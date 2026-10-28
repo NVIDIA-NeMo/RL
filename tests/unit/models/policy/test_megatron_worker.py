@@ -2498,16 +2498,44 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         assert events == [("finalize", False)]
 
 
-def _manual_gc_worker(monkeypatch, megatron_cfg):
+# Both Megatron workers that train across data-parallel ranks take manual_gc.
+_MANUAL_GC_WORKERS = {
+    "policy": (
+        "nemo_rl.models.policy.workers.megatron_policy_worker",
+        "MegatronPolicyWorkerImpl",
+    ),
+    "value": (
+        "nemo_rl.models.value.workers.megatron_value_worker",
+        "MegatronValueWorkerImpl",
+    ),
+}
+
+
+@pytest.fixture(params=sorted(_MANUAL_GC_WORKERS))
+def manual_gc_worker_impl(request):
+    import importlib
+
+    module_name, class_name = _MANUAL_GC_WORKERS[request.param]
+    return getattr(importlib.import_module(module_name), class_name)
+
+
+def _manual_gc_worker(monkeypatch, megatron_cfg, worker_impl=None):
+    import nemo_rl.models.megatron.manual_gc as manual_gc_module
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
-    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    if worker_impl is None:
+        worker_impl = worker_module.MegatronPolicyWorkerImpl
+    worker = object.__new__(worker_impl)
     worker.cfg = {"megatron_cfg": megatron_cfg}
     events = []
-    monkeypatch.setattr(worker_module.gc, "disable", lambda: events.append("disable"))
-    monkeypatch.setattr(worker_module.gc, "collect", lambda: events.append("collect"))
     monkeypatch.setattr(
-        worker_module.os,
+        manual_gc_module.gc, "disable", lambda: events.append("disable")
+    )
+    monkeypatch.setattr(
+        manual_gc_module.gc, "collect", lambda: events.append("collect")
+    )
+    monkeypatch.setattr(
+        manual_gc_module.os,
         "register_at_fork",
         lambda **kwargs: events.append(("register_at_fork", kwargs["after_in_child"])),
     )
@@ -2519,8 +2547,10 @@ def _manual_gc_worker(monkeypatch, megatron_cfg):
     [{}, {"manual_gc": False}, {"manual_gc": False, "manual_gc_interval": 10}],
     ids=["no_keys", "manual_gc_false", "exemplar_defaults"],
 )
-def test_megatron_manual_gc_is_off_unless_enabled(monkeypatch, megatron_cfg):
-    worker, events = _manual_gc_worker(monkeypatch, megatron_cfg)
+def test_megatron_manual_gc_is_off_unless_enabled(
+    monkeypatch, megatron_cfg, manual_gc_worker_impl
+):
+    worker, events = _manual_gc_worker(monkeypatch, megatron_cfg, manual_gc_worker_impl)
 
     assert worker._manual_gc_interval_from_cfg() is None
     worker._maybe_enable_manual_gc()
@@ -2534,11 +2564,13 @@ def test_megatron_manual_gc_is_off_unless_enabled(monkeypatch, megatron_cfg):
     assert worker._manual_gc_interval is None
 
 
-def test_megatron_manual_gc_collects_every_interval(monkeypatch):
+def test_megatron_manual_gc_collects_every_interval(monkeypatch, manual_gc_worker_impl):
     import gc
 
     worker, events = _manual_gc_worker(
-        monkeypatch, {"manual_gc": True, "manual_gc_interval": 2}
+        monkeypatch,
+        {"manual_gc": True, "manual_gc_interval": 2},
+        manual_gc_worker_impl,
     )
 
     worker._maybe_enable_manual_gc()
@@ -2564,8 +2596,10 @@ def test_megatron_manual_gc_collects_every_interval(monkeypatch):
     ],
     ids=["missing", "none", "zero", "negative", "bool", "str"],
 )
-def test_megatron_manual_gc_rejects_a_non_positive_interval(monkeypatch, megatron_cfg):
-    worker, events = _manual_gc_worker(monkeypatch, megatron_cfg)
+def test_megatron_manual_gc_rejects_a_non_positive_interval(
+    monkeypatch, megatron_cfg, manual_gc_worker_impl
+):
+    worker, events = _manual_gc_worker(monkeypatch, megatron_cfg, manual_gc_worker_impl)
 
     with pytest.raises(ValueError, match="manual_gc_interval must be a positive"):
         worker._manual_gc_interval_from_cfg()
@@ -2575,20 +2609,21 @@ def test_megatron_manual_gc_rejects_a_non_positive_interval(monkeypatch, megatro
     assert events == []
 
 
-def _megatron_worker_method_ast(name):
-    """AST of a MegatronPolicyWorkerImpl method, parsed from the module file.
+def _megatron_worker_method_ast(worker_kind, name):
+    """AST of a manual-GC worker method, parsed from the worker's module file.
 
     Parsed from the file rather than via ``inspect.getsource`` because decorators
     such as ``wrap_with_nvtx_name`` may hide the original function.
     """
-    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    import importlib
 
-    with open(worker_module.__file__) as f:
+    module_name, class_name = _MANUAL_GC_WORKERS[worker_kind]
+    with open(importlib.import_module(module_name).__file__) as f:
         module = ast.parse(f.read())
     (cls,) = [
         node
         for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == "MegatronPolicyWorkerImpl"
+        if isinstance(node, ast.ClassDef) and node.name == class_name
     ]
     (method,) = [
         node
@@ -2598,13 +2633,16 @@ def _megatron_worker_method_ast(name):
     return method
 
 
-def test_megatron_worker_init_validates_manual_gc_early_and_enables_it_last():
+@pytest.mark.parametrize("worker_kind", sorted(_MANUAL_GC_WORKERS))
+def test_megatron_worker_init_validates_manual_gc_early_and_enables_it_last(
+    worker_kind,
+):
     """__init__ fails on a bad config before setup and disables GC only at the end.
 
     The worker constructor needs GPUs and a model, so this checks the call sites in
-    the source: validation right after the Timer, enabling as the last statement.
+    the source: one validation call, and enabling as the last statement.
     """
-    init_fn = _megatron_worker_method_ast("__init__")
+    init_fn = _megatron_worker_method_ast(worker_kind, "__init__")
     calls = [
         node.func.attr
         for node in ast.walk(init_fn)
@@ -2623,15 +2661,17 @@ def test_megatron_worker_init_validates_manual_gc_early_and_enables_it_last():
     ), "_maybe_enable_manual_gc must be the last statement of __init__"
 
 
-def test_megatron_train_runs_manual_gc_after_each_optimizer_step():
-    """The monolithic train() (v1 SFT/RM/DPO) must reach the manual GC hook.
+@pytest.mark.parametrize("worker_kind", sorted(_MANUAL_GC_WORKERS))
+def test_megatron_train_runs_manual_gc_after_each_optimizer_step(worker_kind):
+    """The monolithic train() (v1 SFT/RM/DPO, and the PPO value worker) must reach
+    the manual GC hook.
 
     Checked in the source because train() needs GPUs; the GPU test
-    test_megatron_policy_training_manual_gc covers it end to end. The hook must sit
-    in the same block as optimizer.step(), so it runs once per optimizer step and
-    never in eval mode.
+    test_megatron_policy_training_manual_gc covers the policy worker end to end.
+    The hook must sit in the same block as optimizer.step(), so it runs once per
+    optimizer step and never in eval mode.
     """
-    tree = _megatron_worker_method_ast("train")
+    tree = _megatron_worker_method_ast(worker_kind, "train")
 
     def calls_in(stmts, attr):
         return [
