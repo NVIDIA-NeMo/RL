@@ -130,7 +130,8 @@ class CrossTokenizerCollator:
             than its context; same-tokenizer teachers check the shared
             student tokenization against their own context length, rounded
             up to both the student's divisor and their own. Chat mode always
-            rejects rows longer than a context length.
+            rejects rows longer than a context length; same-tokenizer teachers
+            also check the width after padding to the student's divisor.
         ce_covers_assistant_turn: Chat-mode CE target. ``False`` supervises
             the final assistant content and end-of-turn token. ``True``
             supervises every token of the final assistant turn (SFT-style),
@@ -500,6 +501,13 @@ class CrossTokenizerCollator:
                     if len(doc.input_ids) > self.ctx_length_teachers[i]:
                         raise ValueError(
                             f"teacher {i}, sample idx={datum['idx']}: shared tokenization exceeds context length {self.ctx_length_teachers[i]}; overlength rows are rejected"
+                        )
+                    padded = self._padded_width(
+                        len(doc.input_ids), self.make_seq_div_by_student
+                    )
+                    if padded > self.ctx_length_teachers[i]:
+                        raise ValueError(
+                            f"teacher {i}, sample idx={datum['idx']}: shared tokenization has {len(doc.input_ids)} tokens, padded to {padded} for a sequence-length multiple of {self.make_seq_div_by_student}, exceeding context length {self.ctx_length_teachers[i]}; overlength rows are rejected"
                         )
                 continue
             tokenizer = self.teacher_tokenizers[i]

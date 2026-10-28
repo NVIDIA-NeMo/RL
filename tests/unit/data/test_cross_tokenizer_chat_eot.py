@@ -84,6 +84,7 @@ def _collator(
     *,
     student_length: int = 64,
     teacher_length: int = 64,
+    teacher_divisor: int = 8,
     **options: bool,
 ) -> CrossTokenizerCollator:
     return CrossTokenizerCollator(
@@ -99,7 +100,7 @@ def _collator(
         ctx_length_teachers=[teacher_length],
         drop_first_assistant_chunk_kl_by_teacher=[False],
         make_seq_div_by_student=8,
-        make_seq_div_by_teachers=[8],
+        make_seq_div_by_teachers=[teacher_divisor],
         **options,
     )
 
@@ -155,6 +156,50 @@ def test_one_sided_overflow_is_rejected(student_length: int, teacher_length: int
             student_length=student_length,
             teacher_length=teacher_length,
         )([_datum()])
+
+
+@pytest.mark.parametrize("reject_overlength_text", [False, True])
+def test_same_tokenizer_teacher_rejects_chat_padding_overflow(
+    reject_overlength_text: bool,
+) -> None:
+    student = _tokenizer(suffix="<eot>")
+    collator = _collator(
+        student,
+        None,
+        teacher_length=12,
+        teacher_divisor=2,
+        reject_overlength_text=reject_overlength_text,
+    )
+    # Nine real tokens fit the teacher's context, even rounded to its divisor
+    # of two. Its shared input instead pads to the student's multiple of eight.
+    longer_row = {**_datum(trailing_content=" Again Again Again"), "idx": 7}
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"^teacher 0, sample idx=7: shared tokenization has 9 tokens, "
+            r"padded to 16 for a sequence-length multiple of 8, exceeding context "
+            r"length 12; overlength rows are rejected$"
+        ),
+    ):
+        collator([_datum(), longer_row])
+
+
+@pytest.mark.parametrize(
+    "teacher_length,trailing_content,token_count,padded_width",
+    [(8, "", 6, 8), (12, "", 6, 8), (16, " Again Again Again", 9, 16)],
+)
+def test_same_tokenizer_teacher_accepts_chat_padding_that_fits(
+    teacher_length: int,
+    trailing_content: str,
+    token_count: int,
+    padded_width: int,
+) -> None:
+    student = _tokenizer(suffix="<eot>")
+    batch = _collator(student, None, teacher_length=teacher_length, teacher_divisor=2)(
+        [_datum(trailing_content=trailing_content)]
+    )
+    assert batch["input_ids"].shape == (1, padded_width)
+    assert batch["input_lengths"].tolist() == [token_count]
 
 
 def test_template_without_terminators_does_not_supervise_next_role_header():
