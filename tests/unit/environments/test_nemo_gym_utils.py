@@ -419,6 +419,7 @@ def _stub_gym_spinup(run_helper):
         yield
 
 
+@pytest.mark.nemo_gym
 @pytest.mark.parametrize("forest_training", [False, True])
 def test_spinup_passes_parent_resolution_to_gym(forest_training, tmp_path, monkeypatch):
     from nemo_gym.token_id_capture.config import TokenIdCaptureConfig

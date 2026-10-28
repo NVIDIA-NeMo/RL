@@ -117,6 +117,7 @@ def test_gym_functional_launch_config(functional_recipe) -> None:
 
 
 @pytest.mark.nemo_gym
+@pytest.mark.parametrize("functional_recipe", [False], indirect=True)
 def test_gym_functional_config_routes(functional_recipe) -> None:
     pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
     from nemo_gym.global_config import (

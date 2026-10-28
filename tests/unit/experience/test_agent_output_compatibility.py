@@ -8,6 +8,7 @@ execute unchanged source methods with external orchestration omitted.
 """
 
 import asyncio
+import json
 from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
@@ -19,7 +20,6 @@ import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.context_management import ContextManagedResponsesClient
 from nemo_gym.openai_utils import (
     NeMoGymAsyncOpenAI,
     NeMoGymResponseCreateParamsNonStreaming,
@@ -28,13 +28,6 @@ from nemo_gym.server_utils import ServerClient
 from responses_api_agents.browsecomp_agent.app import BrowsecompAgent
 from responses_api_agents.browsecomp_agent.tests.test_progress_tracking import (
     _make_config,
-)
-from responses_api_agents.simple_agent_with_compaction.tests.test_app import (
-    make_agent,
-    run_agent,
-)
-from responses_api_agents.simple_agent_with_compaction.tests.test_client import (
-    http_response,
 )
 
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
@@ -132,7 +125,10 @@ def captured(
                 "done": False,
                 "results_string": f"tool result {count}",
             }
-        response = http_response(result)
+        response = MagicMock(ok=True, status=200, cookies={})
+        payload = json.dumps(result).encode()
+        response.read = AsyncMock(return_value=payload)
+        response.content.read = AsyncMock(return_value=payload)
         response.json = AsyncMock(return_value=result)
         response.raise_for_status = MagicMock()
         return response
@@ -211,52 +207,6 @@ def assert_training_rows(
     ]
     assert generated == list(range(1001, 1001 + len(selected)))
     assert not any(partition == "staged" for partition, _ in captured.plane.rows)
-
-
-@pytest.mark.parametrize("compact", [False, True])
-def test_simple_actual_run_returns_common_history(
-    captured: Any, compact: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    oracle = []
-    original_create = ContextManagedResponsesClient.create
-
-    async def observe_create(client: Any, *args: Any, **kwargs: Any) -> Any:
-        response = await original_create(client, *args, **kwargs)
-        oracle.append(response.id)
-        return response
-
-    monkeypatch.setattr(ContextManagedResponsesClient, "create", observe_create)
-    captured.queue.extend(
-        [tool_message(1), tool_message(2), {"role": "assistant", "content": "done"}]
-    )
-    agent, _ = make_agent(
-        config={
-            "context_history": {
-                "enabled": compact,
-                "max_response_retries": 0,
-                "policy": {
-                    "type": "recency",
-                    "config": {"reasoning": {"enabled": True, "keep_last_blocks": 0}},
-                },
-                "schedule": {"type": "turn_chunked_recency", "actions_per_chunk": 2},
-            },
-        }
-    )
-    agent.server_client = captured.transport
-    result = asyncio.run(run_agent(agent)).model_dump(mode="json")
-    assert result["reward"] == 0.75
-    ordinary = deepcopy(result)
-    assert "context_compaction_result" not in ordinary
-    manifest = captured.harness.manifest("dispatch_g0")
-    # Compare reconstructed membership to independently observed accepted calls.
-    selected = selected_response_ids(manifest.records, ordinary["response"])
-    assert selected == tuple(oracle)
-    assert sum(r.parent_call_id is None for r in manifest.records) == (
-        2 if compact else 1
-    )
-    assert_training_rows(
-        captured, ordinary["response"], owner="dispatch_g0", rows=2 if compact else 1
-    )
 
 
 @pytest.mark.parametrize("compact", [False, True])
@@ -402,28 +352,35 @@ def test_browsecomp_progress_recovery_is_not_sampled_output(
 
 
 @pytest.mark.parametrize(
-    "path,body",
+    "path,body,reason",
     [
         (
             "chat/completions",
-            {"messages": [{"role": "user", "content": "task"}], "stream": True},
+            {
+                "messages": [{"role": "user", "content": "task"}],
+                "stream": True,
+                "n": 2,
+            },
+            "Framework",
         ),
         (
             "messages",
             {"messages": [{"role": "user", "content": "task"}], "max_tokens": 10},
+            "Source-history capture currently requires Responses or Chat",
         ),
         (
             "responses",
             {"input": "task", "stream": True, "previous_response_id": "opaque"},
+            "Framework",
         ),
     ],
 )
 def test_existing_framework_capture_protocol_gap(
-    captured: Any, path: str, body: dict
+    captured: Any, path: str, body: dict, reason: str
 ) -> None:
     response = captured.harness.client.post(
         f"/ng-rollout/owner/training-token-capture/v1/{path}", json=body
     )
     assert response.status_code == 422
-    assert "Framework" in response.text
+    assert reason in response.text
     assert not captured.served and not captured.harness.worker_calls

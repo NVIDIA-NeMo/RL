@@ -4130,7 +4130,7 @@ requires-dist = [
     { name = "daytona", marker = "extra == 'sandbox'", specifier = ">=0.179.0" },
     { name = "defusedxml", marker = "extra == 'dev'", specifier = ">=0.7.1" },
     { name = "devtools" },
-    { name = "e2b", marker = "extra == 'sandbox'", specifier = ">=2.36.0,<3.0.0" },
+    { name = "e2b", marker = "extra == 'sandbox'", specifier = ">=2.46.0,<3.0.0" },
     { name = "fastapi", specifier = "!=0.142.*" },
     { name = "flashinfer-python", marker = "extra == 'vllm'", specifier = "==0.6.18" },
     { name = "fonttools", specifier = ">=4.60.2" },

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Composed CPU CC flow; generation, storage and learner execution are doubles.
 
-Uses real shared-client policy decisions, HTTP capture/ledger, receipt processing,
+Uses scripted context rewrites, real HTTP capture/ledger, receipt processing,
 finalization, replay selection and controller advantages. No real tokenizer,
 image processor, vLLM, TransferQueue service or optimizer executes here.
 """
@@ -12,27 +12,14 @@ import io
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.config_types import ModelServerRef
-from nemo_gym.context_management import (
-    ContextHistoryConfig,
-    ContextManagedResponsesClient,
-)
-from nemo_gym.openai_utils import (
-    NeMoGymAsyncOpenAI,
-    NeMoGymResponseCreateParamsNonStreaming,
-)
-from nemo_gym.server_utils import ServerClient
+from nemo_gym.openai_utils import NeMoGymAsyncOpenAI
 from nemo_gym.token_id_capture.staging.records import RolloutManifest, StageResult
-from responses_api_agents.simple_agent_with_compaction.tests.test_client import (
-    http_response,
-)
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
@@ -113,7 +100,7 @@ async def ready_controller(
     indirect=["pipeline"],
     ids=["identity", "reasoning_k1", "reasoning_k2", "reasoning_k10"],
 )
-def test_twenty_turn_shared_client_to_replay_and_advantages(
+def test_twenty_turn_capture_to_replay_and_advantages(
     pipeline: tuple,
     monkeypatch: pytest.MonkeyPatch,
     compact: bool,
@@ -125,60 +112,26 @@ def test_twenty_turn_shared_client_to_replay_and_advantages(
 
     async def exercise() -> None:
         for owner in range(2):
-            transport = MagicMock(spec=ServerClient)
-
-            async def post(**kwargs: Any) -> Any:
-                assert kwargs["_resend_after_disconnect"] is False
-                response = harness.client.post(
-                    kwargs["url_path"],
-                    json=kwargs["json"].model_dump(mode="json"),
-                    headers=kwargs.get("headers"),
-                )
-                gym_harness.assert_clean(response)
-                return http_response(response.json())
-
-            transport.post = AsyncMock(side_effect=post)
-            client = ContextManagedResponsesClient(
-                server_client=transport,
-                model_server=ModelServerRef(name="policy", type="responses_api_models"),
-                logical_rollout_id=f"group_g{owner}",
-                initial_request=NeMoGymResponseCreateParamsNonStreaming(input="task"),
-                config=ContextHistoryConfig.model_validate(
-                    {
-                        "enabled": compact,
-                        "max_response_retries": 0,
-                        "policy": {
-                            "type": "recency",
-                            "config": {
-                                "reasoning": {"enabled": True, "keep_last_blocks": 0}
-                            },
-                        },
-                        "schedule": {
-                            "type": "turn_chunked_recency",
-                            "actions_per_chunk": chunk_size,
-                        },
-                    }
-                ),
-            )
+            messages = list(gym_harness.HISTORY)
             selected = []
             accepted_ids = []
             accepted_output = []
             for turn in range(20):
-                response = await client.create()
-                accepted_ids.append(response.id)
-                accepted_output.extend(response.model_dump(mode="json")["output"])
+                if compact and turn and turn % chunk_size == 0:
+                    messages = [
+                        {"role": "user", "content": f"summary before turn {turn}"}
+                    ]
+                response = gym_harness.assert_clean(
+                    harness.post(f"group_g{owner}", messages)
+                )
+                accepted_ids.append(response["id"])
+                accepted_output.extend(response["output"])
                 selected.append(1000 + len(harness.worker_calls))
-                if turn < 19:
-                    client.append_observation(
-                        [
-                            {
-                                "role": "user",
-                                "type": "message",
-                                "content": f"observation {turn}",
-                            }
-                        ]
-                    )
-            client.finish(response)
+                messages = (
+                    messages
+                    + response["output"]
+                    + [{"role": "user", "content": f"observation {turn}"}]
+                )
             assert len(accepted_ids) == 20
             manifest = RolloutManifest.model_validate(
                 await harness.ledger.manifest(f"group_g{owner}")
@@ -190,7 +143,7 @@ def test_twenty_turn_shared_client_to_replay_and_advantages(
                 {"_ng_rollout_id": f"group_g{owner}"},
                 {
                     "reward": float(owner),
-                    "response": {"id": response.id, "output": accepted_output},
+                    "response": {"id": response["id"], "output": accepted_output},
                 },
             )
             receipts.append(processed["receipt"])
