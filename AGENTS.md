@@ -4,13 +4,9 @@ NeMo-RL is an RLHF training framework built on Ray and PyTorch (Automodel / Mega
 
 ## Skills
 
-Coding guidelines and operational procedures are organized as Claude skills in
-two locations:
-
-- `skills/` — customer-facing operational skills (launch-nemo-rl, auto-research, brev-etiquette, docs)
-- `.agents/contributor-skills/` — contributor-facing development guidelines (testing, linting, CI/CD, review, etc.)
-
-All skills are symlinked into `.claude/skills/` for unified discovery.
+Coding guidelines and operational procedures are organized as agent skills in
+`skills/`, one directory per skill with a `SKILL.md`. `.claude/skills` and
+`.agents/skills` are symlinks to `skills/`, so every agent discovers the same set.
 **Always read the relevant `SKILL.md` before starting any task it
 covers — skills are mandatory context, not optional background reading.**
 
@@ -35,6 +31,10 @@ Use `/review-pr <pr-number>` for interactive local PR review.
 
 Use `/review-pr-team <pr-number>` for a deeper review by a coordinated team of
 specialized agents (requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`).
+Related: `/review-pr-team-with-html <pr-number>` adds a public explainer page built
+with `/pr-html-concise-public`, and `/review-pr-team-verify-followup <pr-number>`
+checks the author's fixes after a published review and scans the new commits for
+major issues they introduced.
 
 When reviewing code, follow these principles:
 

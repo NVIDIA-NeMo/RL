@@ -17,11 +17,13 @@ import os
 import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from functools import partial
 from typing import Any, Literal, Optional, Protocol
 
 import torch
 import zmq
+from torch.distributed._tensor import Shard
 
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineMixin,
@@ -36,6 +38,12 @@ from nemo_rl.models.generation.vllm.draft_utils import (
     _is_full_draft_stream,
     _validate_draft_refit_info,
     disable_draft_module_sharing,
+)
+from nemo_rl.models.generation.vllm.lora_utils import (
+    NATIVE_LORA_ADAPTER_ID,
+    NativeLoraRefitSettings,
+    collect_native_lora,
+    native_lora_refit_settings,
 )
 from nemo_rl.models.generation.vllm.utils import _format_refit_key_error
 from nemo_rl.models.policy.utils import (
@@ -405,6 +413,248 @@ def _read_mtp_layer_weights_from_checkpoint(
     return weights
 
 
+class VllmReshardParamSpecCollection:
+    """Stateless factories for vLLM's nccl_reshard receive hooks."""
+
+    @staticmethod
+    def _direct_param_spec(
+        vllm_param: torch.Tensor,
+        wire_dtype: torch.dtype,
+    ) -> LocalParamSpec:
+        """Receive into the destination storage captured when the map is built."""
+        return LocalParamSpec(base=vllm_param.data, wire_dtype=wire_dtype)
+
+    @staticmethod
+    def _default_staged_param_spec(
+        vllm_param: torch.Tensor,
+        merged_slice: tuple[slice, ...] | None,
+        wire_dtype: torch.dtype,
+    ) -> LocalParamSpec:
+        """Stage a canonical weight and copy it into the current destination storage."""
+
+        def pre(_base: torch.Tensor) -> RefitCtx:
+            region = (
+                vllm_param.data
+                if merged_slice is None
+                else vllm_param.data[merged_slice]
+            )
+            return RefitCtx(
+                buf=torch.empty_like(region, dtype=wire_dtype),
+                extra={"region": region},
+            )
+
+        def post(ctx: RefitCtx) -> None:
+            ctx.extra["region"].copy_(ctx.buf)
+
+        return LocalParamSpec(
+            base=vllm_param, pre=pre, post=post, wire_dtype=wire_dtype
+        )
+
+    @staticmethod
+    def _trtllm_grouped_expert_spec(
+        param_info: dict[str, Any],
+        wire_dtype: torch.dtype,
+        *,
+        refit_comm_groups: dict[int, Any] | None,
+        device: torch.device,
+        registered_vllm_name: str | None,
+        load_weights: Callable[[Iterable[tuple[str, torch.Tensor]]], set[str] | None],
+    ) -> LocalParamSpec:
+        """Stage EP-local expert weights for the native vLLM weight loader."""
+        unsupported_shards = [
+            placement.dim
+            for placement in param_info["dst_placements"]
+            if isinstance(placement, Shard) and placement.dim != 0
+        ]
+        if unsupported_shards:
+            raise ValueError(
+                "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
+                "expert-parallel destination shards; unsupported tensor shard "
+                f"dimensions {unsupported_shards} for {param_info['name']!r}"
+            )
+
+        dst_mesh = param_info["dst_mesh_info"]
+        mesh_tensor = getattr(dst_mesh, "mesh", None)
+        if mesh_tensor is None:
+            mesh_tensor = getattr(dst_mesh, "_mesh", None)
+        if mesh_tensor is None:
+            raise ValueError(
+                "Destination DeviceMesh does not expose mesh ranks for "
+                f"{param_info['name']!r}"
+            )
+        ep_size = 1
+        for mesh_dim, placement in enumerate(param_info["dst_placements"]):
+            if isinstance(placement, Shard) and placement.dim == 0:
+                ep_size *= int(mesh_tensor.shape[mesh_dim])
+        num_global_experts = int(param_info["global_shape"][0])
+        # The staged expert range uses torch.chunk semantics while vLLM
+        # places experts with a balanced split; the two agree only when
+        # the expert count divides evenly, so reject the uneven case
+        # instead of silently loading experts onto the wrong ranks.
+        if ep_size > 0 and num_global_experts % ep_size != 0:
+            raise ValueError(
+                "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
+                "the global expert count to divide evenly across EP ranks; "
+                f"got {num_global_experts} experts over {ep_size} ranks for "
+                f"{param_info['name']!r}"
+            )
+
+        # prepare defers this factory until refit communicators are initialized.
+        assert refit_comm_groups is not None
+        rank = refit_comm_groups[param_info.get("pp_stage", 0)].rank
+        if registered_vllm_name is None:
+            raise ValueError(
+                "BF16 FlashInfer TRTLLM nccl_reshard refit resolved an "
+                f"unregistered vLLM parameter for {param_info['name']!r}"
+            )
+        local_slices = _local_shard_slices(param_info, rank)
+        local_shape = tuple(
+            global_size
+            if shard_slice.start is None
+            else shard_slice.stop - shard_slice.start
+            for global_size, shard_slice in zip(
+                param_info["global_shape"], local_slices, strict=True
+            )
+        )
+        expert_start = 0 if local_slices[0].start is None else local_slices[0].start
+        grouped_proj = param_info["grouped_expert_proj"]
+        expert_prefix = param_info["name"].rsplit(f".{grouped_proj}.weight", 1)[0]
+        expected_loaded_names = {
+            registered_vllm_name,
+            registered_vllm_name.replace(".routed_experts.", "."),
+        }
+
+        def pre(_base: None) -> RefitCtx:
+            return RefitCtx(
+                buf=torch.empty(local_shape, dtype=wire_dtype, device=device)
+            )
+
+        def post(ctx: RefitCtx) -> None:
+            weights = [
+                (
+                    f"{expert_prefix}.{expert_start + local_idx}.{grouped_proj}.weight",
+                    expert_weight,
+                )
+                for local_idx, expert_weight in enumerate(ctx.buf.unbind(0))
+            ]
+            loaded_names = load_weights(weights)
+            # AutoWeightsLoader reports the fused destination parameter,
+            # not each per-expert HF source name.
+            if loaded_names is not None and expected_loaded_names.isdisjoint(
+                loaded_names
+            ):
+                raise RuntimeError(
+                    "BF16 FlashInfer TRTLLM nccl_reshard refit failed to "
+                    "load fused expert destination; expected one of "
+                    f"{sorted(expected_loaded_names)!r}, "
+                    f"vLLM reported {sorted(loaded_names)!r}"
+                )
+
+        return LocalParamSpec(base=None, pre=pre, post=post, wire_dtype=wire_dtype)
+
+    @staticmethod
+    def _mxfp8_receiver_quant_spec(
+        value_param: torch.Tensor,
+        scale_param: torch.Tensor,
+        merged_slice: tuple[slice, ...] | None,
+        wire_dtype: torch.dtype,
+    ) -> LocalParamSpec:
+        """Quantize a received weight and commit its MXFP8 values and scales."""
+
+        def pre(_base: torch.Tensor) -> RefitCtx:
+            value_region = (
+                value_param.data
+                if merged_slice is None
+                else value_param.data[merged_slice]
+            )
+            scale_region = (
+                scale_param.data
+                if merged_slice is None
+                else scale_param.data[merged_slice]
+            )
+            return RefitCtx(
+                buf=torch.empty_like(value_region, dtype=wire_dtype),
+                extra={"value_region": value_region, "scale_region": scale_region},
+            )
+
+        def post(ctx: RefitCtx) -> None:
+            # Load the optional vLLM quantizer only for MXFP8 storage.
+            from nemo_rl.models.generation.vllm.quantization.fp8 import (
+                quantize_mxfp8_weight,
+            )
+
+            value, scale = quantize_mxfp8_weight(ctx.buf)
+            ctx.extra["value_region"].copy_(value)
+            ctx.extra["scale_region"].copy_(scale)
+
+        return LocalParamSpec(
+            base=value_param.data, pre=pre, post=post, wire_dtype=wire_dtype
+        )
+
+    @staticmethod
+    def _blockwise_fp8_receiver_quant_spec(
+        value_param: torch.Tensor,
+        scale_param: torch.Tensor,
+        merged_slice: tuple[slice, ...] | None,
+        block_size: tuple[int, int],
+        wire_dtype: torch.dtype,
+    ) -> LocalParamSpec:
+        """Quantize a received weight and commit its blockwise FP8 values and scales."""
+        scale_slice = None
+        if merged_slice is not None:
+            # Example: w13_weight [E=8, 2048, 4096], blocks [128, 128],
+            # and gate slice [:, 0:1024, :] into scales [8, 16, 32].
+            axis = value_param.ndim - 2  # 3 - 2 = 1: intermediate dimension.
+            rows = merged_slice[axis]  # Weight rows 0:1024.
+            scale_slices = list(merged_slice)  # [:, 0:1024, :].
+            scale_slices[axis] = slice(
+                rows.start // block_size[0], rows.stop // block_size[0]
+            )  # Scale rows 0:8 (up uses 8:16).
+            scale_slice = tuple(scale_slices)  # [:, 0:8, :], shape [8, 8, 32].
+
+        def pre(_base: torch.Tensor) -> RefitCtx:
+            value_region = (
+                value_param.data
+                if merged_slice is None
+                else value_param.data[merged_slice]
+            )
+            scale_region = (
+                scale_param.data
+                if scale_slice is None
+                else scale_param.data[scale_slice]
+            )
+            return RefitCtx(
+                buf=torch.empty_like(value_region, dtype=wire_dtype),
+                extra={"value_region": value_region, "scale_region": scale_region},
+            )
+
+        def post(ctx: RefitCtx) -> None:
+            # Load the optional vLLM quantizer only for blockwise FP8 storage.
+            from nemo_rl.models.generation.vllm.quantization.fp8 import (
+                cast_tensor_to_fp8_blockwise,
+            )
+
+            if ctx.buf.ndim == 2:
+                value, scale = cast_tensor_to_fp8_blockwise(ctx.buf, block_size)
+                scale = scale.squeeze(-1)
+            else:  # ndim == 3: grouped experts.
+                # Blocks never straddle experts, so one cast covers the group.
+                num_experts, rows, cols = ctx.buf.shape
+                value, scale = cast_tensor_to_fp8_blockwise(
+                    ctx.buf.reshape(num_experts * rows, cols), block_size
+                )
+                value = value.reshape(num_experts, rows, cols)
+                scale = scale.reshape(
+                    num_experts, rows // block_size[0], cols // block_size[1]
+                )
+            ctx.extra["value_region"].copy_(value)
+            ctx.extra["scale_region"].copy_(scale)
+
+        return LocalParamSpec(
+            base=value_param.data, pre=pre, post=post, wire_dtype=wire_dtype
+        )
+
+
 class VllmInternalWorkerExtension(RefitBuilderInterface):
     # Per-PP-stage refit groups, None until init_nccl_reshard_comm_group builds them.
     # Declared rather than sprung into existence so a rebuild can release the previous
@@ -433,6 +683,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     # None until init_collective builds it. Declared so a rebuild can release the
     # previous group without probing for the attribute's existence.
     model_update_group: Any = None
+
+    def _native_lora_refit_settings(self) -> NativeLoraRefitSettings | None:
+        """Return adapter settings when this worker is configured for native refit."""
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None:
+            return None
+        return native_lora_refit_settings(model_runner.vllm_config)
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -1117,6 +1374,135 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         # policy stream (no `draft.` prefix), so feed it the policy weights too.
         self._maybe_refit_mtp_drafter(policy_weights)
 
+    @torch.no_grad()
+    def _install_native_lora(self, lora_tensors: dict[str, torch.Tensor]) -> None:
+        """Replace the active in-memory vLLM adapter from factorized tensors."""
+        from vllm.lora.lora_model import LoRAModel
+        from vllm.lora.peft_helper import PEFTHelper
+
+        settings = self._native_lora_refit_settings()
+        if settings is None:
+            raise RuntimeError("Native LoRA settings are missing from vLLM config.")
+        if not lora_tensors:
+            raise RuntimeError("Native LoRA refit received no factor tensors.")
+
+        lora_a_modules = {
+            name.removesuffix(".lora_A.weight")
+            for name in lora_tensors
+            if name.endswith(".lora_A.weight")
+        }
+        lora_b_modules = {
+            name.removesuffix(".lora_B.weight")
+            for name in lora_tensors
+            if name.endswith(".lora_B.weight")
+        }
+        incomplete_source_modules = lora_a_modules ^ lora_b_modules
+        if incomplete_source_modules:
+            raise RuntimeError(
+                "Native LoRA refit received incomplete source A/B pairs: "
+                f"{sorted(incomplete_source_modules)[:8]}"
+            )
+
+        model_runner = self.model_runner
+        lora_manager = model_runner.lora_manager
+        adapter_manager = lora_manager._adapter_manager
+        # Use the model owned by vLLM's adapter manager. This mirrors vLLM's
+        # LoRA loader and avoids assuming that every model runner exposes the
+        # same public ``model`` attribute.
+        model = adapter_manager.model
+        weights_mapper = getattr(model, "hf_to_vllm_mapper", None)
+        if weights_mapper is not None:
+            weights_mapper = weights_mapper.get_rename_mapper()
+        skip_prefixes = getattr(model, "lora_skip_prefixes", None)
+        skipped_source_tensors = sorted(
+            name
+            for name in lora_tensors
+            if skip_prefixes
+            and any(
+                f".{prefix}" in name or name.startswith(prefix)
+                for prefix in skip_prefixes
+            )
+        )
+        if skipped_source_tensors:
+            raise RuntimeError(
+                "Native LoRA refit received trainable factors for modules that "
+                "vLLM is configured to skip: "
+                f"{skipped_source_tensors[:8]}"
+            )
+        peft_helper = PEFTHelper.from_dict(
+            {
+                "r": settings.rank,
+                "lora_alpha": settings.alpha,
+                "target_modules": [],
+            }
+        )
+        peft_helper.validate_legal(lora_manager.lora_config)
+        lora = LoRAModel.from_lora_tensors(
+            lora_model_id=NATIVE_LORA_ADAPTER_ID,
+            tensors=lora_tensors,
+            peft_helper=peft_helper,
+            # Mirror vLLM's standard loader: the registered adapter is the CPU
+            # cache, while activation copies it into the preallocated GPU slot.
+            device="cpu",
+            dtype=lora_manager.lora_config.lora_dtype,
+            model_vocab_size=lora_manager.vocab_size,
+            weights_mapper=weights_mapper,
+            skip_prefixes=skip_prefixes,
+        )
+        if not lora.loras:
+            raise RuntimeError(
+                "Native LoRA refit did not map any source tensors to vLLM modules."
+            )
+
+        runtime_input_modules = set(adapter_manager.modules)
+        for packed_inputs in adapter_manager.packed_modules.values():
+            runtime_input_modules.update(packed_inputs)
+        if adapter_manager.is_pooling_model:
+            runtime_input_modules.update(
+                [name.removeprefix("model.") for name in runtime_input_modules]
+            )
+        unexpected_runtime_modules = sorted(
+            name
+            for name in lora.loras
+            if name not in runtime_input_modules
+            and not (
+                name.endswith(".base_layer")
+                and name.removesuffix(".base_layer") in runtime_input_modules
+            )
+        )
+        if unexpected_runtime_modules:
+            raise RuntimeError(
+                "Native LoRA refit received modules that vLLM cannot apply: "
+                f"{unexpected_runtime_modules[:8]}. For a model whose vLLM "
+                "implementation does not support lm_head LoRA, configure "
+                "Automodel LoRA with match_all_linear: false and "
+                'exclude_modules: ["*lm_head*"], or set '
+                "policy.generation.lora_refit_mode: merged."
+            )
+
+        incomplete_runtime_modules = sorted(
+            name
+            for name, weights in lora.loras.items()
+            if weights.lora_a is None or weights.lora_b is None
+        )
+        if incomplete_runtime_modules:
+            raise RuntimeError(
+                "Native LoRA refit produced incomplete vLLM A/B pairs: "
+                f"{incomplete_runtime_modules[:8]}"
+            )
+
+        adapter_manager.remove_adapter(NATIVE_LORA_ADAPTER_ID)
+        if not adapter_manager.add_adapter(lora):
+            raise RuntimeError("vLLM rejected the native LoRA adapter update.")
+        adapter_manager.activate_adapter(NATIVE_LORA_ADAPTER_ID)
+        torch.cuda.synchronize(self.device)
+        logger.info(
+            "Installed native LoRA adapter %d: %d source tensors -> %d runtime modules",
+            NATIVE_LORA_ADAPTER_ID,
+            len(lora_tensors),
+            len(lora.loras),
+        )
+
     def _get_sparse_delta_applier(self) -> Any:
         if self._sparse_delta_applier is None:
             # Avoid importing sparse-refit code for existing refit transports.
@@ -1521,12 +1907,19 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         buffer = None
         weight = None
         weights = None
+        native_lora_tensors: dict[str, torch.Tensor] = {}
+        native_lora_refit = self._native_lora_refit_settings() is not None
 
         try:
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
-
-            with self._weight_update_lifecycle("ipc") as finalize:
+            noop_finalize: WeightUpdateFinalizer = lambda: None
+            lifecycle = (
+                nullcontext[WeightUpdateFinalizer](noop_finalize)
+                if native_lora_refit
+                else self._weight_update_lifecycle("ipc")
+            )
+            with lifecycle as finalize:
                 while True:
                     # Blocking receive with timeout (this is the main operation)
                     payload = self.zmq_socket.recv_pyobj()
@@ -1536,7 +1929,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         # fails, otherwise the sender remains blocked until timeout.
                         try:
                             manifest.require_complete()
-                            finalize()
+                            if native_lora_refit:
+                                self._install_native_lora(native_lora_tensors)
+                            else:
+                                finalize()
                         finally:
                             self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                         break
@@ -1573,7 +1969,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             "inaccurate info like keys or cached dtype in "
                             "state_dict_info"
                         )
-                        self._load_weights(weights)
+                        if native_lora_refit:
+                            collect_native_lora(native_lora_tensors, weights)
+                        else:
+                            self._load_weights(weights)
                     except Exception as error:
                         batch_error = error
                         # The manifest only keeps the exception message; log
@@ -1612,7 +2011,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            if self._weight_update_errors_are_fatal():
+            if native_lora_refit or self._weight_update_errors_are_fatal():
                 raise
             logger.exception(
                 "Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: %s",
@@ -1668,7 +2067,22 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "collective refit lifecycle."
             )
 
+        native_lora_refit = self._native_lora_refit_settings() is not None
+        native_lora_tensors: dict[str, torch.Tensor] = {}
+
         try:
+            if native_lora_refit:
+                packed_broadcast_consumer(
+                    iterator=iter(self.state_dict_info.items()),
+                    group=self.model_update_group,
+                    src=0,
+                    post_unpack_func=partial(collect_native_lora, native_lora_tensors),
+                )
+                self._install_native_lora(native_lora_tensors)
+                gc.collect()
+                torch.cuda.empty_cache()
+                return True
+
             if refit_with_reload_api:
                 weight_iterator = packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
@@ -1712,7 +2126,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     finalize()
 
         except Exception as e:
-            if self._weight_update_errors_are_fatal():
+            if native_lora_refit or self._weight_update_errors_are_fatal():
                 raise
             logger.exception(
                 "Error in VllmInternalWorkerExtension.update_weights_from_collective: %s",
@@ -1776,237 +2190,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         - TRTLLM grouped experts: ``pre`` allocates canonical EP-local wire storage,
           and ``post`` sends each expert through vLLM's native weight loader.
         """
-
-        def _default_param_spec(
-            vllm_param: torch.Tensor,
-            merged_slice: tuple[slice, ...] | None,
-            wire_dtype: torch.dtype,
-        ) -> LocalParamSpec:
-            def pre(_base: torch.Tensor) -> RefitCtx:
-                region = (
-                    vllm_param.data
-                    if merged_slice is None
-                    else vllm_param.data[merged_slice]
-                )
-                return RefitCtx(
-                    buf=torch.empty_like(region, dtype=wire_dtype),
-                    extra={"region": region},
-                )
-
-            def post(ctx: RefitCtx) -> None:
-                ctx.extra["region"].copy_(ctx.buf)
-
-            return LocalParamSpec(
-                base=vllm_param, pre=pre, post=post, wire_dtype=wire_dtype
-            )
-
-        def _trtllm_grouped_expert_spec(
-            param_info: dict[str, Any],
-            vllm_param: torch.Tensor,
-            wire_dtype: torch.dtype,
-        ) -> LocalParamSpec:
-            from torch.distributed._tensor import Shard
-
-            unsupported_shards = [
-                placement.dim
-                for placement in param_info["dst_placements"]
-                if isinstance(placement, Shard) and placement.dim != 0
-            ]
-            if unsupported_shards:
-                raise ValueError(
-                    "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
-                    "expert-parallel destination shards; unsupported tensor shard "
-                    f"dimensions {unsupported_shards} for {param_info['name']!r}"
-                )
-
-            dst_mesh = param_info["dst_mesh_info"]
-            mesh_tensor = getattr(dst_mesh, "mesh", None)
-            if mesh_tensor is None:
-                mesh_tensor = getattr(dst_mesh, "_mesh", None)
-            if mesh_tensor is None:
-                raise ValueError(
-                    "Destination DeviceMesh does not expose mesh ranks for "
-                    f"{param_info['name']!r}"
-                )
-            ep_size = 1
-            for mesh_dim, placement in enumerate(param_info["dst_placements"]):
-                if isinstance(placement, Shard) and placement.dim == 0:
-                    ep_size *= int(mesh_tensor.shape[mesh_dim])
-            num_global_experts = int(param_info["global_shape"][0])
-            # The staged expert range uses torch.chunk semantics while vLLM
-            # places experts with a balanced split; the two agree only when
-            # the expert count divides evenly, so reject the uneven case
-            # instead of silently loading experts onto the wrong ranks.
-            if ep_size > 0 and num_global_experts % ep_size != 0:
-                raise ValueError(
-                    "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
-                    "the global expert count to divide evenly across EP ranks; "
-                    f"got {num_global_experts} experts over {ep_size} ranks for "
-                    f"{param_info['name']!r}"
-                )
-
-            pp_stage = param_info.get("pp_stage", 0)
-            pp_comm_groups = self.pp_comm_groups
-            if pp_comm_groups is None:
-                raise RuntimeError(
-                    "BF16 FlashInfer TRTLLM nccl_reshard refit mapping was built "
-                    "before the per-PP-stage groups were initialized"
-                )
-            if pp_stage not in pp_comm_groups:
-                raise RuntimeError(
-                    "BF16 FlashInfer TRTLLM nccl_reshard refit has no "
-                    f"communicator for PP stage {pp_stage}"
-                )
-            rank = pp_comm_groups[pp_stage].rank
-            local_slices = _local_shard_slices(param_info, rank)
-            local_shape = tuple(
-                global_size
-                if shard_slice.start is None
-                else shard_slice.stop - shard_slice.start
-                for global_size, shard_slice in zip(
-                    param_info["global_shape"], local_slices, strict=True
-                )
-            )
-            expert_start = 0 if local_slices[0].start is None else local_slices[0].start
-            grouped_proj = param_info["grouped_expert_proj"]
-            expert_prefix = param_info["name"].rsplit(f".{grouped_proj}.weight", 1)[0]
-            registered_vllm_name = vllm_names_by_id.get(id(vllm_param))
-            if registered_vllm_name is None:
-                raise ValueError(
-                    "BF16 FlashInfer TRTLLM nccl_reshard refit resolved an "
-                    f"unregistered vLLM parameter for {param_info['name']!r}"
-                )
-            expected_loaded_names = {
-                registered_vllm_name,
-                registered_vllm_name.replace(".routed_experts.", "."),
-            }
-
-            def pre(_base: None) -> RefitCtx:
-                return RefitCtx(
-                    buf=torch.empty(local_shape, dtype=wire_dtype, device=self.device)
-                )
-
-            def post(ctx: RefitCtx) -> None:
-                weights = [
-                    (
-                        f"{expert_prefix}.{expert_start + local_idx}."
-                        f"{grouped_proj}.weight",
-                        expert_weight,
-                    )
-                    for local_idx, expert_weight in enumerate(ctx.buf.unbind(0))
-                ]
-                loaded_names = self._load_full_hf_weights(weights)
-                # AutoWeightsLoader reports the fused destination parameter,
-                # not each per-expert HF source name.
-                if loaded_names is not None and expected_loaded_names.isdisjoint(
-                    loaded_names
-                ):
-                    raise RuntimeError(
-                        "BF16 FlashInfer TRTLLM nccl_reshard refit failed to "
-                        "load fused expert destination; expected one of "
-                        f"{sorted(expected_loaded_names)!r}, "
-                        f"vLLM reported {sorted(loaded_names)!r}"
-                    )
-
-            return LocalParamSpec(base=None, pre=pre, post=post, wire_dtype=wire_dtype)
-
-        def _mxfp8_receiver_quant_spec(
-            value_param: torch.Tensor,
-            scale_param: torch.Tensor,
-            merged_slice: tuple[slice, ...] | None,
-            wire_dtype: torch.dtype,
-        ) -> LocalParamSpec:
-            def pre(_base: torch.Tensor) -> RefitCtx:
-                value_region = (
-                    value_param.data
-                    if merged_slice is None
-                    else value_param.data[merged_slice]
-                )
-                scale_region = (
-                    scale_param.data
-                    if merged_slice is None
-                    else scale_param.data[merged_slice]
-                )
-                return RefitCtx(
-                    buf=torch.empty_like(value_region, dtype=wire_dtype),
-                    extra={"value_region": value_region, "scale_region": scale_region},
-                )
-
-            def post(ctx: RefitCtx) -> None:
-                # Load the optional vLLM quantizer only for MXFP8 storage.
-                from nemo_rl.models.generation.vllm.quantization.fp8 import (
-                    quantize_mxfp8_weight,
-                )
-
-                value, scale = quantize_mxfp8_weight(ctx.buf)
-                ctx.extra["value_region"].copy_(value)
-                ctx.extra["scale_region"].copy_(scale)
-
-            return LocalParamSpec(
-                base=value_param.data, pre=pre, post=post, wire_dtype=wire_dtype
-            )
-
-        def _blockwise_fp8_receiver_quant_spec(
-            value_param: torch.Tensor,
-            scale_param: torch.Tensor,
-            merged_slice: tuple[slice, ...] | None,
-            block_size: tuple[int, int],
-            wire_dtype: torch.dtype,
-        ) -> LocalParamSpec:
-            scale_slice = None
-            if merged_slice is not None:
-                # Example: w13_weight [E=8, 2048, 4096], blocks [128, 128],
-                # and gate slice [:, 0:1024, :] into scales [8, 16, 32].
-                axis = value_param.ndim - 2  # 3 - 2 = 1: intermediate dimension.
-                rows = merged_slice[axis]  # Weight rows 0:1024.
-                scale_slices = list(merged_slice)  # [:, 0:1024, :].
-                scale_slices[axis] = slice(
-                    rows.start // block_size[0], rows.stop // block_size[0]
-                )  # Scale rows 0:8 (up uses 8:16).
-                scale_slice = tuple(scale_slices)  # [:, 0:8, :], shape [8, 8, 32].
-
-            def pre(_base: torch.Tensor) -> RefitCtx:
-                value_region = (
-                    value_param.data
-                    if merged_slice is None
-                    else value_param.data[merged_slice]
-                )
-                scale_region = (
-                    scale_param.data
-                    if scale_slice is None
-                    else scale_param.data[scale_slice]
-                )
-                return RefitCtx(
-                    buf=torch.empty_like(value_region, dtype=wire_dtype),
-                    extra={"value_region": value_region, "scale_region": scale_region},
-                )
-
-            def post(ctx: RefitCtx) -> None:
-                # Load the optional vLLM quantizer only for blockwise FP8 storage.
-                from nemo_rl.models.generation.vllm.quantization.fp8 import (
-                    cast_tensor_to_fp8_blockwise,
-                )
-
-                if ctx.buf.ndim == 2:
-                    value, scale = cast_tensor_to_fp8_blockwise(ctx.buf, block_size)
-                    scale = scale.squeeze(-1)
-                else:  # ndim == 3: grouped experts.
-                    # Blocks never straddle experts, so one cast covers the group.
-                    num_experts, rows, cols = ctx.buf.shape
-                    value, scale = cast_tensor_to_fp8_blockwise(
-                        ctx.buf.reshape(num_experts * rows, cols), block_size
-                    )
-                    value = value.reshape(num_experts, rows, cols)
-                    scale = scale.reshape(
-                        num_experts, rows // block_size[0], cols // block_size[1]
-                    )
-                ctx.extra["value_region"].copy_(value)
-                ctx.extra["scale_region"].copy_(scale)
-
-            return LocalParamSpec(
-                base=value_param.data, pre=pre, post=post, wire_dtype=wire_dtype
-            )
-
         # Get dict of vllm_param and merged_slice for each hf_name
         vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
         param_info_by_name = {
@@ -2035,8 +2218,15 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             if id(vllm_param) in unquantized_trtllm_param_ids and param_info.get(
                 "grouped_expert_proj"
             ):
-                specs[hf_name] = _trtllm_grouped_expert_spec(
-                    param_info, vllm_param, wire_dtype
+                specs[hf_name] = (
+                    VllmReshardParamSpecCollection._trtllm_grouped_expert_spec(
+                        param_info,
+                        wire_dtype,
+                        refit_comm_groups=self.pp_comm_groups,
+                        device=self.device,
+                        registered_vllm_name=vllm_names_by_id.get(id(vllm_param)),
+                        load_weights=self._load_full_hf_weights,
+                    )
                 )
                 continue
             if vllm_param.dtype == torch.float8_e4m3fn:
@@ -2122,16 +2312,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         f"{scale_name!r} has dtype {scale_param.dtype}, expected {expected_scale_dtype}"
                     )
                 if block_size is None:
-                    specs[hf_name] = _mxfp8_receiver_quant_spec(
-                        vllm_param, scale_param, merged_slice, wire_dtype
+                    specs[hf_name] = (
+                        VllmReshardParamSpecCollection._mxfp8_receiver_quant_spec(
+                            vllm_param, scale_param, merged_slice, wire_dtype
+                        )
                     )
                 else:
-                    specs[hf_name] = _blockwise_fp8_receiver_quant_spec(
-                        vllm_param,
-                        scale_param,
-                        merged_slice,
-                        block_size,
-                        wire_dtype,
+                    specs[hf_name] = (
+                        VllmReshardParamSpecCollection._blockwise_fp8_receiver_quant_spec(
+                            vllm_param,
+                            scale_param,
+                            merged_slice,
+                            block_size,
+                            wire_dtype,
+                        )
                     )
             else:
                 if vllm_param.dtype not in (
@@ -2145,12 +2339,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     )
                 if merged_slice is None and vllm_param.dtype == wire_dtype:
                     # Canonical storage in the wire dtype receives in place.
-                    specs[hf_name] = LocalParamSpec(
-                        base=vllm_param.data, wire_dtype=wire_dtype
+                    specs[hf_name] = VllmReshardParamSpecCollection._direct_param_spec(
+                        vllm_param, wire_dtype
                     )
                 else:
-                    specs[hf_name] = _default_param_spec(
-                        vllm_param, merged_slice, wire_dtype
+                    specs[hf_name] = (
+                        VllmReshardParamSpecCollection._default_staged_param_spec(
+                            vllm_param, merged_slice, wire_dtype
+                        )
                     )
         return HFToLocalParamMap(specs=specs)
 

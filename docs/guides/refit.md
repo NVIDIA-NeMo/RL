@@ -78,6 +78,69 @@ refit workload.
 | `policy.generation.vllm_cfg.refit_prequantize` | Megatron policy with MXFP8 vLLM rollout | Quantizes supported weights before transfer. See [Optional trainer-side MXFP8 refit](../fp8.md#optional-trainer-side-mxfp8-refit) for requirements and exclusions. |
 | `policy.refit_buffer_size_gb` | Refit paths that stage weights in buffers | Sets a fixed buffer size in GiB. NCCL broadcast uses the same size on both sides to keep chunk boundaries equal. |
 
+### TensorRT-LLM Routed-Expert FP8
+
+TensorRT-LLM supports online block-FP8 refit for MoE rollouts. Policy
+training remains in BF16, and this setting does not change optimizer-state
+precision. During each refit, NeMo RL converts weights to E4M3 with 128x128
+blocks and FP32 scales. Only the routed-expert weights are converted;
+attention, routers, shared experts, embeddings, and the output head remain in
+BF16.
+
+This path starts from a BF16 policy checkpoint. Direct loading of a
+pre-quantized ModelOpt FP8 checkpoint is outside its scope.
+
+Enable the path with:
+
+```yaml
+policy:
+  generation:
+    trtllm_cfg:
+      precision: fp8
+```
+
+Supported models are Qwen3.5 MoE (`qwen3_5_moe`) and Qwen3 MoE (`qwen3_moe`);
+setup fails for any other model type. The path quantizes routed-expert weights,
+either fused (`mlp.experts.gate_up_proj` / `down_proj`, the Qwen3.5 layout) or
+per-expert (`mlp.experts.{i}.{gate,up,down}_proj.weight`, the Qwen3 MoE layout).
+Setup also fails if no routed-expert weight is found, or if the model has dense
+MLP weights that would stay BF16. Supporting another model means extending the
+routed-expert name patterns in `quantization/fp8.py`.
+
+Verified end to end: Qwen3.5 MoE with MXFP8 (`Qwen/Qwen3.5-35B-A3B-Base` and
+`Qwen/Qwen3.5-397B-A17B`).
+
+NeMo RL initializes the TensorRT-LLM model with `load_format` set
+to `dummy`, then populates it from the first BF16 policy refit. By default
+(`is_mx: false`), the TensorRT-LLM MoE backend (`moe_config.backend: TRTLLM`)
+is required to preserve FP32 block scales; MXFP8/E8M0 scales are not used.
+
+#### MXFP8 variant
+
+Set `is_mx: true` to quantize routed experts to MXFP8 (E4M3 weights with
+UE8M0 1x32 block scales) instead of 128x128 block-FP8 with FP32 scales:
+
+```yaml
+policy:
+  generation:
+    trtllm_cfg:
+      precision: fp8
+      is_mx: true
+```
+
+This selects the CUTLASS MoE backend (the default) or the CuTe DSL backend
+(`moe_config.backend: CUTEDSL`, for Rubin) instead of the `TRTLLM` backend that
+block-FP8 uses; any other backend fails at setup. MXFP8 also constrains which
+GPUs it can run on: TensorRT-LLM's
+CUTLASS MoE gates `QuantAlgo.MXFP8` on `sm_constraint in {100, 103}`, so it does
+not run everywhere the default block-FP8 path does.
+
+The installed TensorRT-LLM must provide the incremental-refit lifecycle APIs
+`begin_update_weights`, `finalize_update_weights`, `abort_update_weights`, and
+`WorkerExtension.finalize_weight_update`. NeMo RL fails during setup if any of
+the three model-loader hooks is missing; `finalize_weight_update` is called
+directly and is not checked up front.
+
 ## Minimal Configuration
 
 Colocated vLLM and SGLang refit need no transport configuration:
@@ -121,8 +184,9 @@ policy:
 ```
 
 This option requires the Megatron policy backend. It applies to non-colocated
-vLLM collective and `nccl_reshard` transports, plus non-colocated Megatron
-generation. Unsupported combinations fail during synchronizer setup. It is
+vLLM collective and `nccl_reshard` transports, non-colocated TensorRT-LLM
+collective refit, plus non-colocated Megatron generation. Unsupported
+combinations fail during synchronizer setup. It is
 disabled by default because CPU offload adds transfer overhead when the export
 already fits in trainer GPU memory.
 

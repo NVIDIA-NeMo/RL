@@ -39,7 +39,7 @@ async_rl:
     # throughout. Buffer capacity below must cover the wider of the two.
     warmup_lookahead_versions: null
   # Recompute generation KV caches after each weight update.
-  recompute_kv_cache_after_weight_updates: false
+  recompute_kv_cache_after_weight_updates: true
   # Full-batch default. Reduce this to stream forwards, GAE, and policy backward;
   # requires ppo_epochs=1. normalize_advantages=true then normalizes per chunk.
   # Value training stays full batch.
@@ -52,6 +52,11 @@ async_rl:
   diagnostics: false
   # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
   log_full_train_data: false
+  # Writer used by log_full_train_data. json writes JSONL files; set target to a
+  # dotted import path of a DebugWriter defined outside this repo to store the dump
+  # elsewhere (extra keys are passed to its constructor).
+  debug_writer:
+    target: json
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are
@@ -218,7 +223,6 @@ policy:
   generation:
     # HTTP ports use the shared [3000, 4999) virtual-cluster defaults.
     mcore_generation_config:
-      unified_memory_level: 0
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512
       prefix_caching_mamba_gb: null

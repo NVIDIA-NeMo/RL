@@ -37,6 +37,10 @@ from nemo_rl.utils.flops_tracker import FLOPTracker, get_hf_config
 from tests.unit.test_utils import SimpleLossFn, UnitSequenceLossFn
 
 try:
+    from nemo_automodel.components.moe.megatron.token_dispatcher import (
+        MoEFlexTokenDispatcher,
+    )
+
     import nemo_rl.models.policy.workers.automodel_policy_worker as worker_mod
     from nemo_rl.models.automodel.config import (
         ModelAndOptimizerState,
@@ -45,6 +49,7 @@ try:
     from nemo_rl.models.policy.workers.automodel_policy_worker import (
         AutomodelPolicyWorkerImpl,
         _maybe_adapt_tensor_to_hf,
+        automodel_lora_params_generator,
         automodel_params_generator,
     )
 
@@ -79,6 +84,7 @@ def create_test_config(
         "offload_optimizer_for_logprob": False,
         "generation": {
             "backend": "hf",
+            "lora_refit_mode": "merged",
             "temperature": 1.0,
             "top_p": 1.0,
             "top_k": None,
@@ -315,6 +321,47 @@ def test_prepare_for_lp_inference_keep_train_buffers(monkeypatch, keep_train_buf
 
     assert model.eval_called
     assert offloaded_devices == ([] if keep_train_buffers else ["cpu"])
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize("entry", ["offload_before_refit", "offload_after_refit"])
+def test_offload_releases_moe_dispatcher_state_before_empty_cache(monkeypatch, entry):
+    """MoE dispatch state must be released before the allocator cache is emptied.
+
+    Otherwise the recompute activations it keeps alive pin cached segments and
+    colocated generation wakes up with too little free memory.
+    """
+    manager = SimpleNamespace(
+        num_experts=8, token_probs=torch.rand(4, 8, requires_grad=True) * 1.0
+    )
+    dispatcher = MoEFlexTokenDispatcher.__new__(MoEFlexTokenDispatcher)
+    dispatcher._comm_manager = manager
+    experts = nn.Linear(2, 2)
+    experts.token_dispatcher = dispatcher
+
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    worker.model = nn.Sequential(experts)
+    worker.optimizer = None
+    worker.move_to_cpu = lambda model: model
+    token_probs_at_empty_cache = []
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    # The allocator wake-up is a real ``.cuda()`` call; keep this test CPU-only.
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a, **k: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: token_probs_at_empty_cache.append(manager.token_probs),
+    )
+
+    getattr(AutomodelPolicyWorkerImpl, entry)(worker)
+
+    assert token_probs_at_empty_cache == [None]
+    assert manager.num_experts == 8
 
 
 @pytest.mark.automodel
@@ -697,6 +744,89 @@ class TestAutomodelParamsGenerator:
         assert results["e_score_correction_bias"].dtype == torch.float32
         assert results["ordinary_buffer"].dtype == torch.bfloat16
 
+    @staticmethod
+    def _lora_block(seed: int = 0) -> nn.Module:
+        from nemo_automodel.components._peft.lora import LinearLoRA
+
+        torch.manual_seed(seed)
+        block = nn.Module()
+        block.proj = LinearLoRA(nn.Linear(8, 6, bias=False), dim=2, alpha=4)
+        nn.init.normal_(block.proj.lora_B.weight)  # zero-initialized otherwise
+        return block
+
+    @staticmethod
+    def _expected_merge(proj) -> torch.Tensor:
+        w = proj.weight.detach().float()
+        delta = (
+            proj.lora_B.weight.detach().float() @ proj.lora_A.weight.detach().float()
+        )
+        return (w + proj.scale * delta).to(proj.weight.dtype)
+
+    def test_merges_lora_inside_activation_checkpoint_wrapper(self):
+        """Refit merges LoRA into the weights of activation-checkpointed blocks.
+
+        ``CheckpointWrapper`` strips ``_checkpoint_wrapped_module.`` from
+        ``state_dict()`` keys but not from ``named_modules()``, so a lookup keyed by
+        raw module names misses every LoRA module inside a block and the refit
+        streams the bare base weight.
+        """
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            checkpoint_wrapper,
+        )
+
+        block = self._lora_block()
+        model = nn.Module()
+        model.layers = nn.ModuleList([checkpoint_wrapper(block)])
+        expected = self._expected_merge(block.proj)
+
+        results = dict(automodel_params_generator(model, torch.float32))
+
+        assert set(results) == {"layers.0.proj.weight"}
+        torch.testing.assert_close(results["layers.0.proj.weight"], expected)
+        assert not torch.equal(
+            results["layers.0.proj.weight"], block.proj.weight.detach()
+        ), "refit tensor must not be the unmerged base weight"
+
+    def test_raises_when_lora_module_has_no_state_dict_weight(self):
+        """A LoRA module the merge cannot map to its weight would refit the base weight."""
+
+        class RenamingWrapper(nn.Module):
+            """Drops its ``inner.`` component from state_dict keys, like CheckpointWrapper."""
+
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+                self._register_state_dict_hook(self._strip_inner)
+
+            @staticmethod
+            def _strip_inner(module, state_dict, prefix, local_metadata):
+                inner = f"{prefix}inner."
+                for key in [k for k in state_dict if k.startswith(inner)]:
+                    state_dict[prefix + key[len(inner) :]] = state_dict.pop(key)
+
+        model = nn.Module()
+        model.block = RenamingWrapper(self._lora_block())
+
+        with pytest.raises(RuntimeError, match="block.inner.proj"):
+            list(automodel_params_generator(model, torch.float32))
+
+    def test_bf16_lora_merge_matches_offline_fp32_merge(self):
+        """The merged bf16 weight equals a single-rounded fp32 merge of the adapter.
+
+        Computing ``B @ A`` and the sum in bf16 rounds twice and can differ from the
+        offline merge (``W.float() + scale * B.float() @ A.float()``, cast once) by a
+        bf16 ulp; the refit must serve exactly the weights a merged checkpoint has.
+        """
+        block = self._lora_block(seed=1).to(torch.bfloat16)
+        model = nn.Module()
+        model.layers = nn.ModuleList([block])
+        expected = self._expected_merge(block.proj)
+
+        results = dict(automodel_params_generator(model, torch.bfloat16))
+
+        assert results["layers.0.proj.weight"].dtype == torch.bfloat16
+        assert torch.equal(results["layers.0.proj.weight"], expected)
+
     def test_contiguous_output(self):
         """Test that output tensors are contiguous."""
         # Arrange
@@ -791,6 +921,247 @@ class TestAutomodelParamsGenerator:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+class TestAutomodelLoraParamsGenerator:
+    class FactorizedModel(nn.Module):
+        def __init__(self, *, incomplete: bool = False):
+            super().__init__()
+            self.layer = nn.Module()
+            self.layer.base = nn.Linear(4, 4, bias=False)
+            self.layer.lora_A = nn.Linear(4, 2, bias=False)
+            if not incomplete:
+                self.layer.lora_B = nn.Linear(2, 4, bias=False)
+            self.layer.base.weight.requires_grad_(False)
+
+    def test_yields_only_complete_factorized_adapter(self):
+        model = self.FactorizedModel()
+
+        tensors = dict(automodel_lora_params_generator(model, torch.bfloat16))
+
+        assert set(tensors) == {"layer.lora_A.weight", "layer.lora_B.weight"}
+        assert all(tensor.dtype == torch.bfloat16 for tensor in tensors.values())
+        assert all(tensor.is_contiguous() for tensor in tensors.values())
+
+    def test_accepts_activation_checkpoint_wrapped_parameter_names(self):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            checkpoint_wrapper,
+        )
+
+        model = self.FactorizedModel()
+        model.layer = checkpoint_wrapper(model.layer)
+
+        tensors = dict(automodel_lora_params_generator(model, torch.bfloat16))
+
+        assert set(tensors) == {"layer.lora_A.weight", "layer.lora_B.weight"}
+
+    def test_adapts_grouped_internal_factors_to_hf_pairs(self):
+        from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import (
+            NemotronV3StateDictAdapter,
+        )
+
+        class GroupedFactorizedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([nn.Module()])
+                self.model.layers[0].mixer = nn.Module()
+                self.model.layers[0].mixer.experts = nn.Module()
+                experts = self.model.layers[0].mixer.experts
+                experts.lora_gate_and_up_A = nn.Parameter(torch.randn(2, 4, 2))
+                experts.lora_gate_and_up_B = nn.Parameter(torch.randn(2, 2, 6))
+                experts.lora_down_A = nn.Parameter(torch.randn(2, 6, 2))
+                experts.lora_down_B = nn.Parameter(torch.randn(2, 2, 4))
+                self.state_dict_adapter = NemotronV3StateDictAdapter(
+                    config=MagicMock(),
+                    moe_config=SimpleNamespace(
+                        n_routed_experts=2,
+                        moe_inter_dim=6,
+                        expert_activation="relu2",
+                    ),
+                    backend=MagicMock(),
+                )
+
+        model = GroupedFactorizedModel()
+
+        tensors = dict(automodel_lora_params_generator(model, torch.bfloat16))
+
+        assert set(tensors) == {
+            f"backbone.layers.0.mixer.experts.{expert_id}.{projection}.lora_{factor}.weight"
+            for expert_id in range(2)
+            for projection in ("up_proj", "down_proj")
+            for factor in ("A", "B")
+        }
+        experts = model.model.layers[0].mixer.experts
+        for expert_id in range(2):
+            prefix = f"backbone.layers.0.mixer.experts.{expert_id}"
+            expected = {
+                f"{prefix}.up_proj.lora_A.weight": experts.lora_gate_and_up_A[
+                    expert_id
+                ].T,
+                f"{prefix}.up_proj.lora_B.weight": experts.lora_gate_and_up_B[
+                    expert_id
+                ].T,
+                f"{prefix}.down_proj.lora_A.weight": experts.lora_down_A[expert_id].T,
+                f"{prefix}.down_proj.lora_B.weight": experts.lora_down_B[expert_id].T,
+            }
+            for name, expected_tensor in expected.items():
+                torch.testing.assert_close(
+                    tensors[name], expected_tensor.to(torch.bfloat16)
+                )
+
+            trainer_up_delta = (
+                experts.lora_gate_and_up_A[expert_id]
+                @ experts.lora_gate_and_up_B[expert_id]
+            )
+            # nn.Linear stores the transposed weight, so the PEFT/vLLM
+            # update B @ A must equal the transpose of Automodel's A @ B.
+            vllm_up_weight_delta = (
+                experts.lora_gate_and_up_B[expert_id].T
+                @ experts.lora_gate_and_up_A[expert_id].T
+            )
+            torch.testing.assert_close(
+                vllm_up_weight_delta,
+                trainer_up_delta.T,
+            )
+
+            trainer_down_delta = (
+                experts.lora_down_A[expert_id] @ experts.lora_down_B[expert_id]
+            )
+            vllm_down_weight_delta = (
+                experts.lora_down_B[expert_id].T @ experts.lora_down_A[expert_id].T
+            )
+            torch.testing.assert_close(
+                vllm_down_weight_delta,
+                trainer_down_delta.T,
+            )
+        assert all(tensor.dtype == torch.bfloat16 for tensor in tensors.values())
+        assert all(tensor.is_contiguous() for tensor in tensors.values())
+
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = model
+        worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
+        worker.lora_refit_mode = "native"
+        refit_info = AutomodelPolicyWorkerImpl.prepare_refit_info(worker)
+
+        assert refit_info == {
+            name: (tensor.shape, tensor.dtype) for name, tensor in tensors.items()
+        }
+
+    def test_rejects_incomplete_factor_pair(self):
+        model = self.FactorizedModel(incomplete=True)
+
+        with pytest.raises(RuntimeError, match="complete A/B pairs"):
+            list(automodel_lora_params_generator(model, torch.bfloat16))
+
+    def test_rejects_non_lora_trainable_parameter(self):
+        model = self.FactorizedModel()
+        model.layer.base.weight.requires_grad_(True)
+
+        with pytest.raises(RuntimeError, match="only LoRA A/B tensors"):
+            list(automodel_lora_params_generator(model, torch.bfloat16))
+
+    def test_rejects_dynamically_updated_router_buffer(self):
+        model = self.FactorizedModel()
+        model.router = nn.Module()
+        model.router.bias_update_factor = 1e-3
+        model.router.register_buffer(
+            "e_score_correction_bias", torch.zeros(4, dtype=torch.float32)
+        )
+
+        with pytest.raises(RuntimeError, match="dynamically updated MoE router"):
+            list(automodel_lora_params_generator(model, torch.bfloat16))
+
+    def test_prepare_refit_info_contains_only_factor_metadata(self):
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = self.FactorizedModel()
+        worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
+        worker.lora_refit_mode = "native"
+
+        refit_info = AutomodelPolicyWorkerImpl.prepare_refit_info(worker)
+
+        assert refit_info is not None
+        assert set(refit_info) == {
+            "layer.lora_A.weight",
+            "layer.lora_B.weight",
+        }
+        assert all(dtype == torch.bfloat16 for _, dtype in refit_info.values())
+
+    def test_ipc_producer_uses_worker_refit_generator(self, monkeypatch):
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = self.FactorizedModel()
+        worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
+        worker.lora_refit_mode = "native"
+        worker.cpu_offload = False
+        worker.zmq_socket = object()
+        worker.rank = 0
+        worker.maybe_init_zmq = lambda: None
+        sentinel = torch.ones(1)
+
+        def refit_generator():
+            yield "sentinel", sentinel
+
+        stream_impl = MagicMock()
+        worker._refit_params_generator = refit_generator
+        monkeypatch.setattr(
+            "nemo_rl.models.policy.utils.stream_weights_via_ipc_zmq_impl",
+            stream_impl,
+        )
+
+        worker.stream_weights_via_ipc_zmq(buffer_size_bytes=128)
+
+        assert list(stream_impl.call_args.kwargs["params_generator"]) == [
+            ("sentinel", sentinel)
+        ]
+
+    def test_collective_producer_uses_worker_refit_generator(self, monkeypatch):
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = self.FactorizedModel()
+        worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
+        worker.lora_refit_mode = "native"
+        worker.cpu_offload = False
+        worker.model_update_group = object()
+        sentinel = torch.ones(1)
+
+        def refit_generator():
+            yield "sentinel", sentinel
+
+        producer = MagicMock()
+        worker._refit_params_generator = refit_generator
+        monkeypatch.setattr(worker_mod, "packed_broadcast_producer", producer)
+
+        worker._broadcast_weights_for_collective()
+
+        assert list(producer.call_args.kwargs["iterator"]) == [("sentinel", sentinel)]
+
+    @pytest.mark.parametrize(
+        ("mode", "expected"), [("native", "lora"), ("merged", "full")]
+    )
+    def test_refit_params_generator_selects_by_mode(self, monkeypatch, mode, expected):
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = self.FactorizedModel()
+        worker.draft_model = None
+        worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
+        worker.lora_refit_mode = mode
+        monkeypatch.setattr(
+            worker_mod,
+            "automodel_lora_params_generator",
+            lambda *_: iter([("lora", torch.ones(1))]),
+        )
+        monkeypatch.setattr(
+            worker_mod,
+            "automodel_params_generator",
+            lambda *_, **__: iter([("full", torch.ones(1))]),
+        )
+
+        assert [name for name, _ in worker._refit_params_generator()] == [expected]
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 def test_prepare_refit_info_preserves_fp32_router_correction_bias():
     """Refit metadata must match the FP32 router-bias payload dtype."""
 
@@ -808,6 +1179,7 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
     worker.model = RouterModel()
     worker.dtype = torch.bfloat16
     worker.draft_model = None
+    worker.lora_enabled = False
 
     refit_info = AutomodelPolicyWorkerImpl.prepare_refit_info(worker)
 

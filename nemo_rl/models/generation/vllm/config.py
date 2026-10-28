@@ -29,6 +29,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
 )
+from nemo_rl.models.generation.vllm.lora_utils import LoraRefitMode
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
     MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
@@ -228,6 +229,9 @@ class VllmConfig(GenerationConfig):
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
     refit_transport: NotRequired[VllmRefitSelector | str | None]
     refit_cfg: NotRequired[VllmRefitConfig | None]
+    # LoRA policies use vLLM's factorized adapter runtime by default. Set to
+    # ``merged`` to opt into materializing and refitting full ``W + BA`` weights.
+    lora_refit_mode: NotRequired[LoraRefitMode]
 
     # quantization config
     quant_cfg: NotRequired[str | None]
@@ -279,7 +283,14 @@ def validate_vllm_quantization_config(config: VllmConfig) -> None:
 
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
     """Validate and return the optional vLLM video sampling contract."""
-    raw_video_config = config["vllm_cfg"].get("video")
+    vllm_config = cast(dict[str, Any], config["vllm_cfg"])
+    if "video_loader" in vllm_config:
+        raise ValueError(
+            "policy.generation.vllm_cfg.video_loader is not supported; "
+            "use policy.generation.vllm_cfg.video"
+        )
+
+    raw_video_config = vllm_config.get("video")
     if raw_video_config is None:
         return None
     return VllmVideoConfig.model_validate(raw_video_config)

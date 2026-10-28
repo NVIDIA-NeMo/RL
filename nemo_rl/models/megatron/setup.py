@@ -89,6 +89,13 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
+from nemo_rl.utils.path_utils import (
+    listdir,
+    maybe_enable_msc,
+    open_path,
+    path_exists,
+    path_isdir,
+)
 
 _HF_CONFIG_PATCHED = False
 
@@ -189,6 +196,11 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     def _sync_distrib_opt(distrib_opt):
+        if hasattr(distrib_opt, "chained_optimizers"):
+            applied = False
+            for child in distrib_opt.chained_optimizers:
+                applied |= _sync_distrib_opt(child)
+            return applied
         try:
             from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
                 HybridDeviceOptimizer,
@@ -227,12 +239,7 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
             hdo.update_fp32_param_by_new_param()
         return True
 
-    applied = False
-    if hasattr(optimizer, "chained_optimizers"):
-        for sub_opt in optimizer.chained_optimizers:
-            applied |= _sync_distrib_opt(sub_opt)
-    else:
-        applied = _sync_distrib_opt(optimizer)
+    applied = _sync_distrib_opt(optimizer)
 
     if applied and rank == 0:
         print(
@@ -259,6 +266,11 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     def _sync_distrib_opt(distrib_opt):
+        if hasattr(distrib_opt, "chained_optimizers"):
+            applied = False
+            for child in distrib_opt.chained_optimizers:
+                applied |= _sync_distrib_opt(child)
+            return applied
         try:
             from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
                 HybridDeviceOptimizer,
@@ -286,12 +298,7 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
             model_chunk.start_param_sync(force_sync=True)
         return True
 
-    applied = False
-    if hasattr(optimizer, "chained_optimizers"):
-        for sub_opt in optimizer.chained_optimizers:
-            applied |= _sync_distrib_opt(sub_opt)
-    else:
-        applied = _sync_distrib_opt(optimizer)
+    applied = _sync_distrib_opt(optimizer)
 
     if applied and rank == 0:
         print(
@@ -339,6 +346,7 @@ from nemo_rl.models.policy import (
     MegatronConfig,
     MegatronPeftConfig,
     PolicyConfig,
+    provider_override_allowed,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -670,8 +678,8 @@ def _resolve_iter_dir_from_root(
     for ``iter_*`` subdirectories and taking the last one (lexicographic order).
     """
     tracker = os.path.join(path, "latest_checkpointed_iteration.txt")
-    if os.path.exists(tracker):
-        with open(tracker) as f:
+    if path_exists(tracker):
+        with open_path(tracker) as f:
             iteration_str = f.read().strip()
         if iteration_str == "release":
             return os.path.join(path, "release")
@@ -686,8 +694,8 @@ def _resolve_iter_dir_from_root(
     try:
         iter_subdirs = sorted(
             d
-            for d in os.listdir(path)
-            if d.startswith("iter_") and os.path.isdir(os.path.join(path, d))
+            for d in listdir(path)
+            if d.startswith("iter_") and path_isdir(os.path.join(path, d))
         )
     except (FileNotFoundError, NotADirectoryError):
         iter_subdirs = []
@@ -703,14 +711,14 @@ def _resolve_peft_restore_dir(restore_from: str) -> str:
     or a checkpoint root with a latest_checkpointed_iteration.txt tracker file /
     iter_* subdirectories.
     """
-    if not os.path.isdir(restore_from):
+    if not path_isdir(restore_from):
         raise FileNotFoundError(
             f"megatron_cfg.peft.restore_from={restore_from!r} does not exist or is "
             "not a directory. It must point to a native Megatron-Bridge PEFT "
             "checkpoint (an iter_XXXXXXX directory or a checkpoint root "
             "containing one)."
         )
-    if os.path.exists(os.path.join(restore_from, "run_config.yaml")):
+    if path_exists(os.path.join(restore_from, "run_config.yaml")):
         return restore_from
     resolved = _resolve_iter_dir_from_root(
         restore_from,
@@ -721,7 +729,7 @@ def _resolve_peft_restore_dir(restore_from: str) -> str:
         "one).",
         config_key="megatron_cfg.peft.restore_from",
     )
-    if not os.path.exists(os.path.join(resolved, "run_config.yaml")):
+    if not path_exists(os.path.join(resolved, "run_config.yaml")):
         raise FileNotFoundError(
             f"megatron_cfg.peft.restore_from={restore_from!r}: resolved to "
             f"iteration directory {resolved!r} but it does not contain "
@@ -745,7 +753,7 @@ def _validate_peft_restore_config(
     no diagnostics and leave this run's extra adapters at fresh init.
     """
     run_config_path = os.path.join(restore_dir, "run_config.yaml")
-    with open(run_config_path) as f:
+    with open_path(run_config_path) as f:
         run_config = yaml.safe_load(f)
     saved_peft = run_config.get("peft") if isinstance(run_config, dict) else None
     if not isinstance(saved_peft, dict):
@@ -837,6 +845,7 @@ def _create_peft_warm_start_hook(
         # A disabled machine ignores donor rerun state, and setup is serialized,
         # so temporarily disabling it makes this adapter load weights-only.
         rerun_state_machine.set_mode(RerunMode.DISABLED)
+        maybe_enable_msc(restore_dir)
         try:
             _load_checkpoint_from_path(
                 load_dir=restore_dir,
@@ -889,6 +898,9 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
           created.
     """
     pretrained_ckpt = config.get("pretrained_checkpoint")
+    # Megatron-Bridge loads this checkpoint later and only understands msc://
+    # once its flag is on.
+    maybe_enable_msc(pretrained_ckpt["path"] if pretrained_ckpt else None)
 
     if pretrained_ckpt is not None:
         fmt = pretrained_ckpt["format"]
@@ -897,7 +909,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
         if fmt == "megatron_bridge":
             path = pretrained_ckpt["path"]
             # If it's already a specific iter dir (contains run_config.yaml), use it directly.
-            if os.path.exists(os.path.join(path, "run_config.yaml")):
+            if path_exists(os.path.join(path, "run_config.yaml")):
                 return hf_model_name, path, True
 
             resolved = _resolve_iter_dir_from_root(
@@ -909,7 +921,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
                 f"(e.g. /checkpoints/iter_0005000/) or a checkpoint root "
                 f"directory containing iter_* subdirectories.",
             )
-            if not os.path.exists(os.path.join(resolved, "run_config.yaml")):
+            if not path_exists(os.path.join(resolved, "run_config.yaml")):
                 raise FileNotFoundError(
                     f"pretrained_checkpoint.path={path!r}: resolved to iteration "
                     f"directory {resolved!r} but it does not contain "
@@ -920,7 +932,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
         elif fmt == "megatron_lm":
             path = pretrained_ckpt["path"]
-            if not os.path.isdir(path):
+            if not path_isdir(path):
                 raise FileNotFoundError(
                     f"pretrained_checkpoint.path={path!r} does not exist or "
                     f"is not a directory.  For megatron_lm format, path must point to "
@@ -933,7 +945,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
             # directly.  Otherwise resolve the latest iteration from the tracker file
             # or by scanning for iter_* subdirectories — the bridge does not read
             # latest_checkpointed_iteration.txt itself and defaults to iter_0000000.
-            if os.path.exists(os.path.join(path, "metadata.json")):
+            if path_exists(os.path.join(path, "metadata.json")):
                 resolved = path
             else:
                 resolved = _resolve_iter_dir_from_root(
@@ -942,7 +954,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
                     f"metadata.json, latest_checkpointed_iteration.txt, or any "
                     f"iter_* subdirectories.  Cannot resolve a megatron_lm checkpoint.",
                 )
-            if not os.path.exists(os.path.join(resolved, "metadata.json")):
+            if not path_exists(os.path.join(resolved, "metadata.json")):
                 raise FileNotFoundError(
                     f"Resolved megatron_lm checkpoint directory {resolved!r} does not "
                     f"contain metadata.json.  The checkpoint must use torch_dist format."
@@ -1044,7 +1056,7 @@ def setup_model_config(
                 pretrained_path, "iter_0000000", "run_config.yaml"
             )
 
-        if not os.path.exists(pretrained_run_config):
+        if not path_exists(pretrained_run_config):
             raise FileNotFoundError(
                 f"Pretrained run config not found at {pretrained_run_config} on rank={rank}. "
                 "This usually means that the checkpoint conversion on rank=0 saved to a "
@@ -1114,6 +1126,8 @@ def setup_model_config(
     # construction so RADIO positional encoding and frozen towers are stable
     # and consistent between logprob and training passes.
     for vlm_key, vlm_value in iter_vlm_config_overrides(config["megatron_cfg"]):
+        if not provider_override_allowed(config["megatron_cfg"], vlm_key):
+            continue
         if not hasattr(model_cfg, vlm_key):
             raise ValueError(
                 f"megatron_cfg set '{vlm_key}' but {type(model_cfg).__name__} has no "
@@ -1321,6 +1335,8 @@ def _apply_multimodal_config(model_cfg: Any, config: PolicyConfig) -> None:
     for config_key, provider_attr in field_mapping.items():
         if config_key not in megatron_cfg:
             continue
+        if not provider_override_allowed(megatron_cfg, config_key):
+            continue
         if not hasattr(model_cfg, provider_attr):
             raise ValueError(
                 f"policy.megatron_cfg.{config_key} is only supported by a "
@@ -1387,6 +1403,16 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     ):
         model_cfg.moe_router_num_groups = None
         model_cfg.moe_router_group_topk = None
+    if (
+        config["megatron_cfg"].get("transformer_impl") == "inference_optimized"
+        and getattr(model_cfg, "num_moe_experts", None)
+        and model_cfg.moe_router_dtype != "fp32"
+    ):
+        raise ValueError(
+            "transformer_impl=inference_optimized requires moe_router_dtype=fp32 "
+            f"for MoE models, got {model_cfg.moe_router_dtype!r}: set "
+            "policy.generation.mcore_generation_config.moe_router_dtype=fp32."
+        )
     if "moe_pad_experts_for_cuda_graph_inference" in config["megatron_cfg"]:
         model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
             "moe_pad_experts_for_cuda_graph_inference"
@@ -1476,16 +1502,35 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Multi-Token Prediction settings onto the mcore model config."""
     megatron_cfg = config["megatron_cfg"]
-    if "mtp_num_layers" in megatron_cfg:
+
+    def _allowed(key: str) -> bool:
+        return provider_override_allowed(megatron_cfg, key)
+
+    if "mtp_num_layers" in megatron_cfg and _allowed("mtp_num_layers"):
         # In mcore, mtp_num_layers is both the number of MTP layers (when
         # mtp_use_repeated_layer is False) and the number of times the MTP layer
         # is repeated (when mtp_use_repeated_layer is True).
         model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
-    if "mtp_loss_scaling_factor" in megatron_cfg:
+        if megatron_cfg["mtp_num_layers"] == 0:
+            # HybridProvider.finalize() otherwise retains a repeated MTP
+            # section from the checkpoint and builds one layer even though the
+            # recipe disabled MTP. Remove every inherited MTP source so the
+            # finalized pattern contains only the main decoder.
+            if getattr(model_cfg, "mtp_hybrid_override_pattern", None):
+                model_cfg.mtp_hybrid_override_pattern = None
+            if getattr(model_cfg, "mtp_use_repeated_layer", False):
+                model_cfg.mtp_use_repeated_layer = False
+            for pattern_attr in ("hybrid_layer_pattern", "hybrid_override_pattern"):
+                pattern = getattr(model_cfg, pattern_attr, None)
+                if isinstance(pattern, str) and "/" in pattern:
+                    setattr(model_cfg, pattern_attr, pattern.split("/")[0])
+    if "mtp_loss_scaling_factor" in megatron_cfg and _allowed(
+        "mtp_loss_scaling_factor"
+    ):
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
-    if "mtp_use_repeated_layer" in megatron_cfg:
+    if "mtp_use_repeated_layer" in megatron_cfg and _allowed("mtp_use_repeated_layer"):
         model_cfg.mtp_use_repeated_layer = megatron_cfg["mtp_use_repeated_layer"]
-    if "mtp_detach_heads" in megatron_cfg:
+    if "mtp_detach_heads" in megatron_cfg and _allowed("mtp_detach_heads"):
         model_cfg.mtp_detach_heads = megatron_cfg["mtp_detach_heads"]
 
 
@@ -1495,8 +1540,19 @@ def _quant_recipe_name(recipe: Any) -> str | None:
     return str(getattr(recipe, "value", recipe))
 
 
+def _recipe_block_precision(block_cfg: Mapping[str, Any]) -> str:
+    fp8_recipe = _quant_recipe_name(block_cfg.get("fp8_quantization_recipe"))
+    if fp8_recipe is not None:
+        return f"fp8 ({fp8_recipe})"
+    fp4_recipe = _quant_recipe_name(block_cfg.get("fp4_quantization_recipe"))
+    return fp4_recipe if fp4_recipe is not None else "bf16"
+
+
 def _validate_te_precision_config(
-    quant_recipe: Any, fp8_cfg: Mapping[str, Any] | None
+    quant_recipe: Any,
+    fp8_cfg: Mapping[str, Any] | None,
+    *,
+    zero_train_gen_mismatch: bool = False,
 ) -> None:
     fp8_cfg_enabled = fp8_cfg is not None and fp8_cfg.get("enabled", False)
     fp8_cfg_recipe = (
@@ -1508,17 +1564,51 @@ def _validate_te_precision_config(
     # NeMo-RL derives sequence padding, refit export, and reshard validation
     # from fp8_cfg alone, so such weights would reach the inference engine as
     # if they were BF16. Reject until the refit path understands them.
+    # zero_train_gen_mismatch is the exception for fp8_param: a matched module's
+    # fp8_model_init comes from its own recipe block rather than from
+    # fp8_cfg.fp8_param, so its MXFP8 recipe must repeat fp8_param to keep FP8
+    # primary weights, and that is accepted only when fp8_cfg.fp8_param agrees.
+    fp8_cfg_param = bool(fp8_cfg_enabled and fp8_cfg.get("fp8_param", False))
     for config_key in sorted({m.config_key for m in quant_recipe.matchers}):
         payload = quant_recipe.configs.get(config_key) or {}
+        if zero_train_gen_mismatch:
+            # An absent evaluation_recipe inherits training_recipe; an explicit
+            # empty one means BF16.
+            training_cfg = payload.get("training_recipe") or {}
+            evaluation_cfg = payload.get("evaluation_recipe")
+            if evaluation_cfg is None:
+                evaluation_cfg = training_cfg
+            training_precision = _recipe_block_precision(training_cfg)
+            evaluation_precision = _recipe_block_precision(evaluation_cfg)
+            if training_precision != evaluation_precision:
+                raise ValueError(
+                    "zero_train_gen_mismatch requires the same precision in "
+                    f"'{config_key}.training_recipe' ({training_precision}) and "
+                    f"'{config_key}.evaluation_recipe' ({evaluation_precision}): "
+                    "log-prob forwards and the generation model read "
+                    "evaluation_recipe. An empty evaluation_recipe means BF16; "
+                    "omit it to inherit training_recipe."
+                )
         for block in ("training_recipe", "evaluation_recipe"):
             block_cfg = payload.get(block) or {}
-            if block_cfg.get("fp8_param") or block_cfg.get("fp4_param"):
+            fp8_param = block_cfg.get("fp8_param")
+            if block_cfg.get("fp4_param") or (
+                fp8_param and not zero_train_gen_mismatch
+            ):
                 raise ValueError(
                     "megatron_cfg.te_precision_config_file sets fp8_param or "
                     f"fp4_param in '{config_key}.{block}'. NeMo-RL reads "
                     "megatron_cfg.fp8_cfg for all FP8 behavior, so these "
                     "weights would be sent to the inference engine as BF16. "
                     "Use megatron_cfg.fp8_cfg for FP8 parameter storage."
+                )
+            if fp8_param and not fp8_cfg_param:
+                raise ValueError(
+                    "zero_train_gen_mismatch accepts fp8_param in "
+                    f"'{config_key}.{block}' of megatron_cfg.te_precision_config_file "
+                    "only with megatron_cfg.fp8_cfg.fp8_param enabled, so FP8 "
+                    "parameter storage stays consistent with the padding and refit "
+                    "behavior NeMo-RL derives from fp8_cfg."
                 )
 
             if not fp8_cfg_enabled:
@@ -1555,6 +1645,32 @@ def _validate_te_precision_config(
                     "FP8 refit behavior from megatron_cfg.fp8_cfg.fp8_recipe, so "
                     "mixed FP8 precision recipes are not supported."
                 )
+            # Under zero_train_gen_mismatch the two flags cover different
+            # surrounding forwards. override_quantized_autocast replaces an
+            # already-open FP8 autocast with this block's MXFP8 recipe.
+            # override_nonquantized_autocast opens that recipe when the forward
+            # is BF16; otherwise the MXFP8 weights are dequantized and the
+            # module runs BF16 while generation still runs MXFP8.
+            if zero_train_gen_mismatch and fp8_recipe == "mxfp8":
+                missing = [
+                    name
+                    for name in (
+                        "override_quantized_autocast",
+                        "override_nonquantized_autocast",
+                    )
+                    if not block_cfg.get(name)
+                ]
+                if missing:
+                    raise ValueError(
+                        "zero_train_gen_mismatch requires "
+                        f"{' and '.join(missing)}=true in "
+                        f"'{config_key}.{block}'. override_quantized_autocast "
+                        "keeps this MXFP8 recipe when the surrounding forward "
+                        "is already inside an FP8 autocast; "
+                        "override_nonquantized_autocast turns it on when that "
+                        "forward is BF16. Both the training and evaluation "
+                        "recipes need both flags."
+                    )
 
 
 def _validate_nvfp4_pertoken_precision_recipe(quant_recipe: RecipeConfig) -> None:
@@ -1657,7 +1773,11 @@ def _apply_precision_config(
         # NeMo-RL constructs TransformerConfig directly and therefore bypasses
         # Megatron-LM's CLI path that normally turns this file into quant_recipe.
         quant_recipe = load_quantization_recipe(te_precision_config_file)
-        _validate_te_precision_config(quant_recipe, fp8_cfg)
+        _validate_te_precision_config(
+            quant_recipe,
+            fp8_cfg,
+            zero_train_gen_mismatch=bool(megatron_cfg.get("zero_train_gen_mismatch")),
+        )
         model_cfg.quant_recipe = quant_recipe
 
     raw_fp4_cfg = megatron_cfg.get("fp4_cfg", None)
@@ -2708,7 +2828,7 @@ def setup_model_and_optimizer(
         if optimizer is not None:
             if megatron_cfg.checkpoint.finetune:
                 _force_sync_optimizer_fp32_from_model(optimizer, model)
-            elif resume_checkpoint_exists:
+            elif resume_checkpoint_exists and megatron_cfg.checkpoint.load_optim:
                 _force_sync_model_from_optimizer_fp32(optimizer)
     torch.distributed.barrier()
 

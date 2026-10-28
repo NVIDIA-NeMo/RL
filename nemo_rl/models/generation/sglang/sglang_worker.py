@@ -30,6 +30,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.models.generation.sglang.checkpoint_engine import (
     SGLangCheckpointEngineMixin,
 )
+from nemo_rl.models.generation.sglang.config import SGLangOutlinesCachePolicy
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _format_v6_uri
 from nemo_rl.models.generation.sglang.utils.patches import _apply_sglang_compat_patches
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_current_node_ip
@@ -486,6 +487,15 @@ class SGLangGenerationWorker(SGLangCheckpointEngineMixin):
         nnodes = max(1, _gpus_per_engine // self.gpus_per_node)
         node_rank = self.rank % nnodes
         local_gpu_id = self._to_local_gpu_id(self.base_gpu_id)
+        cache_policy = SGLangOutlinesCachePolicy.model_validate(
+            {
+                "disable_outlines_disk_cache": sglang_cfg_inner[
+                    "disable_outlines_disk_cache"
+                ]
+            }
+            if "disable_outlines_disk_cache" in sglang_cfg_inner
+            else {}
+        )
         kwargs = {
             "model_path": sglang_cfg_inner["model_path"],
             "trust_remote_code": True,
@@ -493,6 +503,8 @@ class SGLangGenerationWorker(SGLangCheckpointEngineMixin):
             # memory
             "enable_memory_saver": sglang_server_cfg["needs_offload"],
             "enable_weights_cpu_backup": sglang_server_cfg["cpu_weight_backup"],
+            # Avoid the legacy pickle-based cache unless explicitly enabled.
+            "disable_outlines_disk_cache": cache_policy.disable_outlines_disk_cache,
             # distributed
             "host": host,
             "port": port,
