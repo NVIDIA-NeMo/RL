@@ -23,4 +23,3 @@ async_rl:
   # Stream policy backward in chunks of at least 32 of the 256 prompt groups.
   # Critic epochs still train on the assembled full batch.
   min_groups_for_streaming_train: 32
-  max_inflight_prompts: 32
