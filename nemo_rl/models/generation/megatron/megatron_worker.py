@@ -1253,7 +1253,8 @@ class MegatronGenerationMixin:
             for sample_ss in batch_stop_strings:
                 if sample_ss:
                     stop_set.update(sample_ss)
-        return list(stop_set) if stop_set else None
+        # Sorted: set order depends on the string hash seed, so it differs between processes.
+        return sorted(stop_set) if stop_set else None
 
     def _sample_vision_tensors(self, data, index: int):
         """Return one sample's vision tensors from RL PackedTensors."""

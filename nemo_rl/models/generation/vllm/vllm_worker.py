@@ -844,7 +844,8 @@ class BaseVllmGenerationWorker:
                 if sample_ss:
                     stop_set.update(sample_ss)
 
-        return list(stop_set) if stop_set else None
+        # Sorted: set order depends on the string hash seed, so it differs between processes.
+        return sorted(stop_set) if stop_set else None
 
     def _build_sampling_params(
         self,
@@ -1347,16 +1348,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
 
         # This function requires all generations have the same stop strings, so we collect all here
-        stop_strings: set[str] = set()
-        for sample_stop_strings in batch_stop_strings:
-            if sample_stop_strings:
-                stop_strings.update(sample_stop_strings)
-
-        # Add default stop strings from config
-        if self.cfg.get("stop_strings", None):
-            stop_strings.update(self.cfg["stop_strings"])
-
-        stop_strings = list(stop_strings) if len(stop_strings) > 0 else None
+        stop_strings = self._merge_stop_strings(batch_stop_strings)
 
         # Read generation parameters from config
         top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
