@@ -519,7 +519,9 @@ Each chunk type compares a different set of events:
 | many:1 | Mirror of 1:many, using the teacher-to-student table | Realized chains plus REST |
 | many:many | Realized student chain against realized teacher chain, plus REST | Same |
 
-With sparse teacher transport, the teacher sends its top-K logits per row together with the exact full-vocabulary log-normalizer, so REST holds the true remaining probability mass: top-K is not a renormalization over K tokens. The realized label always stays in the compared support, and the alternatives are limited to the teacher's top-K.
+With `teacher_topk_ipc_keep_realized: true` (the default), each 1:many and many:1 chunk also compares its realized pair, and a chunk with no table alternatives, or with a chain longer than the tables hold, is scored as its realized chain against REST. With `false`, these chunks compare prefix-support alternatives only, and a chunk with fewer than two of them is skipped. On a 1:1 chunk the setting drops every common pair that shares only the realized student token or only the realized teacher token; the realized pair stays when it is itself common. The setting applies to dense and sparse teacher transport alike, and `csd_realized_only_mismatch` and `csd_pure_alm` always turn it on.
+
+With sparse teacher transport, the teacher sends its top-K logits per row together with the exact full-vocabulary log-normalizer, so REST holds the true remaining probability mass: top-K is not a renormalization over K tokens. Besides the realized pair, a chunk compares at most the teacher's best K-1 alternatives.
 
 The KD term for teacher `i` is
 
@@ -540,7 +542,7 @@ Each cross-tokenizer teacher sends its logits in one of two forms:
 - **Sparse** (`loss_fn.teacher_topk_ipc_k > 0`, default `128`): for each teacher row, the top-K logits, the exact log-normalizer, and the realized teacher labels the loss needs.
 - **Dense** (`teacher_topk_ipc_k: 0`): the full-vocabulary logits.
 
-Same-tokenizer teachers always send dense logits. Sparse and dense transport optimize different objectives: with sparse transport, the KD compares each teacher row's top-K tokens plus REST instead of the full vocabulary.
+Same-tokenizer teachers always send dense logits. The two forms optimize the same objective apart from the top-K limit: sparse transport with K equal to the teacher vocabulary size gives the dense loss.
 
 A Megatron student evaluates cross-tokenizer KD **owner-local** when the run allows it: each context-parallel (CP) rank keeps its own share of the student logits, evaluates the chunks whose final student predictor row it holds, and reads only the teacher rows those chunks need. Otherwise the loss is evaluated **replicated**: every CP rank rebuilds its contiguous sequence window of the student and teacher logits.
 
@@ -689,11 +691,12 @@ Checkpoints are saved in the student backend's format; convert a Megatron checkp
 | `csd_last_pos_loss_fn` | Divergence on mismatch chunks; `null` inherits `csd_loss_fn` |
 | `csd_jsd_beta` | JSD mixture coefficient: `0` is forward KL, `1` is reverse KL, `0.5` (default) is symmetric |
 | `csd_mismatch_loss_beta` | Weight of each 1:many, many:1 and many:many chunk relative to a 1:1 chunk (default `5.0`) |
-| `csd_realized_only_mismatch` | Score 1:many and many:1 chunks by their realized chains against REST instead of prefix-support alternatives |
+| `csd_realized_only_mismatch` | Score 1:many and many:1 chunks by their realized chains against REST instead of prefix-support alternatives; also turns on `teacher_topk_ipc_keep_realized` |
 | `csd_pure_alm` | Score every chunk, including 1:1, by its realized token or chain against REST |
 | `csd_noise_filter_topk` | Skip a chunk when a realized teacher label falls outside the teacher's top-k at its predictor (`0` disables) |
 | `kl_chunk_shift` | Predict each non-initial chunk from the position one step earlier (default `true`) |
 | `teacher_topk_ipc_k` | Teacher logits sent per row: top-K with exact normalization (default `128`), or `0` for dense full-vocabulary logits |
+| `teacher_topk_ipc_keep_realized` | Keep each chunk's realized pair in the compared support, for dense and sparse transport (default `true`); `false` compares all common pairs on 1:1 chunks and prefix-support alternatives only on 1:many and many:1 chunks. `csd_realized_only_mismatch` and `csd_pure_alm` always keep it |
 | `temperature`, `reverse_kl` | Softmax temperature for both models; reverse KL for the `kl` divergence |
 | `dynamic_loss_scaling`, `kl_loss_weight`, `ce_loss_scale` | KD/CE combination; the weights apply only when `dynamic_loss_scaling: false` |
 | `vocab_topk` | Top-K vocabulary for same-tokenizer teachers |
