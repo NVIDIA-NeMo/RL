@@ -3411,7 +3411,7 @@ def test_split_rescale_matches_sync_normalization():
 
 
 # ---------------------------------------------------------------------------
-# vocab_parallel_gather_columns / _direct_topk_kl subset-softmax equivalence
+# vocab_parallel_gather_columns / same_tokenizer_topk_kl subset-softmax equivalence
 # (issue #3272): the K-subset renormalization cancels the full-vocab
 # partition function, so gathering K columns and softmaxing within the
 # subset must reproduce the previous full-vocab-log-softmax-then-renorm
