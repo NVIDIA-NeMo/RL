@@ -84,6 +84,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ensure_bootstrap_anchor,
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
+from nemo_rl.data.processors import (
+    nemo_gym_capture_data_processor,
+    nemo_gym_data_processor,
+)
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import (
     OPD_FULL_TEACHER_INDEX_FIELD,
@@ -2417,8 +2421,14 @@ class TestSetup:
     @pytest.mark.parametrize("with_processor", [True, False])
     @pytest.mark.parametrize("with_opd", [True, False])
     @pytest.mark.parametrize("shaping_enabled", [False, True])
+    @pytest.mark.parametrize("multiple_datasets", [False, True])
     def test_token_capture_always_creates_finalizer_actor_pool(
-        self, patched_factories, with_processor, with_opd, shaping_enabled
+        self,
+        patched_factories,
+        with_processor,
+        with_opd,
+        shaping_enabled,
+        multiple_datasets,
     ):
         # A VLM processor turns media capture on (Omni placeholder processor,
         # Megatron learner); text-only runs get capture_media=False.
@@ -2462,9 +2472,25 @@ class TestSetup:
                 default_teacher_alias="teacher",
                 non_colocated_teachers={"enabled": True},
             )
+        task_spec = object()
+        custom_processor = MagicMock(name="custom_processor")
+        original_processors = {
+            "nemo_gym": (task_spec, nemo_gym_data_processor),
+            "custom": (task_spec, custom_processor),
+        }
+        train_sets = [
+            MagicMock(task_data_processors=original_processors)
+            for _ in range(2 if multiple_datasets else 1)
+        ]
+        train_data = (
+            {str(index): dataset for index, dataset in enumerate(train_sets)}
+            if multiple_datasets
+            else train_sets[0]
+        )
+        val_data = MagicMock(task_data_processors=original_processors)
         patched_factories["setup_response_data"].return_value = (
-            list(range(8)),
-            None,
+            train_data,
+            val_data,
         )
         fake_actors = [MagicMock(name=f"finalizer_{index}") for index in range(3)]
         tokenizer = MagicMock(pad_token_id=9)
@@ -2494,6 +2520,25 @@ class TestSetup:
             ) as mock_create_finalizer_actors,
         ):
             actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
+
+        expected_processor = (
+            nemo_gym_capture_data_processor
+            if with_processor
+            else nemo_gym_data_processor
+        )
+        for train_set in train_sets:
+            assert train_set.task_data_processors["nemo_gym"] == (
+                task_spec,
+                expected_processor,
+            )
+            assert train_set.task_data_processors["custom"] == (
+                task_spec,
+                custom_processor,
+            )
+            if with_processor:
+                assert train_set.task_data_processors is not original_processors
+        assert val_data.task_data_processors is original_processors
+        assert original_processors["nemo_gym"][1] is nemo_gym_data_processor
 
         (actor_dp_config, actor_config), actor_kwargs = (
             mock_create_finalizer_actors.call_args
@@ -3119,8 +3164,8 @@ class TestAdaptiveLossRestore:
         checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
         checkpointer.load_training_info.return_value = vars(save_state)
         checkpointer.get_resume_paths.return_value = (None, None)
-        patched_factories["ClippedPGLossFn"].side_effect = (
-            lambda cfg, **kwargs: ClippedPGLossFn(cfg, **kwargs)
+        patched_factories["ClippedPGLossFn"].side_effect = lambda cfg, **kwargs: (
+            ClippedPGLossFn(cfg, **kwargs)
         )
         mc = _make_master_config(
             loss_cfg=ClippedPGLossConfig(
@@ -3847,7 +3892,10 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     columns on the staging partition and turns media capture on in the
     workers and the finalizer; a text run keeps the base schema."""
     mc = _make_gym_megatron_capture_config()
-    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    train_data = MagicMock(
+        task_data_processors={"nemo_gym": (None, nemo_gym_data_processor)}
+    )
+    patched_factories["setup_response_data"].return_value = (train_data, None)
     fake_gym_actor = MagicMock(name="nemo_gym_actor")
     port_holders = [MagicMock(name="port_holder_rank_0")]
 
