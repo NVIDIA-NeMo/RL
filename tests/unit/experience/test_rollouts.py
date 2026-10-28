@@ -3308,3 +3308,106 @@ def test_mask_sample_flags_read_either_form_of_the_flag():
         ]
     )
     assert flags.tolist() == [True, True, True, False, False, False]
+
+
+def test_infra_failure_flags_keep_only_policy_caused_masks():
+    """An env-masked sample is an infrastructure failure unless its top-level
+    ``failure_kind`` is a listed policy kind; a mask with no kind is one too
+    (OSWorld masks evaluator errors without a kind). Unmasked samples never
+    are, whatever kind they name."""
+    flags = rollouts_mod.infra_failure_flags(
+        [
+            {"mask_sample": False, "failure_kind": "judge_failed"},
+            {"mask_sample": True},
+            {"mask_sample": True, "failure_kind": "verifier_error"},
+            {"mask_sample": True, "failure_kind": "agent_timeout"},
+            {"instance_config": {"mask_sample": True}, "failure_kind": "judge_failed"},
+            {"mask_sample": True, "failure_kind": "critpt:response_incomplete"},
+            {},
+            None,
+        ],
+        frozenset({"agent_timeout", "critpt:response_incomplete"}),
+    )
+    assert flags.tolist() == [False, True, True, False, True, False, False, False]
+
+
+@pytest.mark.parametrize(
+    "policy_failure_kinds, mask_env_flagged_samples, expected_weights",
+    [
+        # grpo.masked_reward_policy=exclude_infra: only the infrastructure
+        # failure loses its dataset weight; the policy-caused mask keeps it.
+        (frozenset({"agent_timeout"}), True, [1.0, 1.0, 0.0, 1.0]),
+        # include/exclude pass None: weights untouched.
+        (None, True, [1.0, 1.0, 1.0, 1.0]),
+        # env.should_mask_flagged_samples=false: nothing is masked, so
+        # nothing is an infrastructure failure either.
+        (frozenset({"agent_timeout"}), False, [1.0, 1.0, 1.0, 1.0]),
+    ],
+)
+def test_postprocess_nemo_gym_group_zeroes_infra_failure_weights(
+    policy_failure_kinds, mask_env_flagged_samples, expected_weights
+):
+    rows = [{"agent_ref": {"name": "agent"}} for _ in range(4)]
+    full_results = [
+        {"reward": 1.0},
+        {"reward": 0.0},
+        # OSWorld evaluator error: masked, no failure_kind.
+        {"reward": 0.0, "mask_sample": True},
+        {"reward": 0.0, "mask_sample": True, "failure_kind": "agent_timeout"},
+    ]
+    results = []
+    for full_result in full_results:
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1, 2]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([3, 4]),
+                        "generation_logprobs": torch.tensor([-0.1, -0.1]),
+                    },
+                ],
+                "full_result": {
+                    **full_result,
+                    "response": {"status": "completed", "output": []},
+                },
+            }
+        )
+    dataset_weights = torch.ones(4)
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": dataset_weights}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+        mask_env_flagged_samples=mask_env_flagged_samples,
+        policy_failure_kinds=policy_failure_kinds,
+    )
+
+    final_batch = rollout_result.final_batch
+    assert final_batch["loss_multiplier"].tolist() == expected_weights
+    # The input batch's dataset weights are not rewritten in place.
+    assert dataset_weights.tolist() == [1.0, 1.0, 1.0, 1.0]
+    if mask_env_flagged_samples:
+        assert final_batch["mask_sample"].tolist() == [False, False, True, True]
+    else:
+        assert "mask_sample" not in final_batch
+    if policy_failure_kinds is not None and mask_env_flagged_samples:
+        assert rollout_result.rollout_metrics["infra_failure_sample_rate"] == 0.25
+    else:
+        assert "infra_failure_sample_rate" not in rollout_result.rollout_metrics

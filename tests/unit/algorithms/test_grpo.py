@@ -101,6 +101,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.experience import rollouts as rollouts_mod
 from nemo_rl.experience import sync_rollout_actor as sync_rollout_mod
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
@@ -366,9 +367,59 @@ def test_refit_returns_empty_metrics_when_synchronizer_returns_none() -> None:
 
 
 def test_masked_reward_policy_default_and_validation() -> None:
-    assert GRPOConfig().masked_reward_policy == "include"
+    assert GRPOConfig().masked_reward_policy == "exclude_infra"
+    assert GRPOConfig().policy_failure_kinds == [
+        "agent_timeout",
+        "agent_command_not_allowed",
+        "agent_limit",
+        "agent_invalid_output",
+        "model_context_limit",
+    ]
     with pytest.raises(ValueError, match="masked_reward_policy"):
         GRPOConfig(masked_reward_policy="unknown")
+
+
+def test_exclude_infra_votes_like_include_on_rows_ingestion_keeps() -> None:
+    """exclude_infra differs from include only in the rows the rollout builders
+    zero; on everything else, every participation site sees include's rows.
+
+    Rows: unmasked; env-masked with a policy-caused kind (weight kept);
+    truncated under overlong filtering; fractional weight; over-length prompt
+    (dataset weight 0); infrastructure failure (weight 0 from ingestion).
+    """
+    batch = BatchedDataDict(
+        {
+            "total_reward": torch.tensor([1.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+            "loss_multiplier": torch.tensor([1.0, 1.0, 1.0, 0.5, 0.0, 0.0]),
+            "mask_sample": torch.tensor([False, True, False, False, False, True]),
+            "truncated": torch.tensor([False, False, True, False, False, False]),
+        }
+    )
+    final_sample_mask = torch.tensor([1.0, 0.0, 0.0, 0.5, 0.0, 0.0])
+    expected = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0, 0.0])
+    for policy in ("include", "exclude_infra"):
+        config = GRPOConfig(masked_reward_policy=policy, overlong_filtering=True)
+        torch.testing.assert_close(
+            grpo_mod._dynamic_sampling_valid_mask(batch, config), expected
+        )
+        for helper in (grpo_mod._advantage_valid_mask, grpo_mod._logprob_sample_mask):
+            torch.testing.assert_close(
+                helper(final_sample_mask, config, batch["loss_multiplier"]), expected
+            )
+
+
+def test_exclude_infra_policy_kinds_only_under_exclude_infra() -> None:
+    """Only exclude_infra asks the rollout builders to zero infra-failed rows."""
+    kinds = grpo_mod.exclude_infra_policy_kinds(
+        GRPOConfig(policy_failure_kinds=["agent_timeout", "critpt:response_incomplete"])
+    )
+    assert kinds == frozenset({"agent_timeout", "critpt:response_incomplete"})
+    for policy in ("include", "exclude"):
+        assert (
+            grpo_mod.exclude_infra_policy_kinds(GRPOConfig(masked_reward_policy=policy))
+            is None
+        )
+    assert grpo_mod.exclude_infra_policy_kinds(None) is None
 
 
 class TestStatisticsParticipation:
@@ -9489,3 +9540,143 @@ def test_trainers_never_let_over_length_prompts_vote(
     counterfactual = all_rows[response] / all_rows[response].var(correction=0).sqrt()
     assert counterfactual.abs().max().item() == pytest.approx(2.236, abs=1e-3)
     assert not torch.allclose(counterfactual[:2], advantages[0][response[0]])
+
+
+def _osworld_evaluator_error_batch(
+    mock_grpo_components, policy: str, evaluator_reward: float
+) -> BatchedDataDict[Any]:
+    """aroshanghias's case on #4160, as NeMo-Gym ingestion delivers it.
+
+    One prompt group of three rollouts: rewards ``[1, 0]`` measured the
+    policy, and the third is an OSWorld evaluator error. OSWorld masks it
+    (``mask_sample``) with no ``failure_kind``, so its ``evaluator_reward``
+    measured nothing. ``mask_sample`` and the loss weights come from the real
+    rollout builder under ``policy``.
+    """
+    full_results = [
+        {"reward": 1.0},
+        {"reward": 0.0},
+        {"reward": evaluator_reward, "mask_sample": True},
+    ]
+    results = []
+    for full_result in full_results:
+        prompt = {"role": "user", "content": "p", "token_ids": torch.tensor([1, 2])}
+        results.append(
+            {
+                "input_message_log": [prompt],
+                "message_log": [prompt],
+                "full_result": {
+                    **full_result,
+                    "response": {"status": "completed", "output": []},
+                },
+            }
+        )
+    ingested = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=[{"agent_ref": {"name": "osworld"}}] * 3,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=SimpleNamespace(cfg={"vllm_cfg": {"max_model_len": 128}}),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(3)}),
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        log_full_result_tables=False,
+        policy_failure_kinds=grpo_mod.exclude_infra_policy_kinds(
+            GRPOConfig(masked_reward_policy=policy)
+        ),
+    ).final_batch
+    batch = next(iter(mock_grpo_components["train_dataloader"])).repeat_interleave(3)
+    for key in ("total_reward", "loss_multiplier", "mask_sample"):
+        batch[key] = ingested[key]
+    batch["truncated"] = torch.zeros(3, dtype=torch.bool)
+    for row in batch["message_log"]:
+        row.append(
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([4, 5]),
+                "generation_logprobs": torch.zeros(2),
+            }
+        )
+    return batch
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+@pytest.mark.parametrize("policy", ["exclude_infra", "exclude", "include"])
+def test_trainers_infra_masked_reward_never_moves_valid_siblings(
+    mock_grpo_components, monkeypatch: pytest.MonkeyPatch, train_func, policy: str
+) -> None:
+    """Regression for #4160's follow-up: an environment-masked reward with no
+    policy-caused failure_kind cannot move its valid siblings' advantages.
+
+    Under ``exclude_infra`` (the default) and ``exclude`` the OSWorld evaluator
+    error stays out of the statistics on the legacy sync, async and
+    TransferQueue trainers, so its reward (0 or 1) leaves rows 0-1 unchanged.
+    ``include`` keeps #4160's behavior: every row votes, so the same
+    perturbation moves them (rewards ``[1, 1, 0]`` with the 0 invalid gave the
+    valid rows ``[0.5, 0.5]`` there). SingleController is pinned in
+    ``test_single_controller_actor.py``.
+    """
+    components = mock_grpo_components
+    cfg = components["master_config"]
+    cfg.grpo.masked_reward_policy = policy
+    cfg.grpo.overlong_filtering = False
+    cfg.grpo.seq_logprob_error_threshold = None
+    cfg.loss_fn.use_kl_in_reward = False
+    policy_mock = components["policy"]
+
+    def valid_row_advantages(evaluator_reward: float):
+        batch = _osworld_evaluator_error_batch(components, policy, evaluator_reward)
+        estimator = MagicMock(wraps=grpo_mod._create_advantage_estimator(cfg))
+        if train_func is grpo_train_sync:
+            cfg.data_plane = {"enabled": True}
+            cfg.grpo.max_num_steps = 1
+            cfg.grpo.val_period = 0
+            cfg.grpo.num_generations_per_prompt = 3
+            meta, carry, rollout_metrics, actor_data = _tq_actor_rollout(
+                components, cfg, batch, monkeypatch, group_size=3, append_response=False
+            )
+            actor_data["prev_logprobs"] = torch.zeros_like(
+                actor_data["generation_logprobs"]
+            )
+            actor_data["reference_policy_logprobs"] = torch.zeros_like(
+                actor_data["generation_logprobs"]
+            )
+            fields = _run_tq_train_step(
+                components, cfg, meta, carry, rollout_metrics, actor_data, estimator
+            )
+            token_mask, advantages = actor_data["token_mask"], fields["advantages"]
+        else:
+            monkeypatch.setattr(
+                grpo_mod, "_create_advantage_estimator", lambda _cfg: estimator
+            )
+            policy_mock.get_logprobs.side_effect = lambda data, **_kw: {
+                "logprobs": torch.zeros_like(data["token_mask"], dtype=torch.float32)
+            }
+            policy_mock.get_reference_policy_logprobs.side_effect = (
+                lambda data, **_kw: {
+                    "reference_logprobs": torch.zeros_like(
+                        data["token_mask"], dtype=torch.float32
+                    )
+                }
+            )
+            train_data = _run_grpo_train_step_on_batch(components, train_func, batch)
+            token_mask, advantages = train_data["token_mask"], train_data["advantages"]
+        estimator.compute_advantage.assert_called_once()
+        valid_mask = estimator.compute_advantage.call_args.kwargs["valid_mask"]
+        response = token_mask.bool()
+        return valid_mask, [advantages[row][response[row]] for row in (0, 1)]
+
+    mask_at_0, advantages_at_0 = valid_row_advantages(0.0)
+    mask_at_1, advantages_at_1 = valid_row_advantages(1.0)
+
+    votes = [1.0, 1.0, 1.0] if policy == "include" else [1.0, 1.0, 0.0]
+    for valid_mask in (mask_at_0, mask_at_1):
+        torch.testing.assert_close(valid_mask, torch.tensor(votes))
+    moved = any(
+        not torch.allclose(before, after)
+        for before, after in zip(advantages_at_0, advantages_at_1)
+    )
+    assert moved is (policy == "include")
+    if policy != "include":
+        # Rewards [1, 0] among the voting rows: the 1 is above its baseline.
+        assert (advantages_at_0[0] > 0).all() and (advantages_at_0[1] < 0).all()

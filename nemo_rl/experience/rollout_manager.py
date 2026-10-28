@@ -20,7 +20,7 @@ import enum
 import json
 import math
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
@@ -76,6 +76,7 @@ from nemo_rl.experience.rollout_recovery import (
 )
 from nemo_rl.experience.rollouts import (
     _SHARED_GENRM_METRICS,
+    FAILURE_KIND,
     EffortLevelsConfig,
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
@@ -89,6 +90,7 @@ from nemo_rl.experience.rollouts import (
     attach_static_multimodal_payload,
     calculate_rewards,
     compute_reward_penalty_metrics,
+    infra_failure_flags,
     nemo_gym_rollout_hit_max_tokens,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -1683,6 +1685,7 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
+        policy_failure_kinds: Collection[str] | None = None,
         reward_penalty_config: Optional[dict[str, Any]] = None,
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
@@ -1741,6 +1744,10 @@ class RolloutManager:
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._rollout_recovery_config = rollout_recovery_config
+        # grpo.masked_reward_policy=exclude_infra only: token-capture
+        # finalization gives infrastructure-failed rows a sample_mask of 0, as
+        # the native payload path does (rollouts.infra_failure_flags).
+        self._policy_failure_kinds = policy_failure_kinds
         self._tq_buffer = tq_buffer
         self._recovery_ledger = RolloutRecoveryLedger()
         self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
@@ -2386,6 +2393,9 @@ class RolloutManager:
                     MASK_SAMPLE, False
                 )
             )
+            failure_kind = (completion.env_extras or {}).get(FAILURE_KIND)
+            if not isinstance(failure_kind, str):
+                failure_kind = None
 
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
@@ -2396,6 +2406,7 @@ class RolloutManager:
                     resolved_agent_name=resolved_agent_name,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
+                    failure_kind=failure_kind,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2428,6 +2439,7 @@ class RolloutManager:
                     resolved_agent_name=resolved_agent_name,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
+                    failure_kind=failure_kind,
                 )
 
         try:
@@ -2461,7 +2473,21 @@ class RolloutManager:
                 mask_sample,
                 reward_checks,
                 reward_log_contexts,
+                failure_kinds,
             ) = self._recovery_ledger.finalization_inputs(group_id)
+            infra_failure = (
+                tuple(
+                    infra_failure_flags(
+                        (
+                            {MASK_SAMPLE: masked, FAILURE_KIND: kind}
+                            for masked, kind in zip(mask_sample, failure_kinds)
+                        ),
+                        self._policy_failure_kinds,
+                    ).tolist()
+                )
+                if self._policy_failure_kinds is not None
+                else None
+            )
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -2473,6 +2499,7 @@ class RolloutManager:
                 fallback_weight_version=start_version,
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
+                infra_failure=infra_failure,
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
                 resolved_agent_name=self._recovery_ledger.get_group(
                     group_id

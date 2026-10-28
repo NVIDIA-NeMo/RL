@@ -42,6 +42,7 @@ from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     _binary_participation,
     _clip_grpo_advantages,
+    _votes_by_dataset_weight,
     compute_and_apply_seq_logprob_error_masking,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
@@ -423,18 +424,18 @@ class AdvantageComputer:
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
         # Statistics participation is binary and independent of the loss
-        # weights (grpo._binary_participation). ``include`` lets every row with
-        # a nonzero data-plane sample_mask vote, so token-capture placeholders
-        # and datums with a dataset-level loss_multiplier of 0 never do; the
-        # legacy and TransferQueue loops read the same dataset weight
+        # weights (grpo._binary_participation). ``include`` and
+        # ``exclude_infra`` let every row with a nonzero data-plane sample_mask
+        # vote, so token-capture placeholders, datums with a dataset-level
+        # loss_multiplier of 0 and (under ``exclude_infra``) rows the
+        # environment masked for an infrastructure failure, which the payload
+        # builders give a sample_mask of 0, never do; the legacy and
+        # TransferQueue loops read the same dataset weight
         # (grpo._include_valid_mask), so every trainer normalizes over the same
         # rows. ``exclude`` lets the rows with a nonzero final loss weight vote.
         # PPO's GAE ignores valid_mask.
         participation = final_sample_mask
-        if (
-            not cfg.is_ppo
-            and cast(GRPOConfig, cfg.algo).masked_reward_policy == "include"
-        ):
+        if not cfg.is_ppo and _votes_by_dataset_weight(cast(GRPOConfig, cfg.algo)):
             participation = sample_mask
         advantage_valid_mask = _binary_participation(participation)
 

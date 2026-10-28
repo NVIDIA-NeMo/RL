@@ -217,7 +217,11 @@ class SyncRolloutActor:
         """
         # Lazy imports keep rollout-specific dependencies off the actor startup path.
         # ``_policy_dtype`` sizes the VLM pixel tensors below.
-        from nemo_rl.algorithms.grpo import _dynamic_sampling_valid_mask, _policy_dtype
+        from nemo_rl.algorithms.grpo import (
+            _dynamic_sampling_valid_mask,
+            _policy_dtype,
+            exclude_infra_policy_kinds,
+        )
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import decompose_message_log
         from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -273,6 +277,7 @@ class SyncRolloutActor:
                 # do: the driver zeroes the loss weight of every mask_sample
                 # row this actor carries, so the flag must gate the carry.
                 mask_env_flagged_samples=should_mask_flagged_samples(cfg.env),
+                policy_failure_kinds=exclude_infra_policy_kinds(cfg.grpo),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,
             )

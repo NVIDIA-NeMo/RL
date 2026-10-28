@@ -50,6 +50,7 @@ from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     _create_advantage_estimator,
     _initial_grpo_save_state,
+    exclude_infra_policy_kinds,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
@@ -85,6 +86,7 @@ from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_reassembler_actor import RolloutReassemblerActor
 from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+from nemo_rl.experience.rollouts import infra_failure_flags
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -1181,7 +1183,7 @@ class _MaskRecordingAdvantageEstimator:
         return rewards.unsqueeze(-1).expand_as(mask).clone()
 
 
-@pytest.mark.parametrize("policy", ["exclude", "include"])
+@pytest.mark.parametrize("policy", ["exclude", "include", "exclude_infra"])
 def test_advantage_stage_composes_all_filters_before_computing_advantages(
     capsys: pytest.CaptureFixture[str],
     policy: str,
@@ -1277,10 +1279,13 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     assert estimator.mask is not None
     assert estimator.mask[0].all()
     assert estimator.mask[1:].count_nonzero() == 0
+    # exclude_infra votes like include here: the payload builders already gave
+    # any infrastructure-failed row a sample_mask of 0, and this batch's
+    # environment-masked row kept its weight (a policy-caused mask).
     expected_valid_mask = (
-        torch.ones(batch_size)
-        if policy == "include"
-        else torch.tensor([1.0, 0.0, 0.0, 0.0])
+        torch.tensor([1.0, 0.0, 0.0, 0.0])
+        if policy == "exclude"
+        else torch.ones(batch_size)
     )
     assert torch.equal(estimator.valid_mask, expected_valid_mask)
     torch.testing.assert_close(
@@ -4636,3 +4641,95 @@ def test_advantage_stage_placeholders_never_vote(
         return torch.stack(written.unbind()[:2])
 
     torch.testing.assert_close(compute(placeholders=True), compute(placeholders=False))
+
+
+@pytest.mark.parametrize("policy", ["exclude_infra", "exclude", "include"])
+@pytest.mark.parametrize("estimator_name", ["grpo", "gdpo", "reinforce_plus_plus"])
+def test_advantage_stage_infra_masked_reward_never_moves_valid_siblings(
+    policy: str, estimator_name: str
+) -> None:
+    """#4160 follow-up regression on SingleController (see the trainer test in
+    ``test_grpo.py``): an OSWorld evaluator error, masked with no
+    ``failure_kind``, cannot move its valid siblings under ``exclude_infra`` or
+    ``exclude``; ``include`` keeps letting it vote."""
+    cfg = GRPOConfig(
+        masked_reward_policy=policy,
+        seq_logprob_error_threshold=None,
+        adv_estimator=AdvEstimatorConfig(name=estimator_name, minus_baseline=True),
+    )
+    master = SimpleNamespace(
+        grpo=cfg, loss_fn=ClippedPGLossConfig(use_kl_in_reward=False)
+    )
+    env_extras = [{}, {}, {"mask_sample": True}]
+    # What the payload builders publish (record_to_train_batch and the
+    # token-capture finalizer): exclude_infra gives the infrastructure failure
+    # a data-plane sample_mask of 0.
+    sample_mask = torch.ones(3)
+    policy_failure_kinds = exclude_infra_policy_kinds(cfg)
+    if policy_failure_kinds is not None:
+        sample_mask[infra_failure_flags(env_extras, policy_failure_kinds)] = 0.0
+
+    def compute(evaluator_reward: float) -> tuple[torch.Tensor, torch.Tensor]:
+        rewards = torch.tensor([1.0, 0.0, evaluator_reward])
+        data = TensorDict(
+            {
+                "prompt_ids_for_adv": torch.tensor([[1]] * 3),
+                "total_reward": rewards,
+                "reward/a": rewards.clone(),
+                "reward/b": 2 * rewards,
+                "token_mask": torch.tensor([[0.0, 1.0, 1.0]] * 3),
+                "sample_mask": sample_mask.clone(),
+                "mask_sample": torch.tensor([False, False, True]),
+                "truncated": torch.zeros(3, dtype=torch.bool),
+            },
+            batch_size=[3],
+        )
+        plane = _AdvantageDataPlane(data)
+        estimator = MagicMock(wraps=_create_advantage_estimator(master))
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._dp_client = plane
+        ctrl._advantage_cfg = AdvantageConfig(
+            repeated_batch_fields=["reward/a", "reward/b"]
+        )
+        ctrl._advantage_estimator = estimator
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        ctrl._policy_logprobs_required = False
+        ctrl._reference_logprobs_required = False
+        ctrl._teacher_logprobs_required = False
+        ctrl._is_ppo = False
+        ctrl._master_config = master
+        ctrl._algo_cfg = cfg
+        ctrl._message_level_advantage_penalties_enabled = False
+        ctrl._step_log_dict = {
+            key: []
+            for key in (
+                "reward_partials",
+                "advantage_partials",
+                "sequence_lengths",
+                "num_mask_sample_filtered",
+                "seq_logprob_error_metrics",
+            )
+        }
+        _stamp_advantage_stage_config(ctrl, shardable=False)
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"sample-{i}" for i in range(3)],
+            fields=list(data.keys()),
+            sequence_lengths=[3] * 3,
+            tags=[{GROUP_ID_TAG: "group"} for _ in range(3)],
+        )
+        _, trainable = asyncio.run(ctrl._advantage_stage(meta))
+        assert trainable
+        assert plane.written_fields is not None
+        advantages = plane.written_fields["advantages"]
+        valid_mask = estimator.compute_advantage.call_args.kwargs["valid_mask"]
+        return valid_mask, torch.stack(advantages.unbind()[:2])
+
+    mask_at_0, advantages_at_0 = compute(0.0)
+    mask_at_1, advantages_at_1 = compute(1.0)
+
+    votes = [1.0, 1.0, 1.0] if policy == "include" else [1.0, 1.0, 0.0]
+    for valid_mask in (mask_at_0, mask_at_1):
+        torch.testing.assert_close(valid_mask, torch.tensor(votes))
+    assert torch.allclose(advantages_at_0, advantages_at_1) is (policy != "include")

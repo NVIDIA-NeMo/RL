@@ -50,11 +50,13 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_training_claims,
 )
 from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
     GRPOSaveState,
     RewardPenaltyConfig,
     _get_effort_config,
     _get_grpo_save_state,
     _restore_adaptive_loss_state,
+    exclude_infra_policy_kinds,
 )
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
@@ -2183,6 +2185,12 @@ def setup_single_controller(
     )
 
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+    # grpo.masked_reward_policy=exclude_infra: both payload paths (native
+    # commit and token-capture finalization) give infrastructure-failed rows a
+    # sample_mask of 0. PPO has no masked-reward policy.
+    policy_failure_kinds = exclude_infra_policy_kinds(
+        None if is_ppo_run(master_config) else cast(GRPOConfig, algo_cfg)
+    )
     tq_buffer = TQReplayBuffer(
         dp_client,
         partition_id=partition_id,
@@ -2195,6 +2203,7 @@ def setup_single_controller(
             algo_cfg.invalid_tool_call_advantage is not None
             or algo_cfg.malformed_thinking_advantage is not None
         ),
+        policy_failure_kinds=policy_failure_kinds,
         require_routed_experts=router_replay_enabled(policy_config),
         staging_partition_id=(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
@@ -2255,6 +2264,7 @@ def setup_single_controller(
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
+        policy_failure_kinds=policy_failure_kinds,
         log_full_result_tables=should_log_nemo_gym_full_result_tables(
             wandb_enabled=master_config.logger.wandb_enabled,
             wandb_config=master_config.logger.wandb,

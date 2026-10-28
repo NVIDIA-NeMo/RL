@@ -352,6 +352,7 @@ def _make_manager(
     """
     mgr = object.__new__(RolloutManager)
     mgr._impl = impl
+    mgr._policy_failure_kinds = None
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = 1
     mgr._rollout_recovery_config = RolloutRecoveryConfig()
@@ -2030,8 +2031,10 @@ def _make_capture_manager(
     instance_configs=None,
     verify_fields=None,
     recovery_config: RolloutRecoveryConfig | None = None,
+    policy_failure_kinds=None,
 ):
     mgr = object.__new__(RolloutManager)
+    mgr._policy_failure_kinds = policy_failure_kinds
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
     mgr._rollout_recovery_config = recovery_config or RolloutRecoveryConfig()
@@ -2172,6 +2175,42 @@ class TestGenerateForFinalizationFlow:
         # measure it from; the finalizer computes it from each row's rebuilt
         # length instead.
         assert request.mask_sample == (True, True, False)
+        # Only grpo.masked_reward_policy=exclude_infra asks for the flags.
+        assert request.infra_failure is None
+
+    @pytest.mark.parametrize(
+        "policy_failure_kinds, expected",
+        [
+            (frozenset({"agent_timeout"}), (True, False, False)),
+            (None, None),
+        ],
+    )
+    def test_request_carries_infra_failure_flags(self, policy_failure_kinds, expected):
+        """The receipt path classifies masks like the native payload path: a
+        mask with no failure_kind (OSWorld's evaluator error) is an
+        infrastructure failure, a listed policy kind is not, and an unmasked
+        row never is. The raw kind is sealed in the recovery ledger."""
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(
+            buf,
+            num_generations=3,
+            verify_fields=[
+                {"mask_sample": True},
+                {"mask_sample": True, "failure_kind": "agent_timeout"},
+                {"mask_sample": False, "failure_kind": "judge_failed"},
+            ],
+            policy_failure_kinds=policy_failure_kinds,
+        )
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        assert request.mask_sample == (True, True, False)
+        assert request.infra_failure == expected
+        assert mgr.recovery_ledger.finalization_inputs(request.group_id)[7] == [
+            None,
+            "agent_timeout",
+            "judge_failed",
+        ]
 
     def test_mints_ids_and_returns_metadata_request(self):
         buf = _FakeCaptureBuffer()

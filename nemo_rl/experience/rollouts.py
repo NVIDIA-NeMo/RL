@@ -22,7 +22,7 @@ import statistics
 import uuid
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -413,6 +413,37 @@ def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
         return bool((extra.get("instance_config") or {}).get(MASK_SAMPLE, False))
 
     return torch.tensor([flagged(extra) for extra in extras], dtype=torch.bool)
+
+
+# Top-level NeMo-Gym verify-response field naming why a sample failed, from the
+# shared vocabulary in nemo_gym/failure_kinds.py (or "<server>:<kind>").
+FAILURE_KIND = "failure_kind"
+
+
+def infra_failure_flags(
+    extras: Iterable[dict[str, Any] | None], policy_failure_kinds: Collection[str]
+) -> torch.Tensor:
+    """Return True for samples the environment masked for an infrastructure failure.
+
+    A sample is one when the environment flagged it with ``mask_sample`` (see
+    ``_mask_sample_flags``) and its verify response's top-level
+    ``failure_kind`` (NeMo-Gym ``BaseVerifyResponse``) is not one of
+    ``policy_failure_kinds`` (``grpo.policy_failure_kinds``) or is absent: a
+    judge, verifier, sandbox, session or transport failure, whose reward
+    measured nothing about the policy. Under ``grpo.masked_reward_policy:
+    exclude_infra`` the rollout builders give these samples a dataset weight of
+    0, so they never vote in the advantage statistics; they already carry no
+    loss through ``mask_sample``.
+    """
+    extras = [extra or {} for extra in extras]
+    masked = _mask_sample_flags(extras).tolist()
+    return torch.tensor(
+        [
+            is_masked and extra.get(FAILURE_KIND) not in policy_failure_kinds
+            for is_masked, extra in zip(masked, extras)
+        ],
+        dtype=torch.bool,
+    )
 
 
 def _attach_routed_experts_to_message_log_prefix(
@@ -2663,6 +2694,7 @@ async def run_async_nemo_gym_rollout(
     length_penalty_config: LengthPenaltyConfig | dict[str, Any] | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
+    policy_failure_kinds: Collection[str] | None = None,
     returns_entire_batch: bool = False,
     routing_group_size: Optional[int] = None,
     sampling_params: Optional[GenerationSamplingParams] = None,
@@ -2699,6 +2731,10 @@ async def run_async_nemo_gym_rollout(
         thinking_tags: Optional opening and closing tags used by thinking penalties.
         mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
             flags in the rollout batch for loss masking.
+        policy_failure_kinds: Under ``grpo.masked_reward_policy: exclude_infra``,
+            the ``grpo.policy_failure_kinds``: every other env-masked sample
+            gets a dataset weight of 0 (see ``infra_failure_flags``). ``None``
+            leaves the weights alone.
         returns_entire_batch: Whether to treat the input as one potentially
             heterogeneous group. This requires ``num_generations`` to equal the
             batch size and is used by synchronous callers.
@@ -2888,6 +2924,7 @@ async def run_async_nemo_gym_rollout(
                         length_penalty_config=length_penalty_config,
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
+                        policy_failure_kinds=policy_failure_kinds,
                         group_size=identity_num_generations,
                     )
                     if accumulator.is_complete:
@@ -2932,6 +2969,7 @@ def run_nemo_gym_rollout_sync(
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     sampling_params: Optional[GenerationSamplingParams] = None,
     mask_env_flagged_samples: bool = True,
+    policy_failure_kinds: Collection[str] | None = None,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
 ) -> NemoGymRolloutResult:
@@ -2969,6 +3007,7 @@ def run_nemo_gym_rollout_sync(
             validation passes its own profile explicitly.
         mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
             flags in the rollout batch for loss masking.
+        policy_failure_kinds: See :func:`run_async_nemo_gym_rollout`.
         deduplicate_multimodal_data: Omit initial policy-ready media from the
             remote Gym return and restore it from the input batch.
         debug_payload_metrics: Emit exact Gym Ray-boundary media payload metrics.
@@ -3006,6 +3045,7 @@ def run_nemo_gym_rollout_sync(
             length_penalty_config=length_penalty_config,
             thinking_tags=thinking_tags,
             mask_env_flagged_samples=mask_env_flagged_samples,
+            policy_failure_kinds=policy_failure_kinds,
             returns_entire_batch=True,
             sampling_params=sampling_params,
             deduplicate_multimodal_data=deduplicate_multimodal_data,
@@ -3210,6 +3250,7 @@ def _postprocess_single_nemo_gym_group(
     length_penalty_config: LengthPenaltyConfig | dict[str, Any] | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
+    policy_failure_kinds: Collection[str] | None = None,
     group_size: Optional[int] = None,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream.
@@ -3455,6 +3496,19 @@ def _postprocess_single_nemo_gym_group(
         final_batch[MASK_SAMPLE] = _mask_sample_flags(
             result["full_result"] for result in results
         )
+        if policy_failure_kinds is not None:
+            # grpo.masked_reward_policy=exclude_infra: an infrastructure
+            # failure's reward measured nothing, so it gets the dataset weight
+            # of an unusable row and never votes in the advantage statistics.
+            infra_failure = infra_failure_flags(
+                (result["full_result"] for result in results), policy_failure_kinds
+            )
+            loss_multiplier = torch.as_tensor(final_batch["loss_multiplier"]).clone()
+            loss_multiplier[infra_failure] = 0
+            final_batch["loss_multiplier"] = loss_multiplier
+            rollout_metrics["infra_failure_sample_rate"] = (
+                infra_failure.float().mean().item()
+            )
     if env_rewards is not None:
         final_batch["env_reward"] = env_rewards
 

@@ -31,6 +31,7 @@ from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
     _get_effort_config,
+    exclude_infra_policy_kinds,
 )
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
@@ -1556,6 +1557,11 @@ class AsyncTrajectoryCollector:
                 thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 mask_env_flagged_samples=should_mask_flagged_samples(
                     self.master_config.env
+                ),
+                policy_failure_kinds=exclude_infra_policy_kinds(
+                    self.master_config.grpo
+                    if isinstance(self.master_config, GRPOMasterConfig)
+                    else None
                 ),
                 deduplicate_multimodal_data=self._deduplicate_multimodal_data,
                 debug_payload_metrics=self._debug_payload_metrics,

@@ -375,7 +375,17 @@ baseline/std and final batch normalization, Reinforce++'s optional group
 baseline and token-level batch normalization, the `env_baseline` behind the
 `baseline_reward/pct_*` diagnostics, and dynamic-sampling admission:
 
-- `include` (default): every row with a nonzero dataset weight votes, including
+- `exclude_infra` (default): like `include`, except that a row the environment
+  flagged with `mask_sample` votes only when its `failure_kind` (the NeMo-Gym
+  verify response's top-level field) is one the policy caused, listed in
+  `grpo.policy_failure_kinds`. Every other environment-masked row is an
+  infrastructure failure and never votes: a judge, verifier,
+  sandbox, session or transport failure, or a mask with no `failure_kind` at
+  all (OSWorld masks evaluator errors that way). Its reward measured nothing
+  about the policy, so it must not move its siblings' baselines. Truncated
+  rows under `overlong_filtering` and rows removed by sequence-logprob-error
+  masking keep voting, as under `include`.
+- `include`: every row with a nonzero dataset weight votes, including
   rows the environment flagged with `mask_sample`, truncated rows under
   `overlong_filtering`, and rows removed by sequence-logprob-error masking.
   Their rewards still shape their siblings' baselines although they contribute
@@ -392,16 +402,33 @@ baseline and token-level batch normalization, the `env_baseline` behind the
   `env_baseline`), and the final sample mask, including sequence-logprob-error
   masking, at the estimator.
 
+`grpo.policy_failure_kinds` defaults to the Gym kinds the policy causes:
+`agent_timeout`, `agent_command_not_allowed`, `agent_limit`,
+`agent_invalid_output` and `model_context_limit`. Matching is exact, so an
+environment's namespaced `<server>:<kind>` names can be added. Only
+`exclude_infra` reads the list; there is no list of infrastructure kinds,
+because any kind not known to be the policy's fault, including kinds added to
+Gym later, is treated as infrastructure. The rollout builders apply the rule:
+they give an infrastructure-failed row the dataset weight of an unusable row
+(`0`, see below), so every trainer leaves it out of the statistics; the legacy,
+asynchronous and TransferQueue rollouts also report its share as
+`infra_failure_sample_rate`. It never trains
+either way, because `mask_sample` already removes it from the loss. With
+`env.should_mask_flagged_samples: false` nothing is masked, so nothing is an
+infrastructure failure. `include` restores the behavior before this setting
+existed.
+
 Participation is binary. A fractional `loss_multiplier` such as `0.5` still
 weights the loss, but the row votes with full weight in the statistics; only a
 weight of exactly `0` removes it under `exclude`. For example, with rewards
 `[1, 1, 0]`, a masked last row and leave-one-out disabled, the valid rows'
-baseline is `2/3` under `include` and `1` under `exclude`; with rewards `[0, 1]`
-and loss weights `[0.5, 0.5]` the baseline is `0.5` for both rows under either
-policy.
+baseline is `2/3` under `include` and `1` under `exclude` (and under
+`exclude_infra` when the masked row has no policy-caused `failure_kind`); with
+rewards `[0, 1]` and loss weights `[0.5, 0.5]` the baseline is `0.5` for both
+rows under any policy.
 
 Rows whose dataset-level `loss_multiplier` is `0` never vote, on any trainer
-and under either policy. The data processors assign that weight to prompts
+and under any policy. The data processors assign that weight to prompts
 that do not fit the sequence limit before any rollout happens, so their
 rollouts are unusable rows, not masked rewards; counting them would, for
 example, let their response tokens enter Reinforce++'s batch normalization,
@@ -416,8 +443,8 @@ prompt is not.
 The `train/baseline_reward/histogram` and `baseline_reward/pct_{0,1,mixed}`
 diagnostics of the legacy and TransferQueue trainers count the rows that vote
 under the configured policy, the same mask the estimator receives: every row
-with a nonzero dataset weight under `include`, the rows with a nonzero final
-loss weight under `exclude`. A
+with a nonzero dataset weight under `include` and `exclude_infra`, the rows
+with a nonzero final loss weight under `exclude`. A
 non-voting row still receives a baseline entry (under the leave-one-out baseline
 it is the mean of its voting siblings' rewards, which is neither 0 nor 1), so
 counting it would report an all-correct group as mixed. When no row votes, the
@@ -434,9 +461,10 @@ mask instead of the loss weights. Under top-k/top-p filtering the workers zero
 every policy logprob outside `token_mask * sample_mask`; the reference pass is
 computed without filtering (see
 [Top-p and top-k filtering](#top-p-and-top-k-filtering)), so its logprobs are
-always real. A loss-masked row that votes under `include` therefore keeps real
-policy logprobs, and Reinforce++'s KL-in-reward and batch normalization see
-its real KL term instead of a zeroed policy logprob against a real reference.
+always real. A loss-masked row that votes under `include` or `exclude_infra`
+therefore keeps real policy logprobs, and Reinforce++'s KL-in-reward and batch
+normalization see its real KL term instead of a zeroed policy logprob against
+a real reference.
 Under `exclude` both masks select the same rows. Training always receives the
 loss weights.
 
@@ -446,11 +474,11 @@ GDPO normalizes over participating rows with an unbiased standard deviation and
 returns zeros when at most one row participates; Reinforce++ returns zeros when
 no token participates. Groups with at most one participating reward keep a zero
 group-relative reward difference. SingleController skips advantage computation
-when a whole chunk has no trainable tokens, under either policy.
+when a whole chunk has no trainable tokens, under any policy.
 
 The default is a policy decision made with the post-training team, not a
 finding that `exclude` is numerically wrong, and no controlled convergence
-comparison between the two settings has been established. To run one, use the
+comparison between the settings has been established. To run one, use the
 paired
 [exclude experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-exclude.yaml)
 and [include experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-include.yaml),
@@ -730,7 +758,7 @@ $$
 L_{\text{effective}} = \sum_{i} m_i \cdot L_i
 $$
 
-where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update. Under the default `grpo.masked_reward_policy: include` they remain in the batch for reward baseline calculations; `exclude` removes them from the statistics as well (see [Masked rewards in advantage statistics](#masked-rewards-in-advantage-statistics)).
+where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update. Under the default `grpo.masked_reward_policy: exclude_infra`, and under `include`, they remain in the batch for reward baseline calculations; `exclude` removes them from the statistics as well (see [Masked rewards in advantage statistics](#masked-rewards-in-advantage-statistics)).
 
 To configure:
 ```yaml

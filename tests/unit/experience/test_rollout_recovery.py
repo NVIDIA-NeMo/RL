@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 from collections.abc import Callable
 from typing import Any, TypeVar
@@ -809,6 +810,9 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
                         receipt=receipt,
                         reward=float(generation_index),
                         mask_sample=generation_index == 0,
+                        failure_kind="verifier_error"
+                        if generation_index == 0
+                        else None,
                     )
                 )
             )
@@ -823,6 +827,9 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
                         receipt=receipt,
                         reward=float(generation_index),
                         mask_sample=generation_index == 0,
+                        failure_kind="verifier_error"
+                        if generation_index == 0
+                        else None,
                     )
                     for generation_index, receipt in enumerate(receipts)
                 },
@@ -839,6 +846,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
         mask_sample,
         evidence,
         log_contexts,
+        failure_kinds,
     ) = restored.finalization_inputs("g7")
 
     assert physical_ids == gate_ids
@@ -847,6 +855,20 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert rewards == [0.0, 1.0]
     assert mask_sample == [True, False]
     assert log_contexts == [None, None]
+    # The raw kind survives a restart, so finalization can still tell an
+    # infrastructure failure from a policy-caused mask (exclude_infra).
+    assert failure_kinds == ["verifier_error", None]
+
+    # A version-3 ledger predates failure_kind and still loads, without one.
+    v3_state = copy.deepcopy(state)
+    v3_state["schema_version"] = 3
+    for group in v3_state["groups"]:
+        for sibling in group["siblings"]:
+            for attempt in sibling["attempts"]:
+                del attempt["failure_kind"]
+    assert RolloutRecoveryLedger.from_state_dict(v3_state).finalization_inputs("g7")[
+        7
+    ] == [None, None]
 
     state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):

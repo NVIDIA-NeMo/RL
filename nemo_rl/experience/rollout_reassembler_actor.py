@@ -52,6 +52,10 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    # Per-rollout infrastructure-failure flag under
+    # grpo.masked_reward_policy=exclude_infra (rollouts.infra_failure_flags):
+    # these rows get a sample_mask of 0. None under the other policies.
+    infra_failure: tuple[bool, ...] | None = None
     reward_checks: tuple[RewardChecks | None, ...] | None = None
     reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
     # Resolved by Gym and persisted with the sealed receipts for teacher routing.
@@ -146,6 +150,9 @@ class RolloutReassemblerActor:  # pragma: no cover
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
+            infra_failure=list(request.infra_failure)
+            if request.infra_failure is not None
+            else None,
             canonical_sample_ids=list(request.canonical_sample_ids),
             reward_checks=list(request.reward_checks)
             if request.reward_checks is not None
