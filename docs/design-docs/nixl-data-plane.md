@@ -74,6 +74,26 @@ carry the data plane's CPU bytes off the node, so its cross-node traffic still
 goes over `rc` (RDMA) only. If you set `UCX_TLS` yourself with both features
 on, keep `cuda_copy,cuda_ipc` in it.
 
+### Images with HPC-X: set `NCCL_NET_PLUGIN=none`
+
+On images that ship HPC-X's NCCL network plugin
+(`/opt/hpcx/nccl_rdma_sharp_plugin/lib/libnccl-net.so`), NIXL can fail to start
+in the trainer processes with `NIXL_ERR_BACKEND`, after UCX warns that `rc`,
+`cuda_copy`, `cuda_ipc` and the `mlx5_*` devices are "not available":
+
+```
+NCCL first collective ─▶ loads HPC-X SHARP net plugin ─▶ HPC-X libucs in process
+NIXL starts its bundled UCX ─▶ finds its plugin dir via the loaded HPC-X libucs
+  ─▶ HPC-X's IB/CUDA plugins register with the wrong UCX
+  ─▶ NIXL's UCX keeps only tcp/shm ─▶ NIXL_ERR_BACKEND
+```
+
+Fix: launch with `NCCL_NET_PLUGIN=none`. NCCL then uses its built-in
+InfiniBand transport over the same rails, HPC-X's UCX is never loaded, and
+NIXL finds its own plugins. Seen on GB200 with the `nightly-gym.2026-10-19`
+image (verified on 1 and 64 nodes); the GB300 runs in this doc did not need it.
+Effect on NCCL collective speed (no SHARP plugin) was not measured.
+
 ## Design points
 
 - **Index-addressed rows.** Like TransferQueue's SimpleStorage, row `gidx`
