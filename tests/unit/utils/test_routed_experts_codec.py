@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from nemo_rl.utils.routed_experts_codec import (
+    RoutedExpertsStagingPayload,
     decode_routed_experts,
     encode_routed_experts,
 )
@@ -60,3 +61,37 @@ def test_encode_rejects_bad_inputs():
         encode_routed_experts(torch.zeros(3, 2, dtype=torch.int16))
     with pytest.raises(ValueError, match="dtype"):
         encode_routed_experts(torch.zeros(2, 3, 2, dtype=torch.int64))
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32])
+@pytest.mark.parametrize("length", [0, 7])
+def test_staging_payload_preserves_envelope_and_owns_snapshot(dtype, length):
+    original = torch.arange(length * 3 * 4).reshape(length, 3, 4).to(dtype)[:, :, ::2]
+    expected = original.clone()
+    payload = RoutedExpertsStagingPayload(original)
+    assert payload.encoded == encode_routed_experts(original)
+    original.fill_(0)
+    snapshot = payload.tensor_for_payload(payload.encoded)
+    assert snapshot.dtype == dtype
+    assert snapshot.is_contiguous()
+    assert torch.equal(snapshot, expected)
+    assert torch.equal(decode_routed_experts(payload.encoded, dtype), expected)
+    assert "nrlre1:" not in repr(payload)
+
+
+def test_staging_payload_rejects_mismatched_envelope_or_modified_tensor():
+    payload = RoutedExpertsStagingPayload(torch.zeros(3, 2, 1, dtype=torch.int16))
+    other = encode_routed_experts(torch.ones(3, 2, 1, dtype=torch.int16))
+    with pytest.raises(ValueError, match="does not match"):
+        payload.tensor_for_payload(other)
+    payload.tensor_for_payload(payload.encoded).add_(1)
+    with pytest.raises(ValueError, match="modified after encoding"):
+        payload.tensor_for_payload(payload.encoded)
+
+
+def test_staging_payload_supports_inference_tensors():
+    with torch.inference_mode():
+        routes = torch.zeros(3, 2, 1, dtype=torch.int16)
+        payload = RoutedExpertsStagingPayload(routes)
+        assert not payload.tensor_for_payload(payload.encoded).is_inference()
+    assert torch.equal(payload.tensor_for_payload(payload.encoded), routes)
