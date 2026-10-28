@@ -152,7 +152,7 @@ def test_gdr_tensor_put_is_confirmed_once_and_never_falls_back(
     )
 
 
-@pytest.mark.parametrize("method_name", ["put", "get", "close"])
+@pytest.mark.parametrize("method_name", ["put", "get"])
 @pytest.mark.parametrize("gdr_active", [False, True])
 def test_gdr_transfers_stay_on_the_attaching_workers_gpu(
     monkeypatch, method_name: str, gdr_active: bool
@@ -179,7 +179,6 @@ def test_gdr_transfers_stay_on_the_attaching_workers_gpu(
         _gdr_staging=object() if gdr_active else None,
         put=transfer,
         get=transfer,
-        close=transfer,
     )
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
     monkeypatch.setattr(

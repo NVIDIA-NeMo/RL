@@ -863,7 +863,7 @@ def _bind_mooncake_cuda_device() -> None:
     ):
         return
     device = torch.device("cuda", torch.cuda.current_device())
-    for name in ("put", "get", "close"):
+    for name in ("put", "get"):
         setattr(
             storage_client,
             name,
