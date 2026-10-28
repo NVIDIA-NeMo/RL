@@ -1,0 +1,323 @@
+defaults: ../../grpo_math_1B_megatron_single_controller.yaml
+async_rl:
+  _override_: true
+  max_buffered_rollouts: 256
+  max_inflight_prompts: 128
+  min_groups_for_streaming_train: 128
+  rollout_failure:
+    max_replacement_attempts: 8
+    min_step_batch_fraction: 1
+    replacement_reserve_prompts: 256
+  sampler:
+    max_staleness_versions: 1
+    name: ready_first
+checkpointing:
+  checkpoint_dir: ${oc.env:CAPRL_RUN_DIR,results/caprl-prefix-smoke}/checkpoints
+  enabled: true
+cluster:
+  gpus_per_node: 4
+  num_nodes: 32
+  segment_size: 8
+data:
+  _override_: true
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    num_frames: 64
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    system_prompt_file: null
+    video_maintain_aspect_ratio: false
+    video_sampling_style: nemotron_vl
+    video_target_num_patches: 1024
+    video_temporal_patch_size: 2
+  max_input_seq_length: 65536
+  num_workers: 1
+  shuffle: false
+  train:
+  - env_name: nemo_gym
+    data_path: ${oc.env:CAPRL_TRAIN_PATH,/lustre/fs1/portfolios/nemotron/projects/nemotron_omni_vision/users/matthieul/data/grpo/v1base_caprl_video_20steps_2spare_seed20261015/training.jsonl}
+    processor: nemo_gym_data_processor
+    num_frames: 64
+    prompt_file: null
+    dataset_name: NemoGymDataset
+    system_prompt_file: null
+    video_sampling_style: nemotron_vl
+    video_target_num_patches: 1024
+    video_temporal_patch_size: 2
+    video_maintain_aspect_ratio: false
+  use_multiple_dataloader: false
+  validation: null
+data_plane:
+  simple:
+    num_storage_units: 64
+env:
+  _override_: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  should_use_nemo_gym: true
+  nemo_gym:
+    pad_dynamic_image_shapes: true
+    policy_max_input_tokens: 65536
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          extra_body:
+            bad_words:
+            - <image>
+            - <img>
+            - </img>
+            - <so_embedding>
+            - <so_start>
+            - <so_end>
+            chat_template_kwargs:
+              enable_thinking: true
+          uses_reasoning_parser: true
+    port_range_low: 5000
+    port_range_high: 5999
+    mcqa_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    uv_venv_dir: /opt/gym_venvs
+    skip_venv_if_present: true
+    nemo_gym_log_dir: ${oc.env:CAPRL_RUN_DIR,results/caprl-prefix-smoke}/gym-logs/${oc.env:SLURM_JOB_ID,local}
+    tokenizer_config:
+      chat_template: ${policy.tokenizer.chat_template}
+      chat_template_kwargs:
+        enable_thinking: true
+        truncate_history_thinking: false
+      name: ${policy.model_name}
+      video:
+        num_frames: 64
+grpo:
+  adv_estimator:
+    normalize_rewards: true
+    reward_weights: null
+    use_leave_one_out_baseline: true
+  advantage_clip_high: 50
+  advantage_clip_low: -50
+  calculate_advantages_on_gpu: false
+  debug_payload_metrics: false
+  deduplicate_multimodal_data: false
+  max_num_epochs: 3
+  max_num_steps: 5
+  max_val_samples: null
+  num_prompts_per_step: 128
+  overlong_filtering: true
+  reward_shaping:
+    max_response_length: null
+    overlong_buffer_length: null
+    overlong_buffer_penalty: null
+  seq_logprob_error_threshold: 2
+  skip_reference_policy_logprobs_calculation: true
+  val_num_generations_per_prompt: 4
+  zero_variance_prompt_filtering: false
+loss_fn:
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_max: 0.28
+  reference_policy_kl_penalty: 0
+  response_length_normalization_constant: null
+  token_level_loss: false
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  use_importance_sampling_correction: true
+  use_on_policy_kl_approximation: true
+policy:
+  dynamic_batching:
+    logprob_mb_tokens: 65536
+    train_mb_tokens: 65536
+  generation:
+    _pad_token_id: 11
+    bad_words:
+    - <image>
+    - <img>
+    - </img>
+    - <so_embedding>
+    - <so_start>
+    - <so_end>
+    colocated:
+      resources:
+        gpus_per_node: 4
+        num_nodes: 16
+    max_new_tokens: 32768
+    model_name: ${policy.model_name}
+    val_temperature: 1
+    val_top_k: null
+    val_top_p: 1
+    vllm_cfg:
+      cap_max_tokens_to_context: true
+      enable_prefix_caching: false
+      env_vars:
+        NCCL_ALGO: Ring
+        NCCL_PROTO: Simple
+        NRL_REFIT_BUFFER_MEMORY_RATIO: '0.006'
+        NRL_REFIT_NUM_BUFFERS: '1'
+        VLLM_TRITON_FORCE_FIRST_CONFIG: '1'
+      expert_parallel_size: 4
+      expose_http_server: true
+      fp32_lm_head: true
+      gpu_memory_utilization: 0.8
+      http_server_serving_chat_kwargs:
+        chat_template: ${policy.tokenizer.chat_template}
+        chat_template_content_format: openai
+        enable_auto_tools: true
+        reasoning_parser: deepseek_r1
+        tool_parser: qwen3_coder
+      load_format: dummy
+      logprobs_mode: raw_logprobs
+      max_model_len: 65536
+      precision: bfloat16
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      skip_tokenizer_init: false
+      tensor_parallel_size: 4
+      video:
+        num_frames: 64
+        sampling_style: nemotron_vl
+        temporal_patch_size: 2
+    vllm_kwargs:
+      allowed_local_media_path: /lustre
+      async_scheduling: false
+      attention_backend: FLASHINFER
+      attention_config:
+        use_trtllm_attention: false
+      compilation_config:
+        backend: eager
+        cudagraph_mode: PIECEWISE
+      disable_custom_all_reduce: true
+      enable_chunked_prefill: true
+      enable_return_routed_experts: false
+      hf_overrides:
+        video_maintain_aspect_ratio: false
+        video_target_num_patches: 1024
+        video_temporal_patch_size: 2
+      kernel_config:
+        enable_flashinfer_autotune: false
+        moe_backend: flashinfer_cutlass
+      limit_mm_per_prompt:
+        image: 64
+        video:
+          count: 1
+          num_frames: 64
+      mamba_ssm_cache_dtype: float32
+      max_num_batched_tokens: 65536
+      max_num_seqs: 128
+      media_io_kwargs:
+        video:
+          num_frames: 64
+      mm_encoder_attn_backend: FLASH_ATTN
+      mm_processor_cache_gb: 0
+      moe_backend: flashinfer_cutlass
+      skip_mm_profiling: true
+      video_pruning_rate: 0.0
+  generation_batch_size: 64
+  hf_config_overrides:
+    video_maintain_aspect_ratio: false
+    video_target_num_patches: 1024
+    video_temporal_patch_size: 2
+  is_vlm: true
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  make_sequence_length_divisible_by: 8
+  max_total_sequence_length: 65536
+  megatron_cfg:
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    checkpoint:
+      async_save: false
+    context_parallel_size: 2
+    defer_fp32_logits: true
+    distributed_data_parallel_config:
+      average_in_collective: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    empty_unused_memory_level: 2
+    env_vars:
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NRL_REFIT_BUFFER_MEMORY_RATIO: '0.006'
+      NRL_REFIT_NUM_BUFFERS: '1'
+    expert_model_parallel_size: 16
+    fp32_lm_head: true
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    moe_aux_loss_coeff: 0
+    moe_router_bias_update_rate: 0.001
+    moe_router_dtype: fp32
+    moe_router_enable_expert_bias: true
+    mtp_detach_heads: true
+    optimizer:
+      adam_beta2: 0.99
+      clip_grad: 1
+      exp_avg_dtype: float32
+      exp_avg_sq_dtype: float32
+      lr: 3.0e-06
+      store_param_remainders: false
+      weight_decay: 0
+    pipeline_dtype: bfloat16
+    radio_force_cpe_eval_mode: true
+    scheduler:
+      end_weight_decay: 0
+      lr_decay_iters: 60
+      lr_decay_style: cosine
+      lr_warmup_init: 3.0e-08
+      lr_warmup_iters: 10
+      override_opt_param_scheduler: false
+      start_weight_decay: 0
+      use_checkpoint_opt_param_scheduler: true
+    sequence_parallel: true
+    tensor_model_parallel_size: 2
+    track_moe_metrics: true
+    train_iters: 50
+  model_name: ${oc.env:CAPRL_MODEL_PATH,/lustre/fsw/portfolios/coreai/users/cye/code/RL/workspace/models/super-vl-35-rlvr-v43-falcon-r3-20260905/hf}
+  offload_optimizer_for_logprob: true
+  optimizer: null
+  router_replay:
+    enabled: false
+    transport: ray
+  scheduler: null
+  sequence_packing:
+    fuse_loss: true
+    logprob_mb_tokens: 65536
+    microbatch_order: largest_first
+    train_mb_tokens: 65536
+  tokenizer:
+    chat_template: ${policy.model_name}/chat_template.jinja
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+    video:
+      num_frames: 64
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+ppo: null
+rollout_checkpointing:
+  keep_latest_k: 3
+  snapshot_attempt_interval_s: 120.0
+  fallback_to_previous_trainer_checkpoint: true
+rollout_recovery:
+  target_level: prefix
+telemetry: null
+token_capture:
+  capture_dir: /tmp/nemo_rl/caprl-token-capture/${oc.env:SLURM_JOB_ID,local}
+  control_timeout_s: 120.0
+  defer_routed_experts_to_policy: false
+  enabled: true
+  min_valid_fraction_per_group: 1
+  num_reassembler_workers: 2
+value: null
+value_loss_fn: null
+logger:
+  log_dir: ${oc.env:CAPRL_RUN_DIR,results/caprl-prefix-smoke}/runs/${oc.env:SLURM_JOB_ID,local}
+  wandb_enabled: true
+  wandb:
+    project: supervl3p5-caprl-prefix-smoke
+    entity: nvidia
+    name: ${oc.env:CAPRL_EXP_NAME,caprl-prefix-smoke}-${oc.env:SLURM_JOB_ID,local}
