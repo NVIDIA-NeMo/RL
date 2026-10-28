@@ -1289,13 +1289,6 @@ def _setup_pipeline_parts(
     """
     parts = pipeline.parts
     stage_ids = [stage.stage_index for stage in pipeline.info.stages]
-    if hasattr(parts[0], "get_pipeline_kwargs_chunk_dims"):
-        raise NotImplementedError(
-            f"{type(parts[0]).__name__} chunks its pipeline inputs with "
-            "get_pipeline_kwargs_chunk_dims, which NeMo RL's pipeline schedule "
-            "calls do not apply yet. Set "
-            "policy.automodel_cfg.pipeline_parallel_size=1 for this model."
-        )
     for stage_id, part in zip(stage_ids, parts):
         print(f"Pipeline stage {stage_id}:\n{part}")
 

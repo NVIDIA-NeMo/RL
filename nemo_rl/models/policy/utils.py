@@ -275,9 +275,6 @@ def validate_automodel_pipeline_config(
             "context_parallel_size"
         ]
         > 1,
-        "automodel_cfg.expert_parallel_size > 1": "expert_parallel_size"
-        in automodel_cfg
-        and automodel_cfg["expert_parallel_size"] > 1,
         "automodel_cfg.sequence_parallel": automodel_cfg["sequence_parallel"],
         "automodel_cfg.cpu_offload": automodel_cfg["cpu_offload"],
         "automodel_cfg.lora_cfg.enabled": "lora_cfg" in automodel_cfg

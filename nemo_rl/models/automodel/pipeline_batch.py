@@ -64,6 +64,33 @@ class ExecutionBatch:
     seq_len: int
 
 
+def _check_batch_major_inputs(model: nn.Module, model_batch: dict[str, Any]) -> None:
+    """Reject model inputs whose batch dimension is not dim 0.
+
+    Execution batches concatenate microbatch inputs along dim 0 and the schedule
+    splits them back along dim 0. A model whose
+    ``get_pipeline_kwargs_chunk_dims`` hook places the batch on another axis for
+    these inputs (for example multimodal M-RoPE position IDs of shape
+    ``[3, B, S]``) would be split wrongly, so it fails here. Text-only inputs of
+    such models (the hook returns no exceptions) are batch-major and run.
+
+    Args:
+        model: A local model part.
+        model_batch: One microbatch's model-facing inputs.
+    """
+    chunk_dims_hook = getattr(model, "get_pipeline_kwargs_chunk_dims", None)
+    if chunk_dims_hook is None:
+        return
+    non_batch_major = chunk_dims_hook(model_batch)
+    if non_batch_major:
+        raise NotImplementedError(
+            f"{type(model).__name__} splits pipeline inputs "
+            f"{sorted(non_batch_major)} along a non-batch dimension, which NeMo "
+            "RL's pipeline execution batches do not support yet. Set "
+            "policy.automodel_cfg.pipeline_parallel_size=1 for these inputs."
+        )
+
+
 def plan_execution_batches(
     data: BatchedDataDict[Any],
     *,
@@ -143,6 +170,7 @@ def plan_execution_batches(
             )
             for mb in microbatches
         ]
+        _check_batch_major_inputs(model, model_batches[0])
         model_inputs = {
             key: (
                 torch.cat([batch[key] for batch in model_batches])
