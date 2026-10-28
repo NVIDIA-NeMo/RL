@@ -18,6 +18,7 @@ grpo:
   max_val_samples: null
   # Validation rollouts per prompt; k > 1 also reports the pass_k metric.
   # max_val_samples counts PROMPTS: total validation rollouts = max_val_samples * k.
+  # must be 1 for DWRL to work properly
   val_num_generations_per_prompt: 1
   # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
   stop_at_validation_metric: null

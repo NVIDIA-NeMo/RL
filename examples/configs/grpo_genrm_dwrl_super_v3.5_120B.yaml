@@ -2,7 +2,6 @@
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
-  num_val_generations_per_prompt: 1   # must be 1 for DWRL to work correctly
   max_rollout_turns: 1
   max_num_epochs: 1
   max_num_steps: 1000000
@@ -18,6 +17,7 @@ grpo:
   max_val_samples: null
   # Validation rollouts per prompt; k > 1 also reports the pass_k metric.
   # max_val_samples counts PROMPTS: total validation rollouts = max_val_samples * k.
+  # must be 1 for DWRL to work properly
   val_num_generations_per_prompt: 1
   # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
   stop_at_validation_metric: null
