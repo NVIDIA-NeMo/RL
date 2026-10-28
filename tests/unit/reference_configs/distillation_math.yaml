@@ -280,6 +280,7 @@ env:
 logger:
     log_dir: "logs/distillation"
     num_val_samples_to_print: 5
+    extra_backends: []
     wandb_enabled: true
     tensorboard_enabled: true
     mlflow_enabled: false

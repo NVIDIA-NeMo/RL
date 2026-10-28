@@ -315,6 +315,7 @@ logger:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
   num_val_samples_to_print: 0
+  extra_backends: []
 
 cluster:
   gpus_per_node: 1

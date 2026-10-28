@@ -533,6 +533,7 @@ env:
 logger:
   log_dir: "logs"
   num_val_samples_to_print: 0
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false

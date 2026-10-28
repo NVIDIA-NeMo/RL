@@ -228,6 +228,7 @@ logger:
   swanlab_enabled: false
   monitor_gpus: true
   num_val_samples_to_print: 0
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb:
     project: vlm-mpo
     name: vlm-mpo
