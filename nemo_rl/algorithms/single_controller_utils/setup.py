@@ -83,7 +83,11 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
+from nemo_rl.data.multimodal_utils import (
+    WIRE_MULTIMODAL_FIELDS,
+    per_token_multimodal_schema,
+    uses_image_placeholder,
+)
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -105,6 +109,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
     build_nemo_gym_actors,
+    set_nemo_gym_log_dir,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
 )
@@ -142,6 +147,7 @@ from nemo_rl.models.megatron.router_replay import (
 )
 from nemo_rl.models.policy import OnPolicyDistillationFullTransport, PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
@@ -1115,6 +1121,10 @@ def setup_single_controller(
     generation_config = policy_config["generation"]
     data_config = master_config.data
 
+    # Validate every LoRA rollout representation and materialize native vLLM
+    # settings before generation and trainer are constructed concurrently.
+    configure_lora_refit(policy_config)
+
     # Every nccl_reshard precondition, checked once, here, before any GPU work.
     #
     # This guard existed but had exactly one production caller -- grpo.setup -- which the
@@ -1247,10 +1257,14 @@ def setup_single_controller(
             "single_controller_utils does not support "
             "data.use_multiple_dataloader=True yet."
         )
-    if opd_module.is_opd_enabled(master_config) and processor is not None:
-        raise NotImplementedError(
-            "SingleController MOPD currently supports text-only teacher inputs. "
-            "Use the legacy controller for multimodal MOPD."
+    if (
+        opd_module.is_opd_enabled(master_config)
+        and processor is not None
+        and not master_config.token_capture.enabled
+    ):
+        raise ValueError(
+            "SingleController multimodal MOPD requires token_capture.enabled=true "
+            "to reuse the rollout's captured media for teacher scoring."
         )
 
     checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
@@ -1276,6 +1290,15 @@ def setup_single_controller(
     # nemo_rl/distributed/actor_environments.py), so nothing here needs to
     # change the worker's environment.
     token_capture_cfg = master_config.token_capture
+    if (
+        generation_config["backend"] == "megatron"
+        and router_replay_enabled(master_config.policy)
+        and not token_capture_cfg.enabled
+    ):
+        raise ValueError(
+            "Megatron router replay requires token_capture.enabled=true so "
+            "MInf routing indices can be joined with Gym lineage"
+        )
     capture_media = token_capture_cfg.enabled and processor is not None
     if capture_media:
         if not uses_image_placeholder(processor):
@@ -1359,10 +1382,14 @@ def setup_single_controller(
                     "Megatron token capture requires policy.generation."
                     "mcore_generation_config.expose_http_server=true"
                 )
-            if router_replay_enabled(master_config.policy):
+            if (
+                router_replay_enabled(master_config.policy)
+                and token_capture_cfg.defer_routed_experts_to_policy
+            ):
                 raise NotImplementedError(
-                    "Megatron token capture does not yet support router replay: "
-                    "the canonical MInf stager does not yet normalize routed experts"
+                    "Megatron token capture does not support "
+                    "token_capture.defer_routed_experts_to_policy yet; MInf "
+                    "routing indices are aligned in the canonical stager"
                 )
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
@@ -1825,6 +1852,8 @@ def setup_single_controller(
         )
 
     if use_nemo_gym:
+        # Before the Gym build task below reads master_config.env.
+        set_nemo_gym_log_dir(master_config.env, master_config.logger.log_dir)
         if megatron_backend:
             # Megatron serves one frontend per model-parallel group; pre-publish
             # every address so Gym can spread sessions over all of them.
@@ -2158,6 +2187,10 @@ def setup_single_controller(
         dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
+        # Captured rows use a separate producer and derive validity in workers.
+        per_token_multimodal_fields=(
+            () if token_capture_cfg.enabled else per_token_multimodal_schema(processor)
+        ),
         include_message_violation_fields=(
             algo_cfg.invalid_tool_call_advantage is not None
             or algo_cfg.malformed_thinking_advantage is not None
