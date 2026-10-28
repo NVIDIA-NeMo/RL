@@ -3975,6 +3975,56 @@ class TestValidateAndSetConfig:
                 assert runtime_config.offload_optimizer_for_refit is True
                 assert os.environ.get("NCCL_CUMEM_ENABLE") == expected_cumem
 
+    @pytest.mark.parametrize(
+        ("backend", "expected_keep_ties"), [("megatron", True), ("vllm", False)]
+    )
+    def test_top_p_keep_ties_follows_generation_backend(
+        self, backend, expected_keep_ties
+    ):
+        from nemo_rl.models.megatron.setup import validate_and_set_config
+
+        config = {
+            "generation": {
+                "backend": backend,
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": None,
+                "colocated": {"enabled": True},
+            },
+            "precision": "bfloat16",
+            "megatron_cfg": {
+                "optimizer": {
+                    "optimizer_cpu_offload": False,
+                },
+                "tensor_model_parallel_size": 2,
+            },
+            "offload_optimizer_for_logprob": False,
+            "offload_optimizer_for_refit": True,
+        }
+
+        with patch(
+            "nemo_rl.models.megatron.setup.setup_model_config"
+        ) as mock_setup_model_config:
+            mock_megatron_cfg = MagicMock()
+            mock_megatron_cfg.model.vocab_size = 32000
+            mock_setup_model_config.return_value = (mock_megatron_cfg, MagicMock())
+
+            with patch(
+                "nemo_rl.models.megatron.setup.calculate_padded_vocab_size",
+                return_value=32000,
+            ):
+                runtime_config = validate_and_set_config(
+                    config=config,
+                    rank=0,
+                    hf_model_name="test-model",
+                    pretrained_path="/path/to/model",
+                    weights_path=None,
+                    optimizer_path=None,
+                )
+
+        assert runtime_config.sampling_params.top_p == 0.95
+        assert runtime_config.sampling_params.top_p_keep_ties is expected_keep_ties
+
 
 @pytest.mark.mcore
 class TestRuntimeConfigNamedTuple:
