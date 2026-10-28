@@ -831,6 +831,48 @@ def _connect_existing_with_segment_size(segment_size: int) -> None:
     tq_interface._maybe_create_tq_client(conf)
 
 
+def _call_on_cuda_device(
+    device: torch.device, method: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    with torch.cuda.device(device):
+        return method(*args, **kwargs)
+
+
+def _bind_mooncake_cuda_device() -> None:
+    """Keep GDR staging and transfers on this worker's GPU instead of GPU 0.
+
+    CUDA's current device is per thread. TQ runs PUT on an executor thread and
+    GET on its own event-loop thread, and both start on GPU 0, so a worker that
+    sees every GPU on its node would allocate its GDR staging buffer, synchronize
+    and receive GET tensors on GPU 0 rather than on the GPU it set.
+    """
+    storage_client = tq.get_client().storage_manager.storage_client
+    if not hasattr(storage_client, "_gdr_staging"):
+        raise _tq_shape_drift_error(
+            "storage client no longer has a _gdr_staging attribute",
+            "GDR transfers cannot be bound to this worker's GPU",
+            "GDR staging attribute",
+        )
+    if storage_client._gdr_staging is None:
+        return
+    # TQ's client is a process singleton: a later adapter in this process must
+    # not retarget the binding or the staging buffer it may already own.
+    if (
+        isinstance(storage_client.put, functools.partial)
+        and storage_client.put.func is _call_on_cuda_device
+    ):
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    for name in ("put", "get", "close"):
+        setattr(
+            storage_client,
+            name,
+            functools.partial(
+                _call_on_cuda_device, device, getattr(storage_client, name)
+            ),
+        )
+
+
 _STORAGE_UNITS_SC_ONLY = (
     "data_plane.mooncake_cpu.storage_unit_segment_size > 0 and "
     "data_plane.simple.storage_unit_placement are only supported by the "
@@ -1206,6 +1248,8 @@ class TQDataPlaneClient(DataPlaneClient):
             _connect_existing()
         else:
             _connect_existing_with_segment_size(segment_size)
+        if self._gdr_requested and torch.cuda.is_initialized():
+            _bind_mooncake_cuda_device()
         # TQ has built this process's store by now; a no-op unless it owns memory.
         mooncake_ssd_offload.require_offloading_store()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]

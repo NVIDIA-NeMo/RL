@@ -15,8 +15,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -147,6 +150,72 @@ def test_gdr_tensor_put_is_confirmed_once_and_never_falls_back(
         )
         == 1
     )
+
+
+@pytest.mark.parametrize("method_name", ["put", "get", "close"])
+@pytest.mark.parametrize("gdr_active", [False, True])
+def test_gdr_transfers_stay_on_the_attaching_workers_gpu(
+    monkeypatch, method_name: str, gdr_active: bool
+) -> None:
+    """A worker on GPU 2 must not stage GDR transfers on TQ's thread-default GPU 0."""
+    # CUDA's current device is per thread; emulate it so this runs without GPUs.
+    current = threading.local()
+    current.device = 2
+
+    @contextlib.contextmanager
+    def cuda_device(device: torch.device):
+        previous = getattr(current, "device", 0)
+        current.device = device.index
+        try:
+            yield
+        finally:
+            current.device = previous
+
+    def transfer(*args, **kwargs) -> tuple:
+        assert torch.cuda.current_device() == (2 if gdr_active else 0)
+        return args, kwargs
+
+    storage_client = SimpleNamespace(
+        _gdr_staging=object() if gdr_active else None,
+        put=transfer,
+        get=transfer,
+        close=transfer,
+    )
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "current_device", lambda: getattr(current, "device", 0)
+    )
+    monkeypatch.setattr(torch.cuda, "device", cuda_device)
+    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
+    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
+    monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
+    monkeypatch.setattr(
+        tq_adapter, "_patch_mooncake_staging_buffers", lambda *_, **__: None
+    )
+    monkeypatch.setattr(tq_adapter.os, "environ", dict(tq_adapter.os.environ))
+    monkeypatch.setattr(
+        tq_adapter.tq,
+        "get_client",
+        lambda: SimpleNamespace(
+            storage_manager=SimpleNamespace(storage_client=storage_client)
+        ),
+    )
+
+    tq_adapter.TQDataPlaneClient(_gdr_cfg(), bootstrap=False)
+    bound = getattr(storage_client, method_name)
+    # A later client in this process must not retarget the existing binding.
+    current.device = 0
+    tq_adapter.TQDataPlaneClient(_gdr_cfg(), bootstrap=False)
+    assert getattr(storage_client, method_name) is bound
+
+    def run_on_tq_thread() -> None:
+        assert torch.cuda.current_device() == 0
+        method = getattr(storage_client, method_name)
+        assert method("key", value=3) == (("key",), {"value": 3})
+        assert torch.cuda.current_device() == 0
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(run_on_tq_thread).result(timeout=10)
 
 
 def test_gdr_receiver_requires_cuda_initialized(monkeypatch) -> None:

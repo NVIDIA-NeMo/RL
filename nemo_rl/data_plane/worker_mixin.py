@@ -280,7 +280,8 @@ def _broadcast_batched_data_dict(
                 torch.distributed.broadcast(wire, src=src, group=group)
                 del wire
             if not is_leader:
-                values = values.to(src_device)
+                if torch.device(src_device).type != torch.device(bcast_device).type:
+                    values = values.to(src_device)
                 out[key] = torch.nested.nested_tensor_from_jagged(
                     values, offsets.to(values.device)
                 )
