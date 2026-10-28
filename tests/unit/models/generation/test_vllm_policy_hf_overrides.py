@@ -47,13 +47,11 @@ def test_policy_overrides_are_added_without_conflict():
     }
 
 
-def test_policy_wins_on_conflict_and_warns():
+def test_conflicting_values_raise():
     vllm_kwargs = {"hf_overrides": {"rope_theta": 1.0, "other": "keep"}}
 
-    with pytest.warns(UserWarning, match=r"\['rope_theta'\]"):
+    with pytest.raises(ValueError, match=r"\['rope_theta'\]"):
         merge_policy_hf_overrides(vllm_kwargs, {"rope_theta": 2.0})
-
-    assert vllm_kwargs["hf_overrides"] == {"rope_theta": 2.0, "other": "keep"}
 
 
 def test_equal_values_do_not_warn():

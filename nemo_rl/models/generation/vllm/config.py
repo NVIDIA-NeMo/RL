@@ -47,8 +47,8 @@ def merge_policy_hf_overrides(
 ) -> None:
     """Sync ``vllm_kwargs["hf_overrides"]`` with ``policy.hf_config_overrides`` in place.
 
-    The training policy's overrides are the source of truth, so on a key
-    collision the policy value wins and a warning names the key. Keys only set
+    The trainer and vLLM must load the same HF config, so a key set to
+    different values in both dicts raises a ``ValueError`` naming it. Keys only set
     under ``policy.generation.vllm_kwargs.hf_overrides`` survive: they exist to
     correct the generation engine's view of the HF config without touching the
     trainer, and a wholesale ``vllm_kwargs["hf_overrides"] = ...`` silently
@@ -65,11 +65,10 @@ def merge_policy_hf_overrides(
         if key in generation_overrides and generation_overrides[key] != value
     )
     if conflicts:
-        warnings.warn(
-            "policy.hf_config_overrides overrides policy.generation.vllm_kwargs."
-            f"hf_overrides for {conflicts}; the training policy's value is used so "
-            "the generation engine stays in sync with the trainer.",
-            stacklevel=2,
+        raise ValueError(
+            f"policy.generation.vllm_kwargs.hf_overrides sets {conflicts} to values "
+            "that differ from policy.hf_config_overrides. The trainer and vLLM must "
+            "load the same HF config; set these keys only in policy.hf_config_overrides."
         )
 
     vllm_kwargs["hf_overrides"] = {**generation_overrides, **policy_overrides}
