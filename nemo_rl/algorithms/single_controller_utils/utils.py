@@ -183,6 +183,7 @@ def reduce_advantage_pump_metrics(
     sequence_lengths: list[int],
     *,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
+    length_penalty_partials: list[dict[str, float]] | None = None,
     num_mask_sample_filtered: list[int] | None = None,
     num_invalid_tool_calls: list[int] | None = None,
     num_malformed_thinking: list[int] | None = None,
@@ -202,6 +203,8 @@ def reduce_advantage_pump_metrics(
         sequence_lengths: All input_lengths trained on this step.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
+        length_penalty_partials: grpo.group_relative_length_penalty sums, one
+            record per advantage_stage call (empty when the penalty is off).
         num_mask_sample_filtered: Environment-flagged sample counts, one per
             streaming chunk.
         num_invalid_tool_calls: Per-sample invalid tool-call counts.
@@ -240,6 +243,8 @@ def reduce_advantage_pump_metrics(
         out["num_mask_sample_filtered"] = float(sum(num_mask_sample_filtered))
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
+    if length_penalty_partials:
+        out.update(_reduce_length_penalty_partials(length_penalty_partials))
     n_asst = sum(num_assistant_messages or [])
     if n_asst:
         n_invalid = sum(num_invalid_tool_calls or [])
@@ -256,6 +261,39 @@ def reduce_advantage_pump_metrics(
         out["routed_experts_backfilled_rate"] = n_backfilled / n_asst
         out["num_routed_experts_backfilled"] = float(n_backfilled)
     return out
+
+
+def _reduce_length_penalty_partials(
+    records: list[dict[str, float]],
+) -> dict[str, float]:
+    """Turn per-call grpo.group_relative_length_penalty sums into step metrics.
+
+    Rates and means are over the rows that took part in the advantage statistics.
+    """
+    total = {key: sum(record[key] for record in records) for key in records[0]}
+    groups = total["groups_applied"]
+    rows = total["num_rows"]
+    passed = total["num_passed"]
+    penalized = total["num_penalized"]
+    return {
+        "length_penalty/groups_applied": groups,
+        "length_penalty/groups_skipped_above_max_pass_rate": total[
+            "groups_skipped_above_max_pass_rate"
+        ],
+        "length_penalty/mean_reference_length": (
+            total["reference_length_sum"] / groups if groups else 0.0
+        ),
+        "length_penalty/frac_passing_penalized": penalized / passed if passed else 0.0,
+        "length_penalty/mean_penalty_on_penalized": (
+            total["penalty_sum"] / penalized if penalized else 0.0
+        ),
+        "length_penalty/mean_reward_unpenalized": (
+            total["reward_sum"] / rows if rows else 0.0
+        ),
+        "reward_with_length_penalty": (
+            total["reward_with_length_penalty_sum"] / rows if rows else 0.0
+        ),
+    }
 
 
 def _reduce_seq_logprob_error_metrics(

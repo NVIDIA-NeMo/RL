@@ -58,6 +58,7 @@ from nemo_rl.algorithms.metric_utils import (
 )
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
+    GroupLengthPenaltyConfig,
     RewardShapingConfig,
     apply_reward_shaping,
 )
@@ -432,6 +433,12 @@ class GRPOConfig(BaseModel, extra="allow"):
     # training rollout rewards (binary single-reward envs only); see
     # docs/guides/length-penalty.md. None/absent disables the feature.
     length_penalty: Optional[LengthPenaltyConfig] = None
+    # MiMo-V2.6 group-relative length penalty on passing rollouts (GroupLengthPenaltyConfig;
+    # docs/guides/length-penalty.md). Applied in the SingleController's advantage stage only;
+    # the legacy loops reject it at setup.
+    group_relative_length_penalty: GroupLengthPenaltyConfig = Field(
+        default_factory=GroupLengthPenaltyConfig
+    )
 
 
 @dataclass
@@ -1024,6 +1031,7 @@ def setup(
     _raise_if_length_penalty_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
+    _raise_if_group_relative_length_penalty_enabled(master_config)
     nemo_gym_actor = None
 
     def _spinup_nemo_gym(base_urls, model_name, policy_api_key=None):
@@ -2511,6 +2519,22 @@ def _raise_if_length_penalty_enabled_without_nemo_gym(
         "grpo.length_penalty requires the NeMo-Gym path "
         "(env.should_use_nemo_gym=true); it is not supported with the native "
         "generation path."
+    )
+
+
+def _raise_if_group_relative_length_penalty_enabled(
+    master_config: MasterConfig,
+) -> None:
+    """Reject grpo.group_relative_length_penalty on the loops that do not apply it.
+
+    Only the SingleController's advantage stage applies the penalty; a legacy-loop run with
+    it enabled would otherwise train on unpenalized rewards without any error.
+    """
+    if not master_config.grpo.group_relative_length_penalty.enabled:
+        return
+    raise NotImplementedError(
+        "grpo.group_relative_length_penalty is only applied on the SingleController path "
+        "(examples/run_grpo_single_controller.py); disable it for this trainer."
     )
 
 

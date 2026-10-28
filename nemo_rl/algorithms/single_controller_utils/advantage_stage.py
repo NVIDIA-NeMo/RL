@@ -48,6 +48,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
+from nemo_rl.algorithms.reward_functions import apply_group_length_penalty
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     ChunkReceipt,
@@ -209,6 +210,70 @@ class AdvantageStageConfig:
         return list(dict.fromkeys(fields))
 
 
+def _apply_group_relative_length_penalty(
+    cfg: AdvantageStageConfig,
+    rewards: torch.Tensor,
+    token_mask: torch.Tensor,
+    prompt_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> tuple[torch.Tensor, Optional[dict[str, float]]]:
+    """Apply grpo.group_relative_length_penalty to the rewards the advantages use.
+
+    Returns the rewards for the advantage estimator and this call's metric sums (None when
+    the penalty is off, in which case ``rewards`` is returned as is). The logged reward stays
+    the environment's.
+
+    A rollout's length is its generated-token count, the sum of its token_mask (generated
+    tokens of every turn). The penalty is computed over the rows that take part in the
+    advantage statistics (``valid_mask``), so token-capture placeholders -- which keep the
+    environment reward but carry no tokens -- never count as length-0 passing rollouts and
+    pull a group's reference length down. Calls hold whole prompt groups
+    (split_meta_by_prompt_group), so each group's pass rate and reference are complete.
+    """
+    if cfg.is_ppo:
+        return rewards, None
+    penalty_cfg = cast(GRPOConfig, cfg.algo).group_relative_length_penalty
+    if not penalty_cfg.enabled:
+        return rewards, None
+
+    lengths = token_mask.sum(dim=-1)
+    participating = valid_mask.bool()
+    adv_rewards = rewards.clone()
+    metrics = {
+        "length_penalty/groups_applied": 0.0,
+        "length_penalty/groups_skipped_above_max_pass_rate": 0.0,
+        "length_penalty/mean_reference_length": 0.0,
+    }
+    if participating.any():
+        adv_rewards[participating], metrics = apply_group_length_penalty(
+            rewards[participating],
+            lengths[participating],
+            prompt_ids.reshape(-1)[participating],
+            penalty_cfg,
+        )
+    penalties = (rewards - adv_rewards).float()
+    hit = penalties > 1e-6
+    groups_applied = metrics["length_penalty/groups_applied"]
+    return adv_rewards, {
+        "groups_applied": groups_applied,
+        "groups_skipped_above_max_pass_rate": metrics[
+            "length_penalty/groups_skipped_above_max_pass_rate"
+        ],
+        "reference_length_sum": metrics["length_penalty/mean_reference_length"]
+        * groups_applied,
+        "num_passed": float(
+            (rewards[participating] >= penalty_cfg.success_threshold).sum().item()
+        ),
+        "num_penalized": float(hit.sum().item()),
+        "penalty_sum": float(penalties[hit].sum().item()),
+        "num_rows": float(participating.sum().item()),
+        "reward_sum": float(rewards[participating].float().sum().item()),
+        "reward_with_length_penalty_sum": float(
+            adv_rewards[participating].float().sum().item()
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class AdvantageRequest:
     """One advantage-stage call, described without any payload.
@@ -287,6 +352,9 @@ class AdvantageOutcome:
     reward_partial: RewardPartial
     advantage_partial: AdvantagePartial
     seq_logprob_error_metrics: Optional[dict[str, float]] = None
+    # grpo.group_relative_length_penalty sums for this call, None when the penalty is off.
+    # Sums rather than means so the controller can add them across calls and shards.
+    length_penalty_partial: Optional[dict[str, float]] = None
     # OPD's running moments, as this call's contribution rather than a total.
     opd_stat_sum: float = 0.0
     opd_stat_sumsq: float = 0.0
@@ -438,8 +506,12 @@ class AdvantageComputer:
             participation = sample_mask
         advantage_valid_mask = _binary_participation(participation)
 
+        adv_rewards, length_penalty_partial = _apply_group_relative_length_penalty(
+            cfg, rewards, token_mask, prompt_ids, advantage_valid_mask
+        )
+
         repeated_batch: dict[str, torch.Tensor] = {
-            "total_reward": rewards,
+            "total_reward": adv_rewards,
         }
         for field_name in adv_cfg.repeated_batch_fields:
             repeated_batch[field_name] = squeeze_trailing_unit_dim(
@@ -475,7 +547,7 @@ class AdvantageComputer:
         if has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
-                rewards=rewards,
+                rewards=adv_rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
                 valid_mask=advantage_valid_mask,
@@ -600,6 +672,7 @@ class AdvantageComputer:
             reward_partial=reward_partial,
             advantage_partial=advantage_partial,
             seq_logprob_error_metrics=seq_error_metrics,
+            length_penalty_partial=length_penalty_partial,
             opd_stat_sum=opd_stat_sum,
             opd_stat_sumsq=opd_stat_sumsq,
             opd_stat_count=opd_stat_count,
