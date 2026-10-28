@@ -93,7 +93,10 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data.multimodal_utils import (
+    per_token_multimodal_schema,
+    present_multimodal_fields,
+)
 from nemo_rl.data.utils import save_dataloader_state
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
@@ -587,6 +590,7 @@ def grpo_train_sync(
         task_to_env=task_to_env,
         master_config=master_config,
         dp_cfg=dp_cfg,
+        per_token_multimodal_fields=per_token_multimodal_schema(processor),
     )
     policy.add_data_plane_snapshot_source(rollout_actor)
 

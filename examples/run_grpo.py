@@ -90,6 +90,12 @@ def main() -> None:
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
         config = MasterConfig(**config)
+        if config.env.get("should_use_nemo_gym"):
+            raise ValueError(
+                "env.should_use_nemo_gym=true: run this config with "
+                "examples/nemo_gym/run_grpo_nemo_gym.py, which prepares the "
+                "NeMo-Gym config and binds the Gym actor. This launcher does neither."
+            )
         print("Applied CLI overrides")
 
     # Print config

@@ -1337,6 +1337,16 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
     return list(all_keys)
 
 
+def per_token_multimodal_schema(processor) -> tuple[str, ...]:
+    """Per-token media fields a multimodal run writes on every row; none if text-only."""
+    if processor is None:
+        return ()
+    keys = set(get_multimodal_keys_from_processor(processor))
+    return tuple(
+        sorted({"media_token_validity_mask"} | (keys & PER_TOKEN_MULTIMODAL_FIELDS))
+    )
+
+
 def get_multimodal_default_settings_from_processor(
     processor,
 ) -> dict[str, dict[str, Any]]:
