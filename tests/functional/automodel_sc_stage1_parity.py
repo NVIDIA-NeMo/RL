@@ -158,7 +158,8 @@ def run(args):
     cfg.policy.automodel_cfg.expert_parallel_size = 1
     if args.force_hf:
         cfg.policy.automodel_cfg.automodel_kwargs.force_hf = True
-    if "backend" in cfg.policy.automodel_cfg.automodel_kwargs:
+        cfg.policy.automodel_cfg.automodel_kwargs.pop("backend", None)
+    elif "backend" in cfg.policy.automodel_cfg.automodel_kwargs:
         cfg.policy.automodel_cfg.automodel_kwargs.backend.dispatcher = "torch"
     cfg.policy.generation.colocated.enabled = False
     # Keep the checkpoint's full-precision parameters and use a simple reference
