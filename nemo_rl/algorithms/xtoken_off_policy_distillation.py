@@ -534,13 +534,67 @@ def _teacher_topk_ipc_keep_realized(
     )
 
 
+def _teacher_force_include_requests(
+    batch: BatchedDataDict[Any],
+    pair_valid: torch.Tensor,
+    *,
+    teacher_idx: int,
+    kl_chunk_shift: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """List the realized teacher labels every valid chunk reads.
+
+    A chunk reads each teacher label position of its span. The predictor row
+    is one position earlier when ``kl_chunk_shift`` is on and both of the
+    chunk's spans start after position zero, and the label position itself
+    otherwise. Chunks that are not ``pair_valid`` or have an empty side
+    (``[0, 0)`` span) read nothing.
+
+    Returns:
+        ``(batch_idx, pair_idx, label_pos, shift)``, one entry per read, in
+        (sample, pair, label position) order. Read ``j`` needs predictor row
+        ``label_pos[j] - shift[j]`` of sample ``batch_idx[j]`` to keep the
+        teacher token at ``label_pos[j]``.
+    """
+    max_pairs = int(pair_valid.shape[1])
+    student_start, student_end = _chunk_ids_to_spans(
+        batch[f"alignment_{teacher_idx}_student_chunk_id"], max_pairs
+    ).unbind(-1)
+    teacher_start, teacher_end = _chunk_ids_to_spans(
+        batch[f"alignment_{teacher_idx}_teacher_chunk_id"], max_pairs
+    ).unbind(-1)
+    batch_idx, pair_idx = (
+        pair_valid & (student_end > student_start) & (teacher_end > teacher_start)
+    ).nonzero(as_tuple=True)
+    starts = teacher_start[batch_idx, pair_idx]
+    lengths = teacher_end[batch_idx, pair_idx] - starts
+    if kl_chunk_shift:
+        shift = ((student_start[batch_idx, pair_idx] > 0) & (starts > 0)).long()
+    else:
+        shift = torch.zeros_like(starts)
+    # Expand each chunk into one read per label position of its teacher span.
+    first_read = torch.cumsum(lengths, 0) - lengths
+    offsets = torch.arange(
+        int(lengths.sum()), device=lengths.device
+    ) - first_read.repeat_interleave(lengths)
+    return (
+        batch_idx.repeat_interleave(lengths),
+        pair_idx.repeat_interleave(lengths),
+        starts.repeat_interleave(lengths) + offsets,
+        shift.repeat_interleave(lengths),
+    )
+
+
 def _build_teacher_force_include_token_ids(
     batch: BatchedDataDict[Any],
     *,
     teacher_idx: int,
     loss_config: CrossTokenizerDistillationLossConfig,
 ) -> Optional[torch.Tensor]:
-    """Build realized teacher labels that sparse IPC must retain per position."""
+    """Build realized teacher labels that sparse IPC must retain per position.
+
+    When several chunks read the same predictor row, the row keeps the label
+    of the highest-indexed chunk.
+    """
     needs_force_ids = _teacher_topk_ipc_keep_realized(loss_config) or (
         int(loss_config["csd_noise_filter_topk"]) > 0
     )
@@ -551,47 +605,42 @@ def _build_teacher_force_include_token_ids(
     if not torch.is_tensor(teacher_input_ids):
         return None
 
-    pair_valid = batch[f"alignment_{teacher_idx}_pair_valid"].to(torch.bool)
-    max_pairs = int(pair_valid.shape[1])
-    student_spans = _chunk_ids_to_spans(
-        batch[f"alignment_{teacher_idx}_student_chunk_id"], max_pairs
+    batch_idx, pair_idx, label_pos, shift = _teacher_force_include_requests(
+        batch,
+        batch[f"alignment_{teacher_idx}_pair_valid"].to(torch.bool),
+        teacher_idx=teacher_idx,
+        kl_chunk_shift=bool(loss_config["kl_chunk_shift"]),
     )
-    teacher_spans = _chunk_ids_to_spans(
-        batch[f"alignment_{teacher_idx}_teacher_chunk_id"], max_pairs
-    )
-    force_ids = torch.full_like(teacher_input_ids, -1)
-    kl_chunk_shift = bool(loss_config["kl_chunk_shift"])
     batch_size, teacher_seq_len = teacher_input_ids.shape
-
-    for batch_idx in range(batch_size):
-        for pair_idx in range(max_pairs):
-            if not bool(pair_valid[batch_idx, pair_idx]):
-                continue
-            student_start = int(student_spans[batch_idx, pair_idx, 0])
-            student_end = int(student_spans[batch_idx, pair_idx, 1])
-            teacher_start = int(teacher_spans[batch_idx, pair_idx, 0])
-            teacher_end = int(teacher_spans[batch_idx, pair_idx, 1])
-            if student_end <= student_start or teacher_end <= teacher_start:
-                continue
-            if kl_chunk_shift and student_start > 0 and teacher_start > 0:
-                predictor_start = teacher_start - 1
-            else:
-                predictor_start = teacher_start
-            for offset in range(teacher_end - teacher_start):
-                predictor_pos = predictor_start + offset
-                label_pos = teacher_start + offset
-                if (
-                    0 <= predictor_pos < teacher_seq_len
-                    and 0 <= label_pos < teacher_seq_len
-                ):
-                    force_ids[batch_idx, predictor_pos] = teacher_input_ids[
-                        batch_idx, label_pos
-                    ]
+    # Spans come from the chunk ids; keep labels inside the token ids (their
+    # predictor rows then are too).
+    in_range = label_pos < teacher_seq_len
+    predictor_pos = (label_pos - shift)[in_range]
+    batch_idx, pair_idx, label_pos = (
+        batch_idx[in_range],
+        pair_idx[in_range],
+        label_pos[in_range],
+    )
+    # A chunk reads each predictor row at most once, so the highest chunk index
+    # per row picks exactly one read.
+    rows = batch_idx * teacher_seq_len + predictor_pos
+    last_pair = torch.full(
+        (batch_size * teacher_seq_len,),
+        -1,
+        dtype=pair_idx.dtype,
+        device=pair_idx.device,
+    ).scatter_reduce_(0, rows, pair_idx, reduce="amax")
+    wins = pair_idx == last_pair[rows]
+    force_ids = torch.full_like(teacher_input_ids, -1)
+    force_ids[batch_idx[wins], predictor_pos[wins]] = teacher_input_ids[
+        batch_idx[wins], label_pos[wins]
+    ]
     return force_ids
 
 
-# Ordered, non-overlapping alignment chunks request at most two distinct
-# realized labels from one teacher row (see the builder below).
+# A teacher row is only read for the realized label at its own position
+# (unshifted chunks) or at the next one (shifted chunks), so two slots hold
+# every label it must keep (see the builder below).
 SPARSE_TEACHER_FORCE_WIDTH = 2
 
 
@@ -609,50 +658,47 @@ def _build_teacher_force_include_token_id_slots(
     so the last predictor of an unshifted chunk at the sequence start can also
     be the first predictor of the following shifted chunk; those two requests
     need different labels (row ``r`` is only ever asked for the token at ``r``
-    or ``r + 1``). Chunks whose ``pair_valid`` or ``sample_mask`` is off, or
-    with an empty side (``[0, 0)`` span), request no label.
+    or ``r + 1``). A row's slots hold its distinct labels in the order chunks
+    first ask for them; a ``-1`` label takes no slot. Chunks whose
+    ``pair_valid`` or ``sample_mask`` is off, or with an empty side
+    (``[0, 0)`` span), request no label.
     """
     teacher_input_ids = batch[f"teacher_{teacher_idx}_input_ids"]
     pair_valid = batch[f"alignment_{teacher_idx}_pair_valid"].to(torch.bool)
     pair_valid = pair_valid & batch["sample_mask"].to(torch.bool).unsqueeze(-1)
-    max_pairs = int(pair_valid.shape[1])
-    student_spans = _chunk_ids_to_spans(
-        batch[f"alignment_{teacher_idx}_student_chunk_id"], max_pairs
-    )
-    teacher_spans = _chunk_ids_to_spans(
-        batch[f"alignment_{teacher_idx}_teacher_chunk_id"], max_pairs
+    batch_idx, pair_idx, label_pos, shift = _teacher_force_include_requests(
+        batch, pair_valid, teacher_idx=teacher_idx, kl_chunk_shift=kl_chunk_shift
     )
     batch_size, teacher_seq_len = teacher_input_ids.shape
-    force = torch.full(
-        (batch_size, teacher_seq_len, SPARSE_TEACHER_FORCE_WIDTH),
+    num_rows = batch_size * teacher_seq_len
+    # Key each read by (shift, row): every read of a key asks for the token at
+    # row + shift, and its first reader is the lowest chunk index.
+    keys = shift * num_rows + batch_idx * teacher_seq_len + (label_pos - shift)
+    labels = torch.full(
+        (2 * num_rows,),
         -1,
         dtype=teacher_input_ids.dtype,
         device=teacher_input_ids.device,
     )
-    # Driver-side and small: explicit loops keep the conflict errors precise.
-    for batch_idx, pair_idx in pair_valid.nonzero().tolist():
-        student_start, student_end = student_spans[batch_idx, pair_idx].tolist()
-        teacher_start, teacher_end = teacher_spans[batch_idx, pair_idx].tolist()
-        if student_end <= student_start or teacher_end <= teacher_start:
-            continue
-        shift = 1 if kl_chunk_shift and student_start > 0 and teacher_start > 0 else 0
-        for label_pos in range(teacher_start, teacher_end):
-            predictor_pos = label_pos - shift
-            label_id = int(teacher_input_ids[batch_idx, label_pos])
-            row = force[batch_idx, predictor_pos]
-            if bool((row == label_id).any()):
-                continue
-            free_slots = (row == -1).nonzero()
-            if free_slots.numel() == 0:
-                raise ValueError(
-                    "CSD alignment requests more than "
-                    f"{SPARSE_TEACHER_FORCE_WIDTH} distinct realized labels from "
-                    f"one teacher row; chunks must be ordered and non-overlapping. "
-                    f"teacher={teacher_idx}, batch={batch_idx}, "
-                    f"pos={predictor_pos}, existing={row.tolist()}, new={label_id}."
-                )
-            row[int(free_slots[0, 0])] = label_id
-    return force
+    labels[keys] = teacher_input_ids[batch_idx, label_pos]
+    first_pair = torch.full(
+        (2 * num_rows,),
+        int(pair_valid.shape[1]),
+        dtype=pair_idx.dtype,
+        device=pair_idx.device,
+    ).scatter_reduce_(0, keys, pair_idx, reduce="amin")
+    own, after = labels.view(2, batch_size, teacher_seq_len).unbind(0)
+    own_first, after_first = first_pair.view(2, batch_size, teacher_seq_len).unbind(0)
+    has_own = own != -1
+    has_after = (after != -1) & (after != own)
+    own_leads = has_own & (~has_after | (own_first < after_first))
+    return torch.stack(
+        (
+            torch.where(own_leads, own, after),
+            torch.where(has_own & has_after, torch.where(own_leads, after, own), -1),
+        ),
+        dim=-1,
+    )
 
 
 def _get_teacher_logits_ipc(
@@ -2290,8 +2336,13 @@ def export_teacher_logits_and_pack(
 
         teacher_policy.prepare_for_lp_inference()
         force_include_token_ids = None
-        if not same_vocab and isinstance(loss_fn, CSDLossFn):
-            if loss_fn.cfg.owner_local and loss_fn.cfg.teacher_topk_ipc_k > 0:
+        # Only sparse teacher transport reads forced labels.
+        if (
+            not same_vocab
+            and isinstance(loss_fn, CSDLossFn)
+            and loss_fn.cfg.teacher_topk_ipc_k > 0
+        ):
+            if loss_fn.cfg.owner_local:
                 force_include_token_ids = _build_teacher_force_include_token_id_slots(
                     batch, teacher_idx=i, kl_chunk_shift=loss_fn.cfg.kl_chunk_shift
                 )
