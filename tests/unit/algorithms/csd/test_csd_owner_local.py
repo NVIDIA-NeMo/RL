@@ -98,6 +98,7 @@ def _loss_config(
     noise_filter_topk: int = 0,
     dynamic_loss_scaling: bool = True,
     same_vocab_teacher: bool = False,
+    keep_realized: bool = True,
 ) -> dict:
     num_teachers = 2 if same_vocab_teacher else 1
     return {
@@ -123,7 +124,7 @@ def _loss_config(
         "csd_noise_filter_topk": noise_filter_topk,
         "csd_realized_only_mismatch": realized_only,
         "teacher_topk_ipc_k": k,
-        "teacher_topk_ipc_keep_realized": True,
+        "teacher_topk_ipc_keep_realized": keep_realized,
         # Small tiles so the batching loops run more than once.
         "csd_selected_row_chunk_size": 3,
         "csd_support_chunk_batch_size": 2,
@@ -344,10 +345,11 @@ def _owner_local_step(
     cp_group,
     same_vocab_teacher: bool = False,
     records: list[dict] | None = None,
+    sparse_k: int = SPARSE_K,
     **cfg_kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor, dict, torch.Tensor]:
     """One rank's owner-local loss, local gradient and metrics."""
-    k = SPARSE_K if transport == "sparse" else 0
+    k = sparse_k if transport == "sparse" else 0
     loss_fn = CSDLossFn(
         _loss_config(
             fx,
@@ -674,6 +676,74 @@ def test_sparse_owner_local_matches_replicated_sparse(tmp_path):
     torch.testing.assert_close(owner_grad, logits.grad, rtol=5e-5, atol=5e-6)
     assert owner_metrics["num_mismatch_chunks_t0"] == metrics["num_mismatch_chunks_t0"]
     assert owner_metrics["num_common_chunks_t0"] == metrics["num_common_chunks_t0"]
+
+
+_TEACHER_LABEL_CASES = [
+    None,
+    # Chunk c3 (1-to-1): the realized teacher 7 is common but is not the
+    # realized student's pair.
+    (5, 7),
+    # Chunk c1 (1-to-2): the teacher prefix (7,) has no forward-table pairs.
+    (1, 7),
+]
+
+
+def _relabeled_fixture(tmp_path, teacher_label) -> dict:
+    """The owner-local fixture with one teacher label replaced, if given."""
+    fx = _fixture(os.fspath(tmp_path))
+    if teacher_label is not None:
+        position, token = teacher_label
+        fx["teacher_ids"] = fx["teacher_ids"].clone()
+        fx["teacher_ids"][:, position] = token
+    return fx
+
+
+_TP1_CP1_STEP = dict(
+    tp_rank=0,
+    cp_rank=0,
+    tp_size=1,
+    cp_size=1,
+    tp_group=None,
+    cp_group=None,
+    dynamic_loss_scaling=False,
+)
+
+
+@pytest.mark.parametrize("teacher_label", _TEACHER_LABEL_CASES)
+def test_owner_local_dense_matches_sparse_full_support(tmp_path, teacher_label):
+    """Owner-local dense K=0 optimizes the same loss as sparse K=V."""
+    fx = _relabeled_fixture(tmp_path, teacher_label)
+    dense_loss, dense_grad, dense_metrics, _ = _owner_local_step(
+        fx, transport="dense", **_TP1_CP1_STEP
+    )
+    sparse_loss, sparse_grad, sparse_metrics, _ = _owner_local_step(
+        fx, transport="sparse", sparse_k=V, **_TP1_CP1_STEP
+    )
+
+    torch.testing.assert_close(dense_loss, sparse_loss, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(dense_grad, sparse_grad, rtol=5e-5, atol=5e-6)
+    for key in ("num_common_chunks_t0", "num_mismatch_chunks_t0"):
+        assert dense_metrics[key] == sparse_metrics[key]
+
+
+@pytest.mark.parametrize("keep_realized", [False, True])
+@pytest.mark.parametrize("teacher_label", _TEACHER_LABEL_CASES)
+def test_owner_local_dense_matches_replicated_dense(
+    tmp_path, teacher_label, keep_realized
+):
+    """Owner-local dense K=0 equals the replicated loss for either keep setting."""
+    fx = _relabeled_fixture(tmp_path, teacher_label)
+    owner_loss, owner_grad, owner_metrics, _ = _owner_local_step(
+        fx, transport="dense", keep_realized=keep_realized, **_TP1_CP1_STEP
+    )
+    loss, grad, metrics = _replicated_reference(
+        fx, keep_realized=keep_realized, dynamic_loss_scaling=False
+    )
+
+    torch.testing.assert_close(owner_loss, loss, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(owner_grad, grad, rtol=5e-5, atol=5e-6)
+    for key in ("num_common_chunks_t0", "num_mismatch_chunks_t0"):
+        assert owner_metrics[key] == metrics[key]
 
 
 def test_owner_local_ce_matches_replicated_ce(tmp_path):
