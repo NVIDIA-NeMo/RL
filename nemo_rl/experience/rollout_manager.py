@@ -100,6 +100,7 @@ from nemo_rl.telemetry.instrumentation import (
     dispatch_with_trace_context,
     in_per_prompt_scope,
 )
+from nemo_rl.utils.routed_experts_codec import slice_routed_experts
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 
@@ -835,7 +836,9 @@ class AsyncRolloutImpl:
                     "message_log token length does not match generation input_length "
                     f"({prefix_length} != {input_len})."
                 )
-            assistant_message["routed_experts"] = routed_experts[input_len:total_len]
+            assistant_message["routed_experts"] = slice_routed_experts(
+                routed_experts, input_len, total_len
+            )
 
         # Calculate generation metrics
         gen_metrics: dict[str, Any] = {}

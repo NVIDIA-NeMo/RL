@@ -115,7 +115,10 @@ from nemo_rl.telemetry.setup import (
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.config import warn_if_config_path_overridden
-from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+from nemo_rl.utils.routed_experts_codec import (
+    decode_routed_experts,
+    slice_routed_experts,
+)
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
@@ -1738,10 +1741,9 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 "token_ids": torch.tensor(new_prompt_token_ids),
             }
             if routed_experts is not None:
-                # Own the emitted span so serialization cannot retain the full turn.
-                user_message["routed_experts"] = routed_experts[
-                    prompt_start:prompt_end
-                ].clone()
+                user_message["routed_experts"] = slice_routed_experts(
+                    routed_experts, prompt_start, prompt_end
+                )
             nemo_rl_message_log.append(user_message)
 
             if processor is not None and not media_geometry_failed:
@@ -1808,9 +1810,9 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 "has_malformed_thinking": has_malformed_thinking,
             }
             if routed_experts is not None:
-                assistant_message["routed_experts"] = routed_experts[
-                    generation_start:generation_end
-                ].clone()
+                assistant_message["routed_experts"] = slice_routed_experts(
+                    routed_experts, generation_start, generation_end
+                )
             nemo_rl_message_log.append(assistant_message)
             # Release the full decoded turn before decoding the next one.
             del routed_experts, routed_experts_raw
