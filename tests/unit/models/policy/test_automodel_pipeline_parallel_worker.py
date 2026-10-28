@@ -66,6 +66,54 @@ def tiny_untied_llama_path():
     yield model_path
 
 
+@pytest.fixture(scope="module")
+def tiny_untied_qwen3_moe_path():
+    """A four-layer Qwen3-MoE (Automodel's custom MoE implementation)."""
+    from transformers import AutoTokenizer, Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+    model_path = os.path.join(
+        TEST_ASSETS_DIR, "tiny_qwen3_moe_4l_untied_qwen2_tokenizer"
+    )
+    torch.manual_seed(0)
+    config = Qwen3MoeConfig(
+        num_hidden_layers=_NUM_LAYERS,
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=32,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        vocab_size=_VOCAB_SIZE,
+        router_aux_loss_coef=0.0,
+        tie_word_embeddings=False,
+    )
+    model = Qwen3MoeForCausalLM(config=config)
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-1.5B")
+    shutil.rmtree(model_path, ignore_errors=True)
+    model.save_pretrained(model_path)
+    tokenizer.save_pretrained(model_path)
+    yield model_path
+
+
+# fp32-capable kernels and the DTensor dispatcher, so pipelined and
+# non-pipelined runs compute the same routing and expert outputs.
+_MOE_AUTOMODEL_KWARGS = {
+    "backend": {
+        "_target_": "nemo_automodel.components.models.common.utils.BackendConfig",
+        "attn": "sdpa",
+        "linear": "torch",
+        "rms_norm": "torch",
+        "experts": "torch",
+        "dispatcher": "torch",
+        "fake_balanced_gate": False,
+        "rope_fusion": False,
+        "enable_hf_state_dict_adapter": True,
+    }
+}
+
+
 def _policy_config(
     model_path: str,
     *,
@@ -75,7 +123,9 @@ def _policy_config(
     train_global_batch_size: int = 8,
     precision: str = "float32",
     tp_size: int = 1,
+    ep_size: int = 1,
     defer_fsdp_grad_sync: bool = False,
+    automodel_kwargs: dict | None = None,
 ) -> PolicyConfig:
     automodel_cfg = {
         "enabled": True,
@@ -91,9 +141,10 @@ def _policy_config(
         "tensor_parallel_size": tp_size,
         "context_parallel_size": 1,
         "pipeline_parallel_size": pp_size,
+        "expert_parallel_size": ep_size,
         "defer_fsdp_grad_sync": defer_fsdp_grad_sync,
         "custom_parallel_plan": None,
-        "automodel_kwargs": {"force_hf": True},
+        "automodel_kwargs": automodel_kwargs or {"force_hf": True},
         "lora_cfg": {"enabled": False},
     }
     if pp_size > 1:
@@ -334,6 +385,32 @@ def test_pipeline_with_tensor_parallel(tiny_untied_llama_path, reference_runs):
         NLLLossFn(),
     )
     _assert_runs_close(reference_runs["nll"], actual)
+
+
+@pytest.mark.timeout(900)
+def test_pipeline_with_expert_parallel_matches_non_pipelined(
+    tiny_untied_qwen3_moe_path,
+):
+    """PP=2 with EP=2 inside each stage reproduces the non-pipelined EP=2 run.
+
+    Both runs have two data-parallel ranks, so every rank sees the same samples
+    and the same expert placement; only the layer split differs.
+    """
+    if torch.cuda.device_count() < 4:
+        pytest.skip("needs 4 GPUs")
+
+    def config(pp_size: int) -> PolicyConfig:
+        return _policy_config(
+            tiny_untied_qwen3_moe_path,
+            pp_size=pp_size,
+            ep_size=2,
+            microbatches_per_step=2,
+            automodel_kwargs=_MOE_AUTOMODEL_KWARGS,
+        )
+
+    reference = _run_steps(config(1), 2, "moe_ep_ref", _clipped_pg_loss_fn())
+    actual = _run_steps(config(2), 4, "moe_pp_ep", _clipped_pg_loss_fn())
+    _assert_runs_close(reference, actual)
 
 
 @pytest.mark.timeout(900)

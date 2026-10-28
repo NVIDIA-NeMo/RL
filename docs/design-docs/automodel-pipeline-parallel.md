@@ -40,6 +40,11 @@ The Ray worker layout is `[PP, DP, CP, TP]` and Automodel's mesh is
 `(pp, dp_replicate, dp_shard, cp, tp)`, so ranks line up. Data is sharded over DP and
 replicated within each PP group; DP size is `world_size / (pp * cp * tp)`.
 
+Expert parallelism composes with PP: Automodel builds the expert mesh inside each
+pipeline stage, so `expert_parallel_size` must divide the `dp * cp * tp` ranks of one
+stage (for example EP8 with PP2 on 16 GPUs). Multi-token-prediction heads (such as
+Qwen3.5-MoE's MTP layer) are not placed on any stage; RL training does not use them.
+
 ### 1.1 Validation
 
 `validate_automodel_pipeline_config` (`nemo_rl/models/policy/utils.py`) runs in
@@ -49,7 +54,7 @@ replicated within each PP group; DP size is `world_size / (pp * cp * tp)`.
   `logprob_batch_size != train_micro_batch_size`.
 - `1f1b` with `M < pp_size` or with `layers_per_stage`; `interleaved_1f1b` with M not a
   multiple of `max(1, M // pp_size)`.
-- Sequence packing, dynamic batching, CP > 1, EP > 1, sequence parallelism, CPU offload,
+- Sequence packing, dynamic batching, CP > 1, sequence parallelism, CPU offload,
   LoRA, draft co-training, router replay, reward models, ModelOpt quantization,
   multimodal (VLM) models, non-colocated generation, and any `refit_transport`.
 - Models whose embedding and LM head share one weight (`tie_word_embeddings`).
@@ -187,12 +192,11 @@ recommended.
 
 ## 8. Limitations and Follow-ups
 
-- Expert parallelism and context parallelism are not supported yet. The update
-  lifecycle already defers MoE expert-gradient sync to the update's last schedule call
-  (`sync_expert_grads`), as Automodel's own trainer does.
+- Context parallelism is not supported yet.
 - Streaming (SingleController) updates need unknown-N normalization and an upstream
   fix that preserves gradients across stage re-initialization.
-- Models whose pipeline inputs need `get_pipeline_kwargs_chunk_dims` are rejected until
-  Automodel exposes explicit schedule arguments.
+- Inputs whose batch dimension is not dim 0, as reported by a model's
+  `get_pipeline_kwargs_chunk_dims` hook (for example multimodal M-RoPE position IDs),
+  are rejected when a batch is planned. Text-only inputs of such models run.
 - V-shaped and zero-bubble schedules are not supported: they place the first and last
   stages on one rank or split the backward pass.

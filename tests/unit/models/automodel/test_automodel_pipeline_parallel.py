@@ -292,6 +292,61 @@ def test_plan_execution_batches_pads_to_the_busiest_dp_rank(monkeypatch):
     assert data["sample_mask"].tolist() == [1.0] * num_samples
 
 
+class _ChunkDimsForward(_Forward):
+    """A model part with Automodel's ``get_pipeline_kwargs_chunk_dims`` hook."""
+
+    def __init__(self, chunk_dims: dict[str, int]):
+        super().__init__()
+        self.chunk_dims = chunk_dims
+        self.seen_position_ids_shapes: list[tuple[int, ...]] = []
+
+    def get_pipeline_kwargs_chunk_dims(self, kwargs: dict[str, Any]) -> dict[str, int]:
+        self.seen_position_ids_shapes.append(tuple(kwargs["position_ids"].shape))
+        return self.chunk_dims
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("chunk_dims", [{}, {"position_ids": 1}])
+def test_plan_execution_batches_checks_model_chunk_dims(monkeypatch, chunk_dims):
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda tensor, op=None, group=None: None
+    )
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.arange(4 * _SEQ_LEN).reshape(4, -1),
+            "input_lengths": torch.full((4,), _SEQ_LEN),
+            "token_mask": torch.ones(4, _SEQ_LEN),
+            "sample_mask": torch.ones(4),
+        }
+    ).to("cuda")
+    model = _ChunkDimsForward(chunk_dims)
+
+    def plan():
+        return plan_execution_batches(
+            data,
+            model=model,
+            micro_batch_size=2,
+            microbatches_per_step=2,
+            dp_group=None,
+            tokenizer=None,
+            cfg={"automodel_cfg": {"sequence_parallel": False}},
+            allow_flash_attn_args=True,
+        )
+
+    if chunk_dims:
+        # Inputs split along a non-batch dimension cannot be concatenated
+        # along dim 0 into an execution batch.
+        with pytest.raises(NotImplementedError, match="position_ids"):
+            plan()
+    else:
+        # Batch-major inputs of a model with the hook (e.g. text-only
+        # Qwen3.5-MoE) plan normally.
+        (execution_batch,) = plan()
+        assert execution_batch.model_inputs["position_ids"].shape == (4, _SEQ_LEN)
+    # The hook sees one microbatch's inputs, not the concatenated batch.
+    assert model.seen_position_ids_shapes == [(2, _SEQ_LEN)]
+
+
 def _check_tq_coordinates(rank: int, world_size: int) -> None:
     from torch.distributed.device_mesh import init_device_mesh
 
