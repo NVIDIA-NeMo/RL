@@ -170,7 +170,7 @@ vllm = [
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
   # PyPI publishes the default cu130 wheels for both supported architectures.
-  # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
+  # https://github.com/vllm-project/vllm/releases/tag/v0.30.0
   "vllm==0.30.0",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.18.post1",
