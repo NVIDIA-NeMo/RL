@@ -103,8 +103,9 @@ class TestHealthCheck:
     ) -> None:
         import nemo_gym.cli
         import nemo_gym.server_utils as gym_utils
-        import nemo_rl.environments.nemo_gym as env_module
         from omegaconf import OmegaConf
+
+        import nemo_rl.environments.nemo_gym as env_module
 
         monkeypatch.setattr(env_module, "_get_node_ip_local", lambda: "127.0.0.1")
         ports = iter([11000, 11001])
