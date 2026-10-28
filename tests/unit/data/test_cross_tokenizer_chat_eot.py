@@ -440,6 +440,25 @@ def test_ce_turn_rejects_history_that_is_not_a_prefix():
         _collator(student, None, ce_covers_assistant_turn=True)([_datum()])
 
 
+def test_ce_turn_rejects_full_rendering_identical_to_history() -> None:
+    student = _tokenizer(suffix="<eot>")
+    student.chat_template = "{{ messages[-1]['content'] }}"
+    datum = _datum()
+    datum["message_log"][0]["content"] = "Answer"
+    # With identical last-message content, this template adds no text when the
+    # final assistant turn is appended. Ordinary content supervision still works.
+    rendered = student.apply_chat_template(datum["message_log"], tokenize=False)
+    history = student.apply_chat_template(datum["message_log"][:-1], tokenize=False)
+    assert rendered == history == "Answer"
+    default = _collator(student, None)([datum])
+    assert _supervised_tokens(student, default, "token_mask") == ["Answer"]
+    with pytest.raises(
+        ValueError,
+        match=r"^student, sample idx=0: final assistant turn has no tokens$",
+    ):
+        _collator(student, None, ce_covers_assistant_turn=True)([datum])
+
+
 def test_ce_turn_rejects_token_that_carries_history_text():
     student = _tokenizer(suffix="<eot>")
     collator = _collator(student, None, ce_covers_assistant_turn=True)
