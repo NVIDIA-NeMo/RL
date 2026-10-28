@@ -150,7 +150,7 @@ def _prepare_opd_full_loss_input(
     )
     entropy = None
     cross_entropy = None
-    if full_cfg.validate_decomposition:
+    if full_cfg.validate_decomposition or full_cfg.log_student_entropy:
         # inference_only: both are read detached for metrics only, so there is no
         # reason to save their inputs for a backward that never runs.
         entropy = ChunkedDistributedEntropy.apply(  # type: ignore[misc]
@@ -159,6 +159,7 @@ def _prepare_opd_full_loss_input(
             vocab_parallel_group,
             True,
         )
+    if full_cfg.validate_decomposition:
         cross_entropy = ChunkedDistributedCrossEntropyToFixedLogits.apply(  # type: ignore[misc]
             logits,
             teacher_logits,
@@ -211,6 +212,33 @@ def _prepare_opd_full_loss_input(
     return loss_input
 
 
+def _student_sum_p_log_p(
+    logits: torch.Tensor,
+    chunk_size: int,
+    vocab_parallel_group: torch.distributed.ProcessGroup,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Per-position ``sum_v p_s log p_s`` of the student, full sequence on every CP rank.
+
+    Metrics only: computed without autograd, so it can never join the loss graph
+    and keeps no logits alive for a backward.
+    """
+    with torch.no_grad():
+        entropy = ChunkedDistributedEntropy.apply(  # type: ignore[misc]
+            logits,
+            chunk_size,
+            vocab_parallel_group,
+            True,
+        )
+    if context_parallel_group is not None and (
+        torch.distributed.get_world_size(context_parallel_group) > 1
+    ):
+        entropy = allgather_cp_sharded_tensor(
+            entropy, context_parallel_group, seq_dim=1
+        )
+    return entropy
+
+
 def _prepare_w2s_opd_loss_input(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
@@ -229,7 +257,8 @@ def _prepare_w2s_opd_loss_input(
         context_parallel_group: Context-parallel process group.
 
     Returns:
-        Loss input dict with the per-token divergence ``[B, S - 1]``.
+        Loss input dict with the per-token divergence ``[B, S - 1]`` and, with
+        ``log_student_entropy``, the student's ``sum_v p log p``.
 
     Raises:
         ValueError: If a proxy column is missing.
@@ -264,6 +293,13 @@ def _prepare_w2s_opd_loss_input(
     loss_input: dict[str, Any] = {
         "opd_full_divergence": divergence[:, :next_token_width]
     }
+    if w2s_cfg.log_student_entropy:
+        loss_input["opd_full_entropy"] = _student_sum_p_log_p(
+            logits,
+            chunk_size,
+            vocab_parallel_group,
+            context_parallel_group,
+        )[:, :next_token_width]
     return loss_input
 
 

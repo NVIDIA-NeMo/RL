@@ -614,12 +614,18 @@ class ClippedPGLossFn(LossFunction):
                         "w2s_opd_seq_sum_log_ratio_abs": MetricNormalizer.SEQUENCES,
                     }
                 )
+            if (
+                self.opd_full.validate_decomposition
+                or self.opd_full.log_student_entropy
+            ):
+                self.metric_normalizations[f"{prefix}_entropy"] = (
+                    MetricNormalizer.TOKENS
+                )
             if self.opd_full.validate_decomposition:
                 self.metric_normalizations.update(
                     {
-                        "opd_full_entropy": MetricNormalizer.TOKENS,
-                        "opd_full_cross_entropy": MetricNormalizer.TOKENS,
-                        "opd_full_decomposition_error": MetricNormalizer.NONE,
+                        f"{prefix}_cross_entropy": MetricNormalizer.TOKENS,
+                        f"{prefix}_decomposition_error": MetricNormalizer.NONE,
                     }
                 )
 
@@ -1288,6 +1294,20 @@ class ClippedPGLossFn(LossFunction):
                 ).item()
             if (
                 opd_full_entropy is not None
+                and self.opd_full is not None
+                and (
+                    self.opd_full.validate_decomposition
+                    or self.opd_full.log_student_entropy
+                )
+            ):
+                # The kernel returns sum_v p_s log p_s; report the entropy itself.
+                metrics[f"{prefix}_entropy"] = masked_mean(
+                    -opd_full_entropy.detach(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+            if (
+                opd_full_entropy is not None
                 and opd_full_cross_entropy is not None
                 and self.opd_full is not None
                 and self.opd_full.validate_decomposition
@@ -1296,17 +1316,12 @@ class ClippedPGLossFn(LossFunction):
                 decomposition = (
                     opd_full_entropy.detach() + opd_full_cross_entropy.detach()
                 )
-                metrics["opd_full_entropy"] = masked_mean(
-                    -opd_full_entropy.detach(),
-                    mask,
-                    global_normalization_factor=global_valid_toks,
-                ).item()
-                metrics["opd_full_cross_entropy"] = masked_mean(
+                metrics[f"{prefix}_cross_entropy"] = masked_mean(
                     opd_full_cross_entropy.detach(),
                     mask,
                     global_normalization_factor=global_valid_toks,
                 ).item()
-                metrics["opd_full_decomposition_error"] = (
+                metrics[f"{prefix}_decomposition_error"] = (
                     (decomposition - opd_full_divergence.detach())
                     .abs()
                     .mul(mask)

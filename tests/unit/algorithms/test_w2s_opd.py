@@ -245,6 +245,14 @@ def test_nonfinite_scoring_propagates_failure_from_another_rank(monkeypatch):
         validate_w2s_scoring(torch.zeros(1, 2), torch.tensor([2]))
 
 
+def _random_arms(seed, batch=2, length=7, widths=(3, 5), vocab=13):
+    """Anchor/positive hidden states, their LM heads, and the negative logits."""
+    torch.manual_seed(seed)
+    heads = tuple(torch.randn(vocab, width) for width in widths)
+    arms = tuple(torch.randn(batch, length, width) for width in widths)
+    return arms, heads, torch.randn(batch, length, vocab)
+
+
 def test_compact_support_rejects_mismatched_columns():
     student = torch.randn(1, 4, 9)
     with pytest.raises(ValueError, match="both be"):
@@ -483,6 +491,16 @@ def test_w2s_config_validates_and_builds_the_w2s_loss(monkeypatch):
     assert not any(
         name.startswith("opd_full_") for name in loss_fn.metric_normalizations
     )
+    assert "w2s_opd_entropy" not in loss_fn.metric_normalizations
+
+
+def test_log_student_entropy_registers_the_entropy_metric(monkeypatch):
+    cfg = _w2s_master_config(
+        monkeypatch, "on_policy_distillation.w2s.log_student_entropy=true"
+    )
+    validate_single_controller_config(cfg)
+    loss_fn = ClippedPGLossFn(cfg.loss_fn, opd_full=get_opd_distribution_config(cfg))
+    assert loss_fn.metric_normalizations["w2s_opd_entropy"] is MetricNormalizer.TOKENS
 
 
 @pytest.mark.parametrize(
@@ -716,6 +734,82 @@ def test_proxy_loss_aligns_next_tokens_and_backpropagates_only_valid_positions(
     assert student.grad[:, -1].count_nonzero() == 0
     with pytest.raises(ValueError, match="proxy columns"):
         prepare_loss_input(student, BatchedDataDict(base), loss_fn, **kwargs)
+
+
+def test_prepared_loss_reports_exact_student_entropy_only_when_asked(
+    _single_rank_collectives,
+):
+    arms, heads, negative = _random_arms(7, length=6, vocab=9)
+    student = torch.randn(2, 6, 9, requires_grad=True)
+    base = {
+        "input_ids": torch.zeros(2, 6, dtype=torch.long),
+        "token_mask": torch.ones(2, 6),
+        "sample_mask": torch.ones(2),
+    }
+    support, target = w2s_compact_proxy(
+        arms,
+        heads,
+        negative,
+        alpha=0.75,
+        top_k=4,
+        vocab_size=9,
+        chunk_size=128,
+        vocab_parallel_group=None,
+    )
+    columns = dict(
+        zip(W2S_PROXY_FIELDS, (support.to(torch.int32), target), strict=True)
+    )
+
+    def prepare(log_student_entropy):
+        loss_fn = _w2s_loss_fn(
+            vocab_size=9,
+            top_k=4,
+            chunk_size=4,
+            log_student_entropy=log_student_entropy,
+        )
+        return loss_fn, prepare_loss_input(
+            student,
+            BatchedDataDict({**base, **columns}),
+            loss_fn,
+            vocab_parallel_rank=0,
+            vocab_parallel_group=object(),
+            context_parallel_group=None,
+            sampling_params=None,
+            chunk_size=None,
+        )[0]
+
+    plain_fn, plain = prepare(False)
+    assert "opd_full_entropy" not in plain
+    assert "w2s_opd_entropy" not in plain_fn.metric_normalizations
+
+    loss_fn, prepared = prepare(True)
+    # Same divergence with or without the diagnostic.
+    torch.testing.assert_close(
+        prepared["opd_full_divergence"], plain["opd_full_divergence"]
+    )
+    log_p = student.detach().log_softmax(-1)
+    expected = (log_p.exp() * log_p).sum(-1)[:, :5]
+    torch.testing.assert_close(prepared["opd_full_entropy"], expected)
+    assert not prepared["opd_full_entropy"].requires_grad
+
+    data = BatchedDataDict(
+        {**base, "token_mask": torch.tensor([[0.0, 1.0, 1.0, 0.0, 1.0, 1.0]] * 2)}
+    )
+    _, metrics = loss_fn(
+        data=data,
+        global_valid_seqs=torch.tensor(2.0),
+        global_valid_toks=torch.tensor(8.0),
+        **prepared,
+    )
+    # token_mask[:, 1:] keeps positions 0, 1, 3, 4 of the next-token axis.
+    kept = torch.tensor([0, 1, 3, 4])
+    assert metrics["w2s_opd_entropy"] == pytest.approx(
+        (-expected[:, kept]).sum().item() / 8.0, rel=1e-5
+    )
+    assert loss_fn.metric_normalizations["w2s_opd_entropy"] is MetricNormalizer.TOKENS
+
+
+# ── Teacher coordinator ────────────────────────────────────────────────────
 
 
 def _extra_env_info(agent_name):

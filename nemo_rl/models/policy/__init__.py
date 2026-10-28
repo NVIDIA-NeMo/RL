@@ -706,6 +706,7 @@ class OnPolicyDistillationFullTransport(TypedDict):
     chunk_size: int | None
     teacher_lm_head_lifecycle: Literal["none", "offload", "evict"]
     validate_decomposition: bool
+    log_student_entropy: bool
     payload_field: str
     # Per-sample teacher-identity column, routing each row's payload to the
     # right teacher LM-head shard. Only the hidden-state path needs it; the
