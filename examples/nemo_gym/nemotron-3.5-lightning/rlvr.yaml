@@ -21,6 +21,8 @@
 # Effective policy generation parallelism is TP=4, EP=1.
 # =============================================================================
 
+defaults: ../legacy_environment_servers/ultra_rlvr.yaml
+
 # =============================================================================
 # Cluster (training + generation actors; Gym nodes are allocated separately)
 # =============================================================================
@@ -145,8 +147,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
     cpu_offload: false
     sequence_parallel: false
@@ -372,7 +376,6 @@ env:
   # true: skip expensive train_data_step*.jsonl (recommended for large Gym runs); false: write full jsonl.
   should_log_nemo_gym_responses: true
   nemo_gym:
-    nemo_gym_log_dir: "logs/nemo_gym"
     skip_venv_if_present: true
     # GenRM and NL2Bash run in external pools. These nodes host only the
     # Gym-managed safety judge.

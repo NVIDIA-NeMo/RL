@@ -85,7 +85,10 @@ def _batch() -> tuple[BatchedDataDict, torch.Tensor]:
 
 @pytest.mark.parametrize("chunks", [[4], [1, 1, 1, 1], [2, 2], [1, 3]])
 @pytest.mark.parametrize("kl_penalty", [0.0, 0.1])
-def test_accumulated_loss_and_gradients_match_upstream_mask(chunks, kl_penalty):
+@pytest.mark.parametrize("metrics_level", ["full", "minimal"])
+def test_accumulated_loss_and_gradients_match_upstream_mask(
+    chunks, kl_penalty, metrics_level
+):
     """Post-backward global scaling matches pre-masking, even with empty chunks."""
     data, values = _batch()
     cfg = ClippedPGLossConfig(
@@ -96,6 +99,7 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(chunks, kl_penalty):
         truncated_importance_sampling_type="seq-mask-tis",
         truncated_importance_sampling_ratio_min=0.8,
         truncated_importance_sampling_ratio=1.2,
+        metrics_level=metrics_level,
     )
     expected_data = data.select_indices(list(range(4)))
     expected_data["sample_mask"] = torch.tensor([1.0, 0.0, 1.0, 0.0])
@@ -124,6 +128,7 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(chunks, kl_penalty):
             global_valid_toks=torch.tensor(6.0),
         )
         loss.backward()
+        assert chunk_metrics.keys() == loss_fn.metric_normalizations.keys()
         metrics.append(chunk_metrics)
         start = end
 
@@ -145,7 +150,7 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(chunks, kl_penalty):
     for key in (
         "loss",
         "is_oob_ratio",
-        "probs_ratio",
+        "token_mult_prob_error",
         "kl_penalty",
         "num_valid_samples",
     ):

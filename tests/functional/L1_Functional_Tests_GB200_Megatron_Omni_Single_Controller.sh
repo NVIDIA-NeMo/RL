@@ -41,10 +41,12 @@ if (( GPU_COUNT < 2 )); then
 fi
 
 # SingleController is non-colocated: one GPU trains the frozen-decoder policy
-# and one GPU hosts Megatron generation.
+# and one GPU hosts Megatron generation (with the token-capture hooks installed
+# for the CLEVR token-capture smoke).
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
 run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_clevr_megatron_single_controller_1n2g.sh
+run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_clevr_megatron_token_capture_single_controller_1n2g.sh
 run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_gym_video_megatron_single_controller_1n2g.sh
 
 cd "${PROJECT_ROOT}/tests"

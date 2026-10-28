@@ -20,6 +20,8 @@ policy:
       max_running_requests: null
       mem_fraction_static: 0.6
       skip_server_warmup: true
+      # Set false to opt into the legacy disk cache with trusted cache files.
+      disable_outlines_disk_cache: true
       # Prefill graphs off: "tc_piecewise" crashes with "illegal memory access" on
       # torch 2.10, and "breakable" (upstream's CUDA default) is rejected under the
       # memory saver that needs_offload: true enables below.

@@ -36,7 +36,7 @@ run_test() {
 
 # All TRT-LLM tests use the async engine. These scenarios deliberately cover
 # the supported axes without creating a full backend/deployment-mode matrix.
-run_test fast uv run --no-sync bash ./tests/functional/grpo_trtllm_fsdp2_colocated.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_trtllm_automodel_colocated.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_trtllm_mcore_colocated.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_trtllm_mcore_non_colocated_async.sh
 

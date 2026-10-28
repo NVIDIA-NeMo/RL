@@ -140,7 +140,7 @@ def test_mpo_rejects_non_pair_grouping_key():
         _validate_pair_safe_packing(policy_config, _cluster_config())
 
 
-def test_mpo_rejects_non_fused_or_dtensor_packed_loss():
+def test_mpo_rejects_non_fused_or_automodel_packed_loss():
     policy_config = _packed_policy_config()
     sequence_packing = cast(dict[str, Any], policy_config["sequence_packing"])
     sequence_packing["fuse_loss"] = False
@@ -214,7 +214,7 @@ def test_nemotron_omni_mpo_recipe_validates():
     assert train_config["dataset_name"] == "MMPRPreference"
     assert "max_samples" in train_config
     assert master_config.data["validation"] is None
-    assert not master_config.logger["wandb_enabled"]
+    assert not master_config.logger.wandb_enabled
 
 
 def test_nemotron_omni_nopack_parity_config_matches_legacy_run():
@@ -254,7 +254,7 @@ def test_nemotron_omni_nopack_parity_config_matches_legacy_run():
     assert train_config["legacy_validation_split"] is True
     assert master_config.data["num_workers"] == 0
     assert master_config.cluster.num_nodes == 4
-    assert not master_config.logger["wandb_enabled"]
+    assert not master_config.logger.wandb_enabled
 
 
 @pytest.mark.parametrize(

@@ -37,10 +37,11 @@ from __future__ import annotations
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 
+from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
@@ -51,9 +52,18 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.payload import pack_payload
+from nemo_rl.experience.reward_penalties import (
+    CAPTURE_PENALTIES,
+    FinalizedReward,
+    RewardChecks,
+    RewardLogContext,
+    finalize_capture_reward,
+)
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
+    RouteLayout,
+    boundary_route_rows,
     execute_route_plan,
 )
 from nemo_rl.experience.route_plan import (
@@ -64,6 +74,10 @@ from nemo_rl.experience.route_plan import (
     encoded_route_plan_size_bytes,
     validate_route_plan,
 )
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
 
 
 @dataclass(frozen=True)
@@ -90,6 +104,8 @@ class FinalizedRollout:
     # media columns (staged in the same put as each call's tokens) and
     # structurally validated. None for text rollouts.
     media: Optional[dict[str, PackedTensor]] = None
+    penalty_counts: dict[str, int] = field(default_factory=dict)
+    reward_metrics: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -102,6 +118,7 @@ class FinalizedGroup:
     staging_keys: list[str]
     canonical_output_tokens: int = 0
     metrics: dict[str, float] = field(default_factory=dict)
+    reward_observations: list[FinalizedReward] = field(default_factory=list)
     # True when the finalizer rejected the whole group as a structural outcome
     # (see drop_reason); the caller aborts the slot instead of committing it.
     # Policy decisions like a low valid-row fraction are no longer made here --
@@ -180,6 +197,29 @@ def _trainer_media(staged: StagedMediaTensors) -> dict[str, PackedTensor]:
     return media
 
 
+def _empty_trainer_media(
+    spec: MediaColumnSpec, num_rows: int
+) -> dict[str, PackedTensor]:
+    """Media fields for a group in which no rollout carried media.
+
+    Each logical row gets a zero-row segment in ``_trainer_media``'s layout
+    (``[0, 3*P*P]`` pixels, ``[0, 2]`` sizes, ``[0]`` frames) rather than no
+    segment at all: a segment-less row ships nothing, so the group would
+    publish without the media columns and TransferQueue would narrow any
+    train fetch that mixes its keys with media keys. A zero-row segment
+    keeps the column present, in the pinned dtype, and rebuilds on the
+    trainer as a ``[0, 3*P*P]`` tensor the Omni model treats as "no images".
+    """
+    pixels = torch.empty(0, spec.pixel_feature_dim, dtype=spec.pixel_dtype)
+    sizes = torch.empty(0, 2, dtype=torch.int32)
+    frames = torch.empty(0, dtype=torch.int32)
+    return {
+        "pixel_values": PackedTensor([pixels for _ in range(num_rows)], dim_to_pack=0),
+        "imgs_sizes": PackedTensor([sizes for _ in range(num_rows)], dim_to_pack=0),
+        "num_frames": PackedTensor([frames for _ in range(num_rows)], dim_to_pack=0),
+    }
+
+
 def _media_fields_for_group(rows: list[FinalizedRollout]) -> dict[str, PackedTensor]:
     """Stack per-rollout media into group-level PackedTensors, one logical row each.
 
@@ -214,16 +254,27 @@ class RolloutReassembler:
         staging_partition: str,
         pad_token_id: int,
         max_seq_len: int,
+        reward_penalty_config: RewardPenaltyConfig | None = None,
+        effort_config: EffortLevelsConfig | None = None,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
+        media_columns: Optional[MediaColumnSpec] = None,
     ) -> None:
+        self._reward_penalty_config = reward_penalty_config
+        self._effort_config = effort_config
         self._dp_client = dp_client
         self._partition_id = partition_id
         # Whether the staging partition carries media columns (setup's
         # ``token_capture.enabled and processor is not None``). Text-only runs
         # never read media columns; media-enabled runs must find them.
         self._capture_media = capture_media
+        if capture_media and media_columns is None:
+            raise ValueError(
+                "media capture requires media_columns (the pixel dtype and patch "
+                "size the serving workers pinned the staging column to)"
+            )
+        self._media_columns = media_columns
         self._pad_token_id = int(pad_token_id)
         self._max_seq_len = int(max_seq_len)
         self._router_replay_enabled = router_replay_enabled
@@ -249,7 +300,12 @@ class RolloutReassembler:
     # ── per rollout ─────────────────────────────────────────────────────────
 
     def finalize_rollout(
-        self, rollout_id: str, receipt: Optional[dict[str, Any]], *, reward: float
+        self,
+        rollout_id: str,
+        receipt: Optional[dict[str, Any]],
+        *,
+        reward: float,
+        reward_checks: RewardChecks | None = None,
     ) -> FinalizedRollout:
         """Verify one receipt against its staged rows and linearize the main chain.
 
@@ -340,6 +396,17 @@ class RolloutReassembler:
             NotImplementedError,
         ) as error:
             return rejected(f"rebuild_failed:{error}", staging_keys)
+        try:
+            reward, penalty_counts, reward_metrics = finalize_capture_reward(
+                reward,
+                checks=reward_checks,
+                penalty_config=self._reward_penalty_config,
+                effort_config=self._effort_config,
+                token_ids=row.token_ids,
+                link_spans=row.link_spans,
+            )
+        except ValueError as error:
+            return rejected(f"reward_processing:{error}", staging_keys)
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
@@ -372,7 +439,10 @@ class RolloutReassembler:
                 commitment = commitments_by_call.get(call_id)
                 if record is None or item is None or commitment is None:
                     return rejected(f"route_span_identity:{call_id}", staging_keys)
-                if item.routed_len not in (0, record.delta_len):
+                expected_routed_len = record.delta_len + boundary_route_rows(
+                    record.prev_len
+                )
+                if item.routed_len not in (0, expected_routed_len):
                     return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
                 if generation_len < 0 or generation_len > record.delta_len:
                     return rejected(
@@ -390,6 +460,11 @@ class RolloutReassembler:
                         staged_route_len=item.routed_len,
                         extras_digest_version=commitment.extras_digest_version,
                         extras_digest=commitment.extras_digest,
+                        boundary_rows=(
+                            boundary_route_rows(record.prev_len)
+                            if item.routed_len
+                            else 0
+                        ),
                     )
                 )
             if sum(span.carry_len + span.generation_len for span in route_spans) != len(
@@ -431,6 +506,8 @@ class RolloutReassembler:
             routed_experts=routed_experts,
             route_plan=route_plan,
             media=media,
+            penalty_counts=penalty_counts,
+            reward_metrics=reward_metrics,
         )
 
     def _resolve_media(
@@ -503,7 +580,9 @@ class RolloutReassembler:
         return execute_route_plan(
             plan,
             fragments,
-            dims=self._routed_dims,
+            layout=RouteLayout.compressed(
+                num_moe_layers=self._routed_dims[0], top_k=self._routed_dims[1]
+            ),
             canonical_len=plan.expected_token_length,
         )
 
@@ -521,6 +600,8 @@ class RolloutReassembler:
         prompt_idx: int,
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
+        reward_checks: Optional[list[RewardChecks | None]] = None,
+        reward_log_contexts: Optional[list[RewardLogContext | None]] = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -546,10 +627,30 @@ class RolloutReassembler:
         assert len(canonical_sample_ids) == len(rollout_ids), (
             "canonical_sample_ids must be one per rollout"
         )
+        checks_by_rollout = (
+            tuple(reward_checks)
+            if reward_checks is not None
+            else (None,) * len(rollout_ids)
+        )
+        assert len(checks_by_rollout) == len(rollout_ids), (
+            "reward_checks must be one per rollout"
+        )
+        log_contexts = (
+            reward_log_contexts
+            if reward_log_contexts is not None
+            else [None] * len(rollout_ids)
+        )
+        assert len(log_contexts) == len(rollout_ids), (
+            "reward_log_contexts must be one per rollout"
+        )
         _group_t0 = time.perf_counter()
         rows = [
-            self.finalize_rollout(rollout_id, receipt, reward=reward)
-            for rollout_id, receipt, reward in zip(rollout_ids, receipts, rewards)
+            self.finalize_rollout(
+                rollout_id, receipt, reward=reward, reward_checks=checks
+            )
+            for rollout_id, receipt, reward, checks in zip(
+                rollout_ids, receipts, rewards, checks_by_rollout
+            )
         ]
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
         valid_rows = [row for row in rows if row.valid]
@@ -568,6 +669,19 @@ class RolloutReassembler:
                 else 0.0
             ),
         }
+        # Per-row counts are pooled by the consuming controller once per
+        # committed group, alongside the retained reward observations;
+        # rejected placeholders never enter this population.
+        for row in valid_rows:
+            for name, value in row.reward_metrics.items():
+                metrics[name] = metrics.get(name, 0.0) + value
+        config = self._reward_penalty_config
+        if config is not None:
+            for spec in CAPTURE_PENALTIES:
+                if spec.enabled(config):
+                    metrics[f"finalize/penalty_count/{spec.name}"] = float(
+                        sum(row.penalty_counts[spec.name] for row in valid_rows)
+                    )
         # Ledger-derived admission counters (per group): each manifest row
         # carries its admission mode. token_in_rate near 1.0 is the capture
         # health signal (a text root only opens each chain); this replaces the
@@ -714,35 +828,30 @@ class RolloutReassembler:
                 # group before the first healthy rollout. Dropping loses no
                 # training signal (no valid rows or routes) and keeps the
                 # partition schema consistent for groups that do publish.
-                print(
-                    f"  finalize: group {group_id} dropped — router replay on "
-                    "but no rollout carried routed_experts and (L, K) is "
-                    "unknown yet",
-                    flush=True,
-                )
-                self._clear_staging(staging_keys)
-                metrics["finalize/group_dropped"] = 1.0
-                return FinalizedGroup(
-                    meta=None,
-                    group_min_wv=group_min_wv,
-                    group_max_wv=group_max_wv,
-                    staging_keys=[],
-                    canonical_output_tokens=0,
-                    metrics=metrics,
-                    dropped=True,
-                    drop_reason=(
+                return self._drop_group(
+                    group_id,
+                    reason=(
                         "router replay on, no rollout carried routed_experts, "
                         "and (L, K) is unknown yet"
                     ),
-                    valid_row_count=0,
-                    total_row_count=0,
+                    staging_keys=staging_keys,
+                    group_min_wv=group_min_wv,
+                    group_max_wv=group_max_wv,
+                    metrics=metrics,
                 )
             train_batch["routed_experts"] = self._build_routed_experts_tensor(
                 rows, max_len=max_len, metrics=metrics
             )
         # Media rides the same packed/tagged transport as the token-echo path
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).
-        train_batch.update(_media_fields_for_group(rows))
+        media_fields = _media_fields_for_group(rows)
+        if self._capture_media and not media_fields:
+            # No valid rollout carried media (an all-text prompt, or every
+            # rollout a placeholder). Publish empty media rows so the group
+            # keeps the partition's media columns; see _empty_trainer_media.
+            assert self._media_columns is not None
+            media_fields = _empty_trainer_media(self._media_columns, len(rows))
+        train_batch.update(media_fields)
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=group_min_wv,
@@ -818,6 +927,13 @@ class RolloutReassembler:
                 int(mask) for row in valid_rows for mask in row.token_mask
             ),
             metrics=metrics,
+            reward_observations=[
+                FinalizedReward(sample_id, row.rollout_id, row.reward, context)
+                for sample_id, row, context in zip(
+                    canonical_sample_ids, rows, log_contexts
+                )
+                if row.valid
+            ],
             valid_row_count=len(valid_rows),
             total_row_count=len(rows),
         )
@@ -871,7 +987,8 @@ class RolloutReassembler:
             valid_rows += 1
             covered_tokens += len(row.token_ids)
             if row.routed_experts is None:
-                sentinel_tokens += len(row.token_ids)
+                # The final token never has a recorded route; don't count it.
+                sentinel_tokens += max(len(row.token_ids) - 1, 0)
                 continue
             rows_with_routes += 1
             row_routes = row.routed_experts
@@ -883,8 +1000,9 @@ class RolloutReassembler:
                     f"rollout {row.rollout_id}"
                 )
             routed[i, : row_routes.shape[0]] = row_routes
+            # The final token never has a recorded route; don't count it.
             sentinel_tokens += int(
-                row_routes.eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
+                row_routes[:-1].eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
             )
         if valid_rows:
             metrics["finalize/routed_experts_row_coverage"] = (
@@ -895,6 +1013,38 @@ class RolloutReassembler:
                 sentinel_tokens / covered_tokens
             )
         return routed
+
+    def _drop_group(
+        self,
+        group_id: str,
+        *,
+        reason: str,
+        staging_keys: list[str],
+        group_min_wv: int,
+        group_max_wv: int,
+        metrics: dict[str, float],
+    ) -> FinalizedGroup:
+        """Reject a whole group and hand the caller a ``dropped`` result.
+
+        Logs the drop, releases the group's staging rows, marks the
+        ``finalize/group_dropped`` metric, and carries ``reason`` through as
+        ``drop_reason`` for the caller's log line.
+        """
+        print(f"  finalize: group {group_id} dropped — {reason}", flush=True)
+        self._clear_staging(staging_keys)
+        metrics["finalize/group_dropped"] = 1.0
+        return FinalizedGroup(
+            meta=None,
+            group_min_wv=group_min_wv,
+            group_max_wv=group_max_wv,
+            staging_keys=[],
+            canonical_output_tokens=0,
+            metrics=metrics,
+            dropped=True,
+            drop_reason=reason,
+            valid_row_count=0,
+            total_row_count=0,
+        )
 
     def _clear_staging(self, staging_keys: list[str]) -> None:
         if not staging_keys:
