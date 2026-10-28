@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import pytest
@@ -1496,8 +1497,14 @@ def test_router_replay_prepared_masks_preserve_microbatch_fifo(
 
     for target, expected_routes in zip(targets, expected, strict=True):
         set_router_replay_forward(model, target)
-        with monkeypatch.context() as no_scalar_reads:
-            no_scalar_reads.setattr(torch.Tensor, "item", unexpected_scalar_read)
+        with monkeypatch.context() as no_scalar_reads, ExitStack() as sync_guard:
+            if device == "cuda":
+                sync_guard.callback(
+                    torch.cuda.set_sync_debug_mode, torch.cuda.get_sync_debug_mode()
+                )
+                torch.cuda.set_sync_debug_mode("error")
+            else:
+                no_scalar_reads.setattr(torch.Tensor, "item", unexpected_scalar_read)
             results = [
                 router.router_replay.get_replay_topk(
                     scores,
@@ -1516,8 +1523,14 @@ def test_router_replay_prepared_masks_preserve_microbatch_fifo(
 
     set_router_replay_backward(model)
     for expected_routes in expected:
-        with monkeypatch.context() as no_scalar_reads:
-            no_scalar_reads.setattr(torch.Tensor, "item", unexpected_scalar_read)
+        with monkeypatch.context() as no_scalar_reads, ExitStack() as sync_guard:
+            if device == "cuda":
+                sync_guard.callback(
+                    torch.cuda.set_sync_debug_mode, torch.cuda.get_sync_debug_mode()
+                )
+                torch.cuda.set_sync_debug_mode("error")
+            else:
+                no_scalar_reads.setattr(torch.Tensor, "item", unexpected_scalar_read)
             results = [
                 router.router_replay.get_replay_topk(
                     scores, 2, default_compute_topk=default_compute_topk

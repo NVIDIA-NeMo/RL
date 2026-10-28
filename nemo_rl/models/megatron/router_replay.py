@@ -478,8 +478,9 @@ def _install_missing_route_fallback_patch() -> None:
             num_groups=num_groups,
             group_topk=group_topk,
         )
-        effective_topk_idx = target_topk_idx.clone()
-        effective_topk_idx[fallback_mask] = default_indices[fallback_mask]
+        effective_topk_idx = torch.where(
+            fallback_mask.unsqueeze(-1), default_indices, target_topk_idx
+        )
         probs = scores.gather(1, effective_topk_idx)
 
         replay_backward_list = getattr(replay_instance, "replay_backward_list", [])
@@ -517,8 +518,8 @@ def _prepare_missing_route_fallback_masks(
     fallback_required = torch.stack(
         [fallback_mask.any() for fallback_mask in fallback_masks]
     )
-    # This is the only device-to-host synchronization needed to select the
-    # fallback path for the whole microbatch.
+    # Select the fallback path for all layers with one setup-time host sync.
+    # Forward then uses fixed-shape torch.where to replace missing routes.
     fallback_required_cpu = fallback_required.detach().to(device="cpu").tolist()
 
     for (replay_instance, _), fallback_mask, is_required in zip(
