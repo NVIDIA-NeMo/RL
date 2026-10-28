@@ -26,8 +26,8 @@ from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
-from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.components.moe.layers import Gate
+from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from torch import nn
 from torch.distributed.tensor import DTensor
