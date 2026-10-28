@@ -260,7 +260,6 @@ class NixlKVClient(StorageKVClient):
             backend=nixl_cfg.get("backend_name", "UCX"),
             init_params=init_params,
             prog_thread=False,
-            require_rdma=bool(nixl_cfg.get("require_rdma", True)),
         )
         # Serialises every NIXL agent call (the agent is not thread-safe) and
         # counts the time callers wait for it (see TimedLock). Copies
@@ -763,7 +762,6 @@ def initialize_nixl_storage(conf: Any) -> dict[str, Any]:
             read_pin_s=read_pin_s,
             nixl_backend=nixl_cfg.get("backend_name", "UCX"),
             nixl_init_params=nixl_cfg.get("backend_init_params") or {},
-            require_rdma=bool(nixl_cfg.get("require_rdma", True)),
             numa_mode=str(cfg.get("numa", "auto")),
             numa_index=numa_index,
             directory=directory,

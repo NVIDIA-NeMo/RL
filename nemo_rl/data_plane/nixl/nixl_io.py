@@ -164,9 +164,8 @@ class NixlEndpoint:
         backend: str = NIXL_DEFAULT_BACKEND_NAME,
         init_params: dict[str, Any] | None = None,
         prog_thread: bool = False,
-        require_rdma: bool = True,
     ) -> None:
-        if backend == "UCX" and require_rdma:
+        if backend == "UCX":
             # Checked before the agent exists: NIXL's UCX backend takes UCX_*
             # env vars over backend_init_params, so the env decides the transport.
             log.info(

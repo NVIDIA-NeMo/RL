@@ -168,7 +168,6 @@ class NixlStorageUnit:
         nixl_backend: str = "UCX",
         nixl_init_params: dict[str, Any] | None = None,
         directory: Any = None,
-        require_rdma: bool = True,
         numa_mode: str = "auto",
         numa_index: int = 0,
         ssd_dir: str | None = None,
@@ -207,7 +206,6 @@ class NixlStorageUnit:
             backend=nixl_backend,
             init_params=nixl_init_params,
             prog_thread=True,
-            require_rdma=require_rdma,
         )
         self.slab_base = self.ep.register(self.slab)
         self.blobs: dict[str, BlobRec] = {}
