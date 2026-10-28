@@ -29,6 +29,8 @@ NRL_FORCE_REBUILD_VENVS=true uv run coverage run -a --data-file=$PROJECT_ROOT/te
     data.shuffle=false \
     policy.automodel_cfg.lora_cfg.enabled=True \
     policy.automodel_cfg.lora_cfg.dim=32 \
+    policy.automodel_cfg.lora_cfg.match_all_linear=false \
+    'policy.automodel_cfg.lora_cfg.exclude_modules=["*lm_head*"]' \
     policy.train_global_batch_size=32 \
     policy.train_micro_batch_size=1 \
     policy.generation.colocated.enabled=false \
