@@ -2355,6 +2355,7 @@ class TestSetup:
         assert actor_config.effort_config == effort
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
+        assert actor_args.tq_buffer._per_token_multimodal_fields == ()
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
         partition_calls = actor_args.dp_client.register_partition.call_args_list
         staging_fields = set(partition_calls[1].kwargs["fields"])
@@ -3665,6 +3666,22 @@ def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkey
 
 
 # ── multimodal token capture guards ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize("with_processor", [False, True])
+def test_ordinary_rollout_schema_uses_processor_token_fields(
+    patched_factories, with_processor
+):
+    processor = MagicMock(model_input_names=["input_ids", "mm_token_type_ids"])
+    processor.tokenizer.model_input_names = ["input_ids"]
+    args, _ = setup_single_controller(
+        _make_master_config(megatron_enabled=with_processor),
+        MagicMock(pad_token_id=0),
+        processor=processor if with_processor else None,
+    )
+    assert args.tq_buffer._per_token_multimodal_fields == (
+        ("media_token_validity_mask", "mm_token_type_ids") if with_processor else ()
+    )
 
 
 def _make_gym_megatron_capture_config() -> MasterConfig:

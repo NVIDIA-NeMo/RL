@@ -2319,6 +2319,7 @@ def extract_initial_prompt_messages(
 
 def add_grpo_token_loss_masks_and_generation_logprobs(
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
+    per_token_multimodal_fields: tuple[str, ...] = (),
 ) -> None:
     """Add GRPO loss masks and ensure generation logprobs exist in message logs.
 
@@ -2339,6 +2340,8 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
         message_logs: Batch of tokenized message logs. Each message must contain a
             ``role`` and ``token_ids`` field. Messages that already contain
             ``generation_logprobs`` are treated as rollout-generated messages.
+        per_token_multimodal_fields: A multimodal run's fixed per-token schema;
+            messages missing one of these fields get zeros (text).
     """
     backfill_missing_routed_experts(message_logs)
 
@@ -2353,7 +2356,8 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     # Only add masks if some message has non-empty media. Overlength messages keep
     # empty media, which is not stored; storing their mask anyway would make
     # reading them together with text-only messages fail on the missing mask.
-    has_media = any(
+    # A multimodal run's schema writes it on every message instead.
+    has_media = "media_token_validity_mask" in per_token_multimodal_fields or any(
         _owns_media(message) for message_log in message_logs for message in message_log
     )
     for message_log in message_logs:
@@ -2383,6 +2387,9 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
                     fill_value=_owns_media(message),
                     dtype=torch.bool,
                 )
+            for key in per_token_multimodal_fields:
+                if key not in message:
+                    message[key] = torch.zeros_like(token_ids)
 
 
 def _resolve_message_level_advantage_penalties(

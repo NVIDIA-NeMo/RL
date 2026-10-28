@@ -8580,6 +8580,7 @@ def test_tq_rollout_and_trainer_masked_rewards(
     actor.policy_generation = None
     actor.tokenizer = components["tokenizer"]
     actor.task_to_env = components["task_to_env"]
+    actor.per_token_multimodal_fields = ()
     actor._dp_client = MagicMock()
     meta, carry, rollout_metrics, _ = actor.rollout_to_tq(
         batch, partition_id="train", group_size=4
@@ -8723,6 +8724,7 @@ def _tq_actor_rollout(
     actor.policy_generation = None
     actor.tokenizer = components["tokenizer"]
     actor.task_to_env = components["task_to_env"]
+    actor.per_token_multimodal_fields = ()
     actor._dp_client = MagicMock()
     meta, carry, rollout_metrics, _ = actor.rollout_to_tq(
         batch, partition_id="train", group_size=group_size
