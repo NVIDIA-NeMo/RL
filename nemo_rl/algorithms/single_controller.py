@@ -4592,7 +4592,7 @@ class SingleControllerActor:
         training_owned_groups = self._buffer.training_owned_replay_groups()
         replay_metadata = self._buffer.metadata_state_dict(
             saved_capacity=self._async_cfg.max_buffered_rollouts,
-            additional_groups=training_owned_groups,
+            already_claimed_groups=training_owned_groups,
         )
         await self._validate_replay_inventory(replay_metadata)
         replay_row_count = sum(

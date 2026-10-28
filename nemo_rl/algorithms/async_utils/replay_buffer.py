@@ -1567,13 +1567,14 @@ class TQReplayBuffer:
                 "TQReplayBuffer must be bound to the controller data-plane "
                 "checkpoint barrier before claiming groups for training"
             )
-        claim_idxs = sorted(idxs, reverse=True)
-        if claim_idxs[0] >= len(self.meta_list):
+        if max(idxs) >= len(self.meta_list):
             raise IndexError(
                 "TQReplayBuffer.claim_for_training: indices out of range: "
-                f"{claim_idxs[0]}; size={len(self.meta_list)}"
+                f"{max(idxs)}; size={len(self.meta_list)}"
             )
-        claim_group_ids = [self._group_ids[i] for i in claim_idxs]
+        # Preserve sampler order in the checkpoint-visible training claims.
+        # _remove_groups_unlocked sorts list slots separately for safe deletion.
+        claim_group_ids = [self._group_ids[i] for i in idxs]
         async with self._data_plane_checkpoint_barrier.mutation(
             "group_removals"
         ) as cut:
@@ -1585,7 +1586,7 @@ class TQReplayBuffer:
             )
 
     def training_owned_replay_groups(self) -> list[TQReplayGroupMetadata]:
-        """Return metadata for canonical rows owned by the open train step."""
+        """Return open-step canonical metadata in sampler selection order."""
         return copy.deepcopy(list(self._training_claims.values()))
 
     def training_owned_group_ids(self) -> set[str]:
@@ -1716,7 +1717,7 @@ class TQReplayBuffer:
         self,
         *,
         saved_capacity: int,
-        additional_groups: Optional[list[TQReplayGroupMetadata]] = None,
+        already_claimed_groups: Optional[list[TQReplayGroupMetadata]] = None,
     ) -> TQReplayMetadataState:
         """Capture the controller index for ready groups without tensor payloads.
 
@@ -1731,17 +1732,42 @@ class TQReplayBuffer:
         not required to originate specifically from :meth:`commit`.
         The advantage stage also takes a mutation slot because the periodic
         checkpoint pump runs concurrently with ``_train_pump``.
-        In-flight reservations are intentionally omitted. ``additional_groups``
+        In-flight reservations are intentionally omitted. ``already_claimed_groups``
         is used by periodic snapshots to re-index rows claimed by an unfinished
-        streamed optimizer step.
+        streamed optimizer step. These groups are saved first, in selection
+        order, so a restore retries the interrupted batch before waiting groups.
+        They restore as ordinary ready groups, not as orphaned training claims.
         """
         groups: list[TQReplayGroupMetadata] = []
+        existing_group_ids: set[str] = set()
+        existing_sample_ids: set[str] = set()
+
+        def append_group(entry: TQReplayGroupMetadata) -> None:
+            group_id = entry["group_id"]
+            if group_id in existing_group_ids:
+                raise ValueError(f"replay metadata duplicates group_id={group_id!r}")
+            duplicate_sample_ids = existing_sample_ids.intersection(
+                entry["meta"].sample_ids
+            )
+            if duplicate_sample_ids:
+                raise ValueError(
+                    "replay metadata duplicates sample IDs: "
+                    f"{sorted(duplicate_sample_ids)!r}"
+                )
+            groups.append(entry)
+            existing_group_ids.add(group_id)
+            existing_sample_ids.update(entry["meta"].sample_ids)
+
+        # Retry the interrupted batch before groups still waiting for training.
+        for group in already_claimed_groups or []:
+            append_group(copy.deepcopy(group))
+
         for i, ready in enumerate(self.ready_list):
             if not ready:
                 continue
             meta = self.meta_list[i]
             assert meta is not None  # commit sets meta before ready=True
-            groups.append(
+            append_group(
                 {
                     "meta": meta,
                     "start_weight": self.start_weight_list[i],
@@ -1750,27 +1776,6 @@ class TQReplayBuffer:
                     "group_id": self._group_ids[i],
                 }
             )
-        existing_group_ids = {group["group_id"] for group in groups}
-        existing_sample_ids = {
-            sample_id for group in groups for sample_id in group["meta"].sample_ids
-        }
-        for group in additional_groups or []:
-            group_id = group["group_id"]
-            if group_id in existing_group_ids:
-                raise ValueError(
-                    f"additional replay metadata duplicates group_id={group_id!r}"
-                )
-            duplicate_sample_ids = existing_sample_ids.intersection(
-                group["meta"].sample_ids
-            )
-            if duplicate_sample_ids:
-                raise ValueError(
-                    "additional replay metadata duplicates sample IDs: "
-                    f"{sorted(duplicate_sample_ids)!r}"
-                )
-            groups.append(copy.deepcopy(group))
-            existing_group_ids.add(group_id)
-            existing_sample_ids.update(group["meta"].sample_ids)
         return {
             "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
             "storage": REPLAY_BUFFER_METADATA_STORAGE,

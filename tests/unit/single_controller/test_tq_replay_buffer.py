@@ -35,7 +35,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
     replay_manifest_digest,
 )
-from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
+    ReadyFirstSampler,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -1281,7 +1284,7 @@ class TestTQReplayBufferStateDict:
 
         periodic_state = buf.metadata_state_dict(
             saved_capacity=8,
-            additional_groups=claims,
+            already_claimed_groups=claims,
         )
         assert [group["meta"].sample_ids for group in periodic_state["groups"]] == [
             list(claimed_meta.sample_ids)
@@ -1308,6 +1311,139 @@ class TestTQReplayBufferStateDict:
         assert buf.size() == 1
         assert buf.training_owned_replay_groups() == []
         assert dp.depth() == _N_GENS
+
+    def test_snapshot_preserves_selection_order_across_training_chunks(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        metas = [_add_group(buf, weight=3) for _ in range(6)]
+
+        async def exercise() -> None:
+            await buf.claim_for_training([2, 0])
+            await buf.claim_for_training([1])  # Original slot 3 after removal.
+            claims = buf.training_owned_replay_groups()
+            expected = [metas[i].sample_ids for i in (2, 0, 3, 1, 4, 5)]
+            state = buf.metadata_state_dict(
+                saved_capacity=6, already_claimed_groups=claims
+            )
+            assert [group["meta"].sample_ids for group in state["groups"]] == expected
+            assert state["manifest_digest"] == replay_manifest_digest(state["groups"])
+            assert buf.group_ids == tuple(_group_id_of(metas[i]) for i in (1, 4, 5))
+            # A snapshot must not mutate live ownership or alias claim metadata.
+            state["groups"][0]["meta"].sample_ids[0] = "mutated-copy"
+            assert (
+                buf.training_owned_replay_groups()[0]["meta"].sample_ids
+                == metas[2].sample_ids
+            )
+            assert dp.depth() == 6 * _N_GENS
+
+        asyncio.run(exercise())
+
+    def test_snapshot_digest_binds_training_priority_order(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        for _ in range(4):
+            _add_group(buf, weight=3)
+        _run(buf.claim_for_training([0, 1]))
+        state = buf.metadata_state_dict(
+            saved_capacity=8, already_claimed_groups=buf.training_owned_replay_groups()
+        )
+        state["groups"].reverse()
+        restored = _make_buffer(FakeDataPlaneClient())
+        with pytest.raises(ValueError, match="digest does not match its contents"):
+            _load(restored, state)
+        assert restored.size() == 0
+
+    @pytest.mark.parametrize("duplicate_id", [True, False])
+    def test_snapshot_rejects_duplicate_already_claimed_groups(self, duplicate_id):
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=3)
+        duplicate = buf.metadata_state_dict(saved_capacity=8)["groups"][0].copy()
+        if not duplicate_id:
+            duplicate["group_id"] = "different-group-same-samples"
+        with pytest.raises(ValueError, match="duplicates"):
+            buf.metadata_state_dict(
+                saved_capacity=8, already_claimed_groups=[duplicate]
+            )
+        assert buf.size() == 1
+        assert buf.training_owned_replay_groups() == []
+
+    @pytest.mark.parametrize("duplicate_id", [True, False])
+    def test_snapshot_rejects_duplicate_claimed_groups_without_ready_groups(
+        self, duplicate_id: bool
+    ) -> None:
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=3)
+        _run(buf.claim_for_training([0]))
+        claims = buf.training_owned_replay_groups()
+        duplicate = claims[0].copy()
+        if not duplicate_id:
+            duplicate["group_id"] = "different-group-same-samples"
+
+        with pytest.raises(ValueError, match="duplicates"):
+            buf.metadata_state_dict(
+                saved_capacity=8, already_claimed_groups=[*claims, duplicate]
+            )
+
+        assert buf.size() == 0
+        assert buf.training_owned_replay_groups() == claims
+
+    @pytest.mark.parametrize(
+        "ready_count,claimed_count", [(8, 2), (8, 5), (8, 8), (7, 5)]
+    )
+    def test_restore_prioritizes_claims_without_waiting_for_admission(
+        self, ready_count, claimed_count
+    ):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        metas = [_add_group(buf, weight=3) for _ in range(ready_count)]
+        if ready_count < 8:
+            buf.reserve(weight_version=3, group_id="unfinished")
+
+        async def exercise() -> None:
+            # Full capacity, optionally including one unfinished reservation
+            # omitted from the snapshot. Selection must not wait for admission.
+            await buf.claim_for_training(list(range(claimed_count)))
+            state = buf.metadata_state_dict(
+                saved_capacity=8,
+                already_claimed_groups=buf.training_owned_replay_groups(),
+            )
+            restored = _make_buffer(dp)
+            await restored.load_state_dict(
+                state,
+                max_groups=8,
+                expected_partition_id="rollout_data",
+                expected_group_size=_N_GENS,
+                expected_manifest_digest=state["manifest_digest"],
+            )
+            assert restored.training_owned_replay_groups() == []
+            sampler = ReadyFirstSampler(restored, max_staleness_versions=1)
+            sampler.restore_dispatch_index(4)  # Dispatch is gated at weight 3.
+            admitted = asyncio.create_task(sampler.admit(trainer_version_fn=lambda: 3))
+            await asyncio.sleep(0)
+            assert not admitted.done()
+            try:
+                selected, count = await asyncio.wait_for(
+                    sampler.select(
+                        current_train_weight=3,
+                        min_prompt_groups=1,
+                        max_prompt_groups=claimed_count,
+                    ),
+                    timeout=1,
+                )
+                assert selected is not None
+                assert count == claimed_count
+                assert selected.sample_ids == [
+                    sid for meta in metas[:claimed_count] for sid in meta.sample_ids
+                ]
+                assert len(restored.training_owned_replay_groups()) == claimed_count
+                assert restored.size() == ready_count - claimed_count
+                assert len(dp.put_calls) == ready_count  # No restore-time re-put.
+                assert dp.depth() == ready_count * _N_GENS
+            finally:
+                admitted.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await admitted
+
+        asyncio.run(exercise())
 
     def test_training_claim_keeps_stable_selection_while_barrier_waits(self):
         async def exercise() -> None:

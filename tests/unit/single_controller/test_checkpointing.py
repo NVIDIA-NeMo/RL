@@ -636,13 +636,13 @@ class _FakeTQBuffer:
         self,
         *,
         saved_capacity: int,
-        additional_groups: Optional[list[dict[str, Any]]] = None,
+        already_claimed_groups: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         self.metadata_state_dict_calls.append(saved_capacity)
         state = dict(self._metadata_state)
         state["groups"] = [
+            *(already_claimed_groups or []),
             *self._metadata_state["groups"],
-            *(additional_groups or []),
         ]
         return state
 
