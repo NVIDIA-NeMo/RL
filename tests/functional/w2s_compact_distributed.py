@@ -18,8 +18,10 @@
 
 Needs no Megatron install, so it also runs on CPU with gloo, where only
 values are checked. Checks that the negative teacher's packed,
-context-parallel proxy support equals a dense per-row oracle, and that the
-student's loss on that support equals the dense oracle in value and gradient.
+context-parallel proxy support equals a dense per-row oracle, that the
+student's loss on that support equals the dense oracle in value and gradient,
+and that the student-vs-proxy agreement diagnostic equals a dense single-rank
+ranking.
 """
 
 import os
@@ -30,6 +32,7 @@ import torch.distributed as dist
 from nemo_rl.algorithms.w2s_opd import (
     w2s_compact_proxy,
     w2s_packed_proxy_support,
+    w2s_proxy_agreement_from_support,
     w2s_reverse_kl_from_support,
 )
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
@@ -164,6 +167,39 @@ def main():
             seq_dim=1,
         )
         torch.testing.assert_close(logits.grad, expected * 2, atol=6e-6, rtol=6e-6)
+
+    # Student-vs-proxy agreement: the student's top-K is merged across the TP
+    # shards with the padded id excluded, and the support is sharded across CP.
+    anchor, positive = [arm @ head.t() for arm, head in zip(hidden, heads)]
+    dense_proxy = anchor + ALPHA * (positive - negative_dense)
+    ranked = dense_student.detach().clone()
+    ranked[0, :3, :] = dense_proxy[0, :3]  # the student ranks like the proxy here
+    ranked[..., VOCAB:] = 1e4  # the padded id must never enter the student's top-K
+    top1, overlap = w2s_proxy_agreement_from_support(
+        _get_tokens_on_this_cp_rank(
+            ranked[..., tp_rank * width : (tp_rank + 1) * width], cp_rank, 2, seq_dim=1
+        ),
+        support.to(torch.int32),
+        vocab_size=VOCAB,
+        chunk_size=3,
+        vocab_parallel_group=tp_group,
+        context_parallel_group=cp_group,
+    )
+    student_top = ranked[:, :7, :VOCAB].topk(TOP_K, dim=-1).indices
+    expected_top1 = (student_top[..., 0] == support[..., 0]).float()
+    expected_overlap = torch.tensor(
+        [
+            [
+                len(set(mine.tolist()) & set(theirs.tolist())) / TOP_K
+                for mine, theirs in zip(row_top, row_support)
+            ]
+            for row_top, row_support in zip(student_top, support)
+        ],
+        device=device,
+    )
+    assert torch.equal(top1[:, :7], expected_top1), (rank, top1, expected_top1)
+    assert torch.equal(overlap[:, :7], expected_overlap), (rank, overlap)
+    assert top1[0, :3].eq(1).all() and overlap[0, :3].eq(1).all(), rank
     dist.barrier()
     if rank == 0:
         checked = "values+gradients" if use_cuda else "values"

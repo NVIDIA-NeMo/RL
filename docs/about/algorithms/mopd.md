@@ -202,6 +202,7 @@ on_policy_distillation:
     teacher_lm_head_lifecycle: offload  # none | offload | evict
     chunk_size: 1024
     validate_decomposition: false
+    log_student_entropy: false
 ```
 
 `teacher_payload` selects what crosses the teacher/student boundary:
@@ -241,6 +242,11 @@ them, at the cost of a second full-vocabulary log-softmax, so it is off by
 default. The assertion that actually catches a broken payload, gather, LM-head
 shard, or token shift is the divergence itself staying near zero under
 self-distillation.
+
+`log_student_entropy` reports only the student's exact next-token entropy
+(`opd_full_entropy`), averaged over trained tokens. It needs no teacher
+logits, costs one extra chunked no-grad pass over the student logits, and is
+also available under [W2S-OPD](#weak-to-strong-opd-w2s-opd).
 
 ### Current restrictions
 
@@ -309,6 +315,8 @@ on_policy_distillation:
     top_k: 32
     chunk_size: 128
     payload_dtype: bfloat16
+    log_student_entropy: false
+    log_proxy_agreement: false
 ```
 
 Each reference becomes a frozen `ref:<alias>` teacher and the anchor an
@@ -338,11 +346,21 @@ support.
 The unit tests and the TP2×CP2 check in
 `tests/functional/w2s_compact_distributed.py` compare the published support and
 the loss with a dense oracle, in value and
-gradient. The loss reports `w2s_opd_reverse_kl` (with `_min` and `_max`) and
-three sampler-drift diagnostics computed from the generation and training
-log-probabilities:
+gradient. The loss reports `w2s_opd_reverse_kl` (with `_min` and `_max`),
+`w2s_opd_entropy` under `log_student_entropy`, and three sampler-drift
+diagnostics computed from the generation and training log-probabilities:
 `w2s_opd_sampling_importance_ratio`, `w2s_opd_seq_mean_log_ratio_abs`, and
 `w2s_opd_seq_sum_log_ratio_abs`. None of the three enters the loss.
+
+`log_proxy_agreement` reports how closely the student's own ranking follows
+the proxy, averaged over trained tokens: `w2s_opd_proxy_top1_agreement`, the
+share of tokens whose student argmax is the proxy's argmax, and
+`w2s_opd_proxy_topk_overlap`, `|top-K(student) ∩ S_t| / K` with `K = top_k`.
+Padded vocabulary ids never enter the student's top-K. The loss renormalizes on
+`S_t`, so it never sees where the student puts the rest of its mass; these
+metrics show how far the student's own top-K is from the support it is
+trained on. The diagnostic costs one extra chunked no-grad top-K pass over the
+student logits.
 
 ### W2S-OPD restrictions
 

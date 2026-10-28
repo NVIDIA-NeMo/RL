@@ -753,4 +753,7 @@ data_plane:
 #     top_k: 32                     # proxy support size K, >= 2
 #     chunk_size: 128               # sequence chunk bounding the fp32 working set
 #     payload_dtype: bfloat16       # dtype of the anchor/positive arm rows
+#     log_student_entropy: false    # also report the student's full-vocab entropy
+#     log_proxy_agreement: false    # also report student-vs-proxy top-1 agreement and
+#                                   # top-K overlap (K = top_k)
 on_policy_distillation: null

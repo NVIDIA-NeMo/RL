@@ -482,6 +482,29 @@ def test_opd_full_reports_the_decomposition_residual():
     )
 
 
+def test_opd_full_reports_student_entropy_without_the_decomposition():
+    """log_student_entropy needs no teacher cross entropy and adds only that metric."""
+    loss_fn = _loss_fn(opd_full=_full(log_student_entropy=True))
+    assert set(loss_fn.metric_normalizations) - set(
+        _loss_fn().metric_normalizations
+    ) == {"opd_full_entropy"}
+    assert loss_fn.metric_normalizations["opd_full_entropy"] is MetricNormalizer.TOKENS
+
+    entropy = torch.tensor([[-1.0, -2.0, -3.0], [-4.0, -5.0, -100.0]])
+    _, metrics = loss_fn(
+        data=_microbatch(),
+        global_valid_seqs=_GLOBAL_VALID_SEQS,
+        global_valid_toks=_GLOBAL_VALID_TOKS,
+        opd_full_divergence=_DIVERGENCE,
+        opd_full_entropy=entropy,
+    )
+
+    # Position [1, 2] is masked out by token_mask.
+    assert metrics["opd_full_entropy"] == pytest.approx((1 + 2 + 3 + 4 + 5) / 5)
+    assert "opd_full_cross_entropy" not in metrics
+    assert "opd_full_decomposition_error" not in metrics
+
+
 def test_opd_full_decomposition_residual_is_masked():
     """A residual at a masked position must not fail an otherwise clean step."""
     entropy = torch.tensor([[-2.0, -2.0, -2.0], [-2.0, -2.0, 0.0]])
@@ -970,6 +993,40 @@ def test_prepare_loss_input_projects_the_payload_and_drops_the_last_position(
     assert loss_input["opd_full_entropy"] is None
     assert loss_input["opd_full_cross_entropy"] is None
     assert "next_token_logprobs" not in loss_input
+
+
+def test_prepare_loss_input_computes_only_the_student_entropy_when_asked(
+    _single_rank_collectives,
+):
+    """log_student_entropy runs the entropy kernel alone, never the cross entropy."""
+    torch.manual_seed(12)
+    batch_size, seq_len, hidden, vocab = 2, 5, 3, 6
+    student_logits = torch.randn(batch_size, seq_len, vocab, requires_grad=True)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(batch_size, seq_len, dtype=torch.long),
+            OPD_FULL_HIDDEN_STATES_FIELD: torch.randn(batch_size, seq_len, hidden),
+        }
+    )
+
+    loss_input, _ = prepare_loss_input(
+        student_logits,
+        data,
+        _loss_fn(opd_full=_full(log_student_entropy=True)),
+        vocab_parallel_rank=0,
+        vocab_parallel_group=object(),  # opaque: every collective is neutralized
+        context_parallel_group=None,
+        sampling_params=None,
+        chunk_size=None,
+        teacher_output_layer_weight_by_index={0: torch.randn(vocab, hidden)},
+    )
+
+    student_log_probs = torch.log_softmax(student_logits.detach(), dim=-1)
+    expected = (student_log_probs.exp() * student_log_probs).sum(-1)[:, :-1]
+    torch.testing.assert_close(
+        loss_input["opd_full_entropy"], expected, rtol=1e-5, atol=1e-6
+    )
+    assert loss_input["opd_full_cross_entropy"] is None
 
 
 def test_prepare_loss_input_routes_rows_by_the_teacher_index_column(

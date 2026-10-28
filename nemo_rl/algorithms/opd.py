@@ -147,6 +147,11 @@ class OnPolicyDistillationFullConfig(BaseModel, extra="allow"):
     # Report the entropy/cross-entropy residual against the reverse KL. Roughly
     # doubles the divergence cost; diagnostics only.
     validate_decomposition: bool = False
+    # Report the student's exact next-token entropy over the full vocabulary
+    # (``<prefix>_entropy``), averaged over trained tokens. One extra chunked,
+    # no-grad pass over the student logits; diagnostics only. Unlike
+    # validate_decomposition it needs no teacher logits, so W2S-OPD supports it.
+    log_student_entropy: bool = False
 
     @model_validator(mode="after")
     def validate_positive_sizes(self) -> "OnPolicyDistillationFullConfig":
@@ -190,6 +195,12 @@ class W2SOPDConfig(OnPolicyDistillationFullConfig):
     # Sequence chunk bounding the fp32 proxy and student-logit working set;
     # required here (null is rejected below).
     chunk_size: Optional[int] = 128
+    # Report how closely the student's own ranking follows the proxy support,
+    # averaged over trained tokens: w2s_opd_proxy_top1_agreement (the student's
+    # argmax is the proxy's) and w2s_opd_proxy_topk_overlap (the share of the
+    # student's top-K inside the support, with K = top_k). One extra chunked,
+    # no-grad top-K pass over the student logits; diagnostics only.
+    log_proxy_agreement: bool = False
 
     @model_validator(mode="after")
     def validate_w2s_settings(self) -> "W2SOPDConfig":
