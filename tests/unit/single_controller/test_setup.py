@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import json
 import threading
@@ -227,6 +228,75 @@ def _make_master_config(
     if backend == "dynamo":
         master_config.async_rl.generation_fleet_health.refit_timeout_s = None
     return master_config
+
+
+@pytest.mark.parametrize("use_pool", [False, True])
+def test_spinup_gym_applies_sampling_at_model_only_for_harness_pool(
+    monkeypatch, use_pool
+):
+    env = {
+        "should_use_nemo_gym": True,
+        "nemo_gym": {
+            "config_paths": ["model.yaml", "harnesses.yaml"],
+            "policy_model": {
+                "responses_api_models": {
+                    "vllm_model": {
+                        "sampling_overrides": {
+                            "temperature": 0.9,
+                            "max_tokens": 123,
+                            "frequency_penalty": 0.1,
+                        }
+                    }
+                }
+            },
+        },
+    }
+    if use_pool:
+        env["nemo_gym"]["harness_pool"] = ["env-a", "env-b"]
+    cfg = _make_master_config(env=env)
+    cfg.policy["generation"].update(
+        model_name="training-policy",
+        temperature=0.7,
+        top_p=0.8,
+        max_new_tokens=64,
+    )
+    cfg.token_capture = TokenCaptureConfig(enabled=True)
+    original = copy.deepcopy(cfg.env)
+    actor = object()
+    captured = []
+
+    def build_actors(env_config, **kwargs):
+        captured.append(env_config)
+        assert kwargs["model_name"] == "training-policy"
+        assert kwargs["token_capture"]["enabled"]
+        return actor
+
+    monkeypatch.setattr(sc_setup_mod, "build_nemo_gym_actors", build_actors)
+    monkeypatch.setattr(sc_setup_mod, "router_replay_enabled", lambda _cfg: False)
+    result, _ = sc_setup_mod._spinup_gym(
+        cfg, ["http://policy/v1"], tokenizer=None, policy_api_key=None
+    )
+
+    assert result is actor
+    assert cfg.env == original
+    actual = captured[0]
+    if use_pool:
+        assert actual is not cfg.env
+        assert (
+            actual["nemo_gym"]["config_paths"]
+            is not cfg.env["nemo_gym"]["config_paths"]
+        )
+        assert actual["nemo_gym"]["policy_model"]["responses_api_models"]["vllm_model"][
+            "sampling_overrides"
+        ] == {
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "max_tokens": 64,
+            "frequency_penalty": 0.1,
+        }
+    else:
+        assert actual is cfg.env
+        assert actual == original
 
 
 def _native_tq_metadata(

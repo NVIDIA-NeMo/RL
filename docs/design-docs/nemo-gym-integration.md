@@ -68,6 +68,95 @@ setting at configuration time rather than ignoring it).
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
+### Route one task's rollouts across session harnesses
+
+SingleController GRPO can choose a session harness independently for each
+generation of a typed Gym task. Set `env.nemo_gym.harness_pool` to an ordered
+list of **environment instance names**. Each instance must use Gym's typed
+`single_agent_turn` server, bind a distinct agent, and share the same resources
+server/verifier. Gym owns sandbox/session creation and cleanup as usual.
+
+This initial path requires `token_capture.enabled: true`, one unsharded Gym
+actor, and text tasks. Ordinary GRPO, distillation/teacher routing, and VLM
+training reject the setting. The existing single-agent path is unchanged when
+the pool is absent. No Gym submodule update is required.
+
+For example, the following is a configuration fragment for a SingleController
+recipe. Supply the sandbox provider configuration and a typed SWE-rebench task
+dataset separately; this fragment alone is not a complete training recipe.
+
+```yaml
+token_capture:
+  enabled: true
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    harness_pool: [swe_opencode, swe_pi]
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/opencode_agent/configs/opencode_agent.yaml
+      - responses_api_agents/pi_agent/configs/pi_agent.yaml
+      - resources_servers/swe_rebench/configs/swe_rebench.yaml
+    swe_rebench_resources_server:
+      resources_servers:
+        swe_rebench:
+          allowed_agents: [opencode_agent, pi_agent]
+    swe_opencode:
+      environment_servers:
+        single_agent_turn:
+          entrypoint: app.py
+          agent_server: {type: responses_api_agents, name: opencode_agent}
+          resources_server: {type: resources_servers, name: swe_rebench_resources_server}
+    swe_pi:
+      environment_servers:
+        single_agent_turn:
+          entrypoint: app.py
+          agent_server: {type: responses_api_agents, name: pi_agent}
+          resources_server: {type: resources_servers, name: swe_rebench_resources_server}
+```
+
+Input JSONL rows contain `task_id: {taskset: ..., task_id: ...}` and
+`task_input: {responses_create_params: ..., task_data: ...}`. Put the benchmark's
+task fields under `task_data`, using the resources server's schema. RL preserves
+`task_input.responses_create_params` because session harnesses own their request
+parameters. The original dataset need not contain an `agent_ref` or a preselected
+environment.
+
+Pool setup applies `policy.generation.temperature`, `top_p`, and `max_new_tokens`
+to the shared policy model's `sampling_overrides` (`max_new_tokens` becomes
+`max_tokens`). This controls each model call, including calls made inside a
+harness; it is not a total token budget for the episode. Other model sampling
+overrides are preserved. SingleController uses this training profile throughout
+the run and has no validation loop.
+
+The selector computes SHA-256 over compact UTF-8 JSON
+`["nemo-rl-harness-v1", taskset, task_id, group_id, generation_index]`, then takes
+the full digest modulo the pool size. The controller supplies the durable group
+and generation index, so a partial sibling retry chooses the same harness even
+when its physical token-capture ID changes. Keep pool membership and order fixed
+when resuming a run. Hashing does not guarantee that every prompt group visits
+every harness, and it does not expand the number of generations.
+
+All selected harnesses must use the RL-injected `policy_model` endpoint, so
+weight refits and token/logprob capture stay on the training policy. Setup rejects
+agents with missing, null, or external model-server references, and agents with
+more than one configuration. The result
+retains `ng_agent_server` and `ng_environment_server`; recovery records keep the
+actual agent for each sibling, and finalized training-row tags include that
+agent. Rewards are normalized over the original prompt group, including its
+different harnesses, rather than splitting the group by harness. Metrics are
+attributed to each completion's actual agent. A handled typed episode failure
+is propagated to the rollout failure policy, never treated as a zero-reward
+success.
+
+Pool support introduces recovery checkpoint schema v4. It reads v2/v3 snapshots
+and preserves their homogeneous-agent behavior; older RL versions cannot read a
+v4 snapshot. A first smoke should exercise two harnesses, retry one sibling,
+check capture/reward attribution, and complete one optimizer update before
+increasing concurrency. A small coding model is suitable for checking the
+integration but does not establish benchmark quality or training convergence.
+
 ### Shard NeMo Gym across nodes
 
 NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.

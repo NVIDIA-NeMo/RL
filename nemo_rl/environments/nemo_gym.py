@@ -63,6 +63,13 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_harnesses import (
+    HarnessRoute,
+    parse_harness_pool,
+    resolve_harness_pool,
+    route_harness_rows,
+    unwrap_harness_result,
+)
 from nemo_rl.environments.nemo_gym_multimodal import (
     _has_image_before_first_trainable_output,
     _index_per_turn_images,
@@ -463,6 +470,8 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # Ordered typed Environment instances; consumed by RL, not Gym global config.
+    harness_pool: NotRequired[list[str] | None]
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -823,6 +832,7 @@ class NemoGym(EnvironmentInterface):
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
+        self._harness_routes: tuple[HarnessRoute, ...] = ()
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -1015,8 +1025,29 @@ Depending on your data shape, you may want to change these values."""
         )
 
         try:
+            harness_pool = self.cfg.get("harness_pool")
+            if harness_pool is not None:
+                # Resolve after Gym expands config_paths, before accepting any rollout.
+                from nemo_gym.global_config import get_global_config_dict
+                from omegaconf import OmegaConf
+
+                resolved = OmegaConf.to_container(
+                    get_global_config_dict(), resolve=True
+                )
+                if not isinstance(resolved, dict):
+                    raise ValueError("Gym global configuration must be a mapping")
+                resolved_config: dict[str, Any] = {}
+                for key, value in resolved.items():
+                    if not isinstance(key, str):
+                        raise ValueError(
+                            "Gym global configuration keys must be strings"
+                        )
+                    resolved_config[key] = value
+                self._harness_routes = resolve_harness_pool(
+                    harness_pool, resolved_config
+                )
             _wait_for_external_services(self.cfg.get("external_service_readiness"))
-        except TimeoutError:
+        except (TimeoutError, ValueError, TypeError):
             # RunHelper.start() has already spawned local Gym services. Do not
             # leave them behind when an external dependency misses its deadline.
             # Clear the handle first, as shutdown() does: the caller's teardown
@@ -1228,6 +1259,11 @@ Depending on your data shape, you may want to change these values."""
 
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
 
+        if self.cfg.get("harness_pool") is not None:
+            if not self._token_capture_enabled:
+                raise ValueError("harness_pool requires SingleController token capture")
+            route_harness_rows(nemo_gym_examples, self._harness_routes)
+
         # Normalize local media before shipping requests to vLLM. Helper is a no-op
         # for text-only rows and already-qualified URLs.
         # Megatron's HTTP backend consumes the same normalized Responses payload.
@@ -1238,86 +1274,96 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
-        # Gym resolves task_source to agent_ref synchronously in run_examples().
-        # Build the counter afterward so completion rows use the resolved identity.
-        _require_resolved_agent_refs(nemo_gym_examples)
-        counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
+        try:
+            # Gym resolves task_source to agent_ref synchronously in run_examples().
+            # Build the counter afterward so completion rows use the resolved identity.
+            _require_resolved_agent_refs(nemo_gym_examples)
+            counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
-        num_results = 0
-        for task in nemo_gym_result_iterator:
-            with timer.time(label=f"{timer_prefix}/await_results"):
-                try:
-                    nemo_gym_row, nemo_gym_result = await task
-                except Exception as error:
-                    if hasattr(error, "response_content"):
-                        print(
-                            "EXCEPTION RESULT",
-                            error.response_content,
-                            file=sys.stderr,
+            num_results = 0
+            for task in nemo_gym_result_iterator:
+                with timer.time(label=f"{timer_prefix}/await_results"):
+                    try:
+                        nemo_gym_row, nemo_gym_result = await task
+                    except Exception as error:
+                        if hasattr(error, "response_content"):
+                            print(
+                                "EXCEPTION RESULT",
+                                error.response_content,
+                                file=sys.stderr,
+                            )
+                        typed = _typed_gym_failure(error)
+                        if typed is not None:
+                            # `from None`, deliberately: chaining the original would put the
+                            # unpicklable exception back on the wire as __cause__ and undo
+                            # the whole point. The status and message are already in `detail`.
+                            raise typed from None
+                        raise
+
+                with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                    if self.cfg.get("harness_pool") is not None:
+                        nemo_gym_result = unwrap_harness_result(
+                            nemo_gym_row, nemo_gym_result
                         )
-                    typed = _typed_gym_failure(error)
-                    if typed is not None:
-                        # `from None`, deliberately: chaining the original would put the
-                        # unpicklable exception back on the wire as __cause__ and undo
-                        # the whole point. The status and message are already in `detail`.
-                        raise typed from None
-                    raise
-
-            with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if self._token_capture_enabled:
-                    # Receipt mode: fetch the ledger manifest and assemble the
-                    # receipt locally; token-free result. The canonical row is
-                    # rebuilt by the finalizer, so no message_log walk (and no
-                    # NaN check) applies here.
-                    nemo_rl_result = await self._postprocess_receipt_mode(
-                        nemo_gym_row, nemo_gym_result
+                    if self._token_capture_enabled:
+                        # Receipt mode: fetch the ledger manifest and assemble the
+                        # receipt locally; token-free result. The canonical row is
+                        # rebuilt by the finalizer, so no message_log walk (and no
+                        # NaN check) applies here.
+                        nemo_rl_result = await self._postprocess_receipt_mode(
+                            nemo_gym_row, nemo_gym_result
+                        )
+                    else:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            tokenizer,
+                            include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        )
+                        if _has_nan_generation_logprobs(nemo_rl_result):
+                            raise RuntimeError("Generation logprobs contain NaN")
+                num_results += 1
+                timing_metrics = None
+                if num_results == len(nemo_gym_examples):
+                    timer.stop("_run_rollouts_total")
+                    timing_metrics = timer.get_timing_metrics("sum")
+                    total_time = timing_metrics.pop("_run_rollouts_total")
+                    timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+                        100
+                        * timing_metrics[f"{timer_prefix}/postprocess_results"]
+                        / total_time
                     )
-                else:
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_row,
-                        nemo_gym_result,
-                        tokenizer,
-                        include_initial_multimodal_data=not deduplicate_multimodal_data,
+
+                agent_name = nemo_gym_row["agent_ref"]["name"]
+                counts_left[agent_name] -= 1
+                if counts_left[agent_name] <= 0:
+                    counts_left.pop(agent_name)
+                if num_results % 10 == 0 and counts_left:
+                    top_left = counts_left.most_common(5)
+                    top_left_str = "\n".join(
+                        f"{index + 1}. {name}: {count}"
+                        for index, (name, count) in enumerate(top_left)
                     )
-                    if _has_nan_generation_logprobs(nemo_rl_result):
-                        raise RuntimeError("Generation logprobs contain NaN")
-            num_results += 1
-            timing_metrics = None
-            if num_results == len(nemo_gym_examples):
-                timer.stop("_run_rollouts_total")
-                timing_metrics = timer.get_timing_metrics("sum")
-                total_time = timing_metrics.pop("_run_rollouts_total")
-                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100
-                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
-                    / total_time
-                )
+                    print(
+                        "Top 5 NeMo Gym agent refs left in this rollout batch: "
+                        f"{top_left_str}",
+                        file=sys.stderr,
+                    )
 
-            agent_name = nemo_gym_row["agent_ref"]["name"]
-            counts_left[agent_name] -= 1
-            if counts_left[agent_name] <= 0:
-                counts_left.pop(agent_name)
-            if num_results % 10 == 0 and counts_left:
-                top_left = counts_left.most_common(5)
-                top_left_str = "\n".join(
-                    f"{index + 1}. {name}: {count}"
-                    for index, (name, count) in enumerate(top_left)
+                # task_source is resolved to agent_ref inside this Ray actor, after
+                # the caller's row was serialized. Return the resolved ref explicitly
+                # so the caller can hydrate its own row copy before postprocessing.
+                yield (
+                    nemo_gym_row["_rowidx"],
+                    nemo_gym_row["agent_ref"],
+                    nemo_rl_result,
+                    timing_metrics,
                 )
-                print(
-                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
-                    f"{top_left_str}",
-                    file=sys.stderr,
-                )
-
-            # task_source is resolved to agent_ref inside this Ray actor, after
-            # the caller's row was serialized. Return the resolved ref explicitly
-            # so the caller can hydrate its own row copy before postprocessing.
-            yield (
-                nemo_gym_row["_rowidx"],
-                nemo_gym_row["agent_ref"],
-                nemo_rl_result,
-                timing_metrics,
-            )
+        finally:
+            if self.cfg.get("harness_pool") is not None:
+                # Typed episode failures arrive as successful HTTP responses. Stop
+                # pending client requests before the controller retries the group.
+                await nemo_gym_result_iterator.aclose()
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict
@@ -2098,6 +2144,8 @@ def build_nemo_gym_config(
     nemo_gym_dict = dict(env_configs["nemo_gym"])
 
     shard_plan = parse_shard_plan(nemo_gym_dict)
+    if shard_plan is not None and nemo_gym_dict.get("harness_pool") is not None:
+        raise ValueError("harness_pool requires one unsharded Gym actor")
     if shard_plan is not None:
         raise ShardConfigError(
             f"env.nemo_gym.shards defines {len(shard_plan.shards)} shards "
@@ -2132,6 +2180,14 @@ def _build_gym_actor_config(
     same treatment of NeMo-RL-side keys regardless of how it was composed.
     """
     nemo_gym_dict = dict(nemo_gym_dict)
+
+    harness_pool = parse_harness_pool(nemo_gym_dict.pop("harness_pool", None))
+    if harness_pool is not None and not (
+        token_capture and token_capture.get("enabled")
+    ):
+        raise ValueError(
+            "harness_pool requires SingleController with token_capture.enabled=true"
+        )
 
     # NeMo-RL-only keys are consumed here and must never reach Gym: the merged
     # config is serialized into every Gym child process, and unrecognized
@@ -2187,6 +2243,7 @@ def _build_gym_actor_config(
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
+        harness_pool=harness_pool,
         **port_range,
         **multimodal_flags,
     )
@@ -2414,6 +2471,8 @@ def build_nemo_gym_actors(
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
     plan = parse_shard_plan(nemo_gym_dict)
+    if plan is not None and nemo_gym_dict.get("harness_pool") is not None:
+        raise ValueError("harness_pool requires one unsharded Gym actor")
 
     if plan is None:
         return _build_single_gym_actor(

@@ -29,6 +29,7 @@ from pydantic import ValidationError
 from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -36,6 +37,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     GenerationRouterConfig,
     MasterConfig,
     RolloutFailureConfig,
+    TokenCaptureConfig,
     WatchdogConfig,
     validate_single_controller_config,
 )
@@ -81,6 +83,64 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
         env={"should_use_nemo_gym": True},
         checkpointing={"enabled": False, "metric_name": None},
     )
+
+
+def test_harness_pool_accepts_text_grpo_with_token_capture():
+    cfg = _master_config()
+    cfg.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    cfg.env["nemo_gym"] = {"harness_pool": ["env-a", "env-b"]}
+    cfg.token_capture = TokenCaptureConfig(enabled=True)
+    validate_single_controller_config(cfg)
+
+
+@pytest.mark.parametrize("pool", [[], "env-a", ["env-a", "env-a"], [""], [3]])
+def test_harness_pool_rejects_invalid_names(pool):
+    cfg = _master_config()
+    cfg.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    cfg.env["nemo_gym"] = {"harness_pool": pool}
+    cfg.token_capture = TokenCaptureConfig(enabled=True)
+    with pytest.raises(ValueError, match="nonempty list of distinct"):
+        validate_single_controller_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("setting", "message"),
+    [
+        ("capture", "token_capture.enabled=true"),
+        ("native", "should_use_nemo_gym=true"),
+        ("shards", "unsharded"),
+        ("vlm", "text-only"),
+        ("ppo", "SingleController GRPO without OPD"),
+        ("opd", "SingleController GRPO without OPD"),
+    ],
+)
+def test_harness_pool_rejects_unsupported_training_paths(setting, message):
+    cfg = _master_config()
+    cfg.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    cfg.env["nemo_gym"] = {"harness_pool": ["env-a", "env-b"]}
+    cfg.token_capture = TokenCaptureConfig(enabled=setting != "capture")
+    if setting == "native":
+        cfg.env["should_use_nemo_gym"] = False
+    elif setting == "shards":
+        cfg.env["nemo_gym"]["shards"] = []
+    elif setting == "vlm":
+        cfg.policy["is_vlm"] = True
+    elif setting == "ppo":
+        cfg.ppo = PPOConfig.model_construct()
+        cfg.grpo = None
+    elif setting == "opd":
+        cfg.on_policy_distillation = OnPolicyDistillationConfig(enabled=True)
+    with pytest.raises(ValueError, match=message):
+        validate_single_controller_config(cfg)
 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
