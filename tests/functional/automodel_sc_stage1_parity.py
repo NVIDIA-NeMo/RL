@@ -156,7 +156,8 @@ def run(args):
     cfg.policy.sequence_packing.enabled = False
     cfg.policy.automodel_cfg.deterministic = True
     cfg.policy.automodel_cfg.expert_parallel_size = 1
-    cfg.policy.automodel_cfg.automodel_kwargs.backend.dispatcher = "torch"
+    if "backend" in cfg.policy.automodel_cfg.automodel_kwargs:
+        cfg.policy.automodel_cfg.automodel_kwargs.backend.dispatcher = "torch"
     cfg.policy.generation.colocated.enabled = False
     # Keep the checkpoint's full-precision parameters and use a simple reference
     # optimizer whose complete state can be compared, including its step counter.
