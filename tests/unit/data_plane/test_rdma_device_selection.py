@@ -244,21 +244,14 @@ def test_nixl_defaults_ucx_to_rdma_only(clean_env, monkeypatch, preset):
     assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
 
 
-@pytest.mark.parametrize("require_rdma", [None, True, False])
-def test_nixl_launcher_tcp_fails_on_the_driver(clean_env, monkeypatch, require_rdma):
-    """A launcher's tcp UCX_TLS fails at configure time unless require_rdma is off."""
+def test_nixl_launcher_tcp_fails_on_the_driver(clean_env, monkeypatch):
+    """A launcher's tcp UCX_TLS fails at configure time; RDMA has no opt-out."""
     from nemo_rl.data_plane.nixl.errors import TransportPolicyError
 
     monkeypatch.setenv("UCX_TLS", "rc,tcp,self")
     monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
-    cfg = {**_mooncake_cfg(), "backend": "nixl"}
-    if require_rdma is not None:
-        cfg["nixl"] = {"require_rdma": require_rdma}
-    if require_rdma is False:
-        tq_env.configure_engine_env(cfg)  # opted out: left to the user
-    else:
-        with pytest.raises(TransportPolicyError, match="tcp"):
-            tq_env.configure_engine_env(cfg)
+    with pytest.raises(TransportPolicyError, match="tcp"):
+        tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
     assert os.environ["UCX_TLS"] == "rc,tcp,self"  # never overridden
 
 
