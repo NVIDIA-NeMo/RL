@@ -90,6 +90,12 @@ def main() -> None:
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
         config = MasterConfig(**config)
+        if config.env.get("should_use_nemo_gym"):
+            raise ValueError(
+                "env.should_use_nemo_gym=true: run this config with "
+                "examples/nemo_gym/run_grpo_nemo_gym.py, which prepares the "
+                "NeMo-Gym config and binds the Gym actor. This launcher does neither."
+            )
         print("Applied CLI overrides")
 
     # Print config
@@ -170,14 +176,6 @@ def main() -> None:
                     val_dataset,
                     policy_factory=make_policy_factory(config.data_plane),
                 )
-
-            # ``setup`` owns NeMo-Gym spinup because it must bind Gym to the
-            # generation endpoints reserved during worker initialization.  The
-            # rollout APIs consume that actor through the canonical
-            # ``"nemo_gym"`` route, rather than through a dataset task name.
-            if _nemo_gym is not None:
-                task_to_env["nemo_gym"] = _nemo_gym
-                val_task_to_env["nemo_gym"] = _nemo_gym
 
             rl_init_timer.record("total", time.perf_counter() - main_start)
 
