@@ -313,6 +313,7 @@ data:
 
 logger:
   log_dir: "logs"  # Base directory for all logs
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
   mlflow_enabled: false
