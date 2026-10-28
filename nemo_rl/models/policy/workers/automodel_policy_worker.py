@@ -51,7 +51,10 @@ from nemo_rl.models.automodel.data import (
     process_global_batch,
 )
 from nemo_rl.models.automodel.model_handle import ModelRuntime
-from nemo_rl.models.automodel.pipeline_batch import plan_execution_batches
+from nemo_rl.models.automodel.pipeline_batch import (
+    ExecutionBatch,
+    plan_execution_batches,
+)
 from nemo_rl.models.automodel.pipeline_parallel import (
     broadcast_object_from_last_stage,
     broadcast_tensor_from_last_stage,
@@ -895,17 +898,7 @@ class AutomodelPolicyWorkerImpl(
                     "(policy.train_micro_batch_size), but this call requested "
                     f"mbs={update.mbs}."
                 )
-            execution_batches = plan_execution_batches(
-                data,
-                model=self.model_runtime.parts[0],
-                micro_batch_size=update.mbs,
-                microbatches_per_step=pipeline.pp_batch_size
-                // pipeline.pp_microbatch_size,
-                dp_group=self.dp_mesh.get_group(),
-                tokenizer=self.tokenizer,
-                cfg=self.cfg,
-                allow_flash_attn_args=self.allow_flash_attn_args,
-            )
+            execution_batches = self._plan_execution_batches(data, update.mbs)
             mb_results = pipeline_forward_backward(
                 self.model_runtime,
                 execution_batches,
@@ -1226,6 +1219,25 @@ class AutomodelPolicyWorkerImpl(
         self.timer.stop("get_logprobs")
         return return_data
 
+    def _plan_execution_batches(
+        self, data: BatchedDataDict[Any], micro_batch_size: int
+    ) -> list[ExecutionBatch]:
+        """Split this rank's ``data`` into the pipeline's schedule calls."""
+        pipeline = self.model_runtime.pipeline
+        return plan_execution_batches(
+            data,
+            model=self.model_runtime.parts[0],
+            micro_batch_size=micro_batch_size,
+            microbatches_per_step=pipeline.pp_batch_size // pipeline.pp_microbatch_size,
+            dp_group=self.dp_mesh.get_group(),
+            tokenizer=self.tokenizer,
+            cfg=self.cfg,
+            allow_flash_attn_args=self.allow_flash_attn_args,
+            device_mesh=self.device_mesh,
+            cp_size=self.cp_size,
+            padding_token_id=self.tokenizer.pad_token_id or 0,
+        )
+
     @torch.no_grad()
     def _get_pipeline_logprobs(
         self,
@@ -1251,16 +1263,7 @@ class AutomodelPolicyWorkerImpl(
                 f"micro_batch_size={micro_batch_size}."
             )
         data.to("cuda")
-        execution_batches = plan_execution_batches(
-            data,
-            model=runtime.parts[0],
-            micro_batch_size=micro_batch_size,
-            microbatches_per_step=pipeline.pp_batch_size // pipeline.pp_microbatch_size,
-            dp_group=self.dp_mesh.get_group(),
-            tokenizer=self.tokenizer,
-            cfg=self.cfg,
-            allow_flash_attn_args=self.allow_flash_attn_args,
-        )
+        execution_batches = self._plan_execution_batches(data, micro_batch_size)
         token_logprobs = pipeline_forward_logprobs(
             runtime,
             execution_batches,

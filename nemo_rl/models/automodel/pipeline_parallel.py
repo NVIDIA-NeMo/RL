@@ -145,7 +145,7 @@ class PipelineOutputAdapter:
             logits,
             context.post_processing_fn,
             context.execution_batch.microbatches[mb_index],
-            cp_sharder=None,
+            cp_sharder=context.execution_batch.cp_sharder,
             global_valid_seqs=context.global_valid_seqs,
             global_valid_toks=context.global_valid_toks,
             sampling_params=context.sampling_params,
@@ -182,21 +182,25 @@ def _run_schedule_call(
     """
     pipeline = runtime.pipeline
     info = pipeline.info
-    pipeline.update_seq_len(execution_batch.seq_len)
-
     model_inputs = dict(execution_batch.model_inputs)
     input_ids = model_inputs.pop("input_ids")
     args = (input_ids,) if info.has_first_stage else ()
     target = execution_batch.sample_ids if info.has_last_stage else None
     run = info.schedule.eval if forward_only else info.schedule.step
-    run(
-        *args,
-        target=target,
-        losses=None,
-        return_outputs=False,
-        loss_kwargs={"context": context},
-        **model_inputs,
-    )
+    with execution_batch.model_context_factory():
+        # Context parallelism may shard the inputs in place on entering the
+        # context, so the stage shapes follow the length inside it. Models
+        # that shard inside their own forward keep full-length inputs here and
+        # describe their local activations through their stage-metadata hook.
+        pipeline.update_seq_len(input_ids.shape[1])
+        run(
+            *args,
+            target=target,
+            losses=None,
+            return_outputs=False,
+            loss_kwargs={"context": context},
+            **model_inputs,
+        )
     if forward_only:
         # Forward-only calls never pop the forward cache; release it now.
         for stage in info.stages:

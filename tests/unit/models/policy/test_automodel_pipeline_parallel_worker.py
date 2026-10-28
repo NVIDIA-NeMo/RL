@@ -123,6 +123,7 @@ def _policy_config(
     train_global_batch_size: int = 8,
     precision: str = "float32",
     tp_size: int = 1,
+    cp_size: int = 1,
     ep_size: int = 1,
     defer_fsdp_grad_sync: bool = False,
     automodel_kwargs: dict | None = None,
@@ -139,7 +140,7 @@ def _policy_config(
         "sequence_parallel": False,
         "activation_checkpointing": False,
         "tensor_parallel_size": tp_size,
-        "context_parallel_size": 1,
+        "context_parallel_size": cp_size,
         "pipeline_parallel_size": pp_size,
         "expert_parallel_size": ep_size,
         "defer_fsdp_grad_sync": defer_fsdp_grad_sync,
@@ -385,6 +386,24 @@ def test_pipeline_with_tensor_parallel(tiny_untied_llama_path, reference_runs):
         NLLLossFn(),
     )
     _assert_runs_close(reference_runs["nll"], actual)
+
+
+@pytest.mark.timeout(900)
+def test_pipeline_with_context_parallel_matches_non_pipelined(tiny_untied_llama_path):
+    """PP=2 with CP=2 inside each stage reproduces the non-pipelined CP=2 run.
+
+    Both runs have one data-parallel rank and shard sequences the same way;
+    only the layer split differs.
+    """
+    if torch.cuda.device_count() < 4:
+        pytest.skip("needs 4 GPUs")
+
+    def config(pp_size: int) -> PolicyConfig:
+        return _policy_config(tiny_untied_llama_path, pp_size=pp_size, cp_size=2)
+
+    reference = _run_steps(config(1), 2, "cp_ref", _clipped_pg_loss_fn())
+    actual = _run_steps(config(2), 4, "pp_cp", _clipped_pg_loss_fn())
+    _assert_runs_close(reference, actual)
 
 
 @pytest.mark.timeout(900)

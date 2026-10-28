@@ -62,8 +62,8 @@ policy:
     context_parallel_size: 1
     # Pipeline parallel size. Values > 1 need the `pipeline` block below and an
     # explicit defer_fsdp_grad_sync (false is recommended), and do not support
-    # sequence packing, dynamic batching, LoRA, CP, or non-colocated
-    # generation. See docs/design-docs/automodel-pipeline-parallel.md.
+    # sequence packing, dynamic batching, LoRA, or non-colocated generation.
+    # See docs/design-docs/automodel-pipeline-parallel.md.
     pipeline_parallel_size: 1
     # pipeline:
     #   pp_schedule: "1f1b"  # "1f1b" or "interleaved_1f1b"

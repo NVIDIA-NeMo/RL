@@ -21,11 +21,16 @@ assumes it equals ``gbs / dp`` or that DP ranks hold the same amount.
 """
 
 import math
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Optional
 
 import torch
+from nemo_automodel.components.distributed.context_parallel import (
+    ContextParallelSharder,
+)
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -33,7 +38,10 @@ from nemo_rl.models.automodel.data import (
     ProcessedMicrobatch,
     make_processed_microbatch_iterator,
 )
-from nemo_rl.models.automodel.train import _build_model_batch
+from nemo_rl.models.automodel.train import (
+    _build_model_batch,
+    shard_model_batch_for_cp,
+)
 
 # Masks that make a padding sample contribute nothing to losses or metrics.
 _DUMMY_SAMPLE_MASK_KEYS = ("sample_mask", "token_mask")
@@ -59,9 +67,18 @@ class ExecutionBatch:
     sample_ids: torch.Tensor
     # Model-facing inputs for the whole call. Tensors are [E, ...], the
     # row-wise concatenation of each microbatch's model batch; the schedule
-    # splits them back into the same microbatches.
+    # splits them back into the same microbatches. Under context parallelism
+    # ``cp_sharder`` has prepared them, and entering ``model_context_factory()``
+    # may shard them along the sequence in place.
     model_inputs: dict[str, Any]
-    seq_len: int
+    # The context the schedule call runs in: Automodel's context-parallel
+    # attention context, or ``nullcontext`` without context parallelism.
+    model_context_factory: Callable[[], AbstractContextManager[Any]]
+    # Maps a microbatch's token tensors between the canonical sequence layout
+    # and this rank's context-parallel shard; None without context
+    # parallelism. One sharder serves every microbatch of the call because the
+    # layout depends only on the sequence position.
+    cp_sharder: Optional[ContextParallelSharder]
 
 
 def _check_batch_major_inputs(model: nn.Module, model_batch: dict[str, Any]) -> None:
@@ -76,7 +93,8 @@ def _check_batch_major_inputs(model: nn.Module, model_batch: dict[str, Any]) -> 
 
     Args:
         model: A local model part.
-        model_batch: One microbatch's model-facing inputs.
+        model_batch: One microbatch's model-facing inputs, or a whole call's
+            once a context-parallel hook has prepared them.
     """
     chunk_dims_hook = getattr(model, "get_pipeline_kwargs_chunk_dims", None)
     if chunk_dims_hook is None:
@@ -101,6 +119,9 @@ def plan_execution_batches(
     tokenizer: AutoTokenizer,
     cfg: dict[str, Any],
     allow_flash_attn_args: bool,
+    device_mesh: DeviceMesh,
+    cp_size: int,
+    padding_token_id: int,
 ) -> list[ExecutionBatch]:
     """Split ``data`` into pipeline execution batches.
 
@@ -111,6 +132,8 @@ def plan_execution_batches(
     the same number of schedule calls and FSDP collectives. All execution
     batches keep ``data``'s sequence length, so one training update never
     re-initializes the pipeline stages (which would drop accumulated gradients).
+    Under context parallelism each execution batch is sharded once for all of
+    its microbatches, as Automodel's own pipeline trainer does.
 
     Args:
         data: The rows to plan, already on the training device.
@@ -121,6 +144,10 @@ def plan_execution_batches(
         tokenizer: Tokenizer used to process microbatches.
         cfg: Policy config used to process microbatches.
         allow_flash_attn_args: Whether the model accepts flash-attention kwargs.
+        device_mesh: Device mesh with the ``cp`` axis.
+        cp_size: Context-parallel size.
+        padding_token_id: Token used to pad ``input_ids`` to the
+            context-parallel granularity.
 
     Returns:
         The execution batches in order. Real rows keep their order, so row
@@ -147,7 +174,6 @@ def plan_execution_batches(
                 padded[key][num_samples:] = 0
     else:
         padded = data
-    seq_len = padded["input_ids"].shape[1]
 
     execution_batches = []
     for call_idx in range(num_calls):
@@ -179,6 +205,20 @@ def plan_execution_batches(
             )
             for key, value in model_batches[0].items()
         }
+        if cp_size > 1:
+            # ``torch.cat`` gave the inputs their own storage, so sharding them
+            # in place cannot reach the canonical microbatch data.
+            cp_sharder, model_context_factory, model_inputs = shard_model_batch_for_cp(
+                model,
+                model_inputs,
+                device_mesh=device_mesh,
+                padding_token_id=padding_token_id,
+                num_chunks=microbatches_per_step,
+            )
+            # The model's CP hook may have rewritten inputs.
+            _check_batch_major_inputs(model, model_inputs)
+        else:
+            cp_sharder, model_context_factory = None, nullcontext
         num_real_samples = min(max(num_samples - start, 0), samples_per_call)
         execution_batches.append(
             ExecutionBatch(
@@ -186,7 +226,8 @@ def plan_execution_batches(
                 num_real_microbatches=math.ceil(num_real_samples / micro_batch_size),
                 sample_ids=torch.arange(start, start + samples_per_call),
                 model_inputs=model_inputs,
-                seq_len=seq_len,
+                model_context_factory=model_context_factory,
+                cp_sharder=cp_sharder,
             )
         )
     return execution_batches
