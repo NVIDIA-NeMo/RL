@@ -604,6 +604,7 @@ class _InlineActor:
             return outcome
 
         self.run = SimpleNamespace(remote=_run)
+        self.computer = computer
 
 
 def _controller(
@@ -789,6 +790,11 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     store = _RowStore(_rows())
     ctrl = _controller("grpo", num_actors, store, dump_dir=str(tmp_path))
     asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    # The stage writes in the background; the controller flushes before merging.
+    for computer in [ctrl._advantage_computer] + [
+        actor.computer for actor in ctrl._advantage_actors
+    ]:
+        computer.flush_train_data_dump()
     ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_rows)
 
     rows = [

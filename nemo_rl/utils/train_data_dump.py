@@ -16,7 +16,9 @@
 
 import json
 import math
+import multiprocessing
 import os
+from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -56,11 +58,19 @@ class TrainDataDump:
     which is already true of the log dir the trainer checkpoints into.
     """
 
-    def __init__(self, log_dir: str, *, shard_id: str = "0") -> None:
+    def __init__(
+        self, log_dir: str, *, shard_id: str = "0", background: bool = False
+    ) -> None:
         self.log_dir = Path(log_dir)
         self.shard_id = shard_id
         self.step: int | None = None
         self.rows = 0
+        # background: add_chunk hands the JSON writing to its own process (off
+        # the caller's GIL) and returns; flush() waits for it. At most two
+        # chunks are pending, which bounds the memory held for them.
+        self._background = background
+        self._executor: ProcessPoolExecutor | None = None
+        self._pending: list[Future] = []
 
     def _part_path(self, step: int, shard_id: str) -> Path:
         return self.log_dir / f"train_data_step{step + 1}.jsonl.part-{shard_id}"
@@ -98,22 +108,25 @@ class TrainDataDump:
             self.rows = 0
         mode = "a" if self.step == step else "w"
         self.step = step
-        with part.open(mode) as stream:
-            for i, length in enumerate(lengths):
-                row = {
-                    "step": step + 1,
-                    "sample_id": [sample_ids[i]],
-                    "input_lengths": [length],
-                    "metadata": [tags[i] if tags is not None else {}],
-                }
-                for key in sequences:
-                    row[key] = [columns[key][i][:length].tolist()]
-                for key in scalars:
-                    row[key] = [columns[key][i].tolist()]
-                stream.write(
-                    json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n"
-                )
-                self.rows += 1
+        self.rows += len(sample_ids)
+        args = (part, mode, step, sample_ids, tags, lengths, sequences, scalars)
+        if not self._background:
+            _write_part(*args)
+            return
+        if self._executor is None:
+            # spawn: never fork a process holding Ray and CUDA state.
+            self._executor = ProcessPoolExecutor(
+                max_workers=1, mp_context=multiprocessing.get_context("spawn")
+            )
+        if len(self._pending) == 2:
+            self._pending.pop(0).result()
+        self._pending.append(self._executor.submit(_write_part, *args))
+
+    def flush(self) -> None:
+        """Wait until every chunk handed to the background is written."""
+        pending, self._pending = self._pending, []
+        for future in pending:
+            future.result()
 
     def finish_step(self, step: int, expected_rows: int | None = None) -> None:
         """Merge every shard's part file and publish the step atomically.
@@ -157,3 +170,32 @@ class TrainDataDump:
             part.unlink()
         self.step = None
         self.rows = 0
+
+
+def _write_part(
+    part: Path,
+    mode: str,
+    step: int,
+    sample_ids: list[str],
+    tags: list[dict[str, Any]] | None,
+    lengths: list[int],
+    sequences: dict[str, torch.Tensor],
+    scalars: dict[str, torch.Tensor],
+) -> None:
+    """Write one validated chunk's rows to its part file (maybe in the background)."""
+    columns = {
+        k: list(v.detach().cpu().unbind()) for k, v in {**sequences, **scalars}.items()
+    }
+    with part.open(mode) as stream:
+        for i, length in enumerate(lengths):
+            row = {
+                "step": step + 1,
+                "sample_id": [sample_ids[i]],
+                "input_lengths": [length],
+                "metadata": [tags[i] if tags is not None else {}],
+            }
+            for key in sequences:
+                row[key] = [columns[key][i][:length].tolist()]
+            for key in scalars:
+                row[key] = [columns[key][i].tolist()]
+            stream.write(json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n")

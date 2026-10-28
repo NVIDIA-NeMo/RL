@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import ray
@@ -61,6 +62,10 @@ class AdvantageActor:  # pragma: no cover
         client, so its local store holds rows a data-plane snapshot must see.
         """
         return run_checkpoint_command(body)
+
+    async def flush_train_data_dump(self) -> None:
+        """Wait until this worker's dump chunks are written (before the merge)."""
+        await asyncio.to_thread(self._computer.flush_train_data_dump)
 
     async def run(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one advantage stage without letting payloads cross Ray RPC."""

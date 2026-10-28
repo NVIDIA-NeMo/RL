@@ -315,12 +315,20 @@ class AdvantageComputer:
         self._config = config
         self._advantage_estimator = advantage_estimator
         # One writer per shard: the pool runs these concurrently, so they must
-        # not share a file. The controller merges them on publish.
+        # not share a file. The controller merges them on publish, after
+        # flush_train_data_dump: the JSON is written in the background.
         self._train_data_dump = (
-            TrainDataDump(config.train_data_dump_dir, shard_id=shard_id)
+            TrainDataDump(
+                config.train_data_dump_dir, shard_id=shard_id, background=True
+            )
             if config.train_data_dump_dir is not None
             else None
         )
+
+    def flush_train_data_dump(self) -> None:
+        """Wait until this process's dump chunks are written (before the merge)."""
+        if self._train_data_dump is not None:
+            self._train_data_dump.flush()
 
     async def run(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one call's advantage stage and return its reduced results."""
