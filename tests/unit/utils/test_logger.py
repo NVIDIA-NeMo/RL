@@ -26,8 +26,8 @@ import pytest
 import torch
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
+from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
 from nemo_rl.utils.logger import (
-    TELEMETRY_WALL_TIME_METRIC,
     WANDB_CALLER_STEP_METRIC,
     GPUMonitoringConfig,
     Logger,
@@ -1869,6 +1869,20 @@ class TestLogger:
         assert len(logger.loggers) == 0
         mock_tb_logger.assert_not_called()
         mock_wandb_logger.assert_not_called()
+
+    def test_init_extra_backends(self, temp_dir):
+        """Test initialization with an extra backend loaded by name."""
+        backend_cls = type("StubBackend", (MagicMock,), {})
+        cfg = LoggerConfig(
+            monitor_gpus=False,
+            log_dir=temp_dir,
+            extra_backends=["nemo_rl.utils.logger.TensorboardLogger"],
+        )
+        with patch("nemo_rl.utils.logger.TensorboardLogger", new=backend_cls):
+            logger = Logger(cfg)
+
+        assert len(logger.loggers) == 1
+        assert isinstance(logger.loggers[0], backend_cls)
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
