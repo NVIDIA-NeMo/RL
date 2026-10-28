@@ -220,6 +220,59 @@ def _sealed_attempt_state() -> dict[str, Any]:
     return ledger.state_dict()
 
 
+@pytest.mark.parametrize("schema", [2, 3])
+def test_restore_rejects_capture_receipts_before_v4(schema: int) -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = schema
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    receipt = attempt["receipt"]
+    receipt["rollout_id"] = receipt.pop("capture_key")
+
+    with pytest.raises(
+        ValueError,
+        match="Token-capture rollout checkpoints from before schema v4 cannot be resumed",
+    ):
+        RolloutRecoveryLedger.from_state_dict(state)
+    assert "rollout_id" in receipt
+    assert "capture_key" not in receipt
+
+
+@pytest.mark.parametrize("schema", [2, 3, 4])
+@pytest.mark.parametrize("sealed", [False, True])
+def test_receipt_free_recovery_still_loads(schema: int, sealed: bool) -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = schema
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    attempt["receipt"] = None
+    attempt["staging_keys"] = []
+    if not sealed:
+        state["groups"][0]["status"] = "generating"
+        attempt.update(status="dispatched", reward=None, mask_sample=None)
+    if schema == 2:
+        for key in ("reward_checks", "reward_log_context"):
+            attempt.pop(key)
+
+    sidecar = {
+        **state,
+        "batch_shortfall": {7: 1},
+        "sampler_stamps_target_steps": True,
+    }
+    if schema >= 3:
+        sidecar.update(
+            reward_settings=None,
+            finalizer_metrics_by_group={},
+            finalizer_rewards_by_group={},
+        )
+    parsed = parse_rollout_recovery_state(sidecar)
+    restored = RolloutRecoveryLedger.from_state_dict(parsed.ledger_state)
+    current = restored.get_group("g7").siblings[0].current_attempt
+    assert current.receipt is None
+    assert current.reward == (1.0 if sealed else None)
+    assert parsed.batch_shortfall == {7: 1}
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict()["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
+
+
 @pytest.mark.parametrize(
     ("case", "error_fragment"),
     [
