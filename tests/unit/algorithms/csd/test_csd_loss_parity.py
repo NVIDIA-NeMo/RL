@@ -208,8 +208,8 @@ def _run_csd(
         "csd_noise_filter_topk": knobs["csd_noise_filter_topk"],
         "teacher_topk_ipc_k": v_t if teacher_sparse_payload is not None else 0,
         "teacher_topk_ipc_support_mode": "row_topk",
-        # Full support needs no forced insertion. Keeping this false also makes
-        # dense and sparse mismatch eligibility identical for this regression.
+        # Full support needs no forced insertion. The probability references
+        # below score prefix-support alternatives only, without the realized pair.
         "teacher_topk_ipc_keep_realized": False,
     }
     cfg.update(cfg_overrides or {})
@@ -241,30 +241,92 @@ def _run_csd(
     return loss.detach(), metrics, student_logits.grad.detach()
 
 
-def test_csd_sparse_full_support_matches_dense():
-    """The production sparse consumer matches dense when support is complete."""
-    with tempfile.TemporaryDirectory() as tmp:
-        fx = _build_case("with_mismatch", tmp)
-        dense_loss, dense_metrics, dense_grad = _run_csd(fx)
+def _full_vocab_payload(fx):
+    """Sparse payload at K = V: every teacher id with its exact logZ."""
+    teacher_logits = fx["teacher_logits"].clone()
+    token_ids = torch.arange(fx["v_t"], dtype=torch.int32).view(1, 1, -1)
+    token_ids = token_ids.expand(*teacher_logits.shape).clone()
+    log_z = torch.logsumexp(teacher_logits / fx["knobs"]["temperature"], dim=-1)
+    return (teacher_logits, token_ids, log_z, None)
 
-        teacher_logits = fx["teacher_logits"].clone()
-        token_ids = torch.arange(fx["v_t"], dtype=torch.int32).view(1, 1, -1)
-        token_ids = token_ids.expand(*teacher_logits.shape).clone()
-        sparse_payload = (
-            teacher_logits,
-            token_ids,
-            torch.logsumexp(teacher_logits / fx["knobs"]["temperature"], dim=-1),
-            None,
-        )
+
+def _realized_pair_not_common(fx):
+    """1-to-1 chunks whose realized pair is not a common pair.
+
+    In sample 0, chunk 1 realizes (5, 7), two different common pairs, and
+    chunk 2 realizes (12, 3), a non-common student with a common teacher.
+    """
+    fx = dict(fx)
+    fx["student_ids"] = torch.tensor([[0, 5, 12, 3], [4, 5, 6, 7]])
+    fx["teacher_ids"] = torch.tensor([[0, 7, 3, 3], [4, 5, 6, 7]])
+    return fx
+
+
+def _empty_teacher_prefix(fx):
+    """The 1-to-2 chunk's teacher prefix (7,) has no forward-table pairs."""
+    fx = dict(fx)
+    fx["teacher_ids"] = fx["teacher_ids"].clone()
+    fx["teacher_ids"][:, 1] = 7
+    return fx
+
+
+def _chain_longer_than_table(fx):
+    """A 1-to-3 chunk longer than the forward table's longest chain (2)."""
+    fx = dict(fx)
+    generator = torch.Generator().manual_seed(5)
+    fx["student_ids"] = torch.tensor([[5, 9, 5], [6, 9, 6]])
+    fx["teacher_ids"] = torch.tensor([[8, 3, 1, 5], [8, 4, 2, 6]])
+    fx["teacher_logits"] = torch.randn(2, 4, fx["v_t"], generator=generator)
+    fx["s_spans"] = torch.tensor([[[0, 1], [1, 3]]] * 2)
+    fx["t_spans"] = torch.tensor([[[0, 3], [3, 4]]] * 2)
+    return fx
+
+
+_FULL_SUPPORT_CASES = {
+    "with_mismatch": ("with_mismatch", None),
+    "mismatch_only": ("mismatch_only", None),
+    "realized_pair_not_common": ("common_only", _realized_pair_not_common),
+    "empty_teacher_prefix": ("with_mismatch", _empty_teacher_prefix),
+    "chain_longer_than_table": ("mismatch_only", _chain_longer_than_table),
+}
+
+
+@pytest.mark.parametrize("keep_realized", [False, True])
+@pytest.mark.parametrize("case", sorted(_FULL_SUPPORT_CASES))
+def test_csd_sparse_full_support_matches_dense(case, keep_realized):
+    """Dense K=0 and sparse K=V optimize the same loss for either keep setting."""
+    base, mutate = _FULL_SUPPORT_CASES[case]
+    overrides = {"teacher_topk_ipc_keep_realized": keep_realized}
+    with tempfile.TemporaryDirectory() as tmp:
+        fx = _build_case(base, tmp)
+        if mutate is not None:
+            fx = mutate(fx)
+        dense_loss, dense_metrics, dense_grad = _run_csd(fx, cfg_overrides=overrides)
         sparse_loss, sparse_metrics, sparse_grad = _run_csd(
             fx,
-            teacher_sparse_payload=sparse_payload,
+            teacher_sparse_payload=_full_vocab_payload(fx),
+            cfg_overrides=overrides,
         )
 
     torch.testing.assert_close(sparse_loss, dense_loss, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(sparse_grad, dense_grad, rtol=1e-5, atol=1e-6)
     assert sparse_metrics["num_common_chunks"] == dense_metrics["num_common_chunks"]
     assert sparse_metrics["num_mismatch_chunks"] == dense_metrics["num_mismatch_chunks"]
+
+
+def test_csd_dense_keep_realized_scores_chunks_without_table_support():
+    """Dense K=0 scores a chunk without table alternatives only when kept."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fx = _empty_teacher_prefix(_build_case("with_mismatch", tmp))
+        _, skip_metrics, _ = _run_csd(
+            fx, cfg_overrides={"teacher_topk_ipc_keep_realized": False}
+        )
+        _, keep_metrics, _ = _run_csd(
+            fx, cfg_overrides={"teacher_topk_ipc_keep_realized": True}
+        )
+
+    assert skip_metrics["num_mismatch_chunks"] == 2
+    assert keep_metrics["num_mismatch_chunks"] == 4
 
 
 def test_csd_dense_teacher_stays_cp_local_and_slices_padded_vocab(monkeypatch):
@@ -863,11 +925,12 @@ def test_csd_realized_only_mismatch_sparse_rows_match_dense(tmp_path):
 
 
 def test_csd_realized_only_mismatch_leaves_common_chunks_unchanged(tmp_path):
-    """The option changes mismatch scoring only; 1-to-1 chunks are untouched."""
+    """With the realized pair kept, the option changes mismatch scoring only."""
     fx = _build_case("with_mismatch", str(tmp_path))
-    prefix_overrides = {**_REALIZED_ONLY, "csd_realized_only_mismatch": False}
+    realized_overrides = {**_REALIZED_ONLY, "teacher_topk_ipc_keep_realized": True}
+    prefix_overrides = {**realized_overrides, "csd_realized_only_mismatch": False}
     _, prefix_metrics, _ = _run_csd(fx, cfg_overrides=prefix_overrides)
-    _, realized_metrics, _ = _run_csd(fx, cfg_overrides=_REALIZED_ONLY)
+    _, realized_metrics, _ = _run_csd(fx, cfg_overrides=realized_overrides)
     assert realized_metrics["num_common_chunks"] == prefix_metrics["num_common_chunks"]
     assert realized_metrics["kl_common_per_chunk"] == pytest.approx(
         prefix_metrics["kl_common_per_chunk"]

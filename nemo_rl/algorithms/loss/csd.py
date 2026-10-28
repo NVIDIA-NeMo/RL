@@ -176,6 +176,10 @@ class CSDLossConfig(BaseModel, extra="allow"):
     # (the KD then compares top-k plus a REST bucket); zero sends dense logits.
     teacher_topk_ipc_k: Annotated[int, Field(ge=0)] = 128
     teacher_topk_ipc_support_mode: Literal["row_topk"] = "row_topk"
+    # Keep each chunk's realized (student, teacher) pair in the compared
+    # support (1-to-1 chunks drop common pairs sharing only one token with
+    # it), for dense and sparse transport alike; sparse transport keeps at
+    # most k-1 other alternatives.
     teacher_topk_ipc_keep_realized: bool = True
     # Owner-local evaluation (eligible Megatron students): selected student or
     # teacher rows per tile, and alignment chunks evaluated per batch. Both
@@ -1335,6 +1339,17 @@ class CSDLossFn(LossFunction):
         mapping[common_teacher_idx_t[valid]] = common_student_idx_t[valid]
         self._csd_teacher_to_common_student_per_device[cache_key] = mapping
         return mapping
+
+    @staticmethod
+    def _common_column_lookup(common_ids: torch.Tensor, size: int) -> torch.Tensor:
+        """Common-pair column of each token id, or -1 for non-common ids."""
+        lookup = torch.full(
+            (int(size),), -1, dtype=torch.long, device=common_ids.device
+        )
+        valid = common_ids < int(size)
+        columns = torch.arange(common_ids.numel(), device=common_ids.device)
+        lookup[common_ids[valid]] = columns[valid]
+        return lookup
 
     @staticmethod
     def _lookup_sparse_teacher_logp(
@@ -2585,7 +2600,9 @@ class CSDLossFn(LossFunction):
                 f"csd_noise_filter_topk must be >= 0, got {noise_filter_topk}"
             )
         teacher_topk_ipc_k = int(cfg.teacher_topk_ipc_k)
-        teacher_topk_keep_realized = teacher_topk_ipc_k > 0 and (
+        # Realized-pair support is part of the objective, so dense rows (which
+        # hold every label) apply it exactly like sparse rows.
+        teacher_topk_keep_realized = (
             pure_alm
             or realized_only_mismatch
             or teacher_topk_ipc_k == 1
@@ -2991,6 +3008,21 @@ class CSDLossFn(LossFunction):
                     common_student_idx_t,
                     common_teacher_idx_t,
                 )
+            # Dense rows apply the realized-pair support by masking at most two
+            # common columns per row, located through these lookups.
+            common_col_of_student = None
+            common_col_of_teacher = None
+            if (
+                teacher_sparse_payload is None
+                and teacher_topk_keep_realized
+                and not pure_alm
+            ):
+                common_col_of_student = self._common_column_lookup(
+                    common_student_idx_t, int(self.student_vocab_size)
+                )
+                common_col_of_teacher = self._common_column_lookup(
+                    common_teacher_idx_t, v_t
+                )
 
             for mb_start in range(0, len(common_chunks), common_mb):
                 mb_end = min(mb_start + common_mb, len(common_chunks))
@@ -3089,6 +3121,27 @@ class CSDLossFn(LossFunction):
                     teacher_common_logp = (
                         teacher_common_logits.to(accum_dtype) - t_log_z_mb
                     )
+                    if common_col_of_student is not None:
+                        # Realized-pair support: a common pair sharing
+                        # only one token with the realized pair leaves the
+                        # support, so its entries contribute exactly zero.
+                        col_s = common_col_of_student[rs]
+                        col_t = common_col_of_teacher[rt]
+                        drop_s = (col_s >= 0) & (col_s != col_t)
+                        drop_t = (col_t >= 0) & (col_t != col_s)
+                        row_ids = torch.arange(rs.shape[0], device=device)
+                        drop = (
+                            torch.cat([row_ids[drop_s], row_ids[drop_t]]),
+                            torch.cat([col_s[drop_s], col_t[drop_t]]),
+                        )
+                        neg_inf = torch.tensor(
+                            -1.0e30, device=device, dtype=accum_dtype
+                        )
+                        student_common_logp.index_put_(drop, neg_inf)
+                        teacher_common_logp.index_put_(drop, neg_inf)
+                        common_valid_row = (
+                            drop_s.long() + drop_t.long() < common_student_idx_t.numel()
+                        )
                 else:
                     assert teacher_to_common_student is not None
                     teacher_topk_logits, teacher_topk_indices, _, _ = (
@@ -3842,8 +3895,8 @@ class CSDLossFn(LossFunction):
 
         Mirrors the replicated CSD rules: realized-only chunks and many-to-many
         chunks use the realized pair; 1-to-many and many-to-1 chunks use the
-        prefix-support alternatives, plus the realized pair when the sparse
-        teacher keeps realized labels. Returns None for an unsupported chunk.
+        prefix-support alternatives, plus the realized pair when realized
+        labels are kept. Returns None for an unsupported chunk.
         """
         b, M, N, _s_pred, s_labels, _t_pred, t_labels, _owned = record
         realized_s = int(inp_s_np[b, s_labels[-1]])
@@ -3906,8 +3959,8 @@ class CSDLossFn(LossFunction):
 
         The result is this rank's partial ``T**2 * (common + beta * mismatch)
         / global_valid_chunks``; summed over CP ranks it equals the replicated
-        CSD KD term. Dense teachers follow the replicated support rules; sparse
-        teachers use each request's top-k with its realized label kept.
+        CSD KD term. Dense and sparse teachers follow the replicated support
+        rules; sparse teachers always keep the realized label.
         Returned metrics are CP sums.
         """
         cfg = self.cfg
@@ -3920,8 +3973,11 @@ class CSDLossFn(LossFunction):
         noise_filter_topk = int(cfg.csd_noise_filter_topk)
         realized_only = bool(cfg.csd_realized_only_mismatch)
         sparse = payload.transport == "sparse"
-        # Sparse owner-local transport always forces realized labels.
-        keep_realized = sparse
+        # Sparse owner-local transport always forces realized labels; dense
+        # transport follows the same rule as the replicated loss.
+        keep_realized = (
+            sparse or realized_only or bool(cfg.teacher_topk_ipc_keep_realized)
+        )
         row_tile = int(cfg.csd_selected_row_chunk_size)
         chunk_batch = int(cfg.csd_support_chunk_batch_size)
         v_t = int(teacher_vocab_size)
@@ -4254,6 +4310,15 @@ class CSDLossFn(LossFunction):
                         -1
                     )
                     valid = torch.ones((len(batch),), device=device, dtype=torch.bool)
+                    if keep_realized:
+                        # Realized-pair support: drop common pairs that share
+                        # only one token with the realized pair.
+                        support = (common_s.unsqueeze(0) == crs.unsqueeze(-1)) == (
+                            common_t.unsqueeze(0) == crt.unsqueeze(-1)
+                        )
+                        s_logp = torch.where(support, s_logp, -1.0e30)
+                        t_logp = torch.where(support, t_logp, -1.0e30)
+                        valid = support.any(dim=-1)
                     noise_ok = (
                         dense_label_in_topk(rows, crt)
                         if noise_filter_topk > 0
