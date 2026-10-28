@@ -127,6 +127,7 @@ def _policy_config(
     ep_size: int = 1,
     defer_fsdp_grad_sync: bool = False,
     automodel_kwargs: dict | None = None,
+    seq_len: int = _SEQ_LEN,
 ) -> PolicyConfig:
     automodel_cfg = {
         "enabled": True,
@@ -162,7 +163,7 @@ def _policy_config(
         "logprob_batch_size": 1,
         "precision": precision,
         "offload_optimizer_for_logprob": False,
-        "max_total_sequence_length": _SEQ_LEN,
+        "max_total_sequence_length": seq_len,
         "make_sequence_length_divisible_by": 1,
         "generation": {
             "backend": "hf",
@@ -199,24 +200,26 @@ def _policy_config(
     }
 
 
-def _batch(batch_size: int, *, seed: int = 7) -> BatchedDataDict:
+def _batch(
+    batch_size: int, *, seed: int = 7, seq_len: int = _SEQ_LEN
+) -> BatchedDataDict:
     """Right-padded sequences of varying length with RL fields."""
     generator = torch.Generator().manual_seed(seed)
-    input_ids = torch.randint(0, 1000, (batch_size, _SEQ_LEN), generator=generator)
+    input_ids = torch.randint(0, 1000, (batch_size, seq_len), generator=generator)
     input_lengths = torch.randint(
-        _SEQ_LEN // 2, _SEQ_LEN + 1, (batch_size,), generator=generator
+        seq_len // 2, seq_len + 1, (batch_size,), generator=generator
     )
-    positions = torch.arange(_SEQ_LEN).unsqueeze(0)
+    positions = torch.arange(seq_len).unsqueeze(0)
     token_mask = (positions < input_lengths.unsqueeze(1)).float()
-    token_mask[:, : _SEQ_LEN // 4] = 0  # prompt tokens
-    logprobs = -torch.rand(batch_size, _SEQ_LEN, generator=generator)
+    token_mask[:, : seq_len // 4] = 0  # prompt tokens
+    logprobs = -torch.rand(batch_size, seq_len, generator=generator)
     return BatchedDataDict(
         {
             "input_ids": input_ids,
             "input_lengths": input_lengths.to(torch.int32),
             "token_mask": token_mask,
             "sample_mask": torch.ones(batch_size),
-            "advantages": torch.randn(batch_size, _SEQ_LEN, generator=generator),
+            "advantages": torch.randn(batch_size, seq_len, generator=generator),
             "prev_logprobs": logprobs,
             "generation_logprobs": logprobs,
             "reference_policy_logprobs": logprobs,
@@ -257,7 +260,10 @@ def _run_steps(
             init_reference_model=False,
             name_prefix=name,
         )
-        data = _batch(config["train_global_batch_size"])
+        data = _batch(
+            config["train_global_batch_size"],
+            seq_len=config["max_total_sequence_length"],
+        )
         out = {"logprobs": [], "loss": [], "grad_norm": [], "mb_loss": []}
         policy.prepare_for_lp_inference()
         out["logprobs"].append(policy.get_logprobs(data)["logprobs"])
@@ -398,8 +404,13 @@ def test_pipeline_with_context_parallel_matches_non_pipelined(tiny_untied_llama_
     if torch.cuda.device_count() < 4:
         pytest.skip("needs 4 GPUs")
 
+    # fp32 attention runs on memory-efficient SDPA, whose log-sum-exp is padded
+    # to 32 tokens; torch's load-balanced ring attention merges it unpadded per
+    # chunk of seq_len / (2 * cp_size) tokens, so a chunk needs 32 tokens.
     def config(pp_size: int) -> PolicyConfig:
-        return _policy_config(tiny_untied_llama_path, pp_size=pp_size, cp_size=2)
+        return _policy_config(
+            tiny_untied_llama_path, pp_size=pp_size, cp_size=2, seq_len=128
+        )
 
     reference = _run_steps(config(1), 2, "cp_ref", _clipped_pg_loss_fn())
     actual = _run_steps(config(2), 4, "pp_cp", _clipped_pg_loss_fn())
