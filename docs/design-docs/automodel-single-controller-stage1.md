@@ -109,20 +109,75 @@ capability-specific tests rather than dense-versus-MoE implementations.
 
 ## Validation status
 
-The revised worker is committed in `711a25ccc`; the dense parity harness ran
-at `e788c747d`. Gemma4 E2B passed four distributed comparisons on four H100
+The validation checkout is frozen at `56b4fc2d582c06204fa5f8effceaecb21dd5419c`.
+Subsequent configuration type casts do not change runtime behavior; the worker
+is identical. Gemma4 E2B passed four distributed comparisons on four H100
 80 GB GPUs: two token-normalized and two sequence-normalized updates. Maximum
 absolute differences were **0.0** for pre-clip gradients, metrics, updated
 parameters/buffers, and optimizer state. Scheduler equality, gradients retained
 through a logprob phase, and abort preservation also passed. Slurm job
-`20954735` completed with exit code 0.
+`20956201` completed with exit code 0.
 
-[W&B parity run](https://wandb.ai/ys_fishcool-nvidia/nemorl-gemma4/runs/3adz0fzt)
-and [six-panel comparison dashboard](https://wandb.ai/ys_fishcool-nvidia/nemorl-gemma4?nw=7syae5h9a74).
-The focused lifecycle suite passed 18 tests; configuration coverage passed 134.
-Broader controller tests, MoE parity, logprob checks, checkpoint/resume, and
-matched 100-step runs remain pending. This document will be updated with their
-results before the PR is marked ready.
+[W&B parity run](https://wandb.ai/ys_fishcool-nvidia/nemorl-gemma4/runs/uwx3bgek)
+and [six-panel comparison dashboard](https://wandb.ai/ys_fishcool-nvidia/nemorl-gemma4?nw=vovwm7ey6oo).
+The focused lifecycle suite passed 19 tests, configuration coverage passed 134,
+and broader setup/controller/checkpoint regression coverage passed 537.
+The fixed-input harness uses deterministic execution, standard AdamW, and a
+StepLR schedule to compare complete optimizer state. Live integration runs use
+the existing recipes' Transformer Engine FusedAdam and scheduler settings.
+MoE live qualification targets sixteen training ranks and eight rollout GPUs
+across three nodes, with the recipe's BF16 optimizer moments and GBS=32.
+Four training ranks exhausted memory when saving BF16 moments as FP32 copies.
+Eight ranks trained two updates and saved full checkpoints, but optimizer restore
+exhausted an 80 GB GPU while PyTorch cast state tensors inside FusedAdam's
+loader. Six ranks failed before training because the native checkpoint adapter
+could not load uneven expert shards. Those layouts are not qualified for the
+complete training/checkpoint/resume workflow.
+
+The dense three-path logprob gate included the HF reference. Its mean KL values
+were 0.0 for HF versus AutoModel, 0.00286 for HF versus vLLM, and 0.00204 for
+vLLM versus AutoModel (global mean threshold 0.01; four prompts, 115 tokens).
+The live SC checkpoint gate saved at step 2, restored model/optimizer and
+controller/data state, and advanced to step 3 with zero policy lag.
+[Its W&B run](https://wandb.ai/ys_fishcool-nvidia/nemorl-gemma4/runs/1f964f66)
+contains all three steps and is marked finished.
+
+Qwen3-30B-A3B Base passed the same four fixed-input comparisons on eight H100
+GPUs at EP=1, again with maximum absolute error **0.0** for gradients, metrics,
+parameters/buffers, and optimizer state. Scheduler, retained-gradient logprob,
+and abort checks passed as well.
+[MoE parity run](https://wandb.ai/ys_fishcool-nvidia/nemorl-gemma4/runs/fntrn5ku)
+and [six-panel comparison dashboard](https://wandb.ai/ys_fishcool-nvidia/nemorl-gemma4?nw=ho8jhl0ldq5).
+
+MoE's three-path logprob probe passed on sixteen fixed prompts, including HF,
+using eight policy ranks and TP=4 rollout. Global mean KL was 0.00370 for HF
+versus AutoModel, 0.00461 for HF versus vLLM, and 0.00511 for vLLM versus
+AutoModel (threshold 0.01). This is a global-mean criterion, not a per-prompt
+bound. An earlier TP=2 four-prompt probe failed at 0.01277; expanding that
+probe to sixteen prompts lowered its global mean but did not change the
+original subset's result. The final rollout configuration uses TP=4.
+
+The sixteen-rank live checkpoint/resume gate and matched 100-step MoE results
+are tracked in the [PR validation record](https://github.com/NVIDIA-NeMo/RL/pull/4963).
+The eight-rank scoring probe alone does not establish sixteen-rank training
+qualification; use that record for the completed integration evidence.
+
+The Gemma4 E2B upstream/SC pair completed 100 real GRPO updates, using four
+training and four generation H100s per run, GBS=32, MBS=1, and seed 42.
+Both runs have 100 finite training records, identical learning-rate sequences,
+32 valid samples per update, and complete step-100 weight/optimizer checkpoints.
+SC policy-version lag remained zero. Mean reward over these updates was 0.345
+for upstream and 0.36875 for SC; a single seed does not establish a quality
+difference. [Paired 12-panel dashboard](https://wandb.ai/ys_fishcool-nvidia/nemorl-gemma4?nw=1tuwnil9b0a).
+
+The original dense Slurm wrappers exited 2 **after** training completed because
+the shared shell launcher was edited while they ran. These job failures are
+preserved, not counted as clean exits. Immutable launcher bundles then restored
+each step-100 checkpoint, completed one extra update, and saved step 101.
+Both recovery jobs (`20959496`, `20959498`) completed with exit code 0.
+The comparison dashboard is restricted to updates 1–100. Upstream uses legacy
+Ray data transport because its synchronous TQ path requests absent reference
+logprobs when KL is disabled; SC uses TQ. The upstream code is unmodified.
 
 Gemma4 26B-A4B was initially considered for MoE qualification, but two existing
 backend failures occurred before any SC call. With the native model at EP=1,
@@ -138,3 +193,7 @@ Validation uses the existing pipeline container with the pinned AutoModel source
 Transformers `5.12.1`. The container receives the upstream-pinned Lens and
 TransferQueue packages plus MSC `0.51.0` for newer imports; this is not a full
 rebuild from the upstream lockfile. Dependency pins in this PR are unchanged.
+For TP=4 MoE generation, the validation launcher starts one explicit Ray head
+and exports `RAY_ADDRESS` to all children. Without that address, vLLM's spawned
+EngineCore started a second cluster and failed to find the original placement
+group. This launcher adjustment is shared by the upstream and SC MoE runs.
