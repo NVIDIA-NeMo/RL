@@ -35,9 +35,9 @@ docker buildx build --build-context nemo-rl=. -f docker/Dockerfile \
 
 ## uv Cache Pruning
 
-The release image ships `uv`'s download cache (`/opt/nemo_rl_cache/uv`) so an unprivileged runtime user can later run `uv run --extra <backend>` fully offline. Because the shared build cache this is seeded from persists across many builds, routine dependency-version bumps (torch, vLLM, SGLang, ...) leave each predecessor version's wheel behind -- `uv` only ever adds to its cache, it never removes a version a prior `uv.lock` pinned and the current one doesn't.
+The release image ships `uv`'s download cache (`/opt/nemo_rl_cache/uv`) so an unprivileged runtime user can later run `uv run --extra <backend>` fully offline. Each build starts that cache from a BuildKit cache mount (seeded from the `uv-cache` registry image), and `uv` only ever adds to it: it never removes a version a prior `uv.lock` pinned and the current one doesn't. The seed export's `uv cache prune --ci` drops prebuilt wheels but keeps every version ever built from source, and a long-lived builder's cache mount keeps everything.
 
-Right after the seed is copied in, before any `uv sync`, `docker/prune_uv_cache.py` removes exactly those superseded entries. Running first means it only judges what the seed carried in, so the build-isolation dependencies the syncs resolve outside `uv.lock` (setuptools, a build-time torch, ...) are kept. It runs in the same layer the syncs fill, because deleting files in a later layer only hides them and the image still ships them. It removes index wheels and source builds whose `(package, version)` the current `uv.lock` no longer pins, and git builds/checkouts for commits it no longer pins, across every extra (installed in this build or not). It never removes a wheel the offline-install promise depends on, since that promise is itself "every wheel `uv.lock` could need." This runs automatically on every build; there is no flag to disable it.
+Right after that cache is restored, before any `uv sync`, `docker/prune_uv_cache.py` removes exactly those superseded entries: index wheels and source builds whose `(package, version)` the current `uv.lock` no longer pins, and git builds/checkouts for commits it no longer pins, across every extra (installed in this build or not). Running first means it only judges restored content, so the build-isolation dependencies the syncs resolve outside `uv.lock` (setuptools, a build-time torch, ...) are kept. It runs in the same layer the syncs fill, because deleting files in a later layer only hides them and the image still ships them, and the result is synced back into the cache mount. It never removes a wheel the offline-install promise depends on, since that promise is itself "every wheel `uv.lock` could need." This runs automatically on every build; there is no flag to disable it.
 
 ## Skipping vLLM or SGLang Dependencies
 
@@ -75,6 +75,22 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 
 > [!NOTE]
 > If you skip vLLM, SGLang, or TRT-LLM during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.
+
+## Stripping the uv Cache
+
+By default, the release image keeps `uv`'s download cache (`/opt/nemo_rl_cache/uv`) on disk. This lets the image's unprivileged runtime user re-run `uv run --extra <backend>` fully offline, since every wheel it could need is already cached in the image. The tradeoff is a larger image.
+
+For size-sensitive builds that don't need that offline capability, drop the cache from the final image with `STRIP_UV_CACHE`:
+
+```sh
+docker buildx build -f docker/Dockerfile \
+    --build-arg STRIP_UV_CACHE=1 \
+    --tag <registry>/nemo-rl:latest \
+    .
+```
+
+> [!NOTE]
+> On a long-lived local builder, BuildKit's cache mount (keyed by base image, uv version, and the HybridEP setting) persists across builds regardless of `STRIP_UV_CACHE` -- it just controls whether a copy also ships in the image layers. To reset that mount, run `docker buildx prune --filter type=exec.cachemount`.
 
 ## Custom Setup Commands
 

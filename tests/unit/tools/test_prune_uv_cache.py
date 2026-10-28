@@ -241,31 +241,43 @@ def test_second_run_is_a_no_op(cache: Path) -> None:
 
 def test_dockerfile_prunes_the_seed_before_any_sync() -> None:
     # Deleting cache files in a later layer only hides them; the image still ships
-    # them. So the prune runs inside the dependency RUN -- and before its first sync,
-    # so it only judges seed content and never deletes the build-isolation deps
-    # (setuptools, a build-time torch, ...) the syncs resolve outside uv.lock.
+    # them. So the prune runs inside the dependency RUN -- right after the cache
+    # mount's content is restored and before the first sync, so it only judges
+    # restored content and never deletes the build-isolation deps (setuptools, a
+    # build-time torch, ...) the syncs resolve outside uv.lock. The RUN's
+    # `uv_cache_persist prune` trap then mirrors the pruned cache into the mount.
     lines = (REPO_ROOT / "docker" / "Dockerfile").read_text().splitlines()
     code = [(i, line) for i, line in enumerate(lines) if not line.startswith("#")]
 
     copy_script = next(
         i for i, l in code if l.startswith("COPY") and "prune_uv_cache.py" in l
     )
-    seed_run = next(i for i, l in code if "from=uv-cache-seed" in l)
-    run_end = next(i for i, l in code if i > seed_run and l == "EOF")
-    seed_copy = next(i for i, l in code if "/tmp/uv-cache-seed/" in l and "rsync" in l)
-    venv = next(i for i, l in code if i > seed_run and l == "uv venv --seed")
-    first_sync = next(i for i, l in code if i > seed_run and "uv sync" in l)
     prunes = [
         i for i, l in code if "prune_uv_cache.py" in l and not l.startswith("COPY")
     ]
+    assert len(prunes) == 1, "prune must run exactly once, in the dependency RUN"
+    prune = prunes[0]
+    run_start = max(i for i, l in code if i < prune and l.startswith("RUN"))
+    run_end = next(i for i, l in code if i > prune and l == "EOF")
+    restore = next(
+        i for i, l in code if i > run_start and l.startswith("uv_cache_restore")
+    )
+    persist = next(i for i, l in code if i > run_start and "uv_cache_persist" in l)
+    venv = next(i for i, l in code if i > run_start and l == "uv venv --seed")
+    first_sync = next(i for i, l in code if i > run_start and "uv sync" in l)
 
     # The script comes from the recipe's own context: an older NRL_GIT_REF lacks it.
     assert "--from=" not in lines[copy_script]
-    assert copy_script < seed_run
-    assert len(prunes) == 1, "prune must run exactly once, in the dependency RUN"
-    assert seed_run < seed_copy < venv < prunes[0] < first_sync < run_end
+    assert copy_script < run_start
+    assert lines[restore] == "uv_cache_restore force"
+    assert "uv_cache_persist prune" in lines[persist]
+    assert run_start < restore < venv < prune < first_sync < run_end
+    assert persist < run_end
 
+    # Dynamo installs with a throwaway cache, so its RUN needs no shared cache mount.
     dynamo = next(i for i, l in code if "docker/dynamo/install.sh" in l and "bash" in l)
+    dynamo_run = max(i for i, l in code if i < dynamo and l.startswith("RUN"))
+    assert "uv-cache" not in "\n".join(lines[dynamo_run:dynamo])
     assert lines[dynamo].startswith("UV_CACHE_DIR=/tmp/")
     assert lines[dynamo + 1].startswith("rm -rf /tmp/")
 
