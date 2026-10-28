@@ -26,7 +26,10 @@ from collections.abc import Callable, Container, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
-from nemo_rl.experience.metric_utils import calculate_single_metric
+from nemo_rl.experience.metric_utils import (
+    calculate_reward_stddev_metrics,
+    calculate_single_metric,
+)
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import RewardPenaltyConfig
@@ -413,12 +416,17 @@ CAPTURE_PENALTY_METRICS = {spec.name: spec.metric for spec in CAPTURE_PENALTIES}
 def aggregate_capture_reward_metrics(
     metrics: dict[str, list[float]],
     observations: Sequence[FinalizedReward],
+    *,
+    reward_groups: Sequence[Sequence[float]] | None = None,
 ) -> dict[str, Any]:
     """Pool per-group finalizer counts and per-row rewards over valid rows.
 
     ``metrics`` holds the per-group finalizer metrics of the consumed groups;
     ``observations`` holds one retained reward per valid row of those groups.
     Rates are computed over valid rows, never averaged across groups.
+    ``reward_groups``, when supplied, preserves consumed prompt boundaries for
+    the separately named mean within-prompt standard deviation. The existing
+    ``total_reward/stddev`` remains pooled for backward compatibility.
     """
     count = len(observations)
     if not count:
@@ -434,6 +442,9 @@ def aggregate_capture_reward_metrics(
             [row.reward for row in observations], count, "total_reward"
         )
     )
+    result["total_reward/batch_stddev"] = result["total_reward/stddev"]
+    if reward_groups is not None:
+        result.update(calculate_reward_stddev_metrics(reward_groups))
     agent_rewards: dict[str, list[float]] = {}
     for row in observations:
         if row.log_context is not None:

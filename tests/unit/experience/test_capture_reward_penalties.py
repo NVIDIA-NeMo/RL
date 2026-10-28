@@ -166,6 +166,7 @@ def test_metric_pooling_uses_valid_rollouts_and_legacy_names():
         "empty_final_answer_rate": 0.25,
         "total_reward/mean": 1.5,
         "total_reward/stddev": 1.0,
+        "total_reward/batch_stddev": 1.0,
         "total_reward/min": 0.0,
         "total_reward/max": 2.0,
         "total_reward/median": 2.0,
@@ -274,6 +275,7 @@ def test_metric_pooling_single_row_reports_nan_stddev_and_no_disabled_keys():
 
     metrics = aggregate_capture_reward_metrics({}, _observations(2.0))
     assert math.isnan(metrics.pop("total_reward/stddev"))
+    assert math.isnan(metrics.pop("total_reward/batch_stddev"))
     assert metrics == {
         "finalize/reward_count": 1.0,
         "total_reward/mean": 2.0,
@@ -427,3 +429,20 @@ def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():
         "sample_id": "sample-0",
     }
     assert aggregate_capture_reward_metrics({}, []) == {}
+
+
+def test_capture_reward_stddev_preserves_prompt_boundaries():
+    metrics = aggregate_capture_reward_metrics(
+        {},
+        _observations(0.0, 0.0, 4.0, 4.0),
+        reward_groups=[[0.0, 0.0], [], [4.0, 4.0]],
+    )
+    assert metrics["total_reward/mean_within_prompt_stddev"] == 0.0
+    assert metrics["total_reward/batch_stddev"] == pytest.approx((16 / 3) ** 0.5)
+    assert metrics["total_reward/stddev"] == metrics["total_reward/batch_stddev"]
+
+
+def test_capture_reward_stddev_does_not_guess_missing_prompt_boundaries():
+    metrics = aggregate_capture_reward_metrics({}, _observations(0.0, 4.0))
+    assert "total_reward/mean_within_prompt_stddev" not in metrics
+    assert metrics["total_reward/batch_stddev"] == metrics["total_reward/stddev"]

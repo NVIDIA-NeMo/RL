@@ -109,7 +109,10 @@ from nemo_rl.experience.interfaces import (
     RETAINED_TASK_INDICES_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
-from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.experience.metric_utils import (
+    calculate_reward_stddev_metrics,
+    is_histogram_metric,
+)
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
@@ -4701,6 +4704,13 @@ def aggregate_rollout_metrics(
             )
         else:
             aggregated[k] = sum(v) / len(v)
+    # Keep legacy scalar reductions unchanged, but provide unambiguous reward
+    # spread metrics shared with token-capture finalization. The histogram
+    # observations still retain one list per prompt at this point.
+    if "total_reward/histogram" in per_group_metrics:
+        aggregated.update(
+            calculate_reward_stddev_metrics(per_group_metrics["total_reward/histogram"])
+        )
     return aggregated
 
 

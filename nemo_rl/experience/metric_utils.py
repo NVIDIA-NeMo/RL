@@ -49,6 +49,31 @@ def calculate_single_metric(
     }
 
 
+def calculate_reward_stddev_metrics(
+    reward_groups: Sequence[Sequence[float]],
+) -> dict[str, float]:
+    """Distinguish pooled reward spread from average within-prompt spread.
+
+    Each group contains the valid finalized rewards for one prompt. Empty
+    groups are omitted. A singleton group's sample standard deviation is NaN,
+    matching the legacy per-group metric rather than reporting false certainty.
+    The mean weights prompts equally, not by their number of valid rows.
+    """
+    populated = [group for group in reward_groups if group]
+    if not populated:
+        return {}
+    rewards = [reward for group in populated for reward in group]
+    return {
+        "total_reward/batch_stddev": (
+            statistics.stdev(rewards) if len(rewards) > 1 else math.nan
+        ),
+        "total_reward/mean_within_prompt_stddev": statistics.fmean(
+            statistics.stdev(group) if len(group) > 1 else math.nan
+            for group in populated
+        ),
+    }
+
+
 def pct(values: Sequence[float | int], p: float) -> float:
     """Percentile helper for buffer starvation diagnostics."""
     if not values:

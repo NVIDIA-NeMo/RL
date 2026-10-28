@@ -6589,6 +6589,18 @@ class TestComputeAndApplySeqLogprobErrorMasking:
 class TestAggregateRolloutMetrics:
     """Tests for aggregate_rollout_metrics which aggregates per-group metrics by semantic type."""
 
+    def test_reward_stddev_definitions_are_explicit_without_changing_legacy(self):
+        result = aggregate_rollout_metrics(
+            {
+                "total_reward/stddev": [0.0, 0.0],
+                "total_reward/histogram": [[0.0, 0.0], [4.0, 4.0]],
+            }
+        )
+        assert result["total_reward/stddev"] == 0.0
+        assert result["total_reward/mean_within_prompt_stddev"] == 0.0
+        assert result["total_reward/batch_stddev"] == pytest.approx((16 / 3) ** 0.5)
+        assert result["total_reward/histogram"] == [0.0, 0.0, 4.0, 4.0]
+
     def test_min_metrics_take_minimum(self):
         metrics = {
             "gen_tokens/min": [10, 5, 8],
