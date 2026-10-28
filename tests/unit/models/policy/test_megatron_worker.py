@@ -3854,14 +3854,26 @@ def test_megatron_policy_training(training_setup):
             )
 
 
-def _manual_gc_state(worker):
-    import gc
+def _manual_gc_states(policy):
+    """Each worker's GC state, read on the worker actor via Ray's ``__ray_call__``."""
 
-    return {
-        "gc_enabled": gc.isenabled(),
-        "interval": worker._manual_gc_interval,
-        "steps": worker._manual_gc_steps,
-    }
+    # Defined here, not at module level, so Ray pickles it by value: the worker
+    # processes cannot import this test module.
+    def manual_gc_state(worker):
+        import gc
+
+        return {
+            "gc_enabled": gc.isenabled(),
+            "interval": worker._manual_gc_interval,
+            "steps": worker._manual_gc_steps,
+        }
+
+    return ray.get(
+        [
+            worker.__ray_call__.remote(manual_gc_state)
+            for worker in policy.worker_group.workers
+        ]
+    )
 
 
 @pytest.mark.hf_gated
@@ -3893,7 +3905,7 @@ def test_megatron_policy_training_manual_gc(tiny_llama_model_path):
             init_reference_model=False,
         )
 
-        before = policy.run_all_workers_single_data("__ray_call__", _manual_gc_state)
+        before = _manual_gc_states(policy)
         assert before == [{"gc_enabled": False, "interval": 2, "steps": 0}] * 2
 
         # 16 rows at train_global_batch_size 8: two optimizer steps per train().
@@ -3915,7 +3927,7 @@ def test_megatron_policy_training_manual_gc(tiny_llama_model_path):
             policy.train(data, SimpleLossFn())
         policy.finish_training()
 
-        after = policy.run_all_workers_single_data("__ray_call__", _manual_gc_state)
+        after = _manual_gc_states(policy)
         assert after == [{"gc_enabled": False, "interval": 2, "steps": 4}] * 2
     finally:
         if policy:
