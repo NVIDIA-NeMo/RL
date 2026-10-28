@@ -114,7 +114,11 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+    PretrainedCheckpointConfig,
+)
 from nemo_rl.utils.logger import LoggerConfig
 from tests.unit.experience.test_rollout_recovery import _forest_sealed_ledger
 
@@ -3698,12 +3702,15 @@ class TestSetupResumeWiring:
         tmp_path,
     ):
         mc = _setup_master_config(str(tmp_path / "ckpts"))
-        pretrained = {"path": "/some/ckpt", "format": "megatron_bridge"}
+        pretrained = PretrainedCheckpointConfig.model_validate(
+            {"path": "/some/ckpt", "format": "megatron_bridge"}
+        )
         mc.checkpointing.pretrained_checkpoint = pretrained
 
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert mc.policy["pretrained_checkpoint"] == pretrained
+        # The policy side is still TypedDict-shaped, so setup hands off a dict.
+        assert mc.policy["pretrained_checkpoint"] == pretrained.model_dump()
 
 
 def _make_int_dataloader() -> StatefulDataLoader:
