@@ -1556,10 +1556,75 @@ class TestSaveTrigger:
 
         assert _step_dir_names(tmp_path / "checkpoints") == {"tmp_step_1"}
 
-    def test_deferred_finalize_requires_megatron_async_save(self, tmp_path):
+    def test_pending_save_survives_a_cancel_while_waiting_for_the_lock(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=0, defer_finalize=True)
+        trainer = _FakeTrainer()
+
+        async def _main():
+            actor = _ACTOR_CLS(
+                mc, _make_actor_args(trainer=trainer), SetupTimingMetrics()
+            )
+            path = actor._checkpointer.init_tmp_checkpoint(1, {}, mc)
+            actor._pending_checkpoint = (path, 1)
+            # Another publication (e.g. a rollout snapshot) holds the lock.
+            await actor._checkpoint_save_lock.acquire()
+            finish = asyncio.create_task(actor._finish_pending_save(blocking=True))
+            while trainer.finalize_calls == 0:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0.05)  # now parked on the lock
+            finish.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await finish
+            actor._checkpoint_save_lock.release()
+            # Still pending, so the teardown publish finds it.
+            assert actor._pending_checkpoint == (path, 1)
+            await actor._finish_pending_save(blocking=True)
+            assert actor._pending_checkpoint is None
+            actor._checkpointer.shutdown()
+
+        asyncio.run(_main())
+
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
+
+    @pytest.mark.parametrize(
+        "megatron_cfg",
+        [
+            None,
+            {"enabled": False, "checkpoint": {"async_save": True}},
+            {"enabled": True, "checkpoint": {"async_save": False}},
+            {"enabled": True},
+        ],
+        ids=["no-megatron", "megatron-disabled", "sync-save", "no-checkpoint-block"],
+    )
+    def test_deferred_finalize_requires_megatron_async_save(
+        self, tmp_path, megatron_cfg
+    ):
         mc = _actor_master_config(tmp_path, defer_finalize=True)
+        if megatron_cfg is not None:
+            mc.policy["megatron_cfg"] = megatron_cfg
 
         with pytest.raises(ValueError, match="checkpoint.async_save=true"):
+            validate_single_controller_config(mc)
+
+    def test_deferred_finalize_accepts_megatron_async_save(self, tmp_path):
+        mc = _actor_master_config(tmp_path, defer_finalize=True)
+        mc.policy["megatron_cfg"] = {
+            "enabled": True,
+            "checkpoint": {"async_save": True},
+        }
+
+        validate_single_controller_config(mc)
+
+    def test_deferred_finalize_rejects_rollout_snapshots(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path, defer_finalize=True, rollout_checkpoint_attempt_interval_s=30.0
+        )
+        mc.policy["megatron_cfg"] = {
+            "enabled": True,
+            "checkpoint": {"async_save": True},
+        }
+
+        with pytest.raises(ValueError, match="rollout_checkpointing"):
             validate_single_controller_config(mc)
 
 

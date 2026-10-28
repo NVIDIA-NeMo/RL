@@ -946,9 +946,9 @@ class SingleControllerActor:
             await asyncio.gather(*tasks, return_exceptions=True)
             try:
                 # With the train pump stopped, publish a save that
-                # defer_async_checkpoint_finalize left pending: a failure or an
-                # orderly rollout-checkpoint stop ends the pump before its own
-                # blocking finalize. Before checkpoint close, which joins the rename.
+                # defer_async_checkpoint_finalize left pending: a failure ends the
+                # pump before its own blocking finalize. Before checkpoint close,
+                # which joins the rename.
                 await self._finish_pending_save(blocking=True)
             except Exception as e:  # teardown must not mask the original failure
                 print(f"Error publishing the pending checkpoint: {e}", flush=True)
@@ -5424,10 +5424,12 @@ class SingleControllerActor:
 
         Called from the train pump between policy-worker calls, and once at teardown
         after the pumps stop: the finalize runs collectives on the training
-        communicator, so every rank must reach it at the same point. A non-blocking poll finalizes the save on every worker
-        only once all ranks' background writes are done; until then the write
-        overlaps training. tmp_step_N becomes step_N after the finalize, under the
-        same lock as every other checkpoint publication.
+        communicator, so every rank must reach it at the same point. A non-blocking
+        poll finalizes the save on every worker only once all ranks' background writes
+        are done; until then the write overlaps training. tmp_step_N becomes step_N
+        after the finalize, under the same lock as every other checkpoint publication.
+        The save stays pending until the rename has started, so a cancellation while
+        waiting for the lock leaves it for the teardown publish.
         """
         if self._pending_checkpoint is None:
             return
@@ -5436,9 +5438,10 @@ class SingleControllerActor:
         elif not await asyncio.to_thread(self._trainer.poll_async_save):
             return
         checkpoint_path, step = self._pending_checkpoint
-        self._pending_checkpoint = None
         async with self._checkpoint_save_lock:
             self._checkpointer.begin_finalization(checkpoint_path)
+            # No await between the rename starting and the clear.
+            self._pending_checkpoint = None
             await asyncio.to_thread(
                 _write_latest_checkpoint_status,
                 self._checkpointer,

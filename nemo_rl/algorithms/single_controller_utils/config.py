@@ -491,7 +491,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # non-colocated generation: colocated refits finish the write before offloading.
     # Cost: until the finalize, only tmp_step_N exists and resume ignores it, so a
     # crash in that window (typically one step) resumes from the previous checkpoint.
-    # Teardown after a controller-side failure still publishes it.
+    # Teardown after a controller-side failure still publishes it. Cannot be combined
+    # with rollout snapshots (rollout_checkpointing.snapshot_attempt_interval_s).
     defer_async_checkpoint_finalize: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
@@ -1387,6 +1388,15 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "async_rl.defer_async_checkpoint_finalize requires the Megatron "
                 "policy backend with policy.megatron_cfg.checkpoint.async_save=true."
+            )
+        # A rollout snapshot needs step_N published while training is still on
+        # step N; a deferred finalize publishes it at a later step boundary.
+        if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
+            raise ValueError(
+                "async_rl.defer_async_checkpoint_finalize cannot be combined with "
+                "rollout_checkpointing.snapshot_attempt_interval_s: rollout snapshots "
+                "need each step's policy checkpoint published before the next "
+                "optimizer step, and a deferred finalize publishes it later."
             )
 
     reward_penalties_enabled = any(
