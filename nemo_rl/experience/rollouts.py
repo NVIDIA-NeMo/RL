@@ -716,7 +716,7 @@ def generate_responses(
                     f"({prefix_length} != {int(input_length.item())})."
                 )
             assistant_message["routed_experts"] = slice_routed_experts(
-                routed_experts, input_length, total_length
+                routed_experts, int(input_length.item()), int(total_length.item())
             )
 
         batch["message_log"][i].append(assistant_message)
@@ -857,7 +857,7 @@ async def generate_responses_async(
                     f"({prefix_length} != {int(input_length.item())})."
                 )
             assistant_message["routed_experts"] = slice_routed_experts(
-                routed_experts, input_length, total_length
+                routed_experts, int(input_length.item()), int(total_length.item())
             )
 
         batch["message_log"][i].append(assistant_message)
