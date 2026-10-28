@@ -1024,7 +1024,9 @@ class AutomodelPolicyWorkerImpl(
         state = self._train_step_state
         if state is None or state.metrics is None:
             raise RuntimeError("finish requires one successfully completed full batch")
-        committed = False
+        # Keep the fence raised until cleanup also succeeds: a failure after
+        # optimizer.step still leaves the caller unsure whether it committed.
+        self._train_step_commit_failed = True
         try:
             self.model.train()
             grad_norm = scale_grads_and_clip_grad_norm(
@@ -1048,14 +1050,13 @@ class AutomodelPolicyWorkerImpl(
             self._update_moe_gate_bias_if_supported()
             self.scheduler.step()
             state.metrics["grad_norm"] = grad_norm
-            committed = True
-            return state.metrics
         finally:
-            self._train_step_commit_failed = not committed
             self._train_step_state = None
             self.optimizer.zero_grad()
             release_moe_dispatcher_state(self.model)
             torch.cuda.empty_cache()
+        self._train_step_commit_failed = False
+        return state.metrics
 
     def abort_train_step(self) -> None:
         """Discard gradients and restore model state without committing an update."""
