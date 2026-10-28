@@ -110,7 +110,9 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     checkpoint-engine refit uses (docs/guides/checkpoint-engine-refit.md):
     ``UCX_TLS`` reaches every Ray worker, and the refit needs ``cuda_copy`` /
     ``cuda_ipc`` to move GPU memory. Neither carries the data plane's CPU
-    bytes off the node, so its cross-node traffic stays on ``rc``.
+    bytes off the node, so its cross-node traffic stays on ``rc``. With
+    ``nixl.require_rdma`` (default on), a launcher's non-RDMA ``UCX_TLS`` fails
+    here on the driver, not minutes later when the storage units start.
     ``mooncake_cpu``: the MC_* knobs
     below. ``simple`` has no engine.
     Values already present in the environment are left alone, so a launcher can
@@ -123,12 +125,17 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     the driver before ``init_ray``, and Ray hands the result to every worker.
 
     Raises:
+        TransportPolicyError: nixl with ``require_rdma`` and a non-RDMA UCX env.
         RuntimeError: if a variable still needs setting but the engine is
             already imported, i.e. the value can no longer reach it. Fatal on
             purpose — the alternative is a run that looks configured and is not.
     """
     if cfg["backend"] == "nixl":
         os.environ.setdefault("UCX_TLS", "rc,cuda_copy,cuda_ipc,self,sm")
+        if (cfg.get("nixl") or {}).get("require_rdma", True):
+            from nemo_rl.data_plane.nixl.nixl_io import check_rdma_only
+
+            check_rdma_only()
         return
     if cfg["backend"] != "mooncake_cpu":
         return
