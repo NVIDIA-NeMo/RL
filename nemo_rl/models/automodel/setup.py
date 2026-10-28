@@ -43,6 +43,7 @@ from nemo_automodel.components.distributed.config import (
     MoEParallelizerConfig,
 )
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
+from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from safetensors import safe_open
@@ -69,6 +70,8 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
+from nemo_rl.models.automodel.model_handle import ModelRuntime
+from nemo_rl.models.automodel.pipeline_parallel import PipelineOutputAdapter
 from nemo_rl.models.automodel.router_replay import (
     enable_routing_replay_in_automodel_kwargs,
     require_automodel_moe_model,
@@ -77,11 +80,15 @@ from nemo_rl.models.automodel.router_replay import (
 from nemo_rl.models.automodel.utils import resolve_model_class
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import (
+    AutomodelPipelineConfig,
     LoRAConfig,
     PolicyConfig,
     TokenizerConfig,
 )
-from nemo_rl.models.policy.utils import configure_dynamo_cache
+from nemo_rl.models.policy.utils import (
+    automodel_pipeline_parallel_size,
+    configure_dynamo_cache,
+)
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
@@ -508,11 +515,12 @@ def setup_distributed(
     tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["automodel_cfg"].get("context_parallel_size", 1)
     ep_size = config["automodel_cfg"].get("expert_parallel_size", 1)
+    pp_size = automodel_pipeline_parallel_size(config["automodel_cfg"])
     dp_replicate_size = config["automodel_cfg"].get("dp_replicate_size", 1)
     sequence_parallel_enabled = config["automodel_cfg"]["sequence_parallel"]
 
     # HSDP requires the data-parallel axis to evenly contain the replicate dim.
-    model_parallel_size = tp_size * cp_size * ep_size
+    model_parallel_size = pp_size * tp_size * cp_size * ep_size
     dp_size = world_size // model_parallel_size
     if dp_size % dp_replicate_size != 0:
         raise ValueError(
@@ -549,13 +557,15 @@ def setup_distributed(
             "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
         )
 
-    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
+    # Create device meshes (dp_size is derived from world_size / (pp * tp * cp));
+    # the mesh order (pp, dp_replicate, dp_shard, cp, tp) matches the Ray
+    # worker layout [PP, DP, CP, TP] in lm_policy.py.
     mesh_context = MeshContext.build(
         fsdp2_config,
         ParallelismSizes(
             dp_replicate_size=dp_replicate_size,
             tp_size=tp_size,
-            pp_size=1,
+            pp_size=pp_size,
             cp_size=cp_size,
             ep_size=ep_size,
         ),
@@ -567,6 +577,7 @@ def setup_distributed(
     resolved_dp_size = device_mesh["dp"].size()
     resolved_tp_size = device_mesh["tp"].size()
     resolved_cp_size = device_mesh["cp"].size()
+    resolved_pp_size = device_mesh["pp"].size()
 
     return DistributedContext(
         device_mesh=device_mesh,
@@ -576,6 +587,7 @@ def setup_distributed(
         dp_size=resolved_dp_size,
         tp_size=resolved_tp_size,
         cp_size=resolved_cp_size,
+        pp_size=resolved_pp_size,
     )
 
 
@@ -927,11 +939,15 @@ def setup_model_and_optimizer(
     # r0.6.0's from_pretrained rejects the old separate distributed kwargs
     # (moe_mesh/distributed_config/moe_config/activation_checkpointing/pipeline_config/tp_plan
     # -- see _reject_separate_distributed_kwargs) and requires them via distributed_setup.
-    # pipeline_config=None: PP is not used here.
+    # With pipeline parallelism from_pretrained returns an AutoPipeline instead of
+    # a module.
+    pp_enabled = distributed_context.pp_size > 1
     distributed_setup = DistributedSetup(
         mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
         strategy_config=fsdp2_config,
-        pipeline_config=None,
+        pipeline_config=(
+            build_pipeline_config(config, fsdp2_config) if pp_enabled else None
+        ),
         moe_parallel_config=moe_config if ep_size > 1 else None,
         activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
     )
@@ -949,6 +965,21 @@ def setup_model_and_optimizer(
         **from_pretrained_kwargs,
         **automodel_kwargs,
     )
+
+    if pp_enabled:
+        return _setup_pipeline_parts(
+            config,
+            pipeline=model,
+            tokenizer=tokenizer,
+            model_config=model_config,
+            is_reward_model=is_reward_model,
+            peft_config=peft_config,
+            checkpoint_manager=checkpoint_manager,
+            optimizer_cls=optimizer_cls if init_optimizer else None,
+            optimizer_kwargs=optimizer_kwargs if init_optimizer else None,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+        )
 
     print(model)
 
@@ -1084,35 +1115,9 @@ def setup_model_and_optimizer(
             )
 
     # Initialize scheduler
-    scheduler = None
-    if "scheduler" in config and optimizer is not None:
-        if isinstance(config["scheduler"], dict):
-            scheduler_cls = get_class(config["scheduler"]["name"])
-            scheduler = scheduler_cls(optimizer, **config["scheduler"]["kwargs"])
-        else:
-            schedulers = []
-            for scheduler_cfg in config["scheduler"]:
-                if "name" in scheduler_cfg:
-                    schedulers.append(
-                        get_class(scheduler_cfg["name"])(
-                            optimizer, **scheduler_cfg["kwargs"]
-                        )
-                    )
-                else:
-                    assert "milestones" in scheduler_cfg, (
-                        "unknown scheduler config: ",
-                        scheduler_cfg,
-                    )
-                    milestones: list[int] = scheduler_cfg["milestones"]
-
-            scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optimizer, schedulers, milestones
-            )
-    elif optimizer is not None:
-        # Default to passthrough LR schedule
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lr_lambda=lambda epoch: 1
-        )
+    scheduler = (
+        _build_lr_scheduler(config, optimizer) if optimizer is not None else None
+    )
 
     # Load NeMo RL checkpoint if provided
     if weights_path:
@@ -1170,7 +1175,194 @@ def setup_model_and_optimizer(
         model_config=model.config,
         peft_config=peft_config,
         autocast_enabled=autocast_enabled,
+        model_runtime=ModelRuntime(
+            parts=[model],
+            stage_ids=[0],
+            optimizers=[optimizer] if optimizer is not None else [],
+            schedulers=[scheduler] if scheduler is not None else [],
+            pipeline=None,
+        ),
         draft_model=draft_model,
         composite_model=composite_model,
         draft_runtime=draft_runtime,
+    )
+
+
+def _build_lr_scheduler(config: PolicyConfig, optimizer: torch.optim.Optimizer) -> Any:
+    """Build the LR scheduler ``policy.scheduler`` describes for one optimizer."""
+    if "scheduler" in config:
+        if isinstance(config["scheduler"], dict):
+            scheduler_cls = get_class(config["scheduler"]["name"])
+            return scheduler_cls(optimizer, **config["scheduler"]["kwargs"])
+
+        schedulers = []
+        for scheduler_cfg in config["scheduler"]:
+            if "name" in scheduler_cfg:
+                schedulers.append(
+                    get_class(scheduler_cfg["name"])(
+                        optimizer, **scheduler_cfg["kwargs"]
+                    )
+                )
+            else:
+                assert "milestones" in scheduler_cfg, (
+                    "unknown scheduler config: ",
+                    scheduler_cfg,
+                )
+                milestones: list[int] = scheduler_cfg["milestones"]
+
+        return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers, milestones)
+
+    # Default to passthrough LR schedule
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1)
+
+
+# policy.automodel_cfg.pipeline.pp_schedule -> torch.distributed.pipelining name.
+_PP_SCHEDULE_NAMES = {"1f1b": "1F1B", "interleaved_1f1b": "Interleaved1F1B"}
+
+
+def build_pipeline_config(
+    config: PolicyConfig, fsdp2_config: FSDP2Config
+) -> PipelineConfig:
+    """Build Automodel's ``PipelineConfig`` from ``policy.automodel_cfg.pipeline``.
+
+    NeMo RL owns the runtime values:
+
+    - Each schedule call runs ``microbatches_per_step`` microbatches of
+      ``train_micro_batch_size`` samples.
+    - The schedule does not scale gradients: the loss adapter already returns
+      the non-pipelined path's backward scale.
+    - Stage shapes are precomputed for ``max_total_sequence_length``, so the
+      schedule uses static stage metadata instead of shape inference.
+    - Activations between stages carry FSDP's mixed-precision output dtype,
+      not the parameter dtype.
+    """
+    pipeline_cfg = AutomodelPipelineConfig.model_validate(
+        config["automodel_cfg"]["pipeline"]
+    )
+    micro_batch_size = config["train_micro_batch_size"]
+    return PipelineConfig(
+        pp_schedule=_PP_SCHEDULE_NAMES[pipeline_cfg.pp_schedule],
+        pp_microbatch_size=micro_batch_size,
+        pp_batch_size=micro_batch_size * pipeline_cfg.microbatches_per_step,
+        layers_per_stage=pipeline_cfg.layers_per_stage,
+        dtype=fsdp2_config.mp_policy.output_dtype,
+        scale_grads_in_schedule=False,
+        loss_fn=PipelineOutputAdapter(),
+        pp_seq_len=config["max_total_sequence_length"],
+    )
+
+
+def _setup_pipeline_parts(
+    config: PolicyConfig,
+    *,
+    pipeline: Any,
+    tokenizer: AutoTokenizer,
+    model_config: Any,
+    is_reward_model: bool,
+    peft_config: Optional[PeftConfig],
+    checkpoint_manager: Any,
+    optimizer_cls: Optional[type[torch.optim.Optimizer]],
+    optimizer_kwargs: Optional[dict[str, Any]],
+    weights_path: Optional[str],
+    optimizer_path: Optional[str],
+) -> ModelAndOptimizerState:
+    """Finish setup for the pipeline stages ``from_pretrained`` built.
+
+    Every local stage (model part) gets its own optimizer and LR scheduler, and
+    checkpoints namespace optimizer state by global stage index.
+
+    Args:
+        config: Policy configuration.
+        pipeline: The ``AutoPipeline`` returned by ``from_pretrained``.
+        tokenizer: Tokenizer for the model.
+        model_config: The Hugging Face model config.
+        is_reward_model: Whether this is a reward model.
+        peft_config: PEFT configuration, if any.
+        checkpoint_manager: Checkpoint manager for loading weights.
+        optimizer_cls: Optimizer class, or None to build no optimizer.
+        optimizer_kwargs: Optimizer keyword arguments.
+        weights_path: Optional path to checkpoint weights to load.
+        optimizer_path: Optional path to optimizer state to load.
+
+    Returns:
+        ModelAndOptimizerState whose ``model_runtime`` holds the local stages.
+    """
+    parts = pipeline.parts
+    stage_ids = [stage.stage_index for stage in pipeline.info.stages]
+    if hasattr(parts[0], "get_pipeline_kwargs_chunk_dims"):
+        raise NotImplementedError(
+            f"{type(parts[0]).__name__} chunks its pipeline inputs with "
+            "get_pipeline_kwargs_chunk_dims, which NeMo RL's pipeline schedule "
+            "calls do not apply yet. Set "
+            "policy.automodel_cfg.pipeline_parallel_size=1 for this model."
+        )
+    for stage_id, part in zip(stage_ids, parts):
+        print(f"Pipeline stage {stage_id}:\n{part}")
+
+    # A stage may hold only dense layers of an MoE model, so decide over the
+    # whole pipeline group: every stage must agree on autocast.
+    has_experts = torch.tensor(
+        [any("expert" in key for part in parts for key in part.state_dict())],
+        device="cuda",
+    )
+    torch.distributed.all_reduce(
+        has_experts,
+        op=torch.distributed.ReduceOp.MAX,
+        group=pipeline.pp_mesh.get_group(),
+    )
+    is_moe_model = bool(has_experts.item())
+    is_hf_model = (
+        model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
+    )
+    # Autocast is disabled for custom MoE models (non-HF) to avoid numerical issues
+    autocast_enabled = not (is_moe_model and not is_hf_model)
+
+    for part in parts:
+        if getattr(part.config, "pad_token_id", None) is None:
+            part.config.pad_token_id = tokenizer.pad_token_id
+
+    optimizers: list[torch.optim.Optimizer] = []
+    if optimizer_cls is not None:
+        # Only pass trainable params to the optimizer; see setup_model_and_optimizer.
+        optimizers = [
+            optimizer_cls(
+                (p for p in part.parameters() if p.requires_grad),
+                **optimizer_kwargs,
+            )
+            for part in parts
+        ]
+    schedulers = [_build_lr_scheduler(config, optimizer) for optimizer in optimizers]
+
+    if weights_path:
+        checkpoint_manager.load_checkpoint(
+            model=parts,
+            weights_path=weights_path,
+            optimizer=optimizers or None,
+            optimizer_path=optimizer_path,
+            scheduler=schedulers or None,
+            optimizer_part_ids=stage_ids,
+        )
+    else:
+        print(
+            "No weights path provided. Loaded base HF weights via from_pretrained (default policy init)"
+        )
+
+    return ModelAndOptimizerState(
+        model=None,
+        optimizer=None,
+        scheduler=None,
+        is_hf_model=is_hf_model,
+        is_moe_model=is_moe_model,
+        is_reward_model=is_reward_model,
+        model_class=type(parts[0]),
+        model_config=parts[0].config,
+        peft_config=peft_config,
+        autocast_enabled=autocast_enabled,
+        model_runtime=ModelRuntime(
+            parts=parts,
+            stage_ids=stage_ids,
+            optimizers=optimizers,
+            schedulers=schedulers,
+            pipeline=pipeline,
+        ),
     )

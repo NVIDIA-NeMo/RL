@@ -24,6 +24,7 @@ except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
 import nemo_rl.models.policy.workers.automodel_policy_worker as worker_mod
+from nemo_rl.models.automodel.model_handle import ModelRuntime
 from nemo_rl.models.policy.workers.automodel_policy_worker import (
     AutomodelPolicyWorkerImpl,
 )
@@ -42,6 +43,9 @@ class _TinyDraft(nn.Module):
 def _make_worker(with_draft: bool = True) -> AutomodelPolicyWorkerImpl:
     worker = AutomodelPolicyWorkerImpl.__new__(AutomodelPolicyWorkerImpl)
     worker.model = nn.Linear(4, 4, bias=False)
+    worker.model_runtime = ModelRuntime(
+        parts=[worker.model], stage_ids=[0], optimizers=[], schedulers=[], pipeline=None
+    )
     worker.draft_model = _TinyDraft() if with_draft else None
     worker.dtype = torch.bfloat16
     worker.cpu_offload = False

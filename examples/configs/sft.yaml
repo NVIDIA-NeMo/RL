@@ -60,6 +60,15 @@ policy:
     deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
+    # Pipeline parallel size. Values > 1 need the `pipeline` block below and an
+    # explicit defer_fsdp_grad_sync (false is recommended), and do not support
+    # sequence packing, dynamic batching, LoRA, CP, EP, or non-colocated
+    # generation. See docs/design-docs/automodel-pipeline-parallel.md.
+    pipeline_parallel_size: 1
+    # pipeline:
+    #   pp_schedule: "1f1b"  # "1f1b" or "interleaved_1f1b"
+    #   microbatches_per_step: 8  # Required. Microbatches per schedule call; >= pipeline_parallel_size for 1f1b
+    #   layers_per_stage: null  # interleaved_1f1b only; null keeps two virtual stages per PP rank
     # HSDP replicate dimension size for Automodel.
     # Typically set to the number of nodes; set to 1 to disable HSDP.
     dp_replicate_size: 1

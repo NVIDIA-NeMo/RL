@@ -16,6 +16,7 @@ import gc
 import os
 import traceback
 import warnings
+from collections.abc import Mapping
 from datetime import timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, cast
@@ -36,7 +37,7 @@ from nemo_rl.models.generation.vllm.patches import (
 from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
 if TYPE_CHECKING:
-    from nemo_rl.models.policy import PolicyConfig
+    from nemo_rl.models.policy import AutomodelPipelineConfig, PolicyConfig
 
 # Environment for bitwise-reproducible policy workers. These are read when the
 # worker creates its cuBLAS handles and selects Transformer Engine kernels, so
@@ -165,6 +166,154 @@ def configure_lora_refit(policy_config: "PolicyConfig") -> None:
 
     validate_vllm_lora_refit(policy_config)
     configure_vllm_lora_refit(policy_config)
+
+
+def automodel_pipeline_parallel_size(automodel_cfg: Mapping[str, Any]) -> int:
+    """Return ``automodel_cfg.pipeline_parallel_size``.
+
+    The key is optional: configs written before Automodel supported pipeline
+    parallelism do not set it, and for them pipeline parallelism is off.
+    """
+    if "pipeline_parallel_size" not in automodel_cfg:
+        return 1
+    return automodel_cfg["pipeline_parallel_size"]
+
+
+def validate_automodel_pipeline_config(
+    config: "PolicyConfig",
+    *,
+    is_vlm: bool,
+    model_config: object | None,
+) -> "AutomodelPipelineConfig | None":
+    """Validate an Automodel policy config for pipeline parallelism.
+
+    Runs on the driver before any worker exists, so every unsupported
+    combination fails with an actionable error instead of inside a worker.
+
+    Args:
+        config: The policy config; ``automodel_cfg`` must be enabled.
+        is_vlm: Whether the policy is built with a multimodal processor.
+        model_config: The Hugging Face model config, used to reject models whose
+            embedding and LM head share one weight. ``None`` skips that check
+            (Automodel repeats it when it splits the model).
+
+    Returns:
+        The parsed ``automodel_cfg.pipeline`` block, or ``None`` when
+        ``pipeline_parallel_size`` is 1.
+    """
+    from nemo_rl.models.policy import AutomodelPipelineConfig
+    from nemo_rl.models.policy.draft_config import draft_refit_enabled
+
+    automodel_cfg = config["automodel_cfg"]
+    pp_size = automodel_pipeline_parallel_size(automodel_cfg)
+    if pp_size < 1:
+        raise ValueError(
+            f"policy.automodel_cfg.pipeline_parallel_size must be >= 1, got {pp_size}."
+        )
+    if pp_size == 1:
+        return None
+
+    if "pipeline" not in automodel_cfg:
+        raise ValueError(
+            f"policy.automodel_cfg.pipeline_parallel_size={pp_size} requires a "
+            "policy.automodel_cfg.pipeline block that sets at least "
+            "microbatches_per_step."
+        )
+    pipeline_cfg = AutomodelPipelineConfig.model_validate(automodel_cfg["pipeline"])
+    num_microbatches = pipeline_cfg.microbatches_per_step
+    if pipeline_cfg.pp_schedule == "1f1b":
+        if pipeline_cfg.layers_per_stage is not None:
+            raise ValueError(
+                "policy.automodel_cfg.pipeline.layers_per_stage applies only to "
+                "pp_schedule=interleaved_1f1b; set it to null for 1f1b, which "
+                "places one stage per pipeline rank."
+            )
+        if num_microbatches < pp_size:
+            raise ValueError(
+                "pp_schedule=1f1b needs at least one microbatch per pipeline "
+                "stage: policy.automodel_cfg.pipeline.microbatches_per_step="
+                f"{num_microbatches} < pipeline_parallel_size={pp_size}."
+            )
+    else:
+        num_rounds = max(1, num_microbatches // pp_size)
+        if num_microbatches % num_rounds != 0:
+            raise ValueError(
+                "pp_schedule=interleaved_1f1b runs microbatches in rounds of "
+                "pipeline_parallel_size, so microbatches_per_step must be a "
+                f"multiple of max(1, microbatches_per_step // pipeline_parallel_size)"
+                f"={num_rounds}; got microbatches_per_step={num_microbatches} "
+                f"with pipeline_parallel_size={pp_size}."
+            )
+
+    if "defer_fsdp_grad_sync" not in automodel_cfg:
+        raise ValueError(
+            "policy.automodel_cfg.pipeline_parallel_size > 1 requires "
+            "policy.automodel_cfg.defer_fsdp_grad_sync to be set explicitly. "
+            "false reduce-scatters gradients after every microbatch (recommended); "
+            "true keeps unsharded parameters and fp32 gradients of a stage "
+            "resident for the whole schedule call."
+        )
+
+    if (
+        "logprob_batch_size" in config
+        and config["logprob_batch_size"] != config["train_micro_batch_size"]
+    ):
+        raise ValueError(
+            "policy.automodel_cfg.pipeline_parallel_size > 1 requires "
+            "policy.logprob_batch_size to equal policy.train_micro_batch_size "
+            "because pipeline stage buffers are sized for one microbatch size; got "
+            f"logprob_batch_size={config['logprob_batch_size']} and "
+            f"train_micro_batch_size={config['train_micro_batch_size']}."
+        )
+
+    generation_cfg = config.get("generation")
+    unsupported = {
+        "sequence_packing.enabled": "sequence_packing" in config
+        and config["sequence_packing"]["enabled"],
+        "dynamic_batching.enabled": config["dynamic_batching"]["enabled"],
+        "automodel_cfg.context_parallel_size > 1": automodel_cfg[
+            "context_parallel_size"
+        ]
+        > 1,
+        "automodel_cfg.expert_parallel_size > 1": "expert_parallel_size"
+        in automodel_cfg
+        and automodel_cfg["expert_parallel_size"] > 1,
+        "automodel_cfg.sequence_parallel": automodel_cfg["sequence_parallel"],
+        "automodel_cfg.cpu_offload": automodel_cfg["cpu_offload"],
+        "automodel_cfg.lora_cfg.enabled": "lora_cfg" in automodel_cfg
+        and automodel_cfg["lora_cfg"]["enabled"],
+        "draft.enabled": draft_refit_enabled(config.get("draft")),
+        "router_replay.enabled": "router_replay" in config
+        and config["router_replay"]["enabled"],
+        "reward_model_cfg.enabled": "reward_model_cfg" in config
+        and config["reward_model_cfg"]["enabled"],
+        "quant_cfg": config.get("quant_cfg") is not None,
+        "multimodal (VLM) models": is_vlm,
+        "non-colocated generation (generation.colocated.enabled=false)": (
+            generation_cfg is not None and not generation_cfg["colocated"]["enabled"]
+        ),
+        "generation.refit_transport": generation_cfg is not None
+        and generation_cfg.get("refit_transport") is not None,
+    }
+    enabled_unsupported = [name for name, enabled in unsupported.items() if enabled]
+    if enabled_unsupported:
+        raise ValueError(
+            "policy.automodel_cfg.pipeline_parallel_size > 1 does not support: "
+            f"{', '.join(enabled_unsupported)}. Disable these options or set "
+            "pipeline_parallel_size=1."
+        )
+
+    if model_config is not None:
+        text_config = getattr(model_config, "text_config", None) or model_config
+        if getattr(text_config, "tie_word_embeddings", False):
+            raise ValueError(
+                f"{config['model_name']} ties its input embedding and LM head "
+                "weights (tie_word_embeddings=true), which pipeline parallelism "
+                "cannot split across stages. Set "
+                "policy.automodel_cfg.pipeline_parallel_size=1 for this model."
+            )
+
+    return pipeline_cfg
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:

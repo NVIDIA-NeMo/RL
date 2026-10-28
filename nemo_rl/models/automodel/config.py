@@ -20,6 +20,7 @@ import torch
 from nemo_automodel.components._peft.lora import PeftConfig
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.models.automodel.model_handle import ModelRuntime
 
 
 class DistributedContext(NamedTuple):
@@ -36,6 +37,9 @@ class DistributedContext(NamedTuple):
     dp_size: int
     tp_size: int
     cp_size: int
+    # Appended with a default so existing constructors that predate pipeline
+    # parallelism keep working; setup_distributed always sets it.
+    pp_size: int = 1
 
 
 class RuntimeConfig(NamedTuple):
@@ -80,7 +84,9 @@ class ModelAndOptimizerState(NamedTuple):
     optimizer, scheduler, and metadata about the model type and configuration.
     """
 
-    model: torch.nn.Module
+    # The whole model, its optimizer, and its LR scheduler. None under pipeline
+    # parallelism, where model_runtime holds one entry per local stage.
+    model: Optional[torch.nn.Module]
     optimizer: Optional[torch.optim.Optimizer]
     scheduler: Optional[Any]
     is_hf_model: bool
@@ -90,6 +96,9 @@ class ModelAndOptimizerState(NamedTuple):
     model_config: Any
     peft_config: Optional[PeftConfig]
     autocast_enabled: bool
+    # Local model parts with their optimizers and schedulers; a single part
+    # (the model above) without pipeline parallelism.
+    model_runtime: ModelRuntime
     # Draft co-training (eagle3/dspark/dflash, Automodel only): the draft
     # model sharing the policy's optimizer, and the composite module used
     # for optimizer state I/O.

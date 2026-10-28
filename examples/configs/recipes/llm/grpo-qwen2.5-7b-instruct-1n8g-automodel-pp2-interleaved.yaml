@@ -1,0 +1,31 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  max_num_steps: 30
+checkpointing:
+  checkpoint_dir: results/grpo-qwen2.5-7b-instruct-1n8g-automodel-pp2-interleaved
+policy:
+  model_name: Qwen/Qwen2.5-7B-Instruct
+  tokenizer:
+    name: Qwen/Qwen2.5-7B-Instruct
+  train_micro_batch_size: 1
+  max_total_sequence_length: 1024
+  automodel_cfg:
+    pipeline_parallel_size: 2
+    defer_fsdp_grad_sync: false
+    pipeline:
+      pp_schedule: interleaved_1f1b
+      microbatches_per_step: 16
+  sequence_packing:
+    enabled: false
+  optimizer:
+    kwargs:
+      lr: 1.0e-06
+logger:
+  log_dir: logs/grpo-qwen2.5-7b-instruct-1n8g-automodel-pp2-interleaved
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen2.5-7b-instruct-1n8g-automodel-pp2-interleaved
+cluster:
+  gpus_per_node: 8
