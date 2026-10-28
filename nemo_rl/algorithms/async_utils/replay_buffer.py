@@ -158,14 +158,14 @@ def validate_forest_checkpoint_metadata(
 ) -> None:
     """Reject changes to the interpretation or padding of restored rollout rows."""
     schema = metadata.get("rollout_recovery_schema_version")
-    if forest_training and schema == 3:
+    if forest_training and type(schema) is int and schema < 5:
         raise ValueError(
-            "forest_training needs rollout recovery schema >= 4; "
+            "forest_training needs rollout recovery schema >= 5; "
             f"checkpoint has schema {schema}. Start a fresh run."
         )
     if "forest_training" not in metadata:
-        # Before schema 4, only ordinary recovery was supported.
-        if forest_training or (type(schema) is int and schema >= 4):
+        # Before schema 5, only ordinary recovery was supported.
+        if forest_training or (type(schema) is int and schema >= 5):
             raise ValueError(
                 "Checkpoint is missing forest_training compatibility metadata; "
                 f"schema={schema!r}, current forest_training={forest_training}. "

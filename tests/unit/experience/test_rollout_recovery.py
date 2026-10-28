@@ -94,7 +94,7 @@ def _forest_sealed_ledger() -> RolloutRecoveryLedger:
             generation_index=0,
             gate_rollout_id=owner,
             receipt={
-                "rollout_id": owner,
+                "capture_key": owner,
                 "manifest": [
                     {"model_call_id": f"call{i}", "staging_key": f"{owner}/call{i}"}
                     for i in range(3)
@@ -152,7 +152,7 @@ def test_masked_forest_sibling_round_trip_preserves_pending_custody(
     ledger = _forest_sealed_ledger()
     owner = ledger.get_group("g7").gate_rollout_id(1)
     receipt = {
-        "rollout_id": owner,
+        "capture_key": owner,
         "manifest": [{"model_call_id": "done", "staging_key": f"{owner}/done"}],
         "attempted_call_ids": ["done", "failed"],
         "pending_call_ids": ["failed"] if pending else [],
@@ -207,7 +207,7 @@ def test_empty_forest_selection_requires_poisoned_receipt_on_seal_and_restore() 
                 "g7",
                 generation_index=1,
                 gate_rollout_id=owner,
-                receipt={"rollout_id": owner, "manifest": []},
+                receipt={"capture_key": owner, "manifest": []},
                 reward=1.0,
                 mask_sample=False,
                 logical_selection=RolloutSelection((), ()),
@@ -249,7 +249,7 @@ def test_forest_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
     if damage == "missing_field":
         del attempt["logical_selection"]
     elif damage == "foreign_receipt":
-        receipt["rollout_id"] = "foreign"
+        receipt["capture_key"] = "foreign"
     elif damage in {"foreign_staging", "wrong_call", "missing_call"}:
         entry = receipt["manifest"][0]
         if damage == "foreign_staging":
@@ -281,7 +281,7 @@ def test_forest_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
         RolloutRecoveryLedger.from_state_dict(state)
 
 
-@pytest.mark.parametrize("schema", [3])
+@pytest.mark.parametrize("schema", [2, 3, 4])
 def test_legacy_ordinary_recovery_still_loads(schema: int) -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
@@ -490,6 +490,7 @@ def test_restore_rejects_capture_receipts_before_v4(schema: int) -> None:
     state = _sealed_attempt_state()
     state["schema_version"] = schema
     attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    del attempt["logical_selection"]
     receipt = attempt["receipt"]
     receipt["rollout_id"] = receipt.pop("capture_key")
 
@@ -502,7 +503,7 @@ def test_restore_rejects_capture_receipts_before_v4(schema: int) -> None:
     assert "capture_key" not in receipt
 
 
-@pytest.mark.parametrize("schema", [2, 3, 4])
+@pytest.mark.parametrize("schema", [2, 3, 4, 5])
 @pytest.mark.parametrize("sealed", [False, True])
 def test_receipt_free_recovery_still_loads(schema: int, sealed: bool) -> None:
     state = _sealed_attempt_state()
@@ -510,6 +511,8 @@ def test_receipt_free_recovery_still_loads(schema: int, sealed: bool) -> None:
     attempt = state["groups"][0]["siblings"][0]["attempts"][0]
     attempt["receipt"] = None
     attempt["staging_keys"] = []
+    if schema < 5:
+        del attempt["logical_selection"]
     if not sealed:
         state["groups"][0]["status"] = "generating"
         attempt.update(status="dispatched", reward=None, mask_sample=None)
@@ -536,6 +539,18 @@ def test_receipt_free_recovery_still_loads(schema: int, sealed: bool) -> None:
     assert parsed.batch_shortfall == {7: 1}
     _bind(restored, "g7", _prompt())
     assert restored.state_dict()["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
+
+
+def test_v4_capture_receipt_restores_without_forest_selection() -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = 4
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    del attempt["logical_selection"]
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    current = restored.get_group("g7").siblings[0].current_attempt
+    assert current.receipt == attempt["receipt"]
+    assert current.logical_selection is None
+    assert restored.expected_staging_keys() == set(attempt["staging_keys"])
 
 
 @pytest.mark.parametrize(
@@ -1412,6 +1427,10 @@ def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> Non
     state["schema_version"] = version
     for group in state["groups"]:
         group.pop("resolved_agent_name", None)
+        if version < 5:
+            for sibling in group["siblings"]:
+                for attempt in sibling["attempts"]:
+                    attempt.pop("logical_selection")
     if version < 4:
         attempt = state["groups"][0]["siblings"][0]["attempts"][0]
         attempt["receipt"] = None
