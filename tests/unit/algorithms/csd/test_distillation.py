@@ -1581,6 +1581,107 @@ def test_build_teacher_force_ids_follow_realized_only_mismatch(realized_only):
         assert force_ids is None
 
 
+def _random_force_id_batch(
+    generator: torch.Generator, *, batch_size: int, seq_len: int
+) -> dict:
+    """Random alignment with one-sided chunks and an optional student BOS.
+
+    Pair ids are shuffled per sample, so a shifted chunk can read a shared row
+    before the unshifted chunk does.
+    """
+    batch = _make_batch(batch_size=batch_size, t_student=seq_len, t_teacher=seq_len)
+    student_chunk_id = torch.full((batch_size, seq_len), -1)
+    teacher_chunk_id = torch.full((batch_size, seq_len), -1)
+    for b in range(batch_size):
+        pair_ids = torch.randperm(seq_len, generator=generator).tolist()
+        student_pos = int(torch.randint(2, (1,), generator=generator))
+        teacher_pos = pair = 0
+        while pair < seq_len:
+            m, n = torch.randint(3, (2,), generator=generator).tolist()
+            if m == n == 0:
+                continue
+            if student_pos + m > seq_len or teacher_pos + n > seq_len:
+                break
+            student_chunk_id[b, student_pos : student_pos + m] = pair_ids[pair]
+            teacher_chunk_id[b, teacher_pos : teacher_pos + n] = pair_ids[pair]
+            student_pos, teacher_pos, pair = student_pos + m, teacher_pos + n, pair + 1
+    # A small vocabulary with -1 makes rows r and r + 1 share labels.
+    batch["teacher_0_input_ids"] = torch.randint(
+        -1, 5, (batch_size, seq_len), generator=generator
+    )
+    batch["alignment_0_pair_valid"] = (
+        torch.rand(batch_size, seq_len, generator=generator) < 0.9
+    )
+    batch["alignment_0_student_chunk_id"] = student_chunk_id
+    batch["alignment_0_teacher_chunk_id"] = teacher_chunk_id
+    batch["sample_mask"] = (torch.rand(batch_size, generator=generator) < 0.8).long()
+    return batch
+
+
+def _per_label_force_ids(
+    batch: dict, *, kl_chunk_shift: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-slot and two-slot forced labels, one chunk label at a time."""
+    token_ids = batch["teacher_0_input_ids"].tolist()
+    pair_valid = batch["alignment_0_pair_valid"].tolist()
+    sample_mask = batch["sample_mask"].tolist()
+    max_pairs = len(pair_valid[0])
+    student_spans = csd_mod._chunk_ids_to_spans(
+        batch["alignment_0_student_chunk_id"], max_pairs
+    ).tolist()
+    teacher_spans = csd_mod._chunk_ids_to_spans(
+        batch["alignment_0_teacher_chunk_id"], max_pairs
+    ).tolist()
+    single = [[-1] * len(ids) for ids in token_ids]
+    slots = [[[] for _ in ids] for ids in token_ids]
+    for b, ids in enumerate(token_ids):
+        for p in range(max_pairs):
+            s_start, s_end = student_spans[b][p]
+            t_start, t_end = teacher_spans[b][p]
+            if not pair_valid[b][p] or s_end <= s_start or t_end <= t_start:
+                continue
+            shift = int(kl_chunk_shift and s_start > 0 and t_start > 0)
+            for label_pos in range(t_start, t_end):
+                row = label_pos - shift
+                single[b][row] = ids[label_pos]
+                if sample_mask[b] and ids[label_pos] not in [-1, *slots[b][row]]:
+                    slots[b][row].append(ids[label_pos])
+    width = csd_mod.SPARSE_TEACHER_FORCE_WIDTH
+    padded = [
+        [labels + [-1] * (width - len(labels)) for labels in row] for row in slots
+    ]
+    return torch.tensor(single), torch.tensor(padded)
+
+
+@pytest.mark.parametrize("kl_chunk_shift", [True, False])
+def test_force_id_builders_match_per_label_loop(kl_chunk_shift):
+    generator = torch.Generator().manual_seed(0)
+    loss_config = {
+        "kl_chunk_shift": kl_chunk_shift,
+        "csd_noise_filter_topk": 0,
+        "csd_pure_alm": False,
+        "csd_realized_only_mismatch": False,
+        "teacher_topk_ipc_k": 128,
+        "teacher_topk_ipc_keep_realized": True,
+    }
+    for _ in range(50):
+        batch = _random_force_id_batch(generator, batch_size=3, seq_len=12)
+        single, slots = _per_label_force_ids(batch, kl_chunk_shift=kl_chunk_shift)
+
+        assert torch.equal(
+            _build_teacher_force_include_token_ids(
+                batch, teacher_idx=0, loss_config=loss_config
+            ),
+            single,
+        )
+        assert torch.equal(
+            _build_teacher_force_include_token_id_slots(
+                batch, teacher_idx=0, kl_chunk_shift=kl_chunk_shift
+            ),
+            slots,
+        )
+
+
 def test_owner_local_export_routes_sparse_teachers_to_the_megatron_sender():
     loss_fn = _FakeLossFn(
         projection_matrix_paths=["/p0.pt", None],
@@ -1634,6 +1735,32 @@ def test_owner_local_dense_export_keeps_full_logits():
     assert train_data["teacher_0_full_logits_ipc"] == [{"teacher_shards": ["dense"]}]
     teacher.get_sparse_logits_ipc.assert_not_called()
     teacher.get_topk_logits_ipc.assert_not_called()
+
+
+@pytest.mark.parametrize("owner_local", [False, True])
+def test_dense_export_with_noise_filter_builds_no_forced_labels(
+    monkeypatch, owner_local
+):
+    loss_fn = _FakeLossFn(
+        projection_matrix_paths=["/p0.pt"],
+        teacher_topk_ipc_k=0,
+        owner_local=owner_local,
+    )
+    loss_fn.cfg.csd_noise_filter_topk = 4
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dense teacher transport built forced labels")
+
+    monkeypatch.setattr(csd_mod, "_build_teacher_force_include_token_ids", fail)
+    monkeypatch.setattr(csd_mod, "_build_teacher_force_include_token_id_slots", fail)
+    teacher = MagicMock()
+    teacher.get_full_logits_ipc.return_value = [{"teacher_shards": ["dense"]}]
+
+    train_data = export_teacher_logits_and_pack(
+        [teacher], loss_fn, _make_batch(), teacher_mbs=[1]
+    )
+
+    assert train_data["teacher_0_full_logits_ipc"] == [{"teacher_shards": ["dense"]}]
 
 
 def _owner_local_master_config(*, k: int = 0, teacher_backend: str = "megatron"):
