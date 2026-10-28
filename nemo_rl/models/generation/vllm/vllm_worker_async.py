@@ -159,6 +159,7 @@ def _generation_cut_blockers(sampling_params: Any) -> list[str]:
     strings and bad words, and counts presence/frequency penalties, over the
     output tokens only. A resumed tail would therefore miss a stop string or
     bad word that straddles the cut and stop penalizing the prefix's tokens.
+    A bad word resolved to a single token needs no output history and is safe.
 
     A request-level ``seed`` gives the call its own random generator, seeded
     when vLLM admits it. The restored call would start that generator over and
@@ -170,7 +171,9 @@ def _generation_cut_blockers(sampling_params: Any) -> list[str]:
     if getattr(sampling_params, "stop", None):
         blockers.append("stop strings")
     if getattr(sampling_params, "bad_words", None):
-        blockers.append("bad_words")
+        bad_word_ids = getattr(sampling_params, "bad_words_token_ids", None)
+        if not bad_word_ids or any(len(ids) != 1 for ids in bad_word_ids):
+            blockers.append("bad_words")
     if getattr(sampling_params, "presence_penalty", 0.0):
         blockers.append("presence_penalty")
     if getattr(sampling_params, "frequency_penalty", 0.0):
@@ -1748,6 +1751,12 @@ class VllmAsyncGenerationWorkerImpl(
         Such a call regenerates from its previous boundary after a restore, which
         costs time but not correctness; see ``_generation_cut_blockers``.
         """
+        if sampling_params.bad_words and self._generation_cut_tokenizer is not None:
+            # The HTTP hook runs before vLLM's input processor resolves bad words.
+            # Use the same resolver (including space-prefixed variants), on a copy
+            # so this check does not mutate the live request's sampling parameters.
+            sampling_params = copy.copy(sampling_params)
+            sampling_params.update_from_tokenizer(self._generation_cut_tokenizer)
         blockers = _generation_cut_blockers(sampling_params)
         if not blockers:
             return

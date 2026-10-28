@@ -1684,12 +1684,104 @@ def _sampling_params(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**{**defaults, **overrides})
 
 
-def _record_cut_constraints(state, sampling_params) -> None:
+def _record_cut_constraints(
+    state: Any, sampling_params: Any, *, tokenizer: Any | None = None
+) -> None:
     VllmAsyncGenerationWorkerImpl._record_request_cut_constraints(
-        SimpleNamespace(_get_request_capture=lambda request: state),
+        SimpleNamespace(
+            _get_request_capture=lambda request: state,
+            _generation_cut_tokenizer=tokenizer,
+        ),
         object(),
         sampling_params,
     )
+
+
+@pytest.mark.parametrize(
+    ("resolved_ids", "blocked"),
+    [
+        (None, True),
+        ([], True),
+        ([[]], True),
+        ([[18]], False),
+        ([[18], [19], [20], [27], [28], [29]], False),
+        ([[18, 19]], True),
+        ([[18], [19, 20]], True),
+    ],
+)
+def test_generation_cut_allows_only_resolved_single_token_bad_words(
+    resolved_ids: list[list[int]] | None, blocked: bool
+) -> None:
+    params = _sampling_params(bad_words=["<image>"], bad_words_token_ids=resolved_ids)
+
+    assert ("bad_words" in _generation_cut_blockers(params)) is blocked
+
+
+class _BadWordsTokenizer:
+    max_token_id = 255
+
+    def __init__(self, encodings: dict[str, list[int]]) -> None:
+        self.encodings = encodings
+
+    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        assert not add_special_tokens
+        return list(self.encodings[text])
+
+
+@pytest.mark.parametrize(
+    ("encodings", "blocked"),
+    [
+        ({"<image>": [18], " <image>": [32, 18]}, False),
+        ({"<image>": [18], " <image>": [19]}, False),
+        ({"<image>": [18, 19], " <image>": [20, 21]}, True),
+    ],
+)
+def test_request_cut_constraints_resolve_bad_words_without_mutating_request(
+    encodings: dict[str, list[int]], blocked: bool
+) -> None:
+    SamplingParams = pytest.importorskip("vllm").SamplingParams
+    params = SamplingParams(bad_words=["<image>"])
+    state = SimpleNamespace(lock=threading.Lock(), uncuttable_reason=None)
+
+    _record_cut_constraints(state, params, tokenizer=_BadWordsTokenizer(encodings))
+
+    assert (state.uncuttable_reason is not None) is blocked
+    assert params.bad_words == ["<image>"]
+    assert params.bad_words_token_ids is None
+
+
+def test_single_token_bad_words_remain_banned_after_prefix_restore() -> None:
+    SamplingParams = pytest.importorskip("vllm").SamplingParams
+    from vllm.v1.sample.ops.bad_words import _apply_bad_words_single_batch
+
+    bad_words = [
+        "<image>",
+        "<img>",
+        "</img>",
+        "<so_embedding>",
+        "<so_start>",
+        "<so_end>",
+    ]
+    forbidden_ids = [18, 19, 20, 27, 28, 29]
+    encodings = {}
+    for word, token_id in zip(bad_words, forbidden_ids, strict=True):
+        encodings[word] = [token_id]
+        encodings[" " + word] = [32, token_id]
+    tokenizer = _BadWordsTokenizer(encodings)
+
+    # The resumed call starts with empty output history: its saved output is
+    # now prompt tokens. Single-token bans must mask the same logits either way.
+    for output_history in ([65, 66], []):
+        params = SamplingParams(bad_words=list(bad_words))
+        params.update_from_tokenizer(tokenizer)
+        assert params.bad_words_token_ids == [[i] for i in forbidden_ids]
+        assert "bad_words" not in _generation_cut_blockers(params)
+        logits = torch.zeros(256)
+        _apply_bad_words_single_batch(
+            logits, params.bad_words_token_ids, output_history
+        )
+        assert torch.isneginf(logits[forbidden_ids]).all()
+        assert logits[65] == 0
 
 
 @pytest.mark.parametrize(

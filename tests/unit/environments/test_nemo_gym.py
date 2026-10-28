@@ -1066,7 +1066,17 @@ def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
     )
 
 
-def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "processor_name",
+    [
+        "NemotronNanoVLV2Processor",
+        "NemotronH_Nano_Omni_Reasoning_V3Processor",
+        "NemotronH_Omni_Reasoning_V3Processor",
+    ],
+)
+def test_nemotron_cached_video_uses_native_lossless_manifest(
+    monkeypatch, tmp_path, processor_name
+):
     frame_paths = []
     for index in range(4):
         frame_path = tmp_path / f"frame_{index:04d}.png"
@@ -1127,14 +1137,19 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
         name_or_path = "nemotron-test"
         model_input_names = ["input_ids"]
 
-    class NemotronNanoVLV2Processor:
-        model_input_names = ["input_ids", "pixel_values", "imgs_sizes"]
-        tokenizer = _Tokenizer()
+    processor_class = type(
+        processor_name,
+        (),
+        {
+            "model_input_names": ["input_ids", "pixel_values", "imgs_sizes"],
+            "tokenizer": _Tokenizer(),
+        },
+    )
 
     datum = nemo_gym_example_to_video_datum_spec(
         example,
-        processor=NemotronNanoVLV2Processor(),
-        max_seq_length=None,
+        processor=processor_class(),
+        max_seq_length=256,
         idx=3,
         task_name="nemo_gym",
         data_config=SimpleNamespace(
@@ -1142,7 +1157,8 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
             video_temporal_patch_size=2,
             video_target_num_patches=64,
             video_maintain_aspect_ratio=True,
-            min_generation_tokens=16,
+            # Native Nemotron video must not require the generic-path budget.
+            min_generation_tokens=None,
         ),
     )
 
