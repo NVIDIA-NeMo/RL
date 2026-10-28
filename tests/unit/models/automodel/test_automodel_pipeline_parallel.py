@@ -14,6 +14,7 @@
 
 """Unit tests for Automodel pipeline-parallel batch planning and the loss adapter."""
 
+from contextlib import nullcontext
 from typing import Any
 
 import pytest
@@ -107,7 +108,8 @@ def _execution_batch(
             first_sample_id, first_sample_id + num_microbatches * mbs
         ),
         model_inputs={},
-        seq_len=_SEQ_LEN,
+        model_context_factory=nullcontext,
+        cp_sharder=None,
     )
 
 
@@ -261,6 +263,9 @@ def test_plan_execution_batches_pads_to_the_busiest_dp_rank(monkeypatch):
         tokenizer=None,
         cfg={"automodel_cfg": {"sequence_parallel": False}},
         allow_flash_attn_args=True,
+        device_mesh=None,
+        cp_size=1,
+        padding_token_id=0,
     )
 
     assert [b.num_real_microbatches for b in execution_batches] == [2, 1, 0]
@@ -290,6 +295,60 @@ def test_plan_execution_batches_pads_to_the_busiest_dp_rank(monkeypatch):
     assert first.model_inputs["use_cache"] is False
     # The caller's data is untouched.
     assert data["sample_mask"].tolist() == [1.0] * num_samples
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_plan_execution_batches_shards_each_call_once_for_cp(monkeypatch):
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda tensor, op=None, group=None: None
+    )
+    sharder = object()
+    num_chunks_per_shard = []
+
+    def fake_shard(model, model_batch, *, device_mesh, padding_token_id, num_chunks):
+        num_chunks_per_shard.append(num_chunks)
+        # Automodel shards the inputs in place.
+        model_batch["input_ids"].fill_(-1)
+        return sharder, nullcontext, model_batch
+
+    monkeypatch.setattr(
+        "nemo_rl.models.automodel.pipeline_batch.shard_model_batch_for_cp",
+        fake_shard,
+    )
+    num_samples = 8
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.arange(num_samples * _SEQ_LEN).reshape(num_samples, -1),
+            "input_lengths": torch.full((num_samples,), _SEQ_LEN),
+            "token_mask": torch.ones(num_samples, _SEQ_LEN),
+            "sample_mask": torch.ones(num_samples),
+        }
+    ).to("cuda")
+    original_input_ids = data["input_ids"].clone()
+
+    execution_batches = plan_execution_batches(
+        data,
+        model=_Forward(),
+        micro_batch_size=2,
+        microbatches_per_step=2,
+        dp_group=None,
+        tokenizer=None,
+        cfg={"automodel_cfg": {"sequence_parallel": False}},
+        allow_flash_attn_args=True,
+        device_mesh=None,
+        cp_size=2,
+        padding_token_id=0,
+    )
+
+    # One sharding per schedule call, told how many microbatches it holds.
+    assert num_chunks_per_shard == [2, 2]
+    assert all(batch.cp_sharder is sharder for batch in execution_batches)
+    # In-place sharding of the model inputs must not reach the canonical data
+    # the loss reads.
+    canonical_input_ids = torch.cat(
+        [mb.data_dict["input_ids"] for b in execution_batches for mb in b.microbatches]
+    )
+    torch.testing.assert_close(canonical_input_ids, original_input_ids)
 
 
 class _ChunkDimsForward(_Forward):
@@ -331,6 +390,9 @@ def test_plan_execution_batches_checks_model_chunk_dims(monkeypatch, chunk_dims)
             tokenizer=None,
             cfg={"automodel_cfg": {"sequence_parallel": False}},
             allow_flash_attn_args=True,
+            device_mesh=None,
+            cp_size=1,
+            padding_token_id=0,
         )
 
     if chunk_dims:

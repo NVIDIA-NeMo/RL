@@ -143,10 +143,11 @@ def test_interleaved_accepts_rounded_microbatches():
     assert pipeline_cfg.pp_schedule == "interleaved_1f1b"
 
 
-def test_accepts_expert_parallelism():
-    # Automodel builds the expert-parallel mesh inside each pipeline stage.
-    config = _config(expert_parallel_size=8)
-    assert _validate(config) is not None
+@pytest.mark.parametrize(
+    "overrides", [{"expert_parallel_size": 8}, {"context_parallel_size": 2}]
+)
+def test_accepts_expert_and_context_parallelism(overrides):
+    assert _validate(_config(**overrides)) is not None
 
 
 def test_defer_fsdp_grad_sync_must_be_explicit():
@@ -173,10 +174,6 @@ def test_logprob_batch_size_must_match_train_micro_batch_size():
         (
             lambda c: c["dynamic_batching"].update(enabled=True),
             "dynamic_batching.enabled",
-        ),
-        (
-            lambda c: c["automodel_cfg"].update(context_parallel_size=2),
-            "context_parallel_size > 1",
         ),
         (
             lambda c: c["automodel_cfg"].update(sequence_parallel=True),

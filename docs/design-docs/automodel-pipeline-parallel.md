@@ -54,7 +54,7 @@ Qwen3.5-MoE's MTP layer) are not placed on any stage; RL training does not use t
   `logprob_batch_size != train_micro_batch_size`.
 - `1f1b` with `M < pp_size` or with `layers_per_stage`; `interleaved_1f1b` with M not a
   multiple of `max(1, M // pp_size)`.
-- Sequence packing, dynamic batching, CP > 1, sequence parallelism, CPU offload,
+- Sequence packing, dynamic batching, sequence parallelism, CPU offload,
   LoRA, draft co-training, router replay, reward models, ModelOpt quantization,
   multimodal (VLM) models, non-colocated generation, and any `refit_transport`.
 - Models whose embedding and LM head share one weight (`tie_word_embeddings`).
@@ -117,6 +117,16 @@ execution batch keeps the data's padded sequence length.
 
 Each row gets a sample ID (its position in the planned data). The schedule receives the
 IDs as the loss `target` and splits them along dim 0 exactly like the model inputs.
+
+With context parallelism, Automodel's `ContextParallelSharder` shards each execution
+batch once for all of its microbatches (`num_chunks=M`), as Automodel's own pipeline
+trainer does. The schedule call runs inside the sharder's context, which may shard the
+inputs in place, so the stage shapes are set from the input length inside it: the local
+shard for the generic round-robin layout, or the full length for models that shard in
+their own forward and describe their local activations through
+`get_pipeline_stage_metas`. The microbatches' canonical data stays unsharded, and the
+loss adapter maps each microbatch's targets and logprobs through the same sharder, which
+is valid because the layout depends only on the sequence position.
 
 ### 4.2 Loss Adapter
 
@@ -192,7 +202,6 @@ recommended.
 
 ## 8. Limitations and Follow-ups
 
-- Context parallelism is not supported yet.
 - Streaming (SingleController) updates need unknown-N normalization and an upstream
   fix that preserves gradients across stage re-initialization.
 - Inputs whose batch dimension is not dim 0, as reported by a model's

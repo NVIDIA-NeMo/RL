@@ -271,10 +271,6 @@ def validate_automodel_pipeline_config(
         "sequence_packing.enabled": "sequence_packing" in config
         and config["sequence_packing"]["enabled"],
         "dynamic_batching.enabled": config["dynamic_batching"]["enabled"],
-        "automodel_cfg.context_parallel_size > 1": automodel_cfg[
-            "context_parallel_size"
-        ]
-        > 1,
         "automodel_cfg.sequence_parallel": automodel_cfg["sequence_parallel"],
         "automodel_cfg.cpu_offload": automodel_cfg["cpu_offload"],
         "automodel_cfg.lora_cfg.enabled": "lora_cfg" in automodel_cfg

@@ -179,28 +179,68 @@ def prepare_model_forward(
             model_context_factory=nullcontext,
         )
 
-    # Automodel's generic CP prep reads ``batch["labels"]`` unconditionally and
-    # shards it alongside input_ids/position_ids (see ``shard_batch_load_balanced``).
-    # NeMo-RL computes its own masked losses from the returned logits, so pass an
-    # all-ignore placeholder purely to satisfy that contract and drop it again
-    # before the forward. ``pop`` tolerates a strategy that consumed it itself.
-    model_batch["labels"] = torch.full_like(processed_inputs.input_ids, -100)
-
-    cp_sharder = ContextParallelSharder(
+    cp_sharder, model_context_factory, model_batch = shard_model_batch_for_cp(
         model,
-        device_mesh,
         model_batch,
+        device_mesh=device_mesh,
         padding_token_id=padding_token_id,
         num_chunks=1,
     )
-    model_context_factory, model_batch = cp_sharder.shard(model_batch)
-    model_batch.pop("labels", None)
     return PreparedModelForward(
         model_batch=model_batch,
         cp_size=cp_size,
         cp_sharder=cp_sharder,
         model_context_factory=model_context_factory,
     )
+
+
+def shard_model_batch_for_cp(
+    model: nn.Module,
+    model_batch: dict[str, Any],
+    *,
+    device_mesh: Optional[DeviceMesh],
+    padding_token_id: int,
+    num_chunks: int,
+) -> tuple[
+    ContextParallelSharder, Callable[[], AbstractContextManager[Any]], dict[str, Any]
+]:
+    """Resolve Automodel's context-parallel sharder for a model batch and shard it.
+
+    Automodel pads and shards the batch's tensors in place, some strategies
+    only once the returned context is entered, so ``model_batch`` must not
+    share storage with the canonical loss-side data.
+
+    Args:
+        model: The model, or under pipeline parallelism a local model part,
+            whose attention backend and CP hook select the strategy.
+        model_batch: Model-facing inputs with full-length sequences.
+        device_mesh: Device mesh with the ``cp`` axis.
+        padding_token_id: Token used to pad ``input_ids`` to the CP granularity.
+        num_chunks: Number of microbatches the batch is split into after
+            sharding (1 outside pipeline parallelism).
+
+    Returns:
+        The sharder, which maps token tensors between the canonical and local
+        sequence layouts; the context factory the forward and backward passes
+        must run in; and the sharded batch.
+    """
+    # Automodel's generic CP prep reads ``batch["labels"]`` unconditionally and
+    # shards it alongside input_ids/position_ids (see ``shard_batch_load_balanced``).
+    # NeMo-RL computes its own masked losses from the returned logits, so pass an
+    # all-ignore placeholder purely to satisfy that contract and drop it again
+    # before the forward. ``pop`` tolerates a strategy that consumed it itself.
+    model_batch["labels"] = torch.full_like(model_batch["input_ids"], -100)
+
+    cp_sharder = ContextParallelSharder(
+        model,
+        device_mesh,
+        model_batch,
+        padding_token_id=padding_token_id,
+        num_chunks=num_chunks,
+    )
+    model_context_factory, model_batch = cp_sharder.shard(model_batch)
+    model_batch.pop("labels", None)
+    return cp_sharder, model_context_factory, model_batch
 
 
 def model_forward(
