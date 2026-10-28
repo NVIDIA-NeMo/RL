@@ -1022,10 +1022,22 @@ class AsyncNemoGymRolloutImpl:
         )
         if not receipt_mode:
             source_message_log = input_sample["message_log"]
-            attach_static_multimodal_payload(prompt_message_log, source_message_log)
+            # Prompt and completion logs may alias message dictionaries. Share
+            # one identity set so rollout-matched media cannot be overwritten
+            # through a second view after its marker is consumed.
+            processed_target_ids: set[int] = set()
+            attach_static_multimodal_payload(
+                prompt_message_log,
+                source_message_log,
+                processed_target_ids=processed_target_ids,
+                tokenizer=self._tokenizer,
+            )
             for completion in completions:
                 attach_static_multimodal_payload(
-                    completion.message_log, source_message_log
+                    completion.message_log,
+                    source_message_log,
+                    processed_target_ids=processed_target_ids,
+                    tokenizer=self._tokenizer,
                 )
 
         timer.stop(f"{timer_prefix}/total")
@@ -1216,6 +1228,10 @@ class AsyncNemoGymRolloutImpl:
                 # Completion callbacks are token-capture receipt-only, making this
                 # conversion lightweight and safe to repeat during group metrics.
                 row_completions, _ = self._results_to_completions([result])
+                assert row_completions[0].env_extras is not None
+                row_completions[0].env_extras["agent_ref"] = copy.deepcopy(
+                    resolved_agent_ref
+                )
                 await on_completion(rowidx, row_completions[0])
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
@@ -2326,6 +2342,14 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain environment extras"
                 )
+            agent_ref = env_extras.get("agent_ref")
+            resolved_agent_name = (
+                agent_ref.get("name") if isinstance(agent_ref, dict) else None
+            )
+            if not isinstance(resolved_agent_name, str) or not resolved_agent_name:
+                raise ValueError(
+                    "token-capture completion requires resolved agent_ref.name"
+                )
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
@@ -2369,6 +2393,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    resolved_agent_name=resolved_agent_name,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
                 )
@@ -2400,6 +2425,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    resolved_agent_name=resolved_agent_name,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
                 )
@@ -2448,6 +2474,9 @@ class RolloutManager:
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
+                resolved_agent_name=self._recovery_ledger.get_group(
+                    group_id
+                ).resolved_agent_name,
             )
             assert_metadata_only(request)
             return request

@@ -14,8 +14,8 @@
 
 """Unit tests for train-side expert source grouping and materialization.
 
-``_group_experts`` (``MegatronPolicyWorkerImpl``) creates a ``pre`` hook that
-prepares this rank's full expert group before selecting one HF projection.
+``MegatronReshardParamSpecCollection._grouped_expert_spec`` creates a ``pre`` hook
+that prepares this rank's full expert group before selecting one HF projection.
 Plain CPU tensors suffice for unquantized sources.
 
 Importing ``megatron_policy_worker`` pulls in megatron.core, so this is
@@ -41,6 +41,7 @@ from megatron.bridge.models.conversion.param_mapping import (  # noqa: E402
 import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module  # noqa: E402
 from nemo_rl.models.policy.workers.megatron_policy_worker import (  # noqa: E402
     MegatronPolicyWorkerImpl,
+    MegatronReshardParamSpecCollection,
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import (  # noqa: E402
     LocalParamSpec,
@@ -51,34 +52,34 @@ pytestmark = pytest.mark.mcore
 
 
 def _source(
-    tensor: torch.Tensor, hf_view: LocalHFParamSpec | None = None
+    tensor: torch.Tensor, hf_spec: LocalHFParamSpec | None = None
 ) -> LocalParamSpec:
-    worker = object.__new__(MegatronPolicyWorkerImpl)
-    return worker._default_param_spec(
-        tensor, hf_view if hf_view is not None else LocalHFParamSpec("weight")
+    return MegatronReshardParamSpecCollection._default_param_spec(
+        tensor, hf_spec if hf_spec is not None else LocalHFParamSpec("weight")
     )
 
 
 def _group(proj, grouped_name, expert_groups):
-    worker = object.__new__(MegatronPolicyWorkerImpl)
-    grouped = worker._group_experts(proj, grouped_name, expert_groups)
+    grouped = MegatronReshardParamSpecCollection._grouped_expert_spec(
+        proj, grouped_name, expert_groups
+    )
     return grouped.materialize().buf
 
 
-def test_group_experts_missing_group_raises():
+def test_grouped_expert_spec_missing_group_raises():
     groups = {("other.experts", "gate_proj"): [_source(torch.randn(8, 8))]}
     with pytest.raises(AssertionError, match="no local experts.*PP-filter"):
         _group("gate_proj", "model.layers.0.mlp.experts.gate_proj.weight", groups)
 
 
-def test_group_experts_empty_group_raises():
+def test_grouped_expert_spec_empty_group_raises():
     prefix = "model.layers.0.mlp.experts"
     with pytest.raises(AssertionError, match="no local experts.*PP-filter"):
         _group("gate_proj", f"{prefix}.gate_proj.weight", {(prefix, "gate_proj"): []})
 
 
 @pytest.mark.parametrize("mismatch", ["shape", "split"])
-def test_group_experts_rejects_incompatible_hf_views(
+def test_grouped_expert_spec_rejects_incompatible_hf_views(
     mismatch: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prefix = "model.layers.0.mlp.experts"
@@ -100,7 +101,7 @@ def test_group_experts_rejects_incompatible_hf_views(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("split_index", [0, 1])
-def test_group_experts_selects_equivalent_axes_after_group_preparation(
+def test_grouped_expert_spec_selects_equivalent_axes_after_group_preparation(
     dtype: torch.dtype, split_index: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prefix = "model.layers.0.mlp.experts"
@@ -120,8 +121,7 @@ def test_group_experts_selects_equivalent_axes_after_group_preparation(
         member.pre = MagicMock(side_effect=AssertionError("individual hook called"))
     prepare = MagicMock(wraps=worker_module._dequantize_refit_source_group)
     monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", prepare)
-    worker = object.__new__(MegatronPolicyWorkerImpl)
-    grouped = worker._group_experts(
+    grouped = MegatronReshardParamSpecCollection._grouped_expert_spec(
         proj, f"{prefix}.{proj}.weight", {(prefix, proj): members}
     )
     assert grouped.wire_dtype == dtype
@@ -451,7 +451,7 @@ def test_source_map_rejects_metadata_dtype_mismatch(
 # --------------------------------------------------------------------------
 # build_hf_to_local_param_map (train/src side) — folds this rank's local
 # shards (_iter_local_hf_param_shards) into LocalParamSpecs.  Fake the shard
-# iterator; _build_expert_groups / _group_experts run for real.
+# iterator; _build_expert_groups / _grouped_expert_spec run for real.
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_build_hf_to_local_param_map_train_side(dtype: torch.dtype):

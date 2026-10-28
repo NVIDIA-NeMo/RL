@@ -65,6 +65,7 @@ from nemo_rl.experience.reward_penalties import (
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
+    RouteLayout,
     boundary_route_rows,
     execute_route_plan,
 )
@@ -584,7 +585,9 @@ class RolloutReassembler:
         return execute_route_plan(
             plan,
             fragments,
-            dims=self._routed_dims,
+            layout=RouteLayout.compressed(
+                num_moe_layers=self._routed_dims[0], top_k=self._routed_dims[1]
+            ),
             canonical_len=plan.expected_token_length,
         )
 

@@ -180,8 +180,8 @@ policy:
     top_p: 1.0
     top_k: null
     mcore_generation_config:
-      buffer_size_gb: 10               # Memory buffer size for requests, total buffer size is 2x this value (active requests + paused requests)
-      num_cuda_graphs: 16              # Number of CUDA graphs to pre-allocate
+      buffer_size_gb: 10               # On-GPU KV-cache block pool shared by all active requests
+      num_cuda_graphs: -1              # Number of CUDA graphs to build; -1 autotunes
       max_tokens: 16384                # Maximum number of tokens for inference
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512
@@ -197,8 +197,8 @@ policy:
 
 The `mcore_generation_config` section controls Megatron Core inference engine behavior:
 
-- **buffer_size_gb**: Buffer size reserved for active requests that live on the GPU. The total buffer size (stored in unified memory) is 2x this value, with the other half of the buffer reserved for paused requests that live on the CPU.
-- **num_cuda_graphs**: Number of CUDA graphs to pre-allocate for different batch sizes. More graphs can improve performance by avoiding runtime graph capture, but consume more memory.
+- **buffer_size_gb**: Size of the on-GPU KV-cache block pool shared by all active requests. When `max_requests` is unset, Megatron-Core derives it from this pool.
+- **num_cuda_graphs**: Number of CUDA graphs to build; `-1` autotunes, `null` disables inference CUDA graphs.
 - **max_tokens**: Maximum total number of tokens (across all requests) that can be processed simultaneously. This limits the maximum batch size and sequence length combinations. Increasing this might throw OOM depending on vocab size and buffer size allocated. 
 
 #### CUDA-graph capture
@@ -421,7 +421,7 @@ policy:
     top_k: null
     mcore_generation_config:
       buffer_size_gb: 10
-      num_cuda_graphs: 16
+      num_cuda_graphs: -1
       max_tokens: 16384
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512

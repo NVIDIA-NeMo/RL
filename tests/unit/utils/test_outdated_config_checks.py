@@ -13,6 +13,7 @@
 # limitations under the License.
 import ast
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -213,6 +214,54 @@ def test_the_rename_is_reported_before_the_v2_key():
 
 
 # ============================================================================
+# reject_outdated_teacher_projection_matrix_path
+# ============================================================================
+
+
+@pytest.mark.parametrize("legacy_path", [None, "/tmp/legacy.pt"])
+@pytest.mark.parametrize(
+    "aligner", [None, {}, {"projection_matrix_path": "/tmp/nested.pt"}]
+)
+@pytest.mark.parametrize("teacher_index", [0, 1])
+def test_legacy_teacher_projection_path_is_rejected(
+    legacy_path: str | None,
+    aligner: dict[str, Any] | None,
+    teacher_index: int,
+) -> None:
+    teacher: dict[str, Any] = {"projection_matrix_path": legacy_path}
+    if aligner is not None:
+        teacher["aligner"] = aligner
+    with pytest.raises(
+        ValueError,
+        match=rf"teachers\.{teacher_index}\.projection_matrix_path is no longer "
+        rf"supported; move it to teachers\.{teacher_index}\.aligner\.projection_matrix_path\.",
+    ):
+        check_outdated_config({"teachers": [{}] * teacher_index + [teacher]})
+
+
+@pytest.mark.parametrize("projection_path", [None, "/tmp/projection.pt"])
+def test_nested_teacher_projection_path_passes(projection_path: str | None) -> None:
+    check_outdated_config(
+        {"teachers": [{"aligner": {"projection_matrix_path": projection_path}}]}
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [{}, {"teachers": None}, {"teachers": []}, {"teachers": [{}, {"aligner": {}}]}],
+)
+def test_absent_teacher_projection_path_passes(config: dict[str, Any]) -> None:
+    check_outdated_config(config)
+
+
+@pytest.mark.parametrize("section", ["policy", "value", "teacher"])
+def test_teacher_projection_rename_is_scoped_to_multi_teacher_configs(
+    section: str,
+) -> None:
+    check_outdated_config({section: {"projection_matrix_path": "/tmp/projection.pt"}})
+
+
+# ============================================================================
 # reject_outdated_dataset_config
 # ============================================================================
 
@@ -251,32 +300,83 @@ def test_absent_checkpointing_passes():
 
 
 # ============================================================================
-# reject_outdated_mcore_refit_offload_key
+# reject_outdated_mcore_generation_keys
 # ============================================================================
 
 
-@pytest.mark.parametrize("value", [True, False])
-def test_outdated_mcore_refit_offload_key_is_rejected(value):
-    config = {
-        "policy": {
-            "generation": {
-                "mcore_generation_config": {"offload_policy_before_refit": value}
-            }
-        }
-    }
+@pytest.mark.parametrize(
+    ("key", "value", "replacement"),
+    [
+        ("offload_policy_before_refit", True, r"policy\.offload_policy_before_refit"),
+        ("offload_policy_before_refit", False, r"policy\.offload_policy_before_refit"),
+        ("buffer_guaranteed_fraction", 0.1, "paused_buffer_size_gb"),
+        ("unified_memory_level", 0, "kv_cache_management_mode"),
+    ],
+)
+def test_removed_mcore_generation_key_is_rejected(key, value, replacement):
     with pytest.raises(
         ValueError,
-        match=r"policy\.generation\.mcore_generation_config\.offload_policy_before_refit.*policy\.offload_policy_before_refit",
+        match=rf"policy\.generation\.mcore_generation_config\.{key}.*{replacement}",
     ):
-        check_outdated_config(config)
+        check_outdated_config(
+            {"policy": {"generation": {"mcore_generation_config": {key: value}}}}
+        )
 
 
-def test_policy_level_refit_offload_key_passes():
+def test_removed_mcore_generation_keys_report_the_first_and_current_keys_pass():
+    with pytest.raises(ValueError, match="offload_policy_before_refit"):
+        check_outdated_config(
+            {
+                "policy": {
+                    "generation": {
+                        "mcore_generation_config": {
+                            "offload_policy_before_refit": True,
+                            "buffer_guaranteed_fraction": 0.1,
+                            "unified_memory_level": 0,
+                        }
+                    }
+                }
+            }
+        )
+
     check_outdated_config(
         {
             "policy": {
                 "offload_policy_before_refit": True,
-                "generation": {"mcore_generation_config": {}},
+                "generation": {
+                    "mcore_generation_config": {
+                        "buffer_size_gb": 10,
+                        "kv_cache_management_mode": "persist",
+                    }
+                },
             }
         }
     )
+
+
+# ============================================================================
+# reject_outdated_dynamo_router_reset_states
+# ============================================================================
+
+
+def _dynamo_frontend_config(frontend_args: dict) -> dict:
+    return {"policy": {"generation": {"dynamo_cfg": {"frontend_args": frontend_args}}}}
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_dynamo_router_reset_states_is_rejected(value):
+    with pytest.raises(
+        ValueError,
+        match=r"frontend_args\.router_reset_states was removed.*--router-reset-states",
+    ):
+        check_outdated_config(
+            _dynamo_frontend_config({"router_mode": "kv", "router_reset_states": value})
+        )
+
+
+def test_dynamo_frontend_args_without_router_reset_states_pass():
+    check_outdated_config(_dynamo_frontend_config({"router_mode": "kv"}))
+
+
+def test_generation_without_dynamo_cfg_passes():
+    check_outdated_config({"policy": {"generation": {"backend": "vllm"}}})

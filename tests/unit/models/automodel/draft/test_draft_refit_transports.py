@@ -45,6 +45,7 @@ def _make_worker(with_draft: bool = True) -> AutomodelPolicyWorkerImpl:
     worker.draft_model = _TinyDraft() if with_draft else None
     worker.dtype = torch.bfloat16
     worker.cpu_offload = False
+    worker.lora_enabled = False
     worker.rank = 0
     worker.zmq_socket = object()
     worker.maybe_init_zmq = lambda: None

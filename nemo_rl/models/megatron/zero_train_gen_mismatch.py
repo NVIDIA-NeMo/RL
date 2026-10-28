@@ -14,12 +14,13 @@
 
 """Zero train/generation KL (batch-invariant Megatron): validate the recipe, then enable.
 
-The recipe sets every required value; this module only checks them. Only BF16
-(no FP8) is supported.
+The recipe sets every required value; this module only checks them. Supported
+precisions are BF16 and MXFP8 (the same on train and generation).
 """
 
 from __future__ import annotations
 
+import math
 import os
 import warnings
 from dataclasses import dataclass, field, fields
@@ -60,14 +61,18 @@ _ZERO_KL_MEGATRON_REQUIRED: dict[str, Any] = {
     "batch_invariant_collective": "ordered",
 }
 
-_ZERO_KL_GENERATION_REQUIRED: dict[str, Any] = {
-    "enable_chunked_prefill": False,
-}
-
 # Workspace-free cuBLAS (fixed reduction order) for the te_native backend.
 _TE_NATIVE_ENV_VARS = {
     "CUBLASLT_WORKSPACE_SIZE": "0",
     "CUBLAS_WORKSPACE_CONFIG": ":0:0",
+}
+
+# Hybrid Mamba models: the SSM Triton ops read both at import. Without
+# TRITON_CACHE_AUTOTUNING, MAMBA_DETERMINISTIC replaces autotuning with the cheapest
+# config.
+_HYBRID_MAMBA_ENV_VARS = {
+    "MAMBA_DETERMINISTIC": "1",
+    "TRITON_CACHE_AUTOTUNING": "1",
 }
 
 
@@ -128,21 +133,16 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             f"{', '.join(missing_fields)}."
         )
 
-    if megatron_cfg.get("tensor_model_parallel_size") != 1:
+    if (megatron_cfg.get("tensor_model_parallel_size") or 1) > 2:
         out.violations.append(
             "batch_invariant_mode=True currently requires "
-            "policy.megatron_cfg.tensor_model_parallel_size=1."
+            "policy.megatron_cfg.tensor_model_parallel_size <= 2: at TP >= 3 "
+            "Megatron-Core's TP reductions sum in a message-layout dependent order."
         )
     if megatron_cfg.get("context_parallel_size") != 1:
         out.violations.append(
             "batch_invariant_mode=True currently requires training context "
             "parallel size 1."
-        )
-    if config["sequence_packing"]["enabled"]:
-        out.violations.append(
-            "batch_invariant_mode=True requires sequence_packing.enabled=False: "
-            "packing changes microbatch composition and the packed log-prob path "
-            "does not share generation's fused log-softmax."
         )
     token_multiple = batch_invariant_token_multiple(
         megatron_cfg["tensor_model_parallel_size"]
@@ -267,36 +267,101 @@ def allow_installed_flash_attn_4() -> None:
     mcore_attention.HAVE_FA4 = True
 
 
-class _Tp1LocalLogprob:
-    """At TP size 1, use the log-softmax Megatron Inference uses (bitwise)."""
+class _GenAlignedLogprob(torch.autograd.Function):
+    """Megatron Inference's log-probs forward; the replaced function's backward.
+
+    The forward gathers each sequence chunk's vocab shards (a no-op at TP 1)
+    and runs the same full-row log-softmax as Megatron Inference, so it matches
+    generation bitwise. The backward re-runs the replaced NeMo-RL function on
+    the saved logits and returns its gradient, so for a given output gradient
+    it is bitwise the gradient of a run without this mode.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]  Always ignore torch.autograd.Function.forward's type since it's always more specific than the base class
+        ctx: Any,
+        vocab_parallel_logits: torch.Tensor,
+        target: torch.Tensor,
+        chunk_size: int | None,
+        group: torch.distributed.ProcessGroup,
+        inference_only: bool,
+        original: Any,
+        original_args: tuple[Any, ...],
+    ) -> torch.Tensor:
+        # Deferred: Megatron-Core exists only in worker venvs; model_utils is heavy.
+        from megatron.core.tensor_parallel.mappings import (
+            gather_from_tensor_model_parallel_region,
+        )
+
+        from nemo_rl.distributed import model_utils
+
+        seq_len = int(target.shape[1])
+        step = chunk_size or seq_len
+        out_chunks = []
+        for chunk_start in range(0, seq_len, step):
+            chunk_end = min(seq_len, chunk_start + step)
+            full_logits = gather_from_tensor_model_parallel_region(
+                vocab_parallel_logits[:, chunk_start:chunk_end, :], group=group
+            )
+            out_chunks.append(
+                model_utils._tp_target_logprobs(
+                    full_logits,
+                    target[:, chunk_start:chunk_end],
+                    vocab_start_index=0,
+                    vocab_end_index=full_logits.shape[-1],
+                    tp_group=None,
+                    inference_only=True,
+                )
+            )
+            del full_logits
+
+        if not inference_only:
+            ctx.save_for_backward(vocab_parallel_logits, target)
+            ctx.original = original
+            ctx.original_args = original_args
+        return torch.cat(out_chunks, dim=1)
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple[Any, ...]:
+        vocab_parallel_logits, target = ctx.saved_tensors
+        with torch.enable_grad():
+            logits = vocab_parallel_logits.detach().requires_grad_()
+            logprobs = ctx.original.apply(logits, target, *ctx.original_args, False)
+            (grad_input,) = torch.autograd.grad(logprobs, logits, grad_outputs[0])
+        return grad_input, None, None, None, None, None, None
+
+
+class _FullVocabLogprob:
+    """Forward with Megatron Inference's full-row log-softmax; backward unchanged.
+
+    The distributed log-softmax sums per-rank partial normalizers, which rounds
+    differently from Megatron Inference's single full-row reduction, so the
+    forward all-gathers the vocab-parallel logits first. Gradients come from
+    the replaced function (see ``_GenAlignedLogprob``).
+    """
 
     def __init__(self, original: Any, *, chunked: bool) -> None:
         self._original = original
         self._chunked = chunked
 
     def apply(self, *args: Any) -> Any:
-        # Deferred: model_utils is heavy and only needed once the shim is installed.
-        from nemo_rl.distributed import model_utils
-
-        if self._chunked:
-            logits, target, start, end, chunk_size, group, inference_only = args
-        else:
-            logits, target, start, end, group, inference_only = args
-            chunk_size = None
-        if group is None or torch.distributed.get_world_size(group) != 1:
+        logits, target, *original_args, inference_only = args
+        group = original_args[-1]
+        chunk_size = original_args[2] if self._chunked else None
+        if group is None:
             return self._original.apply(*args)
-        return model_utils._tp_target_logprobs(
+        return _GenAlignedLogprob.apply(
             logits,
             target,
-            vocab_start_index=start,
-            vocab_end_index=end,
-            tp_group=None,
-            chunk_size=chunk_size,
-            inference_only=inference_only,
-        )
+            chunk_size,
+            group,
+            inference_only,
+            self._original,
+            tuple(original_args),
+        ).contiguous()
 
 
-def _use_fused_log_softmax_at_tp1() -> None:
+def _use_full_vocab_log_softmax() -> None:
     # Deferred: model_utils is heavy and only needed once the shim is installed.
     from nemo_rl.distributed import model_utils
 
@@ -305,8 +370,29 @@ def _use_fused_log_softmax_at_tp1() -> None:
         ("ChunkedDistributedLogprob", True),
     ):
         current = getattr(model_utils, name)
-        if not isinstance(current, _Tp1LocalLogprob):
-            setattr(model_utils, name, _Tp1LocalLogprob(current, chunked=chunked))
+        if not isinstance(current, _FullVocabLogprob):
+            setattr(model_utils, name, _FullVocabLogprob(current, chunked=chunked))
+
+
+def _enable_mcore_deterministic_tuning() -> None:
+    """Pin Megatron-Core's Triton kernel configs when MAMBA_DETERMINISTIC=1 is set.
+
+    Megatron-Core with ``megatron.core.tuning`` (NVIDIA/Megatron-LM#6076) no longer
+    reads MAMBA_DETERMINISTIC. Its SSM kernels, and the hybrid batch-invariant check
+    in TransformerConfig, follow ``set_deterministic_mode``, and ``install`` pins
+    every in-scope autotuner without timing, so training and generation pick the
+    same config per shape. Megatron's own training sets these from
+    --deterministic-mode, which NeMo-RL does not go through. Older Megatron-Core
+    reads the variable itself.
+    """
+    if not os.environ.get("MAMBA_DETERMINISTIC", "").startswith("1"):
+        return
+    try:
+        from megatron.core import tuning
+    except ImportError:
+        return
+    tuning.set_deterministic_mode(True)
+    tuning.install(deterministic=True)
 
 
 def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
@@ -327,7 +413,8 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     enable_mcore_batch_invariant_mode(
         backend=megatron_cfg["batch_invariant_backend"], collective=collective
     )
-    _use_fused_log_softmax_at_tp1()
+    _enable_mcore_deterministic_tuning()
+    _use_full_vocab_log_softmax()
     print(
         "[zero_train_gen_mismatch] batch-invariant kernels enabled: "
         f"backend={megatron_cfg['batch_invariant_backend']} "
@@ -347,7 +434,7 @@ def validate_zero_train_gen_kl(
     call it before Ray allocates GPUs; workers also check the installed
     packages and the GPU.
     """
-    if "megatron_cfg" not in config:  # DTensor / Automodel policies
+    if "megatron_cfg" not in config:  # Automodel policies
         return
     result = validate_zero_train_gen_mismatch(
         config,
@@ -376,17 +463,6 @@ def _validate_required_values(
                 f"(got {megatron_cfg.get(key)!r})."
             )
 
-    generation = config.get("generation")
-    if generation is None or generation.get("backend") != "megatron":
-        return  # reported by _validate_backend
-    mcore_generation_config = generation["mcore_generation_config"]
-    for key, value in _ZERO_KL_GENERATION_REQUIRED.items():
-        if mcore_generation_config.get(key) != value:
-            out.violations.append(
-                f"policy.generation.mcore_generation_config.{key} must be "
-                f"{value!r} (got {mcore_generation_config.get(key)!r})."
-            )
-
 
 def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
     generation = config.get("generation")
@@ -408,6 +484,22 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
     if impl != "inference_optimized":
         out.violations.append(
             f"generation transformer_impl must be 'inference_optimized' (got {impl!r})."
+        )
+
+    fp8_cfg = inference_cfg.get("fp8_cfg") or {}
+    backend = inference_cfg.get("inference_grouped_gemm_backend")
+    backend = getattr(backend, "value", backend)
+    if (
+        impl == "inference_optimized"
+        and backend == "flashinfer"
+        and fp8_cfg.get("enabled")
+        and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    ):
+        out.violations.append(
+            "zero_train_gen_mismatch does not support "
+            "inference_grouped_gemm_backend='flashinfer' with MXFP8: the FlashInfer "
+            "kernel is batch-invariant but not bitwise identical to TE training. "
+            "Use 'torch' or 'vllm'."
         )
 
 
@@ -497,15 +589,41 @@ def _validate_packages(out: ZeroTrainGenValidation) -> None:
 def validate_zero_train_gen_model_provider(
     config: PolicyConfig, model_cfg: Any
 ) -> None:
-    """Reject unsupported architectures using the resolved Bridge provider."""
+    """Reject unsupported architectures using the resolved Bridge provider.
+
+    Hybrid Mamba models are supported with MAMBA_DETERMINISTIC=1 and
+    TRITON_CACHE_AUTOTUNING=1, from policy.megatron_cfg.env_vars or the launch
+    environment. With sequence packing, every packed sequence must also start on a
+    Mamba chunk boundary.
+    """
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return
+
+    if getattr(model_cfg, "is_hybrid_model", False) or "M" in (
+        getattr(model_cfg, "hybrid_layer_pattern", None) or ""
+    ):
+        env_vars = config["megatron_cfg"].get("env_vars") or {}
+        wrong = {}
+        for key, value in _HYBRID_MAMBA_ENV_VARS.items():
+            got = env_vars.get(key, os.environ.get(key))
+            if got != value:
+                wrong[key] = got
+        if wrong:
+            required = ", ".join(
+                f"{k}={v!r}" for k, v in _HYBRID_MAMBA_ENV_VARS.items()
+            )
+            got = ", ".join(f"{k}={v!r}" for k, v in wrong.items())
+            raise ValueError(
+                "zero_train_gen_mismatch on a hybrid Mamba model requires "
+                f"{required} together in policy.megatron_cfg.env_vars or the launch "
+                f"environment (got {got})."
+            )
+        _validate_mamba_packed_sequence_alignment(config, model_cfg)
 
     unsupported_fields = [
         field_name
         for field_name in (
             "multi_latent_attention",
-            "hybrid_layer_pattern",
             "experimental_attention_variant",
         )
         if getattr(model_cfg, field_name, None)
@@ -517,8 +635,36 @@ def validate_zero_train_gen_model_provider(
         )
 
 
+def _validate_mamba_packed_sequence_alignment(
+    config: PolicyConfig, model_cfg: Any
+) -> None:
+    """Packed rows place each sequence at a multiple of make_sequence_length_divisible_by.
+
+    Training's SSM scan cuts fixed chunks from the start of the packed row, while
+    generation cuts them from each request's start; the two match only when every
+    sequence starts on a chunk boundary.
+    """
+    if not config["sequence_packing"]["enabled"]:
+        return
+    chunk_size = model_cfg.mamba_chunk_size
+    multiple = math.lcm(
+        batch_invariant_token_multiple(
+            config["megatron_cfg"]["tensor_model_parallel_size"]
+        ),
+        chunk_size,
+    )
+    divisor = config["make_sequence_length_divisible_by"]
+    if divisor % multiple:
+        raise ValueError(
+            "zero_train_gen_mismatch with sequence packing on a hybrid Mamba model "
+            f"requires policy.make_sequence_length_divisible_by to be a multiple of "
+            f"{multiple} (mamba_chunk_size={chunk_size}), so each packed sequence "
+            f"starts on a Mamba chunk boundary (got {divisor})."
+        )
+
+
 def _validate_precision(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
-    """Only BF16 without FP8 is supported, on both the train and generation side."""
+    """BF16, or FP8 with the MXFP8 recipe; train and generation must agree."""
     if config.get("precision") != "bfloat16":
         out.violations.append(
             "zero_train_gen_mismatch requires policy.precision='bfloat16' "
@@ -529,8 +675,20 @@ def _validate_precision(config: PolicyConfig, out: ZeroTrainGenValidation) -> No
     generation = config.get("generation")
     if generation is not None and generation.get("backend") == "megatron":
         sides.append(("generation", merged_inference_megatron_cfg(config)))
+    kinds: dict[str, str] = {}
     for label, cfg in sides:
-        if cfg.get("fp8_cfg") and cfg["fp8_cfg"].get("enabled"):
+        fp8_cfg = cfg.get("fp8_cfg") or {}
+        if not fp8_cfg.get("enabled"):
+            kinds[label] = "bf16"
+            continue
+        kinds[label] = f"fp8:{fp8_cfg.get('fp8_recipe')}"
+        if fp8_cfg.get("fp8_recipe") != "mxfp8":
             out.violations.append(
-                f"zero_train_gen_mismatch does not support FP8 ({label}.fp8_cfg.enabled=true)."
+                "zero_train_gen_mismatch supports FP8 only with fp8_recipe='mxfp8' "
+                f"(got {label}.fp8_cfg.fp8_recipe={fp8_cfg.get('fp8_recipe')!r})."
             )
+    if len(set(kinds.values())) > 1:
+        out.violations.append(
+            "zero_train_gen_mismatch requires the same precision on the train and "
+            f"generation side (got {kinds})."
+        )

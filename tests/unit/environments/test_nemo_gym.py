@@ -32,7 +32,9 @@ from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
+    ROLLOUT_MATCHED_MEDIA_KEY,
     PackedTensor,
+    attach_image_model_inputs_to_message,
     image_to_data_url,
     video_path_to_data_url,
 )
@@ -69,6 +71,7 @@ from nemo_rl.environments.nemotron_utils import (
 )
 from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
+    _reattach_static_multimodal_payloads_to_result,
     attach_static_multimodal_payload,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -334,7 +337,8 @@ def test_extract_static_video_message_resolves_local_file(tmp_path):
     assert messages[0]["content"][1]["type"] == "video"
 
 
-def test_extract_static_video_message_accepts_cached_frames(tmp_path):
+@pytest.mark.parametrize("with_timing", [False, True])
+def test_extract_static_video_message_accepts_cached_frames(tmp_path, with_timing):
     frame_paths = []
     for index in range(2):
         frame_path = tmp_path / f"frame_{index:04d}.png"
@@ -362,6 +366,13 @@ def test_extract_static_video_message_accepts_cached_frames(tmp_path):
         }
     }
 
+    if with_timing:
+        for part, index in zip(
+            example["responses_create_params"]["input"][0]["content"], [0, 24]
+        ):
+            part.update(_video_frame_index=index, _video_fps=23.976)
+    expected_indices = [0, 24] if with_timing else [0, 1]
+    expected_fps = 23.976 if with_timing else 1.0
     messages, resolved_path = _extract_static_video_messages(example)
 
     assert resolved_path is None
@@ -374,14 +385,18 @@ def test_extract_static_video_message_accepts_cached_frames(tmp_path):
         isinstance(part["image"], Image.Image) for part in messages[0]["content"][:2]
     )
     assert all(part["_is_video_frame"] for part in messages[0]["content"][:2])
-    assert [part["_video_frame_index"] for part in messages[0]["content"][:2]] == [0, 1]
-    assert [part["_video_fps"] for part in messages[0]["content"][:2]] == [1.0, 1.0]
+    assert [
+        part["_video_frame_index"] for part in messages[0]["content"][:2]
+    ] == expected_indices
+    assert [part["_video_fps"] for part in messages[0]["content"][:2]] == [
+        expected_fps
+    ] * 2
 
     _, frames, frame_indices, fps = _flatten_nemotron_video_frame_messages(messages)
 
     assert len(frames) == 2
-    assert frame_indices == [0, 1]
-    assert fps == 1.0
+    assert frame_indices == expected_indices
+    assert fps == expected_fps
 
 
 def test_extract_static_video_message_ignores_still_image_only_row():
@@ -639,6 +654,55 @@ def test_reattach_static_multimodal_payload_to_rollout_user_message():
     assert target[1]["pixel_values"] is payload
 
 
+def test_reattach_keeps_rollout_matched_media_when_token_counts_already_match():
+    """Exact-count processor media is authoritative even without budget repair."""
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class _TextTokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_processor = _ImageProcessor()
+        tokenizer = _TextTokenizer()
+        model_input_names = ["input_ids", "pixel_values", "num_tokens"]
+
+        def __call__(self, *, text, images, return_tensors):
+            assert text == "<image>"
+            assert len(images) == 1
+            assert return_tensors == "pt"
+            return {
+                "input_ids": torch.tensor([[1]]),
+                "pixel_values": torch.tensor([[7.0]]),
+                "num_tokens": torch.tensor([256]),
+            }
+
+    target_user = {"role": "user", "content": "question"}
+    attach_image_model_inputs_to_message(
+        target_user,
+        images=[Image.new("RGB", (2, 2))],
+        processor=_Processor(),
+        expected_num_tokens_per_image=[256],
+    )
+    rollout_media = target_user["pixel_values"]
+    assert target_user[ROLLOUT_MATCHED_MEDIA_KEY] is True
+
+    result = {
+        "input_message_log": [target_user],
+        "message_log": [target_user],
+    }
+    static_media = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    _reattach_static_multimodal_payloads_to_result(
+        result,
+        [{"role": "user", "content": "question", "pixel_values": static_media}],
+    )
+
+    assert target_user["pixel_values"] is rollout_media
+    assert ROLLOUT_MATCHED_MEDIA_KEY not in target_user
+
+
 def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"video")
@@ -764,7 +828,9 @@ def test_video_datum_requires_explicit_video_data_config(tmp_path):
 
 def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_path):
     data_path = tmp_path / "video-gym.jsonl"
-    data_path.write_text(json.dumps({"row": 1}) + "\n", encoding="utf-8")
+    video_part = {"type": "input_video", "video_url": "clip.mp4"}
+    row = {"responses_create_params": {"input": [{"content": [video_part]}]}}
+    data_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
     expected_media_config = {
         "num_frames": 32,
         "video_sampling_style": "nemotron_vl",
@@ -806,7 +872,7 @@ def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_pa
     )
     processor = SimpleNamespace(
         apply_chat_template=lambda *args: None,
-        tokenizer=object(),
+        tokenizer=SimpleNamespace(bos_token_id=None),
     )
 
     train_dataset, _ = setup_response_data(
@@ -1097,7 +1163,10 @@ def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
     )
 
 
-def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_path):
+@pytest.mark.parametrize("with_timing", [False, True])
+def test_nemotron_cached_video_uses_native_lossless_manifest(
+    monkeypatch, tmp_path, with_timing
+):
     frame_paths = []
     for index in range(4):
         frame_path = tmp_path / f"frame_{index:04d}.png"
@@ -1135,10 +1204,15 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
             },
         }
     }
+    if with_timing:
+        for part, index in zip(
+            example["responses_create_params"]["input"][0]["content"], [0, 6, 12, 18]
+        ):
+            part.update(_video_frame_index=index, _video_fps=23.976)
     manifest_calls = []
 
-    def fake_manifest_builder(paths):
-        manifest_calls.append(paths)
+    def fake_manifest_builder(paths, *, frame_indices, frame_fps):
+        manifest_calls.append((paths, frame_indices, frame_fps))
         return "data:video/x-nemo-rl-cached-frames;base64,dGVzdA=="
 
     monkeypatch.setattr(
@@ -1178,7 +1252,13 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
     )
 
     assert datum is not None
-    assert manifest_calls == [[str(path) for path in frame_paths]]
+    assert manifest_calls == [
+        (
+            [str(path) for path in frame_paths],
+            [0, 6, 12, 18] if with_timing else [None] * 4,
+            [23.976] * 4 if with_timing else [None] * 4,
+        )
+    ]
     outbound = datum["extra_env_info"]["responses_create_params"]
     assert outbound["input"][0]["content"] == [
         {
@@ -1289,7 +1369,7 @@ def test_nemo_gym_stub_module():
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
     master_config = MasterConfig.model_construct(
-        policy={"generation": generation_config}
+        policy={"generation": generation_config}, data={}
     )
     setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 
@@ -1724,6 +1804,115 @@ def test_nemo_gym_dedup_omits_actor_initial_tensor_and_preserves_later_media():
     ]
     assert on_users[0]["pixel_values"] is original_media
     assert on_users[1]["pixel_values"].as_tensor().item() == 2
+
+
+def test_nemo_gym_dedup_keeps_initial_media_with_pre_response_tool_image(
+    monkeypatch,
+):
+    """Rollout-budget repair must cover initial and tool images together."""
+    initial_url = image_to_data_url(Image.new("RGB", (512, 512), color=(1, 0, 0)))
+    tool_url = image_to_data_url(Image.new("RGB", (1024, 1024), color=(2, 0, 0)))
+    initial_input = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "inspect"},
+                {"type": "input_image", "image_url": initial_url},
+            ],
+        }
+    ]
+
+    image_start_id, image_id, image_end_id = 10, 11, 12
+    image_run = [image_start_id, *([image_id] * 256), image_end_id]
+    nemo_gym_result = {
+        "response": {
+            "agent_input": deepcopy(initial_input),
+            "seed_obs": deepcopy(initial_input),
+            "output": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": tool_url},
+                    ],
+                },
+                {
+                    "prompt_token_ids": [*image_run, *image_run],
+                    "generation_token_ids": [20],
+                    "generation_log_probs": [-0.1],
+                },
+            ],
+        },
+        "responses_create_params": {"input": deepcopy(initial_input)},
+        "reward": 1.0,
+    }
+
+    class _Tokenizer:
+        model_input_names = ["input_ids"]
+        unk_token_id = -1
+
+        def convert_tokens_to_ids(self, tokens):
+            ids = {
+                "<image>": image_id,
+                "<img>": image_start_id,
+                "</img>": image_end_id,
+            }
+            return [ids[token] for token in tokens]
+
+        def batch_decode(self, batch):
+            return ["decoded"] * len(batch)
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class NemotronH_Super_Omni_Reasoning_V3Processor:
+        image_token = "<image>"
+        image_start_token = "<img>"
+        image_end_token = "</img>"
+        image_processor = _ImageProcessor()
+        tokenizer = _Tokenizer()
+        model_input_names = ["input_ids", "pixel_values"]
+
+    def attach_repaired_images(message, *, images, expected_num_tokens_per_image, **_):
+        assert expected_num_tokens_per_image == [256, 256]
+        message["pixel_values"] = PackedTensor(
+            torch.tensor([[image.width] for image in images], dtype=torch.float32),
+            dim_to_pack=0,
+        )
+        message[ROLLOUT_MATCHED_MEDIA_KEY] = True
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym.attach_image_model_inputs_to_message",
+        attach_repaired_images,
+    )
+
+    class _MockSelf:
+        cfg = {}
+        _processor = NemotronH_Super_Omni_Reasoning_V3Processor()
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(),
+            {},
+            nemo_gym_result,
+            _Tokenizer(),
+            include_initial_multimodal_data=False,
+        )
+    )
+    assert result.get("_initial_multimodal_data_omitted") is False
+    original_media = PackedTensor(torch.tensor([[99.0]]), dim_to_pack=0)
+    _reattach_original_multimodal_payloads(
+        [result],
+        [[{"role": "user", "content": "", "pixel_values": original_media}]],
+    )
+
+    user_message = next(
+        message for message in result["message_log"] if message["role"] == "user"
+    )
+    assert user_message["pixel_values"].as_tensor().flatten().tolist() == [
+        512.0,
+        1024.0,
+    ]
+    assert user_message[ROLLOUT_MATCHED_MEDIA_KEY] is True
 
 
 @pytest.mark.parametrize(
