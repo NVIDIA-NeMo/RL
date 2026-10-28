@@ -171,12 +171,12 @@ vllm = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
   # PyPI publishes the default cu130 wheels for both supported architectures.
   # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
-  "vllm==0.29.0",
+  "vllm==0.30.0",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.18",
-  "flashinfer-cubin==0.6.18",
-  "flashinfer-jit-cache==0.6.18",
-  "nvidia-cutlass-dsl[cu13]==4.6.2",
+  "flashinfer-python==0.6.18.post1",
+  "flashinfer-cubin==0.6.18.post1",
+  "flashinfer-jit-cache==0.6.18.post1",
+  "nvidia-cutlass-dsl[cu13]==4.7.1",
 ]
 sglang = [
   # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
@@ -240,7 +240,7 @@ mcore = [
   "flashinfer-cubin==0.6.18.post1",
   "flashinfer-jit-cache==0.6.18.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "nvidia-cutlass-dsl[cu13]==4.6.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cutlass-dsl[cu13]==4.7.1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
@@ -447,6 +447,11 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
+  # vLLM 0.30 requires mcp>=2.0.0 while the vendored Gym member still caps
+  # mcp<2; Gym main already admits <3 (NVIDIA-NeMo/Gym 0b8783981), and the
+  # 2.x import surface nemo_gym uses is unchanged, so this override bridges
+  # until the next Gym submodule bump — remove it then.
+  "mcp>=2.0.0,<3",
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
