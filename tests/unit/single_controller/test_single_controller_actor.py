@@ -46,7 +46,11 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
     ReadyFirstSamplerConfig,
 )
-from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    _create_advantage_estimator,
+    _initial_grpo_save_state,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
@@ -64,6 +68,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     TokenCaptureConfig,
     validate_single_controller_config,
+)
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    JsonDebugWriter,
+    TrainChunk,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
@@ -84,7 +92,6 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 )
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.train_data_dump import TrainDataDump
 from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
@@ -268,7 +275,7 @@ def _stamp_advantage_stage_config(
         advantage_estimator=ctrl._advantage_estimator,
     )
     ctrl._train_data_dump = dump
-    ctrl._train_data_dump_rows = 0
+    ctrl._train_data_dump_receipts = []
     # _absorb_advantage_outcome accumulates into these unconditionally, so they
     # have to exist even for the non-OPD tests. Tests that assert on them set
     # their own values after this call.
@@ -1162,15 +1169,23 @@ class _AdvantageDataPlane:
 class _MaskRecordingAdvantageEstimator:
     def __init__(self) -> None:
         self.mask: torch.Tensor | None = None
+        self.valid_mask: torch.Tensor | None = None
+        self.normalization_mask: torch.Tensor | None = None
 
-    def compute_advantage(self, *, rewards, mask, **kwargs) -> torch.Tensor:
+    def compute_advantage(
+        self, *, rewards, mask, valid_mask, normalization_mask, **kwargs
+    ) -> torch.Tensor:
         del kwargs
         self.mask = mask.clone()
+        self.valid_mask = valid_mask.clone()
+        self.normalization_mask = normalization_mask.clone()
         return rewards.unsqueeze(-1).expand_as(mask).clone()
 
 
+@pytest.mark.parametrize("policy", ["exclude", "include"])
 def test_advantage_stage_composes_all_filters_before_computing_advantages(
     capsys: pytest.CaptureFixture[str],
+    policy: str,
 ) -> None:
     batch_size, sequence_length = 4, 5
     generation_logprobs = torch.zeros(batch_size, sequence_length)
@@ -1215,6 +1230,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
             seq_logprob_error_threshold=2.0,
+            masked_reward_policy=policy,
             overlong_filtering=True,
             invalid_tool_call_advantage=-5.0,
             malformed_thinking_advantage=None,
@@ -1262,6 +1278,16 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     assert estimator.mask is not None
     assert estimator.mask[0].all()
     assert estimator.mask[1:].count_nonzero() == 0
+    expected_valid_mask = (
+        torch.ones(batch_size)
+        if policy == "include"
+        else torch.tensor([1.0, 0.0, 0.0, 0.0])
+    )
+    assert torch.equal(estimator.valid_mask, expected_valid_mask)
+    torch.testing.assert_close(
+        estimator.normalization_mask,
+        data["token_mask"] * expected_valid_mask.unsqueeze(-1),
+    )
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [1]
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
@@ -1525,8 +1551,10 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     assert logged.maximum == pytest.approx(2.0)
 
 
+@pytest.mark.parametrize("policy", ["exclude", "include"])
 def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     capsys: pytest.CaptureFixture[str],
+    policy: str,
 ) -> None:
     batch_size, sequence_length = 2, 5
     data = TensorDict(
@@ -1559,7 +1587,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig(seq_logprob_error_threshold=2.0)
+        grpo=GRPOConfig(seq_logprob_error_threshold=2.0, masked_reward_policy=policy)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -1730,7 +1758,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
-    ctrl._train_data_dump = TrainDataDump(str(tmp_path))
+    ctrl._train_data_dump = JsonDebugWriter(str(tmp_path))
     ctrl._timer = Timer()
     ctrl._train_steps = 0
     ctrl._is_ppo = False
@@ -1825,7 +1853,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     assert len(dump_timings) == 1
     assert math.isfinite(dump_timings[0]) and dump_timings[0] > 0
 
-    ctrl._train_data_dump.finish_step(0)
+    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
     dumped = [
         json.loads(line)
         for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
@@ -4217,20 +4245,22 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
     final = tmp_path / "train_data_step1.jsonl"
     if dump_enabled:
-        ctrl._train_data_dump = TrainDataDump(str(tmp_path))
-        ctrl._train_data_dump.add_chunk(
-            step=0,
-            sample_ids=meta.sample_ids,
-            tags=meta.tags,
-            input_lengths=torch.tensor([1, 1]),
-            sequences={"token_ids": torch.tensor([[10], [20]])},
-            scalars={},
+        ctrl._train_data_dump = JsonDebugWriter(str(tmp_path))
+        receipt = ctrl._train_data_dump.add_chunk(
+            TrainChunk(
+                step=0,
+                sample_ids=meta.sample_ids,
+                tags=meta.tags,
+                input_lengths=torch.tensor([1, 1]),
+                sequences={"token_ids": torch.tensor([[10], [20]])},
+                scalars={},
+            )
         )
         # Seed chunk-write time to verify publication adds to the per-step sum.
         ctrl._timer.record("train_data_dump", 2.0)
         # The chunk above stands in for the stage's write, so stand in for the
-        # row count it would have reported alongside it too.
-        ctrl._train_data_dump_rows = len(meta.sample_ids)
+        # receipt it would have reported alongside it too.
+        ctrl._train_data_dump_receipts = [receipt]
 
     def finish_training() -> dict:
         assert not final.exists()
@@ -4347,3 +4377,264 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     assert not any(name.startswith("finalize/effort/") for name in metrics)
     assert ctrl._finalizer_metrics_by_group == {}
     assert ctrl._finalizer_rewards_by_group == {}
+
+
+@pytest.mark.parametrize("policy", ["exclude", "include"])
+def test_advantage_stage_statistics_participation_is_binary(policy: str) -> None:
+    """A fractional data-plane sample weight votes fully; a placeholder never votes."""
+    batch_size, sequence_length = 3, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(batch_size, 1, dtype=torch.long),
+            "total_reward": torch.tensor([1.0, 0.0, 5.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            # Row 0 trains at half weight; row 2 is a token-capture placeholder.
+            "sample_mask": torch.tensor([0.5, 1.0, 0.0]),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
+    ctrl._is_ppo = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(seq_logprob_error_threshold=None, masked_reward_policy=policy)
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
+    ctrl._step_log_dict = {
+        key: []
+        for key in (
+            "reward_partials",
+            "advantage_partials",
+            "sequence_lengths",
+            "num_mask_sample_filtered",
+            "seq_logprob_error_metrics",
+        )
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
+    )
+
+    _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert has_valid_training_tokens
+    # Statistics: binary, the same under both policies for this batch.
+    assert torch.equal(estimator.valid_mask, torch.tensor([1.0, 1.0, 0.0]))
+    torch.testing.assert_close(
+        estimator.normalization_mask,
+        data["token_mask"] * torch.tensor([1.0, 1.0, 0.0]).unsqueeze(-1),
+    )
+    # Loss: the fractional weight is preserved (no filter changed the mask, so
+    # the stage does not rewrite the sample_mask column).
+    torch.testing.assert_close(
+        estimator.mask, data["token_mask"] * torch.tensor([0.5, 1.0, 0.0]).unsqueeze(-1)
+    )
+    assert data_plane.written_fields is not None
+    assert "sample_mask" not in data_plane.written_fields.keys()
+
+
+@pytest.mark.parametrize("policy", ["exclude", "include"])
+def test_advantage_stage_over_length_prompts_never_vote(policy: str) -> None:
+    """The same example as ``test_grpo.test_trainers_never_let_over_length_prompts_vote``.
+
+    An over-length prompt reaches the data plane with ``sample_mask`` 0 (the
+    dataset's ``loss_multiplier``). It never votes under either policy, so
+    Reinforce++ normalizes over the trainable rows only and gives them
+    ``[1, -1]``, as the legacy and TransferQueue trainers do.
+    """
+    cfg = GRPOConfig(
+        masked_reward_policy=policy,
+        seq_logprob_error_threshold=None,
+        adv_estimator=AdvEstimatorConfig(
+            name="reinforce_plus_plus", minus_baseline=True
+        ),
+    )
+    master = SimpleNamespace(
+        grpo=cfg, loss_fn=ClippedPGLossConfig(use_kl_in_reward=False)
+    )
+    # One prompt token; rows 0-1 answer in two tokens, rows 2-3 in eight.
+    token_mask = torch.zeros(4, 9)
+    token_mask[:2, 1:3] = 1.0
+    token_mask[2:, 1:] = 1.0
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.tensor([[0], [0], [1], [1]]),
+            "total_reward": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            "token_mask": token_mask,
+            "sample_mask": torch.tensor([1.0, 1.0, 0.0, 0.0]),
+            "mask_sample": torch.zeros(4, dtype=torch.bool),
+            "truncated": torch.zeros(4, dtype=torch.bool),
+        },
+        batch_size=[4],
+    )
+
+    class _Recording:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.kwargs: dict[str, Any] | None = None
+
+        def compute_advantage(self, **kwargs):
+            self.kwargs = kwargs
+            return self.inner.compute_advantage(**kwargs)
+
+    plane = _AdvantageDataPlane(data)
+    estimator = _Recording(_create_advantage_estimator(master))
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._dp_client = plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._master_config = master
+    ctrl._algo_cfg = cfg
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        key: []
+        for key in (
+            "reward_partials",
+            "advantage_partials",
+            "sequence_lengths",
+            "num_mask_sample_filtered",
+            "seq_logprob_error_metrics",
+        )
+    }
+    _stamp_advantage_stage_config(ctrl, shardable=False)
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(4)],
+        fields=list(data.keys()),
+        sequence_lengths=[3, 3, 9, 9],
+        tags=[
+            {GROUP_ID_TAG: "trainable" if i < 2 else "over-length"} for i in range(4)
+        ],
+    )
+
+    _, trainable = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert trainable
+    assert estimator.kwargs is not None
+    participation = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    torch.testing.assert_close(estimator.kwargs["valid_mask"], participation)
+    torch.testing.assert_close(
+        estimator.kwargs["normalization_mask"], token_mask * participation[:, None]
+    )
+    assert plane.written_fields is not None
+    advantages = plane.written_fields["advantages"]
+    assert torch.isfinite(advantages).all()
+    # Rows are written back trimmed to their sequence_lengths.
+    for row, expected in enumerate((1.0, -1.0)):
+        written = advantages[row]
+        response = token_mask[row, : written.shape[0]].bool()
+        torch.testing.assert_close(written[response], torch.full((2,), expected))
+
+
+@pytest.mark.parametrize("policy", ["exclude", "include"])
+@pytest.mark.parametrize("estimator_name", ["grpo", "gdpo", "reinforce_plus_plus"])
+def test_advantage_stage_placeholders_never_vote(
+    policy: str, estimator_name: str
+) -> None:
+    """Adding invalid sibling and all-placeholder groups cannot change real advantages."""
+    cfg = GRPOConfig(
+        masked_reward_policy=policy,
+        seq_logprob_error_threshold=None,
+        adv_estimator=AdvEstimatorConfig(
+            name=estimator_name,
+            use_leave_one_out_baseline=False,
+            normalize_rewards=False,
+            minus_baseline=True,
+        ),
+    )
+    master = SimpleNamespace(
+        grpo=cfg, loss_fn=ClippedPGLossConfig(use_kl_in_reward=False)
+    )
+
+    def compute(*, placeholders: bool) -> torch.Tensor:
+        # Three real rows, one environment-masked. Invalid siblings share prompt 1;
+        # the two wholly invalid groups share the pad prompt 0, as in reassembly.
+        n = 8 if placeholders else 3
+        tokens = torch.tensor([[0.0, 1.0, 1.0]] * 3 + [[0.0, 0.0, 0.0]] * (n - 3))
+        rewards = torch.tensor([1.0, 3.0, 9.0] + [0.0] * (n - 3))
+        data = TensorDict(
+            {
+                "prompt_ids_for_adv": torch.tensor(
+                    [[1]] * min(4, n) + [[0]] * max(0, n - 4)
+                ),
+                "total_reward": rewards,
+                "reward/a": rewards.clone(),
+                "reward/b": 2 * rewards,
+                "token_mask": tokens,
+                "sample_mask": torch.tensor([1.0] * 3 + [0.0] * (n - 3)),
+                "mask_sample": torch.tensor([False, False, True] + [False] * (n - 3)),
+                "truncated": torch.zeros(n, dtype=torch.bool),
+            },
+            batch_size=[n],
+        )
+        plane = _AdvantageDataPlane(data)
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._dp_client = plane
+        ctrl._advantage_cfg = AdvantageConfig(
+            repeated_batch_fields=["reward/a", "reward/b"]
+        )
+        ctrl._advantage_estimator = _create_advantage_estimator(master)
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        ctrl._policy_logprobs_required = False
+        ctrl._reference_logprobs_required = False
+        ctrl._teacher_logprobs_required = False
+        ctrl._is_ppo = False
+        ctrl._master_config = master
+        ctrl._algo_cfg = cfg
+        ctrl._message_level_advantage_penalties_enabled = False
+        ctrl._step_log_dict = {
+            key: []
+            for key in (
+                "reward_partials",
+                "advantage_partials",
+                "sequence_lengths",
+                "num_mask_sample_filtered",
+                "seq_logprob_error_metrics",
+            )
+        }
+        _stamp_advantage_stage_config(ctrl, shardable=False)
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"sample-{i}" for i in range(n)],
+            fields=list(data.keys()),
+            sequence_lengths=[3] * n,
+            tags=[
+                {GROUP_ID_TAG: "real" if i < 4 else f"invalid-{(i - 4) // 2}"}
+                for i in range(n)
+            ],
+        )
+        _, trainable = asyncio.run(ctrl._advantage_stage(meta))
+        assert trainable
+        assert plane.written_fields is not None
+        torch.testing.assert_close(
+            plane.written_fields["sample_mask"],
+            torch.tensor([1.0, 1.0] + [0.0] * (n - 2)),
+        )
+        assert torch.isfinite(plane.written_fields["advantages"]).all()
+        written = plane.written_fields["advantages"]
+        return torch.stack(written.unbind()[:2])
+
+    torch.testing.assert_close(compute(placeholders=True), compute(placeholders=False))

@@ -196,6 +196,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "loss_multiplier",
         "logical_selections",
         "execution_row_multiple",
+        "resolved_agent_name",
         "reward_checks",
         "reward_log_contexts",
     }

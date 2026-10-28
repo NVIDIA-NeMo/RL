@@ -133,6 +133,7 @@ def _controller(
 ):
     settings = dict(
         num_generations_per_prompt=2,
+        masked_reward_policy="exclude",
         adv_estimator=AdvEstimatorConfig(
             normalize_rewards=False, use_leave_one_out_baseline=False
         ),
@@ -612,6 +613,50 @@ def test_masked_owner_is_excluded_from_baseline_and_loss(filter_field, ordinary)
     assert (data["token_mask"] * data["sample_mask"].unsqueeze(-1))[
         -counts[-1] :
     ].count_nonzero() == 0
+
+
+@pytest.mark.parametrize("policy", ["include", "exclude"])
+@pytest.mark.parametrize("ordinary", [False, True])
+@pytest.mark.parametrize(
+    "filter_field", ["mask_sample", "truncated", "logprob_error", "placeholder"]
+)
+def test_masked_reward_policy_counts_each_rollout_once(policy, ordinary, filter_field):
+    counts = [1, 1, 1] if ordinary else [2, 1, 3]
+    meta, data = _batch([("a", list(zip([0.0, 2.0, 10.0], counts)))], padding=True)
+    if ordinary:
+        meta = meta.subset(range(3))
+        data = data[:3]
+        meta.tags = [{GROUP_ID_TAG: "a"} for _ in meta.sample_ids]
+    last = sum(counts) - 1
+    if filter_field == "placeholder":
+        data["sample_mask"][sum(counts[:2]) : last + 1] = 0
+        data["token_mask"][sum(counts[:2]) : last + 1] = 0
+    elif filter_field != "logprob_error":
+        data[filter_field][last] = True
+    data["prev_logprobs"] = torch.zeros_like(data["token_mask"])
+    data["generation_logprobs"] = torch.zeros_like(data["token_mask"])
+    if filter_field == "logprob_error":
+        data["generation_logprobs"][last, 2] = -5
+    ctrl = _controller(
+        meta,
+        data,
+        grpo={
+            "masked_reward_policy": policy,
+            "overlong_filtering": True,
+            "seq_logprob_error_threshold": 1.05,
+        },
+        policy_logprobs_required=True,
+    )
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    baseline = 4.0 if policy == "include" and filter_field != "placeholder" else 1.0
+    torch.testing.assert_close(data["advantages"][0], torch.full((3,), -baseline))
+    torch.testing.assert_close(
+        data["advantages"][counts[0]], torch.full((3,), 2 - baseline)
+    )
+    assert data["sample_mask"][sum(counts[:2]) :].count_nonzero() == 0
+    effective_advantages = data["advantages"] * data["sample_mask"].unsqueeze(-1)
+    assert effective_advantages[sum(counts[:2]) :].count_nonzero() == 0
 
 
 def test_all_invalid_owners_take_existing_no_training_path():

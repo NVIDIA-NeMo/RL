@@ -208,8 +208,11 @@ Optional `grpo.seq_logprob_error_threshold` thresholds the mean multiplicative
 absolute probability error across all uniquely owned generated tokens in a logical
 rollout. Each token has equal weight, so splitting the same generations into more
 segments does not change the decision. If the pooled error exceeds the threshold,
-all rows of that rollout are excluded from loss and its reward is excluded from
-the GRPO baseline. Replayed prefix tokens and execution padding do not participate;
+all rows of that rollout are excluded from loss. The shared
+`grpo.masked_reward_policy` controls baseline participation: `exclude` also removes
+the rollout's reward; `include` retains it once, regardless of segment count.
+Use `exclude` to retain the earlier forest-training baseline behavior.
+Replayed prefix tokens and execution padding do not participate;
 with top-k/top-p filtering enabled, unsupported negative-infinity tokens are also
 excluded from this diagnostic. With the threshold unset, errors are diagnostic
 only. Sequence-error metrics remain per physical row, so a retained segment can

@@ -33,14 +33,15 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Optional
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
+    _binary_participation,
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
 )
@@ -51,6 +52,12 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     logprob_passes_required,
+)
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    ChunkReceipt,
+    DebugWriterConfig,
+    TrainChunk,
+    make_debug_writer,
 )
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
     build_logical_owner_batch,
@@ -69,7 +76,6 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
@@ -110,6 +116,8 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
+    # Which writer the dump uses; ignored while train_data_dump_dir is None.
+    debug_writer: DebugWriterConfig = field(default_factory=DebugWriterConfig)
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -153,13 +161,13 @@ class AdvantageStageConfig:
                 or algo_cfg.malformed_thinking_advantage is not None
             ),
             shardable=algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS,
-            # logger is still a TypedDict, so this is the same value the
-            # Logger exposes as base_log_dir.
+            # Use the resolved logger config shared by controller and pool.
             train_data_dump_dir=(
-                master_config.logger["log_dir"]
+                master_config.logger.log_dir
                 if master_config.async_rl.log_full_train_data
                 else None
             ),
+            debug_writer=master_config.async_rl.debug_writer,
         )
 
     def input_fields(self) -> list[str]:
@@ -291,9 +299,9 @@ class AdvantageOutcome:
     # because the writing moved off the controller with the rest of the
     # stage, and the controller still owns the timer the metric lands in.
     train_data_dump_s: float = 0.0
-    # Rows this call wrote to its shard's part file, so the controller's merge
-    # can tell a missing part from an empty one.
-    train_data_dump_rows: int = 0
+    # What this call stored in the dump, so the controller's publish can tell a
+    # missing chunk from an empty one.
+    train_data_dump_receipt: Optional[ChunkReceipt] = None
 
 
 class AdvantageComputer:
@@ -320,7 +328,9 @@ class AdvantageComputer:
         # One writer per shard: the pool runs these concurrently, so they must
         # not share a file. The controller merges them on publish.
         self._train_data_dump = (
-            TrainDataDump(config.train_data_dump_dir, shard_id=shard_id)
+            make_debug_writer(
+                config.debug_writer, config.train_data_dump_dir, shard_id=shard_id
+            )
             if config.train_data_dump_dir is not None
             else None
         )
@@ -388,6 +398,7 @@ class AdvantageComputer:
         # must not invalidate an owner whose other segments have training tokens.
         owner_sample_mask = sample_mask
         if logical:
+            assert meta.tags is not None
             owner_rows = sample_mask.new_tensor(
                 [not tag.get("is_execution_padding", True) for tag in meta.tags],
                 dtype=torch.bool,
@@ -488,6 +499,21 @@ class AdvantageComputer:
                 ),
             )
         mask = token_mask * final_sample_mask.unsqueeze(-1)
+        # Statistics participation is binary and independent of the loss
+        # weights (grpo._binary_participation). ``include`` lets every row with
+        # a nonzero data-plane sample_mask vote, so token-capture placeholders
+        # and datums with a dataset-level loss_multiplier of 0 never do; the
+        # legacy and TransferQueue loops read the same dataset weight
+        # (grpo._include_valid_mask), so every trainer normalizes over the same
+        # rows. ``exclude`` lets the rows with a nonzero final loss weight vote.
+        # PPO's GAE ignores valid_mask.
+        participation = final_sample_mask
+        if (
+            not cfg.is_ppo
+            and cast(GRPOConfig, cfg.algo).masked_reward_policy == "include"
+        ):
+            participation = sample_mask
+        advantage_valid_mask = _binary_participation(participation)
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -525,11 +551,19 @@ class AdvantageComputer:
         returns: Optional[torch.Tensor] = None
         if has_valid_training_tokens and owner_batch is not None:
             rows = owner_batch.representative_rows
+            owner_participation = torch.zeros_like(
+                owner_batch.valid_mask
+            ).scatter_reduce_(
+                0,
+                owner_batch.row_owner[owned_rows],
+                advantage_valid_mask[owned_rows],
+                reduce="amax",
+            )
             owner_advantages = self._advantage_estimator.compute_advantage(
                 prompt_ids=owner_batch.group_ids,
                 rewards=rewards[rows],
                 mask=owner_batch.valid_mask.unsqueeze(-1),
-                valid_mask=owner_batch.valid_mask,
+                valid_mask=owner_participation,
             )
             if (
                 owner_advantages.shape != (len(rows), 1)
@@ -552,10 +586,8 @@ class AdvantageComputer:
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
-                # Real validity (token-capture placeholders carry sample_mask 0,
-                # and mask_sample/overlong/seq-logprob-error rows are folded in
-                # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                valid_mask=advantage_valid_mask,
+                normalization_mask=token_mask * advantage_valid_mask.unsqueeze(-1),
                 **kwargs,
             )
             if cfg.is_ppo:
@@ -620,7 +652,7 @@ class AdvantageComputer:
         advantage_partial = AdvantagePartial.from_values(response_advantages)
 
         train_data_dump_s = 0.0
-        train_data_dump_rows = 0
+        train_data_dump_receipt = None
         if self._train_data_dump is not None:
             assert request.train_step is not None
             dump_started = time.perf_counter()
@@ -638,25 +670,26 @@ class AdvantageComputer:
                 )
             if cfg.teacher_logprobs_required:
                 sequences["teacher_logprobs"] = kwargs["teacher_logprobs"]
-            await asyncio.to_thread(
+            train_data_dump_receipt = await asyncio.to_thread(
                 self._train_data_dump.add_chunk,
-                step=request.train_step,
-                sample_ids=list(meta.sample_ids),
-                tags=meta.tags,
-                input_lengths=tensor_field(data, INPUT_LENGTHS),
-                sequences=sequences,
-                scalars={
-                    "sample_loss_mask": final_sample_mask,
-                    "pre_seq_error_sample_loss_mask": pre_seq_error_sample_mask,
-                    "rewards": rewards,
-                    # Raw column: jagged when the chunk mixes prompt
-                    # lengths, so rows carry no zero padding. Not the
-                    # group-index key the estimator reduces over.
-                    "prompt_ids": data[adv_cfg.prompt_ids_field],
-                },
+                TrainChunk(
+                    step=request.train_step,
+                    sample_ids=list(meta.sample_ids),
+                    tags=meta.tags,
+                    input_lengths=tensor_field(data, INPUT_LENGTHS),
+                    sequences=sequences,
+                    scalars={
+                        "sample_loss_mask": final_sample_mask,
+                        "pre_seq_error_sample_loss_mask": pre_seq_error_sample_mask,
+                        "rewards": rewards,
+                        # Raw column: jagged when the chunk mixes prompt
+                        # lengths, so rows carry no zero padding. Not the
+                        # group-index key the estimator reduces over.
+                        "prompt_ids": data[adv_cfg.prompt_ids_field],
+                    },
+                ),
             )
             train_data_dump_s = time.perf_counter() - dump_started
-            train_data_dump_rows = len(meta.sample_ids)
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
@@ -686,5 +719,5 @@ class AdvantageComputer:
             opd_stat_count=opd_stat_count,
             opd_gap_sum=opd_gap_sum,
             train_data_dump_s=train_data_dump_s,
-            train_data_dump_rows=train_data_dump_rows,
+            train_data_dump_receipt=train_data_dump_receipt,
         )

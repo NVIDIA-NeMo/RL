@@ -890,6 +890,7 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
 
     config = MasterConfig.model_construct(
         env={"should_use_nemo_gym": True},
+        data={},
         policy={
             "generation": {
                 "backend": "megatron",
@@ -916,6 +917,7 @@ def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None
 
     config = MasterConfig.model_construct(
         env={"should_use_nemo_gym": True},
+        data={},
         policy={
             "generation": {
                 "backend": "dynamo",

@@ -22,10 +22,17 @@ This module provides different advantage estimation strategies:
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
 
-Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts ``valid_mask``
-and must honor it: masked rollouts do not contribute to group baselines.
+Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts a binary
+``valid_mask`` and must honor it. GRPO training selects this mask with
+``grpo.masked_reward_policy`` independently of the sample loss mask: ``include``
+(the default) lets every row with a nonzero dataset weight vote in the group
+statistics and the batch normalization, masked rewards too; ``exclude`` lets
+only rows with a nonzero loss weight vote. Token-capture placeholder rows and
+over-length prompts (dataset weight 0) never vote. Reinforce++ also
+receives a ``normalization_mask`` for its token-level statistics; the loss mask
+is unchanged.
 Forest deduplicates segments before estimation so each logical rollout contributes
-at most one reward, using the same validity rule as ordinary rollouts.
+at most one reward, using the same participation rule as ordinary rollouts.
 
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
@@ -170,10 +177,8 @@ class GDPOAdvantageEstimator:
             repeated_batch: Batch containing named reward component keys (e.g. reward/correctness, reward/format).
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
             valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
-                  reward components should participate in the per-prompt baseline/std.
-                  Token-capture placeholder rows carry 0.0 (their sample_mask already
-                  excludes them from the loss; excluding them here keeps siblings'
-                  baselines unbiased). None keeps the legacy all-valid behavior.
+                  reward components should participate in the per-prompt baseline/std
+                  and final batch normalization. None keeps the all-valid behavior.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -228,15 +233,19 @@ class GDPOAdvantageEstimator:
 
             advantage_parts.append(adv_k)
 
-        advantages = sum(
-            weight * adv_k for weight, adv_k in zip(weights, advantage_parts)
-        )
-        # Normalize combined advantage to zero mean and unit std
-        adv_std = advantages.std()
+        advantages = torch.stack(
+            [weight * adv_k for weight, adv_k in zip(weights, advantage_parts)]
+        ).sum(dim=0)
+        # Use the same participants for the final normalization as for each
+        # reward component; otherwise excluded rewards still rescale valid rows.
+        if valid.sum() <= 1:
+            return torch.zeros_like(advantages).expand(mask.shape)
+        batch_mask = valid.unsqueeze(-1)
+        adv_mean = masked_mean(advantages, batch_mask)
+        adv_std = masked_var(advantages, batch_mask, mean=adv_mean).sqrt()
+        advantages = advantages - adv_mean
         if adv_std > 0:
-            advantages = (advantages - advantages.mean()) / adv_std
-        else:
-            advantages = advantages - advantages.mean()
+            advantages = advantages / adv_std
 
         return advantages.expand(mask.shape)
 
@@ -266,6 +275,7 @@ class ReinforcePlusPlusAdvantageEstimator:
         logprobs_policy=None,
         logprobs_reference=None,
         valid_mask=None,
+        normalization_mask: torch.Tensor | None = None,
         **kwargs,
     ):
         """Compute Reinforce++ advantages with optional KL penalty.
@@ -283,10 +293,14 @@ class ReinforcePlusPlusAdvantageEstimator:
                   placeholder rows carry 0.0 (their sample_mask already excludes them from
                   the loss; excluding them here keeps siblings' baselines unbiased).
                   None keeps the legacy all-valid behavior.
+            normalization_mask: Optional token-level statistics mask of shape
+                  [batch_size, seq_len]. May include loss-masked responses, but must
+                  exclude prompt and padding tokens. None uses mask for backward
+                  compatibility. This does not change the training loss mask.
             **kwargs: Additional arguments (unused).
 
         Returns:
-            Advantages tensor of shape [batch_size, seq_len], globally normalized across valid tokens.
+            Advantages tensor of shape [batch_size, seq_len], globally normalized across participating tokens.
         """
         # minus baseline
         if self.minus_baseline:
@@ -319,9 +333,13 @@ class ReinforcePlusPlusAdvantageEstimator:
             kl = torch.where(~torch.isneginf(logprobs_policy), kl, 0.0)
             adv = adv - self.kl_coef * kl
 
-        # global normalization across the batch
-        adv_mean = (adv * mask).sum() / mask.sum()
-        adv_var = ((adv - adv_mean).pow(2) * mask).sum() / mask.sum()
+        # Statistics participation is independent of loss participation.
+        stats_mask = mask if normalization_mask is None else normalization_mask
+        num_tokens = stats_mask.sum()
+        if num_tokens == 0:
+            return torch.zeros_like(adv)
+        adv_mean = (adv * stats_mask).sum() / num_tokens
+        adv_var = ((adv - adv_mean).pow(2) * stats_mask).sum() / num_tokens
         adv_rstd = adv_var.clamp(min=1e-8).rsqrt()
         adv = (adv - adv_mean) * adv_rstd
 

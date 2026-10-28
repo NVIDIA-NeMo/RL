@@ -3018,6 +3018,10 @@ async def test_vllm_generation_with_hf_training_colocated(
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
     vllm_config["vllm_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = enable_lora
+    if enable_lora:
+        # This legacy integration test exercises both synchronous and async
+        # engines, so keep it on the refit representation supported by both.
+        vllm_config["lora_refit_mode"] = "merged"
 
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(cluster, vllm_config)
@@ -3029,6 +3033,8 @@ async def test_vllm_generation_with_hf_training_colocated(
     automodel_config["automodel_cfg"]["cpu_offload"] = cpu_offload
     automodel_config["automodel_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     automodel_config["automodel_cfg"]["lora_cfg"]["enabled"] = enable_lora
+    if enable_lora:
+        automodel_config["generation"]["lora_refit_mode"] = "merged"
     automodel_config["train_global_batch_size"] = 4
     lm_policy = Policy(cluster, automodel_config, tokenizer)
 
@@ -3088,6 +3094,8 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
     vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = enable_lora
+    if enable_lora:
+        vllm_config["lora_refit_mode"] = "merged"
     vllm_config["colocated"]["enabled"] = False
     if vllm_precision == "fp8":
         vllm_config["vllm_cfg"]["kv_cache_dtype"] = "fp8"
@@ -3106,6 +3114,8 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     automodel_config["train_global_batch_size"] = 4
     automodel_config["automodel_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     automodel_config["automodel_cfg"]["lora_cfg"]["enabled"] = enable_lora
+    if enable_lora:
+        automodel_config["generation"]["lora_refit_mode"] = "merged"
     lm_policy = Policy(policy_cluster_separate, automodel_config, tokenizer)
 
     # Refit

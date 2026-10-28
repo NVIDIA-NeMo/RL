@@ -62,6 +62,8 @@ class ReassemblyRequest:
     execution_row_multiple: int = 1
     reward_checks: tuple[RewardChecks | None, ...] | None = None
     reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
+    # Resolved by Gym and persisted with the sealed receipts for teacher routing.
+    resolved_agent_name: Optional[str] = None
 
     @property
     def capture_receipts(self) -> tuple[Optional[dict[str, Any]], ...]:
