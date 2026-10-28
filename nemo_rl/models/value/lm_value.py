@@ -30,9 +30,9 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
-from nemo_rl.models.policy.utils import reject_legacy_dtensor_key
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface, ValueOutputSpec
+from nemo_rl.utils.path_utils import checkpoint_abspath
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -65,9 +65,9 @@ class Value(ValueInterface):
             optimizer_path: Path to load optimizer state from
         """
         if weights_path:
-            weights_path = os.path.abspath(weights_path)
+            weights_path = checkpoint_abspath(weights_path)
         if optimizer_path:
-            optimizer_path = os.path.abspath(optimizer_path)
+            optimizer_path = checkpoint_abspath(optimizer_path)
 
         worker_builder_cls: str
         tp_size = 1
@@ -75,15 +75,18 @@ class Value(ValueInterface):
         cp_size = 1
 
         # Value models use the same backend configuration as policy models
-        megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
-        dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
-        if megatron_enable and dtensor_enable:
+        megatron_enabled = bool(config.get("megatron_cfg", {}).get("enabled", False))
+        automodel_enabled = bool(config.get("automodel_cfg", {}).get("enabled", False))
+        if megatron_enabled and automodel_enabled:
             raise ValueError(
                 "Configure either Megatron (value.megatron_cfg.enabled=true) or "
-                "DTensor (value.dtensor_cfg.enabled=true), not both."
+                "Automodel (value.automodel_cfg.enabled=true), not both. A config "
+                "that used to set value.dtensor_cfg.enabled=false must now set "
+                "value.automodel_cfg.enabled=false: dtensor_cfg has been renamed "
+                "and no longer disables anything."
             )
 
-        if megatron_enable:
+        if megatron_enabled:
             worker_builder_cls = (
                 "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker"
             )
@@ -94,22 +97,26 @@ class Value(ValueInterface):
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
-            if not dtensor_enable:
+            if not automodel_enabled:
                 raise ValueError(
-                    "Please set value.dtensor_cfg.enabled=true to use DTensor "
+                    "Please set value.automodel_cfg.enabled=true to use the Automodel "
                     "training backend (or value.megatron_cfg.enabled=true for "
                     "Megatron-Core)."
                 )
-            reject_legacy_dtensor_key(config["dtensor_cfg"], "value.dtensor_cfg")
+            if config["automodel_cfg"].get("deterministic"):
+                raise ValueError(
+                    "value.automodel_cfg.deterministic is not supported; "
+                    "it applies to policy workers only."
+                )
 
-            worker_builder_cls = "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2"
+            worker_builder_cls = "nemo_rl.models.value.workers.automodel_value_worker.AutomodelValueWorker"
 
-            tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
-            # DTensor V2 does not pipeline-parallel; pp_size stays at the
+            tp_size = config["automodel_cfg"]["tensor_parallel_size"]
+            # Automodel does not pipeline-parallel; pp_size stays at the
             # default of 1 initialised above.
-            cp_size = config["dtensor_cfg"]["context_parallel_size"]
+            cp_size = config["automodel_cfg"]["context_parallel_size"]
 
-            env_vars = config["dtensor_cfg"].get("env_vars", {})
+            env_vars = config["automodel_cfg"].get("env_vars", {})
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
@@ -431,12 +438,12 @@ class Value(ValueInterface):
     ) -> None:
         """Save a checkpoint of the value model.
 
-        DTensor v2 checkpoint resources are configured when the Value is
+        Automodel checkpoint resources are configured when the Value is
         constructed. ``weights_path`` selects the destination for each save.
         """
-        megatron_enable = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
+        megatron_enabled = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
 
-        if megatron_enable:
+        if megatron_enabled:
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,

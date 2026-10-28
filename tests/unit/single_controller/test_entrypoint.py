@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
+import sys
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -21,8 +23,12 @@ import pytest
 from examples import run_grpo_single_controller
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
-from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AsyncRLConfig,
+    MasterConfig,
+)
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 @pytest.fixture
@@ -35,21 +41,17 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             "draft": Eagle3DraftConfig(enabled=False),
             "megatron_cfg": {"mtp_num_layers": 2},
         },
+        data={},
         env={},
         data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
-        logger={"log_dir": "/tmp/logs"},
+        logger=LoggerConfig(log_dir="/tmp/logs"),
         checkpointing={"enabled": False},
-        async_rl=SimpleNamespace(
-            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
-            # model_construct skips validation, so nothing fills the real
-            # AsyncRLConfig defaults in here. main() reads this before init_ray() to
-            # decide on EngineCore reaping; off keeps that a no-op.
-            generation_fleet_health=SimpleNamespace(enabled=False),
-        ),
+        async_rl=AsyncRLConfig(),
         grpo=GRPOConfig(async_grpo=None),
     )
     configured_generation = {"backend": "vllm", "_mtp_weights_from_refit": True}
     configure_generation = MagicMock(return_value=configured_generation)
+    materialize_video_config = MagicMock()
     actor = SimpleNamespace(run=SimpleNamespace(remote=MagicMock(return_value="run")))
     actor_args = SimpleNamespace(
         env_handles={},
@@ -94,6 +96,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     monkeypatch.setattr(
         run_grpo_single_controller,
+        "materialize_vllm_video_config",
+        materialize_video_config,
+    )
+    monkeypatch.setattr(
+        run_grpo_single_controller,
         "setup_single_controller",
         setup_single_controller,
     )
@@ -116,6 +123,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         configure_generation=configure_generation,
         configured_generation=configured_generation,
         generation_config=generation_config,
+        materialize_video_config=materialize_video_config,
         ray_get=ray_get,
         ray_wait=ray_wait,
         setup_single_controller=setup_single_controller,
@@ -167,9 +175,20 @@ def test_main_configures_generation_for_trained_mtp(
         "tokenizer",
         has_refit_draft_weights=False,
         trains_mtp=True,
+        draft_full_refit=False,
     )
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
+    )
+
+
+def test_main_materializes_video_contract_before_worker_setup(
+    main_context: SimpleNamespace,
+) -> None:
+    run_grpo_single_controller.main()
+
+    main_context.materialize_video_config.assert_called_once_with(
+        main_context.config.policy, main_context.config.data
     )
 
 
@@ -185,6 +204,7 @@ def test_main_accepts_policy_without_draft_config(
         "tokenizer",
         has_refit_draft_weights=False,
         trains_mtp=True,
+        draft_full_refit=False,
     )
 
 
@@ -231,3 +251,16 @@ def test_main_passes_processor_for_vlm(
     setup_single_controller.assert_called_once_with(
         main_context.config, "vlm-tokenizer", processor=processor
     )
+
+
+def test_main_line_buffers_driver_stdout(
+    main_context: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forwarded actor prints must not sit in a block buffer when stdout is a file."""
+    stdout = io.TextIOWrapper(io.BytesIO())
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    run_grpo_single_controller.main()
+
+    assert stdout.line_buffering

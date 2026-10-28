@@ -30,6 +30,7 @@ import ray
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.opd import TeacherResourceConfig
+from nemo_rl.data.multimodal_utils import teacher_multimodal_fields
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
 from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -69,7 +70,9 @@ def create_teacher_configs_from_opd_config(
     """Build per-teacher configs from on_policy_distillation config.
 
     Handles deduplication (multiple aliases sharing one checkpoint produce
-    one TeacherConfig) and per-teacher overrides on top of defaults.
+    one TeacherConfig) and per-teacher overrides on top of defaults. The merge
+    is shallow: a per-alias ``megatron_cfg_overrides`` replaces the default
+    dictionary; unknown top-level keys are merged individually.
     """
     teacher_model_by_agent_name: dict[str, str] = dict(
         opd_cfg.get("teacher_model_by_agent_name", {})
@@ -163,20 +166,29 @@ class TeacherWorkerGroup:
         for key, value in teacher_cfg.megatron_cfg_overrides.items():
             cfg["megatron_cfg"][key] = value
 
+        # Teacher architecture comes from its checkpoint, not the student's
+        # cloned config. Only explicit teacher overrides reach the provider,
+        # except that scoring disables unused MTP layers unless requested.
+        allowlist = set(teacher_cfg.megatron_cfg_overrides)
+        if "mtp_num_layers" not in allowlist:
+            cfg["megatron_cfg"]["mtp_num_layers"] = 0
+            allowlist.add("mtp_num_layers")
+        cfg["megatron_cfg"]["_provider_override_allowlist"] = sorted(allowlist)
+
         # Teachers run Megatron inference-only. Don't let the student's other
         # backend or parameter-adding features leak onto the frozen teacher.
-        if cfg.get("dtensor_cfg", {}).get("enabled", False):
+        if cfg.get("automodel_cfg", {}).get("enabled", False):
             raise ValueError(
                 f"Teacher '{self.alias}': only the Megatron backend is supported "
-                "for teachers, but the policy config has dtensor_cfg.enabled=True."
+                "for teachers, but the policy config has automodel_cfg.enabled=True."
             )
-        if "dtensor_cfg" in cfg:
-            cfg["dtensor_cfg"]["enabled"] = False
+        if "automodel_cfg" in cfg:
+            cfg["automodel_cfg"]["enabled"] = False
         if "peft" in cfg["megatron_cfg"]:
             cfg["megatron_cfg"]["peft"]["enabled"] = False
         cfg.pop("draft", None)
         # Router replay keeps the student's rollout and training logprobs
-        # consistent. A frozen teacher has no training pass, and its text-only
+        # consistent. A frozen teacher has no training pass, and its
         # TQ fetch does not carry routed_experts, so replay must stay off.
         if "router_replay" in cfg:
             cfg["router_replay"]["enabled"] = False
@@ -318,7 +330,7 @@ class TeacherWorkerGroup:
         teacher_meta = replace(
             meta,
             task_name=f"teacher_lp:{self.alias}",
-            fields=list(TEACHER_LP_FIELDS),
+            fields=[*TEACHER_LP_FIELDS, *teacher_multimodal_fields(meta)],
             extra_info={
                 **dict(meta.extra_info or {}),
                 GLOBAL_FORWARD_PAD_SEQLEN: round_up(

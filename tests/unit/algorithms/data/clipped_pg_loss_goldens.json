@@ -1,0 +1,741 @@
+{
+  "schema_version": 1,
+  "compatibility_contract": {
+    "scope": "Preserve loss, gradients, and metrics from the pinned origin/main implementation."
+  },
+  "provenance": {
+    "source_commit": "aa739509ce3772a18a4d02da651b86c9e898e8cb",
+    "source_file": "nemo_rl/algorithms/loss/loss_functions.py",
+    "python_version": "3.12.8",
+    "torch_version": "2.6.0",
+    "device": "cpu",
+    "dtype": "float64"
+  },
+  "base_inputs": {
+    "input_ids": [
+      [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      [
+        5,
+        6,
+        7,
+        8,
+        9
+      ]
+    ],
+    "token_mask": [
+      [
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        0.0
+      ]
+    ],
+    "sample_mask": [
+      1.0,
+      1.0
+    ],
+    "advantages": [
+      [
+        0.0,
+        1.2,
+        -0.7,
+        0.4,
+        2.0
+      ],
+      [
+        0.0,
+        -1.1,
+        0.6,
+        1.5,
+        -0.3
+      ]
+    ],
+    "prev_logprobs": [
+      [
+        0.0,
+        -1.0,
+        -1.1,
+        -0.8,
+        -1.3
+      ],
+      [
+        0.0,
+        -0.9,
+        -1.0,
+        -1.2,
+        -0.8
+      ]
+    ],
+    "generation_logprobs": [
+      [
+        0.0,
+        -1.2,
+        -1.5,
+        -0.7,
+        -1.1
+      ],
+      [
+        0.0,
+        -1.4,
+        -0.7,
+        -1.3,
+        -1.0
+      ]
+    ],
+    "reference_policy_logprobs": [
+      [
+        0.0,
+        -1.1,
+        -0.7,
+        -1.4,
+        -1.0
+      ],
+      [
+        0.0,
+        -1.3,
+        -0.8,
+        -1.0,
+        -1.4
+      ]
+    ],
+    "rewards": [
+      1.0,
+      0.0
+    ],
+    "next_token_logprobs": [
+      [
+        -1.6,
+        -0.8,
+        -1.1,
+        -1.4
+      ],
+      [
+        -0.7,
+        -1.4,
+        -0.9,
+        -1.2
+      ]
+    ]
+  },
+  "cases": [
+    {
+      "name": "ppo_token",
+      "config": {
+        "reference_policy_kl_penalty": 0.0
+      },
+      "input_overrides": {},
+      "expected": {
+        "loss": 0.18627018364195694,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              -0.13171479239913675,
+              0.18898023268267997,
+              -0.05926545753600652,
+              -0.0
+            ],
+            [
+              0.26870860625782017,
+              -0.08043840536339991,
+              0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": 0.18627018364195694,
+          "probs_ratio": 0.9062422918970267,
+          "probs_ratio_clamped": 0.95999999808,
+          "probs_ratio_min": 0.5488116360940264,
+          "probs_ratio_max": 1.3498588075760032,
+          "probs_ratio_clamped_min": 0.8,
+          "probs_ratio_clamped_max": 1.2,
+          "kl_penalty": 0.0,
+          "token_mult_prob_error": 1.3633956877038524,
+          "gen_kl_error": 0.0615208729208074,
+          "policy_kl_error": 0.05012223679533659,
+          "js_divergence_error": 0.013649421513505665,
+          "sampling_importance_ratio": 1.2015208706408074,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "positive_nll_loss": 0.0
+        }
+      }
+    },
+    {
+      "name": "force_on_policy",
+      "config": {
+        "reference_policy_kl_penalty": 0.0,
+        "force_on_policy_ratio": true
+      },
+      "input_overrides": {},
+      "expected": {
+        "loss": -0.07999999984,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              -0.23999999952,
+              0.13999999972,
+              -0.07999999984,
+              -0.0
+            ],
+            [
+              0.21999999956000002,
+              -0.11999999976,
+              -0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": -0.07999999984,
+          "probs_ratio": 0.9999999980000001,
+          "probs_ratio_clamped": 0.9999999980000001,
+          "probs_ratio_min": 1.0,
+          "probs_ratio_max": 1.0,
+          "probs_ratio_clamped_min": 1.0,
+          "probs_ratio_clamped_max": 1.0,
+          "kl_penalty": 0.0,
+          "token_mult_prob_error": 1.8049814999288314,
+          "gen_kl_error": 0.19294616177483598,
+          "policy_kl_error": 0.1781145417109382,
+          "js_divergence_error": 0.04397054964336933,
+          "sampling_importance_ratio": 1.1729461598148359,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "positive_nll_loss": 0.0
+        }
+      }
+    },
+    {
+      "name": "reinforce",
+      "config": {
+        "reference_policy_kl_penalty": 0.0,
+        "disable_ppo_ratio": true
+      },
+      "input_overrides": {},
+      "expected": {
+        "loss": 0.373999999252,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              -0.23999999952,
+              0.13999999972,
+              -0.07999999984,
+              -0.0
+            ],
+            [
+              0.21999999956000002,
+              -0.11999999976,
+              -0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": 0.373999999252,
+          "probs_ratio": -1.1199999977600001,
+          "probs_ratio_clamped": -1.1199999977600001,
+          "probs_ratio_min": -1.6,
+          "probs_ratio_max": -0.7,
+          "probs_ratio_clamped_min": -1.6,
+          "probs_ratio_clamped_max": -0.7,
+          "kl_penalty": 0.0,
+          "token_mult_prob_error": 1.3633956877038524,
+          "gen_kl_error": 0.0615208729208074,
+          "policy_kl_error": 0.05012223679533659,
+          "js_divergence_error": 0.013649421513505665,
+          "sampling_importance_ratio": 1.2015208706408074,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "positive_nll_loss": 0.0
+        }
+      }
+    },
+    {
+      "name": "dual_clip",
+      "config": {
+        "reference_policy_kl_penalty": 0.0,
+        "ratio_clip_c": 3.0
+      },
+      "input_overrides": {
+        "prev_logprobs": [
+          [
+            0.0,
+            -1.0,
+            -3.0,
+            -0.8,
+            -1.3
+          ],
+          [
+            0.0,
+            -0.9,
+            -1.0,
+            -1.2,
+            -0.8
+          ]
+        ]
+      },
+      "expected": {
+        "loss": 0.417289950119277,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              -0.13171479239913675,
+              0.0,
+              -0.05926545753600652,
+              -0.0
+            ],
+            [
+              0.26870860625782017,
+              -0.08043840536339991,
+              0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": 0.417289950119277,
+          "probs_ratio": 2.4412732271985886,
+          "probs_ratio_clamped": 0.95999999808,
+          "probs_ratio_min": 0.5488116360940264,
+          "probs_ratio_max": 9.025013499434122,
+          "probs_ratio_clamped_min": 0.8,
+          "probs_ratio_clamped_max": 1.2,
+          "kl_penalty": 0.0,
+          "token_mult_prob_error": 1.9613685610472653,
+          "gen_kl_error": 0.18778196516971712,
+          "policy_kl_error": 0.43239604089127404,
+          "js_divergence_error": 0.061329026534706434,
+          "sampling_importance_ratio": 0.947781963649717,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "positive_nll_loss": 0.0
+        }
+      }
+    },
+    {
+      "name": "cispo_with_token_is",
+      "config": {
+        "reference_policy_kl_penalty": 0.0,
+        "use_cispo": true,
+        "use_importance_sampling_correction": true
+      },
+      "input_overrides": {},
+      "expected": {
+        "loss": 0.03329652014119518,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              -0.23450932909773395,
+              0.2506265487024803,
+              -0.057909594638482234,
+              -0.0
+            ],
+            [
+              0.435262414594309,
+              -0.07111854904320782,
+              -0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": 0.03329652014119518,
+          "probs_ratio": 0.9062422918970267,
+          "probs_ratio_clamped": 0.95999999808,
+          "probs_ratio_min": 0.5488116360940264,
+          "probs_ratio_max": 1.3498588075760032,
+          "probs_ratio_clamped_min": 0.8,
+          "probs_ratio_clamped_max": 1.2,
+          "kl_penalty": 0.0,
+          "token_mult_prob_error": 1.3633956877038524,
+          "gen_kl_error": 0.0615208729208074,
+          "policy_kl_error": 0.05012223679533659,
+          "js_divergence_error": 0.013649421513505665,
+          "sampling_importance_ratio": 1.2015208706408074,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "positive_nll_loss": 0.0
+        }
+      }
+    },
+    {
+      "name": "kl_on_policy_unfiltered",
+      "config": {
+        "reference_policy_kl_penalty": 0.17,
+        "use_on_policy_kl_approximation": true
+      },
+      "input_overrides": {
+        "curr_logprobs_unfiltered": [
+          [
+            -1.3,
+            -0.9,
+            -1.0,
+            -1.2
+          ],
+          [
+            -0.8,
+            -1.2,
+            -1.1,
+            -1.0
+          ]
+        ]
+      },
+      "expected": {
+        "loss": 0.19851918573481045,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              -0.13171479239913675,
+              0.18898023268267997,
+              -0.05926545753600652,
+              -0.0
+            ],
+            [
+              0.26870860625782017,
+              -0.08043840536339991,
+              0.0,
+              0.0
+            ]
+          ],
+          "curr_logprobs_unfiltered": [
+            [
+              -0.0061528944303387316,
+              -0.012390407817874646,
+              0.010075127781121107,
+              0.0
+            ],
+            [
+              0.03097601954468661,
+              -0.008248816955594178,
+              0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": 0.19851918573481045,
+          "probs_ratio": 0.9062422918970267,
+          "probs_ratio_clamped": 0.95999999808,
+          "probs_ratio_min": 0.5488116360940264,
+          "probs_ratio_max": 1.3498588075760032,
+          "probs_ratio_clamped_min": 0.8,
+          "probs_ratio_clamped_max": 1.2,
+          "kl_penalty": 0.07205295348737359,
+          "token_mult_prob_error": 1.3633956877038524,
+          "gen_kl_error": 0.0615208729208074,
+          "policy_kl_error": 0.05012223679533659,
+          "js_divergence_error": 0.013649421513505665,
+          "sampling_importance_ratio": 1.2015208706408074,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "positive_nll_loss": 0.0
+        }
+      }
+    },
+    {
+      "name": "tis_token",
+      "config": {
+        "reference_policy_kl_penalty": 0.0,
+        "use_importance_sampling_correction": true,
+        "truncated_importance_sampling_type": "tis",
+        "truncated_importance_sampling_ratio": 1.3,
+        "truncated_importance_sampling_ratio_min": 0.7
+      },
+      "input_overrides": {},
+      "expected": {
+        "loss": 0.3209028399844618,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              -0.1608768107267998,
+              0.24567430248748398,
+              -0.05362560357559994,
+              -0.0
+            ],
+            [
+              0.3493211881351662,
+              -0.059590236335788666,
+              0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": 0.3209028399844618,
+          "probs_ratio": 0.9062422918970267,
+          "probs_ratio_clamped": 0.95999999808,
+          "probs_ratio_min": 0.5488116360940264,
+          "probs_ratio_max": 1.3498588075760032,
+          "probs_ratio_clamped_min": 0.8,
+          "probs_ratio_clamped_max": 1.2,
+          "kl_penalty": 0.0,
+          "token_mult_prob_error": 1.3633956877038524,
+          "gen_kl_error": 0.0615208729208074,
+          "policy_kl_error": 0.05012223679533659,
+          "js_divergence_error": 0.013649421513505665,
+          "sampling_importance_ratio": 1.093411677188746,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "is_oob_ratio": 0.3999999992,
+          "positive_nll_loss": 0.0
+        }
+      }
+    },
+    {
+      "name": "icepop_token",
+      "config": {
+        "reference_policy_kl_penalty": 0.0,
+        "use_importance_sampling_correction": true,
+        "truncated_importance_sampling_type": "icepop",
+        "truncated_importance_sampling_ratio": 1.25,
+        "truncated_importance_sampling_ratio_min": 0.75
+      },
+      "input_overrides": {},
+      "expected": {
+        "loss": -0.21450241430239975,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              -0.1608768107267998,
+              0.0,
+              -0.05362560357559994,
+              -0.0
+            ],
+            [
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": -0.21450241430239975,
+          "probs_ratio": 0.9062422918970267,
+          "probs_ratio_clamped": 0.95999999808,
+          "probs_ratio_min": 0.5488116360940264,
+          "probs_ratio_max": 1.3498588075760032,
+          "probs_ratio_clamped_min": 0.8,
+          "probs_ratio_clamped_max": 1.2,
+          "kl_penalty": 0.0,
+          "token_mult_prob_error": 1.3633956877038524,
+          "gen_kl_error": 0.0615208729208074,
+          "policy_kl_error": 0.05012223679533659,
+          "js_divergence_error": 0.013649421513505665,
+          "sampling_importance_ratio": 0.4252480343887298,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "is_oob_ratio": 0.5999999988,
+          "positive_nll_loss": 0.0
+        }
+      }
+    },
+    {
+      "name": "seq_mask_tis",
+      "config": {
+        "reference_policy_kl_penalty": 0.0,
+        "use_importance_sampling_correction": true,
+        "truncated_importance_sampling_type": "seq-mask-tis",
+        "truncated_importance_sampling_ratio": 1.15,
+        "truncated_importance_sampling_ratio_min": 0.95
+      },
+      "input_overrides": {},
+      "expected": {
+        "loss": 0.383435358421665,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              0.0,
+              0.0,
+              0.0,
+              -0.0
+            ],
+            [
+              0.4430255947574536,
+              -0.059590236335788666,
+              0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": 0.383435358421665,
+          "probs_ratio": 0.9062422918970267,
+          "probs_ratio_clamped": 0.95999999808,
+          "probs_ratio_min": 0.5488116360940264,
+          "probs_ratio_max": 1.3498588075760032,
+          "probs_ratio_clamped_min": 0.8,
+          "probs_ratio_clamped_max": 1.2,
+          "kl_penalty": 0.0,
+          "token_mult_prob_error": 1.3633956877038524,
+          "gen_kl_error": 0.0615208729208074,
+          "policy_kl_error": 0.05012223679533659,
+          "js_divergence_error": 0.013649421513505665,
+          "sampling_importance_ratio": 0.4779078973205534,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "is_oob_ratio": 0.4999999975,
+          "positive_nll_loss": 0.0
+        }
+      }
+    },
+    {
+      "name": "gspo_sequence_is",
+      "config": {
+        "reference_policy_kl_penalty": 0.0,
+        "use_importance_sampling_correction": true,
+        "sequence_level_importance_ratios": true,
+        "token_level_loss": false
+      },
+      "input_overrides": {},
+      "expected": {
+        "loss": -0.06433245613699731,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              -0.06749293963637779,
+              -0.06749293963637779,
+              -0.06749293963637779,
+              -0.0
+            ],
+            [
+              0.06907318137816686,
+              0.06907318137816686,
+              0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": -0.06433245613699731,
+          "probs_ratio": 0.8531734178632858,
+          "probs_ratio_clamped": 0.8531734178632858,
+          "probs_ratio_min": 0.8187307536238023,
+          "probs_ratio_max": 0.9048374184883784,
+          "probs_ratio_clamped_min": 0.8187307536238023,
+          "probs_ratio_clamped_max": 0.9048374184883784,
+          "kl_penalty": 0.0,
+          "token_mult_prob_error": 1.3633956877038524,
+          "gen_kl_error": 0.0615208729208074,
+          "policy_kl_error": 0.05012223679533659,
+          "js_divergence_error": 0.013649421513505665,
+          "sampling_importance_ratio": 1.4350620072548388,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "positive_nll_loss": 0.0
+        }
+      }
+    },
+    {
+      "name": "vapo_mixed_rewards",
+      "config": {
+        "reference_policy_kl_penalty": 0.0,
+        "positive_example_nll_weight": 0.3
+      },
+      "input_overrides": {},
+      "expected": {
+        "loss": 0.5362701824752902,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              -0.23171479206580342,
+              0.0889802330160133,
+              -0.15926545720267318,
+              -0.0
+            ],
+            [
+              0.26870860625782017,
+              -0.08043840536339991,
+              0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": 0.5362701824752902,
+          "probs_ratio": 0.9062422918970267,
+          "probs_ratio_clamped": 0.95999999808,
+          "probs_ratio_min": 0.5488116360940264,
+          "probs_ratio_max": 1.3498588075760032,
+          "probs_ratio_clamped_min": 0.8,
+          "probs_ratio_clamped_max": 1.2,
+          "kl_penalty": 0.0,
+          "token_mult_prob_error": 1.3633956877038524,
+          "gen_kl_error": 0.0615208729208074,
+          "policy_kl_error": 0.05012223679533659,
+          "js_divergence_error": 0.013649421513505665,
+          "sampling_importance_ratio": 1.2015208706408074,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "positive_nll_loss": 1.1666666627777778
+        }
+      }
+    },
+    {
+      "name": "vapo_no_positive_rewards",
+      "config": {
+        "reference_policy_kl_penalty": 0.0,
+        "positive_example_nll_weight": 0.3
+      },
+      "input_overrides": {
+        "rewards": [
+          -1.0,
+          0.0
+        ]
+      },
+      "expected": {
+        "loss": 0.18627018364195694,
+        "gradients": {
+          "next_token_logprobs": [
+            [
+              -0.13171479239913675,
+              0.18898023268267997,
+              -0.05926545753600652,
+              -0.0
+            ],
+            [
+              0.26870860625782017,
+              -0.08043840536339991,
+              0.0,
+              0.0
+            ]
+          ]
+        },
+        "metrics": {
+          "loss": 0.18627018364195694,
+          "probs_ratio": 0.9062422918970267,
+          "probs_ratio_clamped": 0.95999999808,
+          "probs_ratio_min": 0.5488116360940264,
+          "probs_ratio_max": 1.3498588075760032,
+          "probs_ratio_clamped_min": 0.8,
+          "probs_ratio_clamped_max": 1.2,
+          "kl_penalty": 0.0,
+          "token_mult_prob_error": 1.3633956877038524,
+          "gen_kl_error": 0.0615208729208074,
+          "policy_kl_error": 0.05012223679533659,
+          "js_divergence_error": 0.013649421513505665,
+          "sampling_importance_ratio": 1.2015208706408074,
+          "num_valid_samples": 2.0,
+          "approx_entropy": 1.1051425199516978,
+          "positive_nll_loss": 0.0
+        }
+      }
+    }
+  ]
+}

@@ -12,19 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 import ray
 import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec, RefitPayloadMode
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.utils.timer import Timer
+
+if TYPE_CHECKING:
+    from nemo_rl.models.policy import PolicyConfig
 
 
 class LogprobOutputSpec(TypedDict):
-    """logprobs: Tensor of log probabilities."""
+    """Token log probabilities; filtered unsupported tokens retain -inf."""
 
     logprobs: torch.Tensor
 
@@ -179,6 +182,8 @@ class PolicyInterface(ABC):
 
 
 class ColocatablePolicyInterface(PolicyInterface):
+    cfg: "PolicyConfig"
+
     @abstractmethod
     def init_collective(
         self,
@@ -209,12 +214,20 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def prepare_refit_info(
-        self,
-        *,
-        refit_payload_mode: RefitPayloadMode,
-    ) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass
+
+    def enable_refit_prequantize(
+        self, param_names: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Quantize the listed params on the trainer during refit streaming.
+
+        Returns:
+            Refit info updated with the quantized dtypes and scale entries.
+        """
+        raise NotImplementedError(
+            "enable_refit_prequantize is not implemented for this policy worker"
+        )
 
     @abstractmethod
     def stream_weights_via_ipc_zmq(
@@ -279,6 +292,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -288,8 +302,6 @@ class ColocatablePolicyInterface(PolicyInterface):
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
-        *,
-        refit_payload_mode: RefitPayloadMode,
     ) -> Any:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
         raise NotImplementedError

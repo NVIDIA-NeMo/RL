@@ -19,6 +19,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 # Using Qwen2.5-0.5B instead of Qwen3-0.6B because the latter is not supported by Megatron yet
 cd $PROJECT_ROOT
+# Qwen2.5-0.5B derives max_requests=3412 from the 10 GB KV pool; pin 4.
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
     --config $PROJECT_ROOT/examples/configs/grpo_math_1B_megatron.yaml \
@@ -30,6 +31,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.train_micro_batch_size=1 \
     policy.generation.backend=megatron \
     policy.generation.refit_transport=null \
+    policy.generation.mcore_generation_config.num_cuda_graphs=4 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.gpus_per_node=1 \
     cluster.gpus_per_node=2 \
