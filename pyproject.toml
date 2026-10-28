@@ -63,7 +63,7 @@ dependencies = [
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
-  "mlflow>=3.13.0",
+  "mlflow>=3.17.2",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
@@ -474,7 +474,7 @@ override-dependencies = [
   # 0.1.11 ABI, so keep the shared override on that compatible release.
   "apache-tvm-ffi==0.1.11",
   # Override dependencies to address CVEs
-  "mlflow>=3.13.0",
+  "mlflow>=3.17.2",
   # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
   "langchain-core>=1.2.22",
   # Override outlines for Python 3.13 support
@@ -528,7 +528,7 @@ constraint-dependencies = [
   "brotli>=1.2.0",            # Address CVE GHSA-2qfp-q593-8484
   "starlette>=0.49.1",        # Address CVE GHSA-7f5h-v6xp-fcq8
   "urllib3>=2.7.0",           # Address CVE GHSA-38jv-5279-wg99
-  "aiohttp>=3.13.3",          # Address CVE GHSA-mqqc-3gqh-h2x8
+  "aiohttp>=3.14.5",          # Address CVE GHSA-mqqc-3gqh-h2x8
   "pyasn1>=0.6.3",            # Address CVE GHSA-jr27-m4p2-rc6r
   "wheel>=0.46.2",            # Address CVE GHSA-8rrh-rw8j-w5fx
   "protobuf>=6.33.5",         # Address CVE GHSA-7gcm-g887-7qv7
