@@ -1546,6 +1546,79 @@ def test_router_replay_prepared_masks_preserve_microbatch_fifo(
 
 
 @pytest.mark.mcore
+@pytest.mark.parametrize(
+    "original,replacement,expected_original,expected_replacement,fallback_calls",
+    [
+        (
+            [[0, 2], [1, 0]],
+            [[0, 2], [-1, -1]],
+            [[0, 2], [1, 0]],
+            [[0, 2], [2, 0]],
+            1,
+        ),
+        (
+            [[-1, -1], [1, 0]],
+            [[0, 2], [1, 0]],
+            [[1, 2], [1, 0]],
+            [[0, 2], [1, 0]],
+            1,
+        ),
+        (
+            [[-1, -1], [1, 0]],
+            [[0, 2], [-1, -1]],
+            [[1, 2], [1, 0]],
+            [[0, 2], [2, 0]],
+            2,
+        ),
+    ],
+    ids=["valid-to-missing", "missing-to-valid", "different-missing-rows"],
+)
+def test_prepared_mask_is_ignored_after_direct_target_replacement(
+    two_layer_replay_model,
+    original,
+    replacement,
+    expected_original,
+    expected_replacement,
+    fallback_calls,
+):
+    from megatron.core.transformer.moe.router_replay import RouterReplayAction
+
+    from nemo_rl.models.megatron.router_replay import set_router_replay_forward
+
+    model = two_layer_replay_model
+    scores = torch.tensor([[0.1, 0.9, 0.2], [0.4, 0.2, 0.8]])
+    native_topk_calls = []
+
+    def default_compute_topk(scores, topk, **kwargs):
+        native_topk_calls.append(True)
+        return scores.topk(topk, dim=1)
+
+    targets = torch.tensor(original)[:, None, :].expand(-1, 2, -1)
+    set_router_replay_forward(model, targets)
+    replay = model.routers[0].router_replay
+    _, first_indices = replay.get_replay_topk(
+        scores, 2, default_compute_topk=default_compute_topk
+    )
+    torch.testing.assert_close(first_indices, torch.tensor(expected_original))
+
+    # MCore's setter replaces the target without refreshing RL's prepared state.
+    replay.set_target_indices(torch.tensor(replacement))
+    probs, indices = replay.get_replay_topk(
+        scores, 2, default_compute_topk=default_compute_topk
+    )
+    expected = torch.tensor(expected_replacement)
+    torch.testing.assert_close(indices, expected)
+    torch.testing.assert_close(probs, scores.gather(1, expected))
+    assert len(native_topk_calls) == fallback_calls
+
+    replay.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+    for expected_routes in (expected_original, expected_replacement):
+        _, indices = replay.get_replay_topk(scores, 2)
+        torch.testing.assert_close(indices, torch.tensor(expected_routes))
+    assert replay.replay_backward_list == []
+
+
+@pytest.mark.mcore
 @pytest.mark.parametrize("clear_all", [False, True])
 def test_router_replay_clear_discards_prepared_masks(two_layer_replay_model, clear_all):
     from megatron.core.transformer.moe.router_replay import RouterReplayAction

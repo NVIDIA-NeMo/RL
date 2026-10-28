@@ -36,7 +36,7 @@ _ROUTER_REPLAY_VALIDATE_ENV = "NRL_ROUTER_REPLAY_VALIDATE"
 _ROUTER_REPLAY_EXCLUDE_MTP_ENV = "NRL_ROUTER_REPLAY_EXCLUDE_MTP"
 _MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 _MISSING_ROUTE_FALLBACK_PATCH_ATTR = "_nrl_missing_route_fallback_patch"
-_MISSING_ROUTE_FALLBACK_MASK_ATTR = "_nrl_missing_route_fallback_mask"
+_MISSING_ROUTE_FALLBACK_STATE_ATTR = "_nrl_missing_route_fallback_state"
 
 
 def router_replay_enabled(config: PolicyConfig) -> bool:
@@ -434,11 +434,14 @@ def _install_missing_route_fallback_patch() -> None:
                 default_compute_topk,
             )
 
-        has_precomputed_fallback_state = hasattr(
-            replay_instance, _MISSING_ROUTE_FALLBACK_MASK_ATTR
+        fallback_state = getattr(
+            replay_instance, _MISSING_ROUTE_FALLBACK_STATE_ATTR, None
+        )
+        has_precomputed_fallback_state = (
+            fallback_state is not None and fallback_state[0] is target_topk_idx
         )
         if has_precomputed_fallback_state:
-            fallback_mask = getattr(replay_instance, _MISSING_ROUTE_FALLBACK_MASK_ATTR)
+            _, fallback_mask = fallback_state
             if fallback_mask is None:
                 return original_get_replay_topk(
                     replay_instance,
@@ -507,6 +510,7 @@ def _prepare_missing_route_fallback_masks(
     small vector of per-layer ``any`` results to the CPU. Layers without missing
     routes carry an explicit ``None`` marker and take MCore's original fast path;
     layers with missing routes retain their GPU mask for row-wise fallback.
+    Pair each mask with its target so direct target replacement cannot reuse it.
     """
     if not replay_assignments:
         return
@@ -522,7 +526,7 @@ def _prepare_missing_route_fallback_masks(
     # Forward then uses fixed-shape torch.where to replace missing routes.
     fallback_required_cpu = fallback_required.detach().to(device="cpu").tolist()
 
-    for (replay_instance, _), fallback_mask, is_required in zip(
+    for (replay_instance, replay_tensor), fallback_mask, is_required in zip(
         replay_assignments,
         fallback_masks,
         fallback_required_cpu,
@@ -530,14 +534,14 @@ def _prepare_missing_route_fallback_masks(
     ):
         setattr(
             replay_instance,
-            _MISSING_ROUTE_FALLBACK_MASK_ATTR,
-            fallback_mask if bool(is_required) else None,
+            _MISSING_ROUTE_FALLBACK_STATE_ATTR,
+            (replay_tensor, fallback_mask if bool(is_required) else None),
         )
 
 
-def _clear_missing_route_fallback_mask(replay_instance: Any) -> None:
-    if hasattr(replay_instance, _MISSING_ROUTE_FALLBACK_MASK_ATTR):
-        delattr(replay_instance, _MISSING_ROUTE_FALLBACK_MASK_ATTR)
+def _clear_missing_route_fallback_state(replay_instance: Any) -> None:
+    if hasattr(replay_instance, _MISSING_ROUTE_FALLBACK_STATE_ATTR):
+        delattr(replay_instance, _MISSING_ROUTE_FALLBACK_STATE_ATTR)
 
 
 def _get_tensor_model_parallel_world_size() -> int:
@@ -702,13 +706,13 @@ def clear_router_replay(model: Optional[Any] = None) -> None:
 
     if model is None:
         for replay_instance in RouterReplay.global_router_replay_instances:
-            _clear_missing_route_fallback_mask(replay_instance)
+            _clear_missing_route_fallback_state(replay_instance)
         RouterReplay.clear_global_router_replay_action()
         RouterReplay.clear_global_indices()
         return
 
     for replay_instance, _ in _router_replay_instances_for_model(model):
-        _clear_missing_route_fallback_mask(replay_instance)
+        _clear_missing_route_fallback_state(replay_instance)
         replay_instance.clear_router_replay_action()
         replay_instance.clear_indices()
 
