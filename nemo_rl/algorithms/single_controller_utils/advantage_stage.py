@@ -48,7 +48,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
-from nemo_rl.algorithms.reward_functions import apply_group_length_penalty
+from nemo_rl.algorithms.reward_functions import apply_group_length_penalty_to_rows
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     ChunkReceipt,
@@ -219,59 +219,20 @@ def _apply_group_relative_length_penalty(
 ) -> tuple[torch.Tensor, Optional[dict[str, float]]]:
     """Apply grpo.group_relative_length_penalty to the rewards the advantages use.
 
-    Returns the rewards for the advantage estimator and this call's metric sums (None when
-    the penalty is off, in which case ``rewards`` is returned as is). The logged reward stays
-    the environment's.
-
-    A rollout's length is its generated-token count, the sum of its token_mask (generated
-    tokens of every turn). The penalty is computed over the rows that take part in the
-    advantage statistics (``valid_mask``), so token-capture placeholders -- which keep the
-    environment reward but carry no tokens -- never count as length-0 passing rollouts and
-    pull a group's reference length down. Calls hold whole prompt groups
-    (split_meta_by_prompt_group), so each group's pass rate and reference are complete.
+    Returns the estimator's rewards and this call's metric sums, or ``rewards`` and None
+    when the penalty is off. The penalty runs over the rows in the advantage statistics
+    (``valid_mask``); see ``apply_group_length_penalty_to_rows``. Calls hold whole prompt
+    groups (split_meta_by_prompt_group), so each group's pass rate and reference length
+    are complete.
     """
     if cfg.is_ppo:
         return rewards, None
     penalty_cfg = cast(GRPOConfig, cfg.algo).group_relative_length_penalty
     if not penalty_cfg.enabled:
         return rewards, None
-
-    lengths = token_mask.sum(dim=-1)
-    participating = valid_mask.bool()
-    adv_rewards = rewards.clone()
-    metrics = {
-        "length_penalty/groups_applied": 0.0,
-        "length_penalty/groups_skipped_above_max_pass_rate": 0.0,
-        "length_penalty/mean_reference_length": 0.0,
-    }
-    if participating.any():
-        adv_rewards[participating], metrics = apply_group_length_penalty(
-            rewards[participating],
-            lengths[participating],
-            prompt_ids.reshape(-1)[participating],
-            penalty_cfg,
-        )
-    penalties = (rewards - adv_rewards).float()
-    hit = penalties > 1e-6
-    groups_applied = metrics["length_penalty/groups_applied"]
-    return adv_rewards, {
-        "groups_applied": groups_applied,
-        "groups_skipped_above_max_pass_rate": metrics[
-            "length_penalty/groups_skipped_above_max_pass_rate"
-        ],
-        "reference_length_sum": metrics["length_penalty/mean_reference_length"]
-        * groups_applied,
-        "num_passed": float(
-            (rewards[participating] >= penalty_cfg.success_threshold).sum().item()
-        ),
-        "num_penalized": float(hit.sum().item()),
-        "penalty_sum": float(penalties[hit].sum().item()),
-        "num_rows": float(participating.sum().item()),
-        "reward_sum": float(rewards[participating].float().sum().item()),
-        "reward_with_length_penalty_sum": float(
-            adv_rewards[participating].float().sum().item()
-        ),
-    }
+    return apply_group_length_penalty_to_rows(
+        rewards, token_mask, prompt_ids, valid_mask, penalty_cfg
+    )
 
 
 @dataclass(frozen=True)

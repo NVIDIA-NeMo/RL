@@ -9,8 +9,9 @@ data-plane driver (`grpo_train_sync`, `data_plane.enabled: true`) and the async
 the raw environment reward. The SingleController path does not apply `grpo.length_penalty`
 yet: until that follow-up lands, a SingleController run with `grpo.length_penalty` set fails at
 startup with `NotImplementedError` (alongside the other unsupported shapers) rather than
-training on unadjusted rewards. The SingleController applies a separate block instead,
-[`grpo.group_relative_length_penalty`](#group-relative-length-penalty-mimo-singlecontroller). Likewise the block requires the NeMo-Gym path: a run with
+training on unadjusted rewards. A separate block,
+[`grpo.group_relative_length_penalty`](#group-relative-length-penalty-mimo), works on every
+GRPO trainer, including the SingleController. Likewise the block requires the NeMo-Gym path: a run with
 `grpo.length_penalty` set and `env.should_use_nemo_gym` false is rejected at setup.
 
 Configure `grpo.length_penalty`. The block is typed (`LengthPenaltyConfig` in
@@ -598,13 +599,15 @@ batch as `env_reward`, and the `baseline_reward/pct_0` / `pct_1` / `pct_mixed` d
 computed from it so they keep reporting the environment's all-wrong / all-correct / mixed prompt
 fractions.
 
-## Group-Relative Length Penalty (MiMo, SingleController)
+## Group-Relative Length Penalty (MiMo)
 
 `grpo.group_relative_length_penalty` (`GroupLengthPenaltyConfig` in
 `nemo_rl/algorithms/reward_functions.py`) implements the MiMo-V2.6 group-relative length penalty
-(arXiv:2610.11959, Eq. 4). It is applied only on the SingleController path
-(`examples/run_grpo_single_controller.py`), in the advantage stage; the legacy, data-plane and
-async GRPO trainers reject it at setup instead of training on unpenalized rewards.
+(arXiv:2610.11959, Eq. 4). It is applied where advantages are computed, by every GRPO trainer:
+`grpo_train`, `async_grpo_train`, `grpo_train_sync` (`data_plane.enabled: true`) and the
+SingleController (`examples/run_grpo_single_controller.py`). All of them go through
+`apply_group_length_penalty_to_rows`, so they penalize the same batch identically. Unlike
+`grpo.length_penalty`, it does not require the NeMo-Gym path.
 
 For each prompt group, let P be its passing rollouts (`reward >= success_threshold`) and G the
 group size. When `min_pass_rate < |P| / G <= max_pass_rate`, the reference length `l*` is the
@@ -643,8 +646,10 @@ Details:
 - The penalty is computed over the rows that take part in the advantage statistics (see
   `grpo.masked_reward_policy`). Token-capture placeholders keep the environment reward but
   have no tokens; they never count as length-0 passing rollouts.
-- Advantage calls hold whole prompt groups, so the result does not depend on streaming chunks or
-  on how the advantage pool shards a step.
+- Each advantage computation holds whole prompt groups, so on the SingleController the result
+  does not depend on streaming chunks or on how the advantage pool shards a step.
+- Estimators that read per-component rewards from the batch (GDPO) instead of the `rewards`
+  argument do not see the penalty.
 - Metrics: `length_penalty/groups_applied`, `length_penalty/groups_skipped_above_max_pass_rate`,
   `length_penalty/mean_reference_length`, `length_penalty/frac_passing_penalized`,
   `length_penalty/mean_penalty_on_penalized`, `length_penalty/mean_reward_unpenalized` and

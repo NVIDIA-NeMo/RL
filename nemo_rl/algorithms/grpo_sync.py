@@ -54,6 +54,7 @@ from nemo_rl.algorithms.grpo import (
     _clip_grpo_advantages,
     _create_advantage_estimator,
     _dynamic_sampling_valid_mask,
+    _group_relative_length_penalty_rewards,
     _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
@@ -1062,6 +1063,16 @@ def grpo_train_sync(
                     advantage_valid_mask = _advantage_valid_mask(
                         sample_mask, master_config.grpo, dataset_loss_multiplier
                     )
+                    adv_rewards, length_penalty_metrics = (
+                        _group_relative_length_penalty_rewards(
+                            master_config.grpo,
+                            rewards,
+                            token_mask,
+                            prompt_ids_for_adv,
+                            advantage_valid_mask,
+                        )
+                    )
+                    metrics.update(length_penalty_metrics)
 
                     # GRPO / Reinforce++ ignore ``repeated_batch`` (it's
                     # swallowed via ``**kwargs``); GDPO reads the
@@ -1080,7 +1091,7 @@ def grpo_train_sync(
                         adv_inputs[k] = driver_carry[k]
                     advantages = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
-                        rewards=rewards,
+                        rewards=adv_rewards,
                         mask=mask,
                         valid_mask=advantage_valid_mask,
                         normalization_mask=token_mask

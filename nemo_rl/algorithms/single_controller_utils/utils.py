@@ -24,6 +24,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.metric_utils import REWARD_KEY
+from nemo_rl.algorithms.reward_functions import group_length_penalty_metrics
 from nemo_rl.data_plane import KVBatchMeta
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
@@ -244,7 +245,7 @@ def reduce_advantage_pump_metrics(
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     if length_penalty_partials:
-        out.update(_reduce_length_penalty_partials(length_penalty_partials))
+        out.update(group_length_penalty_metrics(length_penalty_partials))
     n_asst = sum(num_assistant_messages or [])
     if n_asst:
         n_invalid = sum(num_invalid_tool_calls or [])
@@ -261,39 +262,6 @@ def reduce_advantage_pump_metrics(
         out["routed_experts_backfilled_rate"] = n_backfilled / n_asst
         out["num_routed_experts_backfilled"] = float(n_backfilled)
     return out
-
-
-def _reduce_length_penalty_partials(
-    records: list[dict[str, float]],
-) -> dict[str, float]:
-    """Turn per-call grpo.group_relative_length_penalty sums into step metrics.
-
-    Rates and means are over the rows that took part in the advantage statistics.
-    """
-    total = {key: sum(record[key] for record in records) for key in records[0]}
-    groups = total["groups_applied"]
-    rows = total["num_rows"]
-    passed = total["num_passed"]
-    penalized = total["num_penalized"]
-    return {
-        "length_penalty/groups_applied": groups,
-        "length_penalty/groups_skipped_above_max_pass_rate": total[
-            "groups_skipped_above_max_pass_rate"
-        ],
-        "length_penalty/mean_reference_length": (
-            total["reference_length_sum"] / groups if groups else 0.0
-        ),
-        "length_penalty/frac_passing_penalized": penalized / passed if passed else 0.0,
-        "length_penalty/mean_penalty_on_penalized": (
-            total["penalty_sum"] / penalized if penalized else 0.0
-        ),
-        "length_penalty/mean_reward_unpenalized": (
-            total["reward_sum"] / rows if rows else 0.0
-        ),
-        "reward_with_length_penalty": (
-            total["reward_with_length_penalty_sum"] / rows if rows else 0.0
-        ),
-    }
 
 
 def _reduce_seq_logprob_error_metrics(
