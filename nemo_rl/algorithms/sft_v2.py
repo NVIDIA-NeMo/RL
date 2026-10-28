@@ -468,6 +468,9 @@ class SFTSingleControllerActor:
         save_checkpoint_object(
             loader_states, os.path.join(checkpoint_path, "sft_v2_loaders.pt")
         )
+        # Keep this last: the rename it leads to waits only for the policy's async
+        # weight write, so anything written into checkpoint_path after it races
+        # the rename.
         if self._defer_checkpoint_finalize:
             self._pending_checkpoint_path = checkpoint_path
         else:

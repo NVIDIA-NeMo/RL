@@ -1586,6 +1586,38 @@ class TestSaveTrigger:
 
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
 
+    @pytest.mark.parametrize("defer_finalize", [False, True])
+    def test_nothing_is_written_into_the_checkpoint_after_publish_starts(
+        self, tmp_path, defer_finalize
+    ):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=2, save_period=2, defer_finalize=defer_finalize
+        )
+        at_publish: list[set[str]] = []
+
+        def _files(path) -> set[str]:
+            return {
+                str(p.relative_to(path)) for p in Path(path).rglob("*") if p.is_file()
+            }
+
+        def _seed(actor):
+            publish = actor._publish_when_policy_write_done
+
+            async def _record(checkpoint_path):
+                at_publish.append(_files(checkpoint_path))
+                await publish(checkpoint_path)
+
+            actor._publish_when_policy_write_done = _record
+
+        _run_train_pump(mc, _make_actor_args(trainer=_FakeTrainer()), seed=_seed)
+
+        # The rename waits only for the policy's async write, so every other part
+        # must already be on disk when publishing starts.
+        assert at_publish == [_files(tmp_path / "checkpoints" / "step_2")]
+        assert at_publish[0]
+        # A write that lost the race to the rename recreates tmp_step_2/.
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_2"}
+
     @pytest.mark.parametrize(
         "megatron_cfg",
         [
@@ -2805,6 +2837,13 @@ class TestPPOSaveOrder:
         )
         calls: list[str] = []
         actor = _ppo_save_actor(tmp_path, calls)
+        publish = actor._publish_when_policy_write_done
+
+        async def _record_publish(checkpoint_path):
+            calls.append("publish")
+            await publish(checkpoint_path)
+
+        actor._publish_when_policy_write_done = _record_publish
 
         asyncio.run(
             actor._save_checkpoint(
@@ -2812,6 +2851,7 @@ class TestPPOSaveOrder:
             )
         )
 
+        # Publishing comes last: the rename waits only for the policy's write.
         assert calls == [
             "policy.offload_to_cpu",
             "critic.prepare_for_training",
@@ -2819,6 +2859,7 @@ class TestPPOSaveOrder:
             "critic.finish_training",
             "policy.prepare_for_training",
             "policy.save_checkpoint",
+            "publish",
         ]
         assert actor._trainer.save_kwargs["is_final_checkpoint"] is True
         assert actor._value.save_kwargs["is_final_checkpoint"] is True

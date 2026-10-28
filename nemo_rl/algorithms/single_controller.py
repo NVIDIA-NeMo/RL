@@ -5210,7 +5210,8 @@ class SingleControllerActor:
         """Write a full checkpoint for the just-finished train step.
 
         Everything except the (possibly async) policy weight write must be on disk
-        before `begin_finalization`. Non-colocated engines keep serving rollouts throughout.
+        before `_publish_when_policy_write_done`, which is why it runs last.
+        Non-colocated engines keep serving rollouts throughout.
         Colocated engines are stood down for the save.
         The policy optimizer is skipped during critic warmup: it has never stepped.
         """
@@ -5403,6 +5404,17 @@ class SingleControllerActor:
                 ).write_bytes,
                 rollout_recovery_payload,
             )
+        # Keep this last: the rename it leads to waits only for the policy's async
+        # weight write, so anything written into checkpoint_path after it races
+        # the rename.
+        await self._publish_when_policy_write_done(checkpoint_path)
+
+    async def _publish_when_policy_write_done(self, checkpoint_path: PathLike) -> None:
+        """Arrange for tmp_step_N to become step_N once the policy write lands.
+
+        The only way a full checkpoint gets published. Call it only after every
+        other part of the checkpoint is on disk.
+        """
         if self._defer_checkpoint_finalize:
             # Published by _finish_pending_save at a later step boundary.
             self._pending_checkpoint = (checkpoint_path, self._train_steps)
