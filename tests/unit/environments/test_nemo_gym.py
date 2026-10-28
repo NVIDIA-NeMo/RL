@@ -339,7 +339,8 @@ def test_extract_static_video_message_resolves_local_file(tmp_path):
     assert messages[0]["content"][1]["type"] == "video"
 
 
-def test_extract_static_video_message_accepts_cached_frames(tmp_path):
+@pytest.mark.parametrize("with_timing", [False, True])
+def test_extract_static_video_message_accepts_cached_frames(tmp_path, with_timing):
     frame_paths = []
     for index in range(2):
         frame_path = tmp_path / f"frame_{index:04d}.png"
@@ -367,6 +368,13 @@ def test_extract_static_video_message_accepts_cached_frames(tmp_path):
         }
     }
 
+    if with_timing:
+        for part, index in zip(
+            example["responses_create_params"]["input"][0]["content"], [0, 24]
+        ):
+            part.update(_video_frame_index=index, _video_fps=23.976)
+    expected_indices = [0, 24] if with_timing else [0, 1]
+    expected_fps = 23.976 if with_timing else 1.0
     messages, resolved_path = _extract_static_video_messages(example)
 
     assert resolved_path is None
@@ -379,14 +387,18 @@ def test_extract_static_video_message_accepts_cached_frames(tmp_path):
         isinstance(part["image"], Image.Image) for part in messages[0]["content"][:2]
     )
     assert all(part["_is_video_frame"] for part in messages[0]["content"][:2])
-    assert [part["_video_frame_index"] for part in messages[0]["content"][:2]] == [0, 1]
-    assert [part["_video_fps"] for part in messages[0]["content"][:2]] == [1.0, 1.0]
+    assert [
+        part["_video_frame_index"] for part in messages[0]["content"][:2]
+    ] == expected_indices
+    assert [part["_video_fps"] for part in messages[0]["content"][:2]] == [
+        expected_fps
+    ] * 2
 
     _, frames, frame_indices, fps = _flatten_nemotron_video_frame_messages(messages)
 
     assert len(frames) == 2
-    assert frame_indices == [0, 1]
-    assert fps == 1.0
+    assert frame_indices == expected_indices
+    assert fps == expected_fps
 
 
 def test_extract_static_video_message_ignores_still_image_only_row():
@@ -818,7 +830,9 @@ def test_video_datum_requires_explicit_video_data_config(tmp_path):
 
 def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_path):
     data_path = tmp_path / "video-gym.jsonl"
-    data_path.write_text(json.dumps({"row": 1}) + "\n", encoding="utf-8")
+    video_part = {"type": "input_video", "video_url": "clip.mp4"}
+    row = {"responses_create_params": {"input": [{"content": [video_part]}]}}
+    data_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
     expected_media_config = {
         "num_frames": 32,
         "video_sampling_style": "nemotron_vl",
@@ -860,7 +874,7 @@ def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_pa
     )
     processor = SimpleNamespace(
         apply_chat_template=lambda *args: None,
-        tokenizer=object(),
+        tokenizer=SimpleNamespace(bos_token_id=None),
     )
 
     train_dataset, _ = setup_response_data(
@@ -1151,7 +1165,10 @@ def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
     )
 
 
-def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_path):
+@pytest.mark.parametrize("with_timing", [False, True])
+def test_nemotron_cached_video_uses_native_lossless_manifest(
+    monkeypatch, tmp_path, with_timing
+):
     frame_paths = []
     for index in range(4):
         frame_path = tmp_path / f"frame_{index:04d}.png"
@@ -1189,10 +1206,15 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
             },
         }
     }
+    if with_timing:
+        for part, index in zip(
+            example["responses_create_params"]["input"][0]["content"], [0, 6, 12, 18]
+        ):
+            part.update(_video_frame_index=index, _video_fps=23.976)
     manifest_calls = []
 
-    def fake_manifest_builder(paths):
-        manifest_calls.append(paths)
+    def fake_manifest_builder(paths, *, frame_indices, frame_fps):
+        manifest_calls.append((paths, frame_indices, frame_fps))
         return "data:video/x-nemo-rl-cached-frames;base64,dGVzdA=="
 
     monkeypatch.setattr(
@@ -1232,7 +1254,13 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
     )
 
     assert datum is not None
-    assert manifest_calls == [[str(path) for path in frame_paths]]
+    assert manifest_calls == [
+        (
+            [str(path) for path in frame_paths],
+            [0, 6, 12, 18] if with_timing else [None] * 4,
+            [23.976] * 4 if with_timing else [None] * 4,
+        )
+    ]
     outbound = datum["extra_env_info"]["responses_create_params"]
     assert outbound["input"][0]["content"] == [
         {
@@ -1343,7 +1371,7 @@ def test_nemo_gym_stub_module():
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
     master_config = MasterConfig.model_construct(
-        policy={"generation": generation_config}
+        policy={"generation": generation_config}, data={}
     )
     setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 

@@ -75,9 +75,9 @@ example, an agent harness that rewrites or compacts its history) raises an
 a rollout with a placeholder sample instead. The placeholder sets `mask_sample`
 (so it is excluded from the loss) and always has
 its `loss_multiplier` set to zero, even when `env.should_mask_flagged_samples` is
-`false`. Its reward leaves the group baseline only on the single-controller
-path, where `sample_mask` feeds the advantage stage's valid mask; the batched
-path's baseline still averages it in. A non-contiguous rollout keeps its
+`false`. The zero weight is established before trainer filtering, so its reward
+also stays out of group statistics under either `grpo.masked_reward_policy`
+on the legacy, data-plane and single-controller paths. A non-contiguous rollout keeps its
 contiguous prefix, including the
 media attached to those turns; a rollout with no generation data gets a fixed
 128-token text prompt and a single EOS token. That synthetic prompt holds no

@@ -100,6 +100,7 @@ def record_to_train_batch(
     *,
     pad_value_dict: Mapping[str, int],
     include_message_violation_fields: bool,
+    per_token_multimodal_fields: tuple[str, ...] = (),
 ) -> BatchedDataDict[Any]:
     """Convert one prompt group's record into a packed BatchedDataDict of N rows.
 
@@ -108,6 +109,8 @@ def record_to_train_batch(
         pad_value_dict: Field-name → pad value used by batched_message_log_to_flat_message.
         include_message_violation_fields: Whether to tensorize message violation
             flags for configured advantage penalties.
+        per_token_multimodal_fields: Fixed per-token schema for a multimodal
+            run. Missing message fields get text defaults before flattening.
 
     Returns:
         BatchedDataDict with input IDs and lengths, generation log probabilities,
@@ -154,7 +157,9 @@ def record_to_train_batch(
         pad_value_dict=dict(pad_value_dict),  # type: ignore
     )
 
-    add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
+    add_grpo_token_loss_masks_and_generation_logprobs(
+        message_logs, per_token_multimodal_fields
+    )
     flat, input_lengths = batched_message_log_to_flat_message(
         message_logs,  # type: ignore
         pad_value_dict=dict(pad_value_dict),  # type: ignore

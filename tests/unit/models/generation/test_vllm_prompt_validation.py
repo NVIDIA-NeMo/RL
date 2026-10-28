@@ -79,6 +79,9 @@ def test_workers_validate_returned_prompt_before_rebuilding_trace(
     )
     worker = worker_type.__new__(worker_type)
     worker.routed_experts_dtype = torch.int32
+    # Mirror BaseVllmGenerationWorker._init_config(), which this lightweight
+    # __new__-based fixture intentionally bypasses.
+    worker._native_lora_request = None
     worker.cfg = {
         "_pad_token_id": 0,
         "max_new_tokens": 2,
@@ -224,6 +227,9 @@ def test_workers_handle_mixed_bos_prompts(
     )
     worker = worker_type.__new__(worker_type)
     worker.routed_experts_dtype = torch.int32
+    # Mirror BaseVllmGenerationWorker._init_config(), which this lightweight
+    # __new__-based fixture intentionally bypasses.
+    worker._native_lora_request = None
     worker.cfg = {
         "_pad_token_id": 0,
         "max_new_tokens": 1,

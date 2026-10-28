@@ -562,6 +562,16 @@ singleton-batch JSONL shape. Chunks stream through `.jsonl.partial` files;
 the final name is published only after the optimizer step completes. A
 partial file is not proof of a completed training step.
 
+The files are written by `JsonDebugWriter`, which is what the default
+`async_rl.debug_writer.target: json` selects. To store the dump elsewhere, set
+`target` to the dotted import path of a `DebugWriter` subclass, for example
+`my_pkg.my_module.MyWriter`; any other keys under `async_rl.debug_writer` are
+passed to its constructor after `log_dir` and `shard_id`. The class implements
+`_write_chunk`, which receives each validated chunk as tensors, and
+`_publish_step`, and may override `close`, which the controller calls once at
+shutdown. It is built on the controller and on every advantage shard, so it
+must be importable in each of those processes.
+
 The per-step `timing/train/train_data_dump` metric reports wall-clock seconds
 summed across chunk preparation/writes and final-file publication. Chunk dump
 time is also included in `advantage_calculation`; these timings overlap.
