@@ -599,10 +599,12 @@ def _dynamic_sampling_config(
     on_dropped_prompt: str = "replace",
     sampler: str = "in_order",
     num_generations_per_prompt: int = _NUM_GENERATIONS_PER_PROMPT,
+    max_replacements_per_slot: int = 32,
 ) -> MasterConfig:
     """A GRPO SC config with dynamic sampling on and the knobs it validates."""
     mc = _make_master_config()
     mc.grpo.use_dynamic_sampling = True
+    mc.grpo.dynamic_sampling_max_replacements_per_slot = max_replacements_per_slot
     mc.grpo.num_generations_per_prompt = num_generations_per_prompt
     mc.policy["train_global_batch_size"] = (
         _NUM_PROMPTS_PER_STEP * num_generations_per_prompt
@@ -631,10 +633,29 @@ class TestDynamicSamplingValidation:
         # responsibility and cannot be checked here.
         validate_single_controller_config(_dynamic_sampling_config(sampler="custom"))
 
-    def test_rejects_shrink_since_a_filtered_group_is_never_substituted(self):
-        mc = _dynamic_sampling_config(on_dropped_prompt="shrink")
+    def test_accepts_shrink_because_filtering_replaces_regardless(self):
+        # on_dropped_prompt governs rollout failures only. Training on a uniform group
+        # is never right, so a filtered group is replaced out of its own budget even
+        # when infra drops are configured to shrink the step.
+        validate_single_controller_config(
+            _dynamic_sampling_config(on_dropped_prompt="shrink")
+        )
 
-        with pytest.raises(ValueError, match='on_dropped_prompt="replace"'):
+    def test_rejects_token_capture(self):
+        # The capture path cannot borrow a finished group from a later step, so every
+        # drop would stall its step for a full fresh rollout.
+        mc = _dynamic_sampling_config()
+        mc.token_capture.enabled = True
+
+        with pytest.raises(ValueError, match="token_capture.enabled"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_zero_replacement_budget(self):
+        mc = _dynamic_sampling_config(max_replacements_per_slot=0)
+
+        with pytest.raises(
+            ValueError, match="dynamic_sampling_max_replacements_per_slot must be >= 1"
+        ):
             validate_single_controller_config(mc)
 
     def test_rejects_a_sampler_that_stamps_no_target_step(self):

@@ -245,6 +245,9 @@ def _controller(
     controller._current_epoch = 0
     controller._sampler_stamps_target_steps = False
     controller._rollout_recovery_enabled = True
+    # Dynamic sampling off: these fixtures exercise the fault-tolerance path.
+    controller._dynamic_sampling_enabled = False
+    controller._dynamic_sampling_max_replacements = 0
     controller._restored_replay_groups_to_regenerate = []
     controller._batch_shortfall = {}
     controller._batch_replacements = {}

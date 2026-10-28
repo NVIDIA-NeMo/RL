@@ -2539,7 +2539,9 @@ class TestStepRewardMetrics:
 
         outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=2))
 
-        assert outcome is RolloutOutcome.SKIPPED
+        # FILTERED, not SKIPPED: the rollout succeeded, so the caller replaces it out
+        # of the dynamic-sampling budget rather than the fault-tolerance one.
+        assert outcome is RolloutOutcome.FILTERED
         assert len(buf.remove_calls) == 1
         metrics = mgr.pop_step_reward_metrics(2)
         assert metrics["generated_prompt_groups"] == 1.0
@@ -2560,7 +2562,7 @@ class TestStepRewardMetrics:
 
         outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=2))
 
-        assert outcome is RolloutOutcome.SKIPPED
+        assert outcome is RolloutOutcome.FILTERED
         assert mgr._consecutive_infra_drops == 0
 
     def test_zero_variance_is_counted_even_when_the_filter_is_off(self):

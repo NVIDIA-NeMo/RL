@@ -1226,8 +1226,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "Remove it, or add a `ppo` block with policy_training_start_step > 0."
         )
 
-    # Dynamic sampling drops uniform groups, and each drop needs a replacement prompt.
-    # The default on_dropped_prompt="shrink" would silently shrink the step instead.
+    # Dynamic sampling drops uniform groups and resamples each one. Its replacement
+    # budget is its own (grpo.dynamic_sampling_max_replacements_per_slot), not the
+    # rollout fault-tolerance budget: a zero-variance drop is a data decision about a
+    # healthy rollout, so the two must not be able to redefine each other.
     if algo_cfg.use_dynamic_sampling:
         # Dynamic-sampling drops shorten the training step. PPO's critic shards that
         # step against value.train_global_batch_size, so the first short step fails a
@@ -1244,14 +1246,25 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
-        rollout_failure = async_config.rollout_failure
-        if rollout_failure.on_dropped_prompt != "replace":
+        grpo_cfg = cast(GRPOConfig, algo_cfg)
+        # The capture path replaces a dropped group by waiting out a fresh rollout: it
+        # cannot borrow a finished group from a later step the way the non-capture path
+        # does (_promote_into_step). An occasional fault-tolerance drop can afford that;
+        # dynamic sampling makes drops routine, so the wait would land on every step.
+        # Supporting it there means mirroring the borrow, which is its own change.
+        if master_config.token_capture.enabled:
             raise ValueError(
-                f"{algo_prefix}.use_dynamic_sampling requires "
-                'async_rl.rollout_failure.on_dropped_prompt="replace"; with '
-                f'"{rollout_failure.on_dropped_prompt}" a filtered group is never '
-                "substituted, so each zero-variance group silently shrinks its "
-                "training step instead of being resampled."
+                f"{algo_prefix}.use_dynamic_sampling is not supported together with "
+                "token_capture.enabled: on the capture path a replacement cannot borrow "
+                "a finished group from a later step, so every dropped group stalls its "
+                "step for a full fresh rollout. Disable one of the two."
+            )
+        if grpo_cfg.dynamic_sampling_max_replacements_per_slot < 1:
+            raise ValueError(
+                f"{algo_prefix}.dynamic_sampling_max_replacements_per_slot must be >= 1 "
+                f"when {algo_prefix}.use_dynamic_sampling is set (got "
+                f"{grpo_cfg.dynamic_sampling_max_replacements_per_slot}): with no "
+                "replacement budget the first zero-variance group fails the run."
             )
         if async_config.sampler.name not in ("in_order", "custom"):
             raise ValueError(

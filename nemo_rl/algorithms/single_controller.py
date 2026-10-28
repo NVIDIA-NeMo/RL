@@ -94,6 +94,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     create_sampler,
 )
 from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
     GRPOSaveState,
     _save_adaptive_loss_state,
     _update_adaptive_loss_state,
@@ -771,6 +772,20 @@ class SingleControllerActor:
         # Learned from admit rather than the sampler's type, because a custom sampler's
         # stamping is not knowable until it answers.
         self._sampler_stamps_target_steps: bool = False
+        # Dynamic sampling (DAPO) drops groups whose generations all scored the same.
+        # It gets its own replacement budget rather than sharing the rollout
+        # fault-tolerance one: a zero-variance drop is a data decision about a healthy
+        # rollout, so letting the two share a counter would make an infra failure and a
+        # uniform group spend each other's budget.
+        self._dynamic_sampling_enabled: bool = self._algo_cfg.use_dynamic_sampling
+        # Only GRPO carries the budget key, and setup rejects dynamic sampling on PPO,
+        # so it is read only on the branch that owns it. The 0 is not a default for the
+        # key: with the filter off nothing ever consults it.
+        self._dynamic_sampling_max_replacements: int = (
+            cast(GRPOConfig, self._algo_cfg).dynamic_sampling_max_replacements_per_slot
+            if self._dynamic_sampling_enabled
+            else 0
+        )
 
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released when the buffer
@@ -2187,8 +2202,9 @@ class SingleControllerActor:
         """Continuously dispatch rollout tasks until cancellation.
 
         Per batch:
-          0. Under on_dropped_prompt="replace", divert the batch into the spare pool
-             if the pool is below its low-water mark, and skip admission entirely.
+          0. Under on_dropped_prompt="replace" or dynamic sampling, divert the batch
+             into the spare pool if the pool is below its low-water mark, and skip
+             admission entirely.
              Otherwise await sampler.admit(...) to wait until the batch may dispatch
              and obtain its target_step stamp.
 
@@ -2204,8 +2220,8 @@ class SingleControllerActor:
              is submitted to the finalizer actor pool.
           5. If the prompt was dropped, substitute a spare and repeat step 4 -- for this
              step, or for whichever step lends this one a finished group in its place
-             (see _take_replacement, _promote_into_step) -- or credit the step short so
-             the train pump can close it
+             (see _take_replacement, _take_filtered_replacement, _promote_into_step) --
+             or credit the step short so the train pump can close it
           6. Decrement _inflight_rollouts
 
         Once every epoch is done, whatever is left in the spare pool is dispatched as
@@ -2233,6 +2249,9 @@ class SingleControllerActor:
             # substitutions because the slot stays occupied either way -- they are
             # released once something commits, or once a step is credited short.
             replacements = 0
+            # Zero-variance substitutions for this slot, counted apart from the
+            # fault-tolerance `replacements` above so the two budgets stay independent.
+            filtered_replacements = 0
             generation_permit_released = False
             inflight_count_released = False
             try:
@@ -2310,52 +2329,37 @@ class SingleControllerActor:
                                 / finalized.total_row_count
                                 < min_valid_fraction
                             )
-                            zero_variance = (
-                                self._rollout_manager.filter_zero_variance_groups
-                                and finalized.zero_variance
-                            )
-                            if not below_threshold and not zero_variance:
+                            if not below_threshold:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
                                 break
-                            # The group was published but is not worth training on:
-                            # too few valid rows, or (dynamic sampling) all rewards
-                            # equal. Only the controller can supply a replacement,
-                            # so it makes this call, not the finalizer.
+                            # Enough rows verified to publish, but too few to
+                            # be worth training on. Unlike the finalizer's own
+                            # structural drops above, this is a policy call
+                            # only the controller can act on: it is the one
+                            # component that can source a replacement.
                             try:
                                 await self._discard_committed_group(request)
                             except BaseException as cleanup_error:
                                 raise RuntimeError(
-                                    "finalizer group was discarded "
-                                    f"({'below min_valid_fraction_per_group' if below_threshold else 'zero reward variance'}) "
-                                    "and known-key cleanup failed for group "
+                                    "finalizer group fell below "
+                                    "min_valid_fraction_per_group and "
+                                    "known-key cleanup failed for group "
                                     f"{request.group_id}"
                                 ) from cleanup_error
-                            if below_threshold:
-                                print(
-                                    f"  finalize: group {request.group_id} below "
-                                    "min_valid_fraction_per_group "
-                                    f"({finalized.valid_row_count}/"
-                                    f"{finalized.total_row_count} < "
-                                    f"{min_valid_fraction}); seeking a replacement",
-                                    flush=True,
-                                )
-                            else:
-                                self._rollout_manager.stats.zero_variance_groups += 1
-                                print(
-                                    f"  dynamic sampling: dropped group "
-                                    f"{request.group_id} (target_step={target_step}), "
-                                    "all rewards equal; "
-                                    f"{self._rollout_manager.stats.zero_variance_groups} "
-                                    "dropped so far; seeking a replacement",
-                                    flush=True,
-                                )
+                            print(
+                                f"  finalize: group {request.group_id} below "
+                                "min_valid_fraction_per_group "
+                                f"({finalized.valid_row_count}/"
+                                f"{finalized.total_row_count} < "
+                                f"{min_valid_fraction}); seeking a replacement",
+                                flush=True,
+                            )
                             replacement = self._take_replacement(
                                 target_step, replacements
                             )
                             if replacement is None:
-                                if below_threshold:
-                                    self._rollout_manager.record_finalizer_dropped_prompt()
+                                self._rollout_manager.record_finalizer_dropped_prompt()
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return
@@ -2413,7 +2417,8 @@ class SingleControllerActor:
                                         prompt,
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
-                                        replacement_index=replacements,
+                                        replacement_index=replacements
+                                        + filtered_replacements,
                                     )
                                 else:
                                     outcome = await self._rollout_manager.generate_and_push(
@@ -2421,7 +2426,8 @@ class SingleControllerActor:
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
                                         lineage_group_id=lineage_group_id,
-                                        replacement_index=replacements,
+                                        replacement_index=replacements
+                                        + filtered_replacements,
                                     )
                         except BaseException:
                             # On success ownership transfers to the train pump, which
@@ -2429,16 +2435,39 @@ class SingleControllerActor:
                             self._buffer_capacity.release()
                             raise
 
-                        if outcome is not RolloutOutcome.SKIPPED:
+                        # Only a drop continues the loop. Stated as "not a drop" rather
+                        # than "is COMMITTED" so a future outcome that is neither still
+                        # falls through to the commit path, as it did before FILTERED
+                        # split off from SKIPPED.
+                        if outcome not in (
+                            RolloutOutcome.SKIPPED,
+                            RolloutOutcome.FILTERED,
+                        ):
                             break
+
+                        # Which budget pays for the substitution. A FILTERED group was
+                        # dropped by dynamic sampling, which is a data decision about a
+                        # rollout that succeeded; a SKIPPED one is an infrastructure
+                        # failure. The two are counted apart so neither can spend the
+                        # other's budget, and only the failure path reads
+                        # on_dropped_prompt.
+                        filtered = outcome is RolloutOutcome.FILTERED
+                        if filtered:
+                            self._require_dynamic_sampling_budget(
+                                target_step, filtered_replacements
+                            )
 
                         if self._rollout_recovery_enabled:
                             assert lineage_group_id is not None
                             async with self._data_plane_checkpoint_barrier.mutation(
                                 "prompt_reservations"
                             ) as cut:
-                                replacement = self._take_replacement(
-                                    target_step, replacements
+                                replacement = (
+                                    self._take_filtered_replacement()
+                                    if filtered
+                                    else self._take_replacement(
+                                        target_step, replacements
+                                    )
                                 )
                                 # A skipped tracked prompt remains ledger-owned until this
                                 # controller transition. Dropping the old owner, reserving
@@ -2461,8 +2490,10 @@ class SingleControllerActor:
                                 else:
                                     self._credit_shortfall(target_step)
                         else:
-                            replacement = self._take_replacement(
-                                target_step, replacements
+                            replacement = (
+                                self._take_filtered_replacement()
+                                if filtered
+                                else self._take_replacement(target_step, replacements)
                             )
                         if replacement is None:
                             # Nothing was committed, so the train pump will never see this
@@ -2472,12 +2503,23 @@ class SingleControllerActor:
                                 self._credit_shortfall(target_step)
                             return
 
-                        replacements += 1
+                        if filtered:
+                            filtered_replacements += 1
+                            spent = (
+                                f"{filtered_replacements}/"
+                                f"{self._dynamic_sampling_max_replacements}"
+                            )
+                        else:
+                            replacements += 1
+                            spent = (
+                                f"{replacements}/"
+                                f"{self._async_cfg.rollout_failure.max_replacement_attempts}"
+                            )
                         prompt = replacement
                         print(
-                            f"  target_step={target_step}: substituting a spare prompt for "
-                            f"the dropped group (replacement {replacements}/"
-                            f"{self._async_cfg.rollout_failure.max_replacement_attempts}, "
+                            f"  target_step={target_step}: substituting a spare prompt "
+                            f"for the {'filtered' if filtered else 'dropped'} group "
+                            f"(replacement {spent}, "
                             f"{len(self._replacement_reserve)} spare(s) left)",
                             flush=True,
                         )
@@ -2498,7 +2540,7 @@ class SingleControllerActor:
                 if not generation_permit_released:
                     sem.release()
 
-            if replacements and target_step is not None:
+            if (replacements or filtered_replacements) and target_step is not None:
                 # Counted per slot, not per attempt: a step got its group back, which is
                 # the fact that explains why its batch is full despite a drop. Recorded
                 # against the step the spare actually committed to, which after a borrow
@@ -2676,7 +2718,12 @@ class SingleControllerActor:
         still running, so it is available by the time any of them can be given up on.
         """
         failure_cfg = self._async_cfg.rollout_failure
-        if failure_cfg.on_dropped_prompt != "replace":
+        # Dynamic sampling draws on the same pool and always replaces, whatever
+        # on_dropped_prompt says, so under "shrink" it is the only thing filling it.
+        if (
+            failure_cfg.on_dropped_prompt != "replace"
+            and not self._dynamic_sampling_enabled
+        ):
             return False
         if not self._sampler_stamps_target_steps:
             return False
@@ -2717,8 +2764,9 @@ class SingleControllerActor:
         outcome is that the whole thing is recovered.
 
         Not gated on ``on_dropped_prompt``: an empty pool makes this a no-op anyway, and
-        only "replace" ever fills one, so the gate would buy nothing while stranding a
-        pool restored from a checkpoint into a run that has since switched to "shrink".
+        only a run that replaces something ever fills one, so the gate would buy nothing
+        while stranding a pool restored from a checkpoint into a run that has since
+        switched to "shrink".
         """
         num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         while len(self._replacement_reserve) >= num_prompts_per_step:
@@ -2783,6 +2831,9 @@ class SingleControllerActor:
     ) -> Optional[DatumSpec]:
         """A spare prompt to stand in for a dropped group, or None to shrink instead.
 
+        For rollout failures only. A group dropped by dynamic sampling goes through
+        ``_take_filtered_replacement``, which spends a different budget.
+
         None covers the four ways a replacement can be unavailable: it was not asked
         for, the sampler does not stamp target steps so no step is ever waiting on a
         replacement, the per-slot budget is spent, or the pool is empty because the
@@ -2801,6 +2852,55 @@ class SingleControllerActor:
             return None
         if replacements_used >= failure_cfg.max_replacement_attempts:
             return None
+        if not self._replacement_reserve:
+            return None
+        return self._replacement_reserve.popleft()
+
+    def _require_dynamic_sampling_budget(
+        self, target_step: Optional[int], replacements_used: int
+    ) -> None:
+        """Fail the run when one slot has spent its whole dynamic-sampling budget.
+
+        Matches v1's behaviour past ``dynamic_sampling_max_gen_batches``. A slot that
+        cannot stop producing uniform groups means the filter is mis-tuned for this
+        data, and quietly shrinking the step would hide that behind
+        ``min_step_batch_fraction``.
+
+        Called before the ``prompt_reservations`` cut rather than inside it, so the
+        failure never lands mid-mutation on the ledger.
+
+        Raises:
+            RuntimeError: The slot has used its whole dynamic-sampling budget.
+        """
+        if replacements_used < self._dynamic_sampling_max_replacements:
+            return
+        raise RuntimeError(
+            f"dynamic sampling dropped {replacements_used + 1} consecutive group(s) for "
+            f"one slot of target_step={target_step}, exhausting "
+            "grpo.dynamic_sampling_max_replacements_per_slot="
+            f"{self._dynamic_sampling_max_replacements}. Every resample of this slot "
+            "scored uniformly, so the filter is rejecting faster than the data can "
+            "refill it. Check zero_variance_fraction: a budget of N survives a drop "
+            "rate p only while p**(N+1) stays small across every slot of the run. "
+            "Raise the budget, or revisit the reward/prompt mix."
+        )
+
+    def _take_filtered_replacement(self) -> Optional[DatumSpec]:
+        """A spare prompt for a group dynamic sampling dropped, or None if the pool is dry.
+
+        Deliberately shares none of ``_take_replacement``'s gates. A zero-variance group
+        is a data decision about a rollout that succeeded, so it does not read
+        ``on_dropped_prompt`` -- training on a uniform group is never the right answer,
+        whatever the run does about infrastructure failures -- and it spends
+        ``grpo.dynamic_sampling_max_replacements_per_slot``, checked by the caller
+        through ``_require_dynamic_sampling_budget``, rather than the fault-tolerance
+        budget.
+
+        Returns:
+            A spare prompt, or None when the pool is empty because the dataloader is
+            exhausted. That is the end of the run rather than a mis-tuned filter, so it
+            credits the step short instead of raising.
+        """
         if not self._replacement_reserve:
             return None
         return self._replacement_reserve.popleft()

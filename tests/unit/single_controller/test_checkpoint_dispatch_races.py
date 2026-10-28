@@ -524,6 +524,9 @@ def _reserve_controller() -> Any:
     controller._replacement_reserve = deque()
     controller._sampler_stamps_target_steps = True
     controller._rollout_recovery_enabled = True
+    # Dynamic sampling off: these fixtures exercise the fault-tolerance path.
+    controller._dynamic_sampling_enabled = False
+    controller._dynamic_sampling_max_replacements = 0
     controller._async_cfg = SimpleNamespace(
         rollout_failure=SimpleNamespace(
             on_dropped_prompt="replace",

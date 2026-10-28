@@ -408,6 +408,20 @@ class GRPOConfig(BaseModel, extra="allow"):
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
+    # SingleController only. Replacements one slot may draw from the spare pool after
+    # its group is dropped for zero reward variance, before the run raises. The
+    # SingleController path resamples per dropped slot rather than regenerating whole
+    # batches, so this is its budget in place of dynamic_sampling_max_gen_batches, and
+    # it is counted separately from the rollout fault-tolerance budget
+    # (async_rl.rollout_failure.max_replacement_attempts).
+    #
+    # Sized so that it fires only when the filter is genuinely mis-tuned, not on the
+    # tail of an ordinary run. A slot exhausts the budget when its original group and
+    # all N replacements come back uniform, with probability p**(N+1) for a drop rate
+    # p, so the budget has to cover the whole step's slots across the whole run. At 32
+    # a 4096-group step over 1000 steps is quiet below roughly a 78% drop rate, well
+    # clear of the ~33% seen in practice, and raises above it.
+    dynamic_sampling_max_replacements_per_slot: int = 32
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.

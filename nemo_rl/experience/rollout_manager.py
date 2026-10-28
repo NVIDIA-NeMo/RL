@@ -148,6 +148,12 @@ class RolloutOutcome(str, enum.Enum):
     # releasing its backpressure permit and atomically replacing the ledger owner or
     # crediting the step's shortfall.
     SKIPPED = "skipped"
+    # Dynamic sampling dropped the group before commit: every generation scored the
+    # same, so it carries no advantage signal. The rollout itself was healthy, which is
+    # why this is not SKIPPED -- the caller must replace it out of the dynamic-sampling
+    # budget rather than the rollout fault-tolerance budget, and must not let it count
+    # as a step shortfall.
+    FILTERED = "filtered"
 
 
 @dataclass(frozen=True)
@@ -1819,11 +1825,6 @@ class RolloutManager:
         """Return the prompt-group ownership ledger shared with the controller."""
         return self._recovery_ledger
 
-    @property
-    def filter_zero_variance_groups(self) -> bool:
-        """Whether dynamic sampling drops zero-variance groups (DAPO-style)."""
-        return self._filter_zero_variance_groups
-
     def record_finalizer_dropped_prompt(self) -> None:
         """Count a controller-side drop after generation and finalization succeeded.
 
@@ -2187,7 +2188,7 @@ class RolloutManager:
                         f"{self._stats.zero_variance_groups} dropped so far",
                         flush=True,
                     )
-                    return RolloutOutcome.SKIPPED
+                    return RolloutOutcome.FILTERED
                 end_version = self._weight_version
                 await self._tq_buffer.commit(
                     tq_group_id,
