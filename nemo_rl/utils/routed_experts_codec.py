@@ -112,3 +112,14 @@ def routed_experts_envelope_dtype(payload: str) -> torch.dtype:
     if len(parts) != 3 or parts[0] != _MAGIC or parts[1] not in _WIRE_TORCH_DTYPES:
         raise ValueError("routed_experts payload is not a valid envelope.")
     return _WIRE_TORCH_DTYPES[parts[1]]
+
+
+def slice_routed_experts(
+    routed_experts: torch.Tensor, start: int, end: int
+) -> torch.Tensor:
+    """Return ``routed_experts[start:end]`` with its own storage.
+
+    A plain slice is a view, so serializing one message would carry the full
+    sample buffer. Cloning makes each message own only its token span.
+    """
+    return routed_experts[start:end].clone()

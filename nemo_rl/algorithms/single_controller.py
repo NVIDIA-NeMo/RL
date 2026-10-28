@@ -127,6 +127,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
 )
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    ChunkReceipt,
+    make_debug_writer,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
@@ -237,7 +241,6 @@ from nemo_rl.utils.path_utils import (
     save_checkpoint_object,
 )
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -784,12 +787,12 @@ class SingleControllerActor:
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
         self._train_data_dump = (
-            TrainDataDump(self._logger.base_log_dir)
+            make_debug_writer(self._async_cfg.debug_writer, self._logger.base_log_dir)
             if self._async_cfg.log_full_train_data
             else None
         )
-        # Rows the stage reported writing this step, across every shard.
-        self._train_data_dump_rows = 0
+        # Receipts of the chunks the stage stored this step, across every shard.
+        self._train_data_dump_receipts: list[ChunkReceipt] = []
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -948,6 +951,11 @@ class SingleControllerActor:
                 except Exception as error:
                     print(f"finalizer actor termination failed: {error}", flush=True)
             await stop_storage_units(self._storage_units)
+            if self._train_data_dump is not None:
+                try:
+                    await asyncio.to_thread(self._train_data_dump.close)
+                except Exception as e:  # teardown must not mask the original failure
+                    print(f"Error during debug-writer close: {e}", flush=True)
             try:
                 self._weight_synchronizer.shutdown()
             except Exception as e:  # teardown must not mask the original failure
@@ -3678,9 +3686,9 @@ class SingleControllerActor:
                         await asyncio.to_thread(
                             self._train_data_dump.finish_step,
                             self._train_steps,
-                            self._train_data_dump_rows,
+                            self._train_data_dump_receipts,
                         )
-                    self._train_data_dump_rows = 0
+                    self._train_data_dump_receipts = []
 
                 if not early_refit_done:
                     self._trainer_version += 1
@@ -5820,7 +5828,8 @@ class SingleControllerActor:
             self._timer.record(
                 "train_data_dump", outcome.train_data_dump_s, should_log=False
             )
-        self._train_data_dump_rows += outcome.train_data_dump_rows
+        if outcome.train_data_dump_receipt is not None:
+            self._train_data_dump_receipts.append(outcome.train_data_dump_receipt)
 
     # ── utility helpers ────────────────────────────────────────────────────
 

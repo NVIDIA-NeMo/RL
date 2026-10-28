@@ -101,6 +101,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
+from nemo_rl.utils.routed_experts_codec import slice_routed_experts
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -426,7 +427,9 @@ def _attach_routed_experts_to_message_log_prefix(
         if not isinstance(token_ids, torch.Tensor):
             continue
         msg_len = int(token_ids.shape[0])
-        msg["routed_experts"] = routed_experts[cursor : cursor + msg_len]
+        msg["routed_experts"] = slice_routed_experts(
+            routed_experts, cursor, cursor + msg_len
+        )
         cursor += msg_len
     return cursor
 
@@ -712,9 +715,9 @@ def generate_responses(
                     "message_log token length does not match generation input_length "
                     f"({prefix_length} != {int(input_length.item())})."
                 )
-            assistant_message["routed_experts"] = routed_experts[
-                input_length:total_length
-            ]
+            assistant_message["routed_experts"] = slice_routed_experts(
+                routed_experts, int(input_length.item()), int(total_length.item())
+            )
 
         batch["message_log"][i].append(assistant_message)
 
@@ -850,9 +853,9 @@ async def generate_responses_async(
                     "message_log token length does not match generation input_length "
                     f"({prefix_length} != {int(input_length.item())})."
                 )
-            assistant_message["routed_experts"] = routed_experts[
-                input_length:total_length
-            ]
+            assistant_message["routed_experts"] = slice_routed_experts(
+                routed_experts, int(input_length.item()), int(total_length.item())
+            )
 
         batch["message_log"][i].append(assistant_message)
 
