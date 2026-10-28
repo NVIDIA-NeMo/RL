@@ -61,6 +61,8 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.batch_attribution import TASK_TAG, GroupTrainingStats
+from nemo_rl.utils.batch_attribution_torch import summarize_training_groups
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
@@ -101,6 +103,7 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
+    batch_attribution: bool = False
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -123,6 +126,7 @@ class AdvantageStageConfig:
         algo_cfg = algo_config(master_config)
         loss_cfg = master_config.loss_fn
         return cls(
+            batch_attribution=master_config.async_rl.batch_attribution,
             filtering_on=need_top_k_or_top_p_filtering(
                 TrainingSamplingParams(
                     top_k=master_config.policy["generation"]["top_k"],
@@ -288,6 +292,7 @@ class AdvantageOutcome:
     # Rows this call wrote to its shard's part file, so the controller's merge
     # can tell a missing part from an empty one.
     train_data_dump_rows: int = 0
+    group_training_stats: tuple[GroupTrainingStats, ...] = ()
 
 
 class AdvantageComputer:
@@ -544,6 +549,17 @@ class AdvantageComputer:
             train_data_dump_s = time.perf_counter() - dump_started
             train_data_dump_rows = len(meta.sample_ids)
 
+        group_training_stats: tuple[GroupTrainingStats, ...] = ()
+        if cfg.batch_attribution:
+            assert meta.tags is not None
+            group_training_stats = summarize_training_groups(
+                group_ids=row_group_ids(meta),
+                task_names=[tag.get(TASK_TAG, "unknown_restored") for tag in meta.tags],
+                rewards=rewards,
+                training_mask=mask[:, 1:],
+                sample_mask=final_sample_mask,
+            )
+
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
@@ -573,4 +589,5 @@ class AdvantageComputer:
             opd_gap_sum=opd_gap_sum,
             train_data_dump_s=train_data_dump_s,
             train_data_dump_rows=train_data_dump_rows,
+            group_training_stats=group_training_stats,
         )

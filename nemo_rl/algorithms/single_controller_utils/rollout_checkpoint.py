@@ -69,6 +69,7 @@ _TRASH_SNAPSHOT_RE = re.compile(r"trash_snapshot_(\d+)")
 _BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS = frozenset(
     {
         "async_rl.diagnostics",
+        "async_rl.batch_attribution",
         "async_rl.generation_fleet_health",
         "async_rl.generation_router",
         "async_rl.stall_watchdog",

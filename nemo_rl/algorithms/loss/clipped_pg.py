@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.utils.batch_attribution_torch import task_entropy_metrics
 
 
 def materialize_scalar_metrics(
@@ -46,6 +47,7 @@ def clipped_pg_diagnostic_metrics(
     mask: torch.Tensor,
     global_valid_toks: torch.Tensor,
     reference_policy_kl_type: str,
+    task_names: list[str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute optional diagnostics for the full metric set."""
     gen_kl_error = masked_mean(
@@ -84,8 +86,9 @@ def clipped_pg_diagnostic_metrics(
         mask,
         global_normalization_factor=global_valid_toks,
     )
+    entropy_values = torch.exp(curr_logprobs - generation_logprobs) * curr_logprobs
     seq_entropy_approx = -masked_mean(
-        torch.exp(curr_logprobs - generation_logprobs) * curr_logprobs,
+        entropy_values,
         mask,
         global_normalization_factor=global_valid_toks,
     )
@@ -93,7 +96,7 @@ def clipped_pg_diagnostic_metrics(
     valid_mask = mask.bool()
     inf = torch.full_like(ratios, float("inf"))
     neg_inf = torch.full_like(ratios, float("-inf"))
-    return {
+    metrics = {
         "probs_ratio": masked_mean(
             ratios, mask, global_normalization_factor=global_valid_toks
         ),
@@ -111,6 +114,18 @@ def clipped_pg_diagnostic_metrics(
         "js_divergence_error": js_divergence_error,
         "approx_entropy": seq_entropy_approx,
     }
+    if task_names is not None:
+        metrics.update(
+            task_entropy_metrics(
+                curr_logprobs=curr_logprobs,
+                generation_logprobs=generation_logprobs,
+                mask=mask,
+                task_names=task_names,
+                global_valid_toks=global_valid_toks,
+                entropy_values=entropy_values,
+            )
+        )
+    return metrics
 
 
 def clipped_pg_actor_objective(

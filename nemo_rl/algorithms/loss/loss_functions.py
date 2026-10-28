@@ -71,6 +71,7 @@ from nemo_rl.distributed.model_utils import (
     vocab_parallel_log_softmax,
 )
 from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
+from nemo_rl.utils.batch_attribution_torch import task_entropy_metrics
 
 if TYPE_CHECKING:
     # Import-time only: nemo_rl.algorithms.opd imports the data plane, which
@@ -239,6 +240,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
 class ClippedPGLossDataDict(TypedDict):
     """Required keys for the Clipped Policy Gradient loss function."""
 
+    batch_attribution_task_names: NotRequired[list[str]]
     input_ids: torch.Tensor
     advantages: torch.Tensor
     prev_logprobs: torch.Tensor
@@ -952,6 +954,7 @@ class ClippedPGLossFn(LossFunction):
                     mask=mask,
                     global_valid_toks=global_valid_toks,
                     reference_policy_kl_type=self.reference_policy_kl_type,
+                    task_names=data.get("batch_attribution_task_names"),
                 )
             )
         if need_importance_weights:
@@ -969,6 +972,27 @@ class ClippedPGLossFn(LossFunction):
                 **_is_filter_metrics,
             }
         )
+        if "batch_attribution_task_names" in data:
+            attribution_metrics = (
+                {
+                    name: value
+                    for name, value in metric_tensors.items()
+                    if name.startswith("batch_attribution/tasks/")
+                }
+                if full_metrics
+                else task_entropy_metrics(
+                    curr_logprobs=curr_logprobs,
+                    generation_logprobs=generation_logprobs,
+                    mask=mask,
+                    task_names=data["batch_attribution_task_names"],
+                    global_valid_toks=global_valid_toks,
+                )
+            )
+            # Streaming workers retain this map and normalize raw per-mb sums
+            # at step close; explicitly token-normalize even sequence-level loss.
+            for name in attribution_metrics:
+                self.metric_normalizations[name] = MetricNormalizer.TOKENS
+            metric_tensors.update(attribution_metrics)
         metric_tensors["policy_support_excluded_tokens"] = (kl_mask - mask).sum()
         return loss, {
             **materialize_scalar_metrics(metric_tensors, loss.dtype),

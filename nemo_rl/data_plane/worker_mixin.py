@@ -59,6 +59,7 @@ from nemo_rl.data_plane.schema import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
 from nemo_rl.experience.route_assembly import RouteFragment, execute_route_plan
 from nemo_rl.telemetry.instrumentation import accepts_trace_context
+from nemo_rl.utils.batch_attribution import attach_task_labels
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
@@ -606,6 +607,7 @@ class TQWorkerMixin:
                 keys=meta.sample_ids,
                 data=data,
             )
+            attach_task_labels(data, meta.tags)
             if preprocess is not None:
                 data = preprocess(self, data)
             return data
@@ -637,6 +639,7 @@ class TQWorkerMixin:
             keys=meta.sample_ids,
             data=data,
         )
+        attach_task_labels(data, meta.tags)
         if preprocess is not None:
             data = preprocess(self, data)
         return data

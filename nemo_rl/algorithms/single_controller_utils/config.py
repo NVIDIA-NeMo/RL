@@ -475,6 +475,9 @@ class WatchdogConfig(BaseModel, extra="allow"):
 
 
 class AsyncRLConfig(BaseModel, extra="allow"):
+    # Payload-free per-task loss statistics and group lifecycle/selection JSONL.
+    # Disabled by default; enable for ready-first recovery attribution runs.
+    batch_attribution: bool = False
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
     log_full_train_data: bool = False

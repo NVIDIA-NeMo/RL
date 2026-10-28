@@ -234,6 +234,12 @@ from nemo_rl.telemetry.setup import (
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.batch_attribution import (
+    TASK_TAG,
+    BatchAttribution,
+    finish_entropy_metrics,
+    reconciliation_metrics,
+)
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     PathLike,
@@ -428,6 +434,7 @@ class SingleControllerActor:
     # handle, so an instance built without running __init__ emits no spans
     # rather than raising out of the training loop.
     _tracer: Any = None
+    _batch_attribution: BatchAttribution | None = None
 
     def __init__(
         self,
@@ -861,6 +868,18 @@ class SingleControllerActor:
         )
         # Rows the stage reported writing this step, across every shard.
         self._train_data_dump_rows = 0
+        if self._async_cfg.batch_attribution:
+            if not master_config.token_capture.enabled:
+                raise ValueError("batch attribution currently requires token capture")
+            self._batch_attribution = BatchAttribution(self._logger.base_log_dir)
+            self._batch_attribution.record(
+                "resume_anchor",
+                trainer_step=self._train_steps,
+                trainer_version=self._trainer_version,
+                checkpoint_path=str(self._last_checkpoint_path)
+                if self._last_checkpoint_path is not None
+                else None,
+            )
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -1008,6 +1027,11 @@ class SingleControllerActor:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self._batch_attribution is not None:
+                self._batch_attribution.record(
+                    "attempt_stopping", trainer_step=self._train_steps
+                )
+                await self._flush_batch_attribution()
             if self._engine_supervisor is not None:
                 # Not in `tasks`: the supervisor creates a task per restart, on demand, so
                 # there is nothing to cancel in that list. Without this an in-flight
@@ -1218,6 +1242,18 @@ class SingleControllerActor:
         assert restored <= self._async_cfg.max_buffered_rollouts
         for _ in range(restored):
             await self._buffer_capacity.acquire()
+        if self._batch_attribution is not None:
+            for group_id, meta in zip(self._buffer.group_ids, self._buffer.meta_list):
+                assert meta is not None
+                tag = meta.tags[0] if meta.tags else {}
+                self._batch_attribution.restore_group(
+                    group_id,
+                    origin="restored_complete",
+                    task_name=tag.get(TASK_TAG, "unknown_restored"),
+                    tags=tag,
+                    trainer_step=self._train_steps,
+                    prompt_idx=tag.get("prompt_idx"),
+                )
         return restored
 
     @checkpoint_phase_async("recovery_prepare")
@@ -1689,6 +1725,18 @@ class SingleControllerActor:
         groups_to_recover = recovery_ledger.groups()
         if not groups_to_recover:
             return
+        if self._batch_attribution is not None:
+            for group in groups_to_recover:
+                self._batch_attribution.restore_group(
+                    group.group_id,
+                    origin="restored_unfinished",
+                    task_name=self._attribution_task_name(group.prompt_payload),
+                    trainer_step=self._train_steps,
+                    recovery_level=str(group.restore_level),
+                    sealed_siblings=len(group.sealed_generation_indices),
+                    continued_siblings=len(group.continued_generation_indices),
+                    expected_siblings=group.expected_generations,
+                )
         recovery_started = time.monotonic()
         reused_siblings = 0
         redispatched_siblings = 0
@@ -2095,6 +2143,10 @@ class SingleControllerActor:
         valid-row fraction is no longer a finalizer-side drop -- the caller
         decides that, since only the caller can source a replacement.
         """
+        if self._batch_attribution is not None:
+            self._batch_attribution.record(
+                "group_reply_received", group_id=request.group_id
+            )
         self._finalizer_waiters += 1
         queue_depth = max(
             0,
@@ -2197,6 +2249,21 @@ class SingleControllerActor:
                         raise
                     # Canonical TQ rows plus replay metadata now own the completed
                     # group; keep only unfinished work in the lineage sidecar.
+                    if self._batch_attribution is not None:
+                        names = {
+                            context.agent_name
+                            for context in (request.reward_log_contexts or ())
+                            if context is not None
+                        }
+                        task_name = next(iter(names)) if len(names) == 1 else "unknown"
+                        stamps = self._batch_attribution.ready(
+                            request.group_id,
+                            task_name=task_name,
+                            prompt_idx=request.prompt_idx,
+                        )
+                        assert finalized.meta.tags is not None
+                        for tag in finalized.meta.tags:
+                            tag.update(stamps)
                     ledger.discard_group(cut, request.group_id)
                     self._rollout_manager.record_canonical_publication(
                         finalized.canonical_output_tokens
@@ -2225,6 +2292,46 @@ class SingleControllerActor:
         )
         self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
         return finalized
+
+    @staticmethod
+    def _attribution_task_name(prompt: Mapping[str, Any]) -> str:
+        """Resolve the dataset's task hint; finalization supplies the actual agent."""
+        extra = prompt.get("extra_env_info") or {}
+        ref = extra.get("agent_ref") or prompt.get("agent_ref") or {}
+        return ref.get("name") or prompt.get("task_name") or "unknown"
+
+    def _attribution_inventory(self) -> list[dict[str, Any]]:
+        """Snapshot buffer facts before selection, without fetching TQ tensors."""
+        return [
+            {
+                "group_id": group_id,
+                "buffer_index": index,
+                "ready": ready,
+                "start_weight": weight,
+                "end_weight": self._buffer.end_weight_list[index],
+                "target_step": target,
+                "task_name": self._batch_attribution.groups[group_id].task_name
+                if self._batch_attribution is not None
+                and group_id in self._batch_attribution.groups
+                else "unknown",
+            }
+            for index, (group_id, ready, weight, target) in enumerate(
+                zip(
+                    self._buffer.group_ids,
+                    self._buffer.ready_list,
+                    self._buffer.start_weight_list,
+                    self._buffer.target_step_list,
+                )
+            )
+        ]
+
+    async def _flush_batch_attribution(self) -> None:
+        """Write buffered metadata off-thread at chunk/step boundaries."""
+        if self._batch_attribution is not None:
+            events = self._batch_attribution.drain()
+            if events:
+                with self._timer.time("batch_attribution_flush"):
+                    await asyncio.to_thread(self._batch_attribution.write, events)
 
     async def _cleanup_consumed_metas_unlocked(
         self, cut: DataPlaneMutationCut, metas: list[KVBatchMeta]
@@ -2670,6 +2777,14 @@ class SingleControllerActor:
             finally:
                 self._rollout_permitted_waiters -= 1
             dispatch_started = time.monotonic()
+            if self._batch_attribution is not None and lineage_group_id is not None:
+                self._batch_attribution.dispatch(
+                    lineage_group_id,
+                    task_name=self._attribution_task_name(prompt),
+                    trainer_version=self._trainer_version,
+                    target_step=target_step,
+                    prompt_idx=prompt["idx"],
+                )
 
             task_started_event = asyncio.Event()
             # dispatch rollout
@@ -3150,6 +3265,7 @@ class SingleControllerActor:
             consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
             step_finalizer_rewards: list[FinalizedReward] = []
+            step_finalizer_reward_groups: list[list[float]] = []
             step_finalizer_group_ids: set[str] = set()
 
             with (
@@ -3221,6 +3337,12 @@ class SingleControllerActor:
                         selected_training_claim_ids: list[str] = []
                         training_claim_ids_before = (
                             self._buffer.training_owned_group_ids()
+                        )
+                        attribution_inventory = (
+                            self._attribution_inventory()
+                            if self._batch_attribution is not None
+                            and self._buffer.ready_list.count(True) >= min_prompt_groups
+                            else []
                         )
                         train_meta, num_groups = await self._sampler.select(
                             current_train_weight=self._trainer_version,
@@ -3308,14 +3430,41 @@ class SingleControllerActor:
                             starvation_span = None
 
                         consumed_metas.append(train_meta)
+                        if self._batch_attribution is not None:
+                            sample_ids_by_group: dict[str, list[str]] = {}
+                            for sample_id, group_id in zip(
+                                train_meta.sample_ids, row_group_ids(train_meta)
+                            ):
+                                sample_ids_by_group.setdefault(group_id, []).append(
+                                    sample_id
+                                )
+                            self._batch_attribution.selected(
+                                group_ids=selected_group_ids,
+                                step=self._train_steps + 1,
+                                trainer_version=self._trainer_version,
+                                chunk=chunks_dispatched + 1,
+                                sampler=self._async_cfg.sampler.name,
+                                inventory=attribution_inventory,
+                                min_groups=min_prompt_groups,
+                                max_groups=max_prompt_groups,
+                                sample_ids_by_group=sample_ids_by_group,
+                            )
+                            assert train_meta.tags is not None
+                            for tag in train_meta.tags:
+                                tag["batch_attribution_enabled"] = True
+                                tag.setdefault(TASK_TAG, "unknown_restored")
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
                         consumed_group_count += num_groups
                         for group_id in selected_group_ids:
                             if group_id in step_finalizer_group_ids:
                                 continue
                             step_finalizer_group_ids.add(group_id)
-                            step_finalizer_rewards.extend(
-                                self._finalizer_rewards_by_group.get(group_id, [])
+                            group_rewards = self._finalizer_rewards_by_group.get(
+                                group_id, []
+                            )
+                            step_finalizer_rewards.extend(group_rewards)
+                            step_finalizer_reward_groups.append(
+                                [row.reward for row in group_rewards]
                             )
                             for name, value in self._finalizer_metrics_by_group.get(
                                 group_id, {}
@@ -3328,6 +3477,7 @@ class SingleControllerActor:
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
                         )
 
+                    await self._flush_batch_attribution()
                     if groups_dispatched == 0:
                         try:
                             await asyncio.to_thread(self._gen.snapshot_step_metrics)
@@ -3766,6 +3916,12 @@ class SingleControllerActor:
                 step_metrics = {}
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
+                if self._batch_attribution is not None:
+                    step_metrics.update(
+                        self._batch_attribution.finish_step(self._train_steps + 1)
+                    )
+                    finish_entropy_metrics(step_metrics)
+                    await self._flush_batch_attribution()
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
                 async with self._data_plane_checkpoint_barrier.mutation(
@@ -3802,7 +3958,9 @@ class SingleControllerActor:
                 )
                 step_metrics.update(
                     aggregate_capture_reward_metrics(
-                        step_finalizer_metrics, step_finalizer_rewards
+                        step_finalizer_metrics,
+                        step_finalizer_rewards,
+                        reward_groups=step_finalizer_reward_groups,
                     )
                 )
                 if self._log_full_result_tables:
@@ -3849,6 +4007,8 @@ class SingleControllerActor:
                 self._opd_stat_count = 0
                 if self._teacher_coordinator is not None:
                     step_metrics.update(self._teacher_coordinator.drain_metrics())
+                if self._batch_attribution is not None:
+                    step_metrics.update(reconciliation_metrics(step_metrics))
 
                 if self._train_data_dump is not None:
                     with self._timer.time("train_data_dump"):
@@ -5106,11 +5266,19 @@ class SingleControllerActor:
         timeout_s = self._master_config.token_capture.control_timeout_s
         acquired: Optional[float] = None
         try:
+            if self._batch_attribution is not None:
+                self._batch_attribution.record(
+                    "generation_fence_requested", trainer_step=self._train_steps
+                )
             with checkpoint_phase("generation_fence"):
                 await asyncio.to_thread(
                     self._gen.begin_token_capture_snapshot_fence, timeout_s=timeout_s
                 )
             acquired = time.monotonic()
+            if self._batch_attribution is not None:
+                self._batch_attribution.record(
+                    "generation_fence_acquired", trainer_step=self._train_steps
+                )
             yield
         finally:
             # Idempotent, so it also releases workers a failed begin had
@@ -5119,6 +5287,10 @@ class SingleControllerActor:
             with checkpoint_phase("generation_release"):
                 await asyncio.to_thread(
                     self._gen.end_token_capture_snapshot_fence, timeout_s=timeout_s
+                )
+            if self._batch_attribution is not None:
+                self._batch_attribution.record(
+                    "generation_fence_released", trainer_step=self._train_steps
                 )
             if acquired is not None and cut_stats is not None:
                 cut_stats.fence_hold_seconds = time.monotonic() - acquired
@@ -5154,6 +5326,12 @@ class SingleControllerActor:
             gate.checkpoint(),
         ):
             with checkpoint_phase("dispatch_pause"):
+                if self._batch_attribution is not None:
+                    self._batch_attribution.record(
+                        "gym_dispatch_paused",
+                        checkpoint_id=checkpoint_id,
+                        trainer_step=self._train_steps,
+                    )
                 # Gym parks every live rollout until resume, so the wait must not
                 # count against their deadlines. A separate holder keeps a
                 # colocated engine's own pause intact when this one ends.
@@ -5208,6 +5386,12 @@ class SingleControllerActor:
                     self._rollout_manager.resume_request_deadlines(
                         _GYM_CHECKPOINT_DEADLINE_HOLDER
                     )
+                    if self._batch_attribution is not None:
+                        self._batch_attribution.record(
+                            "gym_dispatch_resuming",
+                            checkpoint_id=checkpoint_id,
+                            trainer_step=self._train_steps,
+                        )
 
     async def _write_rollout_checkpoint_sidecars(
         self,
@@ -6476,6 +6660,8 @@ class SingleControllerActor:
 
     def _absorb_advantage_outcome(self, outcome: AdvantageOutcome) -> None:
         """Fold one call's reduced results into this step's accumulators."""
+        if self._batch_attribution is not None:
+            self._batch_attribution.add_training_stats(outcome.group_training_stats)
         self._step_log_dict["num_mask_sample_filtered"].append(
             outcome.num_mask_sample_filtered
         )
