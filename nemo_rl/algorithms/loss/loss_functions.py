@@ -360,12 +360,17 @@ class ClippedPGLossFn(LossFunction):
         # W2S-OPD rides the opd_full branch with its own objective; its metrics
         # carry a w2s_opd prefix so they never mix with full-vocabulary runs.
         self._is_w2s = False
+        self._log_proxy_agreement = False
         if self.opd_full is not None:
             # Deferred: nemo_rl.algorithms.opd imports the data plane
             # (tensordict), which plain policy-gradient losses never need.
             from nemo_rl.algorithms.opd import W2SOPDConfig
 
             self._is_w2s = isinstance(self.opd_full, W2SOPDConfig)
+            self._log_proxy_agreement = (
+                isinstance(self.opd_full, W2SOPDConfig)
+                and self.opd_full.log_proxy_agreement
+            )
         self._distribution_metric_prefix = "w2s_opd" if self._is_w2s else "opd_full"
         self.input_type = (
             LossInputType.OPD_FULL
@@ -614,6 +619,13 @@ class ClippedPGLossFn(LossFunction):
                         "w2s_opd_seq_sum_log_ratio_abs": MetricNormalizer.SEQUENCES,
                     }
                 )
+            if self._log_proxy_agreement:
+                self.metric_normalizations.update(
+                    {
+                        "w2s_opd_proxy_top1_agreement": MetricNormalizer.TOKENS,
+                        "w2s_opd_proxy_topk_overlap": MetricNormalizer.TOKENS,
+                    }
+                )
             if (
                 self.opd_full.validate_decomposition
                 or self.opd_full.log_student_entropy
@@ -678,6 +690,8 @@ class ClippedPGLossFn(LossFunction):
         opd_full_divergence: Optional[Tensor] = None,
         opd_full_entropy: Optional[Tensor] = None,
         opd_full_cross_entropy: Optional[Tensor] = None,
+        w2s_proxy_top1_agreement: Optional[Tensor] = None,
+        w2s_proxy_topk_overlap: Optional[Tensor] = None,
         policy_support_mask: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
@@ -697,6 +711,10 @@ class ClippedPGLossFn(LossFunction):
                 the ``opd_full`` branch.
             opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
             opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+            w2s_proxy_top1_agreement: Optional W2S-OPD diagnostic, 1 where the
+                student's argmax is the proxy's ``[B, S - 1]``.
+            w2s_proxy_topk_overlap: Optional W2S-OPD diagnostic, the share of
+                the student's top-K inside the proxy support ``[B, S - 1]``.
 
         Returns:
             Tuple of the scalar loss and its metric dict.
@@ -717,6 +735,8 @@ class ClippedPGLossFn(LossFunction):
                 opd_full_divergence=opd_full_divergence,
                 opd_full_entropy=opd_full_entropy,
                 opd_full_cross_entropy=opd_full_cross_entropy,
+                w2s_proxy_top1_agreement=w2s_proxy_top1_agreement,
+                w2s_proxy_topk_overlap=w2s_proxy_topk_overlap,
             )
         assert next_token_logprobs is not None, (
             "ClippedPGLossFn requires next_token_logprobs"
@@ -1142,6 +1162,8 @@ class ClippedPGLossFn(LossFunction):
         opd_full_divergence: Optional[Tensor],
         opd_full_entropy: Optional[Tensor],
         opd_full_cross_entropy: Optional[Tensor],
+        w2s_proxy_top1_agreement: Optional[Tensor],
+        w2s_proxy_topk_overlap: Optional[Tensor],
     ) -> tuple[torch.Tensor, dict]:
         """Full-vocabulary MOPD objective: the exact reverse KL is the whole loss.
 
@@ -1160,6 +1182,10 @@ class ClippedPGLossFn(LossFunction):
             opd_full_divergence: Per-token reverse KL ``[B, S - 1]``.
             opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
             opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+            w2s_proxy_top1_agreement: Optional W2S-OPD top-1 agreement
+                diagnostic ``[B, S - 1]``.
+            w2s_proxy_topk_overlap: Optional W2S-OPD top-K overlap diagnostic
+                ``[B, S - 1]``.
 
         Returns:
             Tuple of the scalar loss and its metric dict.
@@ -1291,6 +1317,21 @@ class ClippedPGLossFn(LossFunction):
                     (log_ratio * token_mask).sum(dim=-1).abs(),
                     sample_mask,
                     global_normalization_factor=global_valid_seqs,
+                ).item()
+            if (
+                self._log_proxy_agreement
+                and w2s_proxy_top1_agreement is not None
+                and w2s_proxy_topk_overlap is not None
+            ):
+                metrics["w2s_opd_proxy_top1_agreement"] = masked_mean(
+                    w2s_proxy_top1_agreement.detach(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+                metrics["w2s_opd_proxy_topk_overlap"] = masked_mean(
+                    w2s_proxy_topk_overlap.detach(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
                 ).item()
             if (
                 opd_full_entropy is not None

@@ -56,6 +56,7 @@ from nemo_rl.algorithms.w2s_opd import (
     validate_w2s_scoring,
     w2s_compact_proxy,
     w2s_packed_proxy_support,
+    w2s_proxy_agreement_from_support,
     w2s_proxy_support,
     w2s_reverse_kl_from_support,
     w2s_reverse_kl_on_support,
@@ -137,6 +138,22 @@ def _support_loss(student, proxy, k, vocab):
     return w2s_reverse_kl_on_support(
         student, support, target, vocab_parallel_group=None
     )
+
+
+def agreement_reference(student, support, vocab):
+    """Argmax match and ``|top-K(student) ∩ support| / K`` on one rank."""
+    k = support.shape[-1]
+    student_top = student[..., :vocab].topk(k, dim=-1).indices
+    top1 = (student_top[..., 0] == support[..., 0]).float()
+    overlap = torch.tensor(
+        [
+            len(set(mine.tolist()) & set(theirs.tolist())) / k
+            for mine, theirs in zip(
+                student_top.reshape(-1, k), support.reshape(-1, k), strict=True
+            )
+        ]
+    ).reshape(top1.shape)
+    return top1, overlap
 
 
 # ── Numerics ───────────────────────────────────────────────────────────────
@@ -369,6 +386,52 @@ def test_packed_proxy_rejects_nonfinite_and_misaligned_rows():
         )
 
 
+@pytest.mark.parametrize("chunk", [1, 2, 8])
+def test_proxy_agreement_matches_a_dense_reference(chunk):
+    torch.manual_seed(41)
+    proxy = torch.randn(2, 5, 12)
+    support = proxy[..., :9].topk(3, dim=-1).indices
+    # One window position past the 5-token payload, as in a CP-padded window.
+    student = torch.randn(2, 6, 12)
+    student[0, 1] = proxy[0, 1]  # same ranking: full agreement
+    student[1, 2, :9] = -proxy[1, 2, :9]  # reversed ranking: no agreement
+    student[..., 9:] = 1e4  # padded vocab must never enter the student's top-K
+    top1, overlap = w2s_proxy_agreement_from_support(
+        student,
+        support.to(torch.int32),
+        vocab_size=9,
+        chunk_size=chunk,
+        vocab_parallel_group=None,
+        context_parallel_group=None,
+    )
+    expected_top1, expected_overlap = agreement_reference(student[:, :5], support, 9)
+    assert top1.shape == overlap.shape == (2, 6)
+    torch.testing.assert_close(top1[:, :5], expected_top1)
+    torch.testing.assert_close(overlap[:, :5], expected_overlap)
+    assert top1[0, 1] == 1 and overlap[0, 1] == 1
+    assert top1[1, 2] == 0 and overlap[1, 2] == 0
+    # The padded window position stays finite; masks drop it.
+    assert torch.isfinite(top1).all() and torch.isfinite(overlap).all()
+
+
+def test_proxy_agreement_rejects_mismatched_support():
+    student = torch.randn(2, 4, 9)
+    kwargs = dict(
+        vocab_size=9,
+        chunk_size=2,
+        vocab_parallel_group=None,
+        context_parallel_group=None,
+    )
+    with pytest.raises(ValueError, match=r"\[B, S, K\]"):
+        w2s_proxy_agreement_from_support(
+            student, torch.zeros(1, 4, 3, dtype=torch.long), **kwargs
+        )
+    with pytest.raises(ValueError, match="K <= vocabulary"):
+        w2s_proxy_agreement_from_support(
+            student, torch.zeros(2, 4, 10, dtype=torch.long), **kwargs
+        )
+
+
 # ── Config schema and dispatch ─────────────────────────────────────────────
 
 
@@ -492,6 +555,7 @@ def test_w2s_config_validates_and_builds_the_w2s_loss(monkeypatch):
         name.startswith("opd_full_") for name in loss_fn.metric_normalizations
     )
     assert "w2s_opd_entropy" not in loss_fn.metric_normalizations
+    assert "w2s_opd_proxy_top1_agreement" not in loss_fn.metric_normalizations
 
 
 def test_log_student_entropy_registers_the_entropy_metric(monkeypatch):
@@ -501,6 +565,16 @@ def test_log_student_entropy_registers_the_entropy_metric(monkeypatch):
     validate_single_controller_config(cfg)
     loss_fn = ClippedPGLossFn(cfg.loss_fn, opd_full=get_opd_distribution_config(cfg))
     assert loss_fn.metric_normalizations["w2s_opd_entropy"] is MetricNormalizer.TOKENS
+
+
+def test_log_proxy_agreement_registers_the_agreement_metrics(monkeypatch):
+    cfg = _w2s_master_config(
+        monkeypatch, "on_policy_distillation.w2s.log_proxy_agreement=true"
+    )
+    validate_single_controller_config(cfg)
+    loss_fn = ClippedPGLossFn(cfg.loss_fn, opd_full=get_opd_distribution_config(cfg))
+    for name in ("w2s_opd_proxy_top1_agreement", "w2s_opd_proxy_topk_overlap"):
+        assert loss_fn.metric_normalizations[name] is MetricNormalizer.TOKENS
 
 
 @pytest.mark.parametrize(
@@ -807,6 +881,93 @@ def test_prepared_loss_reports_exact_student_entropy_only_when_asked(
         (-expected[:, kept]).sum().item() / 8.0, rel=1e-5
     )
     assert loss_fn.metric_normalizations["w2s_opd_entropy"] is MetricNormalizer.TOKENS
+
+
+def test_prepared_loss_reports_proxy_agreement_only_when_asked(
+    _single_rank_collectives,
+):
+    arms, heads, negative = _random_arms(8, length=6, vocab=9)
+    anchor, positive = [arm @ head.t() for arm, head in zip(arms, heads, strict=True)]
+    proxy = anchor + 0.75 * (positive - negative)
+    support, target = w2s_compact_proxy(
+        arms,
+        heads,
+        negative,
+        alpha=0.75,
+        top_k=4,
+        vocab_size=9,
+        chunk_size=128,
+        vocab_parallel_group=None,
+    )
+    student = torch.randn(2, 6, 9)
+    student[0, :3] = proxy[0, :3]  # the student ranks like the proxy here
+    student.requires_grad_()
+    base = {
+        "input_ids": torch.zeros(2, 6, dtype=torch.long),
+        "token_mask": torch.ones(2, 6),
+        "sample_mask": torch.ones(2),
+        **dict(zip(W2S_PROXY_FIELDS, (support.to(torch.int32), target), strict=True)),
+    }
+    names = ("w2s_proxy_top1_agreement", "w2s_proxy_topk_overlap")
+    metric_names = ("w2s_opd_proxy_top1_agreement", "w2s_opd_proxy_topk_overlap")
+
+    def prepare(log_proxy_agreement):
+        loss_fn = _w2s_loss_fn(
+            vocab_size=9,
+            top_k=4,
+            chunk_size=4,
+            log_proxy_agreement=log_proxy_agreement,
+        )
+        return loss_fn, prepare_loss_input(
+            student,
+            BatchedDataDict(base),
+            loss_fn,
+            vocab_parallel_rank=0,
+            vocab_parallel_group=object(),
+            context_parallel_group=None,
+            sampling_params=None,
+            chunk_size=None,
+        )[0]
+
+    plain_fn, plain = prepare(False)
+    assert not set(names) & set(plain)
+    assert not set(metric_names) & set(plain_fn.metric_normalizations)
+
+    loss_fn, prepared = prepare(True)
+    # Same divergence with or without the diagnostic.
+    torch.testing.assert_close(
+        prepared["opd_full_divergence"], plain["opd_full_divergence"]
+    )
+    expected = agreement_reference(student.detach(), support, 9)
+    for name, values in zip(names, expected, strict=True):
+        torch.testing.assert_close(prepared[name], values[:, :5])
+        assert not prepared[name].requires_grad
+    assert prepared["w2s_proxy_top1_agreement"][0, :3].eq(1).all()
+    assert prepared["w2s_proxy_topk_overlap"][0, :3].eq(1).all()
+
+    data = BatchedDataDict(
+        {**base, "token_mask": torch.tensor([[0.0, 1.0, 1.0, 0.0, 1.0, 1.0]] * 2)}
+    )
+    loss, metrics = loss_fn(
+        data=data,
+        global_valid_seqs=torch.tensor(2.0),
+        global_valid_toks=torch.tensor(8.0),
+        **prepared,
+    )
+    # token_mask[:, 1:] keeps positions 0, 1, 3, 4 of the next-token axis.
+    kept = torch.tensor([0, 1, 3, 4])
+    for metric_name, values in zip(metric_names, expected, strict=True):
+        assert metrics[metric_name] == pytest.approx(values[:, kept].sum().item() / 8.0)
+        assert loss_fn.metric_normalizations[metric_name] is MetricNormalizer.TOKENS
+    # Diagnostics only: the loss does not change.
+    plain_loss, plain_metrics = plain_fn(
+        data=data,
+        global_valid_seqs=torch.tensor(2.0),
+        global_valid_toks=torch.tensor(8.0),
+        **plain,
+    )
+    torch.testing.assert_close(loss, plain_loss)
+    assert not set(metric_names) & set(plain_metrics)
 
 
 # ── Teacher coordinator ────────────────────────────────────────────────────

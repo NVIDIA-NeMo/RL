@@ -426,3 +426,101 @@ def w2s_reverse_kl_from_support(
         for start in range(0, logits.shape[1], chunk_size)
     ]
     return _gather_cp(torch.cat(divergences, dim=1), context_parallel_group)
+
+
+@torch.no_grad()
+def w2s_proxy_agreement_on_support(
+    student_logits: torch.Tensor,
+    support: torch.Tensor,
+    *,
+    vocab_size: int,
+    vocab_parallel_group: torch.distributed.ProcessGroup | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """How closely the student's own ranking follows a fixed proxy support.
+
+    ``support`` holds the proxy's top-K global token ids in descending proxy
+    order, so ``support[..., 0]`` is the proxy's argmax and K is its width.
+    Padded vocabulary ids never enter the student's top-K. Diagnostics only.
+
+    Returns:
+        ``(top1, topk_overlap)``, float32 ``support.shape[:-1]``: 1 where the
+        student's argmax is the proxy's, and ``|top-K(student) ∩ support| / K``.
+    """
+    width = student_logits.shape[-1]
+    world, start = _vocab_shard_start(width, vocab_parallel_group)
+    top_k = support.shape[-1]
+    if not 1 <= top_k <= vocab_size <= width * world:
+        raise ValueError(
+            "W2S-OPD proxy agreement requires 1 <= K <= vocabulary <= padded "
+            "vocabulary."
+        )
+    student = student_logits.detach().float()
+    ids = torch.arange(start, start + width, device=student.device)
+    student = student.masked_fill(ids >= vocab_size, float("-inf"))
+    if vocab_parallel_group is None or world == 1:
+        student_top = student.topk(top_k, dim=-1).indices
+    else:
+        _, student_top = distributed_vocab_topk(
+            student,
+            top_k,
+            vocab_parallel_group,
+            vocab_start_index=start,
+            vocab_end_index=start + width,
+        )
+    support = support.to(device=student_top.device, dtype=torch.long)
+    top1 = (student_top[..., 0] == support[..., 0]).float()
+    # The student's top-K ids are distinct, so counting the ones found in the
+    # support counts the intersection.
+    shared = (student_top.unsqueeze(-1) == support.unsqueeze(-2)).any(-1)
+    return top1, shared.sum(-1).float() / top_k
+
+
+@torch.no_grad()
+def w2s_proxy_agreement_from_support(
+    logits: torch.Tensor,
+    support_ids: torch.Tensor,
+    *,
+    vocab_size: int,
+    chunk_size: int,
+    vocab_parallel_group: torch.distributed.ProcessGroup | None,
+    context_parallel_group: torch.distributed.ProcessGroup | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Student-vs-proxy agreement on a frozen-side proxy support; metrics only.
+
+    Args:
+        logits: Student vocabulary-parallel logits ``[B, S_local, V_local]``.
+        support_ids: Proxy top-K global token ids ``[B, S, K]`` in descending
+            proxy order, aligned to prediction positions (not CP sharded).
+        vocab_size: Unpadded vocabulary size; larger ids are padding.
+        chunk_size: Sequence chunk bounding the fp32 student-logit working set.
+
+    Returns:
+        Per-position ``(top1, topk_overlap)``, each ``[B, S_local * CP]`` and
+        identical on all CP ranks; see :func:`w2s_proxy_agreement_on_support`.
+    """
+    if support_ids.ndim != 3 or support_ids.shape[0] != logits.shape[0]:
+        raise ValueError(
+            "W2S-OPD proxy support must be [B, S, K] for the student batch."
+        )
+    if chunk_size < 1:
+        raise ValueError("W2S-OPD agreement chunk_size must be positive.")
+    support = _cp_shard_aligned(
+        support_ids.detach().to(device=logits.device, dtype=torch.long),
+        logits.shape[1],
+        context_parallel_group,
+        pad_value=0,
+    )
+    top1, overlap = [], []
+    for start in range(0, logits.shape[1], chunk_size):
+        chunk_top1, chunk_overlap = w2s_proxy_agreement_on_support(
+            logits[:, start : start + chunk_size],
+            support[:, start : start + chunk_size],
+            vocab_size=vocab_size,
+            vocab_parallel_group=vocab_parallel_group,
+        )
+        top1.append(chunk_top1)
+        overlap.append(chunk_overlap)
+    return (
+        _gather_cp(torch.cat(top1, dim=1), context_parallel_group),
+        _gather_cp(torch.cat(overlap, dim=1), context_parallel_group),
+    )

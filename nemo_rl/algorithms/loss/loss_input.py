@@ -29,6 +29,7 @@ from nemo_rl.algorithms.loss.utils import (
     reconstruct_opd_full_teacher_logits,
 )
 from nemo_rl.algorithms.w2s_opd import (
+    w2s_proxy_agreement_from_support,
     w2s_reverse_kl_from_support,
 )
 from nemo_rl.algorithms.x_token.loss_utils import (
@@ -257,11 +258,14 @@ def _prepare_w2s_opd_loss_input(
         context_parallel_group: Context-parallel process group.
 
     Returns:
-        Loss input dict with the per-token divergence ``[B, S - 1]`` and, with
-        ``log_student_entropy``, the student's ``sum_v p log p``.
+        Loss input dict with the per-token divergence ``[B, S - 1]``; with
+        ``log_student_entropy``, the student's ``sum_v p log p``; and with
+        ``log_proxy_agreement``, the student-vs-proxy top-1 agreement and
+        top-K overlap.
 
     Raises:
-        ValueError: If a proxy column is missing.
+        ValueError: If a proxy column is missing, or ``log_proxy_agreement``
+            lacks the verified vocabulary size.
     """
     # Deferred: the data-plane package imports tensordict, which should not be
     # pulled into every loss-function consumer.
@@ -300,6 +304,19 @@ def _prepare_w2s_opd_loss_input(
             vocab_parallel_group,
             context_parallel_group,
         )[:, :next_token_width]
+    if w2s_cfg.log_proxy_agreement:
+        if w2s_cfg.vocab_size is None:
+            raise ValueError("W2S-OPD requires the verified tokenizer vocabulary size.")
+        top1, overlap = w2s_proxy_agreement_from_support(
+            logits,
+            data[W2S_PROXY_SUPPORT_IDS_FIELD],
+            vocab_size=w2s_cfg.vocab_size,
+            chunk_size=chunk_size,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+        loss_input["w2s_proxy_top1_agreement"] = top1[:, :next_token_width]
+        loss_input["w2s_proxy_topk_overlap"] = overlap[:, :next_token_width]
     return loss_input
 
 

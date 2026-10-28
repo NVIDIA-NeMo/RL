@@ -316,6 +316,7 @@ on_policy_distillation:
     chunk_size: 128
     payload_dtype: bfloat16
     log_student_entropy: false
+    log_proxy_agreement: false
 ```
 
 Each reference becomes a frozen `ref:<alias>` teacher and the anchor an
@@ -350,6 +351,16 @@ gradient. The loss reports `w2s_opd_reverse_kl` (with `_min` and `_max`),
 diagnostics computed from the generation and training log-probabilities:
 `w2s_opd_sampling_importance_ratio`, `w2s_opd_seq_mean_log_ratio_abs`, and
 `w2s_opd_seq_sum_log_ratio_abs`. None of the three enters the loss.
+
+`log_proxy_agreement` reports how closely the student's own ranking follows
+the proxy, averaged over trained tokens: `w2s_opd_proxy_top1_agreement`, the
+share of tokens whose student argmax is the proxy's argmax, and
+`w2s_opd_proxy_topk_overlap`, `|top-K(student) ∩ S_t| / K` with `K = top_k`.
+Padded vocabulary ids never enter the student's top-K. The loss renormalizes on
+`S_t`, so it never sees where the student puts the rest of its mass; these
+metrics show how far the student's own top-K is from the support it is
+trained on. The diagnostic costs one extra chunked no-grad top-K pass over the
+student logits.
 
 ### W2S-OPD restrictions
 

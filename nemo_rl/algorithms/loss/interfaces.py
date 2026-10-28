@@ -101,7 +101,8 @@ class LossFunction(Protocol):
                 - For LossInputType.LOGPROB: next_token_logprobs (torch.Tensor)
                 - For LossInputType.LOGIT: logits (torch.Tensor)
                 - For LossInputType.OPD_FULL: opd_full_divergence, and optionally
-                  opd_full_entropy / opd_full_cross_entropy (torch.Tensor)
+                  opd_full_entropy / opd_full_cross_entropy, and for W2S-OPD
+                  w2s_proxy_top1_agreement / w2s_proxy_topk_overlap (torch.Tensor)
                 - For LossInputType.DISTILLATION: student_topk_logprobs, teacher_topk_logprobs, H_all (torch.Tensor)
                 - For LossInputType.DISTILLATION_CROSS_TOKENIZER: logits (torch.Tensor), teacher_full_logits_by_idx (dict[int, torch.Tensor])
                 - For LossInputType.DRAFT: teacher_logits, student_logits, mask (torch.Tensor)
