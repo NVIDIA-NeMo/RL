@@ -1580,6 +1580,7 @@ def _validate_automodel_stage_one_config(master_config: MasterConfig) -> None:
     automodel = policy.get("automodel_cfg")
     if automodel is None or not automodel["enabled"]:
         return
+    automodel = cast(AutomodelConfig, automodel)
     prefix = "AutoModel SC Stage 1 "
     if is_ppo_run(master_config) or master_config.on_policy_distillation is not None:
         raise ValueError(prefix + "supports text GRPO only")
@@ -1605,7 +1606,7 @@ def _validate_automodel_stage_one_config(master_config: MasterConfig) -> None:
     if (
         generation["backend"] != "vllm"
         or generation["colocated"]["enabled"]
-        or not generation["vllm_cfg"]["async_engine"]
+        or not cast(VllmConfig, generation)["vllm_cfg"]["async_engine"]
     ):
         raise ValueError(prefix + "requires disaggregated async vLLM")
     if policy["sequence_packing"]["enabled"] or policy["dynamic_batching"]["enabled"]:
