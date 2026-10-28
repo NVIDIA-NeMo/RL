@@ -156,6 +156,8 @@ def run(args):
     cfg.policy.sequence_packing.enabled = False
     cfg.policy.automodel_cfg.deterministic = True
     cfg.policy.automodel_cfg.expert_parallel_size = 1
+    if args.force_hf:
+        cfg.policy.automodel_cfg.automodel_kwargs.force_hf = True
     if "backend" in cfg.policy.automodel_cfg.automodel_kwargs:
         cfg.policy.automodel_cfg.automodel_kwargs.backend.dispatcher = "torch"
     cfg.policy.generation.colocated.enabled = False
@@ -192,6 +194,7 @@ def run(args):
             name=args.name,
             config={
                 "model": args.model,
+                "force_hf": args.force_hf,
                 "dp": world,
                 "gbs": world * 2,
                 "steps_per_loss_type": args.steps,
@@ -387,6 +390,7 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--force-hf", action="store_true")
     parser.add_argument(
         "--recipe",
         default="examples/configs/recipes/llm/dapo-gemma4-e2b-it-1n8g-automodel.yaml",
