@@ -130,12 +130,12 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     is_ppo_run,
     validate_forest_objective,
 )
-from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
-    has_logical_owners,
-)
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     ChunkReceipt,
     make_debug_writer,
+)
+from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+    has_logical_owners,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
