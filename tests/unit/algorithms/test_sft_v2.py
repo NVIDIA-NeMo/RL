@@ -389,7 +389,8 @@ def _failing_run_controller(tmp_path: Path) -> object:
     """Deferred-save controller whose step after a pending save raises."""
     controller = _deferred_save_controller(tmp_path)
     controller._pending_checkpoint_path = str(tmp_path)
-    controller._max_steps = 3
+    # The step-10 save is pending; step 11 then raises.
+    controller._max_steps = controller._save_state.total_steps + 1
     controller._logger = MagicMock()
     controller._close_loaders = MagicMock()
     controller._timeout = MagicMock()
