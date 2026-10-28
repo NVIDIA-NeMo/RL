@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -205,12 +206,17 @@ def test_generation_setup_token_capture_keeps_its_arguments_for_restarts(
         lambda futures: futures,
     )
     gen.setup_token_capture({"backend": "simple"}, "rollout_staging")
-    assert gen._token_capture_setup._asdict() == {
+    assert asdict(gen._token_capture_setup) == {
         "dp_cfg": {"backend": "simple"},
         "staging_partition": "rollout_staging",
         "capture_media": False,
     }
     assert gen._token_capture_media is None
+    gen.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "setup_token_capture",
+        **asdict(gen._token_capture_setup),
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
 
 
 def _generation_with_leaders(

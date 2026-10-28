@@ -19,11 +19,11 @@ import secrets
 import time
 import warnings
 from collections import defaultdict
+from dataclasses import asdict, dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
     AsyncGenerator,
-    NamedTuple,
     Optional,
     Union,
     cast,
@@ -168,7 +168,8 @@ def _record_vllm_generation_metrics(
         warn_once("vllm_inference_metrics", "nemo-lens: failed to record vLLM metrics")
 
 
-class _TokenCaptureSetup(NamedTuple):
+@dataclass(frozen=True)
+class _TokenCaptureSetup:
     """The arguments setup_token_capture fanned out, kept for restart_shard."""
 
     dp_cfg: "DataPlaneConfig"
@@ -736,7 +737,7 @@ class VllmGeneration(GenerationInterface):
         setup = _TokenCaptureSetup(dp_cfg, staging_partition, capture_media)
         futures = self.worker_group.run_all_workers_single_data(
             "setup_token_capture",
-            **setup._asdict(),
+            **asdict(setup),
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         self._token_capture_media = agreed_media_columns(ray.get(futures))
@@ -987,7 +988,7 @@ class VllmGeneration(GenerationInterface):
         # published.
         if self._token_capture_setup is not None:
             media = ray.get(
-                leader.setup_token_capture.remote(**self._token_capture_setup._asdict())
+                leader.setup_token_capture.remote(**asdict(self._token_capture_setup))
             )
             if media != self._token_capture_media:
                 raise RuntimeError(
