@@ -125,12 +125,14 @@ and broader setup/controller/checkpoint regression coverage passed 537.
 The fixed-input harness uses deterministic execution, standard AdamW, and a
 StepLR schedule to compare complete optimizer state. Live integration runs use
 the existing recipes' Transformer Engine FusedAdam and scheduler settings.
-MoE live qualification targets sixteen training ranks and eight rollout GPUs
+MoE live qualification uses sixteen training ranks and eight rollout GPUs
 across three nodes, with the recipe's BF16 optimizer moments and GBS=32.
 Four training ranks exhausted memory when saving BF16 moments as FP32 copies.
 Eight ranks trained two updates and saved full checkpoints, but optimizer restore
 exhausted an 80 GB GPU while PyTorch cast state tensors inside FusedAdam's
-loader. Six ranks failed before training because the native checkpoint adapter
+loader. Using FP32 moments on eight ranks also exhausted memory during restore;
+the final sixteen-rank configuration retains the recipe's BF16 moments.
+Six ranks failed before training because the native checkpoint adapter
 could not load uneven expert shards. Those layouts are not qualified for the
 complete training/checkpoint/resume workflow.
 
@@ -157,10 +159,18 @@ bound. An earlier TP=2 four-prompt probe failed at 0.01277; expanding that
 probe to sixteen prompts lowered its global mean but did not change the
 original subset's result. The final rollout configuration uses TP=4.
 
-The sixteen-rank live checkpoint/resume gate and matched 100-step MoE results
-are tracked in the [PR validation record](https://github.com/NVIDIA-NeMo/RL/pull/4963).
-The eight-rank scoring probe alone does not establish sixteen-rank training
-qualification; use that record for the completed integration evidence.
+The sixteen-rank live checkpoint/resume gate completed with exit code 0
+(Slurm job `20963367)). It saved at step 2, restored model/optimizer and
+controller/data state, advanced to step 3, and saved again. Both retained
+checkpoints contain sixteen weight and optimizer shards. All three W&B
+training records are finite, include a nonzero gradient, and have zero policy
+lag. The live generation-KL diagnostic ranged from 0.00147 to 0.00162.
+[MoE checkpoint run](https://wandb.ai/ys_fishcool-nvidia/nemorl-gemma4/runs/ab3b3610).
+
+The matched 100-step MoE results are tracked in the
+[PR validation record](https://github.com/NVIDIA-NeMo/RL/pull/4963).
+The eight-rank scoring probe and sixteen-rank checkpoint gate have distinct
+coverage; use the PR record for the completed long-run integration evidence.
 
 The Gemma4 E2B upstream/SC pair completed 100 real GRPO updates, using four
 training and four generation H100s per run, GBS=32, MBS=1, and seed 42.
