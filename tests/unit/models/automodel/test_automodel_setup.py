@@ -677,11 +677,14 @@ class TestSetupDistributed:
         tp_dim.size.return_value = 1
         cp_dim = MagicMock()
         cp_dim.size.return_value = 1
+        pp_dim = MagicMock()
+        pp_dim.size.return_value = 1
 
         mock_mesh.__getitem__ = lambda self, key: {
             "dp": dp_dim,
             "tp": tp_dim,
             "cp": cp_dim,
+            "pp": pp_dim,
         }[key]
         return mock_mesh
 
@@ -842,6 +845,39 @@ class TestSetupDistributed:
         assert parallelism.ep_size == 1
         assert parallelism.dp_replicate_size == 2
         assert mesh_call_kwargs["world_size"] == 4
+
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_pipeline_parallel_divides_data_parallel(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_mesh_context,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
+    ):
+        """PP ranks are not data-parallel replicas: DP = world / (pp * tp * cp)."""
+        mock_torch_dist.get_world_size.return_value = 8
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_mesh_context.build.return_value = SimpleNamespace(
+            device_mesh=mock_device_mesh, moe_mesh=None
+        )
+        mock_config["automodel_cfg"]["pipeline_parallel_size"] = 2
+        mock_config["automodel_cfg"]["dp_replicate_size"] = 2
+
+        setup_distributed(mock_config, mock_runtime_config)
+        parallelism = mock_mesh_context.build.call_args[0][1]
+        assert parallelism.pp_size == 2
+
+        # DP is 4 with PP=2, which dp_replicate_size=8 cannot divide.
+        mock_config["automodel_cfg"]["dp_replicate_size"] = 8
+        with pytest.raises(ValueError, match="dp_replicate_size"):
+            setup_distributed(mock_config, mock_runtime_config)
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
     @patch("nemo_rl.models.automodel.setup.MeshContext")

@@ -7,7 +7,7 @@
 - **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - **Learning Algorithms** - GRPO/GSPO/DAPO, SFT (with LoRA), DPO, and on-policy distillation.
 - **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
-- **Advanced Parallelism with Automodel** - PyTorch FSDP2, TP, CP, SP, and EP for efficient training (through NeMo AutoModel).
+- **Advanced Parallelism with Automodel** - PyTorch FSDP2, TP, CP, SP, EP, and PP for efficient training (through NeMo AutoModel). See [Automodel Pipeline Parallelism](../design-docs/automodel-pipeline-parallel.md) for the supported PP combinations.
 - **Larger Model Support with Longer Sequences** - Performant parallelism with Megatron Core (TP/PP/CP/SP/EP/FSDP) through NeMo Megatron Bridge.
 - **Sequence Packing** - Sequence packing in both Automodel and Megatron Core for large training performance gains.
 - **Fast Generation** - vLLM backend for optimized inference.

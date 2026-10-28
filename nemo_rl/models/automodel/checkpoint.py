@@ -203,6 +203,7 @@ class AutomodelCheckpointManager:
         dp_mesh: DeviceMesh,
         tp_mesh: DeviceMesh,
         moe_mesh: Optional[DeviceMesh] = None,
+        pp_mesh: Optional[DeviceMesh] = None,
     ):
         """Initialize the AutomodelCheckpointManager.
 
@@ -210,11 +211,14 @@ class AutomodelCheckpointManager:
             dp_mesh: The data parallel device mesh.
             tp_mesh: The tensor parallel device mesh.
             moe_mesh: Optional MoE device mesh.
+            pp_mesh: Optional pipeline parallel device mesh; only consulted
+                when it spans more than one rank.
         """
         self.checkpointer: Optional[Checkpointer] = None
         self.dp_mesh = dp_mesh
         self.tp_mesh = tp_mesh
         self.moe_mesh = moe_mesh
+        self.pp_mesh = pp_mesh
 
     def _get_dp_rank(self) -> int:
         """Get the data parallel rank."""
@@ -264,11 +268,13 @@ class AutomodelCheckpointManager:
             checkpoint_dir="",
             **config_updates,
         )
+        pp_enabled = self.pp_mesh is not None and self.pp_mesh.size() > 1
         self.checkpointer = base_cfg.build(
             dp_rank=self._get_dp_rank(),
             tp_rank=self._get_tp_rank(),
-            pp_rank=0,
+            pp_rank=self.pp_mesh.get_local_rank() if pp_enabled else 0,
             moe_mesh=self.moe_mesh,
+            pp_group=self.pp_mesh.get_group() if pp_enabled else None,
         )
 
     def finalize_async_save(self) -> None:
@@ -325,16 +331,17 @@ class AutomodelCheckpointManager:
 
     def save_checkpoint(
         self,
-        model: nn.Module,
+        model: nn.Module | list[nn.Module],
         weights_path: str,
-        optimizer: Optional[torch.optim.Optimizer] = None,
+        optimizer: Optional[torch.optim.Optimizer | list[torch.optim.Optimizer]] = None,
         optimizer_path: Optional[str] = None,
-        scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+        scheduler: Optional[Any] = None,
         tokenizer: Optional[AutoTokenizer] = None,
         tokenizer_path: Optional[str] = None,
         *,
         is_final_checkpoint: bool,
         peft_config: Optional[PeftConfig] = None,
+        optimizer_part_ids: Optional[list[int]] = None,
     ) -> None:
         """Save a checkpoint of the model.
 
@@ -344,11 +351,11 @@ class AutomodelCheckpointManager:
         staging is complete; upload and consolidation may continue in the background.
 
         Args:
-            model: The model to save.
+            model: The model to save, or this rank's pipeline model parts.
             weights_path: Path to save model weights.
-            optimizer: Optional optimizer to save.
+            optimizer: Optional optimizer to save, or one per model part.
             optimizer_path: Optional path to save optimizer state.
-            scheduler: Optional learning rate scheduler.
+            scheduler: Optional learning rate scheduler, or one per model part.
             tokenizer: Optional tokenizer to save with the checkpoint.
             tokenizer_path: Optional path to save tokenizer separately.
             is_final_checkpoint: Whether this checkpoint completes the training
@@ -357,6 +364,8 @@ class AutomodelCheckpointManager:
                 consolidates these checkpoints. Timeout recovery checkpoints are
                 resumable and are not considered final.
             peft_config: Optional PEFT configuration.
+            optimizer_part_ids: Global pipeline stage index of each model part
+                when saving pipeline parts.
         """
         print(f"Saving checkpoint to {weights_path}")
         assert self.checkpointer is not None, (
@@ -382,6 +391,7 @@ class AutomodelCheckpointManager:
                 model=model,
                 weights_path=optimizer_path,
                 scheduler=scheduler,
+                optimizer_part_ids=optimizer_part_ids,
             )
 
         if tokenizer_path and tokenizer is not None:
@@ -424,20 +434,26 @@ class AutomodelCheckpointManager:
 
     def load_checkpoint(
         self,
-        model: nn.Module,
+        model: nn.Module | list[nn.Module],
         weights_path: str,
-        optimizer: Optional[torch.optim.Optimizer] = None,
+        optimizer: Optional[torch.optim.Optimizer | list[torch.optim.Optimizer]] = None,
         optimizer_path: Optional[str] = None,
-        scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+        scheduler: Optional[Any] = None,
+        *,
+        optimizer_part_ids: Optional[list[int]] = None,
     ) -> None:
         """Load a checkpoint into the model using Automodel Checkpointer.
 
         Args:
-            model: The model to load weights into.
+            model: The model to load weights into, or this rank's pipeline
+                model parts.
             weights_path: Path to the checkpoint weights.
-            optimizer: Optional optimizer to load state into.
+            optimizer: Optional optimizer to load state into, or one per model
+                part.
             optimizer_path: Optional path to optimizer checkpoint.
-            scheduler: Optional learning rate scheduler.
+            scheduler: Optional learning rate scheduler, or one per model part.
+            optimizer_part_ids: Global pipeline stage index of each model part
+                when loading pipeline parts.
         """
         print(f"Loading weights from {weights_path}")
         assert self.checkpointer is not None, (
@@ -460,12 +476,13 @@ class AutomodelCheckpointManager:
                 model=model,
                 weights_path=optimizer_path,
                 scheduler=scheduler,
+                optimizer_part_ids=optimizer_part_ids,
             )
 
     def check_master_weight_dtypes(
         self,
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
+        model: nn.Module | list[nn.Module],
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
         optimizer_path: str,
     ) -> None:
         """Hard-error if a resumed optimizer's on-disk master dtype has drifted.
@@ -475,7 +492,8 @@ class AutomodelCheckpointManager:
         just because ``store_param_remainders``/``master_weight_dtype``
         changed between save and resume.
         """
-        if not getattr(optimizer, "master_weights", False):
+        optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
+        if not any(getattr(opt, "master_weights", False) for opt in optimizers):
             return
         assert self.checkpointer is not None, (
             "Checkpointer must be initialized before loading checkpoint. "

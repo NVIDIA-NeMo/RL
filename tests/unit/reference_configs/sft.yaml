@@ -54,6 +54,7 @@ policy:
     deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
+    pipeline_parallel_size: 1
     # HSDP replicate dimension size for Automodel.
     # Typically set to the number of nodes; set to 1 to disable HSDP.
     dp_replicate_size: 1

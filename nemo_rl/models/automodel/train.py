@@ -343,9 +343,6 @@ def forward_with_post_processing_fn(
             - metrics: Dictionary of metrics from post-processing
             - processed_microbatch: The ProcessedMicrobatch that was processed
     """
-    # Extract the processed components
-    data_dict = processed_mb.data_dict
-    processed_inputs = processed_mb.processed_inputs
     cp_sharder = prepared.cp_sharder
     if prepared.cp_size > 1 and cp_sharder is None:
         raise RuntimeError(
@@ -363,6 +360,55 @@ def forward_with_post_processing_fn(
     # Extract logits from model outputs
     logits = extract_logits(model, outputs)
     del outputs
+
+    result, metrics = post_process_logits(
+        logits,
+        post_processing_fn,
+        processed_mb,
+        cp_sharder=cp_sharder,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+        sampling_params=sampling_params,
+        sequence_dim=sequence_dim,
+    )
+
+    del logits
+    return result, metrics, processed_mb
+
+
+def post_process_logits(
+    logits: torch.Tensor,
+    post_processing_fn: PostProcessingFunction,
+    processed_mb: ProcessedMicrobatch,
+    *,
+    cp_sharder: Optional[ContextParallelSharder],
+    global_valid_seqs: Optional[torch.Tensor],
+    global_valid_toks: Optional[torch.Tensor],
+    sampling_params: Optional[TrainingSamplingParams],
+    sequence_dim: int,
+) -> Tuple[Any, dict[str, Any]]:
+    """Apply sampling-parameter scaling and a post-processor to model logits.
+
+    Shared by the per-microbatch forward above and the pipeline-parallel loss
+    adapter, which receives the last stage's logits from the schedule.
+
+    Args:
+        logits: Model output logits for one microbatch; scaled in place by the
+            sampling temperature.
+        post_processing_fn: Post-processing function to apply to the logits
+        processed_mb: The microbatch the logits belong to
+        cp_sharder: Per-microbatch Automodel sequence-layout owner, or None
+            when context parallelism is inactive.
+        global_valid_seqs: Global valid sequence count for loss normalization
+        global_valid_toks: Global valid token count for loss normalization
+        sampling_params: Sampling parameters (top-k, top-p, temperature)
+        sequence_dim: Sequence dimension
+
+    Returns:
+        tuple: (result, metrics) as returned by forward_with_post_processing_fn.
+    """
+    data_dict = processed_mb.data_dict
+    processed_inputs = processed_mb.processed_inputs
 
     # Draft co-training distills against the policy's raw logits; stash them
     # before the (in-place) temperature scaling below mutates the tensor.
@@ -438,8 +484,22 @@ def forward_with_post_processing_fn(
             f"Unknown post-processing function type: {type(post_processing_fn)}"
         )
 
-    del logits
-    return result, metrics, processed_mb
+    return result, metrics
+
+
+def scale_metrics_for_global_batches(
+    metrics: dict[str, Any], num_global_batches: int
+) -> None:
+    """Scale a microbatch's loss metrics in place by ``1 / num_global_batches``.
+
+    Summing the scaled metrics over every microbatch of a ``train()`` call then
+    gives the per-global-batch value. Min/max metrics are left unscaled.
+    """
+    for k in metrics.keys():
+        if "_min" in k or "_max" in k:
+            continue
+
+        metrics[k] /= num_global_batches
 
 
 def automodel_forward_backward(
@@ -567,13 +627,7 @@ def automodel_forward_backward(
                 if isinstance(post_processing_fn, LossPostProcessor):
                     # skip the update for dummy batches
                     if not is_dummy:
-                        ## scale by the number of global batches so we get the correct
-                        ## value when summing metrics across all microbatches
-                        for k in metrics.keys():
-                            if "_min" in k or "_max" in k:
-                                continue
-
-                            metrics[k] /= num_global_batches
+                        scale_metrics_for_global_batches(metrics, num_global_batches)
                     else:
                         # Zero out loss for dummy batches
                         result = result * 0
