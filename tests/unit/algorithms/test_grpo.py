@@ -39,6 +39,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.grpo import (
     AdvEstimatorConfig,
     AsyncGRPOConfig,
+    EntropyFloorStop,
     GRPOConfig,
     MasterConfig,
     RewardPenaltyConfig,
@@ -65,6 +66,8 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
+    _step_approx_entropy,
+    _validate_entropy_stop,
     _validate_multimodal_dedup_capability,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
@@ -9489,3 +9492,423 @@ def test_trainers_never_let_over_length_prompts_vote(
     counterfactual = all_rows[response] / all_rows[response].var(correction=0).sqrt()
     assert counterfactual.abs().max().item() == pytest.approx(2.236, abs=1e-3)
     assert not torch.allclose(counterfactual[:2], advantages[0][response[0]])
+
+
+def test_step_approx_entropy_sums_microbatch_fragments():
+    """Per-microbatch approx_entropy values are fragments of one batch mean."""
+    fragments = [0.31 / 64] * 64
+    valid_toks = [4096] * 64
+    assert _step_approx_entropy(
+        {
+            "all_mb_metrics": {
+                "approx_entropy": fragments,
+                "global_valid_toks": valid_toks,
+            }
+        }
+    ) == pytest.approx(0.31)
+    assert _step_approx_entropy(
+        {
+            "all_mb_metrics": {
+                "approx_entropy": [0.1, float("nan"), 0.2],
+                "global_valid_toks": [96, 96, 96],
+            }
+        }
+    ) == pytest.approx(0.3)
+    assert (
+        _step_approx_entropy(
+            {"all_mb_metrics": {"loss": [0.5], "global_valid_toks": [96]}}
+        )
+        is None
+    )
+    assert (
+        _step_approx_entropy(
+            {"all_mb_metrics": {"approx_entropy": [], "global_valid_toks": []}}
+        )
+        is None
+    )
+    assert _step_approx_entropy({}) is None
+
+
+def test_step_approx_entropy_requires_a_valid_token_population():
+    """Zero global_valid_toks is not an observation, whatever the fragments read."""
+    # Megatron keeps zero-valid-token microbatches and reads a diagnostic 0.
+    assert (
+        _step_approx_entropy(
+            {
+                "all_mb_metrics": {
+                    "approx_entropy": [0.0, 0.0],
+                    "global_valid_toks": [0, 0],
+                }
+            }
+        )
+        is None
+    )
+    # Without the population count the fragments cannot be trusted either.
+    assert _step_approx_entropy({"all_mb_metrics": {"approx_entropy": [0.05]}}) is None
+    # Any valid token makes the step measured; fragments are still summed.
+    assert _step_approx_entropy(
+        {"all_mb_metrics": {"approx_entropy": [0.0, 0.05], "global_valid_toks": [0, 7]}}
+    ) == pytest.approx(0.05)
+
+
+def test_entropy_floor_stop_counts_consecutive_steps(capsys):
+    guard = EntropyFloorStop(threshold=0.18, patience=3)
+    assert guard.update(0.10) is None
+    assert guard.update(0.10) is None
+    assert guard.update(0.25) is None  # back above the floor resets the count
+    assert guard.update(0.10) is None
+    assert guard.update(0.10) is None
+    message = guard.update(0.17)
+    assert message is not None and "stop_at_entropy_below=0.18" in message
+    # Like _validation_early_stop_message, the rule leaves printing to the trainer.
+    assert capsys.readouterr().out == ""
+
+
+def test_entropy_floor_stop_disabled_and_unmeasured_step():
+    assert EntropyFloorStop(threshold=None).update(0.0) is None
+    guard = EntropyFloorStop(threshold=0.18)
+    with pytest.warns(UserWarning, match="approx_entropy"):
+        assert guard.update(None) is None
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert guard.update(None) is None  # warns only once
+    assert caught == []
+    assert guard.update(0.1) is not None
+
+
+@pytest.mark.parametrize(
+    "middle_observation", [None, 0.25], ids=["unmeasured", "healthy"]
+)
+def test_entropy_floor_stop_interrupted_streak_restarts(middle_observation):
+    """low / unmeasured / low and low / healthy / low do not satisfy patience 2."""
+    guard = EntropyFloorStop(threshold=0.18, patience=2)
+    assert guard.update(0.10) is None
+    assert guard.consecutive == 1
+    assert guard.update(middle_observation) is None
+    assert guard.consecutive == 0
+    assert guard.update(0.10) is None
+    assert guard.consecutive == 1
+    # The next measured low step completes a fresh streak of two.
+    assert guard.update(0.10) is not None
+
+
+def _clipped_pg_all_mb_metrics(
+    microbatch_sample_masks: list[list[float]],
+    logprob: float,
+    *,
+    drop_empty_microbatches: bool,
+) -> dict[str, list[float]]:
+    """One step's ``all_mb_metrics`` from the real ``ClippedPGLossFn``.
+
+    Each microbatch holds one row per entry of its ``sample_mask`` list, four
+    predicted tokens per row and finite logprobs ``logprob`` everywhere, so a
+    valid token contributes ``-logprob`` to ``approx_entropy``. A row masked
+    to 0 is a rollout the trainer filtered out. Every microbatch is normalized
+    by the step's global valid-token count and stamped with it, as both
+    workers do. ``drop_empty_microbatches`` applies the AutoModel worker's
+    ``num_valid_samples > 0`` filter; the Megatron worker keeps every
+    microbatch.
+    """
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.0))
+    microbatches = []
+    for sample_mask in microbatch_sample_masks:
+        rows = len(sample_mask)
+        logprobs = torch.cat(
+            [torch.zeros(rows, 1), torch.full((rows, 4), logprob)], dim=1
+        )
+        microbatches.append(
+            BatchedDataDict(
+                {
+                    "token_mask": torch.ones(rows, 5),
+                    "sample_mask": torch.tensor(sample_mask),
+                    "advantages": torch.ones(rows, 5),
+                    "prev_logprobs": logprobs,
+                    "generation_logprobs": logprobs,
+                }
+            )
+        )
+    global_valid_toks = sum(
+        (mb["token_mask"][:, 1:] * mb["sample_mask"].unsqueeze(-1)).sum()
+        for mb in microbatches
+    )
+    global_valid_seqs = sum(mb["sample_mask"].sum() for mb in microbatches)
+    all_mb_metrics: dict[str, list[float]] = {}
+    for mb in microbatches:
+        _, metrics = loss_fn(
+            next_token_logprobs=mb["prev_logprobs"][:, 1:],
+            data=mb,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+        )
+        if drop_empty_microbatches and metrics["num_valid_samples"] == 0:
+            continue
+        metrics["global_valid_toks"] = global_valid_toks.item()
+        for key, value in metrics.items():
+            all_mb_metrics.setdefault(key, []).append(value)
+    return all_mb_metrics
+
+
+def test_all_filtered_megatron_step_is_not_measured():
+    """Megatron keeps zero-valid-token microbatches; their approx_entropy 0 is not collapse."""
+    all_mb_metrics = _clipped_pg_all_mb_metrics(
+        [[0.0, 0.0], [0.0, 0.0]], logprob=-1.0, drop_empty_microbatches=False
+    )
+    # The real loss reads a finite 0 for healthy logprobs with no valid tokens...
+    assert all_mb_metrics["approx_entropy"] == [0.0, 0.0]
+    assert all_mb_metrics["global_valid_toks"] == [0.0, 0.0]
+    # ...which is below any positive floor but is not an observation.
+    observation = _step_approx_entropy({"all_mb_metrics": all_mb_metrics})
+    assert observation is None
+    guard = EntropyFloorStop(threshold=0.18, patience=1)
+    assert guard.update(observation) is None
+    assert guard.consecutive == 0
+
+
+def test_all_filtered_automodel_step_has_no_entropy_metric():
+    """AutoModel drops zero-valid-sample microbatches, leaving no metric to read."""
+    all_mb_metrics = _clipped_pg_all_mb_metrics(
+        [[0.0, 0.0]], logprob=-1.0, drop_empty_microbatches=True
+    )
+    assert all_mb_metrics == {}
+    assert _step_approx_entropy({"all_mb_metrics": all_mb_metrics}) is None
+
+
+def test_measured_low_entropy_step_stops():
+    """A real valid population with low entropy still trips the floor."""
+    all_mb_metrics = _clipped_pg_all_mb_metrics(
+        [[1.0, 1.0], [1.0, 1.0]], logprob=-0.05, drop_empty_microbatches=False
+    )
+    observation = _step_approx_entropy({"all_mb_metrics": all_mb_metrics})
+    assert observation == pytest.approx(0.05)
+    assert EntropyFloorStop(threshold=0.18, patience=1).update(observation) is not None
+
+
+@pytest.mark.parametrize(
+    "drop_empty_microbatches", [False, True], ids=["megatron", "automodel"]
+)
+def test_mixed_filtered_and_valid_microbatches_measure_the_valid_entropy(
+    drop_empty_microbatches,
+):
+    """A filtered microbatch next to a healthy one is measured as the healthy entropy."""
+    healthy = _clipped_pg_all_mb_metrics(
+        [[1.0, 1.0]], logprob=-1.0, drop_empty_microbatches=drop_empty_microbatches
+    )
+    assert _step_approx_entropy({"all_mb_metrics": healthy}) == pytest.approx(1.0)
+    mixed = _clipped_pg_all_mb_metrics(
+        [[0.0, 0.0], [1.0, 1.0]],
+        logprob=-1.0,
+        drop_empty_microbatches=drop_empty_microbatches,
+    )
+    # Fragments are summed: the filtered microbatch adds 0 and the step still
+    # reads the healthy value; averaging would halve it on Megatron.
+    assert _step_approx_entropy({"all_mb_metrics": mixed}) == pytest.approx(1.0)
+    if not drop_empty_microbatches:
+        assert mixed["approx_entropy"] == pytest.approx([0.0, 1.0])
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"stop_at_entropy_below": float("nan")}, "stop_at_entropy_below"),
+        ({"stop_at_entropy_patience": 0}, "stop_at_entropy_patience"),
+    ],
+)
+def test_grpo_config_rejects_invalid_entropy_stop(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        GRPOConfig(**kwargs)
+
+
+def test_validate_entropy_stop_requires_full_loss_metrics(mock_grpo_components):
+    """stop_at_entropy_below with metrics_level 'minimal' could never fire; reject it."""
+    config = mock_grpo_components["master_config"]
+    assert config.loss_fn.metrics_level == "full"
+    _validate_entropy_stop(config)  # disabled stop, full metrics
+    config.grpo.stop_at_entropy_below = 0.18
+    _validate_entropy_stop(config)  # enabled stop, full metrics
+    config.loss_fn.metrics_level = "minimal"
+    with pytest.raises(ValueError, match="metrics_level='full'"):
+        _validate_entropy_stop(config)
+    # Without the stop, minimal metrics stay allowed.
+    config.grpo.stop_at_entropy_below = None
+    _validate_entropy_stop(config)
+
+
+_LOW_ENTROPY_STEP = {"approx_entropy": [0.05, 0.05], "global_valid_toks": [10, 10]}
+
+
+_HEALTHY_ENTROPY_STEP = {
+    "approx_entropy": [0.10, 0.10, 0.10, 0.10],
+    "global_valid_toks": [10, 10, 10, 10],
+}
+
+
+_ALL_FILTERED_STEP = {"approx_entropy": [0.0, 0.0], "global_valid_toks": [0, 0]}
+
+
+def _run_entropy_stop_trainer(
+    mock_grpo_components, train_func, tmp_path, step_mb_metrics, *, val_period=0
+):
+    """Run ``train_func`` for up to 5 steps with floor 0.18 and patience 2.
+
+    ``step_mb_metrics`` lists per-step ``all_mb_metrics`` overrides returned by
+    the mocked policy; the last entry repeats for any further steps.
+    ``val_period`` runs the (mocked, metric-less) validation every that many
+    steps; 0 disables it.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = val_period
+    master_config.grpo.val_at_end = False
+    master_config.grpo.stop_at_entropy_below = 0.18
+    master_config.grpo.stop_at_entropy_patience = 2
+    master_config.checkpointing["enabled"] = True
+    # save_period alone can never fire, so only the early stop or the last
+    # step saves.
+    master_config.checkpointing["save_period"] = 1000
+    master_config.checkpointing["metric_name"] = None
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    checkpointer.checkpoint_dir = tmp_path
+    policy = mock_grpo_components["policy"]
+    base_result = policy.train.return_value
+    step_results = [
+        {
+            **base_result,
+            "all_mb_metrics": {**base_result["all_mb_metrics"], **mb_metrics},
+        }
+        for mb_metrics in step_mb_metrics
+    ]
+    seen_steps: list[int] = []
+
+    def _train(*_args, **_kwargs):
+        result = step_results[min(len(seen_steps), len(step_results) - 1)]
+        seen_steps.append(len(seen_steps))
+        return result
+
+    policy.train.side_effect = _train
+    policy.train_from_meta.side_effect = _train
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    with ExitStack() as stack:
+        validate_target = _enter_stop_test_mocks(
+            stack,
+            train_func,
+            master_config,
+            mock_grpo_components,
+            mock_batch,
+            mock_rollout_metrics,
+        )
+        stack.enter_context(patch("nemo_rl.algorithms.grpo.torch.save"))
+        stack.enter_context(patch("nemo_rl.algorithms.grpo_sync.torch.save"))
+        # The save path reads val_metrics["accuracy"] whenever validation ran.
+        stack.enter_context(
+            patch(validate_target, return_value=({"accuracy": 0.0}, {}))
+        )
+        train_func(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+    train_calls = (
+        policy.train_from_meta.call_count
+        if train_func is grpo_train_sync
+        else policy.train.call_count
+    )
+    return train_calls, checkpointer, policy
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_training_stops_at_entropy_floor(mock_grpo_components, train_func, tmp_path):
+    """Entropy below the floor for `patience` steps saves a final checkpoint and stops."""
+    train_calls, checkpointer, policy = _run_entropy_stop_trainer(
+        mock_grpo_components, train_func, tmp_path, [_LOW_ENTROPY_STEP]
+    )
+
+    assert train_calls == 2
+    checkpointer.init_tmp_checkpoint.assert_called_once()
+    assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 2
+    policy.save_checkpoint.assert_called_once()
+    assert policy.save_checkpoint.call_args.kwargs["is_final_checkpoint"] is True
+    assert checkpointer.shutdown.called
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_entropy_stop_message_is_printed_once_on_a_validation_step(
+    mock_grpo_components, train_func, tmp_path, capsys
+):
+    """An entropy stop that coincides with validation logs its message once."""
+    train_calls, checkpointer, _ = _run_entropy_stop_trainer(
+        mock_grpo_components, train_func, tmp_path, [_LOW_ENTROPY_STEP], val_period=2
+    )
+
+    assert train_calls == 2
+    assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 2
+    printed = capsys.readouterr().out
+    assert printed.count("grpo.stop_at_entropy_below=0.18") == 1
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_entropy_floor_reads_the_summed_step_value(
+    mock_grpo_components, train_func, tmp_path
+):
+    """Fragments averaging 0.10 but summing to 0.40 (the logged value) do not trip 0.18."""
+    train_calls, checkpointer, _ = _run_entropy_stop_trainer(
+        mock_grpo_components, train_func, tmp_path, [_HEALTHY_ENTROPY_STEP]
+    )
+
+    assert train_calls == 5
+    assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 5
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_all_filtered_steps_do_not_stop_at_entropy_floor(
+    mock_grpo_components, train_func, tmp_path
+):
+    """Zero-valid-token steps with a diagnostic approx_entropy of 0 never stop training."""
+    train_calls, checkpointer, _ = _run_entropy_stop_trainer(
+        mock_grpo_components, train_func, tmp_path, [_ALL_FILTERED_STEP]
+    )
+
+    assert train_calls == 5
+    # Only the regular last-step save happens; no early-stop checkpoint.
+    checkpointer.init_tmp_checkpoint.assert_called_once()
+    assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 5
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [_ALL_FILTERED_STEP, _HEALTHY_ENTROPY_STEP],
+    ids=["unmeasured", "healthy"],
+)
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_interrupted_low_entropy_streak_restarts_patience(
+    mock_grpo_components, train_func, tmp_path, interruption
+):
+    """low / interrupted / low does not satisfy patience 2; the next low step does."""
+    train_calls, checkpointer, policy = _run_entropy_stop_trainer(
+        mock_grpo_components,
+        train_func,
+        tmp_path,
+        [_LOW_ENTROPY_STEP, interruption, _LOW_ENTROPY_STEP, _LOW_ENTROPY_STEP],
+    )
+
+    assert train_calls == 4
+    checkpointer.init_tmp_checkpoint.assert_called_once()
+    assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 4
+    policy.save_checkpoint.assert_called_once()
+    assert policy.save_checkpoint.call_args.kwargs["is_final_checkpoint"] is True
+    assert checkpointer.shutdown.called

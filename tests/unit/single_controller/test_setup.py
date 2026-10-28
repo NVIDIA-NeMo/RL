@@ -3967,3 +3967,12 @@ def test_minf_image_preprocessing_emits_float32_pixels():
     assert tuple(imgs.shape) == (1, 4, 3 * 2 * 2)
     assert imgs_sizes.dtype == torch.int32
     assert imgs_sizes.tolist() == [[4, 4]]
+
+
+def test_single_controller_rejects_entropy_floor_stop():
+    """grpo.stop_at_entropy_below is not wired into SingleController; reject it."""
+    config = _make_master_config()
+    validate_single_controller_config(config)
+    config.grpo.stop_at_entropy_below = 0.18
+    with pytest.raises(NotImplementedError, match="stop_at_entropy_below"):
+        validate_single_controller_config(config)
