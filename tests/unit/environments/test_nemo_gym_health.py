@@ -50,6 +50,8 @@ class _FakeRunHelper:
         self.error = error
         self.polls = 0
         self.shutdowns = 0
+        # Read by NemoGym.shutdown() to find the servers Gym launched; none here.
+        self._processes: dict = {}
 
     def poll(self) -> None:
         self.polls += 1

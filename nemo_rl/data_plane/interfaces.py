@@ -662,6 +662,11 @@ class DataPlaneClient(ABC):
         most expensive shape the wire can take. Callers must name what
         they read.
 
+        Every requested field must exist on every requested row, or the
+        backend raises. Callers reading rows that carry different fields
+        (e.g. image and text samples) split the request by row set, as
+        :func:`nemo_rl.data_plane.column_io.fetch_columns` does for media.
+
         Args:
             sample_ids: Uids to fetch.
             partition_id: Partition the samples live in.
