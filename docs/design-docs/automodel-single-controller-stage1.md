@@ -11,7 +11,7 @@ are not evidence for this revised implementation.
 Supported scope is text GRPO, full-parameter FSDP2, TP=CP=EP=1, fixed
 microbatches, disaggregated async vLLM, `in_order`, and lookahead zero. Dense and
 MoE models use the same lifecycle. EP>1 is a parallelism extension, not a
-prerequisite for MoE. Validation targets Gemma4 E2B and Gemma4 26B-A4B at EP=1.
+prerequisite for MoE. Validation targets Gemma4 E2B and Qwen3-30B-A3B at EP=1.
 Model-specific numerical/refit support remains subject to the existing backend.
 
 Packing, dynamic batching, HSDP, CPU offload, LoRA, draft training, VLM,
@@ -107,5 +107,34 @@ capability-specific tests rather than dense-versus-MoE implementations.
    parity or learning-quality equivalence. Disclose transport differences if the
    synchronous baseline requires a workaround.
 
-Validation results for this revision are pending execution. Do not substitute
-results from the earlier experimental implementation.
+## Validation status
+
+The revised worker is committed in `711a25ccc`; the dense parity harness ran
+at `e788c747d`. Gemma4 E2B passed four distributed comparisons on four H100
+80 GB GPUs: two token-normalized and two sequence-normalized updates. Maximum
+absolute differences were **0.0** for pre-clip gradients, metrics, updated
+parameters/buffers, and optimizer state. Scheduler equality, gradients retained
+through a logprob phase, and abort preservation also passed. Slurm job
+`20954735` completed with exit code 0.
+
+[W&B parity run](https://wandb.ai/ys_fishcool-nvidia/nemorl-gemma4/runs/3adz0fzt)
+and [six-panel comparison dashboard](https://wandb.ai/ys_fishcool-nvidia/nemorl-gemma4?nw=7syae5h9a74).
+The focused lifecycle suite passed 18 tests; configuration coverage passed 134.
+Broader controller tests, MoE parity, logprob checks, checkpoint/resume, and
+matched 100-step runs remain pending. This document will be updated with their
+results before the PR is marked ready.
+
+Gemma4 26B-A4B was initially considered for MoE qualification, but two existing
+backend failures occurred before any SC call. With the native model at EP=1,
+its checkpoint adapter returns local expert tensors and loses their global
+shape (`128` experts in the checkpoint versus `16` on each of eight ranks).
+With `force_hf=true`, loading succeeds but the existing logprob forward fails
+with an FP32/BF16 mismatch at the LM head. Neither configuration is qualified
+by this PR. Qwen3 MoE validation uses the existing recipe with the local Base
+checkpoint, EP=1, the torch dispatcher, and auxiliary router loss disabled.
+
+Validation uses the existing pipeline container with the pinned AutoModel source
+`b916107a5ce8e77a3f18682f8b0eaa46a4b54389`, PyTorch `2.13.0+cu130`, and
+Transformers `5.12.1`. The container receives the upstream-pinned Lens and
+TransferQueue packages plus MSC `0.51.0` for newer imports; this is not a full
+rebuild from the upstream lockfile. Dependency pins in this PR are unchanged.
