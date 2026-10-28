@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import errno
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -70,6 +72,7 @@ from nemo_rl.environments.nemo_gym_multimodal import (
 )
 from nemo_rl.environments.nemo_gym_shards import (
     DEFAULT_PLACEMENT_STRATEGY,
+    GYM_LOG_DIR_KEY,
     SHARDING_CONFIG_KEYS,
     ShardConfigError,
     ShardPlan,
@@ -86,7 +89,10 @@ from nemo_rl.environments.nemotron_utils import (
     predicted_static_image_num_tokens,
     supports_image_placeholder_run_parity,
 )
-from nemo_rl.environments.utils import shutdown_environments
+from nemo_rl.environments.utils import (
+    DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS,
+    shutdown_environments,
+)
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -108,12 +114,20 @@ from nemo_rl.telemetry.setup import (
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.config import warn_if_config_path_overridden
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
+# How long the Gym servers get to exit, from the SIGINT NemoGym.shutdown() sends
+# them, before whatever is still running is killed. At the end of a run
+# shutdown_environments() gives the whole actor shutdown
+# DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS and then kills the actor. Gym's own
+# shutdown runs inside this window; the rest of the budget is for the kills and
+# the telemetry flush that follow.
+NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S = DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS / 2
 
 # The three server-type keys Gym nests under a top-level config entry. Gym's
 # constant is private (nemo_gym.discovery._SERVER_GROUP_KEYS), and the literal
@@ -312,6 +326,32 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     )
 
     return True
+
+
+def set_nemo_gym_log_dir(env_config: dict[str, Any], log_dir: str) -> None:
+    """Point NeMo Gym's server logs at ``<log_dir>/nemo_gym``.
+
+    Gym writes server log files only when ``nemo_gym_log_dir`` is set, so call
+    this before building the Gym actors. Any configured value is replaced, with
+    a warning, so the Gym logs stay with the rest of this run's logs.
+
+    The path is made absolute here, on the driver. Gym resolves a relative path
+    against the Gym actor's working directory, which is the raylet's and differs
+    from the driver's when the driver attaches to a cluster started elsewhere.
+
+    Args:
+        env_config: The ``env`` section of the master config; updated in place.
+        log_dir: This run's log directory.
+    """
+    nemo_gym_config = env_config.setdefault("nemo_gym", {})
+    nemo_gym_log_dir = os.path.abspath(os.path.join(log_dir, "nemo_gym"))
+    warn_if_config_path_overridden(
+        f"env.nemo_gym.{GYM_LOG_DIR_KEY}",
+        configured=nemo_gym_config.get(GYM_LOG_DIR_KEY),
+        effective=nemo_gym_log_dir,
+        reason="NeMo Gym server logs always go under this run's log directory",
+    )
+    nemo_gym_config[GYM_LOG_DIR_KEY] = nemo_gym_log_dir
 
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
@@ -653,6 +693,102 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     if not nemo_gym_config:
         return False
     return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
+
+
+def _shut_down_gym_servers(run_helper: Any) -> None:
+    """Interrupt Gym's servers, run ``RunHelper.shutdown()``, then stop what is left.
+
+    With ``nemo_gym_log_dir`` set, Gym launches each server as
+    ``set -o pipefail; (<server command>) 2>&1 | tee -a <log>`` under bash, and
+    ``RunHelper.shutdown()`` signals only that bash process. The server never
+    sees the signal, so Gym waits out its one-second grace period on each
+    command in turn, then kills the bash process and leaves the server running.
+    Ten such servers use up the DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS that
+    shutdown_environments() gives this actor at the end of a run, and the actor
+    is killed with its servers still up. Ray's process-group cleanup, on by
+    default since Ray 2.57, then kills them without a graceful shutdown. Where it
+    is off they keep running, along with any placement group they hold as Ray
+    drivers, such as a local vLLM judge's GPUs.
+
+    So the servers are interrupted first: every process below a command Gym
+    launched, except ``tee``, which exits at EOF and so still logs the servers'
+    shutdown. Each command then exits as soon as its server has, and Gym's
+    waits return at once. The commands themselves are left for Gym to signal:
+    without ``nemo_gym_log_dir`` a command is the server, and a second SIGINT
+    makes uvicorn skip the application's shutdown. Whatever is still running
+    once Gym's shutdown has returned, or failed, is interrupted if Gym did not
+    get to it, given until NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S after the first
+    SIGINT, and then killed.
+
+    A command that has already exited is skipped. Gym's ``poll()``, which
+    NemoGym.health_check() runs, reaps a command that died, so its pid may have
+    gone to an unrelated process since.
+
+    Args:
+        run_helper: The Gym ``RunHelper`` that started the servers.
+    """
+    # Deferred: psutil comes with nemo_gym, which only the Gym actor's venv is
+    # guaranteed to have.
+    import psutil
+
+    # Gym has no public accessor for the processes it launched.
+    # TODO: switch to a public RunHelper accessor once Gym provides one.
+    commands: list[psutil.Process] = []
+    for popen in run_helper._processes.values():
+        # Skip a command that has exited: once reaped, its pid may be reused.
+        if popen.poll() is not None:
+            continue
+        try:
+            commands.append(psutil.Process(popen.pid))
+        except psutil.NoSuchProcess:
+            continue
+
+    # Everything below the commands: the servers, their own children, and tee.
+    # One pass over the process table, as Process.children() makes its own on
+    # every call, which adds up to seconds with dozens of servers on a busy node.
+    descendants: list[psutil.Process] = []
+    if commands:
+        children_by_ppid: dict[int, list[psutil.Process]] = {}
+        for process in psutil.process_iter(["ppid"]):
+            children_by_ppid.setdefault(process.info["ppid"], []).append(process)
+        pending = [command.pid for command in commands]
+        while pending:
+            for child in children_by_ppid.get(pending.pop(), []):
+                descendants.append(child)
+                pending.append(child.pid)
+
+    for process in descendants:
+        try:
+            if process.name() != "tee":
+                process.send_signal(signal.SIGINT)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    deadline = monotonic() + NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S
+    try:
+        run_helper.shutdown()
+    finally:
+        # Still running only if RunHelper.shutdown() failed before stopping them.
+        for command in commands:
+            try:
+                command.send_signal(signal.SIGINT)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        for process in commands + descendants:
+            try:
+                if process.is_running():
+                    process.wait(timeout=max(0.0, deadline - monotonic()))
+            except psutil.TimeoutExpired:
+                try:
+                    process.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            except OSError as error:
+                # psutil 7.2.2 waits with pidfd_open(), which fails with EINVAL
+                # rather than ESRCH for a process that is gone while its pid is
+                # still held, e.g. as its session's ID (giampaolo/psutil#2715,
+                # fixed after 7.2.2). A process that is gone needs nothing more.
+                if error.errno != errno.EINVAL:
+                    raise
 
 
 # Fail fast rather than restart. The servers this actor owns are started in
@@ -1772,11 +1908,14 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         RunHelper.shutdown() is not idempotent, so the handle is cleared before
         it is used. A failure therefore cannot leave a live handle that a later
         cleanup attempt invokes again.
+
+        The servers are interrupted before RunHelper.shutdown() runs, and
+        whatever it leaves running is stopped too; see _shut_down_gym_servers.
         """
         try:
             rh, self.rh = self.rh, None
             if rh is not None:
-                rh.shutdown()
+                _shut_down_gym_servers(rh)
         finally:
             # Ray reaps this actor, so no atexit handler runs: whatever the span
             # processor is still holding is dropped unless it is flushed here.
@@ -1867,6 +2006,20 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
+    # Validate before starting any workers. Capture preserves the generated
+    # media tensors but does not make the dynamic tiler honor this option.
+    for section in ("default", "train", "validation"):
+        datasets = config.data.get(section)
+        if datasets is None:
+            continue
+        for dataset in datasets if isinstance(datasets, list) else [datasets]:
+            if dataset.get("image_max_num_tiles") is not None:
+                raise ValueError(
+                    f"data.{section}.image_max_num_tiles is not supported by "
+                    "NeMo Gym, with or without token capture. Remove this "
+                    "setting; per-dataset image tile caps are not implemented."
+                )
+
     generation_config = config.policy["generation"]
 
     # Enable the backend's OpenAI-compatible server.
