@@ -201,6 +201,21 @@ def test_failed_commit_requires_recovery(worker, monkeypatch):
         worker.begin_train_step(Mock())
 
 
+def test_cleanup_failure_after_update_requires_recovery(worker, monkeypatch):
+    worker.begin_train_step(Mock())
+    dispatch(worker)
+    monkeypatch.setattr(
+        worker.optimizer, "zero_grad", Mock(side_effect=RuntimeError("cleanup failed"))
+    )
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        worker.finish_train_step()
+    assert worker.scheduler.last_epoch == 1
+    assert worker._train_step_state is None
+    worker.abort_train_step()
+    with pytest.raises(RuntimeError, match="recover"):
+        worker.begin_train_step(Mock())
+
+
 @pytest.mark.parametrize("gbs,mbs", [(0, 1), (4, 0), (3, 1), (4, 3)])
 def test_invalid_sizes(worker, gbs, mbs):
     with pytest.raises(ValueError, match="divisible"):
