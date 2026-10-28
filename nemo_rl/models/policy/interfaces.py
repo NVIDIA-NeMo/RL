@@ -57,7 +57,9 @@ class TeacherFullPayloadOutputSpec(TypedDict):
     ``teacher_full_payload`` is ``[B, S, hidden_size]`` or ``[B, S, vocab_size]``
     depending on ``on_policy_distillation.full.teacher_payload``. It is ``None``
     off the last pipeline stage: the payload is far too large to broadcast, so
-    only the stage that produced it writes it back. It comes back on CPU --
+    only the stage that produced it writes it back. Within that stage only the
+    data-plane writer (TP0/CP0) keeps it; the other ranks return ``None`` too.
+    It comes back on CPU --
     each microbatch is moved off the device inside the forward schedule, which
     is what bounds the resident payload to one microbatch.
     """

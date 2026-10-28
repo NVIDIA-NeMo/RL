@@ -23,7 +23,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+from typing import Any, Callable, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
@@ -61,10 +61,15 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
 from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
+from nemo_rl.algorithms.w2s_opd import validate_w2s_scoring
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
     chunks_accept_media_token_validity_mask,
     media_placeholder_token_id_from_chunks,
+)
+from nemo_rl.data_plane.schema import (
+    W2S_PROXY_SUPPORT_IDS_FIELD,
+    W2S_PROXY_TARGET_LOGPROBS_FIELD,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -127,6 +132,7 @@ from nemo_rl.models.megatron.train import (
     LossPostProcessor,
     TeacherFullPayloadPostProcessor,
     TopkLogitsPostProcessor,
+    W2SProxyPostProcessor,
     aggregate_training_statistics,
     megatron_forward_backward,
     should_reduce_loss_across_context_parallel,
@@ -1134,6 +1140,10 @@ class MegatronPolicyWorkerImpl(
         # to checkpoint saving and refit.
         opd_full_cfg = self.cfg.get("on_policy_distillation_full") or {}
         self._opd_full_enabled = bool(opd_full_cfg)
+        # W2S-OPD rides the opd_full transport. On the negative teacher, the
+        # anchor and positive heads are cached under keys 0 and 1 of the same
+        # dict; see load_w2s_teacher_lm_heads.
+        self._w2s_opd_enabled = opd_full_cfg.get("method") == "w2s_opd"
         self._opd_full_lm_head_lifecycle: Optional[str] = (
             opd_full_cfg["teacher_lm_head_lifecycle"] if opd_full_cfg else None
         )
@@ -2690,6 +2700,8 @@ class MegatronPolicyWorkerImpl(
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
+        if self._w2s_opd_enabled:
+            validate_w2s_scoring(logprobs, data["input_lengths"])
 
         # TODO: @nan: will remove in the future
         cpu_logprobs = torch.empty_like(
@@ -2763,6 +2775,36 @@ class MegatronPolicyWorkerImpl(
         )
         return teacher_pretrained_path
 
+    def load_w2s_teacher_lm_heads(
+        self, teacher_path_configs: list[PolicyConfig]
+    ) -> list[str]:
+        """Load the frozen W2S-OPD anchor and positive LM heads.
+
+        They are cached under keys 0 and 1 of the opd_full LM-head dict, in that
+        order. Runs on the negative teacher, which projects the anchor and
+        positive hidden states with them and contrasts the result with its own
+        logits, once every frozen model's HF conversion has materialized its
+        Megatron checkpoint.
+
+        Args:
+            teacher_path_configs: The anchor and positive teacher groups' policy
+                configs, in that order.
+
+        Returns:
+            The two resolved Megatron checkpoint roots, in the same order.
+        """
+        if len(teacher_path_configs) != 2:
+            raise ValueError(
+                "W2S-OPD requires the anchor and positive teacher path configs; "
+                f"got {len(teacher_path_configs)}."
+            )
+        paths = []
+        for arm_index, teacher_path_config in enumerate(teacher_path_configs):
+            _, path, _ = validate_model_paths(teacher_path_config)
+            self._load_opd_full_teacher_lm_head_from_path(path, arm_index)
+            paths.append(path)
+        return paths
+
     def _load_opd_full_teacher_lm_head_from_path(
         self, teacher_pretrained_path: str, teacher_index: int
     ) -> None:
@@ -2811,7 +2853,9 @@ class MegatronPolicyWorkerImpl(
         # driver is still walking the teachers one RPC at a time. Only V_local
         # and dtype are safe by construction -- both are the student's.
         teacher_hidden_size = int(teacher_lm_head.shape[1])
-        if self._opd_full_teacher_lm_heads:
+        # W2S-OPD ships each frozen arm in its own column, so its heads may
+        # differ in width (e.g. a small anchor next to larger teachers).
+        if self._opd_full_teacher_lm_heads and not self._w2s_opd_enabled:
             loaded_index = next(iter(self._opd_full_teacher_lm_heads))
             loaded_hidden_size = int(
                 self._opd_full_teacher_lm_heads[loaded_index].shape[1]
@@ -2912,16 +2956,9 @@ class MegatronPolicyWorkerImpl(
         """
         if payload == "hidden_states":
             # The student rebuilds teacher logits as output_layer(h) with no
-            # post-transform. A teacher whose forward rescales or softcaps its
-            # logits after the linear (Gemma2/Gemma4 final_logit_softcapping,
-            # MuseGlimmer output_multiplier, MuP) would be silently
-            # mis-reconstructed; the logits payload is exact for those models.
-            model_config = self._get_model_config()
-            if (
-                getattr(model_config, "final_logit_softcapping", None)
-                or getattr(model_config, "output_multiplier", 1.0) != 1.0
-                or getattr(model_config, "use_mup", False)
-            ):
+            # post-transform, which is silently wrong for a teacher that
+            # post-processes them; the logits payload is exact for those models.
+            if self._post_processes_logits_after_output_layer():
                 raise ValueError(
                     "on_policy_distillation.full.teacher_payload='hidden_states' "
                     "reconstructs teacher logits as output_layer(h), but this "
@@ -2989,21 +3026,243 @@ class MegatronPolicyWorkerImpl(
             }
             # Already on CPU: the post-processor moves each microbatch off the
             # device as it is produced, so this pad-and-concatenate never puts
-            # the payload back on the GPU.
-            teacher_full_payload = pad_and_concat(
-                [o["teacher_full_payload"] for o in list_of_outputs],
-                target_len=seq_length,
-            )
+            # the payload back on the GPU. Only the data-plane writer (TP0/CP0)
+            # keeps one; see TeacherFullPayloadPostProcessor.emit_payload.
+            payloads = [o["teacher_full_payload"] for o in list_of_outputs]
+            if payloads and payloads[0] is not None:
+                teacher_full_payload = pad_and_concat(payloads, target_len=seq_length)
         else:
             tensors = {"logprobs": None}
         logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs_with_full_payload")
+        if self._w2s_opd_enabled:
+            validate_w2s_scoring(logprobs, data["input_lengths"])
         return BatchedDataDict[TeacherFullPayloadOutputSpec](
             logprobs=logprobs.to("cpu"),
             teacher_full_payload=teacher_full_payload,
         )
+
+    def _fetch_w2s_arms_collectively(
+        self,
+        fetch_arm_rows: Callable[[], list[tuple[torch.Tensor, torch.Tensor]]],
+        input_lengths: list[int],
+        widths: tuple[int, int],
+    ) -> Optional[list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Fetch and validate the arm rows on the replica leader; fail on every rank.
+
+        A leader that raised alone would leave its siblings waiting in the
+        forward's collectives, so the outcome is agreed over the replica group.
+
+        Returns:
+            The leader's ``(anchor, positive)`` rows, ``None`` on other ranks.
+        """
+        arm_rows: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None
+        error: Optional[Exception] = None
+        if self._is_replica_leader():
+            try:
+                arm_rows = fetch_arm_rows()
+                if len(arm_rows) != len(input_lengths):
+                    raise ValueError(
+                        f"fetched {len(arm_rows)} W2S arm rows for "
+                        f"{len(input_lengths)} scored rows"
+                    )
+                for row, (arms, length) in enumerate(zip(arm_rows, input_lengths)):
+                    for arm, width in zip(arms, widths, strict=True):
+                        if (
+                            arm.ndim != 2
+                            or arm.shape[0] < length
+                            or arm.shape[1] != width
+                        ):
+                            raise ValueError(
+                                f"W2S arm row {row} has shape {tuple(arm.shape)}; "
+                                f"expected at least {length} x {width}"
+                            )
+            except Exception as fetch_error:
+                error = fetch_error
+                arm_rows = None
+        group = self._get_replica_group()
+        failed = torch.tensor([int(error is not None)], device="cuda")
+        if group is not None and group.size() > 1:
+            torch.distributed.all_reduce(
+                failed, op=torch.distributed.ReduceOp.MAX, group=group
+            )
+        if error is not None:
+            raise error
+        if failed.item():
+            raise RuntimeError("The replica leader failed to fetch the W2S arm rows.")
+        return arm_rows
+
+    def _w2s_arm_source(
+        self,
+        arm_rows: Optional[list[tuple[torch.Tensor, torch.Tensor]]],
+        widths: tuple[int, int],
+        dtype: torch.dtype,
+    ) -> Callable[[BatchedDataDict[Any]], tuple[torch.Tensor, torch.Tensor]]:
+        """Broadcast each microbatch's anchor/positive rows from the replica leader.
+
+        Only the leader holds the fetched rows, on CPU. Sending one microbatch
+        at a time bounds device memory to that microbatch's true-length arms.
+        """
+        group = self._get_replica_group()
+        is_leader = self._is_replica_leader()
+        if is_leader and arm_rows is None:
+            raise ValueError("The W2S replica leader must hold the fetched arm rows.")
+        broadcast = group is not None and group.size() > 1
+        src = torch.distributed.get_global_rank(group, 0) if broadcast else 0
+        device = torch.device("cuda", torch.cuda.current_device())
+
+        def source(
+            data_dict: BatchedDataDict[Any],
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            rows = data_dict["w2s_row_index"].tolist()
+            lengths = [int(x) for x in data_dict["input_lengths"].tolist()]
+            arms = []
+            for arm_index, width in enumerate(widths):
+                if is_leader:
+                    assert arm_rows is not None  # checked above
+                    # Shapes were agreed in _fetch_w2s_arms_collectively.
+                    tensor = torch.cat(
+                        [
+                            arm_rows[row][arm_index][:length]
+                            for row, length in zip(rows, lengths, strict=True)
+                        ]
+                    ).to(device=device, dtype=dtype)
+                else:
+                    tensor = torch.empty(
+                        (sum(lengths), width), dtype=dtype, device=device
+                    )
+                if broadcast:
+                    torch.distributed.broadcast(tensor, src=src, group=group)
+                arms.append(tensor)
+            return arms[0], arms[1]
+
+        return source
+
+    @wrap_with_nvtx_name("megatron_policy_worker/get_w2s_proxy_logprobs")
+    def get_w2s_proxy_logprobs(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        fetch_arm_rows: Callable[[], list[tuple[torch.Tensor, torch.Tensor]]],
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Score sampled tokens and publish the W2S-OPD proxy support as the negative arm.
+
+        :class:`W2SProxyPostProcessor` combines the negative teacher's own logits
+        with the anchor and positive rows, projected with their LM heads, into
+        the proxy's exact top-K support.
+
+        Args:
+            data: This DP shard's right-padded batch.
+            fetch_arm_rows: Called on the replica leader only; returns each
+                row's ``(anchor, positive)`` hidden states ``[length, H]`` on
+                CPU, in ``data`` row order.
+            micro_batch_size: Overrides the configured logprob batch size.
+
+        Returns:
+            ``logprobs`` ``[B, S]`` on every rank. TP0/CP0 also gets
+            ``w2s_proxy_support_ids`` (int32) and ``w2s_proxy_target_logprobs``
+            (float32), both ``[B, S, K]`` on CPU.
+
+        Raises:
+            ValueError: If this worker is not a W2S-OPD negative teacher with the
+                anchor and positive LM heads loaded, or runs with pipeline
+                parallelism.
+        """
+        full_cfg = self.cfg.get("on_policy_distillation_full") or {}
+        if not self._w2s_opd_enabled:
+            raise ValueError("The W2S proxy pass requires a W2S-OPD teacher config.")
+        if sorted(self._opd_full_teacher_lm_heads) != [0, 1]:
+            raise ValueError(
+                "The W2S proxy teacher needs the anchor and positive LM heads; "
+                "call load_w2s_teacher_lm_heads on the negative teacher first."
+            )
+        if parallel_state.get_pipeline_model_parallel_world_size() != 1:
+            raise ValueError("The W2S proxy teacher requires pipeline parallel size 1.")
+        self._move_opd_full_teacher_lm_head("cuda")
+        heads = (self._opd_full_teacher_lm_heads[0], self._opd_full_teacher_lm_heads[1])
+        payload_dtype = getattr(torch, full_cfg["payload_dtype"])
+        widths = (int(heads[0].shape[1]), int(heads[1].shape[1]))
+        arm_rows = self._fetch_w2s_arms_collectively(
+            fetch_arm_rows,
+            [int(x) for x in data["input_lengths"].tolist()],
+            widths,
+        )
+
+        self.timer.start("get_w2s_proxy_logprobs")
+        no_grad = torch.no_grad()
+        no_grad.__enter__()
+        logprob_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+        self.model.eval()
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
+        # Lets the arm source map each packed microbatch row back to its arms.
+        data["w2s_row_index"] = torch.arange(data.size, dtype=torch.long)
+        (
+            mb_iterator,
+            num_microbatches,
+            micro_batch_size,
+            seq_length,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            logprob_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
+        )
+        list_of_outputs = megatron_forward_backward(
+            model=self.model,
+            data_iterator=mb_iterator,
+            seq_length=padded_seq_length,
+            mbs=micro_batch_size,
+            num_microbatches=num_microbatches,
+            post_processing_fn=W2SProxyPostProcessor(
+                cfg=self.cfg,
+                heads=heads,
+                alpha=float(full_cfg["alpha"]),
+                top_k=int(full_cfg["top_k"]),
+                vocab_size=int(full_cfg["vocab_size"]),
+                chunk_size=int(full_cfg["chunk_size"]),
+                payload_dtype=payload_dtype,
+                arm_source=self._w2s_arm_source(
+                    arm_rows, widths=widths, dtype=payload_dtype
+                ),
+                sampling_params=self.sampling_params,
+            ),
+            forward_only=True,
+            defer_fp32_logits=self.defer_fp32_logits,
+            sampling_params=self.sampling_params,
+            straggler_timer=self.mcore_state.straggler_timer,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+        )
+        del data["w2s_row_index"], arm_rows
+
+        logprobs = pad_and_concat(
+            [o["logprobs"] for o in list_of_outputs], target_len=seq_length
+        )
+        # None on every rank but TP0/CP0; see W2SProxyPostProcessor.
+        proxies = [o["w2s_proxy"] for o in list_of_outputs]
+        no_grad.__exit__(None, None, None)
+        self.timer.stop("get_w2s_proxy_logprobs")
+        validate_w2s_scoring(logprobs, data["input_lengths"])
+        result = BatchedDataDict[Any](logprobs=logprobs.to("cpu"))
+        if proxies and proxies[0] is not None:
+            result[W2S_PROXY_SUPPORT_IDS_FIELD] = pad_and_concat(
+                [support for support, _ in proxies], target_len=seq_length
+            )
+            result[W2S_PROXY_TARGET_LOGPROBS_FIELD] = pad_and_concat(
+                [target for _, target in proxies], target_len=seq_length
+            )
+        return result
 
     def _apply_state_dict_to_model(
         self,
@@ -3443,6 +3702,20 @@ class MegatronPolicyWorkerImpl(
         elif hasattr(model, "config"):
             return model.config
         return None
+
+    def _post_processes_logits_after_output_layer(self) -> bool:
+        """Whether this model rescales or softcaps its logits after ``output_layer``.
+
+        Gemma2/Gemma4 (``final_logit_softcapping``), MuseGlimmer
+        (``output_multiplier``) and MuP models do, so logits rebuilt from their
+        hidden states as ``output_layer(h)`` would be silently wrong.
+        """
+        model_config = self._get_model_config()
+        return bool(
+            getattr(model_config, "final_logit_softcapping", None)
+            or getattr(model_config, "output_multiplier", 1.0) != 1.0
+            or getattr(model_config, "use_mup", False)
+        )
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/init_remote_sparse_delta_baseline")

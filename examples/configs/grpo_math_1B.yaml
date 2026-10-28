@@ -740,4 +740,17 @@ data_plane:
 # nemo_gym). null = disabled (default). See
 # examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml for a full
 # enabled example.
+#
+# Weak-to-strong OPD (W2S-OPD, arXiv:2607.26246; SingleController + Megatron
+# only) distills toward the frozen proxy
+# softmax(z_anchor + alpha * (z_positive - z_negative)) on its exact top-K
+# support; see docs/about/algorithms/mopd.md. On top of an enabled MOPD block:
+#   reference_model_by_agent_name:  # pre-RL (negative) checkpoint per teacher alias
+#     <alias>: <pre-RL checkpoint of that alias's teacher>
+#   w2s:                            # null = disabled; mutually exclusive with full
+#     enabled: true
+#     alpha: 0.75                   # contrast strength, finite and >= 0
+#     top_k: 32                     # proxy support size K, >= 2
+#     chunk_size: 128               # sequence chunk bounding the fp32 working set
+#     payload_dtype: bfloat16       # dtype of the anchor/positive arm rows
 on_policy_distillation: null

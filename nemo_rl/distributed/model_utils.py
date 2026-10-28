@@ -1826,16 +1826,18 @@ def gather_logits_at_global_indices(
     out_chunks: list[torch.Tensor] = []
     for s0 in range(0, S, chunk_size):
         s1 = min(S, s0 + chunk_size)
-        # Upcast only the current slice to bound the fp32 working set to
-        # [B, chunk_size, V_local] (chunk_size driven by logprob_chunk_size).
-        logits_chunk = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
         gi = global_indices[:, s0:s1, :]
 
         in_range = (gi >= int(vocab_start_index)) & (gi < int(vocab_end_index))
         # Map global ids to local shard ids and clamp to valid range to avoid OOB gather
         li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1)
 
-        local_vals = torch.gather(logits_chunk, dim=-1, index=li)
+        # Gather in the logits' own dtype and upcast only the k gathered values:
+        # torch.gather keeps its input for backward, so upcasting the slice first
+        # would keep a [B, chunk, V_local] fp32 copy of every chunk alive.
+        local_vals = torch.gather(
+            vocab_parallel_logits[:, s0:s1, :], dim=-1, index=li
+        ).to(dtype=torch.float32)
         local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
 
         if tp_group is not None:

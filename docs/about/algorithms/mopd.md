@@ -270,6 +270,108 @@ Rejected at construction rather than silently ignored:
   this loss ignores: `proximal_teacher_alpha < 1` and
   `subtract_global_baseline: true` are rejected.
 
+## Weak-to-strong OPD (W2S-OPD)
+
+`on_policy_distillation.w2s` implements weak-to-strong on-policy distillation
+([arXiv:2607.26246](https://arxiv.org/abs/2607.26246), equations 2 and 7).
+Three frozen models score every student-generated prefix: the *anchor*, a
+frozen copy of the student's initialization; the *positive* teacher, a post-RL
+checkpoint; and the *negative* teacher, its pre-RL checkpoint. Their logits
+define a proxy teacher
+
+```
+z_proxy = z_anchor + alpha · (z_positive − z_negative)
+```
+
+and the student minimizes the reverse KL to it, with both distributions
+renormalized on the proxy's exact top-K support `S_t = top-K(z_proxy,t)`:
+
+```
+L_t = Σ_{v ∈ S_t} p̃_student(v) · [ log p̃_student(v) − log p̃_proxy(v) ]
+```
+
+The support is selected after the logit arithmetic — the union of each model's
+own top-K is not equivalent — and padded vocabulary ids never enter it. Only the
+student receives gradients. Like full-vocabulary MOPD, this replaces the
+policy-gradient objective: rewards, advantages, and importance ratios do not
+enter the loss, and the OPD advantage estimator's output is unused.
+
+```yaml
+on_policy_distillation:
+  enabled: true
+  teacher_model_by_agent_name:
+    my_agent: /path/to/post-rl-teacher    # positive arm
+  reference_model_by_agent_name:
+    my_agent: /path/to/pre-rl-teacher     # negative arm
+  w2s:
+    enabled: true
+    alpha: 0.75
+    top_k: 32
+    chunk_size: 128
+    payload_dtype: bfloat16
+```
+
+Each reference becomes a frozen `ref:<alias>` teacher and the anchor an
+`anchor:` teacher. They are resourced like any other non-colocated teacher:
+`teacher_overrides` accepts the `ref:<alias>` and `anchor:` keys, and a
+`ref:<alias>` teacher falls back to the `<alias>` override. Roles that share a
+checkpoint share one teacher worker group. The anchor is always
+`policy.model_name`, the student's initialization, so a resumed student keeps
+anchoring to it rather than to its updated weights.
+
+The negative teacher builds the proxy. The anchor and positive teachers write
+their pre-LM-head hidden states to temporary data-plane rows; the negative
+teacher reads them, projects them with the anchor and positive LM heads on its
+own GPUs, contrasts them with its own logits, takes the exact global top-K
+across TP, gathers it across CP, and publishes the support
+(`w2s_proxy_support_ids`, int32) and the renormalized proxy log-probabilities
+(`w2s_proxy_target_logprobs`, float32). It keeps the two heads resident on its
+GPUs, so `teacher_lm_head_lifecycle` must stay `none`, its W2S-OPD default.
+The temporary rows are cleared within the same enrichment, so the data plane
+holds `8 · K` bytes per token until training (256 at `K = 32`) rather than the
+three hidden states,
+`(H_anchor + H_positive + H_negative) · itemsize(payload_dtype)` bytes (85×
+more for a 2688-wide anchor with two 4096-wide teachers in bfloat16). The
+student never holds a frozen LM head: it only gathers its own logits on the
+support.
+
+The unit tests and the TP2×CP2 check in
+`tests/functional/w2s_compact_distributed.py` compare the published support and
+the loss with a dense oracle, in value and
+gradient. The loss reports `w2s_opd_reverse_kl` (with `_min` and `_max`) and
+three sampler-drift diagnostics computed from the generation and training
+log-probabilities:
+`w2s_opd_sampling_importance_ratio`, `w2s_opd_seq_mean_log_ratio_abs`, and
+`w2s_opd_seq_sum_log_ratio_abs`. None of the three enters the loss.
+
+### W2S-OPD restrictions
+
+On top of the full-vocabulary loss restrictions above (Megatron, the
+Single-Controller runtime, and no policy-gradient knobs), the following are
+rejected rather than silently ignored:
+
+- Exactly one positive and one negative checkpoint, with a
+  `reference_model_by_agent_name` entry for every teacher alias. The `ref:` and
+  `anchor:` aliases are reserved, and `deduplicate_shared_teacher_checkpoints`
+  must stay `true`.
+- All three frozen models must share the student's token-ID mapping; this is
+  checked when the teachers start.
+- Unfiltered, untempered sampling: `policy.generation.temperature: 1.0`,
+  `top_k: null`, and `top_p: 1.0`.
+- `loss_fn.reference_policy_kl_penalty: 0`; the anchor already ties the proxy
+  to the student's initialization.
+- The negative teacher folds the proxy one packed microbatch at a time:
+  `policy.sequence_packing.enabled: true`, and a negative teacher with
+  `pipeline_model_parallel_size: 1`.
+- Under the `ready_first` sampler, set `grpo.seq_logprob_error_threshold`
+  instead of `use_importance_sampling_correction`: there is no sampled-token
+  term to reweight, so rollouts whose generation and training log-probabilities
+  drift too far apart are masked instead.
+- The anchor and positive models must produce their logits as
+  `output_layer(h)`; the same post-transform restriction as
+  `teacher_payload: hidden_states` applies, and is checked on each one's first
+  scoring pass.
+
 ## Running MOPD
 
 MOPD collects rollouts through NeMo Gym and supports both the legacy async GRPO

@@ -43,6 +43,7 @@ from nemo_rl.distributed.batched_data_dict import (
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 
@@ -66,17 +67,45 @@ class TeacherConfig:
 
 def create_teacher_configs_from_opd_config(
     opd_cfg: dict[str, Any],
+    *,
+    anchor_model: Optional[str] = None,
 ) -> list[TeacherConfig]:
     """Build per-teacher configs from on_policy_distillation config.
 
     Handles deduplication (multiple aliases sharing one checkpoint produce
     one TeacherConfig) and per-teacher overrides on top of defaults. The merge
     is shallow: a per-alias ``megatron_cfg_overrides`` replaces the default
-    dictionary; unknown top-level keys are merged individually.
+    dictionary; unknown top-level keys are merged individually. Frozen
+    reference models (``reference_model_by_agent_name``) join as ``ref:<alias>``
+    and the W2S-OPD anchor as ``anchor:``; a ``ref:<alias>`` teacher inherits the
+    ``<alias>`` override unless it has its own.
+
+    Args:
+        opd_cfg: The ``on_policy_distillation`` block as a plain dict.
+        anchor_model: The W2S-OPD anchor checkpoint, ``policy.model_name``
+            (see :func:`nemo_rl.algorithms.opd.w2s_anchor_model`); required
+            when W2S-OPD is enabled and None otherwise.
+
+    Raises:
+        ValueError: If ``anchor_model`` disagrees with whether W2S-OPD is on.
     """
     teacher_model_by_agent_name: dict[str, str] = dict(
         opd_cfg.get("teacher_model_by_agent_name", {})
     )
+    teacher_model_by_agent_name.update(
+        {
+            f"ref:{alias}": model
+            for alias, model in opd_cfg.get("reference_model_by_agent_name", {}).items()
+        }
+    )
+    w2s_cfg = opd_cfg.get("w2s")
+    if bool(w2s_cfg and w2s_cfg.get("enabled")) != (anchor_model is not None):
+        raise ValueError(
+            "The W2S-OPD anchor model must be given exactly when "
+            "on_policy_distillation.w2s is enabled."
+        )
+    if anchor_model is not None:
+        teacher_model_by_agent_name["anchor:"] = anchor_model
     non_coloc_cfg = dict(opd_cfg.get("non_colocated_teachers", {}))
     default_cfg = dict(non_coloc_cfg.get("default_teacher_cfg", {}))
     overrides = dict(non_coloc_cfg.get("teacher_overrides", {}))
@@ -91,7 +120,11 @@ def create_teacher_configs_from_opd_config(
         seen_models.add(model_name)
 
         # defaults <- per-alias override, then validated/typed by the schema.
-        merged = {**default_cfg, **dict(overrides.get(alias, {}))}
+        merged = {
+            **default_cfg,
+            **dict(overrides.get(alias.removeprefix("ref:"), {})),
+            **dict(overrides.get(alias, {})),
+        }
         res = TeacherResourceConfig(**merged)
 
         # Unknown top-level keys (extra="allow") fold into megatron_cfg_overrides;
@@ -310,8 +343,78 @@ class TeacherWorkerGroup:
             )
         )
 
-    def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
-        """Dispatch a TQ metadata batch; workers fetch and write teacher logprobs."""
+    def get_logprobs_from_meta(
+        self, meta: KVBatchMeta, *, payload_field: Optional[str] = None
+    ) -> None:
+        """Dispatch a TQ metadata batch; workers fetch and write teacher logprobs.
+
+        Args:
+            meta: Rows to score.
+            payload_field: W2S-OPD arm column this teacher writes its hidden
+                states to, instead of the run's default payload column.
+        """
+        self._dispatch_logprobs_from_meta(meta, payload_field=payload_field)
+
+    def load_w2s_teacher_lm_heads(
+        self, teacher_path_configs: list[PolicyConfig]
+    ) -> list[str]:
+        """Load the anchor and positive LM heads this negative teacher folds with.
+
+        Args:
+            teacher_path_configs: The anchor and positive teacher groups' policy
+                configs, in that order.
+
+        Returns:
+            The two resolved Megatron checkpoint roots, in the same order.
+        """
+        return ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "load_w2s_teacher_lm_heads",
+                teacher_path_configs=teacher_path_configs,
+            )
+        )[0]
+
+    def get_w2s_proxy_from_meta(
+        self,
+        meta: KVBatchMeta,
+        *,
+        arm_sample_ids: dict[str, str],
+        arm_fields: tuple[str, str],
+    ) -> None:
+        """Score the negative arm and write the W2S-OPD proxy support for ``meta``.
+
+        Args:
+            meta: Canonical rows to score and enrich.
+            arm_sample_ids: Maps each canonical sample id to the temporary row
+                carrying its anchor and positive hidden states.
+            arm_fields: The ``(anchor, positive)`` hidden-state columns.
+
+        Raises:
+            ValueError: If a row of ``meta`` has no arm row.
+        """
+        missing = [
+            sample_id
+            for sample_id in meta.sample_ids
+            if sample_id not in arm_sample_ids
+        ]
+        if missing:
+            raise ValueError(f"W2S proxy rows lack arm rows: {missing[:5]!r}")
+        self._dispatch_logprobs_from_meta(
+            meta,
+            w2s_proxy={
+                "arm_sample_ids": dict(arm_sample_ids),
+                "arm_fields": tuple(arm_fields),
+            },
+        )
+
+    def _dispatch_logprobs_from_meta(
+        self,
+        meta: KVBatchMeta,
+        *,
+        payload_field: Optional[str] = None,
+        w2s_proxy: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Shard ``meta`` over data parallelism; workers fetch, score, and write back."""
         if not meta.sequence_lengths:
             raise ValueError(
                 f"Teacher {self.alias!r} requires sequence_lengths in TQ metadata"
@@ -375,9 +478,14 @@ class TeacherWorkerGroup:
                 "micro_batch_size": self._micro_batch_size,
                 "opd_full_payload": self._opd_full_payload,
                 "opd_full_payload_dtype": self._opd_full_payload_dtype,
-                "opd_full_payload_field": self._opd_full_payload_field,
+                "opd_full_payload_field": (
+                    self._opd_full_payload_field
+                    if payload_field is None
+                    else payload_field
+                ),
                 "opd_full_teacher_index": self.teacher_index,
                 "opd_full_teacher_index_field": self._opd_full_teacher_index_field,
+                **({"w2s_proxy": w2s_proxy} if w2s_proxy is not None else {}),
                 **trace_context_kwargs(),
             },
         )

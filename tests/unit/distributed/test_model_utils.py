@@ -1997,3 +1997,40 @@ def test_student_teacher_kernels_normalize_bf16_logits_in_fp32(
 
     expected_kl, _, _ = _student_teacher_reference(student, teacher)
     torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-5)
+
+
+def test_gather_logits_at_global_indices_keeps_no_fp32_vocab_copy_for_backward():
+    """Upcasting after the gather keeps only the gathered values for backward.
+
+    torch.gather saves its input for backward, so upcasting a bf16 slice before
+    gathering kept a vocabulary-wide fp32 copy of every chunk alive.
+    """
+    torch.manual_seed(5)
+    vocab = 32
+    logits = torch.randn(2, 6, vocab, dtype=torch.bfloat16, requires_grad=True)
+    # Distinct ids per position, as in a top-k support.
+    indices = torch.stack([torch.randperm(vocab)[:4] for _ in range(12)]).view(2, 6, 4)
+    saved = []
+
+    def pack(tensor):
+        saved.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        gathered = gather_logits_at_global_indices(
+            logits, indices, vocab_start_index=0, vocab_end_index=vocab, chunk_size=4
+        )
+
+    assert not any(
+        tensor.dtype == torch.float32 and tensor.shape[-1] == vocab for tensor in saved
+    )
+    reference = logits.detach().float().requires_grad_()
+    expected = reference.gather(-1, indices)
+    assert gathered.dtype == torch.float32
+    torch.testing.assert_close(gathered, expected, atol=0, rtol=0)
+    weights = torch.randn_like(expected)
+    (gathered * weights).sum().backward()
+    (expected * weights).sum().backward()
+    torch.testing.assert_close(
+        logits.grad, reference.grad.to(torch.bfloat16), atol=0, rtol=0
+    )
