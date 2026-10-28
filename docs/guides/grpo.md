@@ -375,17 +375,7 @@ baseline/std and final batch normalization, Reinforce++'s optional group
 baseline and token-level batch normalization, the `env_baseline` behind the
 `baseline_reward/pct_*` diagnostics, and dynamic-sampling admission:
 
-- `exclude_infra` (default): like `include`, except that a row the environment
-  flagged with `mask_sample` votes only when its `failure_kind` (the NeMo-Gym
-  verify response's top-level field) is one the policy caused, listed in
-  `grpo.policy_failure_kinds`. Every other environment-masked row is an
-  infrastructure failure and never votes: a judge, verifier,
-  sandbox, session or transport failure, or a mask with no `failure_kind` at
-  all (OSWorld masks evaluator errors that way). Its reward measured nothing
-  about the policy, so it must not move its siblings' baselines. Truncated
-  rows under `overlong_filtering` and rows removed by sequence-logprob-error
-  masking keep voting, as under `include`.
-- `include`: every row with a nonzero dataset weight votes, including
+- `include` (default): every row with a nonzero dataset weight votes, including
   rows the environment flagged with `mask_sample`, truncated rows under
   `overlong_filtering`, and rows removed by sequence-logprob-error masking.
   Their rewards still shape their siblings' baselines although they contribute
@@ -396,6 +386,16 @@ baseline and token-level batch normalization, the `env_baseline` behind the
   it moves no trainable row's baseline. SingleController previously excluded
   all of these rows (`valid_mask=final_sample_mask`) and now lets the masked,
   truncated and sequence-error rows vote under `include`.
+- `exclude_infra`: like `include`, except that a row the environment
+  flagged with `mask_sample` votes only when its `failure_kind` (the NeMo-Gym
+  verify response's top-level field) is one the policy caused, listed in
+  `grpo.policy_failure_kinds`. Every other environment-masked row is an
+  infrastructure failure and never votes: a judge, verifier,
+  sandbox, session or transport failure, or a mask with no `failure_kind` at
+  all (OSWorld masks evaluator errors that way). Its reward measured nothing
+  about the policy, so it must not move its siblings' baselines. Truncated
+  rows under `overlong_filtering` and rows removed by sequence-logprob-error
+  masking keep voting, as under `include`.
 - `exclude`: only rows with a nonzero loss weight vote, using the masks known at
   each stage: the environment, pre-existing loss-weight and overlong masks
   before the logprob pass (dynamic-sampling admission, baseline/std,
@@ -415,8 +415,8 @@ asynchronous and TransferQueue rollouts also report its share as
 `infra_failure_sample_rate`. It never trains
 either way, because `mask_sample` already removes it from the loss. With
 `env.should_mask_flagged_samples: false` nothing is masked, so nothing is an
-infrastructure failure. `include` restores the behavior before this setting
-existed.
+infrastructure failure. `exclude_infra` is opt-in: the default, `include`, keeps
+the behavior from before it existed.
 
 Participation is binary. A fractional `loss_multiplier` such as `0.5` still
 weights the loss, but the row votes with full weight in the statistics; only a
@@ -758,7 +758,7 @@ $$
 L_{\text{effective}} = \sum_{i} m_i \cdot L_i
 $$
 
-where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update. Under the default `grpo.masked_reward_policy: exclude_infra`, and under `include`, they remain in the batch for reward baseline calculations; `exclude` removes them from the statistics as well (see [Masked rewards in advantage statistics](#masked-rewards-in-advantage-statistics)).
+where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update. Under the default `grpo.masked_reward_policy: include`, and under `exclude_infra`, they remain in the batch for reward baseline calculations; `exclude` removes them from the statistics as well (see [Masked rewards in advantage statistics](#masked-rewards-in-advantage-statistics)).
 
 To configure:
 ```yaml

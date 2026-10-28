@@ -8,11 +8,11 @@ grpo:
   normalize_rewards: true
   # Rows that vote in the advantage statistics (group baseline/std, GDPO/Reinforce++
   # batch normalization, dynamic-sampling admission). Loss masks unchanged.
-  # exclude_infra (default): every row except env-masked (mask_sample) rows whose
-  #   failure_kind is not in policy_failure_kinds, or that carry none (infrastructure,
-  #   judge or verifier failures); include: every row, masked rewards too;
-  #   exclude: only rows with a nonzero loss weight.
-  masked_reward_policy: exclude_infra
+  # include (default): every row, masked rewards too; exclude_infra: every row
+  #   except env-masked (mask_sample) rows whose failure_kind is not in
+  #   policy_failure_kinds, or that carry none (infrastructure, judge or verifier
+  #   failures); exclude: only rows with a nonzero loss weight.
+  masked_reward_policy: include
   # Gym failure kinds the policy caused; read only by exclude_infra. Exact match,
   # so namespaced "<server>:<kind>" names may be added.
   policy_failure_kinds:

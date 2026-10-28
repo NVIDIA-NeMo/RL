@@ -367,7 +367,7 @@ def test_refit_returns_empty_metrics_when_synchronizer_returns_none() -> None:
 
 
 def test_masked_reward_policy_default_and_validation() -> None:
-    assert GRPOConfig().masked_reward_policy == "exclude_infra"
+    assert GRPOConfig().masked_reward_policy == "include"
     assert GRPOConfig().policy_failure_kinds == [
         "agent_timeout",
         "agent_command_not_allowed",
@@ -411,7 +411,10 @@ def test_exclude_infra_votes_like_include_on_rows_ingestion_keeps() -> None:
 def test_exclude_infra_policy_kinds_only_under_exclude_infra() -> None:
     """Only exclude_infra asks the rollout builders to zero infra-failed rows."""
     kinds = grpo_mod.exclude_infra_policy_kinds(
-        GRPOConfig(policy_failure_kinds=["agent_timeout", "critpt:response_incomplete"])
+        GRPOConfig(
+            masked_reward_policy="exclude_infra",
+            policy_failure_kinds=["agent_timeout", "critpt:response_incomplete"],
+        )
     )
     assert kinds == frozenset({"agent_timeout", "critpt:response_incomplete"})
     for policy in ("include", "exclude"):
@@ -9608,7 +9611,7 @@ def test_trainers_infra_masked_reward_never_moves_valid_siblings(
     """Regression for #4160's follow-up: an environment-masked reward with no
     policy-caused failure_kind cannot move its valid siblings' advantages.
 
-    Under ``exclude_infra`` (the default) and ``exclude`` the OSWorld evaluator
+    Under ``exclude_infra`` and ``exclude`` the OSWorld evaluator
     error stays out of the statistics on the legacy sync, async and
     TransferQueue trainers, so its reward (0 or 1) leaves rows 0-1 unchanged.
     ``include`` keeps #4160's behavior: every row votes, so the same

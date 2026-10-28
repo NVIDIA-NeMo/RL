@@ -376,15 +376,13 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Reinforce++ batch normalization, dynamic-sampling admission). None of the
     # values changes the loss masks; token-capture placeholders and rows with a
     # dataset weight of 0 never vote.
-    # "exclude_infra" (default): every row votes except rows the environment
-    #   masked (mask_sample) for a failure the policy did not cause: their
-    #   failure_kind is not in policy_failure_kinds, or they carry none. Their
-    #   rewards measure the infrastructure, judge or verifier, not the policy.
-    # "include": every row votes, masked rewards too.
+    # "include" (default): every row votes, masked rewards too.
+    # "exclude_infra": every row votes except rows the environment masked
+    #   (mask_sample) for a failure the policy did not cause: their failure_kind
+    #   is not in policy_failure_kinds, or they carry none. Their rewards measure
+    #   the infrastructure, judge or verifier, not the policy.
     # "exclude": only rows with a nonzero loss weight vote.
-    masked_reward_policy: Literal["exclude_infra", "include", "exclude"] = (
-        "exclude_infra"
-    )
+    masked_reward_policy: Literal["include", "exclude_infra", "exclude"] = "include"
     # Gym failure kinds (the verify response's top-level failure_kind) that the
     # policy caused. Under "exclude_infra" an environment-masked row with one of
     # these kinds votes; any other kind, or none, is an infrastructure failure.
