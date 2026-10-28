@@ -160,7 +160,7 @@ probe to sixteen prompts lowered its global mean but did not change the
 original subset's result. The final rollout configuration uses TP=4.
 
 The sixteen-rank live checkpoint/resume gate completed with exit code 0
-(Slurm job `20963367)). It saved at step 2, restored model/optimizer and
+(Slurm job `20963367`). It saved at step 2, restored model/optimizer and
 controller/data state, advanced to step 3, and saved again. Both retained
 checkpoints contain sixteen weight and optimizer shards. All three W&B
 training records are finite, include a nonzero gradient, and have zero policy
