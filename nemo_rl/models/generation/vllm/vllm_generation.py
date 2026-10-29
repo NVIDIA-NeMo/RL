@@ -411,6 +411,10 @@ class VllmGeneration(GenerationInterface):
         # RayWorkerGroup(env_vars=...) below) is inherited by them.
         if draft_module_sharing_disable_required(self.cfg):
             env_vars[DRAFT_DISABLE_MODULE_SHARING_ENV] = "1"
+        if dynamo_enabled(self.cfg):
+            # dynamo._core fixes its log format when the engine first imports it,
+            # before engine_env is applied, so it must be in the actor's env.
+            env_vars["DYN_SDK_DISABLE_ANSI_LOGGING"] = "1"
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:

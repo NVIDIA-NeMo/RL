@@ -108,9 +108,7 @@ def test_runtime_construction_is_inert_and_namespace_is_driver_owned(
 def test_managed_service_and_frontend_environments_are_runtime_owned(
     monkeypatch,
 ) -> None:
-    runtime = _runtime(
-        tokenizer="fastokens", tokenizer_cache=True, tokenizer_cache_bytes=4096
-    )
+    runtime = _runtime()
     runtime._manager_env = {
         "DYN_NAMESPACE": "managed",
         "DYN_DISCOVERY_BACKEND": "etcd",
@@ -136,14 +134,9 @@ def test_managed_service_and_frontend_environments_are_runtime_owned(
     engine_env = runtime.engine_env
     assert engine_env["DYN_NAMESPACE"] == "managed"
     # Each engine serves its own model card, so a frontend on another node can
-    # read a chat template that exists only on the engine's node.
+    # read model files that exist only on the engine's node.
     assert engine_env["DYN_SYSTEM_PORT"] == "0"
-
-    frontend_env = runtime._frontend_env()
-    assert "DYN_SYSTEM_PORT" not in frontend_env
-    assert frontend_env["DYN_TOKENIZER"] == "fastokens"
-    assert frontend_env["DYN_TOKENIZER_CACHE"] == "1"
-    assert frontend_env["DYN_TOKENIZER_CACHE_BYTES"] == "4096"
+    assert "DYN_SYSTEM_PORT" not in service_env
 
 
 def test_dynamo_python_resolves_the_vllm_worker_venv_as_workers_do(
@@ -313,8 +306,8 @@ def test_engine_wait_fails_immediately_with_the_engines_error() -> None:
         runtime.wait_for_engines(1, check_engines=endpoint_stopped)
 
 
-def test_frontend_launches_from_the_given_interpreter(monkeypatch, capsys) -> None:
-    runtime = _runtime(tokenizer="fastokens", tokenizer_cache=True)
+def test_frontend_launches_from_the_given_interpreter(monkeypatch) -> None:
+    runtime = _runtime()
     runtime._frontend_port = 3000
     runtime._namespace = "nemo-rl-test"
     launched = []
@@ -326,8 +319,6 @@ def test_frontend_launches_from_the_given_interpreter(monkeypatch, capsys) -> No
     runtime._start_frontend()
 
     assert launched[0][:3] == ["/venvs/vllm/bin/python", "-m", "dynamo.frontend"]
-    output = capsys.readouterr().out
-    assert "DYN_TOKENIZER': 'fastokens" in output
 
 
 def test_shutdown_logs_the_kv_events_the_router_applied(monkeypatch, capsys) -> None:

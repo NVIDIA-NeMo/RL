@@ -48,22 +48,9 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
 MAX_MODEL_LEN = 16
 
 
-EOS = 2
-
-
 class _Context:
     def id(self) -> str:
         return "request-0"
-
-    def is_stopped(self) -> bool:
-        return False
-
-
-class _Tokenizer:
-    eos_token_id = EOS
-
-    def decode(self, token_ids) -> str:
-        return "".join(f"<{token_id}>" for token_id in token_ids)
 
 
 def _logprob(value: float):
@@ -114,8 +101,6 @@ def _host(llm: _FakeLLM, **cfg) -> VllmAsyncGenerationWorkerImpl:
         "max_new_tokens": 8,
         "temperature": 0.7,
         "top_p": 0.9,
-        "val_temperature": 0.0,
-        "val_top_p": 1.0,
         "top_k": None,
         "stop_token_ids": [2],
         "stop_strings": ["</done>"],
@@ -126,7 +111,6 @@ def _host(llm: _FakeLLM, **cfg) -> VllmAsyncGenerationWorkerImpl:
     host.model_name = "model"
     host.routed_experts_dtype = torch.int16
     host.llm = llm
-    host._capture_media = False
     return host
 
 
@@ -218,7 +202,7 @@ def test_a_rollout_with_no_room_returns_the_prompt_untruncated() -> None:
     assert rollout["token_ids"] == [] and rollout["truncated"] is False
 
 
-def _start_worker_config(monkeypatch, host) -> SimpleNamespace:
+def _start_worker_config(monkeypatch, host) -> native_engine.WorkerConfig:
     """The WorkerConfig ``start_dynamo_endpoint`` registers ``host``'s engine with."""
     configs = []
 
@@ -230,7 +214,6 @@ def _start_worker_config(monkeypatch, host) -> SimpleNamespace:
             return None
 
     monkeypatch.setattr(native_engine, "Worker", _Worker)
-    monkeypatch.setattr(native_engine, "WorkerConfig", SimpleNamespace)
     env = {
         "DYN_DISCOVERY_BACKEND": "etcd",
         "DYN_REQUEST_PLANE": "tcp",

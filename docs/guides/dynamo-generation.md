@@ -1,6 +1,6 @@
 # Dynamo serving for vLLM generation
 
-Any vLLM generation config can serve its rollouts through
+Any non-colocated vLLM generation config can serve its rollouts through
 [Dynamo](https://github.com/ai-dynamo/dynamo)'s OpenAI frontend and KV-aware
 router. Add one line:
 
@@ -27,9 +27,8 @@ independent.
 With `dynamo: true`:
 
 - `vllm_cfg.async_engine` is turned on, because Dynamo drives the engine's
-  `AsyncLLM`. Settings the async engine does not run, such as data parallelism
-  inside vLLM (`expert_parallel_size > tensor_parallel_size`), are rejected at
-  startup.
+  `AsyncLLM`. Settings Dynamo does not serve are rejected at startup; see
+  [Not supported](#not-supported).
 - The driver starts etcd, NATS and `dynamo.frontend`. The frontend runs from the
   vLLM workers' own venv, so it is the same ai-dynamo release.
 - Each engine turns on vLLM's KV-cache events for `router_mode: kv` and
@@ -51,9 +50,8 @@ shows them all:
 | Key | Default | Meaning |
 |---|---|---|
 | `startup_timeout_s` | 600 | Bounds service start-up and engine registration |
-| `request_timeout_s` | 900 | Timeout for one NeMo RL rollout through the frontend, in place of `NRL_VLLM_ASYNC_TIMEOUT_SECONDS`. A timeout fails the attempt as a native timeout does, and the rollout retry policy applies |
+| `request_timeout_s` | null | Deadline for one NeMo RL rollout through the frontend. null waits as long as generation takes, as native does; on the SingleController, `async_rl.rollout_failure.native.generation_timeout_s` bounds both paths |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
-| `frontend_args.tokenizer`, `tokenizer_cache*` | `default`, off | Frontend tokenizer |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags |
 
 The etcd and nats-server binaries are found in `NEMO_RL_DYNAMO_BIN_DIR` when it
@@ -87,7 +85,12 @@ Startup rejects these with `dynamo: true`:
 - `async_rl.generation_fleet_health.enabled`: the frontend picks engines itself,
   and a restarted shard does not register with it yet.
 - `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data
-  parallelism inside vLLM, which the async engine Dynamo serves does not.
+  parallelism inside vLLM, which Dynamo does not serve yet. Above data-parallel
+  rank 0, vLLM rejects each engine's `ipc://` KV-event endpoint.
+- `vllm_cfg.http_server_api_key_required`: the frontend serves the same engines
+  on 0.0.0.0 and checks no bearer token.
+- `frontend_args.router_mode: direct`: it needs a worker ID on every request, and
+  NeMo RL's rollouts name none.
 - `dynamo: true` on a backend other than vLLM, and a `dynamo_cfg` block without
   `dynamo: true`.
 
@@ -117,7 +120,7 @@ bash docker/dynamo/install.sh
 
 ## Run
 
-Use any non-colocated vLLM recipe and add the switch:
+Use any non-colocated vLLM recipe that does not use NeMo-Gym, and add the switch:
 
 ```bash
 uv run examples/run_grpo_single_controller.py \
@@ -142,4 +145,6 @@ rejects it with the migration:
     `vllm_cfg.enable_vllm_metrics_logger`;
   - `worker_args`: the engines serve only NeMo RL's rollouts, which need no chat
     parsers or templates; engines are configured through `vllm_cfg` and
-    `vllm_kwargs`.
+    `vllm_kwargs`;
+  - `frontend_args.tokenizer`, `tokenizer_cache` and `tokenizer_cache_bytes`:
+    rollouts send token IDs, which the frontend never tokenizes.

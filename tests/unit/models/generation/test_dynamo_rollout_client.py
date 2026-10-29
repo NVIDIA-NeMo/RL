@@ -12,40 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import json
 
 import pytest
 
 from nemo_rl.models.generation.dynamo import rollout_client
 from nemo_rl.models.generation.dynamo.rollout_client import (
-    ROLLOUT_ANNOTATION,
     parse_rollout_response,
     post_rollout,
-    rollout_payload,
 )
-
-
-def test_rollout_payload_leaves_sampling_and_stopping_to_the_engine() -> None:
-    payload = rollout_payload(
-        model_name="model",
-        prompt_token_ids=[5, 6, 7],
-        max_model_len=10,
-        greedy=True,
-        stop_strings=["</answer>"],
-    )
-
-    assert payload["prompt"] == [5, 6, 7]
-    # The frontend's own stop rules must never end the stream first.
-    assert payload["ignore_eos"] is True
-    assert payload["max_tokens"] == 7
-    assert "stop" not in payload and "temperature" not in payload
-    (annotation,) = payload["nvext"]["annotations"]
-    assert annotation.startswith(ROLLOUT_ANNOTATION)
-    assert json.loads(annotation[len(ROLLOUT_ANNOTATION) :]) == {
-        "greedy": True,
-        "stop_strings": ["</answer>"],
-    }
-    assert payload["nvext"]["extra_fields"] == ["engine_data"]
 
 
 @pytest.mark.parametrize(

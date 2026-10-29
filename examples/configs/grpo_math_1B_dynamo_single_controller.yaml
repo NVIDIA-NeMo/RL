@@ -14,14 +14,11 @@ policy:
     dynamo_cfg:
       # Bounds etcd/NATS/frontend start-up and every engine's registration.
       startup_timeout_s: 600
-      # Timeout for one rollout routed through the frontend (in place of
-      # NRL_VLLM_ASYNC_TIMEOUT_SECONDS). A timeout fails the attempt as a native
-      # timeout does, and the rollout retry policy applies.
-      request_timeout_s: 900
+      # Deadline for one rollout through the frontend. null waits as long as
+      # generation takes, as native generate_async does; on the SingleController,
+      # async_rl.rollout_failure.native.generation_timeout_s bounds both paths.
+      request_timeout_s: null
       frontend_args:
-        tokenizer: default
-        tokenizer_cache: false
-        tokenizer_cache_bytes: 52428800
         # kv: route each request to the engine holding most of its prefix.
         router_mode: kv
         extra_cli_args: []

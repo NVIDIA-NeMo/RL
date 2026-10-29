@@ -83,9 +83,10 @@ def test_async_http_post_json_error_contract(
         lambda **kwargs: session,
     )
 
+    # No deadline is the default (dynamo_cfg.request_timeout_s: null).
     response = asyncio.run(
         http_client.async_http_post_json(
-            "http://worker/route", {"value": 1}, timeout_s=3
+            "http://worker/route", {"value": 1}, timeout_s=None
         )
     )
 

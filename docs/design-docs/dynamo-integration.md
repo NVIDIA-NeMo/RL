@@ -6,8 +6,13 @@ Dynamo's frontend and KV-aware router. Two requirements shape the design:
 - A vLLM bump must never be blocked by Dynamo.
 - Dynamo CI coverage must stay consistent with native vLLM's.
 
-Both hold only if the engine process contains no Dynamo-owned vLLM code. Then a
-vLLM bump can break Dynamo serving only where it also breaks native vLLM.
+Both hold only if the engine process contains no Dynamo-owned vLLM code. A vLLM
+bump can then break Dynamo serving only in NeMo RL's own adapter
+(`native_engine.py`), which calls a few vLLM APIs native NeMo RL does not: the
+`get_kv_cache_group_metadata` engine utility and `KVCacheSpecKind` at
+registration, and `StatLoggerBase` for the router's load signal. A renamed import
+fails the vLLM-lane unit tests at collection, and the Dynamo functional overlays
+run registration.
 
 ## Engine hosting
 
@@ -85,12 +90,8 @@ runtime logs the router's applied-event counts at shutdown, and the Dynamo
 functional overlays fail if the engines published events but none were
 applied (`tests/functional/check_dynamo_overlay.sh`).
 
-`ai-dynamo-runtime` caps pydantic, which pins the vLLM venvs' pydantic version.
-Dependency bounds like this one can still block a vLLM bump, and the import
-guard does not see them: `ai-dynamo-runtime` 1.5.1 requires
-`pydantic>=2.10.6,<=2.13`, and `ai-dynamo` caps `aiohttp<4`,
-`prometheus-client<1` and `zstandard<1`. A vLLM release that needs a version
-outside one of these bounds does not lock with the pinned `ai-dynamo`. Until a
-Dynamo release lifts the bound, override it under
+ai-dynamo's own dependency bounds (`ai-dynamo-runtime` caps pydantic, for
+example) can still block a vLLM bump, and the import guard does not see them.
+Until a Dynamo release lifts a bound, override it under
 `[tool.uv] override-dependencies` (as `aisimulate` and `kubernetes` are), and
 let the vLLM-lane Dynamo unit tests catch a real break.

@@ -213,6 +213,11 @@ _REMOVED_DYNAMO_CFG_KEYS = {
         "templates; engines are configured through vllm_cfg and vllm_kwargs"
     ),
 }
+_REMOVED_DYNAMO_FRONTEND_KEYS = (
+    "tokenizer",
+    "tokenizer_cache",
+    "tokenizer_cache_bytes",
+)
 
 
 def reject_outdated_dynamo_backend(config: dict[str, Any]) -> None:
@@ -246,6 +251,15 @@ def reject_outdated_dynamo_backend(config: dict[str, Any]) -> None:
                 problems.append(
                     f"policy.generation.dynamo_cfg.{key} was removed: {replacement}."
                 )
+        frontend_args = dynamo_cfg.get("frontend_args")
+        if isinstance(frontend_args, dict):
+            for key in _REMOVED_DYNAMO_FRONTEND_KEYS:
+                if key in frontend_args:
+                    problems.append(
+                        f"policy.generation.dynamo_cfg.frontend_args.{key} was "
+                        "removed: NeMo RL's rollouts send token IDs, which the "
+                        "frontend never tokenizes."
+                    )
     if problems:
         raise ValueError(" ".join(problems))
 

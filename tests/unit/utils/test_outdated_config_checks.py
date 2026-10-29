@@ -407,6 +407,10 @@ def test_dynamo_backend_is_rejected_with_the_migration():
         ({"metrics_exclude_prefixes": None}, r"dynamo_cfg\.metrics_exclude_prefixes"),
         ({"worker_args": {"extra_cli_args": []}}, r"dynamo_cfg\.worker_args was"),
         ({"worker_args": {"reasoning_parser": None}}, r"dynamo_cfg\.worker_args was"),
+        (
+            {"frontend_args": {"tokenizer_cache": False}},
+            r"frontend_args\.tokenizer_cache was",
+        ),
     ],
 )
 def test_removed_dynamo_cfg_keys_are_rejected(dynamo_cfg, removed):

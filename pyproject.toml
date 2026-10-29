@@ -708,7 +708,9 @@ exclude = '''
 '''
 
 [tool.pytest.ini_options]
-addopts = "--durations=100 -s -rA -x"
+# ai-dynamo (vllm extra) registers pytest plugins that skip test_sglang_*,
+# test_trtllm_* and test_triton_* files when those frameworks are absent.
+addopts = "--durations=100 -s -rA -x -p no:vllm_tests -p no:sglang_tests -p no:trtllm_tests -p no:triton_tests"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [

@@ -75,7 +75,7 @@ def test_without_dynamo_the_vllm_config_is_untouched() -> None:
         (_vllm_config(dynamo=True, backend="sglang"), "backend=vllm"),
         # dynamo_cfg alone would be ignored.
         (_vllm_config(dynamo_cfg={}), "dynamo is not true"),
-        # The async engine Dynamo serves runs no data parallelism inside vLLM.
+        # Dynamo does not serve data parallelism inside vLLM yet.
         (
             _vllm_config(
                 dynamo=True,
@@ -87,6 +87,27 @@ def test_without_dynamo_the_vllm_config_is_untouched() -> None:
                 },
             ),
             "expert_parallel_size <= tensor_parallel_size",
+        ),
+        # The frontend serves the same engines and checks no bearer token.
+        (
+            _vllm_config(
+                dynamo=True,
+                vllm_cfg={
+                    "async_engine": True,
+                    "max_model_len": 512,
+                    "tensor_parallel_size": 1,
+                    "expert_parallel_size": 1,
+                    "http_server_api_key_required": True,
+                },
+            ),
+            "checks no bearer token",
+        ),
+        # Direct routing needs a worker ID that rollouts never carry.
+        (
+            _vllm_config(
+                dynamo=True, dynamo_cfg={"frontend_args": {"router_mode": "direct"}}
+            ),
+            "router_mode",
         ),
     ],
 )

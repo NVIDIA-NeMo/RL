@@ -216,15 +216,6 @@ class ManagedDynamoRuntime:
         env.update(self._manager_env)
         return env
 
-    def _frontend_env(self) -> dict[str, str]:
-        env = self._service_env()
-        frontend_args = self._dynamo_cfg.frontend_args
-        env["DYN_TOKENIZER"] = frontend_args.tokenizer
-        if frontend_args.tokenizer_cache:
-            env["DYN_TOKENIZER_CACHE"] = "1"
-            env["DYN_TOKENIZER_CACHE_BYTES"] = str(frontend_args.tokenizer_cache_bytes)
-        return env
-
     def _start_etcd(self) -> None:
         self._etcd_data_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_etcd_")
         peer_url = f"http://{self._host}:{self._etcd_peer_port}"
@@ -312,19 +303,10 @@ class ManagedDynamoRuntime:
         print(
             f"  [Dynamo] launching frontend argv={redact_argv(command)!r}", flush=True
         )
-        frontend_env = self._frontend_env()
+        frontend_env = self._service_env()
         dynamo_venv = os.path.dirname(os.path.dirname(self._frontend_python))
         frontend_env["VIRTUAL_ENV"] = dynamo_venv
         frontend_env["UV_PROJECT_ENVIRONMENT"] = dynamo_venv
-        tokenizer_env = {
-            key: value
-            for key, value in frontend_env.items()
-            if key.startswith("DYN_TOKENIZER")
-        }
-        print(
-            f"  [Dynamo] frontend tokenizer environment={tokenizer_env!r}",
-            flush=True,
-        )
         self._frontend_process = subprocess.Popen(
             command, env=frontend_env, start_new_session=True
         )

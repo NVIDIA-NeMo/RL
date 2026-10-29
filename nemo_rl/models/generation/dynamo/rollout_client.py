@@ -19,6 +19,7 @@ import json
 import logging
 from typing import Any, Optional
 
+from nemo_rl.experience.failures import http_status_is_infra
 from nemo_rl.models.generation.dynamo.http_client import (
     async_http_post_json,
     format_dynamo_error,
@@ -33,7 +34,6 @@ ROLLOUT_ANNOTATION = "nemo_rl:rollout:"
 
 _HTTP_MAX_ATTEMPTS = 3
 _HTTP_RETRY_DELAY_S = 1.0
-_RETRYABLE_HTTP_STATUS_CODES = {408, 429}
 
 
 def _is_retryable(response: dict[str, Any]) -> bool:
@@ -42,9 +42,7 @@ def _is_retryable(response: dict[str, Any]) -> bool:
     if "transport_error" in response or response.get("json_decode_error") is True:
         return True
     status = response.get("http_status")
-    return isinstance(status, int) and (
-        status in _RETRYABLE_HTTP_STATUS_CODES or 500 <= status < 600
-    )
+    return isinstance(status, int) and http_status_is_infra(status)
 
 
 def rollout_payload(
@@ -95,7 +93,7 @@ def parse_rollout_response(response: dict[str, Any], *, url: str) -> dict[str, A
 
 
 async def post_rollout(
-    url: str, payload: dict[str, Any], timeout_s: float
+    url: str, payload: dict[str, Any], timeout_s: float | None
 ) -> dict[str, Any]:
     """POST one rollout, retrying transient errors; returns its ``engine_data``."""
     response: dict[str, Any] = {}
@@ -116,7 +114,6 @@ async def post_rollout(
         raise RuntimeError(
             f"Dynamo rollout request to {url} failed: {response['timeout_error']}. "
             "For longer sequences, increase "
-            "policy.generation.dynamo_cfg.request_timeout_s, e.g. to "
-            f"{int(timeout_s * 2)}."
+            "policy.generation.dynamo_cfg.request_timeout_s, or set it to null."
         )
     return parse_rollout_response(response, url=url)

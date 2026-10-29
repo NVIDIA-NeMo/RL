@@ -36,7 +36,7 @@ def _decode_json_object(body: bytes) -> dict[str, Any]:
 
 
 async def async_http_post_json(
-    url: str, payload: dict[str, Any], timeout_s: float
+    url: str, payload: dict[str, Any], timeout_s: float | None
 ) -> dict[str, Any]:
     """POST JSON without blocking the rollout actor event loop."""
     timeout = aiohttp.ClientTimeout(total=timeout_s)
