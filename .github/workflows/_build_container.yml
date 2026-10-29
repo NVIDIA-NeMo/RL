@@ -595,7 +595,8 @@ jobs:
         # image itself. Replaces the old post-build docker-cp extraction, which
         # was also main-only; keep that restriction so PR builds don't refresh
         # the shared cache from build-arg variations (SKIP_*_BUILD, etc.).
-        if: ${{ always() && !cancelled() && steps.uv_cache.outputs.tag != '' && github.ref == 'refs/heads/main' }}
+        # TEST ONLY (do not merge): also refresh from PRs; cicd-main.yml points them at uv-cache-test.
+        if: ${{ always() && !cancelled() && steps.uv_cache.outputs.tag != '' }}
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           file: ${{ inputs.dockerfile }}

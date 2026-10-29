@@ -580,7 +580,8 @@ jobs:
         nemo-rl=.
       trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
       trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
-      uv-cache-tag: ${{ vars.UV_BUILD_CACHE == 'enabled' && 'uv-cache' || '' }}
+      # TEST ONLY (do not merge): never read or write the real uv-cache-* seed tags.
+      uv-cache-tag: ${{ vars.UV_BUILD_CACHE == 'enabled' && 'uv-cache-test' || '' }}
       trtllm-cache-scope: ${{ needs.pre-flight.outputs.cache_scope }}
       megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
       megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
@@ -631,7 +632,8 @@ jobs:
         nemo-rl=.
       trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
       trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
-      uv-cache-tag: ${{ vars.UV_BUILD_CACHE == 'enabled' && 'uv-cache' || '' }}
+      # TEST ONLY (do not merge): never read or write the real uv-cache-* seed tags.
+      uv-cache-tag: ${{ vars.UV_BUILD_CACHE == 'enabled' && 'uv-cache-test' || '' }}
       trtllm-cache-scope: ${{ needs.pre-flight.outputs.cache_scope }}
       megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
       megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
