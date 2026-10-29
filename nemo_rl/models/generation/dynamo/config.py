@@ -21,7 +21,7 @@ every field below carries its default.
 
 from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel, Field, PositiveFloat, PositiveInt, model_validator
+from pydantic import BaseModel, Field, PositiveFloat, model_validator
 
 
 class DynamoWorkerArgs(BaseModel, extra="forbid"):
@@ -53,17 +53,14 @@ class DynamoWorkerArgs(BaseModel, extra="forbid"):
 class DynamoFrontendArgs(BaseModel, extra="forbid"):
     """Arguments for the managed ``dynamo.frontend`` process."""
 
-    tokenizer: Literal["default", "fastokens"] = "default"
-    tokenizer_cache: bool = False
-    tokenizer_cache_bytes: PositiveInt = 50 * 1024**2
     # "kv" routes each request to the engine holding most of its prefix, fed by
-    # the engines' vLLM KV-cache events.
+    # the engines' vLLM KV-cache events. No "direct": it needs a worker ID on
+    # every request, and NeMo RL's rollouts name none.
     router_mode: Literal[
         "round-robin",
         "random",
         "power-of-two",
         "kv",
-        "direct",
         "least-loaded",
         "device-aware-weighted",
     ] = "kv"
@@ -83,12 +80,11 @@ class DynamoCfg(BaseModel, extra="forbid"):
 
     # Bounds etcd/NATS/frontend start-up and every engine's registration.
     startup_timeout_s: PositiveFloat = 600.0
-    # Timeout for one NeMo RL rollout routed through the frontend, in place of
-    # NRL_VLLM_ASYNC_TIMEOUT_SECONDS. A timeout fails the attempt as a native one
-    # does (GenerationUnavailable), and the rollout retry policy re-dispatches it
-    # (SingleController: async_rl.rollout_failure.max_infra_attempts_per_prompt).
+    # Deadline for one NeMo RL rollout through the frontend. None waits as long
+    # as generation takes, as native generate_async does; on the SingleController,
+    # async_rl.rollout_failure.native.generation_timeout_s bounds both paths.
     # NeMo-Gym's own calls keep Gym's timeouts.
-    request_timeout_s: PositiveFloat = 900.0
+    request_timeout_s: PositiveFloat | None = None
     worker_args: DynamoWorkerArgs = Field(default_factory=DynamoWorkerArgs)
     frontend_args: DynamoFrontendArgs = Field(default_factory=DynamoFrontendArgs)
 

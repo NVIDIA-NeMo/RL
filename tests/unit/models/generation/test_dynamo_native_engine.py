@@ -384,7 +384,7 @@ def test_queue_limits_reject_with_the_engines_status() -> None:
     assert llm.calls == []
 
 
-def _start_worker_config(monkeypatch, host) -> SimpleNamespace:
+def _start_worker_config(monkeypatch, host) -> native_engine.WorkerConfig:
     """The WorkerConfig ``start_dynamo_endpoint`` registers ``host``'s engine with."""
     configs = []
 
@@ -396,7 +396,6 @@ def _start_worker_config(monkeypatch, host) -> SimpleNamespace:
             return None
 
     monkeypatch.setattr(native_engine, "Worker", _Worker)
-    monkeypatch.setattr(native_engine, "WorkerConfig", SimpleNamespace)
     env = {
         "DYN_DISCOVERY_BACKEND": "etcd",
         "DYN_REQUEST_PLANE": "tcp",

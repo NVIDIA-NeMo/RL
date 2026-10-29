@@ -83,7 +83,7 @@ Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for dist
 :link: guides/dynamo-generation
 :link-type: doc
 
-Serve any vLLM generation config through Dynamo's frontend and KV-aware router with `dynamo: true`.
+Serve non-colocated vLLM generation through Dynamo's frontend and KV-aware router with `dynamo: true`.
 :::
 
 ::::

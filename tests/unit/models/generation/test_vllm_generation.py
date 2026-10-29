@@ -2628,32 +2628,30 @@ def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error
         VllmGeneration.validate_settings(master_config)
 
 
-@pytest.mark.parametrize("dynamo", [False, True])
-def test_vllm_token_rollouts_and_clients_use_the_dynamo_frontend_when_it_serves(
-    dynamo,
-):
-    generation = object.__new__(VllmGeneration)
-    generation.dp_openai_server_base_urls = ["http://a/v1", "http://b/v1"]
-    generation.dynamo_frontend_url = "http://frontend/v1" if dynamo else None
-    tokens = BatchedDataDict({"input_ids": torch.tensor([[1]])})
-    # The frontend request carries token IDs only, so media prompts stay native.
-    media = BatchedDataDict({"input_ids": torch.tensor([[1]]), "vllm_content": [None]})
-
-    assert generation.client_base_urls == (
-        ["http://frontend/v1"] if dynamo else ["http://a/v1", "http://b/v1"]
-    )
-    assert generation._dynamo_serves(tokens) is dynamo
-    assert not generation._dynamo_serves(media)
-
-
-def test_vllm_dynamo_frontend_failures_are_generation_unavailable(monkeypatch):
+def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
     from nemo_rl.experience.failures import GenerationUnavailable
     from nemo_rl.models.generation.dynamo import rollout_client
+    from nemo_rl.models.generation.vllm.request_pipeline import (
+        RolloutResult,
+        rollout_output,
+        rollout_result_to_wire,
+    )
 
-    async def frontend_down(url, payload, timeout_s):
-        raise RuntimeError(f"Dynamo rollout request to {url} failed: HTTP 503")
+    result = RolloutResult([7, 8], [-0.5, -0.25], False, None, None)
+    responses = [
+        {"rollout": rollout_result_to_wire(result), "gen_leader_worker_idx": 3},
+        RuntimeError("Dynamo rollout request to frontend failed: HTTP 503"),
+    ]
+    requests = []
 
-    monkeypatch.setattr(rollout_client, "post_rollout", frontend_down)
+    async def frontend(url, payload, timeout_s):
+        requests.append((url, payload, timeout_s))
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(rollout_client, "post_rollout", frontend)
     generation = object.__new__(VllmGeneration)
     generation.cfg = {
         "model_name": "model",
@@ -2662,9 +2660,38 @@ def test_vllm_dynamo_frontend_failures_are_generation_unavailable(monkeypatch):
     }
     generation.dynamo_frontend_url = "http://frontend/v1"
     data = BatchedDataDict(
-        {"input_ids": torch.tensor([[5, 6, 0]]), "input_lengths": torch.tensor([2])}
+        {
+            "input_ids": torch.tensor([[5, 6, 0]]),
+            "input_lengths": torch.tensor([2]),
+            "stop_strings": [["</answer>"]],
+        }
     )
+    # The frontend request carries token IDs only, so media prompts stay native.
+    media = BatchedDataDict({**data, "vllm_content": [None]})
+    assert generation._dynamo_serves(data) and not generation._dynamo_serves(media)
+    # NeMo-Gym is pointed at the frontend too.
+    assert generation.client_base_urls == ["http://frontend/v1"]
 
+    _, output = asyncio.run(anext(generation.generate_async(data, greedy=True)))
+
+    ((url, payload, timeout_s),) = requests
+    assert (url, timeout_s) == ("http://frontend/v1/completions", None)
+    # The unpadded prompt; the engine samples it from the generation config, and
+    # the frontend's own stop rules never end the stream before the engine does.
+    assert payload["prompt"] == [5, 6]
+    assert payload["ignore_eos"] is True and payload["max_tokens"] == 14
+    assert "stop" not in payload and "temperature" not in payload
+    (annotation,) = payload["nvext"]["annotations"]
+    assert json.loads(annotation.removeprefix(rollout_client.ROLLOUT_ANNOTATION)) == {
+        "greedy": True,
+        "stop_strings": ["</answer>"],
+    }
+    assert payload["nvext"]["extra_fields"] == ["engine_data"]
+    # The driver returns what native dispatch returns.
+    native = rollout_output(result, input_ids=data["input_ids"][0], input_length=2)
+    assert output["gen_leader_worker_idx"] == [3]
+    for key in native:
+        assert torch.equal(output[key], native[key]), key
     # An infrastructure failure is re-dispatched; an unmapped RuntimeError would
     # count as a DATA failure against the prompt.
     with pytest.raises(GenerationUnavailable, match="HTTP 503"):
