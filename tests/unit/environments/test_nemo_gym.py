@@ -47,6 +47,7 @@ from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
     _count_structured_response_tokens,
+    _refuse_empty_server_mappings,
     _wait_for_external_services,
     build_reward_component_columns,
     extract_external_service_readiness,
@@ -2511,3 +2512,104 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
     without_key = spin_up(None)
     assert without_key["policy_api_key"] == "dummy_key"
     assert "NEMO_RL_POLICY_API_KEY" not in os.environ
+
+
+def test_refuse_empty_server_mappings_names_each_empty_entry():
+    """An empty server entry, or an entry whose first server-type group is
+    empty, would crash NeMo-Gym's launcher with a bare IndexError at one of
+    its two index levels; the guard refuses both and names them."""
+    from omegaconf import DictConfig
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"empty server mapping\(s\) "
+            r"\['judge_model', 'policy_model\.responses_api_models', 'tools'\]"
+        ),
+    ):
+        _refuse_empty_server_mappings(
+            {
+                "tools": {},
+                "policy_model": {"responses_api_models": {}},
+                "judge_model": DictConfig({}),
+                "telemetry": {},
+            },
+            reserved_keys=("telemetry",),
+        )
+
+    # A third-level empty mapping is a server's own settings, which the
+    # launcher never indexes; a reserved key is skipped even when empty; and
+    # scalars and lists are not server entries at all.
+    _refuse_empty_server_mappings(
+        {
+            "policy_model": {"responses_api_models": {"vllm_model": {}}},
+            "telemetry": {},
+            "default_host": "h",
+            "x": [],
+        },
+        reserved_keys=("telemetry", "default_host"),
+    )
+
+
+def test_refuse_empty_server_mappings_leaves_interpolations_unresolved(monkeypatch):
+    """The merged config carries ``policy_api_key`` as an environment
+    interpolation that only the server processes can resolve; the guard reads
+    the structure without resolving it, so an unset variable is not an error
+    and an empty entry beside the interpolation is still refused."""
+    from omegaconf import DictConfig
+
+    monkeypatch.delenv("NEMO_RL_POLICY_API_KEY", raising=False)
+    _refuse_empty_server_mappings(
+        DictConfig(
+            {
+                "policy_api_key": "${oc.env:NEMO_RL_POLICY_API_KEY}",
+                "tools": {"responses_api_models": {"vllm_model": {}}},
+            }
+        ),
+        reserved_keys=(),
+    )
+    with pytest.raises(ValueError, match=r"empty server mapping\(s\) \['tools'\]"):
+        _refuse_empty_server_mappings(
+            DictConfig(
+                {"policy_api_key": "${oc.env:NEMO_RL_POLICY_API_KEY}", "tools": {}}
+            ),
+            reserved_keys=(),
+        )
+
+
+@pytest.mark.nemo_gym
+def test_spinup_guards_the_merged_config_before_starting_gym(monkeypatch):
+    """_spinup runs the guard on the config Gym merges (config_paths YAMLs
+    first, the initial dict on top) and aborts before RunHelper exists, so a
+    refused config leaves no half-started servers behind."""
+    import nemo_gym.global_config as gym_global_config
+    from omegaconf import DictConfig
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    seen_parser_configs = []
+
+    def fake_merged_config(parser_config=None, **_kwargs):
+        # Stands in for Gym's merge, which would also cache the result for
+        # the whole process; the guard must see this merged mapping.
+        seen_parser_configs.append(parser_config)
+        return DictConfig({"tools": {}, "default_host": "127.0.0.1", "telemetry": {}})
+
+    monkeypatch.setattr(gym_global_config, "get_global_config_dict", fake_merged_config)
+    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    gym = NemoGym.__ray_metadata__.modified_class(
+        {
+            "initial_global_config_dict": {"tools": {}},
+            "model_name": "policy",
+            "base_urls": ["http://127.0.0.1:1/v1"],
+        }
+    )
+
+    with pytest.raises(ValueError, match=r"empty server mapping\(s\) \['tools'\]"):
+        gym._spinup()
+
+    assert gym.rh is None
+    # The guard read Gym's merged config built from the same parser config
+    # RunHelper.start would have received.
+    assert len(seen_parser_configs) == 1
+    assert seen_parser_configs[0].initial_global_config_dict["tools"] == {}
