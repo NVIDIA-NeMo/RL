@@ -1856,8 +1856,7 @@ class VllmAsyncGenerationWorkerImpl(
         """Token budget for one rollout prompt; 0 means nothing fits.
 
         The configured cap, clipped to the context window and to speculative
-        decoding's lookahead. Kept apart from ``generate_async`` so every path that
-        serves a rollout from this engine gives it the same budget.
+        decoding's lookahead.
         """
         max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
         allowed_new_tokens = max(
@@ -1875,45 +1874,73 @@ class VllmAsyncGenerationWorkerImpl(
             )
         return allowed_new_tokens
 
-    def _rollout_sampling_params(
+    async def _serve_rollout(
         self,
+        prompt: Any,
         *,
-        max_new_tokens: int,
+        prompt_token_ids: list[int],
         greedy: bool,
         stop_strings: Optional[list[str]],
-    ) -> Any:
-        """The SamplingParams for one rollout.
+        request_id: str,
+        device: torch.device,
+    ) -> tuple[RolloutResult, Optional[Any]]:
+        """Serve one rollout from this engine: its budget, sampling, generation and result.
 
-        Kept apart from ``generate_async`` so every path that serves a rollout
-        from this engine samples it the same way.
+        Every path that serves a rollout from this engine calls this, so a rollout
+        step added here runs on all of them.
 
         Args:
-            max_new_tokens: The rollout's budget, from ``_rollout_max_new_tokens``.
+            prompt: The vLLM prompt to generate from.
+            prompt_token_ids: The learner's prompt tokens, which vLLM must have run.
             greedy: Greedy decoding instead of the configured sampling.
-            stop_strings: The sample's own stop strings, merged with the
+            stop_strings: The rollout's own stop strings, merged with the
                 configured ones.
+            request_id: The vLLM request ID.
+            device: Where to place the routed-experts tensor.
+
+        Returns:
+            The result, and vLLM's final RequestOutput (None when no new token fits).
         """
-        return self._build_sampling_params(
+        max_new_tokens = self._rollout_max_new_tokens(len(prompt_token_ids))
+        if max_new_tokens == 0:
+            return RolloutResult.nothing_generated(), None
+        sampling_params = self._build_sampling_params(
             greedy=greedy,
             stop_strings=self._merge_stop_strings(
                 [stop_strings] if stop_strings else None
             ),
             max_new_tokens=max_new_tokens,
         )
+        final_output = None
+        async for output in self.llm.generate(
+            prompt=prompt, sampling_params=sampling_params, request_id=request_id
+        ):
+            final_output = output
+        if final_output is None:
+            raise RuntimeError(f"No output received for request {request_id}")
+        validate_rollout_prompt(prompt_token_ids, final_output.prompt_token_ids)
+        result = rollout_result(
+            final_output,
+            input_length=len(prompt_token_ids),
+            return_routed_experts=self._return_routed_experts_enabled(),
+            routed_experts_dtype=self.routed_experts_dtype,
+            device=device,
+        )
+        return result, final_output
 
     async def generate_async(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         greedy: bool = False,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
-        """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
+        """Generate one sample with vLLM's AsyncLLM, yielding it when it is ready.
 
         Args:
-            data: BatchedDataDict with input_ids and input_lengths
-            greedy: Whether to use greedy decoding instead of sampling
+            data: BatchedDataDict with input_ids and input_lengths for one sample.
+            greedy: Whether to use greedy decoding instead of sampling.
 
         Yields:
-            Tuple of (original_index, BatchedDataDict conforming to GenerationOutputSpec for the single sequence)
+            (0, the sample's output conforming to GenerationOutputSpec).
         """
         if not self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError(
@@ -1926,92 +1953,26 @@ class VllmAsyncGenerationWorkerImpl(
 
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
-        input_ids_batch = data["input_ids"]
-        input_lengths_batch = data["input_lengths"]
-        batch_size = input_ids_batch.shape[0]
-
-        # Ensure generate_async only receives single samples (batch_size = 1)
+        batch_size = data["input_ids"].shape[0]
         assert batch_size == 1, (
             f"generate_async is restricted to handle only single samples, "
             f"but received batch_size={batch_size}. Please handle batching outside this method."
         )
 
-        batch_specific_stop_strings_list = data.get(
-            "stop_strings", [[] for _ in range(batch_size)]
+        input_ids = data["input_ids"][0]
+        input_length = int(data["input_lengths"][0].item())
+        prompt = self._tokenize_prompt_with_bos(
+            format_prompt_for_vllm_generation(data, 0)
         )
-
-        # Create tasks for each sample in the batch
-        async def process_single_sample(sample_idx):
-            """Process a single sample and return the result."""
-            current_input_actual_length = input_lengths_batch[sample_idx].item()
-            prompt = format_prompt_for_vllm_generation(data, sample_idx)
-            prompt = self._tokenize_prompt_with_bos(prompt)
-
-            per_sample_stop_strings = None
-            if batch_specific_stop_strings_list and sample_idx < len(
-                batch_specific_stop_strings_list
-            ):
-                per_sample_stop_strings = batch_specific_stop_strings_list[sample_idx]
-
-            max_new_tokens = self._rollout_max_new_tokens(current_input_actual_length)
-            input_ids_single_row = input_ids_batch[sample_idx]
-            if max_new_tokens == 0:
-                # No new token fits in the context: return the prompt alone.
-                result = RolloutResult.nothing_generated()
-            else:
-                sampling_params_for_request = self._rollout_sampling_params(
-                    max_new_tokens=max_new_tokens,
-                    greedy=greedy,
-                    stop_strings=per_sample_stop_strings,
-                )
-                request_id = str(uuid.uuid4())
-                final_request_output = None
-                async for req_output in self.llm.generate(
-                    prompt=prompt,
-                    sampling_params=sampling_params_for_request,
-                    request_id=request_id,
-                ):
-                    final_request_output = req_output
-                if final_request_output is None:
-                    raise RuntimeError(f"No output received for request {request_id}")
-
-                validate_rollout_prompt(
-                    input_ids_single_row[:current_input_actual_length].tolist(),
-                    final_request_output.prompt_token_ids,
-                )
-                result = rollout_result(
-                    final_request_output,
-                    input_length=current_input_actual_length,
-                    return_routed_experts=self._return_routed_experts_enabled(),
-                    routed_experts_dtype=self.routed_experts_dtype,
-                    device=input_ids_single_row.device,
-                    sample_idx=sample_idx,
-                )
-            return (
-                sample_idx,
-                rollout_output(
-                    result,
-                    input_ids=input_ids_single_row,
-                    input_length=current_input_actual_length,
-                    pad_token_id=self.cfg["_pad_token_id"],
-                ),
-            )
-
-        # Create tasks for all samples and yield results as they complete
-        sample_tasks = [
-            asyncio.create_task(process_single_sample(i)) for i in range(batch_size)
-        ]
-
-        # Yield results as they become available
-        try:
-            for completed_task in asyncio.as_completed(sample_tasks):
-                result = await completed_task
-                yield result
-        finally:
-            for task in sample_tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*sample_tasks, return_exceptions=True)
+        result, _ = await self._serve_rollout(
+            prompt,
+            prompt_token_ids=input_ids[:input_length].tolist(),
+            greedy=greedy,
+            stop_strings=(data.get("stop_strings") or [None])[0],
+            request_id=str(uuid.uuid4()),
+            device=input_ids.device,
+        )
+        yield 0, rollout_output(result, input_ids=input_ids, input_length=input_length)
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

@@ -15,7 +15,7 @@
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import is_dataclass, replace
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
 
@@ -336,9 +336,12 @@ def off_policy_sampling_error(
     Args:
         temperature: The request's temperature.
         top_p: The request's top_p. It must be explicit: vLLM resolves an unset top_p
-            from the model's generation_config.json, not to 1.0.
+            from the model's generation_config.json (``ModelConfig.generation_config``
+            defaults to ``"auto"``), not necessarily 1.0.
         top_k: The request's top_k, which must be unset or -1 (disabled), matching
-            ``BaseVllmGenerationWorker._build_sampling_params``.
+            ``BaseVllmGenerationWorker._build_sampling_params``. vLLM resolves an
+            unset top_k from generation_config.json too, so None means on-policy only
+            once the caller sends the request with top_k=-1.
         generation_config: ``policy.generation``, with the train and validation
             sampling parameters.
     """
@@ -558,22 +561,20 @@ def chat_routed_experts(
 ) -> str:
     """The routed-experts envelope the chat endpoint attaches to one choice."""
     generation_token_count = len(getattr(generation_details, "token_ids", []) or [])
-    routed_result = pad_and_align_routed_expert_indices(
-        final_request_output,
-        generation_details,
-        valid_length=prompt_token_count + generation_token_count,
-        padded_length=prompt_token_count + generation_token_count,
-        device=device,
-        require_complete_routed_experts=True,
-        return_stats=True,
-        routed_experts_dtype=routed_experts_dtype,
+    # return_stats=True returns the (routes, stats) pair.
+    routed_experts, r3_stats = cast(
+        tuple[Optional[torch.Tensor], dict[str, int]],
+        pad_and_align_routed_expert_indices(
+            final_request_output,
+            generation_details,
+            valid_length=prompt_token_count + generation_token_count,
+            padded_length=prompt_token_count + generation_token_count,
+            device=device,
+            require_complete_routed_experts=True,
+            return_stats=True,
+            routed_experts_dtype=routed_experts_dtype,
+        ),
     )
-    if not isinstance(routed_result, tuple):
-        raise RuntimeError(
-            "Expected routed_experts alignment to return stats for the "
-            "OpenAI-compatible chat endpoint."
-        )
-    routed_experts, r3_stats = routed_result
     if routed_experts is None:
         raise RuntimeError(
             "vLLM was asked to return routed experts for the "
