@@ -44,7 +44,9 @@ def _in_group(body, rank: int, world_size: int, tmp_init_file: str, q, backend):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    if backend == "nccl":
+    # Give each rank its own GPU, as a worker has. If every rank sat on GPU 0,
+    # a field landing on another rank's GPU would look correct.
+    if backend == "nccl" or torch.cuda.device_count() > rank:
         torch.cuda.set_device(rank)
     dist.init_process_group(
         backend=backend,
@@ -577,4 +579,30 @@ def test_nested_tensors_survive_nccl_leader_broadcast(tmp_path, source_device):
         partial(_nested_round_trip_body, source_device=source_device),
         str(tmp_path / "init_nested"),
         backend="nccl",
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="two CUDA devices are required to tell each rank's GPU apart",
+)
+@pytest.mark.parametrize(
+    "body",
+    [
+        _tensor_layout_round_trip_body,
+        _nested_round_trip_body,
+        _int16_byte_wire_round_trip_body,
+    ],
+    ids=["dense", "nested", "packed"],
+)
+def test_gloo_broadcast_returns_cuda_fields_to_each_ranks_own_gpu(tmp_path, body):
+    """Gloo stages on CPU, so a CUDA field must come back to this rank's GPU.
+
+    The leader describes the field by its own device string, e.g. ``cuda:0``.
+    Moving to that string puts a non-leader's field on the leader's GPU.
+    """
+    _run_two_ranks(
+        partial(body, source_device="cuda"),
+        str(tmp_path / "init_gloo_cuda"),
+        backend="gloo",
     )

@@ -631,6 +631,42 @@ def test_the_release_still_runs_without_cuda(monkeypatch):
     assert ran == [True]
 
 
+def test_the_off_loop_call_runs_on_the_callers_cuda_device(monkeypatch):
+    """await_off_loop's thread must run on the caller's CUDA device, not device 0.
+
+    Each caller used to re-set the device by hand inside ``fn``. One that
+    forgets would run its refit on GPU 0, and nothing would fail until a rank
+    on another GPU did.
+    """
+    import torch
+
+    # CUDA's current device is per thread; emulate it so this runs without GPUs.
+    current = threading.local()
+    current.device = 3
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "current_device", lambda: getattr(current, "device", 0)
+    )
+    monkeypatch.setattr(
+        torch.cuda, "set_device", lambda device: setattr(current, "device", device)
+    )
+
+    assert asyncio.run(await_off_loop(torch.cuda.current_device)) == 3
+
+
+def test_the_off_loop_call_still_runs_without_cuda(monkeypatch):
+    """A caller that never touched CUDA must not have a device set for it."""
+    import torch
+
+    def _unexpected_set_device(device):
+        raise AssertionError(f"set_device({device}) without an initialized CUDA")
+
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.cuda, "set_device", _unexpected_set_device)
+
+    assert asyncio.run(await_off_loop(lambda: "ran")) == "ran"
+
+
 class TestStandDown:
     """The deadline is for a SILENT peer, not a dead one.
 
