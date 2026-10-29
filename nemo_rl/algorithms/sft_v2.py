@@ -716,6 +716,13 @@ def setup_sft_v2(
     # cluster_init is the placement-group wait; policy_init covers the worker
     # builds and the model load, the bulk of a large-MoE start. What is left of
     # total_setup is this function's own validation and resume reads.
+    #
+    # policy_init is not comparable with the other algorithms', which exclude the
+    # placement wait only when a config pre-creates the groups for a different
+    # reason -- node constraints in grpo/ppo, a segment size in single_controller
+    # -- and report no cluster_init either way. There the wait is inside
+    # policy_init or in no phase at all; here it is always its own. total_setup is
+    # the only phase that means the same thing across algorithms.
     setup_timing = SetupTimingMetrics(
         policy_init_time_s=policy_seconds,
         total_setup_time_s=time.monotonic() - setup_started,
