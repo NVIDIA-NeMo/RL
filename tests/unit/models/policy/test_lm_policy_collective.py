@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 
@@ -33,6 +35,35 @@ def test_policy_waits_for_param_sync_before_refit(monkeypatch):
 
     assert calls == [("sync_params_before_refit", {})]
     assert waited_for == [["future"]]
+
+
+def _poll_policy(monkeypatch, worker_results):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return worker_results
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
+    )
+    policy = Policy.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+    return policy, calls
+
+
+def test_policy_poll_async_save_returns_the_workers_shared_answer(monkeypatch):
+    for answer in (True, False):
+        policy, calls = _poll_policy(monkeypatch, [answer, answer, answer])
+        assert policy.poll_async_save() is answer
+        assert calls == [("poll_async_save", {})]
+
+
+def test_policy_poll_async_save_rejects_disagreeing_workers(monkeypatch):
+    policy, _ = _poll_policy(monkeypatch, [True, False])
+    with pytest.raises(RuntimeError, match="disagree"):
+        policy.poll_async_save()
 
 
 def test_policy_forwards_nccl_peer_to_workers():

@@ -2741,6 +2741,79 @@ def test_megatron_finish_train_step_runs_manual_gc_only_after_success(
         assert events == ["manual_gc"]
 
 
+def _poll_worker(monkeypatch, *, async_save=True, queue_sizes=(1, 1)):
+    """A Megatron worker whose async queue reports ``queue_sizes`` on successive checks."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.cfg = {"generation": None}
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(
+                async_save=async_save,
+                use_persistent_ckpt_worker=True,
+                ckpt_assume_constant_structure=True,
+                async_ckpt_use_cpu_shm=True,
+            )
+        )
+    )
+    sizes = iter(queue_sizes)
+    events = []
+    monkeypatch.setattr(
+        worker_module, "is_empty_async_queue", lambda state: next(sizes) == 0
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "maybe_finalize_async_save",
+        lambda *args, **kwargs: events.append(("finalize", kwargs["blocking"])),
+    )
+    return worker_module, worker, events
+
+
+def test_megatron_poll_async_save_is_a_no_op_without_a_pending_save(monkeypatch):
+    worker_module, worker, events = _poll_worker(monkeypatch, queue_sizes=(0,))
+    assert worker_module.MegatronPolicyWorkerImpl.poll_async_save(worker) is True
+    assert events == []
+
+    worker_module, worker, events = _poll_worker(monkeypatch, async_save=False)
+    assert worker_module.MegatronPolicyWorkerImpl.poll_async_save(worker) is True
+    assert events == []
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_megatron_poll_async_save_finalizes_without_blocking(monkeypatch, finished):
+    worker_module, worker, events = _poll_worker(
+        monkeypatch, queue_sizes=(1, 0 if finished else 1)
+    )
+
+    done = worker_module.MegatronPolicyWorkerImpl.poll_async_save(worker)
+
+    assert events == [("finalize", False)]
+    assert done is finished
+
+
+def test_megatron_poll_async_save_keeps_blocking_finalize_for_unsafe_ipc_cache(
+    monkeypatch,
+):
+    worker_module, worker, events = _poll_worker(monkeypatch, queue_sizes=(1,))
+    worker._async_checkpoint_cuda_cache_active = True
+    worker._requires_nvrx_cuda_cache_release = lambda: True
+    worker.finalize_async_save = MagicMock()
+
+    assert worker_module.MegatronPolicyWorkerImpl.poll_async_save(worker) is True
+    worker.finalize_async_save.assert_called_once_with()
+    assert events == []
+
+
+def test_megatron_poll_async_save_rejects_an_open_train_step(monkeypatch):
+    worker_module, worker, events = _poll_worker(monkeypatch, queue_sizes=(1, 0))
+    worker._train_step_state = {}
+
+    with pytest.raises(RuntimeError, match="inside an open train step"):
+        worker_module.MegatronPolicyWorkerImpl.poll_async_save(worker)
+    assert events == []
+
+
 def test_megatron_move_model_does_not_serialize_extra_state():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,

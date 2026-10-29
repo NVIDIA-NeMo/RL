@@ -77,6 +77,7 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
             get_dp_leader_worker_idx=lambda shard: shard * workers_per_shard,
         ),
         dp_size=dp_size,
+        vllm_dp_size=1,
         # Declared, because VllmGeneration declares it. It used to be read with a getattr
         # default, which meant this fake could omit it and still pass -- the getattr was
         # covering for the fake rather than for a genuinely optional field.
@@ -164,6 +165,15 @@ def _no_ray(monkeypatch):
 
 
 class TestPlanRegeneration:
+    def test_vllm_dp_rebuild_is_rejected(self):
+        sync, generation, _, _, _ = _reshard(dp_size=4)
+        generation.vllm_dp_size = 2
+
+        with pytest.raises(
+            RuntimeError, match="Partial-shard rebuild is not supported with vLLM DP"
+        ):
+            sync.init_communicator()
+
     def test_the_plan_is_rebuilt_for_the_smaller_fleet(self):
         """The whole reason reshard could not simply resize."""
         sync, _, _, plan_calls, kill = _reshard(dp_size=4, dead_shards=(2,))
