@@ -14,11 +14,11 @@
 
 """Turn a finished vLLM rollout into NeMo RL's per-sample generation output.
 
-Building the per-sample result is kept apart from assembling the output tensors,
-so a path that builds the result on the engine and assembles the output
-elsewhere behaves the same as the worker's own ``generate_async``. A rollout
-feature added here, such as router replay (R3), then behaves the same on every
-path.
+The worker's ``_serve_rollout`` builds the result; ``rollout_output`` assembles
+the output tensors from it. The two are apart so a host that builds the result
+on the engine and assembles the output elsewhere returns what ``generate_async``
+returns. A rollout feature added here, such as router replay (R3), then behaves
+the same on every path.
 """
 
 import logging
@@ -55,7 +55,7 @@ class RolloutResult:
         return cls([], [], False, None, None)
 
 
-def selected_logprobs(completion: Any) -> list[float]:
+def _selected_logprobs(completion: Any) -> list[float]:
     """The sampled token's log probability at each position of a completion."""
     by_position = completion.logprobs or ()
     logprobs = []
@@ -73,7 +73,6 @@ def rollout_result(
     return_routed_experts: bool,
     routed_experts_dtype: torch.dtype,
     device: torch.device,
-    sample_idx: int = 0,
 ) -> RolloutResult:
     """Build the result of a finished rollout from vLLM's final RequestOutput.
 
@@ -83,7 +82,6 @@ def rollout_result(
         return_routed_experts: Router replay is on, so routes are required.
         routed_experts_dtype: The dtype router replay consumes.
         device: Where to place the routed-experts tensor.
-        sample_idx: For log messages only.
     """
     completion = final_output.outputs[0]
     token_ids = list(completion.token_ids)
@@ -110,17 +108,16 @@ def rollout_result(
     if return_routed_experts and r3_stats["missing_routes"] > 0:
         LOGGER.warning(
             "R3 router replay fallback: vLLM returned incomplete "
-            "routed_experts for sample_idx=%d, missing_token_routes=%d, "
-            "actual_routes=%d, expected_routes=%d. Megatron will use its "
-            "own router for those missing token routes.",
-            sample_idx,
+            "routed_experts, missing_token_routes=%d, actual_routes=%d, "
+            "expected_routes=%d. Megatron will use its own router for those "
+            "missing token routes.",
             r3_stats["missing_routes"],
             r3_stats["actual_routes"],
             r3_stats["expected_routes"],
         )
     return RolloutResult(
         token_ids=token_ids,
-        logprobs=selected_logprobs(completion),
+        logprobs=_selected_logprobs(completion),
         truncated=completion.finish_reason == "length",
         routed_experts=routed_experts,
         r3_stats=r3_stats if return_routed_experts else None,
@@ -132,7 +129,6 @@ def rollout_output(
     *,
     input_ids: torch.Tensor,
     input_length: int,
-    pad_token_id: int,
 ) -> BatchedDataDict[GenerationOutputSpec]:
     """The single-sample output ``generate_async`` yields for ``result``.
 
@@ -140,17 +136,15 @@ def rollout_output(
         result: The rollout's result.
         input_ids: The sample's (right-padded) prompt row.
         input_length: Prompt length in tokens.
-        pad_token_id: The tokenizer's pad token, as ``generate_async`` uses it.
     """
     device = input_ids.device
     generated = result.token_ids
     output_length = input_length + len(generated)
-    output_ids = torch.full(
-        (output_length,), pad_token_id, dtype=input_ids.dtype, device=device
-    )
-    output_ids[:input_length] = input_ids[:input_length]
-    output_ids[input_length:] = torch.tensor(
-        generated, dtype=input_ids.dtype, device=device
+    output_ids = torch.cat(
+        (
+            input_ids[:input_length],
+            torch.tensor(generated, dtype=input_ids.dtype, device=device),
+        )
     )
     logprobs = torch.zeros((1, output_length), dtype=torch.float32, device=device)
     logprobs[0, input_length:] = torch.tensor(

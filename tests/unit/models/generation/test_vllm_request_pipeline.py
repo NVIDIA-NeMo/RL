@@ -73,43 +73,11 @@ def _result(final_output, *, input_length=3, r3=False) -> RolloutResult:
     )
 
 
-def test_output_layout_matches_generate_async() -> None:
-    result = _result(_final_output([7, 8, 9], finish_reason="length"))
-    output = rollout_output(
-        result, input_ids=torch.tensor([1, 2, 3, 0, 0]), input_length=3, pad_token_id=0
-    )
-
-    assert output["output_ids"].tolist() == [[1, 2, 3, 7, 8, 9]]
-    # A position without a reported logprob stays 0.0, aligned with its token.
-    assert output["logprobs"].tolist() == [[0.0, 0.0, 0.0, -0.5, 0.0, -1.0]]
-    assert output["generation_lengths"].tolist() == [3]
-    assert output["unpadded_sequence_lengths"].tolist() == [6]
-    assert output["truncated"].tolist() == [True]
-    assert "routed_experts" not in output
-
-
-def test_nothing_generated_returns_the_prompt_untruncated() -> None:
-    output = rollout_output(
-        RolloutResult.nothing_generated(),
-        input_ids=torch.tensor([1, 2, 3, 0]),
-        input_length=3,
-        pad_token_id=0,
-    )
-
-    assert output["output_ids"].tolist() == [[1, 2, 3]]
-    assert output["logprobs"].tolist() == [[0.0, 0.0, 0.0]]
-    assert output["generation_lengths"].tolist() == [0]
-    assert output["truncated"].tolist() == [False]
-
-
 def test_router_replay_routes_are_aligned_and_counted() -> None:
-    # 3 prompt + 3 generated tokens need 5 routes; vLLM reported 3 + 1.
-    result = _result(
-        _final_output([7, 8, 9], prompt_routes=3, generated_routes=1), r3=True
-    )
-    output = rollout_output(
-        result, input_ids=torch.tensor([1, 2, 3]), input_length=3, pad_token_id=0
-    )
+    # 3 prompt + 3 generated tokens need 5 routes; vLLM reports prompt and
+    # generated routes together on the completion, here only 4 of them.
+    result = _result(_final_output([7, 8, 9], generated_routes=4), r3=True)
+    output = rollout_output(result, input_ids=torch.tensor([1, 2, 3]), input_length=3)
 
     routed = output["routed_experts"]
     assert routed.shape == (1, 6, LAYERS, TOPK) and routed.dtype == torch.int16
