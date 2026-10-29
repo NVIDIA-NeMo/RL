@@ -41,6 +41,7 @@ from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.codec import pad_batch
+from nemo_rl.data_plane.column_io import fetch_columns
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
 from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
@@ -57,7 +58,11 @@ from nemo_rl.data_plane.schema import (
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
-from nemo_rl.experience.route_assembly import RouteFragment, execute_route_plan
+from nemo_rl.experience.route_assembly import (
+    RouteFragment,
+    RouteLayout,
+    execute_route_plan,
+)
 from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
@@ -447,10 +452,10 @@ class TQWorkerMixin:
         """
         return None
 
-    def _routed_experts_dimensions(self) -> tuple[int, int]:
-        """Return model-owned ``(num_moe_layers, top_k)`` route dimensions."""
+    def _routed_experts_layout(self) -> RouteLayout:
+        """Return the model-owned route layout (MoE layer numbers, total layers, top-k)."""
         raise NotImplementedError(
-            "the router-replay policy worker must provide route dimensions"
+            "the router-replay policy worker must provide the route layout"
         )
 
     def _pad_value_dict(self) -> dict[str, Any]:
@@ -559,11 +564,7 @@ class TQWorkerMixin:
                         select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
                     )
                 else:
-                    td = dp_client.get_samples(
-                        sample_ids=meta.sample_ids,
-                        partition_id=meta.partition_id,
-                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-                    )
+                    td = fetch_columns(dp_client, meta, meta.fields)
                 data = _materialize_fetched(
                     td,
                     local_batch=local_batch,
@@ -617,11 +618,7 @@ class TQWorkerMixin:
                 select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
             )
         else:
-            td = dp_client.get_samples(
-                sample_ids=meta.sample_ids,
-                partition_id=meta.partition_id,
-                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-            )
+            td = fetch_columns(dp_client, meta, meta.fields)
         data = _materialize_fetched(
             td,
             local_batch=local_batch,
@@ -781,8 +778,11 @@ class TQWorkerMixin:
             ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
         )
 
-        # The worker supplies real model dims — the authoritative shape check.
-        num_moe_layers, top_k = self._routed_experts_dimensions()
+        # The worker supplies the real model layout — the authoritative shape
+        # check, and what lets a full-layer vLLM fragment be reduced to the
+        # MoE columns a hybrid model trains.
+        layout = self._routed_experts_layout()
+        num_moe_layers, top_k = layout.dims
         input_lengths = data["input_lengths"].reshape(-1).cpu().long()
         offsets = torch.nn.functional.pad(input_lengths.cumsum(0), (1, 0))
         values = torch.full(
@@ -796,7 +796,7 @@ class TQWorkerMixin:
             tensor, reason = execute_route_plan(
                 plan,
                 fragments,
-                dims=(num_moe_layers, top_k),
+                layout=layout,
                 canonical_len=canonical_len,
             )
             if tensor is None:

@@ -232,7 +232,8 @@ def prepare_loss_input(
             projects each row's teacher payload into teacher logits with them.
 
     Notes:
-        vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
+        Parallel groups are supplied by Megatron and Automodel workers.
+        Automodel uses a singleton vocabulary group for chunked local logprobs.
         sampling_params is only used for LossInputType.LOGPROB, and currently only supported for ClippedPGLossFn.
         d2t is only used for LossInputType.DRAFT.
         teacher_output_layer_weight_by_index is only used for LossInputType.OPD_FULL.
