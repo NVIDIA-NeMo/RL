@@ -676,15 +676,15 @@ class TestDynamicSamplingValidation:
             validate_single_controller_config(mc)
 
     def test_warns_when_the_spare_pool_is_smaller_than_one_batch(self):
-        # The key is a low-water mark and one refill diverts exactly one batch, so
-        # below num_prompts_per_step the pool reaches 0 between refills and groups
-        # filtered in that window shrink their step. A warning, not a raise: how much
-        # headroom a run needs depends on its drop rate, which setup cannot know.
+        # The key is a low-water mark checked once per dataloader batch, so below
+        # num_prompts_per_step the pool can empty mid-batch and groups filtered after
+        # that shrink their step. A warning, not a raise: the headroom a run needs
+        # scales with its drop rate, which setup cannot know.
         mc = _dynamic_sampling_config(
             replacement_reserve_prompts=_NUM_PROMPTS_PER_STEP - 1
         )
 
-        with pytest.warns(UserWarning, match="reaches 0 between refills"):
+        with pytest.warns(UserWarning, match="can empty between refills"):
             validate_single_controller_config(mc)
 
     def test_does_not_warn_when_the_spare_pool_holds_a_full_batch(self):

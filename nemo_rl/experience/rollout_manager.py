@@ -151,8 +151,8 @@ class RolloutOutcome(str, enum.Enum):
     # Dynamic sampling dropped the group before commit: every generation scored the
     # same, so it carries no advantage signal. The rollout itself was healthy, which is
     # why this is not SKIPPED -- the caller must replace it out of the dynamic-sampling
-    # budget rather than the rollout fault-tolerance budget, and must not let it count
-    # as a step shortfall.
+    # budget rather than the rollout fault-tolerance budget, and credits the step short
+    # only when the spare pool is dry.
     FILTERED = "filtered"
 
 

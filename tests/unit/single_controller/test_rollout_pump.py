@@ -852,6 +852,9 @@ class TestTargetGroupsForStep:
             rollout_failure=SimpleNamespace(min_step_batch_fraction=fraction)
         )
         ctrl._batch_shortfall = dict(shortfall)
+        # Read by the short-step error, which names the spare pool as a third cause
+        # when filtering is on.
+        ctrl._dynamic_sampling_enabled = False
         return ctrl
 
     def test_an_untouched_step_waits_for_the_configured_batch(self):
@@ -889,6 +892,19 @@ class TestTargetGroupsForStep:
         ctrl = self._controller(128, {0: 1}, fraction=1.0)
         with pytest.raises(RuntimeError, match="below the floor of 128"):
             ctrl._target_groups_for_step(0)
+
+    def test_the_error_names_the_spare_pool_only_under_dynamic_sampling(self):
+        # The two generic causes send the reader to the cluster. Under filtering an
+        # empty spare pool is the likelier one, and it is fixed by a config change.
+        quiet = self._controller(128, {0: 128})
+        with pytest.raises(RuntimeError) as without_filtering:
+            quiet._target_groups_for_step(0)
+        assert "spare pool" not in str(without_filtering.value)
+
+        filtering = self._controller(128, {0: 128})
+        filtering._dynamic_sampling_enabled = True
+        with pytest.raises(RuntimeError, match="an empty spare pool"):
+            filtering._target_groups_for_step(0)
 
 
 def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
