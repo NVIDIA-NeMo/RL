@@ -174,7 +174,8 @@ def configure_fp32_lm_head(
     if overrides is not None and not isinstance(overrides, dict):
         raise ValueError("vllm_kwargs.hf_overrides must be a dictionary.")
     head_dtype = (overrides or {}).get("head_dtype")
-    is_fp32_override = str(head_dtype).removeprefix("torch.") in (
+    # vLLM normalizes string dtype aliases to lowercase before resolving them.
+    is_fp32_override = str(head_dtype).lower().removeprefix("torch.") in (
         "float32",
         "float",
         "fp32",

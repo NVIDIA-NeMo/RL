@@ -2,6 +2,7 @@
 
 import copy
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -46,13 +47,25 @@ def test_fp32_head_rejects_conflicting_override(enabled: bool, head_dtype: str) 
         )
 
 
-@pytest.mark.parametrize("head_dtype", ["float32", "float", "fp32", torch.float32])
+@pytest.mark.parametrize(
+    "head_dtype", ["float32", "float", "fp32", "FLOAT32", "Float", torch.float32]
+)
 def test_fp32_head_accepts_matching_dtype_aliases(
     head_dtype: str | torch.dtype,
 ) -> None:
     kwargs = {"hf_overrides": {"head_dtype": head_dtype}}
     configure_fp32_lm_head({"fp32_lm_head": True}, kwargs)
     assert kwargs["hf_overrides"]["head_dtype"] == "float32"
+
+
+@pytest.mark.parametrize("head_dtype", ["float32", "FLOAT32", "Float", torch.float32])
+@pytest.mark.parametrize("enabled", [None, False])
+def test_disabled_fp32_head_rejects_all_fp32_aliases(
+    head_dtype: str | torch.dtype, enabled: bool | None
+) -> None:
+    cfg = {} if enabled is None else {"fp32_lm_head": enabled}
+    with pytest.raises(ValueError, match="conflicts"):
+        configure_fp32_lm_head(cfg, {"hf_overrides": {"head_dtype": head_dtype}})
 
 
 @pytest.mark.parametrize("head_dtype", ["model", "bfloat16", "float16"])
@@ -71,6 +84,68 @@ def test_fp32_head_preserves_native_lora() -> None:
     kwargs = {"enable_lora": True}
     configure_fp32_lm_head({"fp32_lm_head": True}, kwargs)
     assert kwargs == {"enable_lora": True, "hf_overrides": {"head_dtype": "float32"}}
+
+
+@torch.inference_mode()
+def _inspect_loaded_head(worker: Any) -> dict[str, str]:
+    """Probe the live model without changing its configured projection dtype."""
+    model = worker.model_runner.model
+    weight = model.lm_head.weight
+    hidden = torch.randn(2, weight.shape[1], device=weight.device, dtype=weight.dtype)
+    logits = model.compute_logits(hidden)
+    return {
+        "head_dtype": str(model.logits_processor.head_dtype),
+        "weight_dtype": str(weight.dtype),
+        "logits_dtype": str(logits.dtype),
+    }
+
+
+@pytest.mark.vllm
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fp32_head_reaches_initialized_worker(
+    tiny_qwen3_model_path: str, enabled: bool
+) -> None:
+    # Import the optional inference backend only in the vLLM test lane.
+    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
+
+    worker = VllmGenerationWorkerImpl(
+        {
+            "model_name": tiny_qwen3_model_path,
+            "vllm_cfg": {
+                "precision": "bfloat16",
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "expert_parallel_size": 1,
+                "gpu_memory_utilization": 0.3,
+                "max_model_len": 128,
+                "async_engine": False,
+                "skip_tokenizer_init": False,
+                "load_format": "auto",
+                "enforce_eager": True,
+                "enable_prefix_caching": False,
+                "fp32_lm_head": enabled,
+            },
+            "vllm_kwargs": {
+                "max_num_seqs": 2,
+                "max_num_batched_tokens": 128,
+                "attention_config": {"backend": "FLASH_ATTN"},
+            },
+        },
+        bundle_indices=[],
+        seed=42,
+    )
+    try:
+        expected = "torch.float32" if enabled else "torch.bfloat16"
+        assert worker.llm.collective_rpc(_inspect_loaded_head) == [
+            {
+                "head_dtype": expected,
+                "weight_dtype": "torch.bfloat16",
+                "logits_dtype": expected,
+            }
+        ]
+    finally:
+        worker.shutdown()
 
 
 @pytest.mark.vllm
