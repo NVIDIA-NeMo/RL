@@ -50,10 +50,16 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer import MegatronModule
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType, MetricNormalizer
-from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    attach_media_token_validity_mask,
+    chunks_accept_media_token_validity_mask,
+    media_placeholder_token_id_from_chunks,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
@@ -139,7 +145,18 @@ def _report_multimodal_input_once(worker: Any, data: BatchedDataDict[Any]) -> No
     worker._reported_multimodal_input = True
 
 
-def _value_head_parent(chunk: GPTModel) -> tuple[Any, str]:
+def _model_media_placeholder_token_id(model: Any) -> Optional[int]:
+    """Return the media token only when the model explicitly accepts its mask."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    if not chunks_accept_media_token_validity_mask(chunks):
+        return None
+    return media_placeholder_token_id_from_chunks(chunks)
+
+
+def _value_head_parent(chunk: MegatronModule) -> tuple[Any, str]:
     """Return the module and state-dict path that own a chunk's language head.
 
     Plain GPT models expose ``output_layer`` directly. Megatron-Bridge VLM
@@ -158,7 +175,9 @@ def _value_head_parent(chunk: GPTModel) -> tuple[Any, str]:
     )
 
 
-def _install_value_head_load_skip(chunk: GPTModel, output_layer_path: str) -> None:
+def _install_value_head_load_skip(
+    chunk: MegatronModule, output_layer_path: str
+) -> None:
     """Install ``hide_loss_modules`` for the actual scalar-head state-dict path.
 
     The freshly-initialized value head is never in a base checkpoint, so Megatron-Bridge
@@ -550,6 +569,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             self.model,
             self.optimizer,
         )
+        self.media_placeholder_token_id = _model_media_placeholder_token_id(self.model)
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
         self._maybe_enable_manual_gc()
@@ -586,6 +606,9 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         """
         if self._train_step_state is not None:
             raise RuntimeError("finish or abort the open value train step before train")
+        attach_media_token_validity_mask(
+            data, getattr(self, "media_placeholder_token_id", None)
+        )
         _report_multimodal_input_once(self, data)
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
@@ -1053,6 +1076,9 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                 "finish or abort the value train step before inference/offload"
             )
 
+        attach_media_token_validity_mask(
+            data, getattr(self, "media_placeholder_token_id", None)
+        )
         _report_multimodal_input_once(self, data)
         no_grad = torch.no_grad()
         no_grad.__enter__()
