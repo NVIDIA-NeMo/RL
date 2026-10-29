@@ -51,6 +51,8 @@ shows them all:
 |---|---|---|
 | `startup_timeout_s` | 600 | Bounds service start-up and engine registration |
 | `request_timeout_s` | null | Deadline for one NeMo RL rollout through the frontend. null waits as long as generation takes, as native does; on the SingleController, `async_rl.rollout_failure.native.generation_timeout_s` bounds both paths |
+| `worker_args.tool_call_parser`, `reasoning_parser` | null | Dynamo's built-in parser names. null follows the native server's settings; see [Chat settings](#chat-settings) |
+| `worker_args.custom_jinja_template` | null | A chat template that replaces the model's own. null follows the native server's |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags |
 
@@ -71,7 +73,31 @@ native path: token IDs, log probabilities, truncation, routed experts with
 their `r3_routed_experts_*` counts, and `gen_leader_worker_idx`. Both paths
 build it with `nemo_rl/models/generation/vllm/request_pipeline.py`.
 
-The engines serve only these rollouts; the frontend refuses other requests.
+OpenAI clients of the frontend get what vLLM's own OpenAI server applies:
+- the model's generation-config sampling defaults;
+- `n > 1`;
+- guided decoding (`guided_*`, `response_format`);
+- `bad_words_token_ids` and `allowed_token_ids`;
+- prompt log probabilities (`nvext.extra_fields: ["prompt_logprobs"]`);
+- vLLM's queue limits, rejected with HTTP 503;
+- a 400 naming the "maximum context length" for a prompt that leaves no room
+  for output. The engine, not the frontend, checks the context, so it checks
+  the prompt it actually runs.
+
+## Chat settings
+
+The native server's chat settings carry over to the frontend:
+
+| Native setting (`vllm_cfg`) | Under Dynamo |
+|---|---|
+| `http_server_serving_chat_kwargs.tool_parser`, `reasoning_parser` | The frontend's parsers, under Dynamo's names: NeMo RL's `nano_v3` plugin is `nemotron_v3`, vLLM's `openai` tool parser is `harmony` |
+| `tool_parser_plugin`, `reasoning_parser_plugin` | Python plugins cannot run in the Rust frontend. Startup asks for `dynamo_cfg.worker_args` to name a Dynamo parser, unless the plugin has a rename above |
+| `http_server_serving_chat_kwargs.chat_template` | The frontend's template, as a file, a vLLM template name or literal Jinja |
+| `http_server_serving_chat_kwargs.enable_auto_tools`, `chat_template_content_format` | The frontend always parses `tool_choice: auto` calls and has no content-format setting, so only the defaults (`true`, `auto`) are accepted |
+
+Where the behavior differs from the native endpoint: when a request sets
+`chat_template_kwargs.force_nonempty_content`, Dynamo reports a reasoning-only
+turn as content.
 
 ## Not supported
 
@@ -91,6 +117,8 @@ Startup rejects these with `dynamo: true`:
   on 0.0.0.0 and checks no bearer token.
 - `frontend_args.router_mode: direct`: it needs a worker ID on every request, and
   NeMo RL's rollouts name none.
+- Parser plugins with no Dynamo parser, and the chat settings above that the
+  frontend has no counterpart for.
 - `dynamo: true` on a backend other than vLLM, and a `dynamo_cfg` block without
   `dynamo: true`.
 
@@ -136,5 +164,5 @@ is the same run with every `dynamo_cfg` default spelled out.
 `backend: dynamo` launched Dynamo's own vLLM engine and was removed. Set
 `backend: vllm` and `dynamo: true`; `vllm_cfg` and `vllm_kwargs` keep their
 meaning. Startup rejects the old backend and each removed `dynamo_cfg` key
-(`engine`, `control_timeout_s`, `metrics_*_prefixes`, `worker_args`,
+(`engine`, `control_timeout_s`, `metrics_*_prefixes`, `worker_args.extra_cli_args`,
 `frontend_args.tokenizer*`) with what replaces it.

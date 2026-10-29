@@ -414,7 +414,7 @@ def _generation_config(**generation) -> dict:
         ),
         (
             {"dynamo_cfg": {"worker_args": {"extra_cli_args": []}}},
-            r"dynamo_cfg\.worker_args was",
+            r"worker_args\.extra_cli_args",
         ),
         (
             {"dynamo_cfg": {"frontend_args": {"tokenizer_cache": False}}},
