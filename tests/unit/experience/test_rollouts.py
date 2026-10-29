@@ -2589,6 +2589,7 @@ def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
         assert kwargs["log_full_result_tables"] is False
         assert kwargs["deduplicate_multimodal_data"] is True
         assert kwargs["debug_payload_metrics"] is True
+        assert kwargs["allow_straggler_cutoff"] is True
         yield expected
 
     monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_stream)
@@ -2603,6 +2604,7 @@ def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
         num_generations_per_prompt=2,
         deduplicate_multimodal_data=True,
         debug_payload_metrics=True,
+        allow_straggler_cutoff=True,
     )
 
     assert actual is expected

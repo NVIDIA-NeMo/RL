@@ -549,6 +549,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported. Managed Dynamo pauses its engines before every refit because its weight update is unsafe while requests run, but that is not the drain gate: running requests finish on the old weights, while queued requests and later turns of a multi-turn rollout run on the new ones.
+- `env.nemo_gym.straggler_cutoff` (the synchronous trainers' batch-level cutoff of slow Gym rollouts) never applies on SC, which bounds slow rollouts with `async_rl.rollout_failure.nemo_gym.rollout_timeout_s` and asynchronous admission instead; the block is accepted but has no effect here.
 
 ### Full training-data dumps
 

@@ -693,6 +693,7 @@ def test_find_gym_config_entries_ignores_scalars_and_known_keys():
             "allowed_duplicate_entries": ["policy_model"],
             "effort_levels": {"low_weight": 0.0},
             "external_service_readiness": {"services": []},
+            "straggler_cutoff": {"enabled": True, "grace_s": 60},
             "tokenizer_config": {"name": "policy"},
             "genrm_model": {"responses_api_models": {}},
             "safety_judge_model": {"responses_api_models": {}},
@@ -724,3 +725,21 @@ def test_external_service_readiness_reaches_every_shard():
     for shard in plan.shards:
         merged = apply_shard_overlay(config, plan, shard)
         assert merged["external_service_readiness"] == readiness
+
+
+def test_straggler_cutoff_reaches_every_shard():
+    """The cutoff is a NeMo RL setting every actor applies, not an overlay one shard claims.
+
+    Read as an overlay, a two-shard plan would reject the block as unowned, and
+    claiming it under one shard would leave the other shards running uncut.
+    """
+    cutoff = {"enabled": True, "done_fraction": 0.95, "grace_s": 300}
+    config = _sharded_config(straggler_cutoff=cutoff)
+
+    plan = parse_shard_plan(config)
+
+    assert plan is not None
+    assert find_gym_config_entries(config) == []
+    for shard in plan.shards:
+        merged = apply_shard_overlay(config, plan, shard)
+        assert merged["straggler_cutoff"] == cutoff
