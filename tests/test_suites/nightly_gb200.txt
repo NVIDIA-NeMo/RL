@@ -38,6 +38,8 @@ tests/test_suites/llm/grpo-qwen2.5-0.5b-1n4g-megatron-trtllm-noncolocated-async.
 tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.sh
 
 tests/test_suites/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated.sh
+# Same recipe with the shard-to-shard (nccl_reshard) refit into TRT-LLM's EP slots.
+tests/test_suites/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated-reshard.sh
 
 # Functional moonlight run
 tests/test_suites/llm/grpo-moonlight-16ba3b-4n4g-megatron.sh
