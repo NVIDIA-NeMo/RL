@@ -373,7 +373,9 @@ def test_validate_model_type_rejects_other_models():
 
 
 def _fused_expert_stacks(num_experts: int):
-    gate = torch.stack([_block_matrix([[float(2 * e + 1), 2.0]]) for e in range(num_experts)])
+    gate = torch.stack(
+        [_block_matrix([[float(2 * e + 1), 2.0]]) for e in range(num_experts)]
+    )
     up = torch.stack([_block_matrix([[5.0, float(e + 1)]]) for e in range(num_experts)])
     down = torch.stack(
         [_block_matrix([[9.0], [float(10 + e)]]) for e in range(num_experts)]
