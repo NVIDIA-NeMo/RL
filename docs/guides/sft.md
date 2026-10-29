@@ -561,6 +561,24 @@ For the full reference — backend support, the Automodel vs Megatron schema com
 
 ## Optimizations
 
+### Overlap Async Checkpoint Writes with Training (SFT v2)
+
+With `policy.megatron_cfg.checkpoint.async_save: true`, a save returns once the weights are staged in host memory and the disk write continues in a background process. By default the next training step still waits for that write: the finalize is queued on the policy workers right after the save. SFT v2 can instead finalize the save at a later step boundary, once every rank's write is done, so the write overlaps training:
+
+```yaml
+sft:
+  defer_async_checkpoint_finalize: true
+policy:
+  megatron_cfg:
+    checkpoint:
+      async_save: true
+```
+
+**Notes:**
+
+- SFT v2 only (`examples/run_sft_v2.py`); SFT v1 rejects the key, and SFT v2 rejects it without `async_save`.
+- `tmp_step_N` is renamed to `step_N` only after the finalize, and resume reads only `step_N`. A crash in that window — typically one step — resumes from the previous checkpoint. The next save, training exit, and teardown after a failure still finalize blocking, so the save is published whenever the policy workers are still alive.
+
 ### Chunked Linear Cross-Entropy Fusion Loss
 
 During standard SFT training the model materializes a full logit tensor of shape `[batch_size, seq_length, vocab_size]`, which can cause out-of-memory (OOM) errors for long sequences or large vocabularies. The **chunked linear cross-entropy fusion loss** avoids this by computing the loss directly from the hidden states: it chunks the sequence dimension, projects each chunk to logits on the fly, computes per-token log probabilities, and discards the logits before moving to the next chunk.
