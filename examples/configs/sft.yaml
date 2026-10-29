@@ -13,6 +13,9 @@ sft:
   val_at_end: false
   seed: 42
   only_unmask_final: false
+  # SFT v2 + policy.megatron_cfg.checkpoint.async_save only: finalize async checkpoints
+  # at a later step boundary so the disk write overlaps training (see SFTConfig).
+  defer_async_checkpoint_finalize: false
 
 checkpointing:
   enabled: true
@@ -310,6 +313,7 @@ data:
 
 logger:
   log_dir: "logs"  # Base directory for all logs
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
   mlflow_enabled: false

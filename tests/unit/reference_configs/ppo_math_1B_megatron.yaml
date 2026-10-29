@@ -265,6 +265,7 @@ policy:
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
+    lora_refit_mode: native
     mcore_generation_config:
       buffer_size_gb: 20
       cuda_graph_sizing_distribution: hybrid
@@ -475,6 +476,7 @@ env:
 logger:
   log_dir: "logs"
   num_val_samples_to_print: 0
+  extra_backends: []
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false
