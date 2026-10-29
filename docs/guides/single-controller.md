@@ -184,6 +184,11 @@ The TQ snapshot and replay index are captured under the same checkpoint barrier.
 
 On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
 
+Only the current `rollout_recovery.pt` schema is accepted, for every recovery
+level. Data-plane checkpoints written with an earlier schema, such as those from
+releases before turn-level recovery, cannot be resumed; start those runs in a
+new `checkpoint_dir`.
+
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
 
 ### Periodic rollout snapshots
@@ -301,9 +306,10 @@ checkpoint exists.
 
 :::{note}
 Completed groups are restored directly from the TQ snapshot. For unfinished
-token-capture groups, `rollout_recovery.default_granularity` controls both live
-failure and restart behavior:
+token-capture groups, `rollout_recovery.target_level` selects the requested
+restart boundary:
 
+- `turn` requests coordinated Gym participant recovery from the last saved turn.
 - `sibling` preserves each sealed sibling and redispatches only unfinished ones.
 - `prompt_group` retries every sibling in the group when any sibling is unfinished.
 
@@ -311,16 +317,100 @@ failure and restart behavior:
 `prompt_group` when every generation in a recovered group must come from the
 policy weights live at redispatch.
 
-`task_source_granularity_overrides` can select the policy using the Gym
+Turn recovery coordinates Gym and RL as one rollout-snapshot cut. Each prompt group
+is pinned to the Gym shard replica that accepted it. SC first closes its narrow
+`/run` dispatch admission gate; already-submitted requests, completion callbacks,
+finalization, and TQ writes remain live. Gym parks its participants and commits
+the subset of candidate episodes it still owns into the checkpoint's
+`gym-instances/` tree. Candidate replies already on the wire drain through the
+ordinary RL/TQ completion path. SC then acquires the exclusive data-plane
+barrier, verifies that the remaining Gym-owned episodes and their TQ staging
+keys match the Gym commit, and captures TQ plus the rollout ledger. Gym reports
+as restarts the episodes a participant cannot capture, such as rollouts on a
+restart-only resources server or on an agent without checkpoint support. SC
+leaves them out of the commit, does not wait for them, and records them in
+`gym_checkpoint.json`; they keep running, and after a crash they start over from
+their tasks. If any other candidate is neither exported by Gym nor drained before
+the deadline, the checkpoint aborts and every deployment is resumed.
+
+Because a restart-only server would make turn-level recovery quietly restart its
+rollouts, SC reads every Gym participant's checkpoint `mode` from discovery
+before the first rollout. If any server's mode is `restart_only` (the default for
+agents and resources servers), setup fails and names it, unless
+`rollout_recovery.allow_restart_only_gym_servers` is true, which accepts it with
+a warning. Each saved snapshot logs `gym_restarted_episodes`, the episodes that
+would start over after a crash.
+
+Gym leases are renewed throughout. Gym resumes as soon as the cut is captured,
+before SC writes its sidecars and publishes the snapshot, so new rollouts wait
+only for the Gym commit and the TQ capture, not for the publish. Gym's own
+coordination guide publishes first and resumes after; resuming first is safe
+because every Gym commit is already written and resume only reopens admission. A
+resume that still fails after a successful cut is logged as a warning instead of
+failing the snapshot: that deployment reopens on its own once its lease grace,
+`3 * token_capture.control_timeout_s`, runs out.
+
+Gym keeps a rollout it retired, or continued through a restore, refused by ID
+on every participant until the controller forgets it. Before each prepare,
+while Gym is idle, SC retires the episodes it dropped since the last snapshot
+and then forgets them, together with restored rollouts whose continued attempt
+has since sealed; RL never sends those rollout IDs again. A deployment that
+refuses the forget gets the retire again and then the forget. Forgetting is
+best effort: a deployment that still refuses keeps its rollouts queued for the
+next snapshot, since each costs one small entry, and the snapshot goes ahead.
+
+`rollout_recovery.gym_prepare_timeout_s` (default 300 seconds) bounds how long
+Gym gets to park its in-flight steps; raise it for long agent or environment
+steps. Every other Gym control call keeps `token_capture.control_timeout_s`. A
+snapshot whose Gym cannot park in time, or is unavailable, is skipped and
+retried under the `max_consecutive_failures` budget. The stall watchdog keeps
+counting while Gym is parked, so setup requires
+`async_rl.stall_watchdog.stall_timeout_s` to exceed `gym_prepare_timeout_s +
+2 * token_capture.control_timeout_s`; raise it together with the prepare
+timeout.
+
+Gym state is saved only in rollout snapshots. A trainer checkpoint never pauses
+Gym, so a slow or unavailable Gym cannot fail it. It wakes the snapshot loop,
+which captures Gym anchored to it as soon as the checkpoint is durable.
+
+On restart, SC validates that the episodes `gym_checkpoint.json` saves, together
+with those it records as restarts, are exactly the episodes owned by the rollout
+ledger, and that the saved Gym actor topology matches the live one. It restores
+Gym before starting rollout dispatch, advances each restored episode to its next
+attempt, and routes it back to the same Gym actor; recorded restarts start over
+from their tasks.
+If one shard replica fails restore, every replica conservatively retires its
+replacement attempts before the outer restore fails. This also covers a lost
+Ray reply where the remote restore may actually have succeeded, so a partially
+restored topology is never released for execution. A second checkpoint taken
+after restore but before redispatch includes the unclaimed restored attempt, so
+another crash does not lose the saved turn boundary.
+
+If no rollout snapshot follows the newest trainer checkpoint, SC restores that
+checkpoint on its own: completed groups come back from TQ and unfinished
+turn-level rollouts restart from their tasks. A rollout snapshot without its
+`gym_checkpoint.json` is refused.
+
+The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
+periodic rollout snapshots, `restore_mode: latest`, and the same named Gym
+shards and replica counts on restart. Only checkpoints using the current rollout
+recovery schema are accepted.
+
+`task_source_target_level_overrides` can coarsen the target using the Gym
 `task_source` embedded in the raw rollout row. Unlike `agent_ref`, this identity
 is available before Gym resolves the concrete agent and SC reserves the recovery
 group. When a row already carries an `agent_ref`, a matching
-`agent_granularity_overrides` entry wins over a matching task-source entry,
+`agent_target_level_overrides` entry wins over a matching task-source entry,
 mirroring Gym's concrete-route precedence. Otherwise the task-source override,
 then the global default, applies. The agent map also keeps datasets collated
 before Gym recorded `task_source` working, although re-collating them is
-recommended. Non-default policies require `token_capture.enabled: true`. The
-task source and resolved policy are persisted in `rollout_recovery.pt`, so
+recommended. Overrides may only select a coarser level than the global target,
+and are not supported with `turn` yet: a checkpointing Gym deployment exports
+every live episode, so a coarser route on it would fall outside the commit
+scope. Until Gym advertises group-scoring capabilities, configure group-scored routes
+such as GenRM explicitly as `prompt_group`. Non-default policies require
+`token_capture.enabled: true`. The task source and resolved policy are persisted
+in `rollout_recovery.pt`, so
 recovery does not reinterpret an existing group using changed configuration. A
 generation that already finished keeps its tokens in the token-capture staging
 area, so `sibling` reuses them unchanged; a redispatched sibling produces a new

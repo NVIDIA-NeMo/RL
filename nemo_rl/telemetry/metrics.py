@@ -212,6 +212,7 @@ _CHECKPOINT_DURATION_PHASES = {
     "exclusive_hold_seconds": "exclusive_hold",
     "sidecar_save_seconds": "sidecar_save",
     "snapshot_commit_seconds": "publication",
+    "gym_parked_seconds": "gym_parked",
     "total_load_seconds": "total",
     "snapshot_resolution_seconds": "snapshot_resolution",
     "dataloader_load_seconds": "dataloader_load",
@@ -230,6 +231,9 @@ _CHECKPOINT_LEVELS = {
     "groups_unfinished_found": (_CHECKPOINT_GROUPS_KEY, "unfinished"),
     "siblings_reused": (_CHECKPOINT_SIBLINGS_KEY, "reused"),
     "siblings_rerun": (_CHECKPOINT_SIBLINGS_KEY, "rerun"),
+    "siblings_continued": (_CHECKPOINT_SIBLINGS_KEY, "continued"),
+    "siblings_restarted": (_CHECKPOINT_SIBLINGS_KEY, "restarted"),
+    "gym_restarted_episodes": (_CHECKPOINT_SIBLINGS_KEY, "gym_restarted"),
     "controller_sidecar_bytes": (_CHECKPOINT_SIDECAR_BYTES_KEY, "controller"),
 }
 
