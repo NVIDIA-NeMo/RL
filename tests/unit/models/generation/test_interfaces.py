@@ -74,3 +74,7 @@ def test_agreed_media_columns_rejects_disagreeing_workers():
                 MediaColumnSpec(pixel_dtype=torch.float32, patch_size=16),
             ]
         )
+
+
+def test_a_backend_with_no_layout_to_report_has_an_empty_timeline_topology():
+    assert _MinimalGeneration().timeline_topology() == []

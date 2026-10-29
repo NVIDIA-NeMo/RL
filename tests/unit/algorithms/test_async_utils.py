@@ -69,6 +69,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.timer import timeline_clock_id
 
 
 @ray.remote(num_cpus=0)
@@ -4260,3 +4261,68 @@ def test_turn_count_fallback_priority():
     assert f({"turns_per_sample/max": 5, "turns_per_sample/mean": 3}) == 5.0
     assert f({"turns_per_sample/mean": 6}) == 6.0
     assert f({"reward": 1.0}) is None
+
+
+class TestReplayBufferRolloutLifecycle:
+    """Rollout lifecycle records for the collect-training-timeline skill."""
+
+    @staticmethod
+    def _records(path):
+        import json
+
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_buffered_and_consumed_records_carry_gym_rollout_ids(self, tmp_path):
+        path = str(tmp_path / "logs" / "rollout_lifecycle.jsonl")
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=False,
+            lifecycle_log_path=path,
+        )
+        group = {
+            "batch": SimpleNamespace(size=2),
+            "rollout_metrics": {},
+            NEMO_GYM_TASK_INDEX_KEY: 7,
+        }
+
+        assert buffer.add(group, weight_version=4, target_weight_version=5) == "success"
+        assert buffer.sample(
+            num_prompt_groups=1, current_weight_version=5, max_age_steps=1
+        )
+
+        records = self._records(path)
+        buffered = [r for r in records if r["event"] == "rollout_buffered"]
+        consumed = [r for r in records if r["event"] == "rollout_consumed"]
+        # Same "{_ng_task_index}-{_ng_rollout_index}" id Gym stamps on each run.
+        assert [r["rollout_id"] for r in buffered] == ["7-0", "7-1"]
+        assert [r["rollout_id"] for r in consumed] == ["7-0", "7-1"]
+        assert buffered[0]["generation_weight_version"] == 4
+        assert buffered[0]["target_display_step"] == 6
+        assert consumed[0]["consumed_display_step"] == 6
+        assert consumed[0]["disposition"] == "consumed_as_targeted"
+        # Keys the host's clock_calibration.jsonl offset for these records.
+        assert {r["clock_id"] for r in records} == {timeline_clock_id()}
+
+    def test_groups_without_a_task_index_write_nothing(self, tmp_path):
+        path = str(tmp_path / "rollout_lifecycle.jsonl")
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=False,
+            lifecycle_log_path=path,
+        )
+
+        buffer.add(
+            {"batch": SimpleNamespace(size=2), "rollout_metrics": {}},
+            weight_version=0,
+            target_weight_version=1,
+        )
+
+        assert self._records(path) == []
+
+    def test_logging_is_off_without_a_path(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+
+        assert buffer.lifecycle_log_path is None

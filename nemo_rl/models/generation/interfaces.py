@@ -499,6 +499,15 @@ class GenerationInterface(ABC):
             master_config: The single-controller MasterConfig.
         """
 
+    def timeline_topology(self) -> list[dict[str, Any]]:
+        """Engine layout for the collect-training-timeline skill.
+
+        Returns:
+            One record per engine that maps it to its replica, role and host, or an
+            empty list for a backend with nothing to report.
+        """
+        return []
+
     @abstractmethod
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int

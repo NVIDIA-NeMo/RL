@@ -18,6 +18,7 @@ import gc
 import hashlib
 import json
 import math
+import os
 import statistics
 import threading as _threading
 import time
@@ -59,6 +60,7 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.path_utils import load_checkpoint_object, save_checkpoint_object
 from nemo_rl.utils.r3_trace import trace_rollout_payload
+from nemo_rl.utils.timer import timeline_clock_id
 
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"
 REPLAY_BUFFER_METADATA_FILENAME = "replay_buffer_metadata.pt"
@@ -392,10 +394,25 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         self,
         max_size: int,
         drop_incomplete_targets_on_restore: bool,
+        lifecycle_log_path: Optional[str] = None,
     ) -> None:
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
+        # Best-effort rollout lifecycle JSONL (collect-training-timeline skill):
+        # one record per rollout when buffered and when consumed by training.
+        self.lifecycle_log_path = lifecycle_log_path or None
+        if self.lifecycle_log_path is not None:
+            try:
+                os.makedirs(os.path.dirname(self.lifecycle_log_path) or ".", exist_ok=True)
+                with open(self.lifecycle_log_path, "a"):
+                    pass
+            except OSError as error:
+                print(
+                    "⚠️ Disabling rollout lifecycle logging because "
+                    f"{self.lifecycle_log_path} is not writable: {error}"
+                )
+                self.lifecycle_log_path = None
         # True discards partial restored rows. The dataloader is not rewound,
         # so replacement rollouts come from subsequent prompts.
         self._drop_incomplete_targets_on_restore = drop_incomplete_targets_on_restore
@@ -406,6 +423,76 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
+
+    def _append_lifecycle_events(self, events: list[dict[str, Any]]) -> None:
+        """Append rollout lifecycle records from this single-writer actor."""
+        if self.lifecycle_log_path is None or not events:
+            return
+        try:
+            fd = os.open(
+                self.lifecycle_log_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o644,
+            )
+            try:
+                for event in events:
+                    os.write(fd, (json.dumps(event, separators=(",", ":")) + "\n").encode())
+            finally:
+                os.close(fd)
+        except (OSError, TypeError, ValueError) as error:
+            print(f"⚠️ Failed to append rollout lifecycle events: {error}")
+            self.lifecycle_log_path = None
+
+    @staticmethod
+    def _rollout_lifecycle_events(
+        trajectory: dict[str, Any],
+        *,
+        event: str,
+        weight_version: int,
+        target_weight_version: int,
+        consumed_weight_version: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """One record per rollout of a prompt group.
+
+        The rollout id is NeMo Gym's run-body correlation id
+        ``"{_ng_task_index}-{_ng_rollout_index}"`` (nemo_gym.rollout_correlation),
+        which the SWE agent also writes into each rollout's timeline.jsonl.
+        """
+        task_index = trajectory.get(NEMO_GYM_TASK_INDEX_KEY)
+        batch = trajectory.get("batch")
+        num_samples = getattr(batch, "size", None)
+        if task_index is None or not isinstance(num_samples, int):
+            return []
+        timestamp_us = time.time_ns() // 1_000
+        records: list[dict[str, Any]] = []
+        for sample_idx in range(num_samples):
+            record: dict[str, Any] = {
+                "event": event,
+                "ts": timestamp_us,
+                "clock_id": timeline_clock_id(),
+                "rollout_id": f"{task_index}-{sample_idx}",
+                "prompt_idx": task_index,
+                "sample_idx": sample_idx,
+                "generation_weight_version": weight_version,
+                "target_weight_version": target_weight_version,
+                "target_display_step": target_weight_version + 1,
+            }
+            if consumed_weight_version is not None:
+                if target_weight_version > consumed_weight_version:
+                    disposition = "consumed_early"
+                elif target_weight_version < consumed_weight_version:
+                    disposition = "consumed_late"
+                else:
+                    disposition = "consumed_as_targeted"
+                record.update(
+                    {
+                        "consumed_weight_version": consumed_weight_version,
+                        "consumed_display_step": consumed_weight_version + 1,
+                        "disposition": disposition,
+                    }
+                )
+            records.append(record)
+        return records
 
     @staticmethod
     def _rollout_metrics_turn_count_for_diagnostics(
@@ -447,6 +534,14 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.trajectories.append(trajectory)
             self.trajectory_versions.append(weight_version)
             self.target_weight_versions.append(target_weight_version)
+            self._append_lifecycle_events(
+                self._rollout_lifecycle_events(
+                    trajectory,
+                    event="rollout_buffered",
+                    weight_version=weight_version,
+                    target_weight_version=target_weight_version,
+                )
+            )
             # Do not advance last_target_weight_already_generated here. A target
             # is only safe to skip once training consumes a complete batch for it.
             print(
@@ -648,6 +743,18 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
             # Remove selected items in reverse order to maintain correct indices
             sampled_items = [self.trajectories[i] for i in selected]
+            lifecycle_events: list[dict[str, Any]] = []
+            for idx in selected:
+                lifecycle_events.extend(
+                    self._rollout_lifecycle_events(
+                        self.trajectories[idx],
+                        event="rollout_consumed",
+                        weight_version=self.trajectory_versions[idx],
+                        target_weight_version=self.target_weight_versions[idx],
+                        consumed_weight_version=current_weight_version,
+                    )
+                )
+            self._append_lifecycle_events(lifecycle_events)
             self._remove_indices(selected)
 
             old_last_target = self.last_target_weight_already_generated

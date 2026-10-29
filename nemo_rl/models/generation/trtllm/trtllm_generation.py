@@ -203,6 +203,9 @@ class TrtllmGeneration(GenerationInterface):
         # disaggregation is on. See _start_disagg_servers.
         self._disagg_actors: list[ray.actor.ActorHandle] = []
         self._disagg_server_urls: list[Optional[str]] = []
+        # Engine -> replica / role / host records for the timeline skill; filled
+        # by _start_disagg_servers and read through timeline_topology().
+        self._engine_topology: list[dict[str, Any]] = []
         # The synchronous TRT-LLM engine path is no longer supported: only the
         # async worker wires up colocated sleep/wakeup, IPC-ZMQ refit, and
         # per-sample streaming. Fail loudly at setup rather than silently
@@ -680,6 +683,24 @@ class TrtllmGeneration(GenerationInterface):
                 futures.append(actor.start.remote())
 
         self._disagg_server_urls = ray.get(futures)
+        self._engine_topology = []
+        for engine_idx, addr in enumerate(addrs):
+            replica_idx = engine_idx // per_replica
+            self._engine_topology.append(
+                {
+                    "event": "engine_topology",
+                    "engine_index": engine_idx,
+                    "replica_idx": replica_idx,
+                    "role": self._engine_roles[engine_idx],
+                    "tensor_parallel_size": self._engine_tps[engine_idx],
+                    "host": addr["host"],
+                    "port": addr["port"],
+                    "ray_node_id": addr["node_id"],
+                    "frontend_urls": self._disagg_server_urls[
+                        replica_idx * n_fe : (replica_idx + 1) * n_fe
+                    ],
+                }
+            )
         print(
             f"  ✓ PD disaggregation: {self.num_replicas} replica(s) x "
             f"({num_prefill} prefill + {num_decode} decode) engines, "
@@ -688,6 +709,10 @@ class TrtllmGeneration(GenerationInterface):
             flush=True,
         )
         return self._disagg_server_urls
+
+    def timeline_topology(self) -> list[dict[str, Any]]:
+        """Engine layout; empty until the disagg servers have started."""
+        return list(self._engine_topology)
 
     def _run_on_engines(
         self,

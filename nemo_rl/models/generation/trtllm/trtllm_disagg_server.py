@@ -27,12 +27,17 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+    _COLLECT_TIMELINE_FIELDS,
+)
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "DisaggServerActor",
     "DisaggServerActorImpl",
     "attach_rollout_fields",
+    "attach_timeline_fields",
     "build_config",
     "generation_token_ids",
     "start_server",
@@ -118,6 +123,26 @@ _TOKEN_ID_PREFIX = "token_id:"
 # Paths whose bodies are validated against TRT-LLM's extra="forbid" models.
 _ADAPTED_PATHS = frozenset({"/v1/chat/completions", "/v1/completions"})
 
+# Frontend timeline stamps: the request middleware records them as scope
+# headers, and the route wrapper moves them onto the final response.
+_FE_STAMP_HEADERS = (
+    ("x-nemo-fe-recv-us", "nemo_fe_recv_ts_us"),
+    ("x-nemo-fe-fwd-us", "nemo_fe_fwd_ts_us"),
+)
+
+# Context-leg timeline fields trtllm_http_server emits on the ctx response;
+# the generation response is all the caller sees, so they are relayed.
+_CTX_STAMP_FIELDS = (
+    "nemo_ctx_arrival_ts_us",
+    "nemo_ctx_queued_ts_us",
+    "nemo_ctx_first_scheduled_ts_us",
+    "nemo_ctx_done_ts_us",
+    "nemo_ctx_cached_tokens",
+    "nemo_ctx_computed_tokens",
+    "nemo_ctx_first_begin",
+    "nemo_ctx_num_chunks",
+)
+
 
 def generation_token_ids(choice: dict[str, Any]) -> Optional[list[int]]:
     """Generated token ids, from whichever declared field carries them.
@@ -175,6 +200,33 @@ def attach_rollout_fields(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def attach_timeline_fields(
+    payload: dict[str, Any],
+    headers: Any,
+    ctx_stamps: Optional[dict[str, int]],
+) -> dict[str, Any]:
+    """Add, in place, the frontend and context-leg timeline fields.
+
+    With the generation adapter's own ``nemo_llm_*`` set already on the
+    payload, these complete the per-call path decomposition: frontend hold,
+    ctx submit, ctx queue, prefill, then the generation leg.
+
+    Args:
+        payload: The final chat-completion response body.
+        headers: The inbound request headers, carrying the frontend stamps the
+            request middleware recorded.
+        ctx_stamps: The ``nemo_ctx_*`` fields captured off the context-leg
+            response, or None.
+    """
+    for header, field in _FE_STAMP_HEADERS:
+        value = headers.get(header)
+        if value and value.isdigit():
+            payload[field] = int(value)
+    if ctx_stamps:
+        payload.update(ctx_stamps)
+    return payload
+
+
 class _DropGymOnlyRequestFields:
     """ASGI middleware stripping the vLLM-only fields from request bodies.
 
@@ -196,6 +248,8 @@ class _DropGymOnlyRequestFields:
         if scope.get("type") != "http" or scope.get("path") not in _ADAPTED_PATHS:
             await self.app(scope, receive, send)
             return
+
+        t_recv_us = time.time_ns() // 1_000
 
         chunks: list[bytes] = []
         while True:
@@ -253,6 +307,14 @@ class _DropGymOnlyRequestFields:
         ]
         if mutated:
             headers.append((b"content-length", str(len(body)).encode()))
+        if _COLLECT_TIMELINE_FIELDS:
+            # Ride the scope headers so the route wrapper can attach them to
+            # the final response: recv = raw receipt, fwd = after this
+            # middleware's parse/strip/tokenize work.
+            headers.append((b"x-nemo-fe-recv-us", str(t_recv_us).encode()))
+            headers.append(
+                (b"x-nemo-fe-fwd-us", str(time.time_ns() // 1_000).encode())
+            )
         scope = {**scope, "headers": headers}
 
         delivered = False
@@ -275,7 +337,10 @@ def _build_adaptor_class() -> type:
     import aiohttp
     from fastapi import HTTPException, Request, Response
     from fastapi.responses import JSONResponse
-    from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+    from tensorrt_llm.serve.openai_disagg_server import (
+        OpenAIDisaggServer,
+        RawRequestResponseHooks,
+    )
     from tensorrt_llm.serve.openai_protocol import (
         ChatCompletionRequest,
         UCompletionRequest,
@@ -286,6 +351,27 @@ def _build_adaptor_class() -> type:
     )
 
     chat_request_cls = _chat_completion_request_cls()
+
+    class _CtxStampRelayHooks(RawRequestResponseHooks):
+        """Stash the ctx adapter's timeline fields on the raw request.
+
+        ``on_ctx_resp`` is the only place the context-leg response is visible
+        outside the disagg service. Parking the fields on ``raw_req.state``
+        lets the route wrapper, which holds the same ``raw_req``, move them
+        onto the final response without touching the service itself. The
+        fields arrive as extras of the relayed response model; nothing is
+        stashed when the ctx adapter does not emit them.
+        """
+
+        def on_ctx_resp(self, ctx_server: str, response: Any) -> None:
+            super().on_ctx_resp(ctx_server, response)
+            stamps = {}
+            for field in _CTX_STAMP_FIELDS:
+                value = getattr(response, field, None)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    stamps[field] = value
+            if stamps:
+                self.raw_req.state.nemo_ctx_stamps = stamps
 
     class OpenAIDisaggServerAdaptor(OpenAIDisaggServer):
         """``OpenAIDisaggServer`` speaking NeMo-Gym's dialect at both edges.
@@ -305,6 +391,8 @@ def _build_adaptor_class() -> type:
         emitted that ``ChatCompletionResponse`` does not declare; those have to
         travel in a declared field (see ``generation_token_ids``).
         """
+
+        response_hooks_cls = _CtxStampRelayHooks
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self._tokenize_fn = kwargs.pop("tokenize_fn", None)
@@ -390,10 +478,14 @@ def _build_adaptor_class() -> type:
                 # so it can be unit-tested against the exact payload
                 # trtllm_http_server emits; only the JSONResponse re-wrap
                 # belongs to this subclass.
-                return JSONResponse(
-                    content=attach_rollout_fields(json.loads(bytes(response.body))),
-                    status_code=response.status_code,
-                )
+                payload = attach_rollout_fields(json.loads(bytes(response.body)))
+                if _COLLECT_TIMELINE_FIELDS:
+                    attach_timeline_fields(
+                        payload,
+                        raw_req.headers,
+                        getattr(raw_req.state, "nemo_ctx_stamps", None),
+                    )
+                return JSONResponse(content=payload, status_code=response.status_code)
 
             return wrapper
 
