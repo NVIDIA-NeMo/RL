@@ -232,6 +232,29 @@ def test_not_applied_to_simple_backend(clean_env, fake_fabric):
     assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
 
 
+@pytest.mark.parametrize("preset", [None, "rc_x,self"])
+def test_nixl_defaults_ucx_to_rdma_only(clean_env, monkeypatch, preset):
+    """nixl refuses an unset UCX_TLS; fill an RDMA-only default, keep a launcher's."""
+    monkeypatch.delenv("UCX_TLS", raising=False)
+    monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
+    if preset:
+        monkeypatch.setenv("UCX_TLS", preset)
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == (preset or "rc,cuda_copy,cuda_ipc,self,sm")
+    assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
+def test_nixl_launcher_tcp_fails_on_the_driver(clean_env, monkeypatch):
+    """A launcher's tcp UCX_TLS fails at configure time; RDMA has no opt-out."""
+    from nemo_rl.data_plane.nixl.errors import TransportPolicyError
+
+    monkeypatch.setenv("UCX_TLS", "rc,tcp,self")
+    monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
+    with pytest.raises(TransportPolicyError, match="tcp"):
+        tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == "rc,tcp,self"  # never overridden
+
+
 def test_raises_when_the_engine_was_already_imported(engine_imported, fake_fabric):
     """The whole point of the split: too-late must be loud, not silent.
 

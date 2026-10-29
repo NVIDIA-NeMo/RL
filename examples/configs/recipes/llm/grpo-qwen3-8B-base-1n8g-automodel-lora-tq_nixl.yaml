@@ -1,0 +1,4 @@
+defaults: grpo-qwen3-8B-base-1n8g-automodel-lora.yaml
+data_plane:
+  enabled: true
+  backend: nixl

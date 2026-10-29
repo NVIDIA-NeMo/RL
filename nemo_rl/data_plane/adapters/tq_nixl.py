@@ -1,0 +1,824 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""TransferQueue glue for the NIXL data plane (``data_plane.backend: nixl``).
+
+Importing this module registers the ``NixlStore`` backend with TransferQueue:
+
+- ``StorageClientFactory["NixlStoreClient"]`` -> :class:`NixlKVClient`
+- ``StorageManagerFactory["NixlStore"]`` -> :class:`NixlStorageManager`
+- ``StorageBootstrapProvider["NixlStore"]`` -> :func:`initialize_nixl_storage`
+
+**Client.** Index-addressed, like SimpleStorage: TQ's key ``gidx@field`` names a
+row, and row ``gidx`` lives on unit ``unit_ids[gidx % N]``, which keeps the row's
+``field -> (blob, entry)`` index. ``put`` lays each owner unit's values out as
+raw bytes in one blob (:mod:`nemo_rl.data_plane.nixl`), WRITEs it and commits
+it, which publishes its rows on the unit; it returns no ``custom_backend_meta``,
+so the TQ controller stores no locations. ``get`` asks each owner unit for its
+keys' entries (one ``resolve_keys`` per unit, which pins them), READs the ranges
+and reconstructs from the unit's entry, not from TQ's field schema, so a TQ
+shape bug cannot corrupt a read. Clearing is row-wide, by global index
+(:meth:`NixlStorageManager.clear_data`). Clients hold no state but the unit
+table, so they can join at any time. All NIXL access happens under one lock:
+the TQ KV manager calls ``put`` from executor threads and ``get`` from its
+event loop.
+
+**Bootstrap.** Called once by ``transfer_queue.init`` in the process that
+creates the TQ controller: starts the BlobDirectory and the storage units
+(:mod:`nemo_rl.data_plane.nixl_storage_unit`). Placement is SimpleStorage style
+(``num_storage_units`` round-robin over eligible nodes, default one per node) or per node
+(``storage_units_per_node`` on each node of ``node_ids``, which the caller
+resolves from ``storage_unit_placement``). ``transfer_queue.close`` does not stop
+third-party backends, so the owner calls :func:`shutdown` after it.
+
+**Manager.** ``put``/``get`` are inherited from ``KVStorageManager``; ``clear_data``
+is row-wide; checkpointing goes through
+:mod:`nemo_rl.data_plane.adapters.tq_nixl_checkpoint`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import sys
+import threading
+import time
+import uuid
+from typing import Any, Iterable
+
+import numpy as np
+import ray
+import torch
+from ray.util.placement_group import placement_group_table
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
+from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
+
+from nemo_rl.data_plane.adapters import tq_nixl_checkpoint
+from nemo_rl.data_plane.nixl import blob_format
+from nemo_rl.data_plane.nixl.blobstore import (
+    BUSY_RETRY_MAX_S,
+    PENDING_POLL_S,
+    LostBlobs,
+    TransferFailed,
+    UnitSlabStore,
+    busy_wait,
+)
+from nemo_rl.data_plane.nixl.bufpool import BufferPool, PoolExhausted, PoolTimeout
+from nemo_rl.data_plane.nixl.directory import BlobDirectory
+from nemo_rl.data_plane.nixl.errors import (
+    DataPlaneFatal,
+    DataPlaneLostKeys,
+    DataPlaneTimeout,
+    DataPlaneTransferFailed,
+    StaleRead,
+)
+from nemo_rl.data_plane.nixl.nixl_io import GRAVEYARD, NixlEndpoint
+from nemo_rl.data_plane.nixl_storage_unit import NixlStorageUnit, split_key
+
+BACKEND_NAME = "NixlStore"
+DEFAULT_NAMESPACE = "nemo_rl_nixl"
+
+
+def _as_dict(cfg: Any) -> dict[str, Any]:
+    try:
+        from omegaconf import DictConfig, OmegaConf
+
+        if isinstance(cfg, DictConfig):
+            return OmegaConf.to_container(cfg, resolve=True)  # type: ignore[return-value]
+    except Exception:
+        pass
+    return dict(cfg or {})
+
+
+# Default lease_margin_s: a pinned read's lease is transfer_timeout_s + this
+# margin (design §3.2).
+LEASE_MARGIN_S = 30.0
+
+
+def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
+    """``(transfer_timeout_s, read_pin_s, op_timeout_s)`` from the config.
+
+    A read's pin holds its blobs for ``read_pin_s``, so a READ that may run
+    for ``transfer_timeout_s`` needs ``read_pin_s`` to cover it with margin
+    (design §3.3); anything shorter is rejected.
+    """
+    timeout_s = float(cfg.get("transfer_timeout_s", 120.0))
+    margin = float(cfg.get("lease_margin_s", LEASE_MARGIN_S))
+    pin = cfg.get("read_pin_s")
+    read_pin_s = timeout_s + margin if pin is None else float(pin)
+    if read_pin_s < timeout_s + margin:
+        raise ValueError(
+            f"NixlStore read_pin_s={read_pin_s} must be >= transfer_timeout_s "
+            f"({timeout_s}) + lease_margin_s ({margin}): a pinned READ may run "
+            "for transfer_timeout_s, and its source region must not be reused "
+            "before it ends"
+        )
+    op = cfg.get("op_timeout_s")
+    op_timeout_s = 2 * timeout_s if op is None else float(op)
+    return timeout_s, read_pin_s, op_timeout_s
+
+
+def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """Unit kwargs for the SSD tier, or None when ``ssd.enabled`` is off.
+
+    ``ssd: {enabled, dir, staging_bytes, pickup_s}``: when a unit's put area cannot
+    take a put, the put goes to a file under ``dir`` (node-local NVMe) from birth,
+    through an IO area of ``staging_bytes`` carved from the slab; reads of such
+    blobs are staged back into the same area. Data already in the put area never
+    moves.
+
+    Contract: data is read roughly oldest first (the ``weight_fifo``,
+    ``in_order`` and ``ready_first`` samplers), so the oldest data stays in RAM
+    and the newest goes to disk. The ``windowed`` sampler with freshest-first
+    selection works but spills the data it reads next.
+    """
+    ssd = _as_dict(cfg.get("ssd") or {})
+    if not ssd.get("enabled", False):
+        return None
+    slab = int(cfg.get("unit_slab_bytes", 1 << 30))
+    staging = int(ssd.get("staging_bytes", slab // 4))
+    pickup_s = float(ssd.get("pickup_s", 10.0))
+    if not 0 < staging < slab:
+        raise ValueError(
+            f"NixlStore ssd.staging_bytes={staging} must be in (0, unit_slab_bytes={slab})"
+        )
+    if pickup_s < 2 * BUSY_RETRY_MAX_S:
+        # A reader polls a pending blob every <= BUSY_RETRY_MAX_S; a staged copy
+        # must not become evictable between two of its polls (design §4.2).
+        raise ValueError(
+            f"NixlStore ssd.pickup_s={pickup_s} must be >= {2 * BUSY_RETRY_MAX_S}"
+        )
+    return {
+        "ssd_dir": str(ssd.get("dir", "/tmp/nvdp-ssd")),
+        "staging_bytes": staging,
+        "pickup_s": pickup_s,
+    }
+
+
+def _check_finite(tag: str, keys: list[str], values: list[Any]) -> None:
+    """Debug aid (``debug_check_finite`` / ``NVDP_CHECK_FINITE=1``).
+
+    Report rows whose float tensors hold NaN/inf or whose bool masks are all False, at both ends of
+    the wire. A row reported on ``get`` but never on ``put`` is corruption in the
+    data plane; a row reported on both was already like that upstream.
+    """
+    for k, v in zip(keys, values):
+        if not isinstance(v, torch.Tensor) or v.is_nested or v.numel() == 0:
+            continue
+        if v.is_floating_point():
+            bad = ~torch.isfinite(v)
+            if bad.any():
+                n_nan = int(torch.isnan(v).sum())
+                n_inf = int(bad.sum()) - n_nan
+                print(
+                    f"[nvdp-check] {tag} key={k} dtype={v.dtype} shape={tuple(v.shape)} nan={n_nan} inf={n_inf} "
+                    f"first={v.reshape(-1)[:4].tolist()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        elif v.dtype == torch.bool and not v.any():
+            print(
+                f"[nvdp-check] {tag} key={k} bool all-False shape={tuple(v.shape)}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _copy_into(dst: np.ndarray, src: memoryview, parallel_min: int) -> None:
+    """Copy raw bytes into a registered buffer; torch's parallel copy_ when large.
+
+    Single-threaded memcpy tops out near 14-28 GB/s on GB300; torch ``copy_``
+    reaches ~107 GB/s from ~16 MB up, but costs ~0.4 ms of thread fan-out.
+    """
+    n = dst.nbytes
+    if n >= parallel_min and not src.readonly:
+        torch.from_numpy(dst).copy_(torch.frombuffer(src, dtype=torch.uint8, count=n))
+    else:
+        memoryview(dst)[:] = src
+
+
+class TimedLock:
+    """The client's lock, which also records how long callers wait for it.
+
+    The numbers decide whether concurrent callers in one process contend enough
+    to justify a finer-grained lock: ``wait_ms_sum`` / ``wait_ms_max`` over
+    contended acquisitions, ``waits`` those longer than 1 ms. Counters change
+    only while the lock is held, so they need no lock of their own. Re-entrant
+    acquisition by the holder never waits.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.waits = 0
+        self.wait_ms_sum = 0.0
+        self.wait_ms_max = 0.0
+
+    def __enter__(self) -> TimedLock:
+        if not self._lock.acquire(blocking=False):
+            t0 = time.monotonic()
+            self._lock.acquire()
+            ms = (time.monotonic() - t0) * 1000.0
+            self.wait_ms_sum += ms
+            self.wait_ms_max = max(self.wait_ms_max, ms)
+            self.waits += ms > 1.0
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._lock.release()
+
+    def snapshot(self) -> tuple[int, float, float]:
+        """``(waits, wait_ms_sum, wait_ms_max)``; plain reads, so it never waits itself."""
+        return self.waits, self.wait_ms_sum, self.wait_ms_max
+
+
+@StorageClientFactory.register("NixlStoreClient")
+class NixlKVClient(StorageKVClient):
+    def __init__(self, config: dict[str, Any]):
+        cfg = _as_dict(config)
+        super().__init__(cfg)
+        self.namespace = cfg.get("namespace", DEFAULT_NAMESPACE)
+        directory = ray.get_actor(
+            cfg.get("directory_name", "BlobDirectory"), namespace=self.namespace
+        )
+        nixl_cfg = _as_dict(cfg.get("nixl") or {})
+        init_params = dict(nixl_cfg.get("backend_init_params") or {})
+        self.ep = NixlEndpoint(
+            f"client-{os.getpid()}-{uuid.uuid4().hex[:6]}",
+            backend=nixl_cfg.get("backend_name", "UCX"),
+            init_params=init_params,
+            prog_thread=False,
+        )
+        # Serialises every NIXL agent call (the agent is not thread-safe) and
+        # counts the time callers wait for it (see TimedLock). Copies
+        # into and out of pool buffers happen outside it, so concurrent TQ
+        # threads overlap their memory traffic with each other's transfers.
+        self._lock = TimedLock()
+        # Time spent in put / get, with TimedLock's counters: one line per
+        # process every 30 s while they change, to judge lock contention.
+        self._op_mu = threading.Lock()
+        self._ops, self._op_ms = 0, 0.0
+        self._stats_at, self._stats_last = time.monotonic(), None
+        try:
+            ctx = ray.get_runtime_context()
+            self._who = f"pid={os.getpid()} node={ctx.get_node_id()[:8]} actor={ctx.get_actor_name() or '-'}"
+        except Exception:  # noqa: BLE001 - a label only
+            self._who = f"pid={os.getpid()}"
+        self.pool = BufferPool(
+            self.ep,
+            self._lock,
+            base_bytes=int(cfg.get("client_staging_bytes", 256 << 20)),
+            base_count=int(cfg.get("client_staging_buffers", 2)),
+            max_oversize_bytes=int(cfg.get("client_pool_max_bytes", 8 << 30)),
+        )
+        # Zero-copy put: register the caller's own value memory and RDMA from it.
+        # Pays off only where registration is cheap (UCX caches reused heap
+        # ranges): ~0.02 ms at 16 MB, but ~70 ms per fresh 1 GiB mapping, where a
+        # parallel copy into a pooled buffer takes ~10 ms. Hence a size window.
+        # Zero-copy sources of WRITEs that failed short of DONE, kept registered
+        # and referenced until the process exits (see _put_segments).
+        self.retained_sources: list[tuple[int, np.ndarray, Any]] = []
+        self.retained_source_bytes = 0
+        self.zero_copy_min = int(cfg.get("zero_copy_min_bytes", 1 << 20))
+        self.zero_copy_max = int(cfg.get("zero_copy_max_bytes", 32 << 20))
+        self.parallel_copy_min = int(cfg.get("parallel_copy_min_bytes", 16 << 20))
+        # read_pin_s must match the units' pin TTL: a READ that completes after
+        # its pin expired may have observed a reused region and is discarded.
+        # Every put / get also has one deadline, op_timeout_s, that bounds all
+        # of its waits (pool, ZMQ replies, transfers, Busy retries).
+        self.timeout_s, self.read_pin_s, self.op_timeout_s = check_timeouts(cfg)
+        GRAVEYARD.max_bytes = int(cfg.get("graveyard_max_bytes", GRAVEYARD.max_bytes))
+        self._check = (
+            bool(cfg.get("debug_check_finite", False))
+            or os.environ.get("NVDP_CHECK_FINITE") == "1"
+        )
+        ssd = ssd_config(cfg)
+        # A blob is one region of one unit's put area (the slab minus SSD
+        # staging); a put bigger than max_blob_bytes is split at key
+        # boundaries into several blobs, so it fits a unit with room to spare.
+        area = int(cfg.get("unit_slab_bytes", 1 << 30))
+        area -= ssd["staging_bytes"] if ssd else 0
+        self.max_blob_bytes = int(cfg.get("max_blob_bytes", area // 4))
+        self.store = UnitSlabStore(
+            self.ep,
+            directory,
+            namespace=self.namespace,
+            timeout_s=self.timeout_s,
+            ssd=ssd is not None,
+        )
+        # The unit table every client routes by: all units registered at
+        # bootstrap, in id order, whatever their state, so routing never moves.
+        self.unit_ids = sorted(self.store._units)
+        if not self.unit_ids:
+            raise RuntimeError("NixlStore has no storage units")
+
+    def owner(self, gidx: int) -> int:
+        """The unit that owns row ``gidx`` (TQ global index)."""
+        return self.unit_ids[int(gidx) % len(self.unit_ids)]
+
+    def _by_owner(self, keys: list[str]) -> dict[int, list[int]]:
+        """Key positions grouped by owner unit, in key order."""
+        out: dict[int, list[int]] = {}
+        for i, k in enumerate(keys):
+            out.setdefault(self.owner(split_key(k)[0]), []).append(i)
+        return out
+
+    # ------------------------------------------------------------------ put
+    def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
+        t0 = time.monotonic()
+        try:
+            return self._put(keys, values)
+        finally:
+            self._op_done(t0)
+
+    def _put(self, keys: list[str], values: list[Any]) -> None:
+        """Write each owner unit's keys as blobs there; return no meta.
+
+        Failure policy (SimpleStorage's): a blob that was committed stays
+        published even if a later one fails; the put raises and TQ is not
+        notified, so the new values are reclaimed by the next overwrite or the
+        row-wide clear of those rows.
+        """
+        if not keys:
+            return None
+        values = list(values)
+        if self._check:
+            _check_finite("put", keys, values)
+        deadline = time.monotonic() + self.op_timeout_s
+        with self._errors(keys):
+            for u, idx in self._by_owner(keys).items():
+                self._put_split(
+                    u, [keys[i] for i in idx], [values[i] for i in idx], deadline
+                )
+        return None
+
+    def _put_split(
+        self, unit_id: int, keys: list[str], values: list[Any], deadline: float
+    ) -> None:
+        """Put as one blob on ``unit_id``, halving at key boundaries while over max_blob_bytes."""
+        blob_id = uuid.uuid4().hex
+        p = blob_format.plan(keys, values, tag=bytes.fromhex(blob_id))
+        if p.nbytes > self.max_blob_bytes and len(keys) > 1:
+            h = len(keys) // 2
+            self._put_split(unit_id, keys[:h], values[:h], deadline)
+            self._put_split(unit_id, keys[h:], values[h:], deadline)
+            return
+        self._put_segments(p, blob_id, deadline, unit_id)
+
+    def _acquire(self, nbytes: int, deadline: float):
+        """A pool buffer, waiting no longer than the operation's deadline."""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise DataPlaneTimeout("operation deadline passed before a pool buffer")
+        return self.pool.acquire(nbytes, timeout_s=left)
+
+    @contextlib.contextmanager
+    def _errors(self, keys: list[str], by_blob: dict[str, list[int]] | None = None):
+        """Map store errors to what NeMo-RL sees (design §6).
+
+        ``by_blob`` maps blob -> key indexes, to name exactly the affected keys.
+        """
+
+        def affected(blob_ids: list[str]) -> list[str]:
+            if by_blob is None:
+                return list(keys)
+            hit = [keys[i] for b in blob_ids for i in by_blob.get(b, [])]
+            return hit or list(keys)
+
+        try:
+            yield
+        except LostBlobs as e:
+            raise DataPlaneLostKeys(affected(e.blob_ids), reason=e.reason) from e
+        except TransferFailed as e:
+            raise DataPlaneTransferFailed(
+                affected(e.blob_ids), e.reason, in_flight=e.in_flight
+            ) from e
+        except PoolTimeout as e:
+            raise DataPlaneTimeout(str(e)) from e
+        except PoolExhausted as e:
+            # Every base buffer was retired and none could be replaced: this
+            # client can no longer move data and must not wait.
+            raise DataPlaneFatal(str(e)) from e
+
+    @staticmethod
+    def _backing_bytes(owner: Any) -> int:
+        """Size of the allocation a value lives in (not the value itself)."""
+        if isinstance(owner, torch.Tensor):
+            return int(owner.untyped_storage().nbytes())
+        base = owner
+        while isinstance(base, np.ndarray) and base.base is not None:
+            base = base.base
+        return int(getattr(base, "nbytes", 0) or 0)
+
+    def _zero_copy_ok(self, e: blob_format.Entry, mv: memoryview, owner: Any) -> bool:
+        # Gated on the *backing allocation*, not the value: registration is only
+        # cheap for ranges UCX has cached, i.e. reused heap allocations. Rows that
+        # slice one big freshly mmap'd tensor (a 256 MB batch -> 16 x 16 MB rows)
+        # cost ~1-2 ms each to register (bench: 256 MB put 33 -> 51 ms).
+        return (
+            e.kind in (blob_format.KIND_TENSOR, blob_format.KIND_NUMPY)
+            and self.zero_copy_min <= e.len <= self.zero_copy_max
+            and self._backing_bytes(owner) <= self.zero_copy_max
+            and not mv.readonly
+            and mv.c_contiguous
+        )
+
+    def _put_segments(
+        self, p: blob_format.BlobPlan, blob_id: str, deadline: float, unit_id: int
+    ) -> str:
+        """Lay out a blob without building it.
+
+        Big values go zero-copy, the rest (small values, the index and the footer) is packed into one pool buffer.
+        """
+        zero = [
+            (e, mv, owner)
+            for e, mv, owner in zip(p.entries, p.buffers, p.keepalive)
+            if e.len and self._zero_copy_ok(e, mv, owner)
+        ]
+        zero_ids = {id(e) for e, _, _ in zero}
+        packed = [
+            (e, mv)
+            for e, mv in zip(p.entries, p.buffers)
+            if e.len and id(e) not in zero_ids
+        ]
+        tail = len(p.index_bytes) + blob_format.FOOTER_SIZE
+        layout, cur = [], 0
+        for e, mv in packed:
+            layout.append((e, mv, cur))
+            cur = blob_format._align_up(cur + e.len)
+        tail_off = cur
+        packed_bytes = tail_off + tail
+
+        regs: list[tuple[int, np.ndarray, Any]] = []
+        try:
+            with self._acquire(packed_bytes, deadline) as (base, buf):
+                segments: list[tuple[int, int, int]] = []
+                for e, mv, at in layout:
+                    _copy_into(
+                        buf[at : at + e.len], mv.cast("B"), self.parallel_copy_min
+                    )
+                    segments.append((base + at, e.off, e.len))
+                blob_format.write_tail(p, memoryview(buf)[tail_off : tail_off + tail])
+                segments.append((base + tail_off, p.index_off, tail))
+                with self._lock:
+                    for e, mv, owner in zero:
+                        arr = np.frombuffer(mv.cast("B"), dtype=np.uint8)
+                        addr = self.ep.register(arr)
+                        regs.append((addr, arr, owner))
+                        segments.append((addr, e.off, e.len))
+                    return self.store.put_segments(
+                        segments,
+                        p.nbytes,
+                        len(p.entries),
+                        unit_id,
+                        blob_id=blob_id,
+                        deadline=deadline,
+                    )
+        finally:
+            if regs:
+                with self._lock:
+                    for addr, arr, owner in regs:
+                        if self.ep.touches_unfinished(addr, arr.nbytes):
+                            # A failed WRITE may still read this memory: keep it
+                            # registered and alive. The caller may overwrite it.
+                            self.retained_sources.append((addr, arr, owner))
+                            self.retained_source_bytes += arr.nbytes
+                        else:
+                            self.ep.deregister(addr)
+
+    # ------------------------------------------------------------------ get
+    def get(
+        self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None
+    ) -> list[Any]:
+        t0 = time.monotonic()
+        try:
+            return self._get(keys)
+        finally:
+            self._op_done(t0)
+
+    def _get(self, keys: list[str]) -> list[Any]:
+        if not keys:
+            return []
+        deadline = time.monotonic() + self.op_timeout_s
+        out: list[Any] = [None] * len(keys)
+        pending = list(range(len(keys)))
+        backoff = PENDING_POLL_S
+        stale = 0
+        while pending:
+            t0 = time.monotonic()
+            left = self._get_once(keys, pending, out, deadline)
+            if time.monotonic() - t0 > self.read_pin_s:
+                # The read outlived its pins: the regions may have been reused.
+                stale += 1
+                if stale >= 2:
+                    raise StaleRead(
+                        f"read of {len(keys)} keys outlived its {self.read_pin_s}s pin twice"
+                    )
+                continue
+            if len(left) == len(pending):
+                backoff = busy_wait(deadline, backoff)  # all staging from disk
+            else:
+                backoff = PENDING_POLL_S
+            pending = left
+        if self._check:
+            _check_finite("get", keys, out)
+        return out
+
+    def _get_once(
+        self, keys: list[str], idx: list[int], out: list[Any], deadline: float
+    ) -> list[int]:
+        """Resolve, READ and decode ``keys[i] for i in idx``; return the still-pending ones."""
+        sub = [keys[i] for i in idx]
+        by_unit = {u: [sub[j] for j in pos] for u, pos in self._by_owner(sub).items()}
+        pos_of = {k: i for k, i in zip(sub, idx)}
+        with self._errors(sub), self._lock:
+            resolved = self.store.resolve_keys(by_unit, deadline)
+        try:
+            missing = [k for r in resolved.values() for k in r["missing"]]
+            if missing:
+                raise DataPlaneLostKeys(missing, reason="key not on its unit")
+            failed = [k for r in resolved.values() for k in r["failed"]]
+            if failed:
+                raise DataPlaneTransferFailed(failed, "disk read failed on the unit")
+            found = [
+                (u, k, ent)
+                for u, r in resolved.items()
+                for k, ent in r["entries"].items()
+            ]
+            total = sum(blob_format._align_up(int(e[1])) for _, _, e in found)
+            with (
+                self._errors(sub),
+                self._acquire(max(total, 1), deadline) as (lbase, lbuf),
+            ):
+                reads: dict[int, list[tuple[int, int, int]]] = {}
+                at: list[int] = []
+                cur = 0
+                for u, _k, ent in found:
+                    reads.setdefault(u, []).append(
+                        (int(ent[0]), int(ent[1]), lbase + cur)
+                    )
+                    at.append(cur)
+                    cur = blob_format._align_up(cur + int(ent[1]))
+                with self._lock:
+                    self.store.read_entries(reads, by_unit, deadline)
+                # One copy out of the pool buffer, then zero-copy views into it:
+                # a clone per key cost ~5 us x every key of a get.
+                owned = torch.empty(cur, dtype=torch.uint8)
+                owned.copy_(torch.from_numpy(lbuf[:cur]))
+                oview = memoryview(owned.numpy())
+                for (_u, k, ent), a in zip(found, at):
+                    _off, n, kind, dtype, shape = ent
+                    e = blob_format.Entry(
+                        k,
+                        0,
+                        int(n),
+                        kind,
+                        dtype,
+                        tuple(shape) if shape is not None else None,
+                    )
+                    out[pos_of[k]] = blob_format.decode_entry(oview[a : a + int(n)], e)
+        finally:
+            with self._lock:
+                self.store.unpin_all(resolved)
+        return [pos_of[k] for r in resolved.values() for k in r["pending"]]
+
+    # ------------------------------------------------------------------ clear
+    def clear(self, keys: list[str], custom_backend_meta=None) -> None:
+        # Abstract in StorageKVClient. TQ's KV clear names only the fields every
+        # cleared row shares; NixlStorageManager.clear_data clears whole rows.
+        raise NotImplementedError(
+            "NixlStore clears whole rows through NixlStorageManager.clear_data"
+        )
+
+    def clear_rows(self, gidxs: list[int]) -> None:
+        """Drop every field of rows ``gidxs`` on their owner units (awaited)."""
+        if not gidxs:
+            return
+        deadline = time.monotonic() + self.op_timeout_s
+        by_unit: dict[int, list[int]] = {}
+        for g in gidxs:
+            by_unit.setdefault(self.owner(g), []).append(int(g))
+        with self._errors([str(g) for g in gidxs]), self._lock:
+            self.store.release_rows(by_unit, deadline)
+
+    def _op_done(self, t0: float) -> None:
+        now = time.monotonic()
+        with self._op_mu:
+            self._ops += 1
+            self._op_ms += (now - t0) * 1000.0
+            due = now - self._stats_at >= 30.0
+            if due:
+                self._stats_at = now
+        if due:
+            self._log_stats()
+
+    def _log_stats(self) -> None:
+        waits, wait_sum, wait_max = self._lock.snapshot()
+        with self._op_mu:
+            st = (
+                self._ops,
+                round(self._op_ms, 1),
+                waits,
+                round(wait_sum, 1),
+                round(wait_max, 1),
+            )
+        if st != self._stats_last:
+            self._stats_last = st
+            print(
+                f"[nvdp-client] {self._who} stats "
+                f"{dict(zip(('ops', 'op_ms_sum', 'lock_waits', 'lock_wait_ms_sum', 'lock_wait_ms_max'), st))}",
+                flush=True,
+            )
+
+    # ------------------------------------------------------------------ lifecycle
+    def close(self) -> None:
+        self._log_stats()
+        self.pool.close()
+        with self._lock:
+            self.store.close()
+            self.ep.close()
+
+
+# ============================================================================ bootstrap
+def _unit_name(i: int) -> str:
+    return f"NixlStorageUnit#{i}"
+
+
+# ----------------------------------------------------------------------------- node selection
+def alive_node_ids(required_node_resource: str | None = None) -> list[str]:
+    ids = sorted(
+        n["NodeID"]
+        for n in ray.nodes()
+        if n.get("Alive", False)
+        and (
+            required_node_resource is None
+            or n.get("Resources", {}).get(required_node_resource, 0) > 0
+        )
+    )
+    if not ids:
+        raise RuntimeError("No alive Ray nodes found. Is Ray initialized?")
+    return ids
+
+
+def placement_group_node_ids(placement_groups: Iterable[Any]) -> list[str]:
+    """Ray node ids occupied by the given placement groups (one GCS read).
+
+    Pass the inference and/or train clusters' placement groups to implement
+    ``storage_unit_placement: all | inference | train``.
+    """
+    table = placement_group_table()
+    return sorted(
+        {
+            node_id
+            for pg in placement_groups
+            for node_id in table[pg.id.hex()]["bundles_to_node_id"].values()
+        }
+    )
+
+
+def unit_node_ids(cfg: dict[str, Any]) -> list[str]:
+    """One node id per unit to create, from the backend config block."""
+    nodes = list(cfg.get("node_ids") or []) or alive_node_ids(
+        cfg.get("required_node_resource")
+    )
+    per_node = cfg.get("storage_units_per_node")
+    if per_node:
+        return [n for n in nodes for _ in range(int(per_node))]
+    total = cfg.get("num_storage_units") or len(nodes)  # None: one per node
+    return [nodes[i % len(nodes)] for i in range(int(total))]
+
+
+# ----------------------------------------------------------------------------- lifecycle
+def _kill_named(name: str, namespace: str) -> bool:
+    try:
+        h = ray.get_actor(name, namespace=namespace)
+    except ValueError:
+        return False
+    ray.kill(h, no_restart=True)
+    return True
+
+
+def shutdown(conf_or_backend_cfg: Any) -> None:
+    """Kill the BlobDirectory and every storage unit of a NixlStore system.
+
+    Units are named ``NixlStorageUnit#<i>``; kill consecutively until a name
+    is missing, so a larger earlier system in the same namespace is swept too.
+    """
+    cfg = conf_or_backend_cfg
+    if hasattr(cfg, "backend"):
+        cfg = cfg.backend.NixlStore
+    cfg = _as_dict(cfg)
+    namespace = cfg.get("namespace", DEFAULT_NAMESPACE)
+    i = 0
+    while _kill_named(_unit_name(i), namespace):
+        i += 1
+    _kill_named(cfg.get("directory_name", "BlobDirectory"), namespace)
+
+
+@StorageBootstrapProvider.register_provider("NixlStore")
+def initialize_nixl_storage(conf: Any) -> dict[str, Any]:
+    cfg = _as_dict(conf.backend.NixlStore)
+    timeout_s, read_pin_s, op_timeout_s = check_timeouts(cfg)  # fail before any actor
+    ssd = ssd_config(cfg) or {}
+    namespace = cfg.get("namespace", DEFAULT_NAMESPACE)
+    dir_name = cfg.get("directory_name", "BlobDirectory")
+    nixl_cfg = _as_dict(cfg.get("nixl") or {})
+
+    # A fresh TQ controller means a fresh data plane: stale named actors from a
+    # previous system in the same namespace would otherwise block creation.
+    shutdown(cfg)
+
+    directory = BlobDirectory.options(name=dir_name, namespace=namespace).remote()
+    handles: dict[str, Any] = {"BlobDirectory": directory}
+
+    units = []
+    per_node: dict[str, int] = {}
+    for i, node_id in enumerate(unit_node_ids(cfg)):
+        numa_index = per_node.get(
+            node_id, 0
+        )  # k-th unit on this node -> socket k % sockets
+        per_node[node_id] = numa_index + 1
+        unit = NixlStorageUnit.options(
+            name=_unit_name(i),
+            namespace=namespace,
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=node_id, soft=False
+            ),
+        ).remote(
+            i,
+            int(cfg.get("unit_slab_bytes", 1 << 30)),
+            read_pin_s=read_pin_s,
+            nixl_backend=nixl_cfg.get("backend_name", "UCX"),
+            nixl_init_params=nixl_cfg.get("backend_init_params") or {},
+            numa_mode=str(cfg.get("numa", "auto")),
+            numa_index=numa_index,
+            directory=directory,
+            alloc_lease_s=op_timeout_s + timeout_s,
+            **ssd,
+        )
+        units.append(unit)
+        handles[_unit_name(i)] = unit
+    infos = ray.get([u.info.remote() for u in units])
+    ray.get([directory.register_unit.remote(info) for info in infos])
+
+    conf.backend.NixlStore.directory_name = dir_name
+    conf.backend.NixlStore.namespace = namespace
+    return handles
+
+
+# ============================================================================ manager
+@StorageManagerFactory.register("NixlStore")
+class NixlStorageManager(KVStorageManager):
+    def __init__(self, controller_info: Any, config: Any, zmq_context: Any = None):
+        cfg = _as_dict(config)
+        cfg["client_name"] = "NixlStoreClient"
+        # Newer TQ offers to share the client's ZMQ context; the pinned SHA does not
+        # take that argument. KV managers only use ZMQ for the controller notify path,
+        # so owning a private context is correct on both.
+        super().__init__(controller_info, cfg)
+
+    async def clear_data(self, metadata) -> None:
+        """Clear whole rows by global index, like SimpleStorage.
+
+        TQ's KV ``clear_data`` would name only the fields every row has
+        (an overwrite releases its old blob on the unit, at commit).
+        """
+        await asyncio.get_running_loop().run_in_executor(
+            None, self.storage_client.clear_rows, list(metadata.global_indexes)
+        )
+
+    # TQ calls these from its client event loop (sync wrappers block on them);
+    # the work is Ray RPCs plus file I/O, so run it off the loop.
+    async def save_checkpoint(self, checkpoint_dir: str) -> None:
+        await asyncio.to_thread(
+            tq_nixl_checkpoint.save_storage_checkpoint,
+            self.storage_client,
+            checkpoint_dir,
+        )
+
+    async def load_checkpoint(self, checkpoint_dir: str) -> None:
+        await asyncio.to_thread(
+            tq_nixl_checkpoint.load_storage_checkpoint,
+            self.storage_client,
+            checkpoint_dir,
+        )
+
+    def close(self) -> None:
+        try:
+            client = getattr(self, "storage_client", None)
+            if client is not None and hasattr(client, "close"):
+                client.close()
+        finally:
+            super().close()

@@ -875,6 +875,34 @@ def _pin_simple_storage_units(node_ids: list[str]) -> None:
     )
 
 
+def _nixl_storage_node_ids(placement: str) -> list[str]:
+    """Ray node IDs for a NIXL storage_unit_placement: train | inference | gym (= neither) | all."""
+    import ray
+    from ray.util.placement_group import placement_group_table
+
+    def pg_nodes(prefix: str) -> set[str]:
+        return {
+            node_id
+            for pg in placement_group_table().values()
+            if pg["name"].startswith(prefix) and pg["state"] == "CREATED"
+            for node_id in pg["bundles_to_node_id"].values()
+        }
+
+    train = pg_nodes("sc_train_cluster") | pg_nodes("sc_policy_cluster")
+    inference = pg_nodes("sc_inference_cluster") | pg_nodes("sc_policy_cluster")
+    alive = {
+        n["NodeID"] for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU")
+    }
+    return sorted(
+        {
+            "train": train,
+            "inference": inference,
+            "gym": alive - train - inference,
+            "all": alive,
+        }[placement]
+    )
+
+
 def _init_tq(
     cfg: DataPlaneConfig,
     *,
@@ -1015,6 +1043,25 @@ def _init_tq(
                 hard_pin=not mooncake_cfg.ssd_offload.enabled,
                 offload={"enabled": False},
             )
+    elif backend == "nixl":
+        # The NIXL data plane's TransferQueue backend (adapters/tq_nixl.py): CPU NixlStorageUnit actors own
+        # pinned-DRAM slabs, every other process is a client doing one-sided
+        # NIXL RDMA. Importing the plug-in registers "NixlStore" with TQ's
+        # manager / client / bootstrap registries; the bootstrap provider
+        # starts the units and the BlobDirectory inside tq.init.
+        import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
+
+        nixl_cfg = backend_config(cfg)
+        block = nixl_cfg.model_dump()
+        placement = block.pop("storage_unit_placement", "all")
+        if placement != "all" and not block.get("node_ids"):
+            block["node_ids"] = _nixl_storage_node_ids(placement)
+            if not block["node_ids"]:
+                raise RuntimeError(f"no nodes for storage_unit_placement={placement!r}")
+        overlay = {
+            **controller_overlay,
+            "backend": {"storage_backend": "NixlStore", "NixlStore": block},
+        }
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
@@ -1184,6 +1231,11 @@ class TQDataPlaneClient(DataPlaneClient):
             install_tq_mooncake_checkpoint_plugin()
             # Before the store is set up; a no-op unless this process owns memory.
             mooncake_ssd_offload.install(mooncake_cfg, segment_size)
+
+        if cfg["backend"] == "nixl":
+            # Workers attach with tq.init() and need TQ's registries to know
+            # "NixlStore" before the client's storage manager is built.
+            import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
