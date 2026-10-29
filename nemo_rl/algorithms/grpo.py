@@ -2834,9 +2834,9 @@ def _advantage_valid_mask(
     ``include`` lets every row with a nonzero dataset weight vote
     (``_include_valid_mask``); ``exclude`` lets the rows with a nonzero (final)
     loss weight vote. Both return a binary mask and leave ``sample_mask``
-    unchanged. The legacy and TransferQueue trainers carry no synthetic
-    placeholder rows; the SingleController stage excludes its token-capture
-    placeholders itself (see ``advantage_stage.py``).
+    unchanged. Unusable NeMo Gym rows enter with zero dataset weight; the
+    SingleController stage also excludes its token-capture placeholders
+    itself (see ``advantage_stage.py``).
     """
     if grpo_config.masked_reward_policy == "include":
         return _include_valid_mask(dataset_loss_multiplier, sample_mask)
