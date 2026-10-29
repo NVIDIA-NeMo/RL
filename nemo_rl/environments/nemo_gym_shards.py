@@ -38,12 +38,7 @@ from omegaconf import OmegaConf
 # Dict-shaped NeMo RL integration settings that are not Gym server entries.
 # The actor factory or rollout code consumes these separately.
 NEMO_RL_DICT_CONFIG_KEYS = frozenset(
-    {
-        "dynamo_dialect",
-        "effort_levels",
-        "external_service_readiness",
-        "tokenizer_config",
-    }
+    {"effort_levels", "external_service_readiness", "tokenizer_config"}
 )
 
 # Ray placement-group strategies a shard plan may ask for. STRICT_SPREAD is the

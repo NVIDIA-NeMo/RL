@@ -58,48 +58,13 @@ def replace_prefix_tokens(
     ).token_ids
 
 
-def _eos_token_id_set(eos_token_id: int | Collection[int]) -> frozenset[int]:
-    eos_token_ids = (
-        frozenset([eos_token_id])
-        if isinstance(eos_token_id, int)
-        else frozenset(eos_token_id)
-    )
-    assert eos_token_ids, "EOS token id collection must not be empty"
-    return eos_token_ids
-
-
-def derive_prefix_eos_count(
-    model_prefix_token_ids: list[int], *, eos_token_id: int | Collection[int]
-) -> int:
-    """The EOS count a template render of the prefix's history would hold.
-
-    For hosts that see only the rendered prompt, not the messages (the managed
-    Dynamo engine receives token ids from its frontend), this stands in for
-    counting EOS in ``template_prefix_token_ids``. Every EOS in the prefix
-    closed one message, and a template closes the final assistant turn with one
-    EOS even when the model was truncated before emitting it. The two counts
-    agree when the history up to the prefix's last assistant turn is the
-    history the prefix was generated from (Gym's lineage admission checks this
-    for captured calls; without capture it is assumed, as on the native server)
-    and the model emitted no EOS text as ordinary tokens. A render with fewer
-    EOS than this count fails the splice; an extra EOS before the boundary cuts
-    early instead.
-    """
-    eos_token_ids = _eos_token_id_set(eos_token_id)
-    count = sum(tid in eos_token_ids for tid in model_prefix_token_ids)
-    if not model_prefix_token_ids or model_prefix_token_ids[-1] not in eos_token_ids:
-        count += 1
-    return count
-
-
 def splice_prefix_tokens(
     *,
     tokenizer: Any,
     model_prefix_token_ids: list[int],
-    template_prefix_token_ids: list[int] | None = None,
+    template_prefix_token_ids: list[int],
     template_token_ids: list[int],
     eos_token_id: int | Collection[int] | None = None,
-    template_prefix_eos_count: int | None = None,
 ) -> PrefixSplice:
     """This is a subroutine used inside the OpenAI-compatible Chat Completion server.
 
@@ -167,24 +132,19 @@ def splice_prefix_tokens(
     toward the boundary, and when the model's prefix ends on one of them that
     exact id is kept in place of the template's, so the spliced prompt still
     starts with the model's tokens verbatim.
-
-    Pass exactly one of ``template_prefix_token_ids`` and
-    ``template_prefix_eos_count``. The prefix render is only ever used for its
-    EOS count, so a host without the messages passes the count directly (see
-    :func:`derive_prefix_eos_count`).
     """
-    if (template_prefix_token_ids is None) == (template_prefix_eos_count is None):
-        raise ValueError(
-            "Pass exactly one of template_prefix_token_ids and "
-            "template_prefix_eos_count"
-        )
     if not model_prefix_token_ids:
         return PrefixSplice(template_token_ids, 0, 0)
 
     if eos_token_id is None:
         eos_token_id = tokenizer.eos_token_id
     assert eos_token_id is not None, "Tokenizer must have an EOS token ID"
-    eos_token_ids = _eos_token_id_set(eos_token_id)
+    eos_token_ids = (
+        frozenset([eos_token_id])
+        if isinstance(eos_token_id, int)
+        else frozenset(eos_token_id)
+    )
+    assert eos_token_ids, "EOS token id collection must not be empty"
 
     # The model isn't guaranteed to end on EOS (e.g. it hit max_tokens); chat
     # templates always add one, so cut the model input to just before its EOS.
@@ -197,11 +157,7 @@ def splice_prefix_tokens(
     # templates may strip prior reasoning blocks when re-rendering history;
     # EOS counting preserves the original generated reasoning tokens without
     # requiring a customized chat template.
-    count_needed = (
-        template_prefix_eos_count
-        if template_prefix_token_ids is None
-        else sum(tid in eos_token_ids for tid in template_prefix_token_ids)
-    )
+    count_needed = sum(tid in eos_token_ids for tid in template_prefix_token_ids)
     count_seen = 0
     template_cut_start = -1
     for pos, tid in enumerate(template_token_ids):
@@ -215,14 +171,14 @@ def splice_prefix_tokens(
         message = (
             f"EOS token #{count_needed} not found in template_token_ids "
             f"(only found {count_seen} EOS tokens total)!\n"
+            f"Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}\n\n"
+            f"Template token IDs (everything that was sent to the model endpoint): {template_token_ids}"
         )
-        if template_prefix_token_ids is not None:
-            message += f"Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}\n\n"
-        message += f"Template token IDs (everything that was sent to the model endpoint): {template_token_ids}"
         if tokenizer is not None:
-            if template_prefix_token_ids is not None:
-                message += f"\n\nTemplate prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}"
-            message += f"\n\nTemplate repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
+            message += (
+                f"\n\nTemplate prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}\n\n"
+                f"Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
+            )
         raise AssertionError(message)
 
     boundary = (

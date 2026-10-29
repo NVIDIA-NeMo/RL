@@ -1771,8 +1771,8 @@ def setup(
             )
             vllm_reserve_time = time.perf_counter() - vllm_reserve_t0
             print(
-                f"  ✓ Reserved {len(deferred_vllm.client_base_urls)} vLLM server URLs: "
-                f"{deferred_vllm.client_base_urls}",
+                f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
+                f"{deferred_vllm.dp_openai_server_base_urls}",
                 flush=True,
             )
 
@@ -1786,7 +1786,7 @@ def setup(
             def init_nemo_gym():
                 """Spin up NeMo Gym servers with the pre-assigned vLLM URLs."""
                 return _spinup_nemo_gym(
-                    deferred_vllm.client_base_urls,
+                    deferred_vllm.dp_openai_server_base_urls,
                     generation_config["model_name"],
                     policy_api_key=deferred_vllm.http_server_api_key,
                 )

@@ -230,7 +230,6 @@ def _worker_with_capture(sink: _MemorySink):
     for name in (
         "_fetch_chain_prefix",
         "_capture_admission",
-        "_parse_capture_admission",
         "_resolve_admission_prefix",
         "_enter_request_prefix",
     ):

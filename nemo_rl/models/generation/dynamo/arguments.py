@@ -111,12 +111,6 @@ def build_dynamo_frontend_argv(
         dynamo_cfg.frontend_args.router_mode,
         source="dynamo_cfg.frontend_args.router_mode",
     )
-    if dynamo_cfg.frontend_args.session_affinity_ttl_secs is not None:
-        builder.add(
-            "--router-session-affinity-ttl-secs",
-            dynamo_cfg.frontend_args.session_affinity_ttl_secs,
-            source="dynamo_cfg.frontend_args.session_affinity_ttl_secs",
-        )
     builder.add_raw(
         dynamo_cfg.frontend_args.extra_cli_args,
         source="dynamo_cfg.frontend_args.extra_cli_args",

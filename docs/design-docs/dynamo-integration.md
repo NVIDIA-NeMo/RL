@@ -32,29 +32,17 @@ implements its `LLMEngine` over the worker's `AsyncLLM`:
   The result travels in `engine_data`, and the driver assembles the same
   output with `request_pipeline.rollout_output`.
 
-  NeMo-Gym's calls also carry an annotation (Gym's Dynamo dialect). The engine
-  applies the native chat endpoint's rules to them: the on-policy sampling check
-  (`vllm/utils.off_policy_sampling_error`), the prefix splice
-  (`openai_server_utils.splice_prefix_tokens`) and the context clamp. A
-  token-capture call stages through the worker's own capture lifecycle
-  (`_begin_request_capture` / `_finish_request_capture`), and the token fields
-  and routed experts come from the native endpoint's helpers
-  (`chat_generation_tokens`, `chat_routed_experts`).
-
   A request with media carries the frontend's tokens, with one unexpanded
   placeholder per item, and the media URLs. The adapter loads the media with
   vLLM's media connector. It then builds the processed prompt with the engine's
   renderer (`process_for_engine_async`), the same step that follows rendering
-  on the native endpoint. The splice, the placeholder remap
-  (`remap_multimodal_placeholders`) and media capture (`_capture_request_media`)
-  all run on that processed prompt.
+  on the native endpoint.
 - `abort` cancels the vLLM request on client disconnect.
 - Registration advertises the context length, the KV block size (from vLLM's
   KV-cache group metadata), the block count and the scheduler limits. It
   publishes no token budget. The engine owns the context check and the output
-  cap, as the native server does. With a budget, the frontend would fill an
-  omitted `max_tokens` from the prompt it rendered, which a prefix splice then
-  changes, and would refuse NeMo RL's own rollouts that fill the context.
+  cap, as the native server does. With a budget, the frontend would refuse NeMo
+  RL's own rollouts that fill the context.
 - `kv_event_sources` points Dynamo at the engine's own vLLM KV-event ZMQ
   publisher. It is set only when the engine caches prefixes. Each engine binds
   its own Linux abstract-namespace socket (`ipc://@...`), so engines on one node

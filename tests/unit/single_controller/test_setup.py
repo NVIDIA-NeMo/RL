@@ -2222,7 +2222,7 @@ class TestSetup:
         assert data_kwargs["is_vlm"] is True
         mock_spinup.assert_called_once_with(
             mc.env,
-            base_urls=patched_factories["fake_gen"].client_base_urls,
+            base_urls=patched_factories["fake_gen"].dp_openai_server_base_urls,
             model_name="test-model",
             # Reaches the actor once, at spinup, rather than riding along with every
             # run_rollouts call.
@@ -2374,44 +2374,6 @@ class TestSetup:
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args
         assert setup_kwargs["capture_media"] is with_processor
-
-    def test_dynamo_token_capture_tells_gym_to_speak_dynamo(self, patched_factories):
-        """The same vLLM workers stage the calls; Gym reaches them through the frontend."""
-        mc = _make_master_config(backend="vllm")
-        mc.policy["generation"].update(
-            {
-                "model_name": "test-model",
-                "stop_strings": None,
-                "stop_token_ids": None,
-                "top_k": None,
-                "dynamo": True,
-                "vllm_cfg": {"async_engine": True, "expose_http_server": True},
-            }
-        )
-        mc.token_capture.enabled = True
-        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {}}
-        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
-
-        with (
-            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-            patch.object(
-                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
-            ) as mock_spinup,
-            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
-            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
-            patch(
-                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
-                return_value=[MagicMock()],
-            ),
-        ):
-            setup_single_controller(mc, MagicMock(pad_token_id=9))
-
-        assert mc.token_capture.generation_backend == "dynamo"
-        assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
-            "dynamo"
-        )
-        generation, _ = patched_factories["_build_generation"].return_value
-        generation.setup_token_capture.assert_called()
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
         mc = _make_master_config(colocated=False, backend="vllm")

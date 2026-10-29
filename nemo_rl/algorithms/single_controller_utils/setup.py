@@ -125,7 +125,6 @@ from nemo_rl.experience.rollouts import (
     should_mask_flagged_samples,
 )
 from nemo_rl.models.generation import resolve_generation_class
-from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -1370,11 +1369,7 @@ def setup_single_controller(
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token, the process-shared capture
         # directory used by every Gym worker, and the capture-host backend.
-        token_capture_cfg.generation_backend = (
-            "dynamo"
-            if dynamo_enabled(generation_config)
-            else generation_config["backend"]
-        )
+        token_capture_cfg.generation_backend = generation_config["backend"]
         if token_capture_cfg.control_auth_token is None:
             # Deferred import: only needed on the capture path.
             import secrets
@@ -1861,7 +1856,7 @@ def setup_single_controller(
                 defer_model_load=True,
             )
             defer_generation_model_load = True
-            gym_base_urls = generation.client_base_urls
+            gym_base_urls = generation.dp_openai_server_base_urls
         # Before the Gym task is built, so Gym can be handed the router's single URL.
         # These two statements are the only failable ones related to the port holder's creation.
         try:

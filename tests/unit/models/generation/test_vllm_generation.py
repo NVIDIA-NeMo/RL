@@ -2571,7 +2571,7 @@ def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
     VllmGeneration.validate_settings(master_config)
 
 
-def _dynamo_master_config(*, router=False, fleet_health=False):
+def _dynamo_master_config(*, fleet_health=False):
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["dynamo"] = True
     vllm_config["vllm_cfg"]["async_engine"] = True
@@ -2579,7 +2579,6 @@ def _dynamo_master_config(*, router=False, fleet_health=False):
     return types.SimpleNamespace(
         policy={"generation": vllm_config},
         async_rl=types.SimpleNamespace(
-            generation_router=types.SimpleNamespace(enabled=router),
             generation_fleet_health=types.SimpleNamespace(enabled=fleet_health),
         ),
     )
@@ -2589,7 +2588,6 @@ def _dynamo_master_config(*, router=False, fleet_health=False):
     ("settings", "error"),
     [
         ({}, None),
-        ({"router": True}, "routes the whole fleet behind one URL"),
         ({"fleet_health": True}, "Disable fleet health"),
     ],
 )
@@ -2603,19 +2601,13 @@ def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error
 
 
 @pytest.mark.parametrize("dynamo", [False, True])
-def test_vllm_token_rollouts_and_clients_use_the_dynamo_frontend_when_it_serves(
-    dynamo,
-):
+def test_vllm_token_rollouts_use_the_dynamo_frontend_when_it_serves(dynamo):
     generation = object.__new__(VllmGeneration)
-    generation.dp_openai_server_base_urls = ["http://a/v1", "http://b/v1"]
     generation.dynamo_frontend_url = "http://frontend/v1" if dynamo else None
     tokens = BatchedDataDict({"input_ids": torch.tensor([[1]])})
     # The frontend request carries token IDs only, so media prompts stay native.
     media = BatchedDataDict({"input_ids": torch.tensor([[1]]), "vllm_content": [None]})
 
-    assert generation.client_base_urls == (
-        ["http://frontend/v1"] if dynamo else ["http://a/v1", "http://b/v1"]
-    )
     assert generation._dynamo_serves(tokens) is dynamo
     assert not generation._dynamo_serves(media)
 

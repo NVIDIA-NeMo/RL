@@ -167,8 +167,8 @@ class ManagedDynamoRuntime:
             "DYN_NAMESPACE": self._namespace,
             "DYN_DISCOVERY_BACKEND": "etcd",
             # Dynamo's legacy tool jail rebuilds response chunks with nvext=None.
-            # Its v2 parser path preserves engine_data, which NeMo-Gym needs for
-            # exact token IDs and log probabilities.
+            # Its v2 parser path preserves engine_data, which carries every NeMo
+            # RL rollout's result.
             "DYN_ENABLE_EXPERIMENTAL_PARSERS_V2": "1",
             "DYN_REQUEST_PLANE": "tcp",
             "DYN_EVENT_PLANE": "nats",
