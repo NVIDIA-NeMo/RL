@@ -52,6 +52,29 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 pytestmark = pytest.mark.mcore
 
 
+def test_value_media_mask_only_for_explicit_model_forward() -> None:
+    """Qwen2.5-style forwards must not receive the rollout media mask."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _model_media_placeholder_token_id,
+    )
+
+    class _WithMask(torch.nn.Module):
+        image_token_index = 42
+
+        def forward(self, input_ids, media_token_validity_mask=None):
+            del media_token_validity_mask
+            return input_ids
+
+    class _WithoutMask(torch.nn.Module):
+        image_token_index = 42
+
+        def forward(self, input_ids):
+            return input_ids
+
+    assert _model_media_placeholder_token_id(_WithMask()) == 42
+    assert _model_media_placeholder_token_id(_WithoutMask()) is None
+
+
 def test_value_head_hook_replaces_nested_vlm_language_head() -> None:
     """VLM critics must replace the head used by the nested language model."""
     from megatron.bridge.training.utils.train_utils import LinearForLastLayer
@@ -197,6 +220,7 @@ def test_get_values_passes_multimodal_batch_to_model_forward(
             "input_ids": torch.tensor([[1, 2]]),
             "pixel_values": torch.ones(1, 4),
             "image_grid_thw": torch.tensor([[1, 1, 1]]),
+            "media_token_validity_mask": torch.tensor([[True, False]]),
         }
     )
     processed = SimpleNamespace(
@@ -217,6 +241,7 @@ def test_get_values_passes_multimodal_batch_to_model_forward(
         _policy_like_cfg={},
         mcore_state=SimpleNamespace(straggler_timer=None),
         defer_fp32_logits=False,
+        media_placeholder_token_id=None,
     )
 
     def run_forward_only(**kwargs: Any) -> list[dict[str, torch.Tensor]]:
@@ -254,6 +279,7 @@ def test_get_values_passes_multimodal_batch_to_model_forward(
 
     assert model_forward.call_args.kwargs["data_dict"] is batch
     assert "pixel_values" in model_forward.call_args.kwargs["data_dict"]
+    assert "media_token_validity_mask" not in model_forward.call_args.kwargs["data_dict"]
     torch.testing.assert_close(result["values"], torch.tensor([[0.0, 1.0]]))
     assert (
         "MegatronValueWorker multimodal input fields: image_grid_thw,pixel_values"

@@ -53,7 +53,12 @@ from megatron.core.transformer import MegatronModule
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    attach_media_token_validity_mask,
+    chunks_accept_media_token_validity_mask,
+    media_placeholder_token_id_from_chunks,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
@@ -113,6 +118,17 @@ def _report_multimodal_input_once(worker: Any, data: BatchedDataDict[Any]) -> No
         flush=True,
     )
     worker._reported_multimodal_input = True
+
+
+def _model_media_placeholder_token_id(model: Any) -> Optional[int]:
+    """Return the media token only when the model explicitly accepts its mask."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    if not chunks_accept_media_token_validity_mask(chunks):
+        return None
+    return media_placeholder_token_id_from_chunks(chunks)
 
 
 def _value_head_parent(chunk: MegatronModule) -> tuple[Any, str]:
@@ -531,6 +547,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             self.model,
             self.optimizer,
         )
+        self.media_placeholder_token_id = _model_media_placeholder_token_id(
+            self.model
+        )
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
 
@@ -564,6 +583,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         Returns:
             Dictionary with training metrics (global_loss, grad_norm, etc.)
         """
+        attach_media_token_validity_mask(
+            data, getattr(self, "media_placeholder_token_id", None)
+        )
         _report_multimodal_input_once(self, data)
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
@@ -780,6 +802,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         Returns:
             BatchedDataDict with "values" key of shape [batch_size, seq_length].
         """
+        attach_media_token_validity_mask(
+            data, getattr(self, "media_placeholder_token_id", None)
+        )
         _report_multimodal_input_once(self, data)
         no_grad = torch.no_grad()
         no_grad.__enter__()
