@@ -1493,7 +1493,9 @@ class TestRoutedExpertsTensorDtype:
 
     def test_an_out_of_range_uint16_id_is_rejected_rather_than_wrapped(self):
         """The widening must not cost the overflow check it exists to serve."""
-        value = torch.tensor([70], dtype=torch.uint16)
+        # Above int8's max of 127, so the guard fires. 200 also wraps to -56 in
+        # int8, which is the silent corruption the check exists to prevent.
+        value = torch.tensor([200], dtype=torch.uint16)
 
         with pytest.raises(ValueError, match="exceeds the resolved carry dtype"):
             _as_routed_experts_tensor(

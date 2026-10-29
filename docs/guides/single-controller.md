@@ -385,11 +385,11 @@ Set `grpo.use_dynamic_sampling: true` to drop prompt groups whose generations al
 
 - `grpo.dynamic_sampling_max_replacements_per_slot >= 1` (default `32`). Each slot may draw this many spare prompts after its group is filtered. If a slot spends the whole budget on groups that all score uniformly, the run raises, as v1 does past `dynamic_sampling_max_gen_batches`. This is a separate budget from `async_rl.rollout_failure.max_replacement_attempts`, which covers rollout failures only; neither drop spends the other's allowance. Size it from the drop rate your run actually reports, not from how many resamples feel reasonable. A slot exhausts the budget only when its original group and all `N` replacements come back uniform, so at drop rate `p` the expected number of run-ending raises is:
 
-```
-p ** (N + 1)  *  grpo.num_prompts_per_step  *  grpo.max_num_steps
-```
+  ```
+  p ** (N + 1)  *  grpo.num_prompts_per_step  *  grpo.max_num_steps
+  ```
 
-Read `p` off `zero_variance_fraction` and keep that product well below 1. The term is dominated by `p ** (N + 1)`, so a budget that is ample at one drop rate fails constantly a little above it; raise `N` rather than trimming it to the smallest value that happened to survive.
+  Read `p` off `zero_variance_fraction` and keep that product well below 1. The term is dominated by `p ** (N + 1)`, so a budget that is ample at one drop rate fails constantly a little above it; raise `N` rather than trimming it to the smallest value that happened to survive.
 - A sampler that stamps a target step: `in_order`, or a `custom` sampler that does. The other built-in samplers (`weight_fifo`, `ready_first`, `windowed`) are rejected, because without a stamped step a filtered group can be neither replaced in place nor counted as missing.
 - `grpo.num_generations_per_prompt >= 2`.
 - `token_capture.enabled: false`. The capture path cannot borrow a finished group from a later step, so each drop would stall its step for a full fresh rollout; setup rejects the combination rather than paying that on every step.
