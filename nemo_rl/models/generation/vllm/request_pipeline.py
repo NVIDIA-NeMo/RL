@@ -14,10 +14,11 @@
 
 """Turn a finished vLLM rollout into NeMo RL's per-sample generation output.
 
-Every path that serves a rollout from a NeMo RL vLLM engine goes through here:
-the worker's own ``generate_async``, and Dynamo serving (the engine builds the
-result, the driver assembles the output). A rollout feature added here, such
-as router replay (R3), therefore behaves the same on every path.
+Building the per-sample result is kept apart from assembling the output tensors,
+so a path that builds the result on the engine and assembles the output
+elsewhere behaves the same as the worker's own ``generate_async``. A rollout
+feature added here, such as router replay (R3), then behaves the same on every
+path.
 """
 
 import logging

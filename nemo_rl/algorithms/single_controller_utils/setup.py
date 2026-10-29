@@ -742,6 +742,7 @@ def _build_value(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
     *,
+    seed: int,
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
 ) -> tuple[TQValue, float]:
@@ -751,6 +752,7 @@ def _build_value(
         train_cluster: Ray virtual cluster the critic shares with the trainer.
         master_config: SC MasterConfig.
         tokenizer: Tokenizer used by the value model.
+        seed: Algorithm seed forwarded to the critic; the Megatron critic ignores it.
         weights_path: Checkpointed value weights to resume from, or None.
         optimizer_path: Checkpointed value optimizer state to resume from, or None.
 
@@ -762,6 +764,7 @@ def _build_value(
         cluster=train_cluster,
         config=master_config.value,
         tokenizer=tokenizer,
+        seed=seed,
         name_prefix="lm_value",
         weights_path=weights_path,
         optimizer_path=optimizer_path,
@@ -1740,6 +1743,7 @@ def setup_single_controller(
             train_cluster,
             master_config,
             tokenizer,
+            seed=algo_cfg.seed,
             weights_path=value_weights_path,
             optimizer_path=value_optimizer_path,
         )

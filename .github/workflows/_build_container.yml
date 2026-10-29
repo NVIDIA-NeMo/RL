@@ -86,6 +86,10 @@ on:
         default: ""
         description: Dockerfile stage to build.
         type: string
+    secrets:
+      APPTAINER_GITHUB_TOKEN:
+        required: false
+        description: Read-only GitHub token for the Apptainer dependency downloads, so they are not subject to anonymous HTTP 429 rate limits.
 
 permissions:
   contents: read
@@ -452,6 +456,10 @@ jobs:
             ${{ steps.trtllm_cache_seed.outputs.ccache_context }}
             ${{ steps.trtllm_cache_seed.outputs.wheel_context }}
           build-args: ${{ inputs.build-args }}
+          # Mounted by the Dockerfile's custom-setup layer (hermetic stage) only;
+          # the cache-image steps below build from `base` and do not need it.
+          secrets: |
+            APPTAINER_GITHUB_TOKEN=${{ secrets.APPTAINER_GITHUB_TOKEN }}
           cache-from: |
             ${{ steps.build_meta.outputs.cache-from }}
             ${{ steps.recent_pr_cache_refs.outputs.cache-from }}
