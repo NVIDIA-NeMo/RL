@@ -41,19 +41,61 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
-from nemo_rl.models.generation.dynamo.arguments import (
-    build_dynamo_frontend_argv,
-    redact_argv,
-    redact_environment,
-)
 from nemo_rl.models.generation.dynamo.config import DynamoCfg
-from nemo_rl.models.generation.dynamo.venv import get_dynamo_service_executable
 
 # The engines register on this component and endpoint (see native_engine).
 DYNAMO_COMPONENT = "backend"
 DYNAMO_ENDPOINT = "generate"
 
 LOGGER = logging.getLogger(__name__)
+
+
+def frontend_argv(
+    *, host: str, port: int, namespace: str, dynamo_cfg: DynamoCfg
+) -> list[str]:
+    """The ``dynamo.frontend`` arguments; ``extra_cli_args`` may not repeat one."""
+    argv = [
+        "--http-host",
+        host,
+        "--http-port",
+        str(port),
+        "--namespace-prefix",
+        namespace,
+        "--discovery-backend",
+        "etcd",
+        "--request-plane",
+        "tcp",
+        "--event-plane",
+        "nats",
+        "--router-mode",
+        dynamo_cfg.frontend_args.router_mode,
+    ]
+    extra = dynamo_cfg.frontend_args.extra_cli_args
+    for token in extra:
+        flag = token.split("=", 1)[0].replace("_", "-")
+        if flag.startswith("--") and flag in argv:
+            raise ValueError(
+                f"Dynamo frontend option {flag} is set by both the managed runtime "
+                "and dynamo_cfg.frontend_args.extra_cli_args."
+            )
+    return argv + list(extra)
+
+
+def _service_executable(name: str) -> str:
+    """The etcd or nats-server binary: in NEMO_RL_DYNAMO_BIN_DIR when set, else on PATH."""
+    bin_dir = os.environ.get("NEMO_RL_DYNAMO_BIN_DIR")
+    found = shutil.which(name, path=os.path.expanduser(bin_dir) if bin_dir else None)
+    if found is None:
+        where = f"NEMO_RL_DYNAMO_BIN_DIR={bin_dir}" if bin_dir else "PATH"
+        raise FileNotFoundError(
+            f"{name} is not an executable on {where}. Build the image with "
+            "--build-arg BUILD_DYNAMO=1, or install etcd and nats-server with "
+            "docker/dynamo/install.sh and set NEMO_RL_DYNAMO_BIN_DIR to their "
+            "directory."
+        )
+    return found
+
+
 # The KV router's applied-event counter (Dynamo's kvrouter.KV_CACHE_EVENTS_APPLIED),
 # one sample per label set.
 _KV_EVENTS_APPLIED = re.compile(
@@ -65,10 +107,7 @@ _KV_EVENTS_APPLIED = re.compile(
 
 def _managed_namespace() -> str:
     raw = f"nemo-rl-{os.environ.get('SLURM_JOB_ID', os.getpid())}"
-    namespace = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(raw)).strip("-_").lower()
-    if not namespace:
-        raise ValueError(f"Could not derive a valid Dynamo namespace from {raw!r}.")
-    return namespace
+    return re.sub(r"[^a-zA-Z0-9_-]+", "-", raw).strip("-_").lower()
 
 
 class ManagedDynamoRuntime:
@@ -96,7 +135,6 @@ class ManagedDynamoRuntime:
         self._frontend_port = 0
         self._manager_env: dict[str, str] = {}
         self._started = False
-        self._atexit_registered = False
         self._etcd_process: subprocess.Popen | None = None
         self._nats_process: subprocess.Popen | None = None
         self._frontend_process: subprocess.Popen | None = None
@@ -131,35 +169,21 @@ class ManagedDynamoRuntime:
         # exception that escapes setup. Keep an interpreter-exit fallback in
         # addition to the normal explicit shutdown path.
         atexit.register(self.shutdown)
-        self._atexit_registered = True
         self._host = _get_node_ip_local()
-        used_ports: set[int] = set()
-
-        def allocate_port(*, low: int, high: int) -> int:
-            port = _get_free_port_local(
-                low,
-                high,
-                max_retries=None,
-                excluded_ports=used_ports,
+        control = (
+            DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
+            DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
+        )
+        http = (DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW, DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH)
+        ports: list[int] = []
+        for low, high in (control, control, control, http):
+            ports.append(
+                _get_free_port_local(
+                    low, high, max_retries=None, excluded_ports=set(ports)
+                )
             )
-            used_ports.add(port)
-            return port
-
-        self._etcd_port = allocate_port(
-            low=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
-            high=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
-        )
-        self._etcd_peer_port = allocate_port(
-            low=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
-            high=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
-        )
-        self._nats_port = allocate_port(
-            low=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
-            high=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
-        )
-        self._frontend_port = allocate_port(
-            low=DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
-            high=DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
+        self._etcd_port, self._etcd_peer_port, self._nats_port, self._frontend_port = (
+            ports
         )
         self._manager_env = {
             "ETCD_ENDPOINTS": f"http://{self._host}:{self._etcd_port}",
@@ -174,7 +198,7 @@ class ManagedDynamoRuntime:
             "DYN_SDK_DISABLE_ANSI_LOGGING": "1",
         }
         print(
-            f"  [Dynamo] managed environment={redact_environment(self._manager_env)!r}",
+            f"  [Dynamo] managed environment={self._manager_env!r}",
             flush=True,
         )
         try:
@@ -220,7 +244,7 @@ class ManagedDynamoRuntime:
         self._etcd_data_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_etcd_")
         peer_url = f"http://{self._host}:{self._etcd_peer_port}"
         command = [
-            get_dynamo_service_executable("etcd"),
+            _service_executable("etcd"),
             "--listen-client-urls",
             f"http://0.0.0.0:{self._etcd_port}",
             "--advertise-client-urls",
@@ -260,7 +284,7 @@ class ManagedDynamoRuntime:
         self._nats_data_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_nats_")
         self._nats_process = subprocess.Popen(
             [
-                get_dynamo_service_executable("nats-server"),
+                _service_executable("nats-server"),
                 "-js",
                 "-sd",
                 self._nats_data_dir,
@@ -288,7 +312,7 @@ class ManagedDynamoRuntime:
         raise RuntimeError(f"{label} did not open port {port}.")
 
     def _start_frontend(self) -> None:
-        argv = build_dynamo_frontend_argv(
+        argv = frontend_argv(
             host="0.0.0.0",
             port=self._frontend_port,
             namespace=self._namespace,
@@ -300,9 +324,7 @@ class ManagedDynamoRuntime:
             "dynamo.frontend",
             *argv,
         ]
-        print(
-            f"  [Dynamo] launching frontend argv={redact_argv(command)!r}", flush=True
-        )
+        print(f"  [Dynamo] launching frontend argv={command!r}", flush=True)
         frontend_env = self._service_env()
         dynamo_venv = os.path.dirname(os.path.dirname(self._frontend_python))
         frontend_env["VIRTUAL_ENV"] = dynamo_venv
@@ -435,7 +457,5 @@ class ManagedDynamoRuntime:
         if self._nats_data_dir is not None:
             shutil.rmtree(self._nats_data_dir, ignore_errors=True)
             self._nats_data_dir = None
-        if self._atexit_registered:
-            atexit.unregister(self.shutdown)
-            self._atexit_registered = False
+        atexit.unregister(self.shutdown)
         self._started = False

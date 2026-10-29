@@ -635,14 +635,6 @@ def _needs_hf_refit_handshake(
     return not (nccl_reshard_refit_enabled and not colocated_inference)
 
 
-def _uses_managed_noncolocated_refit(
-    nccl_reshard_refit_enabled: bool,
-    offload_policy_before_refit: bool,
-) -> bool:
-    """Whether non-colocated setup must attach a weight synchronizer."""
-    return nccl_reshard_refit_enabled or offload_policy_before_refit
-
-
 def _shutdown_completed_nemo_gym_startup(
     future: Future[tuple[NemoGymShardSet, float]] | None,
 ) -> None:
@@ -1935,11 +1927,8 @@ def setup(
         and checkpoint_engine_config is None
     ):
         t0 = time.perf_counter()
-        # init collective
-        if _uses_managed_noncolocated_refit(
-            nccl_reshard_refit_enabled=nccl_reshard_refit_enabled,
-            offload_policy_before_refit=offload_policy_before_refit,
-        ):
+        # init collective; these refits need an attached weight synchronizer.
+        if nccl_reshard_refit_enabled or offload_policy_before_refit:
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,

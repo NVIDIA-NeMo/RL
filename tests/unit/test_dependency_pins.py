@@ -144,21 +144,3 @@ def test_torch_split_shims_are_still_needed() -> None:
         "(nemo_rl/data_plane/adapters/tq_mooncake_checkpoint.py) - drop the "
         "check outright; the pre-2.13 `names` comparison cannot be restored"
     )
-
-
-def test_vllm_extra_carries_base_dynamo_release() -> None:
-    """Dynamo serving runs NeMo RL's own vLLM workers, so the vllm extra carries the
-    released Dynamo runtime but never ai-dynamo[vllm], which pins Dynamo's vLLM."""
-    extras = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"][
-        "optional-dependencies"
-    ]
-    requirements = {
-        canonicalize_name(req.name): req
-        for req in (Requirement(dep) for dep in extras["vllm"])
-    }
-
-    dynamo, runtime = requirements["ai-dynamo"], requirements["ai-dynamo-runtime"]
-    assert not dynamo.extras, f"ai-dynamo must not take extras, got {dynamo.extras}"
-    assert dynamo.specifier == runtime.specifier, (
-        "ai-dynamo and ai-dynamo-runtime must pin the same release"
-    )

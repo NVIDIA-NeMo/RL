@@ -726,12 +726,13 @@ class VllmGeneration(GenerationInterface):
         from nemo_rl.models.generation.dynamo.managed_runtime import (
             ManagedDynamoRuntime,
         )
-        from nemo_rl.models.generation.dynamo.venv import get_dynamo_python
 
         runtime = ManagedDynamoRuntime(
             dynamo_cfg=dynamo_cfg(self.cfg),
             model_name=self.cfg["model_name"],
-            frontend_python=get_dynamo_python(),
+            # The workers' venv carries ai-dynamo, so the frontend runs the same
+            # release as every engine.
+            frontend_python=self.worker_group.py_executable,
         )
         runtime.start()
         self._dynamo_runtime = runtime

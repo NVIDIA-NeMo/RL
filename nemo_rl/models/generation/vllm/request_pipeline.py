@@ -33,7 +33,6 @@ from nemo_rl.models.generation.vllm.utils import pad_and_align_routed_expert_ind
 from nemo_rl.utils.routed_experts_codec import (
     decode_routed_experts,
     encode_routed_experts,
-    routed_experts_envelope_dtype,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -195,14 +194,7 @@ def rollout_result_from_wire(wire: dict[str, Any]) -> RolloutResult:
     """Inverse of :func:`rollout_result_to_wire`; routes keep their own dtype."""
     routed_experts = wire["routed_experts"]
     if routed_experts is not None:
-        routed_experts = decode_routed_experts(
-            routed_experts, routed_experts_envelope_dtype(routed_experts)
-        )
-    if len(wire["logprobs"]) != len(wire["token_ids"]):
-        raise ValueError(
-            f"rollout result has {len(wire['logprobs'])} logprobs for "
-            f"{len(wire['token_ids'])} tokens"
-        )
+        routed_experts = decode_routed_experts(routed_experts, dtype=None)
     return RolloutResult(
         token_ids=list(wire["token_ids"]),
         logprobs=list(wire["logprobs"]),

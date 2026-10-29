@@ -16,15 +16,14 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
-from nemo_rl.models.generation.dynamo import venv as dynamo_venv
 from nemo_rl.models.generation.dynamo.config import DynamoCfg
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
     _managed_namespace,
+    _service_executable,
 )
 
 
@@ -139,54 +138,20 @@ def test_managed_service_and_frontend_environments_are_runtime_owned(
     assert "DYN_SYSTEM_PORT" not in service_env
 
 
-def test_dynamo_python_resolves_the_vllm_worker_venv_as_workers_do(
-    monkeypatch,
-) -> None:
-    built = []
-    monkeypatch.setattr(
-        dynamo_venv, "get_actor_python_env", lambda fqn: "uv run --locked --extra vllm"
-    )
-    # The workers' resolver: reuses an existing venv, builds a missing one per node.
-    monkeypatch.setattr(
-        dynamo_venv,
-        "create_local_venv_on_each_node",
-        lambda py_executable, venv_name: built.append((py_executable, venv_name))
-        or "/venvs/vllm/bin/python",
-    )
-
-    assert dynamo_venv.get_dynamo_python() == "/venvs/vllm/bin/python"
-    assert built == [
-        ("uv run --locked --extra vllm", dynamo_venv.VLLM_ASYNC_WORKER_FQN)
-    ]
-
-
-def test_dynamo_python_passes_an_interpreter_through(monkeypatch) -> None:
-    monkeypatch.setattr(
-        dynamo_venv, "get_actor_python_env", lambda fqn: "/usr/bin/python3"
-    )
-    monkeypatch.setattr(
-        dynamo_venv,
-        "create_local_venv_on_each_node",
-        MagicMock(side_effect=AssertionError("no venv for an interpreter")),
-    )
-
-    assert dynamo_venv.get_dynamo_python() == "/usr/bin/python3"
-
-
 def test_dynamo_services_resolve_from_bin_dir_then_path(monkeypatch, tmp_path) -> None:
     etcd = tmp_path / "etcd"
     etcd.write_text("#!/bin/sh\n")
     etcd.chmod(0o755)
     monkeypatch.setenv("NEMO_RL_DYNAMO_BIN_DIR", str(tmp_path))
-    assert dynamo_venv.get_dynamo_service_executable("etcd") == str(etcd)
+    assert _service_executable("etcd") == str(etcd)
     with pytest.raises(FileNotFoundError, match="NEMO_RL_DYNAMO_BIN_DIR"):
-        dynamo_venv.get_dynamo_service_executable("nats-server")
+        _service_executable("nats-server")
 
     monkeypatch.delenv("NEMO_RL_DYNAMO_BIN_DIR")
     monkeypatch.setenv("PATH", str(tmp_path))
-    assert dynamo_venv.get_dynamo_service_executable("etcd") == str(etcd)
-    with pytest.raises(FileNotFoundError, match="not on PATH"):
-        dynamo_venv.get_dynamo_service_executable("nats-server")
+    assert _service_executable("etcd") == str(etcd)
+    with pytest.raises(FileNotFoundError, match="on PATH"):
+        _service_executable("nats-server")
 
 
 def test_stop_process_escalates_its_process_group(monkeypatch) -> None:

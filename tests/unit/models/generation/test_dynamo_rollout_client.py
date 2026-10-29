@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 
+import aiohttp
 import pytest
 
 from nemo_rl.models.generation.dynamo import rollout_client
@@ -20,6 +21,67 @@ from nemo_rl.models.generation.dynamo.rollout_client import (
     parse_rollout_response,
     post_rollout,
 )
+
+
+class _Response:
+    def __init__(self, status: int, body: bytes):
+        self.status = status
+        self._body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def read(self) -> bytes:
+        return self._body
+
+
+class _Session:
+    def __init__(self, reply):
+        self._reply = reply
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    def post(self, url, *, json):
+        if isinstance(self._reply, Exception):
+            raise self._reply
+        return _Response(*self._reply)
+
+
+@pytest.mark.parametrize(
+    ("reply", "error", "retryable"),
+    [
+        ((200, b'{"status":"ok"}'), None, False),
+        ((200, b"not-json"), "not-json", True),
+        ((503, b"busy"), "HTTP 503: busy", True),
+        (aiohttp.ClientConnectionError("refused"), "refused", True),
+        # One request_timeout_s bounds a rollout: a timeout is not retried.
+        (TimeoutError("slow"), "no response within", False),
+        (aiohttp.ServerTimeoutError("slow read"), "no response within", False),
+    ],
+)
+def test_post_json_reports_failures_as_error_dicts(
+    monkeypatch, reply, error, retryable
+) -> None:
+    monkeypatch.setattr(
+        rollout_client.aiohttp, "ClientSession", lambda **kwargs: _Session(reply)
+    )
+
+    # No deadline is the default (dynamo_cfg.request_timeout_s: null).
+    response = asyncio.run(
+        rollout_client._post_json("http://frontend/v1/completions", {}, timeout_s=None)
+    )
+
+    assert (response.get("status") == "error") is (error is not None)
+    if error is not None:
+        assert error in rollout_client._format_error(response)
+    assert rollout_client._is_retryable(response) is retryable
 
 
 @pytest.mark.parametrize(
@@ -73,7 +135,7 @@ def test_post_rollout_retries_only_transient_failures(
         calls.append(payload)
         return responses[len(calls) - 1]
 
-    monkeypatch.setattr(rollout_client, "async_http_post_json", fake_post)
+    monkeypatch.setattr(rollout_client, "_post_json", fake_post)
     monkeypatch.setattr(rollout_client, "_HTTP_RETRY_DELAY_S", 0.0)
     rollout = post_rollout("http://frontend/v1/completions", {}, timeout_s=1.0)
 

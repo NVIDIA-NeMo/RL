@@ -133,18 +133,8 @@ is the same run with every `dynamo_cfg` default spelled out.
 
 ## Migrating from `backend: dynamo`
 
-`backend: dynamo` launched Dynamo's own vLLM engine and was removed. Startup
-rejects it with the migration:
-
-- Set `backend: vllm` and `dynamo: true`. `vllm_cfg` and `vllm_kwargs` keep their
-  meaning, and every vLLM feature is now available.
-- Remove these from `dynamo_cfg`:
-  - `engine`;
-  - `control_timeout_s`: refit and pause use the vLLM backend's controls;
-  - `metrics_include_prefixes` / `metrics_exclude_prefixes`: use
-    `vllm_cfg.enable_vllm_metrics_logger`;
-  - `worker_args`: the engines serve only NeMo RL's rollouts, which need no chat
-    parsers or templates; engines are configured through `vllm_cfg` and
-    `vllm_kwargs`;
-  - `frontend_args.tokenizer`, `tokenizer_cache` and `tokenizer_cache_bytes`:
-    rollouts send token IDs, which the frontend never tokenizes.
+`backend: dynamo` launched Dynamo's own vLLM engine and was removed. Set
+`backend: vllm` and `dynamo: true`; `vllm_cfg` and `vllm_kwargs` keep their
+meaning. Startup rejects the old backend and each removed `dynamo_cfg` key
+(`engine`, `control_timeout_s`, `metrics_*_prefixes`, `worker_args`,
+`frontend_args.tokenizer*`) with what replaces it.

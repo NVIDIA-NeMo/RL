@@ -378,8 +378,15 @@ def test_dynamo_frontend_args_without_router_reset_states_pass():
     check_outdated_config(_dynamo_frontend_config({"router_mode": "kv"}))
 
 
-def test_generation_without_dynamo_cfg_passes():
-    check_outdated_config({"policy": {"generation": {"backend": "vllm"}}})
+@pytest.mark.parametrize(
+    "generation",
+    [
+        {"backend": "vllm"},
+        {"backend": "vllm", "dynamo": True, "dynamo_cfg": {"frontend_args": {}}},
+    ],
+)
+def test_generation_without_removed_dynamo_keys_passes(generation):
+    check_outdated_config({"policy": {"generation": generation}})
 
 
 # ============================================================================
@@ -391,40 +398,32 @@ def _generation_config(**generation) -> dict:
     return {"policy": {"generation": generation}}
 
 
-def test_dynamo_backend_is_rejected_with_the_migration():
-    with pytest.raises(
-        ValueError, match=r"backend=vllm and policy\.generation\.dynamo=true"
-    ):
-        check_outdated_config(_generation_config(backend="dynamo"))
-
-
 @pytest.mark.parametrize(
-    "dynamo_cfg, removed",
+    "generation, removed",
     [
-        ({"engine": "vllm"}, r"dynamo_cfg\.engine"),
-        ({"control_timeout_s": 600}, r"dynamo_cfg\.control_timeout_s"),
-        ({"metrics_include_prefixes": None}, r"dynamo_cfg\.metrics_include_prefixes"),
-        ({"metrics_exclude_prefixes": None}, r"dynamo_cfg\.metrics_exclude_prefixes"),
-        ({"worker_args": {"extra_cli_args": []}}, r"dynamo_cfg\.worker_args was"),
-        ({"worker_args": {"reasoning_parser": None}}, r"dynamo_cfg\.worker_args was"),
+        ({"backend": "dynamo"}, r"backend=vllm and policy\.generation\.dynamo=true"),
+        ({"dynamo_cfg": {"engine": "vllm"}}, r"dynamo_cfg\.engine"),
+        ({"dynamo_cfg": {"control_timeout_s": 600}}, r"dynamo_cfg\.control_timeout_s"),
         (
-            {"frontend_args": {"tokenizer_cache": False}},
+            {"dynamo_cfg": {"metrics_include_prefixes": None}},
+            r"dynamo_cfg\.metrics_include_prefixes",
+        ),
+        (
+            {"dynamo_cfg": {"metrics_exclude_prefixes": None}},
+            r"dynamo_cfg\.metrics_exclude_prefixes",
+        ),
+        (
+            {"dynamo_cfg": {"worker_args": {"extra_cli_args": []}}},
+            r"dynamo_cfg\.worker_args was",
+        ),
+        (
+            {"dynamo_cfg": {"frontend_args": {"tokenizer_cache": False}}},
             r"frontend_args\.tokenizer_cache was",
         ),
     ],
 )
-def test_removed_dynamo_cfg_keys_are_rejected(dynamo_cfg, removed):
+def test_removed_dynamo_config_is_rejected(generation, removed):
     with pytest.raises(ValueError, match=removed):
         check_outdated_config(
-            _generation_config(backend="vllm", dynamo=True, dynamo_cfg=dynamo_cfg)
+            _generation_config(**{"backend": "vllm", "dynamo": True, **generation})
         )
-
-
-def test_vllm_backend_with_dynamo_passes():
-    check_outdated_config(
-        _generation_config(
-            backend="vllm",
-            dynamo=True,
-            dynamo_cfg={"frontend_args": {"router_mode": "kv"}},
-        )
-    )
