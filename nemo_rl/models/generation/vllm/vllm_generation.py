@@ -66,6 +66,10 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
+from nemo_rl.models.generation.vllm.worker_utils import (
+    resolve_vllm_dp_size,
+    resolve_vllm_rank_prefixes,
+)
 from nemo_rl.telemetry.instrumentation import trace_fn
 from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
 from nemo_rl.telemetry.setup import get_telemetry_handle
@@ -243,7 +247,6 @@ class VllmGeneration(GenerationInterface):
             f"Got world size {cluster.world_size()} and model parallel size (TP * PP) {self.model_parallel_size}."
         )
         self.dp_size = cluster.world_size() // self.model_parallel_size
-        self.vllm_dp_size = self.ep_size // self.tp_size
 
         if self.pp_size > 1:
             assert self.cfg["vllm_cfg"]["async_engine"], (
@@ -256,13 +259,10 @@ class VllmGeneration(GenerationInterface):
                 "When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP. "
                 "Please update your configuration to set expert_parallel_size to a multiple of tensor_parallel_size."
             )
-            if self.ep_size != self.tp_size:
-                # vLLM's EP = DP * TP, so here we need to use DP inside vLLM.
-                assert not self.cfg["vllm_cfg"]["async_engine"], (
-                    "vLLM async_engine has some issues when using DP inside vLLM. "
-                    "Please update your configuration to set `policy.generation.vllm_cfg.async_engine=false`. "
-                    "See https://github.com/NVIDIA-NeMo/RL/issues/1101 for more details."
-                )
+        self.vllm_dp_size = resolve_vllm_dp_size(self.tp_size, self.ep_size)
+        assert self.dp_size % self.vllm_dp_size == 0, (
+            f"Data parallel size ({self.dp_size}) must be a multiple of vLLM data parallel size ({self.vllm_dp_size})."
+        )
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         top_k: int | None = self.cfg["top_k"]
@@ -374,10 +374,6 @@ class VllmGeneration(GenerationInterface):
                 "[INFO] NCCL_NVLS_ENABLE is set to 0 for non-colocated inference with cross-node model parallelism."
                 "See https://github.com/NVIDIA-NeMo/RL/issues/1352 for more details."
             )
-        # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
-        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
-        if self.ep_size > self.tp_size:
-            env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
 
         # Set via runtime_env (not a later os.environ mutation in __init__)
         # because this actor's own vLLM engine spawns further Ray actors for
@@ -836,14 +832,10 @@ class VllmGeneration(GenerationInterface):
             else "init_collective"
         )
 
-        # Prepare rank
         total_workers = len(self.worker_group.workers)
-        if self.dp_size == 0:
-            raise RuntimeError(
-                "Data parallel size is zero, cannot initialize collective."
-            )
-        workers_per_group = total_workers // self.dp_size
-        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+        rank_prefix_list = resolve_vllm_rank_prefixes(
+            total_workers, self.dp_size, self.vllm_dp_size
+        )
 
         # Send world_size and rank for init collective to all workers
         futures = self.worker_group.run_all_workers_multiple_data(
@@ -1002,6 +994,8 @@ class VllmGeneration(GenerationInterface):
         Only leaders are called: each one ``collective_rpc``s into its own TP/PP workers,
         so one Ray call per shard reaches every rank in it.
         """
+        if self.vllm_dp_size > 1:
+            raise RuntimeError("Partial-shard rebuild is not supported with vLLM DP")
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
