@@ -287,21 +287,23 @@ def build_sampling_params(
 class SnapshotStatLogger(StatLoggerBase):
     """Push per-iteration KV usage into Dynamo's SnapshotPublisher (router load)."""
 
+    # Set by Dynamo after vLLM built the logger, so shared through the class.
     publisher: Optional[Any] = None
-    num_gpu_blocks: int = 0
 
     def __init__(self, vllm_config: Any, engine_index: int = 0) -> None:
         self.dp_rank = engine_index
+        # vLLM sizes the KV cache before it builds its stat loggers.
+        self.num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks or 0
 
     def record(self, scheduler_stats, iteration_stats, *args, **kwargs) -> None:
         cls = type(self)
         if scheduler_stats is None or cls.publisher is None:
             return
-        total = max(1, cls.num_gpu_blocks)
+        total = max(1, self.num_gpu_blocks)
         usage = scheduler_stats.kv_cache_usage
         hit_rate = None
-        prefix = getattr(scheduler_stats, "prefix_cache_stats", None)
-        if prefix is not None and prefix.queries > 0:
+        prefix = scheduler_stats.prefix_cache_stats
+        if prefix.queries > 0:
             hit_rate = prefix.hits / prefix.queries
         cls.publisher.publish(
             self.dp_rank,
@@ -362,7 +364,6 @@ class NativeVllmEngine(LLMEngine):
             ):
                 block_size = group["block_size"]
                 break
-        SnapshotStatLogger.num_gpu_blocks = cache.num_gpu_blocks or 0
         model = self._host.model_name
         return EngineConfig(
             model=model,
@@ -816,7 +817,9 @@ class NativeVllmEngine(LLMEngine):
         kv_events = self._llm.vllm_config.kv_events_config
         if kv_events is None or not kv_events.enable_kv_cache_events:
             return []
-        return [ZmqSource(endpoint=kv_events.endpoint)]
+        # A user's own kv_events_config can keep vLLM's wildcard default
+        # (tcp://*:5557): vLLM binds it, but a subscriber cannot connect to "*".
+        return [ZmqSource(endpoint=kv_events.endpoint.replace("*", "127.0.0.1"))]
 
     def component_metrics_dp_ranks(self) -> list[int]:
         return [0]

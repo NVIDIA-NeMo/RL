@@ -86,9 +86,6 @@ policy:
     dynamo_cfg:
       startup_timeout_s: 1800
       frontend_args:
-        tokenizer: fastokens
-        tokenizer_cache: true
-        tokenizer_cache_bytes: 4294967296
         router_mode: kv
         extra_cli_args: []
     vllm_cfg:

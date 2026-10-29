@@ -1,6 +1,6 @@
 # Dynamo serving for vLLM generation
 
-Any vLLM generation config can serve its rollouts through
+Any non-colocated vLLM generation config can serve its rollouts through
 [Dynamo](https://github.com/ai-dynamo/dynamo)'s OpenAI frontend and KV-aware
 router. Add one line:
 
@@ -27,9 +27,8 @@ independent.
 With `dynamo: true`:
 
 - `vllm_cfg.async_engine` is turned on, because Dynamo drives the engine's
-  `AsyncLLM`. Settings the async engine does not run, such as data parallelism
-  inside vLLM (`expert_parallel_size > tensor_parallel_size`), are rejected at
-  startup.
+  `AsyncLLM`. Settings Dynamo does not serve are rejected at startup; see
+  [Not supported](#not-supported).
 - The driver starts etcd, NATS and `dynamo.frontend`. The frontend runs from the
   vLLM workers' own venv, so it is the same ai-dynamo release.
 - Each engine turns on vLLM's KV-cache events for `router_mode: kv` and
@@ -51,12 +50,11 @@ shows them all:
 | Key | Default | Meaning |
 |---|---|---|
 | `startup_timeout_s` | 600 | Bounds service start-up and engine registration |
-| `request_timeout_s` | 900 | Timeout for one NeMo RL rollout through the frontend, in place of `NRL_VLLM_ASYNC_TIMEOUT_SECONDS`. A timeout fails the attempt as a native timeout does, and the rollout retry policy applies; NeMo-Gym's calls keep Gym's timeouts |
+| `request_timeout_s` | null | Deadline for one NeMo RL rollout through the frontend. null waits as long as generation takes, as native does; on the SingleController, `async_rl.rollout_failure.native.generation_timeout_s` bounds both paths |
 | `worker_args.tool_call_parser`, `reasoning_parser` | null | Dynamo's built-in parser names. null follows the native server's settings; see [NeMo-Gym](#nemo-gym) |
 | `worker_args.custom_jinja_template` | null | A chat template that replaces the model's own. null follows the native server's |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
 | `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym rollout on one engine while it is idle for up to this many seconds; null disables it. Dynamo keeps at most 65,536 sessions and answers a new one past that with HTTP 529 |
-| `frontend_args.tokenizer`, `tokenizer_cache*` | `default`, off | Frontend tokenizer |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags |
 
 The etcd and nats-server binaries are found in `NEMO_RL_DYNAMO_BIN_DIR` when it
@@ -162,13 +160,17 @@ Startup rejects these with `dynamo: true`:
   colocated vLLM; the other entrypoints need non-colocated generation.
 - `async_rl.generation_router`: the frontend already routes the fleet behind one
   URL and, with fleet health, only to the shards in service.
-- `vllm_cfg.http_server_api_key_required`: the frontend checks no bearer token.
 - `extra_body.bad_words` on the policy model
   (`env.nemo_gym.policy_model.responses_api_models.vllm_model`): the frontend
   answers every request carrying it with HTTP 400. Startup checks only this
   overlay, not Gym's own YAMLs.
 - `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data
-  parallelism inside vLLM, which the async engine Dynamo serves does not.
+  parallelism inside vLLM, which Dynamo does not serve yet. Above data-parallel
+  rank 0, vLLM rejects each engine's `ipc://` KV-event endpoint.
+- `vllm_cfg.http_server_api_key_required`: the frontend serves the same engines
+  on 0.0.0.0 and checks no bearer token.
+- `frontend_args.router_mode: direct`: it needs a worker ID on every request, and
+  NeMo RL's rollouts name none.
 - The chat settings above that the frontend would not reproduce:
   `enable_auto_tools: false`, and `chat_template_content_format: string` with
   more than one media item of a modality allowed.
@@ -176,10 +178,10 @@ Startup rejects these with `dynamo: true`:
   `enable_thinking: false`: vLLM's parser returns a non-thinking turn as
   reasoning, and Dynamo's return it as content. NeMo RL's `nano_v3` parser
   returns it as content on both.
-
-Engine registration refuses a parser name that a parser plugin provides.
 - `dynamo: true` on a backend other than vLLM, and a `dynamo_cfg` block without
   `dynamo: true`.
+
+Engine registration refuses a parser name that a parser plugin provides.
 
 ## Build the image
 
@@ -207,7 +209,7 @@ bash docker/dynamo/install.sh
 
 ## Run
 
-Use any non-colocated vLLM recipe and add the switch:
+Use any non-colocated vLLM recipe that does not use NeMo-Gym, and add the switch:
 
 ```bash
 uv run examples/run_grpo_single_controller.py \
@@ -220,15 +222,8 @@ is the same run with every `dynamo_cfg` default spelled out.
 
 ## Migrating from `backend: dynamo`
 
-`backend: dynamo` launched Dynamo's own vLLM engine and was removed. Startup
-rejects it with the migration:
-
-- Set `backend: vllm` and `dynamo: true`. `vllm_cfg` and `vllm_kwargs` keep their
-  meaning, and every vLLM feature is now available.
-- Remove these from `dynamo_cfg`:
-  - `engine`;
-  - `control_timeout_s`: refit and pause use the vLLM backend's controls;
-  - `metrics_include_prefixes` / `metrics_exclude_prefixes`: use
-    `vllm_cfg.enable_vllm_metrics_logger`;
-  - `worker_args.extra_cli_args`: engines are configured through `vllm_cfg` and
-    `vllm_kwargs`.
+`backend: dynamo` launched Dynamo's own vLLM engine and was removed. Set
+`backend: vllm` and `dynamo: true`; `vllm_cfg` and `vllm_kwargs` keep their
+meaning. Startup rejects the old backend and each removed `dynamo_cfg` key
+(`engine`, `control_timeout_s`, `metrics_*_prefixes`, `worker_args.extra_cli_args`,
+`frontend_args.tokenizer*`) with what replaces it.

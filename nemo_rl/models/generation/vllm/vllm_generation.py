@@ -417,6 +417,10 @@ class VllmGeneration(GenerationInterface):
         # RayWorkerGroup(env_vars=...) below) is inherited by them.
         if draft_module_sharing_disable_required(self.cfg):
             env_vars[DRAFT_DISABLE_MODULE_SHARING_ENV] = "1"
+        if dynamo_enabled(self.cfg):
+            # dynamo._core fixes its log format when the engine first imports it,
+            # before engine_env is applied, so it must be in the actor's env.
+            env_vars["DYN_SDK_DISABLE_ANSI_LOGGING"] = "1"
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
@@ -740,12 +744,13 @@ class VllmGeneration(GenerationInterface):
         from nemo_rl.models.generation.dynamo.managed_runtime import (
             ManagedDynamoRuntime,
         )
-        from nemo_rl.models.generation.dynamo.venv import get_dynamo_python
 
         runtime = ManagedDynamoRuntime(
             dynamo_cfg=dynamo_cfg(self.cfg),
             model_name=self.cfg["model_name"],
-            frontend_python=get_dynamo_python(),
+            # The workers' venv carries ai-dynamo, so the frontend runs the same
+            # release as every engine.
+            frontend_python=self.worker_group.py_executable,
         )
         runtime.start()
         self._dynamo_runtime = runtime
