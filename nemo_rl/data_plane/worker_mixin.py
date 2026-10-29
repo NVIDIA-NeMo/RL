@@ -263,7 +263,9 @@ def _broadcast_batched_data_dict(
             del wire
             if not is_leader:
                 if torch.device(src_device).type != torch.device(bcast_device).type:
-                    tensor = tensor.to(src_device)
+                    # Move by device type only: the source's index names the
+                    # leader's GPU, and "cuda" resolves to this rank's own.
+                    tensor = tensor.to(torch.device(src_device).type)
                 out[key] = tensor
             del tensor
         elif kind == "nested":
@@ -281,7 +283,7 @@ def _broadcast_batched_data_dict(
                 del wire
             if not is_leader:
                 if torch.device(src_device).type != torch.device(bcast_device).type:
-                    values = values.to(src_device)
+                    values = values.to(torch.device(src_device).type)
                 out[key] = torch.nested.nested_tensor_from_jagged(
                     values, offsets.to(values.device)
                 )
@@ -318,7 +320,7 @@ def _broadcast_batched_data_dict(
                 del wire
             if not is_leader:
                 if torch.device(source_device).type != torch.device(bcast_device).type:
-                    tensor = tensor.to(source_device)
+                    tensor = tensor.to(torch.device(source_device).type)
                 out[key] = header.rebuild_from_broadcast_parts(shapes, tensor)
             del tensor
         else:

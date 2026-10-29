@@ -135,7 +135,14 @@ async def await_off_loop(fn):
 
     No timeout here on purpose. Bounding the wait is the controller's job
     (``_sync_weights_within``); this only decides which thread blocks.
+
+    The CUDA device is thread-local and a fresh thread starts on device 0, so the
+    caller's device is carried into the thread, as in :func:`release_within`. Otherwise
+    every caller has to remember to set it inside ``fn``.
     """
+    import torch
+
+    device = torch.cuda.current_device() if torch.cuda.is_initialized() else None
     loop = asyncio.get_running_loop()
     settled: asyncio.Future = loop.create_future()
 
@@ -145,6 +152,8 @@ async def await_off_loop(fn):
 
     def _run() -> None:
         try:
+            if device is not None:
+                torch.cuda.set_device(device)
             result = fn()
         except BaseException as exc:  # noqa: BLE001 - re-raised on the loop below
             loop.call_soon_threadsafe(_settle, settled.set_exception, exc)
