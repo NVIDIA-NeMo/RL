@@ -474,6 +474,131 @@ async def test_async_vllm_worker_gpu_profiling_awaits_collective_rpc(
     worker.llm.collective_rpc.assert_awaited_once_with("stop_gpu_profiling", args=())
 
 
+class _ScriptedAsyncLLM:
+    """Yields one scripted final RequestOutput and records what it was asked to generate."""
+
+    def __init__(self, generated: list[int], finish_reason: str = "stop") -> None:
+        self.generated = generated
+        self.finish_reason = finish_reason
+        self.calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+    async def generate(self, prompt, sampling_params, request_id):
+        self.calls.append((prompt, sampling_params))
+        yield types.SimpleNamespace(
+            prompt_token_ids=prompt["prompt_token_ids"],
+            prompt_routed_experts=None,
+            num_cached_tokens=0,
+            outputs=[
+                types.SimpleNamespace(
+                    token_ids=self.generated,
+                    logprobs=[
+                        {t: types.SimpleNamespace(logprob=-0.5)} for t in self.generated
+                    ],
+                    finish_reason=self.finish_reason,
+                    routed_experts=None,
+                )
+            ],
+        )
+
+
+def _rollout_worker(llm: _ScriptedAsyncLLM, **cfg) -> VllmAsyncGenerationWorkerImpl:
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "max_new_tokens": 8,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": None,
+        "stop_token_ids": [2],
+        "stop_strings": ["</done>"],
+        "_pad_token_id": 0,
+        "vllm_cfg": {"async_engine": True, "max_model_len": 16},
+        **cfg,
+    }
+    # Records the sampling kwargs instead of building vLLM's SamplingParams.
+    worker.SamplingParams = dict
+    worker.routed_experts_dtype = torch.int16
+    worker.llm = llm
+    return worker
+
+
+async def _generate_one(
+    worker: VllmAsyncGenerationWorkerImpl,
+    prompt: list[int],
+    stop_strings: list[str] | None = None,
+) -> BatchedDataDict:
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([prompt]),
+            "input_lengths": torch.tensor([len(prompt)]),
+            "stop_strings": [stop_strings],
+        }
+    )
+    ((sample_idx, output),) = [item async for item in worker.generate_async(data)]
+    assert sample_idx == 0
+    return output
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_generate_async_samples_and_returns_the_rollout() -> None:
+    llm = _ScriptedAsyncLLM([10, 11, 2], finish_reason="stop")
+    worker = _rollout_worker(llm)
+
+    output = await _generate_one(worker, [1, 2, 3, 4, 5], stop_strings=["</x>"])
+
+    ((prompt, sampling),) = llm.calls
+    assert prompt == {"prompt_token_ids": [1, 2, 3, 4, 5]}
+    assert sampling["max_tokens"] == 8
+    assert sampling["temperature"] == 0.7
+    assert sampling["top_k"] == -1
+    assert sorted(sampling["stop"]) == ["</done>", "</x>"]
+    assert output["output_ids"].tolist() == [[1, 2, 3, 4, 5, 10, 11, 2]]
+    assert output["logprobs"].tolist() == [[0.0] * 5 + [-0.5] * 3]
+    assert output["generation_lengths"].tolist() == [3]
+    assert output["unpadded_sequence_lengths"].tolist() == [8]
+    assert output["truncated"].tolist() == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("speculative_config", "expected_max_tokens"),
+    [
+        # min(max_new_tokens=8, max_model_len 16 - prompt 12)
+        (None, 4),
+        # The drafter reads 2 tokens ahead: 16 - 12 - (2 + 1)
+        ({"num_speculative_tokens": 2}, 1),
+    ],
+)
+async def test_async_vllm_generate_async_caps_the_budget_to_the_context(
+    speculative_config, expected_max_tokens
+) -> None:
+    llm = _ScriptedAsyncLLM([10], finish_reason="length")
+    worker = _rollout_worker(
+        llm, vllm_kwargs={"speculative_config": speculative_config}
+    )
+
+    output = await _generate_one(worker, list(range(1, 13)))
+
+    ((_, sampling),) = llm.calls
+    assert sampling["max_tokens"] == expected_max_tokens
+    assert output["truncated"].tolist() == [True]
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_generate_async_returns_the_prompt_when_nothing_fits() -> None:
+    llm = _ScriptedAsyncLLM([10])
+    worker = _rollout_worker(llm)
+    prompt = list(range(1, 17))
+
+    output = await _generate_one(worker, prompt)
+
+    assert llm.calls == []
+    assert output["output_ids"].tolist() == [prompt]
+    assert output["logprobs"].tolist() == [[0.0] * 16]
+    assert output["generation_lengths"].tolist() == [0]
+    assert output["unpadded_sequence_lengths"].tolist() == [16]
+    assert output["truncated"].tolist() == [False]
+
+
 @pytest.mark.asyncio
 async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
     engine_loop = asyncio.get_running_loop()
