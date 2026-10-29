@@ -1107,7 +1107,9 @@ def from_parallel_logits_to_logprobs_packed_sequences(
             This is used when the input data was packed before it reached the
             model worker.
         reuse_logits_storage (bool): Let the chunked path write its fp32 grad into
-            the logits' storage. Only for callers whose logits have no other consumer.
+            the logits' storage. After backward the logits tensor holds the grad,
+            so reading it as logits afterwards gives wrong values. Only for callers
+            whose logits have no other consumer.
 
     Returns:
         torch.Tensor: Log probabilities in unpacked ``[batch_size,
