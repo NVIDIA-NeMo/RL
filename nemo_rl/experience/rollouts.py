@@ -3361,6 +3361,9 @@ def _postprocess_single_nemo_gym_group(
             agent_to_results[agent_name].append(result["full_result"])
             agent_to_sample_metrics[agent_name].append(sample_metrics)
             result["agent_ref"] = agent_ref
+            # The dataset's routing key, when the row has one; run_examples
+            # resolves it to agent_ref in place but leaves it on the row.
+            result["task_source"] = nemo_gym_row.get("task_source")
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
@@ -3433,6 +3436,7 @@ def _postprocess_single_nemo_gym_group(
     final_batch = BatchedDataDict[DatumSpec](
         {
             "agent_ref": [r["agent_ref"] for r in results],
+            "task_source": [r.get("task_source") for r in results],
             "message_log": [r["message_log"] for r in results],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
