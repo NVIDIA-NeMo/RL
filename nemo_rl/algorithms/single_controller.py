@@ -1919,7 +1919,14 @@ class SingleControllerActor:
 
     async def _discard_committed_group(self, request: "ReassemblyRequest") -> None:
         """Release a committed group the controller declines to train on."""
-        await self._cleanup_known_finalization_request(request)
+        async with self._data_plane_checkpoint_barrier.mutation(
+            "group_removals"
+        ) as cut:
+            await self._cleanup_known_finalization_request_unlocked(cut, request)
+            # The cleanup's abort() keeps ready slots, and this group committed:
+            # drop its slot in the same cut, or the sampler could still select
+            # it with its rows cleared.
+            await self._buffer.drop_committed_group(cut, request.group_id)
         # The group left the buffer unconsumed, so the post-step release for
         # consumed groups never reaches its pending metrics and observations.
         self._finalizer_metrics_by_group.pop(request.group_id, None)
