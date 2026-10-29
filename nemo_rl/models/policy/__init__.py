@@ -223,7 +223,9 @@ class AutomodelConfig(TypedDict):
     # is rejected by validate_and_prepare_config when init_optimizer=True.
     load_precision: NotRequired[str]
     # Shard the model before loading its weights instead of loading the
-    # unwrapped model first. Lowers peak memory for large checkpoints.
+    # unwrapped model first. Only takes effect when TP=1 and every GPU is in
+    # one context-parallel group (e.g. TP=1, CP=8 on 8 GPUs), where it lowers
+    # peak GPU memory during loading; Automodel already shards first otherwise.
     shard_before_load: NotRequired[bool]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]

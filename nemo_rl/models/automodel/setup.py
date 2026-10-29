@@ -117,10 +117,12 @@ def _precision_to_dtype(precision: str, field_name: str) -> torch.dtype:
 def _force_shard_before_load(enabled: bool):
     """Make Automodel shard the model before loading its weights.
 
-    Automodel decides load-vs-shard order from the parallelism sizes; with
-    tp_size == 1 it loads the unwrapped model first, which materializes the
-    whole checkpoint on every rank. Forcing the post-shard path caps peak
-    memory at the per-rank shard, which is what makes 30B-class teachers fit.
+    Automodel loads the unsharded model first only when PP, TP, EP and LoRA
+    are off and the ``dp_shard`` mesh axis is 1. With NeMo-RL's mesh that is
+    TP=1 with every GPU in one context-parallel group (e.g. TP=1, CP=8 on 8
+    GPUs), where each GPU briefly holds the whole checkpoint before FSDP
+    shards it over the CP ranks. Forcing the post-shard path caps per-GPU load
+    memory at the local shard; in every other layout this is a no-op.
     """
     if not enabled:
         yield
