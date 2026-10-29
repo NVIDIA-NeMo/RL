@@ -45,10 +45,10 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
+    configure_fp32_lm_head,
     parse_nvfp4_pertoken_rollout,
     resolve_vllm_video_config,
     validate_nvfp4_pertoken_model,
-    vllm_nemotron_h_fp32_lm_head_enabled,
 )
 from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
@@ -500,11 +500,9 @@ class BaseVllmGenerationWorker:
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
-        vllm_cfg = self.cfg["vllm_cfg"]
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
-            nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
             require_moe_routed_experts_capture=bool(
                 (self.cfg.get("vllm_kwargs") or {}).get(
                     "enable_return_routed_experts", False
@@ -555,6 +553,7 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        configure_fp32_lm_head(self.cfg["vllm_cfg"], vllm_kwargs)
         # vLLM 0.28 (vllm-project/vllm#50411) skips rescale/normalize in the HF image
         # processor and re-applies them on the GPU in the vision tower's dtype. The
         # policy side normalizes on the CPU in fp32 through the same HF processor, so

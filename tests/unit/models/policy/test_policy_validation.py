@@ -266,19 +266,18 @@ def test_policy_accepts_matched_vllm_and_megatron_fp32_lm_head():
     assert policy.worker_group is not None
 
 
-def test_policy_warns_when_vllm_fp32_lm_head_model_is_not_nemotron_h():
+@pytest.mark.parametrize(
+    "architecture", ["Qwen2ForCausalLM", "Qwen3ForCausalLM", "LlamaForCausalLM"]
+)
+def test_policy_accepts_vllm_fp32_lm_head_for_standard_models(
+    architecture: str,
+) -> None:
     config = create_megatron_config("test-model", tp=1)
     config["megatron_cfg"]["fp32_lm_head"] = True
     set_vllm_generation(config, {"fp32_lm_head": True})
-
-    with pytest.warns(UserWarning, match="Nemotron-H"):
-        policy = construct_policy_with_mocks(
-            config,
-            model_config=SimpleNamespace(
-                architectures=["Qwen2ForCausalLM"], model_type="qwen2"
-            ),
-        )
-
+    policy = construct_policy_with_mocks(
+        config, model_config=SimpleNamespace(architectures=[architecture])
+    )
     assert policy.worker_group is not None
 
 

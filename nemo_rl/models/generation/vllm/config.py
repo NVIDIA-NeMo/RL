@@ -73,7 +73,8 @@ class VllmSpecificArgs(TypedDict):
     # with generation-time processors should request ``raw_logprobs`` when
     # comparing generation and policy logprobs.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
-    # Nemotron-H only: compute vLLM Nemotron-H logits with an fp32 LM head.
+    # Emit FP32 logits directly from the unquantized vLLM LM-head GEMM.
+    # Inputs and weights stay in the model dtype (vLLM native head_dtype).
     # Pair this with policy.megatron_cfg.fp32_lm_head when using a Megatron
     # trainer.
     fp32_lm_head: NotRequired[bool]
@@ -142,11 +143,50 @@ class VllmSpecificArgs(TypedDict):
     reasoning_parser_plugin: NotRequired[str]
 
 
-def vllm_nemotron_h_fp32_lm_head_enabled(
+def vllm_fp32_lm_head_enabled(
     vllm_cfg: VllmSpecificArgs | dict[str, Any],
 ) -> bool:
-    """Return whether vLLM should run Nemotron-H logits with an fp32 head."""
-    return bool(vllm_cfg.get("fp32_lm_head"))
+    """Validate and return the optional FP32 LM-head switch."""
+    value = vllm_cfg.get("fp32_lm_head")
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(
+            "policy.generation.vllm_cfg.fp32_lm_head must be true or false."
+        )
+    if "NRL_VLLM_FP32_LM_HEAD" in (vllm_cfg.get("env_vars") or {}):
+        raise ValueError(
+            "NRL_VLLM_FP32_LM_HEAD is obsolete; configure "
+            "policy.generation.vllm_cfg.fp32_lm_head instead."
+        )
+    return bool(value)
+
+
+def configure_fp32_lm_head(
+    vllm_cfg: VllmSpecificArgs | dict[str, Any], vllm_kwargs: dict[str, Any]
+) -> None:
+    """Map NeMo RL's switch to vLLM's native projection output dtype.
+
+    vLLM 0.29 uses torch.mm(out_dtype=torch.float32) for CUDA BF16/FP16
+    inputs, without casting or replacing the live (refittable) LM-head weight.
+    Reject competing overrides so policy validation sees the effective setting.
+    """
+    enabled = vllm_fp32_lm_head_enabled(vllm_cfg)
+    overrides = vllm_kwargs.get("hf_overrides")
+    if overrides is not None and not isinstance(overrides, dict):
+        raise ValueError("vllm_kwargs.hf_overrides must be a dictionary.")
+    head_dtype = (overrides or {}).get("head_dtype")
+    is_fp32_override = str(head_dtype).removeprefix("torch.") in (
+        "float32",
+        "float",
+        "fp32",
+    )
+    if head_dtype is not None and enabled != is_fp32_override:
+        raise ValueError(
+            f"vllm_kwargs.hf_overrides.head_dtype={head_dtype!r} conflicts with "
+            f"vllm_cfg.fp32_lm_head={enabled}. Configure the FP32 head with "
+            "vllm_cfg.fp32_lm_head and remove the head_dtype override."
+        )
+    if enabled:
+        vllm_kwargs["hf_overrides"] = {**(overrides or {}), "head_dtype": "float32"}
 
 
 class VllmDeltaCompressionConfig(BaseModel, extra="allow"):
