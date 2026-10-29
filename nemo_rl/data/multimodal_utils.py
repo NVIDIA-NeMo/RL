@@ -15,6 +15,7 @@
 import base64
 import inspect
 import logging
+import math
 import re
 import uuid
 from collections import defaultdict
@@ -198,6 +199,37 @@ def present_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
     deterministic field list across ranks.
     """
     return sorted(WIRE_MULTIMODAL_FIELDS & set(meta.fields or ()))
+
+
+def teacher_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
+    """Omit packed columns whose row shapes prove the whole teacher batch empty.
+
+    Capture keeps empty media columns for the trainer's partition schema, but
+    text teachers do not accept media arguments. Keep per-token fields and any
+    packed field with missing or malformed shapes for the decoder to validate.
+    """
+    fields = present_multimodal_fields(meta)
+    if not meta.tags or len(meta.tags) != meta.size:
+        return fields
+
+    def row_is_empty(tag: dict[str, Any], field: str) -> bool:
+        geometry = tag.get(row_shapes_key(field))
+        if not isinstance(geometry, dict):
+            return False
+        shapes = geometry.get(ROW_GEOMETRY_SHAPES)
+        return isinstance(shapes, (list, tuple)) and all(
+            isinstance(shape, (list, tuple))
+            and all(type(dim) is int and dim >= 0 for dim in shape)
+            and math.prod(shape) == 0
+            for shape in shapes
+        )
+
+    return [
+        field
+        for field in fields
+        if field not in PACKED_MULTIMODAL_FIELDS
+        or not all(row_is_empty(tag, field) for tag in meta.tags)
+    ]
 
 
 def multimodal_row_tags(
@@ -1303,6 +1335,16 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
     all_keys.update(processor.model_input_names)
     all_keys.difference_update(set(processor.tokenizer.model_input_names))
     return list(all_keys)
+
+
+def per_token_multimodal_schema(processor) -> tuple[str, ...]:
+    """Per-token media fields a multimodal run writes on every row; none if text-only."""
+    if processor is None:
+        return ()
+    keys = set(get_multimodal_keys_from_processor(processor))
+    return tuple(
+        sorted({"media_token_validity_mask"} | (keys & PER_TOKEN_MULTIMODAL_FIELDS))
+    )
 
 
 def get_multimodal_default_settings_from_processor(

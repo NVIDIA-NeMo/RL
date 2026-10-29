@@ -1369,7 +1369,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
 
     with (
         patch.object(distil_mod, "RayVirtualCluster", DummyCluster),
-        patch.object(distil_mod, "Logger"),
+        patch.object(distil_mod, "Logger") as mock_logger_cls,
         patch.object(distil_mod, "CheckpointManager") as mock_ckpt_mgr,
         patch.object(distil_mod, "StatefulDataLoader"),
         patch.object(distil_mod, "Policy", DummyPolicy),
@@ -1379,6 +1379,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         ) as mock_spinup_nemo_gym,
         patch.object(distil_mod, "ray") as mock_ray,
     ):
+        mock_logger_cls.return_value.base_log_dir = "/tmp/distillation-test-logs"
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
         mock_ckpt_mgr.return_value.get_resume_paths.return_value = (None, None)
         mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
@@ -1415,7 +1416,12 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         use_fastokens=False,
         policy_api_key="k",
     )
-    assert master_config.env["nemo_gym"] == nemo_gym_env_before
+    # Building the actor leaves the configured keys alone. setup() adds only the
+    # Gym log dir, under this run's log dir.
+    assert master_config.env["nemo_gym"] == {
+        **nemo_gym_env_before,
+        "nemo_gym_log_dir": "/tmp/distillation-test-logs/nemo_gym",
+    }
 
 
 def test_nemo_gym_distillation_runner_uses_setup_actor():
