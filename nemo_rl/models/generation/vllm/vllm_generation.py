@@ -290,6 +290,20 @@ class VllmGeneration(GenerationInterface):
             f"Please update your configuration to include all required VLLM parameters."
         )
 
+        discard_weights_on_sleep = self.cfg["vllm_cfg"].get("discard_weights_on_sleep")
+        if discard_weights_on_sleep is True:
+            if not self.cfg["colocated"]["enabled"]:
+                raise ValueError(
+                    "generation.vllm_cfg.discard_weights_on_sleep has no effect "
+                    "when generation.colocated.enabled is false."
+                )
+            if self._has_static_speculative_weights():
+                raise ValueError(
+                    "generation.vllm_cfg.discard_weights_on_sleep is not supported "
+                    "when speculative drafter weights are not restored by policy "
+                    "refit. Disable it for this configuration. See #2646."
+                )
+
         assert_reload_refit_config_supported(self.cfg)
 
         extension_fqn = self.cfg.get("worker_extension_cls_fqn")
@@ -1402,8 +1416,19 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy preparation: {e}")
             return False
 
-    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Sleep workers and reset prefix cache."""
+    def finish_generation(
+        self,
+        *args: Any,
+        discard_weights: bool = False,
+        **kwargs: Any,
+    ) -> bool:
+        """Sleep workers and reset prefix cache.
+
+        Args:
+            discard_weights: Use vLLM sleep level 2 to release weight storage.
+                Set this only when a full refit is guaranteed before the next
+                generation.
+        """
         try:
             # Choose the appropriate method based on setting
             # non-colocated only needs reset prefix cache, no need to sleep.
@@ -1417,10 +1442,15 @@ class VllmGeneration(GenerationInterface):
                     if self.cfg["vllm_cfg"]["async_engine"]
                     else "reset_prefix_cache"
                 )
+            worker_kwargs = {"sleep_level": 2 if discard_weights else 1}
+            if not self.cfg["colocated"]["enabled"]:
+                worker_kwargs = {}
+
             # Use run_all_workers_single_data for methods that don't need data
             futures = self.worker_group.run_all_workers_single_data(
                 method_name,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                **worker_kwargs,
             )
             # Wait for all futures to complete
             results = ray.get(futures)
@@ -1428,6 +1458,26 @@ class VllmGeneration(GenerationInterface):
         except Exception as e:
             print(f"Error during policy preparation: {e}")
             return False
+
+    def _has_static_speculative_weights(self) -> bool:
+        """Whether refit omits weights required by speculative decoding."""
+        vllm_kwargs = self.cfg.get("vllm_kwargs")
+        if not vllm_kwargs:
+            return False
+
+        speculative_config = vllm_kwargs.get("speculative_config")
+        if not speculative_config:
+            return False
+
+        method = speculative_config.get("method")
+        if method in ("deepseek_mtp", "mtp"):
+            return self.cfg.get("_mtp_weights_from_refit") is not True
+
+        # Non-MTP speculative models (for example Eagle) are safe only when
+        # their draft weights are included in every refit stream. Treat unknown
+        # speculative methods conservatively: an unnecessary level-1 sleep is
+        # preferable to silently waking with discarded drafter weights.
+        return self.cfg.get("_draft_weights_from_refit") is not True
 
     def shutdown(self) -> bool:
         """Shut down all vLLM workers and clean up resources."""

@@ -3,6 +3,7 @@ defaults: ../../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 8
+  val_period: 5
 
 loss_fn:
   use_importance_sampling_correction: true
@@ -10,6 +11,7 @@ loss_fn:
 
 checkpointing:
   checkpoint_dir: results/grpo-nemotron3-super-120BA12B-32n4g
+  save_period: 5
 
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
@@ -53,6 +55,7 @@ policy:
       async_engine: true
       tensor_parallel_size: 4
       gpu_memory_utilization: 0.7
+      discard_weights_on_sleep: true
       env_vars:
         NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
         NRL_REFIT_NUM_BUFFERS: "1"

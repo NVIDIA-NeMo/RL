@@ -631,7 +631,7 @@ class MegatronGeneration(GenerationInterface):
             ]
         return True
 
-    def finish_generation(self, *, release_gpu: bool = True) -> bool:
+    def finish_generation(self, *, release_gpu: bool = True, **kwargs: Any) -> bool:
         """Clean up after generation.
 
         When `release_gpu` is False, a colocated engine keeps serving instead of standing down.

@@ -1614,7 +1614,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         gc.collect()
         torch.cuda.empty_cache()
 
-    def sleep(self):
+    def sleep(self, sleep_level: int = 1) -> None:
         """Put the vLLM engine to sleep."""
         assert self.llm is not None, (
             "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
@@ -1637,7 +1637,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        self.llm.sleep(level=1)
+        self.llm.sleep(level=sleep_level)
 
         gc.collect()
         torch.cuda.empty_cache()
