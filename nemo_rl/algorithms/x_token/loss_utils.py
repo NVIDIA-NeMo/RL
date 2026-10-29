@@ -73,12 +73,88 @@ if TYPE_CHECKING:
     )
 
 
-SparseTeacherLogits = tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    Optional[torch.Tensor],
-]
+@dataclass(frozen=True)
+class SparseTeacherLogits:
+    """Full-sequence sparse teacher rows read by the replicated CSD loss.
+
+    The fields match what :func:`distributed_vocab_topk_logz_force` exports for
+    each teacher row.
+
+    Attributes:
+        topk_logits: Natural top-k raw logits ``[B, T, k]`` fp32, sorted by id.
+        topk_indices: Natural top-k token ids ``[B, T, k]`` int32, ascending.
+        log_z: Temperature-scaled full-vocabulary log normalizer ``[B, T]`` fp32.
+        natural_tail_indices: Score-rank-k token id of each row ``[B, T]`` int32.
+        forced_logits: Raw logits of the forced labels ``[B, T, F]`` fp32.
+        forced_indices: Forced label ids ``[B, T, F]`` int32, ``-1`` if unused.
+        forced_in_topk: Forced-label membership in the natural
+            top-``membership_k`` ``[B, T, F]`` bool.
+        membership_k: Natural top-k width ``forced_in_topk`` refers to.
+    """
+
+    topk_logits: torch.Tensor
+    topk_indices: torch.Tensor
+    log_z: torch.Tensor
+    natural_tail_indices: torch.Tensor
+    forced_logits: torch.Tensor
+    forced_indices: torch.Tensor
+    forced_in_topk: torch.Tensor
+    membership_k: int
+
+    def gather_rows(
+        self,
+        batch_indices: torch.Tensor,
+        positions: torch.Tensor,
+        required_token_ids: torch.Tensor,
+        *,
+        insert_required: bool,
+        real_vocab_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather one K-wide support per loss request.
+
+        With ``insert_required`` each support follows
+        :func:`materialize_sparse_teacher_rows`, as the owner-local reader
+        builds it; otherwise every request reads its natural top-k row.
+
+        Args:
+            batch_indices: Batch rows ``[N]``.
+            positions: Teacher sequence positions ``[N]``.
+            required_token_ids: Teacher label per request ``[N]``.
+            insert_required: Whether a required label outside the natural
+                top-k replaces the row's score-rank-k token.
+            real_vocab_size: Number of real teacher vocabulary ids.
+
+        Returns:
+            ``(topk_logits [N, k], topk_indices [N, k] sorted by id, log_z [N],
+            requested_in_topk [N])``, as :meth:`SparseTeacherRowReader.gather_rows`
+            returns them.
+        """
+        topk_logits = self.topk_logits[batch_indices, positions]
+        topk_indices = self.topk_indices[batch_indices, positions]
+        log_z = self.log_z[batch_indices, positions]
+        forced_indices = self.forced_indices[batch_indices, positions]
+        forced_in_topk = self.forced_in_topk[batch_indices, positions]
+        if insert_required and batch_indices.numel() > 0:
+            topk_logits, topk_indices, requested_in_topk = (
+                materialize_sparse_teacher_rows(
+                    topk_logits,
+                    topk_indices,
+                    self.natural_tail_indices[batch_indices, positions],
+                    self.forced_logits[batch_indices, positions],
+                    forced_indices,
+                    forced_in_topk,
+                    required_token_ids,
+                    real_vocab_size=real_vocab_size,
+                )
+            )
+        else:
+            required = required_token_ids.to(
+                device=forced_indices.device, dtype=torch.long
+            )
+            requested_in_topk = (
+                (forced_indices.long() == required.unsqueeze(-1)) & forced_in_topk
+            ).any(dim=-1)
+        return topk_logits, topk_indices, log_z, requested_in_topk
 
 
 def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
@@ -1015,30 +1091,25 @@ def rebuild_teacher_sparse_logits_from_ipc(
     if not per_sample_entries:
         raise ValueError("Sparse teacher IPC payload is empty.")
 
-    per_sample_logits: list[torch.Tensor] = []
-    per_sample_indices: list[torch.Tensor] = []
-    per_sample_log_z: list[torch.Tensor] = []
-    per_sample_gt_in_topk: list[torch.Tensor] = []
-    has_gt_in_topk: Optional[bool] = None
+    fields_and_dtypes = (
+        ("topk_logits_ipc", torch.float32),
+        ("topk_indices_ipc", torch.int32),
+        ("log_z_ipc", torch.float32),
+        ("natural_tail_indices_ipc", torch.int32),
+        ("forced_logits_ipc", torch.float32),
+        ("forced_indices_ipc", torch.int32),
+        ("forced_in_topk_ipc", torch.bool),
+    )
+    per_field: dict[str, list[torch.Tensor]] = {
+        field: [] for field, _ in fields_and_dtypes
+    }
+    membership_ks: set[int] = set()
 
     for sample_entry in per_sample_entries:
         shards = sample_entry.get("teacher_shards", [sample_entry])
         shards = sorted(shards, key=lambda shard: int(shard["global_seq_start"]))
         if not shards:
             raise ValueError("Sparse teacher IPC sample has no sequence shards.")
-        shard_has_gt = ["gt_in_topk_ipc" in shard for shard in shards]
-        if len(set(shard_has_gt)) != 1:
-            raise ValueError(
-                "Sparse teacher IPC handles mix gt_in_topk and non-gt_in_topk "
-                "payloads within one sample."
-            )
-        if has_gt_in_topk is None:
-            has_gt_in_topk = shard_has_gt[0]
-        elif has_gt_in_topk != shard_has_gt[0]:
-            raise ValueError(
-                "Sparse teacher IPC handles mix gt_in_topk and non-gt_in_topk "
-                "payloads across samples."
-            )
 
         expected_start = 0
         for shard in shards:
@@ -1050,6 +1121,7 @@ def rebuild_teacher_sparse_logits_from_ipc(
                     f"{shard_start}."
                 )
             expected_start += int(shard["topk_shape"][0])
+            membership_ks.add(int(shard["forced_in_topk_k"]))
         full_seq_len = int(shards[0]["full_seq_len"])
         if expected_start != full_seq_len:
             raise ValueError(
@@ -1057,61 +1129,153 @@ def rebuild_teacher_sparse_logits_from_ipc(
                 f"covered={expected_start}, full_seq_len={full_seq_len}."
             )
 
-        per_sample_logits.append(
-            torch.cat(
-                [
-                    rebuild_cuda_tensor_from_ipc(
-                        shard["topk_logits_ipc"], device
-                    ).detach()
-                    for shard in shards
-                ],
-                dim=0,
-            )
-        )
-        per_sample_indices.append(
-            torch.cat(
-                [
-                    rebuild_cuda_tensor_from_ipc(
-                        shard["topk_indices_ipc"], device
-                    ).detach()
-                    for shard in shards
-                ],
-                dim=0,
-            )
-        )
-        per_sample_log_z.append(
-            torch.cat(
-                [
-                    rebuild_cuda_tensor_from_ipc(shard["log_z_ipc"], device).detach()
-                    for shard in shards
-                ],
-                dim=0,
-            )
-        )
-        if has_gt_in_topk:
-            per_sample_gt_in_topk.append(
+        for field, _ in fields_and_dtypes:
+            per_field[field].append(
                 torch.cat(
                     [
-                        rebuild_cuda_tensor_from_ipc(
-                            shard["gt_in_topk_ipc"], device
-                        ).detach()
+                        rebuild_cuda_tensor_from_ipc(shard[field], device).detach()
                         for shard in shards
                     ],
                     dim=0,
                 )
             )
 
-    gt_in_topk = (
-        torch.stack(per_sample_gt_in_topk, dim=0).to(torch.bool)
-        if has_gt_in_topk
-        else None
+    if len(membership_ks) != 1:
+        raise ValueError(
+            "Sparse teacher IPC shards disagree on forced_in_topk_k: "
+            f"{sorted(membership_ks)}."
+        )
+    stacked = {
+        field: torch.stack(per_field[field], dim=0).to(dtype)
+        for field, dtype in fields_and_dtypes
+    }
+    return SparseTeacherLogits(
+        topk_logits=stacked["topk_logits_ipc"],
+        topk_indices=stacked["topk_indices_ipc"],
+        log_z=stacked["log_z_ipc"],
+        natural_tail_indices=stacked["natural_tail_indices_ipc"],
+        forced_logits=stacked["forced_logits_ipc"],
+        forced_indices=stacked["forced_indices_ipc"],
+        forced_in_topk=stacked["forced_in_topk_ipc"],
+        membership_k=membership_ks.pop(),
     )
-    return (
-        torch.stack(per_sample_logits, dim=0).float(),
-        torch.stack(per_sample_indices, dim=0).to(torch.int32),
-        torch.stack(per_sample_log_z, dim=0).float(),
-        gt_in_topk,
+
+
+def materialize_sparse_teacher_rows(
+    topk_logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    natural_tail_indices: torch.Tensor,
+    forced_logits: torch.Tensor,
+    forced_indices: torch.Tensor,
+    forced_in_topk: torch.Tensor,
+    required_token_ids: torch.Tensor,
+    *,
+    real_vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the exact K-wide sparse teacher support of each loss request.
+
+    A request keeps its natural top-k row when the required label is in it.
+    Otherwise the row's score-rank-k token is evicted and only that request's
+    forced label is inserted, so two requests for one teacher row may get
+    different supports.
+
+    Args:
+        topk_logits: Natural top-k raw logits ``[N, k]``, sorted by token id.
+        topk_indices: Natural top-k token ids ``[N, k]``, strictly ascending.
+        natural_tail_indices: Score-rank-k token id of each natural row ``[N]``.
+        forced_logits: Raw logits of the forced labels ``[N, F]``.
+        forced_indices: Forced label ids ``[N, F]``, ``-1`` in unused slots.
+        forced_in_topk: Whether each forced label is in the producer's natural
+            top-``membership_k`` ``[N, F]``.
+        required_token_ids: Teacher label each request needs ``[N]``; it must
+            appear exactly once in its row's forced labels.
+        real_vocab_size: Number of real teacher vocabulary ids.
+
+    Returns:
+        ``(topk_logits [N, k], topk_indices [N, k] sorted by id,
+        requested_in_topk [N])``, where ``requested_in_topk`` is the required
+        label's natural top-``membership_k`` membership.
+    """
+    k = int(topk_indices.shape[-1])
+    force_width = int(forced_indices.shape[-1])
+    required = required_token_ids.to(device=topk_indices.device, dtype=torch.long)
+    if bool(((required < 0) | (required >= real_vocab_size)).any()):
+        raise ValueError(
+            "required_token_ids must contain real-vocabulary ids in "
+            f"[0, {real_vocab_size})."
+        )
+    if bool(((topk_indices < 0) | (topk_indices >= real_vocab_size)).any()):
+        raise ValueError("Sparse teacher natural top-k contains an invalid id")
+    if k > 1 and bool((topk_indices[:, 1:] <= topk_indices[:, :-1]).any()):
+        raise ValueError("Sparse teacher natural top-k ids must be strictly sorted")
+    if bool(((forced_indices < -1) | (forced_indices >= real_vocab_size)).any()):
+        raise ValueError("Sparse teacher forced sidecar contains an invalid id")
+    for left in range(force_width):
+        for right in range(left + 1, force_width):
+            duplicate = (forced_indices[:, left] >= 0) & (
+                forced_indices[:, left] == forced_indices[:, right]
+            )
+            if bool(duplicate.any().item()):
+                raise ValueError(
+                    "Sparse teacher forced sidecar contains duplicate labels"
+                )
+
+    sidecar_match = forced_indices.long() == required.unsqueeze(-1)
+    if bool((sidecar_match.sum(dim=-1) != 1).any().item()):
+        raise ValueError(
+            "Sparse teacher required label must appear exactly once in the "
+            "forced sidecar"
+        )
+    selected_forced_logits = (
+        torch.where(
+            sidecar_match, forced_logits, torch.full_like(forced_logits, -torch.inf)
+        )
+        .max(dim=-1)
+        .values
     )
+    requested_in_topk = (sidecar_match & forced_in_topk).any(dim=-1)
+
+    natural_match = topk_indices.long() == required.unsqueeze(-1)
+    if bool((natural_match.sum(dim=-1) > 1).any().item()):
+        raise ValueError("Sparse teacher natural top-k contains duplicate ids")
+    natural_requested_logits = torch.where(
+        natural_match, topk_logits, torch.zeros_like(topk_logits)
+    ).sum(dim=-1)
+    inconsistent_duplicate = natural_match.any(dim=-1) & (
+        natural_requested_logits != selected_forced_logits
+    )
+    if bool(inconsistent_duplicate.any().item()):
+        raise ValueError(
+            "Sparse teacher natural and forced copies of a requested label "
+            "have different raw logits"
+        )
+    needs_insert = ~natural_match.any(dim=-1)
+
+    tail_match = topk_indices.long() == natural_tail_indices.long().unsqueeze(-1)
+    if bool((tail_match.sum(dim=-1) != 1).any().item()):
+        raise ValueError(
+            "Sparse teacher natural tail id must appear exactly once in top-k"
+        )
+    evict_slot = tail_match.to(torch.long).argmax(dim=-1)
+    materialized_logits = topk_logits.clone()
+    materialized_indices = topk_indices.clone()
+    insert_rows = needs_insert.nonzero(as_tuple=False).flatten()
+    if insert_rows.numel() > 0:
+        insert_slots = evict_slot.index_select(0, insert_rows)
+        materialized_logits[insert_rows, insert_slots] = (
+            selected_forced_logits.index_select(0, insert_rows)
+        )
+        materialized_indices[insert_rows, insert_slots] = required.index_select(
+            0, insert_rows
+        ).to(materialized_indices.dtype)
+
+    sorted_indices, order = torch.sort(materialized_indices, dim=-1)
+    sorted_logits = torch.gather(materialized_logits, dim=-1, index=order)
+    if k > 1 and bool((sorted_indices[:, 1:] <= sorted_indices[:, :-1]).any()):
+        raise ValueError(
+            "Sparse teacher materialized top-k ids must be strictly sorted"
+        )
+    return sorted_logits, sorted_indices, requested_in_topk
 
 
 @dataclass(frozen=True)
@@ -1730,79 +1894,18 @@ class SparseTeacherRowReader:
                 source = source[:, :width] if width is not None else source[:, 0]
                 destination.index_copy_(0, output_index, source.to(destination.dtype))
 
-        if bool(((topk_indices < 0) | (topk_indices >= self.real_vocab_size)).any()):
-            raise ValueError("Sparse teacher natural top-k contains an invalid id")
-        if self.k > 1 and bool((topk_indices[:, 1:] <= topk_indices[:, :-1]).any()):
-            raise ValueError("Sparse teacher natural top-k ids must be strictly sorted")
-        if bool(
-            ((forced_indices < -1) | (forced_indices >= self.real_vocab_size)).any()
-        ):
-            raise ValueError("Sparse teacher forced sidecar contains an invalid id")
-        for left in range(self.force_width):
-            for right in range(left + 1, self.force_width):
-                duplicate = (forced_indices[:, left] >= 0) & (
-                    forced_indices[:, left] == forced_indices[:, right]
-                )
-                if bool(duplicate.any().item()):
-                    raise ValueError(
-                        "Sparse teacher forced sidecar contains duplicate labels"
-                    )
-
-        sidecar_match = forced_indices.long() == required.unsqueeze(-1)
-        if bool((sidecar_match.sum(dim=-1) != 1).any().item()):
-            raise ValueError(
-                "Sparse teacher required label must appear exactly once in the "
-                "forced sidecar"
+        sorted_logits, sorted_indices, requested_in_topk = (
+            materialize_sparse_teacher_rows(
+                topk_logits,
+                topk_indices,
+                natural_tail_indices,
+                forced_logits,
+                forced_indices,
+                forced_in_topk,
+                required,
+                real_vocab_size=self.real_vocab_size,
             )
-        selected_forced_logits = (
-            torch.where(
-                sidecar_match, forced_logits, torch.full_like(forced_logits, -torch.inf)
-            )
-            .max(dim=-1)
-            .values
         )
-        requested_in_topk = (sidecar_match & forced_in_topk).any(dim=-1)
-
-        natural_match = topk_indices.long() == required.unsqueeze(-1)
-        if bool((natural_match.sum(dim=-1) > 1).any().item()):
-            raise ValueError("Sparse teacher natural top-k contains duplicate ids")
-        natural_requested_logits = torch.where(
-            natural_match, topk_logits, torch.zeros_like(topk_logits)
-        ).sum(dim=-1)
-        inconsistent_duplicate = natural_match.any(dim=-1) & (
-            natural_requested_logits != selected_forced_logits
-        )
-        if bool(inconsistent_duplicate.any().item()):
-            raise ValueError(
-                "Sparse teacher natural and forced copies of a requested label "
-                "have different raw logits"
-            )
-        needs_insert = ~natural_match.any(dim=-1)
-
-        tail_match = topk_indices.long() == natural_tail_indices.long().unsqueeze(-1)
-        if bool((tail_match.sum(dim=-1) != 1).any().item()):
-            raise ValueError(
-                "Sparse teacher natural tail id must appear exactly once in top-k"
-            )
-        evict_slot = tail_match.to(torch.long).argmax(dim=-1)
-        materialized_logits = topk_logits.clone()
-        materialized_indices = topk_indices.clone()
-        insert_rows = needs_insert.nonzero(as_tuple=False).flatten()
-        if insert_rows.numel() > 0:
-            insert_slots = evict_slot.index_select(0, insert_rows)
-            materialized_logits[insert_rows, insert_slots] = (
-                selected_forced_logits.index_select(0, insert_rows)
-            )
-            materialized_indices[insert_rows, insert_slots] = required.index_select(
-                0, insert_rows
-            ).to(materialized_indices.dtype)
-
-        sorted_indices, order = torch.sort(materialized_indices, dim=-1)
-        sorted_logits = torch.gather(materialized_logits, dim=-1, index=order)
-        if self.k > 1 and bool((sorted_indices[:, 1:] <= sorted_indices[:, :-1]).any()):
-            raise ValueError(
-                "Sparse teacher materialized top-k ids must be strictly sorted"
-            )
         return sorted_logits, sorted_indices, log_z, requested_in_topk
 
     def close(self) -> None:
@@ -2682,7 +2785,7 @@ def prepare_csd_cross_tokenizer_loss_input(
                 device=device,
             )
             teacher_sparse_logits_by_idx[i] = teacher_sparse_logits
-            full_teacher_seq_len = int(teacher_sparse_logits[0].shape[1])
+            full_teacher_seq_len = int(teacher_sparse_logits.topk_logits.shape[1])
             if full_teacher_seq_len % student_cp_size != 0:
                 raise ValueError(
                     "Sparse teacher sequence length must be divisible by the "

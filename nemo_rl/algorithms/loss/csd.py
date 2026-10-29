@@ -257,8 +257,9 @@ class CSDLossDataDict(TypedDict):
       ``teacher_{i}_full_logits_ipc`` (List[B] of CUDA IPC handle dicts with
       TP/CP shard metadata). Sparse cross-tokenizer teachers use
       ``teacher_{i}_sparse_logits_ipc`` with row-top-k logits/token ids, the
-      exact full-vocabulary log-normalizer, and optional realized-label
-      membership. ``prepare_loss_input`` P2P-reads and reassembles either form.
+      exact full-vocabulary log-normalizer, and the forced realized-label
+      sidecar (see ``SparseTeacherLogits``). ``prepare_loss_input`` P2P-reads
+      and reassembles either form.
     - Cross-tokenizer teacher only: ``teacher_{i}_input_ids`` /
       ``teacher_{i}_token_mask`` ``[B, T_t]`` and ``alignment_{i}_*``
       (``pair_valid`` / ``pair_is_correct`` ``[B, max_pairs]``;
@@ -303,10 +304,8 @@ class CSDLossFn(LossFunction):
             logits for dense teachers, rebuilt from CUDA IPC handles by
             ``prepare_loss_input`` (see
             :func:`nemo_rl.algorithms.x_token.loss_utils.rebuild_teacher_full_logits_from_ipc`).
-        teacher_sparse_logits_by_idx: Per-sparse-teacher row-top-k logits,
-            token ids, exact full-vocabulary log-normalizers, and optional
-            realized-label top-k membership, reconstructed for the full
-            teacher sequence.
+        teacher_sparse_logits_by_idx: Per-sparse-teacher
+            ``SparseTeacherLogits`` for the full teacher sequence.
         teacher_row_payloads_by_idx: Owner-local evaluation only: each
             cross-tokenizer teacher's IPC records, read row by row by the rank
             that owns each chunk (see ``owner_local``).
@@ -1351,6 +1350,29 @@ class CSDLossFn(LossFunction):
         lookup[common_ids[valid]] = columns[valid]
         return lookup
 
+    @classmethod
+    def _lookup_sparse_row_logp(
+        cls,
+        rows: tuple[torch.Tensor, ...],
+        token_ids: torch.Tensor,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Lookup teacher log-probs for token ids in per-request sparse rows.
+
+        ``rows`` is :meth:`SparseTeacherLogits.gather_rows` output for ``N``
+        requests; ``token_ids`` is ``[N]`` or ``[N, W]``.
+        """
+        row_logits, row_indices, row_log_z = rows[:3]
+        return cls._lookup_sparse_teacher_logp(
+            row_logits.unsqueeze(1),
+            row_indices.unsqueeze(1),
+            row_log_z.unsqueeze(1),
+            torch.arange(row_indices.shape[0], device=row_indices.device),
+            torch.zeros_like(token_ids, dtype=torch.long),
+            token_ids,
+            temperature,
+        )
+
     @staticmethod
     def _lookup_sparse_teacher_logp(
         topk_logits: torch.Tensor,
@@ -2085,8 +2107,9 @@ class CSDLossFn(LossFunction):
         teacher_log_z: torch.Tensor,
         temperature: float,
         loss_fn: str,
-        teacher_sparse: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        teacher_sparse: Optional[SparseTeacherLogits] = None,
         teacher_sparse_keep_realized: bool = False,
+        teacher_vocab_size: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, int, int, list[int], list[bool]]:
@@ -2344,16 +2367,28 @@ class CSDLossFn(LossFunction):
             assert t_label_id is not None
             assert t_pmask is not None
             if teacher_sparse is not None:
-                teacher_topk_logits, teacher_topk_indices = teacher_sparse
-                t_prefix_scores, t_prefix_found = self._lookup_sparse_teacher_logp(
-                    teacher_topk_logits,
-                    teacher_topk_indices,
-                    teacher_log_z,
-                    b_idx,
-                    t_pred_pos,
-                    t_label_id,
-                    temperature,
+                assert teacher_vocab_size is not None
+                # Padding slots request no row; they count as found below.
+                prefix_slot = t_pmask > 0
+                t_prefix_scores = torch.zeros(
+                    t_pred_pos.shape, device=device, dtype=accum_dtype
                 )
+                t_prefix_found = torch.zeros(
+                    t_pred_pos.shape, device=device, dtype=torch.bool
+                )
+                if bool(prefix_slot.any()):
+                    prefix_rows = teacher_sparse.gather_rows(
+                        b_idx[:, None].expand_as(t_pred_pos)[prefix_slot],
+                        t_pred_pos[prefix_slot],
+                        t_label_id[prefix_slot],
+                        insert_required=teacher_sparse_keep_realized,
+                        real_vocab_size=teacher_vocab_size,
+                    )
+                    slot_scores, slot_found = self._lookup_sparse_row_logp(
+                        prefix_rows, t_label_id[prefix_slot], temperature
+                    )
+                    t_prefix_scores[prefix_slot] = slot_scores.to(accum_dtype)
+                    t_prefix_found[prefix_slot] = slot_found
                 t_prefix_scores = torch.where(
                     t_prefix_found,
                     t_prefix_scores.to(accum_dtype),
@@ -2408,19 +2443,19 @@ class CSDLossFn(LossFunction):
 
         with torch.no_grad():
             if teacher_sparse is not None:
-                teacher_topk_logits, teacher_topk_indices = teacher_sparse
-                t_last_pos = t_last.unsqueeze(-1).expand_as(t_ids)
-                t_final_scores, t_final_found = self._lookup_sparse_teacher_logp(
-                    teacher_topk_logits,
-                    teacher_topk_indices,
-                    teacher_log_z,
+                assert teacher_vocab_size is not None
+                final_rows = teacher_sparse.gather_rows(
                     b_idx,
-                    t_last_pos,
-                    t_ids,
-                    temperature,
+                    t_last,
+                    t_realized_last,
+                    insert_required=teacher_sparse_keep_realized,
+                    real_vocab_size=teacher_vocab_size,
+                )
+                t_final_scores, t_final_found = self._lookup_sparse_row_logp(
+                    final_rows, t_ids, temperature
                 )
                 if teacher_sparse_keep_realized:
-                    topk_width = int(teacher_topk_indices.shape[-1])
+                    topk_width = int(teacher_sparse.topk_indices.shape[-1])
                     alt_budget = max(topk_width - 1, 0)
                     realized_pair_mask = (
                         (support_mask > 0)
@@ -2612,16 +2647,21 @@ class CSDLossFn(LossFunction):
         mtom_as_alm = True
 
         v_t = int(teacher_vocab_size)
-        teacher_gt_in_topk: Optional[torch.Tensor] = None
         teacher_logits: Optional[torch.Tensor] = None
         if teacher_sparse_payload is not None:
-            (
-                teacher_topk_logits,
-                _,
-                teacher_log_z,
-                teacher_gt_in_topk,
-            ) = teacher_sparse_payload
-            B2, T, _ = teacher_topk_logits.shape
+            expected_membership = noise_filter_topk or teacher_topk_ipc_k
+            if (
+                int(teacher_sparse_payload.topk_indices.shape[-1]) != teacher_topk_ipc_k
+                or teacher_sparse_payload.membership_k != expected_membership
+            ):
+                raise ValueError(
+                    "Sparse teacher payload (k="
+                    f"{int(teacher_sparse_payload.topk_indices.shape[-1])}, "
+                    f"membership_k={teacher_sparse_payload.membership_k}) "
+                    "disagrees with the loss."
+                )
+            teacher_log_z = teacher_sparse_payload.log_z
+            B2, T, _ = teacher_sparse_payload.topk_logits.shape
         else:
             assert teacher_full_logits is not None
             # Slice teacher logits to the real tokenizer vocab (drop any padded
@@ -2702,20 +2742,21 @@ class CSDLossFn(LossFunction):
         inp_s_np = input_ids_student.detach().cpu().numpy()
         inp_t_np = input_ids_teacher.detach().cpu().numpy()
 
-        teacher_gt_in_topk_np: Optional[np.ndarray] = None
+        teacher_forced_indices_np: Optional[np.ndarray] = None
+        teacher_forced_in_topk_np: Optional[np.ndarray] = None
         teacher_filter_topk_indices_np: Optional[np.ndarray] = None
         dense_noise_filter_cp_sharded = False
         filter_k = 0
         if noise_filter_topk > 0:
             if teacher_sparse_payload is not None:
-                if teacher_gt_in_topk is None:
-                    raise ValueError(
-                        "csd_noise_filter_topk requires sparse "
-                        "teacher IPC handles with gt_in_topk metadata. Ensure "
-                        "the teacher IPC path receives force_include_token_ids."
-                    )
-                teacher_gt_in_topk_np = (
-                    teacher_gt_in_topk.detach().cpu().numpy().astype(bool)
+                teacher_forced_indices_np = (
+                    teacher_sparse_payload.forced_indices.detach().cpu().numpy()
+                )
+                teacher_forced_in_topk_np = (
+                    teacher_sparse_payload.forced_in_topk.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(bool)
                 )
             else:
                 assert teacher_logits is not None
@@ -2743,13 +2784,24 @@ class CSDLossFn(LossFunction):
                 return True
             if len(pred_positions) != len(label_positions):
                 return False
-            if teacher_gt_in_topk_np is not None:
-                for pred_pos in pred_positions:
-                    if (
-                        pred_pos < 0
-                        or pred_pos >= teacher_gt_in_topk_np.shape[1]
-                        or not bool(teacher_gt_in_topk_np[b_idx, pred_pos])
-                    ):
+            if teacher_forced_indices_np is not None:
+                assert teacher_forced_in_topk_np is not None
+                # Each request reads its own label's membership from the row's
+                # forced sidecar, as the owner-local reader does.
+                for pred_pos, label_pos in zip(pred_positions, label_positions):
+                    if pred_pos < 0 or pred_pos >= teacher_forced_indices_np.shape[1]:
+                        return False
+                    if label_pos < 0 or label_pos >= inp_t_np.shape[1]:
+                        return False
+                    slots = teacher_forced_indices_np[b_idx, pred_pos] == int(
+                        inp_t_np[b_idx, label_pos]
+                    )
+                    if int(slots.sum()) != 1:
+                        raise ValueError(
+                            "Sparse teacher required label must appear exactly "
+                            "once in the forced sidecar"
+                        )
+                    if not bool(teacher_forced_in_topk_np[b_idx, pred_pos][slots][0]):
                         return False
                 return True
             for pred_pos, label_pos in zip(pred_positions, label_positions):
@@ -2978,6 +3030,19 @@ class CSDLossFn(LossFunction):
                 device=device,
                 dtype=torch.long,
             )
+            # One K-wide teacher support per common chunk, built as the
+            # owner-local reader builds it.
+            teacher_rows_full = (
+                None
+                if teacher_sparse_payload is None
+                else teacher_sparse_payload.gather_rows(
+                    sb_full,
+                    tp_full,
+                    rt_full,
+                    insert_required=teacher_topk_keep_realized,
+                    real_vocab_size=v_t,
+                )
+            )
 
             common_loss_sum = torch.tensor(
                 0.0,
@@ -3031,6 +3096,15 @@ class CSDLossFn(LossFunction):
                 tp = tp_full[mb_start:mb_end]
                 rs = rs_full[mb_start:mb_end]
                 rt = rt_full[mb_start:mb_end]
+                teacher_rows = (
+                    None
+                    if teacher_rows_full is None
+                    else (
+                        teacher_rows_full[0][mb_start:mb_end],
+                        teacher_rows_full[1][mb_start:mb_end],
+                        teacher_rows_full[2][mb_start:mb_end],
+                    )
+                )
                 support_mask = None
                 common_valid_row = None
                 if pure_alm:
@@ -3065,17 +3139,9 @@ class CSDLossFn(LossFunction):
                             dtype=torch.bool,
                         )
                     else:
-                        teacher_topk_logits, teacher_topk_indices, _, _ = (
-                            teacher_sparse_payload
-                        )
-                        t_real_logp, t_real_found = self._lookup_sparse_teacher_logp(
-                            teacher_topk_logits,
-                            teacher_topk_indices,
-                            teacher_log_z,
-                            sb,
-                            tp,
-                            rt,
-                            temperature,
+                        assert teacher_rows is not None
+                        t_real_logp, t_real_found = self._lookup_sparse_row_logp(
+                            teacher_rows, rt, temperature
                         )
                         teacher_common_logp = t_real_logp.to(accum_dtype).unsqueeze(-1)
                         common_valid_row = t_real_found
@@ -3144,11 +3210,8 @@ class CSDLossFn(LossFunction):
                         )
                 else:
                     assert teacher_to_common_student is not None
-                    teacher_topk_logits, teacher_topk_indices, _, _ = (
-                        teacher_sparse_payload
-                    )
-                    topk_ids = teacher_topk_indices[sb, tp]
-                    topk_vals = teacher_topk_logits[sb, tp]
+                    assert teacher_rows is not None
+                    topk_vals, topk_ids = teacher_rows[0], teacher_rows[1]
                     mapped_student = teacher_to_common_student[topk_ids.long()]
                     support_mask = mapped_student >= 0
                     if teacher_topk_keep_realized:
@@ -3194,14 +3257,8 @@ class CSDLossFn(LossFunction):
                         neg_inf,
                     )
                     if teacher_topk_keep_realized:
-                        t_real_logp, t_real_found = self._lookup_sparse_teacher_logp(
-                            teacher_topk_logits,
-                            teacher_topk_indices,
-                            teacher_log_z,
-                            sb,
-                            tp,
-                            rt,
-                            temperature,
+                        t_real_logp, t_real_found = self._lookup_sparse_row_logp(
+                            teacher_rows, rt, temperature
                         )
                         realized_common_student = teacher_to_common_student[rt.long()]
                         realized_common_mask = t_real_found & (
@@ -3489,15 +3546,9 @@ class CSDLossFn(LossFunction):
                     teacher_log_z,
                     temperature,
                     loss_fn=effective_last_pos_loss_fn,
-                    teacher_sparse=(
-                        None
-                        if teacher_sparse_payload is None
-                        else (
-                            teacher_sparse_payload[0],
-                            teacher_sparse_payload[1],
-                        )
-                    ),
+                    teacher_sparse=teacher_sparse_payload,
                     teacher_sparse_keep_realized=teacher_topk_keep_realized,
+                    teacher_vocab_size=v_t,
                     tp_group=tp_group,
                     cp_group=cp_group,
                 )

@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU regression coverage for CSD values, gradients, masking, and transport."""
 
+import dataclasses
 import os
 import tempfile
 
@@ -241,13 +242,60 @@ def _run_csd(
     return loss.detach(), metrics, student_logits.grad.detach()
 
 
+def _realized_labels(fx):
+    """Realized teacher labels each teacher predictor row is read for."""
+    teacher_ids = fx["teacher_ids"]
+    batch, seq_len = teacher_ids.shape
+    required = [[set() for _ in range(seq_len)] for _ in range(batch)]
+    for b in range(batch):
+        for c in range(int(fx["num_chunks"][b])):
+            ss = int(fx["s_spans"][b, c, 0])
+            ts, te = fx["t_spans"][b, c].tolist()
+            shift = fx["knobs"]["kl_chunk_shift"] and ss > 0 and ts > 0
+            for label in range(ts, te):
+                pred = label - 1 if shift else label
+                required[b][pred].add(int(teacher_ids[b, label]))
+    return required
+
+
+def _sparse_payload(fx, ids):
+    """Sparse payload whose natural rows are ``ids`` ``[B, T, k]`` sorted by id.
+
+    Every realized label is in the forced sidecar, so a row that already holds
+    it is served unchanged.
+    """
+    from nemo_rl.algorithms.x_token.loss_utils import SparseTeacherLogits
+
+    # These rows are not score-ranked, so noise-filter membership is undefined.
+    assert not fx["knobs"]["csd_noise_filter_topk"]
+    teacher_logits = fx["teacher_logits"]
+    batch, seq_len, _ = teacher_logits.shape
+    forced = torch.full((batch, seq_len, 2), -1, dtype=torch.long)
+    for b, rows in enumerate(_realized_labels(fx)):
+        for pos, labels in enumerate(rows):
+            forced[b, pos, : len(labels)] = torch.tensor(sorted(labels))
+    logits = teacher_logits.gather(-1, ids)
+    k = int(ids.shape[-1])
+    return SparseTeacherLogits(
+        topk_logits=logits.float(),
+        topk_indices=ids.to(torch.int32),
+        log_z=torch.logsumexp(teacher_logits / fx["knobs"]["temperature"], dim=-1),
+        natural_tail_indices=ids.gather(-1, logits.argmin(dim=-1, keepdim=True))
+        .squeeze(-1)
+        .to(torch.int32),
+        forced_logits=teacher_logits.gather(-1, forced.clamp(min=0)).float(),
+        forced_indices=forced.to(torch.int32),
+        forced_in_topk=(forced.unsqueeze(-1) == ids.unsqueeze(-2)).any(dim=-1)
+        & (forced >= 0),
+        membership_k=fx["knobs"]["csd_noise_filter_topk"] or k,
+    )
+
+
 def _full_vocab_payload(fx):
     """Sparse payload at K = V: every teacher id with its exact logZ."""
-    teacher_logits = fx["teacher_logits"].clone()
-    token_ids = torch.arange(fx["v_t"], dtype=torch.int32).view(1, 1, -1)
-    token_ids = token_ids.expand(*teacher_logits.shape).clone()
-    log_z = torch.logsumexp(teacher_logits / fx["knobs"]["temperature"], dim=-1)
-    return (teacher_logits, token_ids, log_z, None)
+    teacher_logits = fx["teacher_logits"]
+    ids = torch.arange(fx["v_t"]).view(1, 1, -1).expand(*teacher_logits.shape)
+    return _sparse_payload(fx, ids.clone())
 
 
 def _realized_pair_not_common(fx):
@@ -312,6 +360,14 @@ def test_csd_sparse_full_support_matches_dense(case, keep_realized):
     torch.testing.assert_close(sparse_grad, dense_grad, rtol=1e-5, atol=1e-6)
     assert sparse_metrics["num_common_chunks"] == dense_metrics["num_common_chunks"]
     assert sparse_metrics["num_mismatch_chunks"] == dense_metrics["num_mismatch_chunks"]
+
+
+def test_csd_sparse_payload_must_match_loss_config(tmp_path):
+    fx = _build_case("with_mismatch", str(tmp_path))
+    payload = dataclasses.replace(_full_vocab_payload(fx), membership_k=3)
+
+    with pytest.raises(ValueError, match="disagrees with the loss"):
+        _run_csd(fx, teacher_sparse_payload=payload)
 
 
 def test_csd_dense_keep_realized_scores_chunks_without_table_support():
@@ -866,32 +922,16 @@ def _realized_chain_reference(fx, student_logits):
 
 def _realized_rows_payload(fx, k):
     """Sparse teacher rows holding each position's realized labels plus fillers."""
-    teacher_logits = fx["teacher_logits"]
-    batch, seq_len, vocab = teacher_logits.shape
-    required = [[set() for _ in range(seq_len)] for _ in range(batch)]
-    for b in range(batch):
-        for c in range(int(fx["num_chunks"][b])):
-            ss = int(fx["s_spans"][b, c, 0])
-            ts, te = fx["t_spans"][b, c].tolist()
-            shift = fx["knobs"]["kl_chunk_shift"] and ss > 0 and ts > 0
-            for label in range(ts, te):
-                pred = label - 1 if shift else label
-                required[b][pred].add(int(fx["teacher_ids"][b, label]))
+    batch, seq_len, vocab = fx["teacher_logits"].shape
     ids = torch.empty(batch, seq_len, k, dtype=torch.long)
-    for b in range(batch):
-        for pos in range(seq_len):
-            row = set(required[b][pos])
+    for b, rows in enumerate(_realized_labels(fx)):
+        for pos, labels in enumerate(rows):
+            row = set(labels)
             filler = (t for t in range(vocab) if t not in row)
             while len(row) < k:
                 row.add(next(filler))
             ids[b, pos] = torch.tensor(sorted(row))
-    temperature = fx["knobs"]["temperature"]
-    return (
-        teacher_logits.gather(-1, ids),
-        ids.to(torch.int32),
-        torch.logsumexp(teacher_logits / temperature, dim=-1),
-        None,
-    )
+    return _sparse_payload(fx, ids)
 
 
 def test_csd_realized_only_mismatch_matches_chain_reference(tmp_path):

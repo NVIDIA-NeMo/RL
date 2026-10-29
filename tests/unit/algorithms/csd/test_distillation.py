@@ -46,7 +46,6 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     TeacherAlignerConfig,
     TeacherConfig,
     _build_teacher_force_include_token_id_slots,
-    _build_teacher_force_include_token_ids,
     _default_off_policy_distillation_save_state,
     _packing_batch_uids_from_state,
     build_csd_lockstep_packing_plan,
@@ -1481,33 +1480,6 @@ def test_export_teacher_logits_threads_lockstep_plan_and_occurrence_ids():
     )
 
 
-def test_build_teacher_force_ids_respects_position_zero_and_shift():
-    batch = _make_batch(batch_size=1, t_student=5, t_teacher=5)
-    batch["teacher_0_input_ids"] = torch.tensor([[10, 11, 12, 13, 14]])
-    batch["alignment_0_pair_valid"] = torch.tensor([[True, True, False]])
-    batch["alignment_0_student_chunk_id"] = torch.tensor([[0, 0, -1, 1, 1]])
-    batch["alignment_0_teacher_chunk_id"] = torch.tensor([[0, 0, 1, 1, -1]])
-    loss_config = {
-        "kl_chunk_shift": True,
-        "csd_noise_filter_topk": 0,
-        "csd_pure_alm": False,
-        "csd_realized_only_mismatch": False,
-        "teacher_topk_ipc_k": 8192,
-        "teacher_topk_ipc_keep_realized": True,
-    }
-
-    force_ids = _build_teacher_force_include_token_ids(
-        batch,
-        teacher_idx=0,
-        loss_config=loss_config,
-    )
-
-    # Chunk 0 starts at position zero, so it remains unshifted. Chunk 1 starts
-    # later and its labels at teacher positions 2,3 are attached to predictors
-    # 1,2, with the latter write taking precedence at position 1.
-    assert torch.equal(force_ids, torch.tensor([[10, 12, 13, -1, -1]]))
-
-
 @pytest.mark.parametrize(
     "kl_chunk_shift,expected",
     [
@@ -1552,35 +1524,6 @@ def test_build_teacher_force_id_slots_skip_masked_and_one_sided_chunks():
     assert bool((force_ids[1] == -1).all())
 
 
-@pytest.mark.parametrize("realized_only", [False, True])
-def test_build_teacher_force_ids_follow_realized_only_mismatch(realized_only):
-    """Realized-only mismatch keeps realized labels even without keep_realized."""
-    batch = _make_batch(batch_size=1, t_student=5, t_teacher=5)
-    batch["teacher_0_input_ids"] = torch.tensor([[10, 11, 12, 13, 14]])
-    batch["alignment_0_pair_valid"] = torch.tensor([[True, True, False]])
-    batch["alignment_0_student_chunk_id"] = torch.tensor([[0, 0, -1, 1, 1]])
-    batch["alignment_0_teacher_chunk_id"] = torch.tensor([[0, 0, 1, 1, -1]])
-    loss_config = {
-        "kl_chunk_shift": True,
-        "csd_noise_filter_topk": 0,
-        "csd_pure_alm": False,
-        "csd_realized_only_mismatch": realized_only,
-        "teacher_topk_ipc_k": 8192,
-        "teacher_topk_ipc_keep_realized": False,
-    }
-
-    force_ids = _build_teacher_force_include_token_ids(
-        batch,
-        teacher_idx=0,
-        loss_config=loss_config,
-    )
-
-    if realized_only:
-        assert torch.equal(force_ids, torch.tensor([[10, 12, 13, -1, -1]]))
-    else:
-        assert force_ids is None
-
-
 def _random_force_id_batch(
     generator: torch.Generator, *, batch_size: int, seq_len: int
 ) -> dict:
@@ -1618,10 +1561,8 @@ def _random_force_id_batch(
     return batch
 
 
-def _per_label_force_ids(
-    batch: dict, *, kl_chunk_shift: bool
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Single-slot and two-slot forced labels, one chunk label at a time."""
+def _per_label_force_ids(batch: dict, *, kl_chunk_shift: bool) -> torch.Tensor:
+    """Two-slot forced labels, one chunk label at a time."""
     token_ids = batch["teacher_0_input_ids"].tolist()
     pair_valid = batch["alignment_0_pair_valid"].tolist()
     sample_mask = batch["sample_mask"].tolist()
@@ -1632,7 +1573,6 @@ def _per_label_force_ids(
     teacher_spans = csd_mod._chunk_ids_to_spans(
         batch["alignment_0_teacher_chunk_id"], max_pairs
     ).tolist()
-    single = [[-1] * len(ids) for ids in token_ids]
     slots = [[[] for _ in ids] for ids in token_ids]
     for b, ids in enumerate(token_ids):
         for p in range(max_pairs):
@@ -1643,42 +1583,26 @@ def _per_label_force_ids(
             shift = int(kl_chunk_shift and s_start > 0 and t_start > 0)
             for label_pos in range(t_start, t_end):
                 row = label_pos - shift
-                single[b][row] = ids[label_pos]
                 if sample_mask[b] and ids[label_pos] not in [-1, *slots[b][row]]:
                     slots[b][row].append(ids[label_pos])
     width = csd_mod.SPARSE_TEACHER_FORCE_WIDTH
     padded = [
         [labels + [-1] * (width - len(labels)) for labels in row] for row in slots
     ]
-    return torch.tensor(single), torch.tensor(padded)
+    return torch.tensor(padded)
 
 
 @pytest.mark.parametrize("kl_chunk_shift", [True, False])
-def test_force_id_builders_match_per_label_loop(kl_chunk_shift):
+def test_force_id_slot_builder_matches_per_label_loop(kl_chunk_shift):
     generator = torch.Generator().manual_seed(0)
-    loss_config = {
-        "kl_chunk_shift": kl_chunk_shift,
-        "csd_noise_filter_topk": 0,
-        "csd_pure_alm": False,
-        "csd_realized_only_mismatch": False,
-        "teacher_topk_ipc_k": 128,
-        "teacher_topk_ipc_keep_realized": True,
-    }
     for _ in range(50):
         batch = _random_force_id_batch(generator, batch_size=3, seq_len=12)
-        single, slots = _per_label_force_ids(batch, kl_chunk_shift=kl_chunk_shift)
 
-        assert torch.equal(
-            _build_teacher_force_include_token_ids(
-                batch, teacher_idx=0, loss_config=loss_config
-            ),
-            single,
-        )
         assert torch.equal(
             _build_teacher_force_include_token_id_slots(
                 batch, teacher_idx=0, kl_chunk_shift=kl_chunk_shift
             ),
-            slots,
+            _per_label_force_ids(batch, kl_chunk_shift=kl_chunk_shift),
         )
 
 
@@ -1751,7 +1675,6 @@ def test_dense_export_with_noise_filter_builds_no_forced_labels(
     def fail(*args: object, **kwargs: object) -> None:
         raise AssertionError("dense teacher transport built forced labels")
 
-    monkeypatch.setattr(csd_mod, "_build_teacher_force_include_token_ids", fail)
     monkeypatch.setattr(csd_mod, "_build_teacher_force_include_token_id_slots", fail)
     teacher = MagicMock()
     teacher.get_full_logits_ipc.return_value = [{"teacher_shards": ["dense"]}]
@@ -1914,9 +1837,13 @@ def test_export_teacher_logits_mixes_sparse_cross_and_dense_same_vocab():
     assert sparse_kwargs["micro_batch_size"] == 1
     assert sparse_kwargs["support_mode"] == "row_topk"
     assert sparse_kwargs["gt_filter_topk"] is None
+    force = t0.get_topk_logits_ipc.call_args.args[0]["force_include_token_ids"]
+    assert force.shape == (1, 4, csd_mod.SPARSE_TEACHER_FORCE_WIDTH)
     assert torch.equal(
-        t0.get_topk_logits_ipc.call_args.args[0]["force_include_token_ids"],
-        torch.zeros((1, 4), dtype=torch.long),
+        force,
+        _build_teacher_force_include_token_id_slots(
+            batch, teacher_idx=0, kl_chunk_shift=False
+        ),
     )
     assert t1.get_full_logits_ipc.call_args.kwargs["micro_batch_size"] == 2
 

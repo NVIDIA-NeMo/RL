@@ -622,8 +622,8 @@ from the plan's maximum required storage or use a stable per-sample slab.
 
 ### Sparse IPC
 
-DTensor sparse packing must unpack values, token IDs, `logZ`, forced-token
-membership, and any support masks with exactly the same teacher boundaries.
+DTensor sparse packing must unpack every sparse handle field with exactly the
+same teacher boundaries.
 
 Megatron sparse IPC supports unpacked batches only. Its non-IPC packed top-k path is
 a useful TP/CP reference, but cross-tokenizer additionally needs globally correct top-k

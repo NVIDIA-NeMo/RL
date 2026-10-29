@@ -18,6 +18,7 @@ shard. Summed over CP ranks, the owner-local loss and gradient must equal the
 replicated TP1/CP1 loss with no ``1/CP`` factor, at every TP/CP size.
 """
 
+import dataclasses
 import os
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from nemo_rl.algorithms.loss.csd import (
 from nemo_rl.algorithms.x_token import loss_utils
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
+    SparseTeacherLogits,
     SparseTeacherRowReader,
     _chunk_ids_to_spans,
     prepare_csd_owner_local_loss_input,
@@ -599,50 +601,83 @@ def test_owner_local_tp2_cp2_variants(tmp_path, transport, case):
     _spawn(tmp_path, _run_topology, 4, 2, 2, transport, case)
 
 
-def test_sparse_owner_local_matches_replicated_sparse(tmp_path):
-    """At TP1/CP1, owner-local sparse equals the replicated sparse path.
+def _shared_row_fixture(tmp_path, *, noise_window: int = 0) -> dict:
+    """The owner-local fixture with row 0's forced labels outside the top-k.
 
-    The replicated payload holds one forced label per row, so chunk 0 (whose
-    teacher row would need two labels) is left out of this comparison.
+    Teacher row 0 serves the unshifted common chunk c0 (label at position 0)
+    and the shifted 1-to-2 chunk c1 (label at position 1). By default sample 0
+    needs both labels inserted, and sample 1 keeps c1's label in the natural
+    top-k and needs c0's inserted. With ``noise_window`` both samples rank the
+    two labels right after the natural top-k, inside the top-``noise_window``
+    noise filter, and c1's row-1 label is lifted into that window, so every
+    shared-row request passes the filter and needs insertion.
     """
     fx = _fixture(os.fspath(tmp_path))
-    fx["pair_valid"][:, 0] = False
-    records = _sparse_records(fx, k=SPARSE_K, noise_filter_topk=0, teacher_cp=2)
-    owner_loss, owner_grad, owner_metrics, _ = _owner_local_step(
-        fx,
-        transport="sparse",
-        tp_rank=0,
-        cp_rank=0,
-        tp_size=1,
-        cp_size=1,
-        tp_group=None,
-        cp_group=None,
-        records=records,
-    )
+    logits = fx["teacher_logits"].clone()
+    if not noise_window:
+        logits[0, 0, [TEACHER_IDS[0][0], TEACHER_IDS[0][1]]] = -20.0
+        logits[1, 0, TEACHER_IDS[1][0]] = -20.0
+        logits[1, 0, TEACHER_IDS[1][1]] = 20.0
+    else:
+        for b in range(2):
+            labels = [TEACHER_IDS[b][0], TEACHER_IDS[b][1]]
+            keep = torch.ones(V, dtype=torch.bool)
+            keep[labels] = False
+            others = logits[b, 0, keep].sort(descending=True).values
+            high, low = float(others[SPARSE_K - 1]), float(others[SPARSE_K])
+            logits[b, 0, labels[0]] = high - (high - low) / 3
+            logits[b, 0, labels[1]] = high - 2 * (high - low) / 3
+            logits[b, 1, TEACHER_IDS[b][2]] = 20.0
+    fx["teacher_logits"] = logits
+    return fx
 
-    # Materialize the replicated [B, T, K] payload: each row's natural top-k
-    # with its single forced label kept, exactly as the reader serves it.
+
+def _replicated_sparse_payload(
+    fx: dict, *, k: int, noise_filter_topk: int
+) -> SparseTeacherLogits:
+    """The full-sequence payload the Automodel sparse producer emits."""
     force = _build_teacher_force_include_token_id_slots(
         _batch(fx), teacher_idx=0, kl_chunk_shift=True
     )
-    assert int((force[..., 1] >= 0).sum()) == 0
-    reader = SparseTeacherRowReader(records, device=torch.device("cpu"))
-    natural_logits, natural_ids = torch.topk(fx["teacher_logits"], SPARSE_K, dim=-1)
-    natural_ids, order = natural_ids.sort(dim=-1)
-    topk_logits = natural_logits.gather(-1, order)
-    topk_ids = natural_ids.to(torch.int32)
-    labeled = (force[..., 0] >= 0).nonzero().tolist()
-    rows = reader.gather_rows(
-        torch.tensor([b for b, _ in labeled]),
-        torch.tensor([t for _, t in labeled]),
-        torch.stack([force[b, t, 0] for b, t in labeled]),
+    (
+        topk_logits,
+        topk_indices,
+        log_z,
+        natural_tail_indices,
+        forced_logits,
+        forced_indices,
+        forced_in_topk,
+    ) = distributed_vocab_topk_logz_force(
+        fx["teacher_logits"],
+        force,
+        k,
+        None,
+        vocab_start_index=0,
+        vocab_end_index=V,
+        real_vocab_size=V,
+        temperature=TEMPERATURE,
+        noise_filter_k=noise_filter_topk,
     )
-    for row, (b, t) in enumerate(labeled):
-        topk_logits[b, t] = rows[0][row]
-        topk_ids[b, t] = rows[1][row]
-    log_z = torch.logsumexp(fx["teacher_logits"] / TEMPERATURE, dim=-1)
+    return SparseTeacherLogits(
+        topk_logits=topk_logits,
+        topk_indices=topk_indices,
+        log_z=log_z,
+        natural_tail_indices=natural_tail_indices.squeeze(-1),
+        forced_logits=forced_logits,
+        forced_indices=forced_indices,
+        forced_in_topk=forced_in_topk,
+        membership_k=noise_filter_topk or k,
+    )
 
-    loss_fn = CSDLossFn(_loss_config(fx, owner_local=False, k=SPARSE_K))
+
+def _replicated_step(
+    fx: dict, cfg: dict, *, payload: SparseTeacherLogits | None
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """TP1/CP1 replicated CSD loss, gradient and metrics.
+
+    The teacher is ``payload`` when given, else the dense teacher logits.
+    """
+    loss_fn = CSDLossFn(cfg)
     batch = _batch(fx)
     logits = fx["student_logits"].clone().requires_grad_(True)
     max_pairs = int(fx["pair_valid"].shape[1])
@@ -664,18 +699,154 @@ def test_sparse_owner_local_matches_replicated_sparse(tmp_path):
         valid_toks,
         logits,
         logits,
-        {},
+        {} if payload is not None else {0: fx["teacher_logits"]},
         {0: align},
-        teacher_sparse_logits_by_idx={0: (topk_logits, topk_ids, log_z, None)},
+        teacher_sparse_logits_by_idx={0: payload} if payload is not None else {},
         global_valid_chunks_by_idx={0: valid_chunks},
         global_valid_kd_toks=valid_toks,
     )
     loss.backward()
+    return loss.detach(), logits.grad.detach(), metrics
 
-    torch.testing.assert_close(owner_loss, loss.detach(), rtol=2e-5, atol=2e-6)
-    torch.testing.assert_close(owner_grad, logits.grad, rtol=5e-5, atol=5e-6)
-    assert owner_metrics["num_mismatch_chunks_t0"] == metrics["num_mismatch_chunks_t0"]
-    assert owner_metrics["num_common_chunks_t0"] == metrics["num_common_chunks_t0"]
+
+@pytest.mark.parametrize("noise_filter_topk", [0, 6])
+def test_replicated_sparse_rows_match_owner_local_reader(tmp_path, noise_filter_topk):
+    fx = _shared_row_fixture(tmp_path, noise_window=noise_filter_topk)
+    payload = _replicated_sparse_payload(
+        fx, k=SPARSE_K, noise_filter_topk=noise_filter_topk
+    )
+    reader = SparseTeacherRowReader(
+        _sparse_records(
+            fx, k=SPARSE_K, noise_filter_topk=noise_filter_topk, teacher_cp=2
+        ),
+        device=torch.device("cpu"),
+    )
+    b, t, slot = (payload.forced_indices >= 0).nonzero(as_tuple=True)
+    labels = payload.forced_indices[b, t, slot].long()
+
+    rows = payload.gather_rows(b, t, labels, insert_required=True, real_vocab_size=V)
+    expected = reader.gather_rows(b, t, labels)
+
+    for got, want in zip(rows, expected, strict=True):
+        assert torch.equal(got, want)
+    # Row 0 of sample 0 serves two requests with two different supports.
+    shared = ((b == 0) & (t == 0)).nonzero().flatten()
+    assert shared.numel() == 2
+    assert not torch.equal(rows[1][shared[0]], rows[1][shared[1]])
+
+
+_SHARED_ROW_CASES = {
+    "default": {},
+    "noise_filter": {"noise_filter_topk": 6},
+    "realized_only": {"realized_only": True},
+    "realized_only_no_keep": {"realized_only": True, "keep_realized": False},
+}
+
+
+@pytest.mark.parametrize("sparse_k", [1, SPARSE_K])
+@pytest.mark.parametrize("case", sorted(_SHARED_ROW_CASES))
+def test_sparse_replicated_matches_owner_local_on_shared_rows(tmp_path, case, sparse_k):
+    """At TP1/CP1 the replicated sparse path equals owner-local sparse.
+
+    Row 0 is read by two chunks for two different labels, each of which needs
+    insertion, so every request must get its own K-wide support.
+    """
+    cfg_kwargs = {**_SHARED_ROW_CASES[case], "dynamic_loss_scaling": False}
+    noise_filter_topk = cfg_kwargs.get("noise_filter_topk", 0)
+    fx = _shared_row_fixture(tmp_path, noise_window=noise_filter_topk)
+    force = _build_teacher_force_include_token_id_slots(
+        _batch(fx), teacher_idx=0, kl_chunk_shift=True
+    )
+    natural = torch.topk(fx["teacher_logits"], sparse_k, dim=-1).indices
+    assert bool((force[:, 0] >= 0).all())
+    assert not bool((natural[0, 0].unsqueeze(-1) == force[0, 0]).any())
+    if noise_filter_topk:
+        window = torch.topk(fx["teacher_logits"], noise_filter_topk, dim=-1).indices
+        assert bool(
+            (window[:, 0].unsqueeze(-1) == force[:, 0].unsqueeze(-2)).any(-2).all()
+        )
+
+    owner_loss, owner_grad, owner_metrics, _ = _owner_local_step(
+        fx,
+        transport="sparse",
+        tp_rank=0,
+        cp_rank=0,
+        tp_size=1,
+        cp_size=1,
+        tp_group=None,
+        cp_group=None,
+        records=_sparse_records(
+            fx, k=sparse_k, noise_filter_topk=noise_filter_topk, teacher_cp=2
+        ),
+        sparse_k=sparse_k,
+        **cfg_kwargs,
+    )
+    loss, grad, metrics = _replicated_step(
+        fx,
+        _loss_config(fx, owner_local=False, k=sparse_k, **cfg_kwargs),
+        payload=_replicated_sparse_payload(
+            fx, k=sparse_k, noise_filter_topk=noise_filter_topk
+        ),
+    )
+
+    torch.testing.assert_close(owner_loss, loss, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(owner_grad, grad, rtol=5e-5, atol=5e-6)
+    shared_metrics = sorted(set(owner_metrics) & set(metrics))
+    assert {
+        "num_common_chunks_t0",
+        "num_mismatch_chunks_t0",
+        "top1_acc_per_chunk_t0",
+        "kl_loss_t0",
+    } <= set(shared_metrics)
+    for key in shared_metrics:
+        torch.testing.assert_close(
+            torch.as_tensor(owner_metrics[key], dtype=torch.float64),
+            torch.as_tensor(metrics[key], dtype=torch.float64),
+            rtol=2e-5,
+            atol=2e-6,
+            msg=key,
+        )
+
+
+def test_sparse_pure_alm_matches_dense_on_shared_rows(tmp_path):
+    """Pure ALM reads each request's realized label, so sparse K<V equals dense."""
+    fx = _shared_row_fixture(tmp_path)
+    cfg = {
+        **_loss_config(fx, owner_local=False, k=SPARSE_K, dynamic_loss_scaling=False),
+        "csd_pure_alm": True,
+    }
+
+    dense_loss, dense_grad, _ = _replicated_step(
+        fx, {**cfg, "teacher_topk_ipc_k": 0}, payload=None
+    )
+    sparse_loss, sparse_grad, _ = _replicated_step(
+        fx,
+        cfg,
+        payload=_replicated_sparse_payload(fx, k=SPARSE_K, noise_filter_topk=0),
+    )
+
+    torch.testing.assert_close(sparse_loss, dense_loss, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(sparse_grad, dense_grad, rtol=1e-5, atol=1e-6)
+
+
+def test_sparse_rows_stay_natural_without_keep_realized(tmp_path):
+    """With keep_realized off, the forced sidecar never enters the support."""
+    fx = _shared_row_fixture(tmp_path)
+    cfg = _loss_config(
+        fx,
+        owner_local=False,
+        k=SPARSE_K,
+        keep_realized=False,
+        dynamic_loss_scaling=False,
+    )
+    payload = _replicated_sparse_payload(fx, k=SPARSE_K, noise_filter_topk=0)
+    shifted = dataclasses.replace(payload, forced_logits=payload.forced_logits + 1.0)
+
+    loss, grad, _ = _replicated_step(fx, cfg, payload=payload)
+    shifted_loss, shifted_grad, _ = _replicated_step(fx, cfg, payload=shifted)
+
+    assert torch.equal(loss, shifted_loss)
+    assert torch.equal(grad, shifted_grad)
 
 
 _TEACHER_LABEL_CASES = [
