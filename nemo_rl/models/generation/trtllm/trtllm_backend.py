@@ -25,7 +25,6 @@ Injected into TRT-LLM's RayGPUWorker via ``ray_worker_extension_cls``.
 
 import gc
 import os
-import time
 from collections import OrderedDict
 from typing import Any, Optional
 
@@ -41,7 +40,6 @@ from nemo_rl.models.policy.utils import (
     rebuild_cuda_tensor_from_ipc,
 )
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
-from nemo_rl.utils.timer import refit_timing_log_enabled
 
 # Disable TRT-LLM weight loader's ThreadPoolExecutor: serial loading keeps
 # all copies on the caller's stream (same as NCCL writes), so the existing
@@ -84,7 +82,6 @@ class NcclExtension(WorkerExtension):
     # fp8_quantization.build_local_expert_lookup); None converts every expert.
     _local_expert_lookup: Optional[fp8_quantization.LocalExpertLookup] = None
     # Per-refit timing counters, reset at the start of each refit.
-    _refit_stats_dict: Optional[dict[str, float]] = None
     # nccl_reshard: per-PP-stage bulk communicators, the transfer plan, the misc
     # broadcast's (shape, dtype) map, and the bulk param -> local slot specs.
     pp_comm_groups: Optional[dict[int, Any]] = None
@@ -185,9 +182,6 @@ class NcclExtension(WorkerExtension):
         assert hasattr(self, "state_dict_info") and self.state_dict_info is not None, (
             "state_dict_info not set — call prepare_refit_info first"
         )
-        self._reset_refit_stats()
-        phases: dict = {}
-        t_start = time.perf_counter()
         with self.engine.control_action(drain=drain):
             try:
                 # Delegate the whole refit lifecycle to WorkerExtension: begin
@@ -198,16 +192,13 @@ class NcclExtension(WorkerExtension):
                 # _handle_control_request synchronizes before releasing the
                 # barrier control_action waits on.
                 self.begin_weight_update()
-                phases["begin"] = time.perf_counter() - t_start
-                t = time.perf_counter()
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
                     post_unpack_func=self._reload_bucket,
                 )
-                phases["transfer_and_load"] = time.perf_counter() - t
-                self._finish_refit(recompute_kv, phases, t_start, "collective")
+                self._finish_refit(recompute_kv)
             except Exception:
                 self.engine.model_engine.model_loader.abort_update_weights()
                 raise
@@ -339,32 +330,20 @@ class NcclExtension(WorkerExtension):
     # ------------------------------------------------------------------ #
     #  Per-bucket reload shared by the collective and nccl_reshard paths
     # ------------------------------------------------------------------ #
-    def _finish_refit(
-        self, recompute_kv: bool, phases: dict, t_start: float, path: str
-    ) -> None:
-        """Finalize a refit inside control_action and log its timing."""
-        t = time.perf_counter()
+    def _finish_refit(self, recompute_kv: bool) -> None:
+        """Finalize a refit inside control_action."""
         self.finalize_weight_update()
-        phases["finalize"] = time.perf_counter() - t
         if recompute_kv:
             # Re-prefill in-flight requests under the new weights; this
             # also resets the prefix cache (NVIDIA/TensorRT-LLM#17937).
-            t = time.perf_counter()
             self.engine.recompute_active_requests()
-            phases["recompute"] = time.perf_counter() - t
-        t = time.perf_counter()
         self.finish_weight_update()
-        phases["finish"] = time.perf_counter() - t
-        phases["total"] = time.perf_counter() - t_start
-        self._log_refit_timing(path, phases)
 
     def _reload_bucket(self, weight_list) -> None:
         """Convert routed experts if the engine is FP8/MXFP8, then reload."""
         model_engine = self.engine.model_engine
         model = model_engine.model
         quant_config = model.model_config.quant_config
-        stats = self._refit_stats
-        t0 = time.perf_counter()
         if fp8_quantization.is_quantized_expert_refit(quant_config):
             weights = fp8_quantization.load_weights(
                 weight_list,
@@ -373,53 +352,10 @@ class NcclExtension(WorkerExtension):
             )
         else:
             weights = dict(weight_list)
-        torch.cuda.current_stream().synchronize()
-        t1 = time.perf_counter()
         model_engine.model_loader.reload(
             model,
             weights,
             allow_partial_loading=True,
-        )
-        torch.cuda.current_stream().synchronize()
-        stats["convert_s"] += t1 - t0
-        stats["reload_s"] += time.perf_counter() - t1
-        stats["buckets"] += 1
-        stats["tensors"] += len(weights)
-
-    @property
-    def _refit_stats(self) -> dict:
-        stats = self._refit_stats_dict
-        if stats is None:
-            stats = self._reset_refit_stats()
-        return stats
-
-    def _reset_refit_stats(self) -> dict:
-        self._refit_stats_dict = {
-            "convert_s": 0.0,
-            "reload_s": 0.0,
-            "bulk_convert_s": 0.0,
-            "bulk_reload_s": 0.0,
-            "bulk_reload_calls": 0,
-            "buckets": 0,
-            "tensors": 0,
-        }
-        return self._refit_stats_dict
-
-    def _log_refit_timing(self, path: str, phases: dict) -> None:
-        """One rank-0 line per refit: where this engine's wall time went."""
-        if not refit_timing_log_enabled():
-            return
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
-            return
-        stats = self._refit_stats
-        parts = " ".join(f"{k}={v:.2f}s" for k, v in phases.items())
-        print(
-            f"[refit-timing] path={path} {parts} "
-            f"convert={stats['convert_s']:.2f}s reload={stats['reload_s']:.2f}s "
-            f"bulk_convert={stats['bulk_convert_s']:.2f}s bulk_reload={stats['bulk_reload_s']:.2f}s "
-            f"bulk_reload_calls={stats['bulk_reload_calls']} "
-            f"buckets={stats['buckets']} tensors={stats['tensors']}",
-            flush=True,
         )
 
     # ------------------------------------------------------------------ #
@@ -682,10 +618,7 @@ class NcclExtension(WorkerExtension):
         self, prefix: str, projection: str, expert_ids: list[int], stack: torch.Tensor
     ) -> None:
         """Convert one received stack and reload it, batched under the byte budget."""
-        stats = self._refit_stats
-        t0 = time.perf_counter()
         weights = self._convert_received_experts(prefix, projection, expert_ids, stack)
-        stats["bulk_convert_s"] += time.perf_counter() - t0
         pending = self._pending_bulk_reload
         if pending is None:
             pending = self._pending_bulk_reload = {"weights": {}, "bytes": 0}
@@ -781,18 +714,12 @@ class NcclExtension(WorkerExtension):
         weights = pending["weights"]
         self._pending_bulk_reload = {"weights": {}, "bytes": 0}
         model_engine = self.engine.model_engine
-        stats = self._refit_stats
-        t0 = time.perf_counter()
-        # CPU wall only (kernels stay enqueued on the receive stream): the
-        # loader's per-call module scan is the host cost this measures.
         if self._direct_expert_load_enabled():
             weights = self._load_expert_weights_direct(weights)
         if weights:
             model_engine.model_loader.reload(
                 model_engine.model, weights, allow_partial_loading=True
             )
-        stats["bulk_reload_s"] += time.perf_counter() - t0
-        stats["bulk_reload_calls"] += 1
 
     def _recv_bulk_params(self) -> None:
         """Receive every bulk param of every PP stage into its local slots."""
@@ -884,21 +811,13 @@ class NcclExtension(WorkerExtension):
             raise RuntimeError("init_nccl_reshard_comm_group must run before the refit")
         if self.hf_to_local_param_map is None:
             self.hf_to_local_param_map = self._build_expert_local_param_map(refit_info)
-        self._reset_refit_stats()
-        phases: dict = {}
-        t_start = time.perf_counter()
         with self.engine.control_action(drain=drain):
             try:
                 self.begin_weight_update()
-                phases["begin"] = time.perf_counter() - t_start
-                t = time.perf_counter()
                 self._recv_bulk_params()
                 torch.cuda.empty_cache()
-                phases["bulk"] = time.perf_counter() - t
-                t = time.perf_counter()
                 self._receive_and_load_misc_params()
-                phases["misc"] = time.perf_counter() - t
-                self._finish_refit(recompute_kv, phases, t_start, "nccl_reshard")
+                self._finish_refit(recompute_kv)
             except Exception:
                 self.engine.model_engine.model_loader.abort_update_weights()
                 raise

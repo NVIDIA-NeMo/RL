@@ -145,11 +145,6 @@ def test_collective_refit_runs_at_async_engine_boundary(
     monkeypatch.setattr(
         backend.torch.cuda, "synchronize", lambda: call_order.append("cuda_sync")
     )
-    monkeypatch.setattr(
-        backend.torch.cuda,
-        "current_stream",
-        lambda: SimpleNamespace(synchronize=lambda: call_order.append("stream_sync")),
-    )
 
     assert (
         extension.update_weights_from_collective(
@@ -170,16 +165,12 @@ def test_collective_refit_runs_at_async_engine_boundary(
     # pre_reload_weights), the refit itself, finalize (finalize_update_weights
     # -> process/post hooks), recompute in-flight requests, finish
     # (reset_prefix_cache -> sync -> re-wrap).
-    # _reload_bucket brackets each bucket's reload with stream syncs so the
-    # ``[refit-timing]`` convert/reload split is measured, not enqueued.
     assert call_order == [
         "unwrap",
         "begin",
         "pre",
         "broadcast",
-        "stream_sync",
         "reload",
-        "stream_sync",
         "finalize",
         "process",
         "post",
