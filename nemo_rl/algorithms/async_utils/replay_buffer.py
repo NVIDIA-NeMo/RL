@@ -23,7 +23,7 @@ import threading as _threading
 import time
 import uuid
 from collections import Counter, deque
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Collection, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from numbers import Integral, Real
@@ -1110,6 +1110,7 @@ class TQReplayBuffer:
         pad_value_dict: Mapping[str, int],
         include_message_violation_fields: bool,
         per_token_multimodal_fields: tuple[str, ...] = (),
+        policy_failure_kinds: Collection[str] | None = None,
         staging_partition_id: Optional[str] = None,
         require_routed_experts: bool = False,
     ):
@@ -1118,6 +1119,8 @@ class TQReplayBuffer:
         self._pad_value_dict = dict(pad_value_dict)
         self._include_message_violation_fields = include_message_violation_fields
         self._per_token_multimodal_fields = per_token_multimodal_fields
+        # grpo.masked_reward_policy=exclude_infra only; see record_to_train_batch.
+        self._policy_failure_kinds = policy_failure_kinds
         # Token-capture mode only: the staging partition whose per-call delta
         # rows `remove` must clear alongside the canonical rows. None on the
         # legacy path.
@@ -1256,7 +1259,23 @@ class TQReplayBuffer:
             pad_value_dict=self._pad_value_dict,
             include_message_violation_fields=self._include_message_violation_fields,
             per_token_multimodal_fields=self._per_token_multimodal_fields,
+            policy_failure_kinds=self._policy_failure_kinds,
         )
+        rollout_metrics = dict(record.rollout_metrics)
+        if self._policy_failure_kinds is not None:
+            from nemo_rl.experience.rollouts import infra_failure_flags
+
+            # grpo.masked_reward_policy=exclude_infra: the same rows
+            # record_to_train_batch just gave a sample_mask of 0.
+            rollout_metrics["infra_failure_sample_rate"] = (
+                infra_failure_flags(
+                    (c.env_extras for c in record.completions),
+                    self._policy_failure_kinds,
+                )
+                .float()
+                .mean()
+                .item()
+            )
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=start_weight_version,
@@ -1290,7 +1309,7 @@ class TQReplayBuffer:
                     sample_ids=list(sample_ids),
                     fields=list(fields.keys()),
                     sequence_lengths=[int(s) for s in lengths.tolist()],
-                    extra_info={ROLLOUT_METRICS: [dict(record.rollout_metrics)]},
+                    extra_info={ROLLOUT_METRICS: [rollout_metrics]},
                     tags=[dict(t) for t in tags],
                 )
 

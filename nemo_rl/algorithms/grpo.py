@@ -353,6 +353,18 @@ _REWARD_PENALTY_FLAGS = (
 )
 
 
+# Gym failure kinds (nemo_gym/failure_kinds.py) that the policy causes: it ran
+# out of time or of its turn, token or context budget, issued a command the
+# harness refuses, or produced output the harness cannot use.
+DEFAULT_POLICY_FAILURE_KINDS = (
+    "agent_timeout",
+    "agent_command_not_allowed",
+    "agent_limit",
+    "agent_invalid_output",
+    "model_context_limit",
+)
+
+
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
@@ -362,11 +374,25 @@ class GRPOConfig(BaseModel, extra="allow"):
     max_rollout_turns: int = 1
     normalize_rewards: bool = True
     # Which rows vote in the advantage statistics (group baseline/std, GDPO and
-    # Reinforce++ batch normalization, dynamic-sampling admission). "include"
-    # (default, requested by the post-training team): every row, masked rewards
-    # too. "exclude": only rows with a nonzero loss weight. Neither changes the
-    # loss masks; token-capture placeholders never vote under either policy.
-    masked_reward_policy: Literal["include", "exclude"] = "include"
+    # Reinforce++ batch normalization, dynamic-sampling admission). None of the
+    # values changes the loss masks; token-capture placeholders and rows with a
+    # dataset weight of 0 never vote.
+    # "include" (default): every row votes, masked rewards too.
+    # "exclude_infra": every row votes except rows the environment masked
+    #   (mask_sample) for a failure the policy did not cause: their failure_kind
+    #   is not in policy_failure_kinds, or they carry none. Their rewards measure
+    #   the infrastructure, judge or verifier, not the policy.
+    # "exclude": only rows with a nonzero loss weight vote.
+    masked_reward_policy: Literal["include", "exclude_infra", "exclude"] = "include"
+    # Gym failure kinds (the verify response's top-level failure_kind) that the
+    # policy caused. Under "exclude_infra" an environment-masked row with one of
+    # these kinds votes; any other kind, or none, is an infrastructure failure.
+    # Exact match, namespaced "<server>:<kind>" names included. A recipe that
+    # sets this list replaces it, so list the defaults with any new name. The
+    # other policies ignore it.
+    policy_failure_kinds: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_POLICY_FAILURE_KINDS)
+    )
     # Clipping bounds for normalized advantages to prevent extreme values
     # When set, advantages are clipped to [advantage_clip_low, advantage_clip_high] after normalization
     # Default: null (no clipping)
@@ -2732,7 +2758,7 @@ def _baseline_valid_mask(
     synthetic placeholder, is not a measurement of the policy); every other row
     is 1. ``grpo.masked_reward_policy`` decides whether the trainers use it
     (``exclude``) or let every row with a nonzero dataset weight vote
-    (``include``, see ``_include_valid_mask``); see
+    (``include`` and ``exclude_infra``, see ``_include_valid_mask``); see
     ``_dynamic_sampling_valid_mask`` and ``_advantage_valid_mask``.
 
     Participation is binary because ``calculate_baseline_and_std_per_prompt``
@@ -2798,24 +2824,58 @@ def _binary_participation(loss_weights: torch.Tensor) -> torch.Tensor:
     return (loss_weights != 0).to(dtype)
 
 
+def _votes_by_dataset_weight(grpo_config: GRPOConfig) -> bool:
+    """Whether ``grpo.masked_reward_policy`` lets every row with a nonzero dataset weight vote.
+
+    True for ``include`` and ``exclude_infra``: both take their population from
+    the dataset weight (``_include_valid_mask``). They differ only in the rows
+    the rollout builders give a weight of 0 under ``exclude_infra``
+    (``nemo_rl.experience.rollouts.infra_failure_flags``). False for
+    ``exclude``, which takes the rows with a nonzero loss weight.
+    """
+    return grpo_config.masked_reward_policy in ("include", "exclude_infra")
+
+
+def exclude_infra_policy_kinds(
+    grpo_config: GRPOConfig | None,
+) -> frozenset[str] | None:
+    """The policy-caused failure kinds the rollout builders keep under ``exclude_infra``.
+
+    Under ``grpo.masked_reward_policy: exclude_infra`` the rollout and payload
+    builders give every environment-masked sample whose ``failure_kind`` is not
+    in ``grpo.policy_failure_kinds`` a dataset weight of 0 (see
+    ``nemo_rl.experience.rollouts.infra_failure_flags``). ``None`` (``include``,
+    ``exclude``, or a trainer without a GRPO config) leaves the weights alone;
+    ``exclude`` already keeps every environment-masked row out of the
+    statistics.
+    """
+    if grpo_config is None or grpo_config.masked_reward_policy != "exclude_infra":
+        return None
+    return frozenset(grpo_config.policy_failure_kinds)
+
+
 def _include_valid_mask(
     dataset_loss_multiplier: torch.Tensor | list[float] | None,
     like: torch.Tensor,
 ) -> torch.Tensor:
-    """The ``include`` population: every row whose dataset weight is nonzero.
+    """The ``include``/``exclude_infra`` population: every row whose dataset weight is nonzero.
 
-    ``include`` keeps the rows the in-trainer filters drop from the loss voting
+    Both keep the rows the in-trainer filters drop from the loss voting
     (``mask_sample``, truncated rows under ``overlong_filtering``, rows masked
     by ``seq_logprob_error_threshold``): their rewards are measurements of the
     policy. A prompt the dataset could not fit into the sequence limit is
     different: ``nemo_rl/data/processors.py`` cuts it to a few tokens and gives
     it ``loss_multiplier == 0`` before any rollout, so its rows are unusable,
-    not masked rewards, and no trainer lets them vote under either policy (the
+    not masked rewards, and no trainer lets them vote under any policy (the
     SingleController stage reads the same weight from its data-plane
-    ``sample_mask``). ``dataset_loss_multiplier`` must therefore be the weight
-    before the in-trainer filters; every filter clones the column before
-    rewriting it, so a reference taken ahead of them stays the dataset weight.
-    ``None`` (a batch without the column) lets every row vote.
+    ``sample_mask``). Under ``exclude_infra`` the rollout builders also give a
+    weight of 0 to every row the environment masked for an infrastructure
+    failure (its ``failure_kind`` is not in ``grpo.policy_failure_kinds``): its
+    reward measured nothing about the policy either.
+    ``dataset_loss_multiplier`` must therefore be the weight before the
+    in-trainer filters; every filter clones the column before rewriting it, so
+    a reference taken ahead of them stays the dataset weight. ``None`` (a batch
+    without the column) lets every row vote.
     """
     if dataset_loss_multiplier is None:
         return torch.ones_like(like)
@@ -2833,14 +2893,14 @@ def _advantage_valid_mask(
 ) -> torch.Tensor:
     """Statistics participation at the estimator, per ``grpo.masked_reward_policy``.
 
-    ``include`` lets every row with a nonzero dataset weight vote
-    (``_include_valid_mask``); ``exclude`` lets the rows with a nonzero (final)
-    loss weight vote. Both return a binary mask and leave ``sample_mask``
-    unchanged. The legacy and TransferQueue trainers carry no synthetic
-    placeholder rows; the SingleController stage excludes its token-capture
-    placeholders itself (see ``advantage_stage.py``).
+    ``include`` and ``exclude_infra`` let every row with a nonzero dataset
+    weight vote (``_include_valid_mask``); ``exclude`` lets the rows with a
+    nonzero (final) loss weight vote. All return a binary mask and leave
+    ``sample_mask`` unchanged. The legacy and TransferQueue trainers carry no
+    synthetic placeholder rows; the SingleController stage excludes its
+    token-capture placeholders itself (see ``advantage_stage.py``).
     """
-    if grpo_config.masked_reward_policy == "include":
+    if _votes_by_dataset_weight(grpo_config):
         return _include_valid_mask(dataset_loss_multiplier, sample_mask)
     return _binary_participation(sample_mask)
 
@@ -2856,10 +2916,11 @@ def _logprob_sample_mask(
     ``token_mask * sample_mask`` (``mask_filtered_logprobs_outside_tokens``).
     The reference pass is never filtered: ``use_reference_model`` disables
     top-k/top-p, so reference logprobs are always real. A row that carries no
-    loss but votes in the advantage statistics (``include``) would therefore
-    reach Reinforce++'s KL-in-reward and the batch normalization with a zeroed
-    policy logprob against a real reference, so the statistics rows, not the
-    loss rows, decide which policy logprobs stay real. The training
+    loss but votes in the advantage statistics (``include``, ``exclude_infra``)
+    would therefore reach Reinforce++'s KL-in-reward and the batch
+    normalization with a zeroed policy logprob against a real reference, so
+    the statistics rows, not the loss rows, decide which policy logprobs stay
+    real. The training
     ``sample_mask`` is left unchanged; under ``exclude`` both masks select the
     same rows.
     """
@@ -2874,15 +2935,16 @@ def _dynamic_sampling_valid_mask(
     Dynamic-sampling admission, the group baseline/std and the ``env_baseline``
     all take this mask, so one policy decides which groups are admitted and
     which rewards they are centred on. It runs before the in-trainer filters,
-    so ``loss_multiplier`` is still the dataset weight here: ``include`` lets
-    every row with a nonzero dataset weight vote (``_include_valid_mask``).
+    so ``loss_multiplier`` is still the dataset weight here: ``include`` and
+    ``exclude_infra`` let every row with a nonzero dataset weight vote
+    (``_include_valid_mask``).
     ``exclude`` starts from ``_baseline_valid_mask`` and, under
     ``overlong_filtering``, also drops truncated rows: the rows the loss drops
     later in the step. Sequence-logprob-error masking runs after this stage,
     so it only reaches ``_advantage_valid_mask``.
     """
     rewards = repeated_batch["total_reward"]
-    if grpo_config.masked_reward_policy == "include":
+    if _votes_by_dataset_weight(grpo_config):
         return _include_valid_mask(
             repeated_batch["loss_multiplier"]
             if "loss_multiplier" in repeated_batch
@@ -3756,6 +3818,9 @@ def _grpo_train_impl(
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
                                 master_config.env
+                            ),
+                            policy_failure_kinds=exclude_infra_policy_kinds(
+                                master_config.grpo
                             ),
                             deduplicate_multimodal_data=(
                                 master_config.grpo.deduplicate_multimodal_data

@@ -1963,6 +1963,30 @@ class TestSetup:
             low_weight=1.0, low_penalty=2.0, low_ub=500, low_string="<budget>"
         )
 
+    @pytest.mark.parametrize("policy", ["exclude_infra", "include", "exclude"])
+    def test_policy_failure_kinds_reach_both_payload_paths(
+        self, policy: str, patched_factories
+    ):
+        """grpo.masked_reward_policy=exclude_infra hands grpo.policy_failure_kinds
+        to the native commit path (TQReplayBuffer) and to token-capture
+        finalization (RolloutManager); the other policies hand them None."""
+        mc = _make_master_config()
+        mc.grpo.masked_reward_policy = policy
+
+        with (
+            patch.object(sc_setup_mod, "TQReplayBuffer") as tq_buffer,
+            patch.object(sc_setup_mod, "RolloutManager") as rollout_manager,
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        expected = (
+            frozenset(mc.grpo.policy_failure_kinds)
+            if policy == "exclude_infra"
+            else None
+        )
+        assert tq_buffer.call_args.kwargs["policy_failure_kinds"] == expected
+        assert rollout_manager.call_args.kwargs["policy_failure_kinds"] == expected
+
     @pytest.mark.parametrize(
         ("wandb_enabled", "table_flag", "expected"),
         [(False, True, False), (True, False, False), (True, True, True)],

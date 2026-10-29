@@ -58,12 +58,14 @@ def _stub_record_to_train_batch(
     pad_value_dict: Any,
     include_message_violation_fields: bool,
     per_token_multimodal_fields: tuple[str, ...] = (),
+    policy_failure_kinds: Any,
 ) -> BatchedDataDict[Any]:
     del (
         record,
         pad_value_dict,
         include_message_violation_fields,
         per_token_multimodal_fields,
+        policy_failure_kinds,
     )
     return BatchedDataDict[Any](
         {
@@ -243,6 +245,7 @@ def _make_buffer(
     *,
     require_routed_experts: bool = False,
     checkpoint_barrier: DataPlaneCheckpointBarrier | None = None,
+    policy_failure_kinds: frozenset[str] | None = None,
 ) -> TQReplayBuffer:
     buffer = TQReplayBuffer(
         dp,
@@ -250,6 +253,7 @@ def _make_buffer(
         pad_value_dict={"token_ids": 0},
         include_message_violation_fields=False,
         require_routed_experts=require_routed_experts,
+        policy_failure_kinds=policy_failure_kinds,
     )
     buffer.set_data_plane_checkpoint_barrier(
         checkpoint_barrier or DataPlaneCheckpointBarrier()
@@ -603,6 +607,45 @@ class TestTQReplayBufferReserveCommit:
         assert meta.extra_info[ROLLOUT_METRICS] == [
             {"gen_tokens/min": 3, "total_turns": 2}
         ]
+
+    @pytest.mark.parametrize(
+        "policy_failure_kinds, expected",
+        [
+            (frozenset({"agent_timeout"}), {"infra_failure_sample_rate": 0.5}),
+            (None, {}),
+        ],
+    )
+    def test_commit_reports_infra_failure_sample_rate(
+        self, policy_failure_kinds, expected
+    ):
+        """grpo.masked_reward_policy=exclude_infra: the native SingleController
+        path logs the share of infrastructure-failed rows, like the other
+        trainers. A mask with no failure_kind is one; a listed policy kind is
+        not."""
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp, policy_failure_kinds=policy_failure_kinds)
+        record = _make_record({"total_turns": 2})
+        record.completions = [
+            Completion(message_log=[], env_extras=extras, truncated=False, reward=0.0)
+            for extras in (
+                {"mask_sample": True},
+                {"mask_sample": True, "failure_kind": "agent_timeout"},
+            )
+        ]
+        group_id = buf.reserve(weight_version=3)
+
+        meta = _run(
+            buf.commit(
+                group_id,
+                record,
+                start_weight_version=3,
+                end_weight_version=3,
+            )
+        )
+
+        assert meta.extra_info[ROLLOUT_METRICS] == [{"total_turns": 2, **expected}]
+        # The record's own metrics are not rewritten in place.
+        assert record.rollout_metrics == {"total_turns": 2}
 
     def test_commit_clears_rows_when_put_raises_after_writing(self):
         dp = FailAfterPutDataPlaneClient()

@@ -599,6 +599,7 @@ class RolloutReassembler:
         fallback_weight_version: int,
         prompt_idx: int,
         loss_multiplier: float = 1.0,
+        infra_failure: Optional[list[bool]] = None,
         canonical_sample_ids: Optional[list[str]] = None,
         reward_checks: Optional[list[RewardChecks | None]] = None,
         reward_log_contexts: Optional[list[RewardLogContext | None]] = None,
@@ -614,13 +615,18 @@ class RolloutReassembler:
         environment masking reads the same field on both paths (placeholder
         rows already train nothing through ``sample_mask`` 0).
         ``loss_multiplier`` supplies the dataset-level weight for every valid
-        row, matching the ordinary ``record_to_train_batch`` path. ``truncated``
+        row, matching the ordinary ``record_to_train_batch`` path, except the
+        rows ``infra_failure`` flags (``grpo.masked_reward_policy:
+        exclude_infra``), which get 0 there too. ``truncated``
         is not carried from the dispatcher -- the receipt path has no real
         tokens to measure it from at dispatch time -- so it is computed here
         instead, from each row's rebuilt length against ``max_seq_len``.
         """
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
+        )
+        assert infra_failure is None or len(infra_failure) == len(rollout_ids), (
+            "infra_failure must be one per rollout"
         )
         if canonical_sample_ids is None:
             canonical_sample_ids = rollout_ids
@@ -669,6 +675,10 @@ class RolloutReassembler:
                 else 0.0
             ),
         }
+        if infra_failure is not None:
+            # grpo.masked_reward_policy=exclude_infra: the same flags give
+            # these rows a sample_mask of 0 below.
+            metrics["infra_failure_sample_rate"] = sum(infra_failure) / len(rows)
         # Per-row counts are pooled by the consuming controller once per
         # committed group, alongside the retained reward observations;
         # rejected placeholders never enter this population.
@@ -805,7 +815,11 @@ class RolloutReassembler:
             input_ids[i, :length] = torch.tensor(row.token_ids, dtype=torch.int64)
             token_mask[i, :length] = torch.tensor(row.token_mask, dtype=torch.float32)
             logprobs[i, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
-            sample_mask[i] = float(loss_multiplier)
+            sample_mask[i] = (
+                0.0
+                if infra_failure is not None and infra_failure[i]
+                else float(loss_multiplier)
+            )
 
         train_batch: dict[str, Any] = {
             "input_ids": input_ids,
