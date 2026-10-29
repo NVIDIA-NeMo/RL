@@ -37,7 +37,10 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    WeightSynchronizer,
+    initialize_refit_metadata,
+)
 from nemo_rl.weight_sync.membership import (
     RefitMembership,
     desired_membership,
@@ -144,6 +147,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                 refit_timeout_s=self._refit_timeout_s,
                 buffer_size_bytes=sender_spec.buffer_size_bytes,
                 num_buffers=sender_spec.num_buffers,
+                use_legacy_packing=sender_spec.use_legacy_packing,
             )
             futures_inference = self._generation.update_weights_from_collective(
                 refit_timeout_s=self._refit_timeout_s
@@ -220,10 +224,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # prepare_refit_info is called before init_collective. This matches
         # distillation.py ordering. Neither call depends on the other today,
         # but we document this as the canonical ordering for future reference.
-        state_dict_info = self._policy.prepare_refit_info(
-            refit_payload_mode=self._generation.get_refit_payload_mode()
-        )
-        self._generation.prepare_refit_info(state_dict_info)
+        initialize_refit_metadata(self._policy, self._generation)
 
         ip, port = self._train_cluster.get_master_address_and_port()
         train_world_size = self._train_cluster.world_size()
@@ -337,14 +338,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # state_dict_info at all -- update_weights_from_collective asserts on it -- and
         # this is metadata rather than weights, so redistributing it to shards that
         # already have it is cheap and removes the need to track who is new.
-        #
-        # Same payload mode as init_communicator: the policy has required it since #3739,
-        # and this call shipped without it, so every collective-transport recovery died
-        # here with a TypeError before touching NCCL (PR #3929 validation, job 18689836).
-        state_dict_info = self._policy.prepare_refit_info(
-            refit_payload_mode=self._generation.get_refit_payload_mode()
-        )
-        self._generation.prepare_refit_info(state_dict_info)
+        initialize_refit_metadata(self._policy, self._generation)
 
         # nccl_peer, exactly as init_communicator passes it. The receiver's bootstrap is
         # not negotiable: "nemo" publishes a raw unique ID and warms up with a rank-0

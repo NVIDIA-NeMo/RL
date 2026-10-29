@@ -13,9 +13,11 @@
 # limitations under the License.
 import datetime
 import logging
+import os
 import sys
 import threading
 import time
+import warnings
 from contextlib import contextmanager
 from typing import Callable, Generator, Optional, Sequence, Union
 
@@ -449,7 +451,15 @@ class TimeoutChecker:
         self.last_save_time = (
             float("inf") if timeout is None else convert_to_seconds(timeout)
         )
-        self.start_time = time.time()
+        # Start the clock at job start (NRL_JOB_START_EPOCH is set by ray.sub).
+        if "NRL_JOB_START_EPOCH" in os.environ:
+            self.start_time = float(os.environ["NRL_JOB_START_EPOCH"])
+        else:
+            warnings.warn(
+                "NRL_JOB_START_EPOCH is not set; timeout is measured from now",
+                stacklevel=2,
+            )
+            self.start_time = time.time()
         self.last_saved = False
         self.iteration_times = []
         self.previous_iteration_time: Optional[float] = None

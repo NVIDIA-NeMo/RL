@@ -42,7 +42,11 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StageResult,
 )
 
-from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
+from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
+from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    ChainPrefixCache,
+    StagedPrefix,
+)
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
@@ -89,11 +93,9 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client,
-        *,
-        staging_partition,
-        capture_media,
-        media_pixel_dtype=None: sink,
+        lambda dp_client, *, staging_partition, capture_media, media_pixel_dtype=None: (
+            sink
+        ),
     )
     worker = _fake_worker()
 
@@ -103,7 +105,7 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
         )
     )
 
-    assert installed is True
+    assert installed is None  # text-only capture pins no media column
     # The capture client owns no Mooncake memory, so no save waits on vLLM.
     assert segment_sizes == [0]
     assert isinstance(worker.token_capture, RolloutTokenCapture)
@@ -120,7 +122,7 @@ def test_setup_token_capture_skips_non_model_owners(monkeypatch):
             worker, dp_cfg={}, staging_partition="rollout_staging"
         )
     )
-    assert installed is False
+    assert installed is None
     assert worker.token_capture is None
 
 
@@ -134,11 +136,9 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client,
-        *,
-        staging_partition,
-        capture_media,
-        media_pixel_dtype=None: sink,
+        lambda dp_client, *, staging_partition, capture_media, media_pixel_dtype=None: (
+            sink
+        ),
     )
     worker = _fake_worker()
     asyncio.run(
@@ -249,9 +249,12 @@ class _MemoryPrefixSource:
         self.deltas = deltas
         self.calls: list[list[str]] = []
 
-    def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
+    def fetch_prefix_chains(self, staging_keys: list[str]) -> StagedPrefix:
+        """Text-only chains: the vLLM worker never stages media through this source."""
         self.calls.append(list(staging_keys))
-        return [token for key in staging_keys for token in self.deltas[key]]
+        return StagedPrefix(
+            expanded=[token for key in staging_keys for token in self.deltas[key]]
+        )
 
 
 def _served_content(gen_ids, logprobs):
@@ -575,9 +578,11 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
                 )
             )
     else:
-        assert asyncio.run(
+        spec = asyncio.run(
             VllmAsyncGenerationWorkerImpl.setup_token_capture(
                 worker, {}, staging_partition="staging", capture_media=True
             )
         )
+        # The engine's model dtype and the HF patch size, as pinned on the sink.
+        assert spec == MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=2)
         assert worker._capture_image_token_id == 18

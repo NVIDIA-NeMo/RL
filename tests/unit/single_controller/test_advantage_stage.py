@@ -15,6 +15,7 @@
 
 import asyncio
 import json
+import math
 from collections.abc import Sequence
 from dataclasses import fields
 from pathlib import Path
@@ -31,6 +32,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     SHARD_INVARIANT_ESTIMATORS,
@@ -43,6 +45,10 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    DebugWriterConfig,
+    JsonDebugWriter,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -51,9 +57,9 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
-from nemo_rl.utils.train_data_dump import TrainDataDump
 
 
 def _config(**overrides) -> AdvantageStageConfig:
@@ -64,12 +70,37 @@ def _config(**overrides) -> AdvantageStageConfig:
         policy_logprobs_required=False,
         reference_logprobs_required=False,
         teacher_logprobs_required=False,
+        opd_full_enabled=False,
         message_level_advantage_penalties_enabled=False,
         shardable=True,
         train_data_dump_dir=None,
     )
     base.update(overrides)
     return AdvantageStageConfig(**base)
+
+
+@pytest.mark.parametrize("log_full_train_data", [False, True])
+def test_from_master_config_uses_typed_logger(
+    tmp_path: Path, log_full_train_data: bool
+) -> None:
+    master_config = SimpleNamespace(
+        grpo=GRPOConfig(num_generations_per_prompt=2),
+        ppo=None,
+        loss_fn=ClippedPGLossConfig(),
+        on_policy_distillation=None,
+        policy={"generation": {"top_k": None, "top_p": 1.0}},
+        logger=LoggerConfig(log_dir=str(tmp_path)),
+        async_rl=SimpleNamespace(
+            log_full_train_data=log_full_train_data,
+            debug_writer=DebugWriterConfig(),
+        ),
+    )
+
+    config = AdvantageStageConfig.from_master_config(master_config)
+
+    assert config.train_data_dump_dir == (
+        str(tmp_path) if log_full_train_data else None
+    )
 
 
 class TestInputFields:
@@ -477,10 +508,10 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "opd_stat_sumsq",
         "opd_stat_count",
         "opd_gap_sum",
-        # A duration and a count, not the rows: the dump itself went to
+        # A duration and a receipt, not the rows: the dump itself went to
         # disk shard-side.
         "train_data_dump_s",
-        "train_data_dump_rows",
+        "train_data_dump_receipt",
     }
 
 
@@ -588,6 +619,8 @@ def _controller(
     *,
     fail: bool = False,
     dump_dir: str | None = None,
+    opd_full_enabled: bool = False,
+    seq_logprob_error_threshold: float | None = None,
 ):
     """Build the controller stub _advantage_stage needs, and nothing more.
 
@@ -598,7 +631,7 @@ def _controller(
     algo = GRPOConfig(
         num_generations_per_prompt=GROUP_SIZE,
         adv_estimator=AdvEstimatorConfig(name=estimator_name),
-        seq_logprob_error_threshold=None,
+        seq_logprob_error_threshold=seq_logprob_error_threshold,
     )
     is_opd = estimator_name == "opd"
     estimator = (
@@ -616,6 +649,7 @@ def _controller(
         policy_logprobs_required=is_opd,
         reference_logprobs_required=False,
         teacher_logprobs_required=is_opd,
+        opd_full_enabled=opd_full_enabled,
         message_level_advantage_penalties_enabled=False,
         shardable=estimator_name in SHARD_INVARIANT_ESTIMATORS,
         train_data_dump_dir=dump_dir,
@@ -626,9 +660,9 @@ def _controller(
     ctrl._advantage_computer = AdvantageComputer(
         store, config=config, advantage_estimator=estimator
     )
-    ctrl._train_data_dump = TrainDataDump(dump_dir) if dump_dir is not None else None
+    ctrl._train_data_dump = JsonDebugWriter(dump_dir) if dump_dir is not None else None
     ctrl._timer = Timer()
-    ctrl._train_data_dump_rows = 0
+    ctrl._train_data_dump_receipts = []
     ctrl._train_steps = 0
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._advantage_actors = [
@@ -700,6 +734,54 @@ def test_sharded_pool_matches_in_process(estimator_name: str) -> None:
     assert opd_pool == pytest.approx(opd_local)
 
 
+@pytest.mark.parametrize("full_vocab", [False, True])
+@pytest.mark.parametrize("tokenless_sample", [False, True])
+def test_opd_normalization_gap_and_tokenless_rows_match_across_shards(
+    full_vocab: bool, tokenless_sample: bool
+) -> None:
+    results = []
+    total_rows = NUM_GROUPS * GROUP_SIZE
+    for num_actors in (0, 3):
+        rows = _rows()
+        for row in rows.values():
+            row["generation_logprobs"] = row["prev_logprobs"] + math.log(2.5)
+        if tokenless_sample:
+            rows["s0"]["token_mask"][1:] = 0
+        store = _RowStore(rows)
+        ctrl = _controller(
+            "opd",
+            num_actors,
+            store,
+            opd_full_enabled=full_vocab,
+            seq_logprob_error_threshold=2.0,
+        )
+        _, has_valid = asyncio.run(ctrl._advantage_stage(_pool_meta()))
+        masks = torch.stack(
+            [store.rows[f"s{i}"]["sample_mask"] for i in range(total_rows)]
+        )
+        advantages = torch.stack(
+            [store.rows[f"s{i}"]["advantages"] for i in range(total_rows)]
+        )
+        metrics = reduce_advantage_pump_metrics(
+            **ctrl._step_log_dict, sequence_lengths=[]
+        )
+        expected_rows = total_rows - int(tokenless_sample) if full_vocab else 0
+        assert has_valid == full_vocab
+        assert masks.sum() == expected_rows
+        assert ctrl._opd_stat_count == expected_rows * SEQ
+        if full_vocab:
+            assert metrics["max_seq_mult_prob_error"] == pytest.approx(2.5)
+            assert metrics["num_masked_seqs_by_logprob_error"] == 0
+        results.append(
+            (masks, advantages, metrics, ctrl._opd_stat_sum, ctrl._opd_gap_sum)
+        )
+    for local, sharded in zip(*results):
+        if isinstance(local, torch.Tensor):
+            torch.testing.assert_close(local, sharded)
+        else:
+            assert local == pytest.approx(sharded)
+
+
 @pytest.mark.parametrize("num_actors", [0, 3])
 def test_training_dump_is_complete_however_the_stage_was_split(
     tmp_path: Path, num_actors: int
@@ -713,7 +795,7 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     store = _RowStore(_rows())
     ctrl = _controller("grpo", num_actors, store, dump_dir=str(tmp_path))
     asyncio.run(ctrl._advantage_stage(_pool_meta()))
-    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_rows)
+    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
 
     rows = [
         json.loads(line)

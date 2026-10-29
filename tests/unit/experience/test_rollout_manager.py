@@ -1011,6 +1011,9 @@ def _mask_gate_result():
         ],
         "full_result": {
             "reward": 1.0,
+            # Both forms of the env mask flag: the verify response's
+            # first-class field and the older instance_config mapping.
+            "mask_sample": True,
             "instance_config": {"mask_sample": True, "other_key": "kept"},
         },
     }
@@ -1020,6 +1023,7 @@ def test_result_to_completion_keeps_mask_flag_when_gate_on():
     completion = _nemo_gym_impl(True)._results_to_completions([_mask_gate_result()])[0][
         0
     ]
+    assert completion.env_extras["mask_sample"] is True
     assert completion.env_extras["instance_config"]["mask_sample"] is True
 
 
@@ -1027,8 +1031,27 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     completion = _nemo_gym_impl(False)._results_to_completions([_mask_gate_result()])[
         0
     ][0]
+    assert "mask_sample" not in completion.env_extras
     assert "mask_sample" not in completion.env_extras["instance_config"]
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
+
+
+def test_gate_off_keeps_the_mask_flag_in_the_per_agent_metrics():
+    """Dropping the flag from the completions must not drop it from the metrics:
+    the gate-off mode exists for flags too coarse to honor, which is when the
+    flagged rate is worth watching. The metrics read the results the caller
+    still holds, not the completions."""
+    impl = _nemo_gym_impl(False)
+    result = _mask_gate_result()
+    completions, _ = impl._results_to_completions([result])
+    assert "mask_sample" not in completions[0].env_extras
+    # The caller's result is untouched by the gate.
+    assert result["full_result"]["mask_sample"] is True
+
+    metrics = impl._compute_rollout_metrics(
+        completions, "agent", full_results=[result["full_result"]]
+    )
+    assert metrics["agent/mask_sample/mean"] == 1.0
 
 
 def _mask_gate_receipt_result():
@@ -1038,6 +1061,9 @@ def _mask_gate_receipt_result():
         "rollout_id": "r0",
         "full_result": {
             "reward": 1.0,
+            # Both forms, as in _mask_gate_result, so the receipt branch's
+            # handling of the first-class field is observed too.
+            "mask_sample": True,
             "instance_config": {"mask_sample": True, "other_key": "kept"},
         },
     }
@@ -1047,6 +1073,7 @@ def test_receipt_completion_keeps_mask_flag_when_gate_on():
     completion = _nemo_gym_impl(True)._results_to_completions(
         [_mask_gate_receipt_result()]
     )[0][0]
+    assert completion.env_extras["mask_sample"] is True
     assert completion.env_extras["instance_config"]["mask_sample"] is True
     assert completion.truncated is False
 
@@ -1055,8 +1082,37 @@ def test_receipt_completion_drops_mask_flag_when_gate_off():
     completion = _nemo_gym_impl(False)._results_to_completions(
         [_mask_gate_receipt_result()]
     )[0][0]
+    assert "mask_sample" not in completion.env_extras
     assert "mask_sample" not in completion.env_extras["instance_config"]
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_truncated"),
+    [
+        pytest.param(
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+            True,
+            id="length_incomplete",
+        ),
+        pytest.param(
+            {"status": "completed", "incomplete_details": None},
+            False,
+            id="completed",
+        ),
+    ],
+)
+def test_result_to_completion_truncated_on_length_incomplete_response(
+    response, expected_truncated
+):
+    result = _mask_gate_result()
+    result["full_result"]["response"] = response
+    completion = _nemo_gym_impl(True)._results_to_completions([result])[0][0]
+    # Two tokens, far below max_seq_len: only the length cut marks truncation.
+    assert completion.truncated is expected_truncated
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
@@ -1109,6 +1165,7 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     generation_index, completion = streamed[0]
     assert generation_index == 0
     assert completion.env_extras["ng_rollout_id"] == "r0"
+    assert completion.env_extras["agent_ref"] == {"name": "resolved-agent"}
     assert "mask_sample" not in completion.env_extras["instance_config"]
     context = completion.env_extras["ng_reward_log_context"]
     assert context.agent_name == "resolved-agent"
@@ -1144,6 +1201,8 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
             ],
             env_extras={
                 "reward": 0.0,
+                "reward_score_raw": 0.0,
+                "optional_score": 1.0,
                 "total_tokens_per_sample": 1000,
                 "gen_tokens_per_sample": 1000,
             },
@@ -1157,6 +1216,8 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
             ],
             env_extras={
                 "reward": 1.0,
+                "reward_score_raw": 1.0,
+                "optional_score": None,
                 "total_tokens_per_sample": 1000,
                 "gen_tokens_per_sample": 1000,
             },
@@ -1176,6 +1237,8 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
     assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(2.0)
     assert metrics["agent/gen_tokens_per_sample/max"] == 3
     assert metrics["agent/gen_tokens_per_sample/histogram"] == [1, 3]
+    assert metrics["agent/optional_score/mean"] == pytest.approx(0.5)
+    assert "agent/reward_score_raw/mean" not in metrics
 
 
 def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():
@@ -1917,9 +1980,18 @@ class _FakeCaptureBuffer(_FakeBuffer):
 
 
 def _receipt_record(
-    rollout_ids, receipts, instance_configs=None, *, loss_multiplier=1.0
+    rollout_ids,
+    receipts,
+    instance_configs=None,
+    *,
+    loss_multiplier=1.0,
+    verify_fields=None,
 ):
+    """``instance_configs`` nests each entry under ``instance_config``;
+    ``verify_fields`` spreads each entry's verify-response fields (such as the
+    first-class ``mask_sample``) into the completion's env_extras as they are."""
     instance_configs = instance_configs or [None] * len(rollout_ids)
+    verify_fields = verify_fields or [{}] * len(rollout_ids)
     completions = [
         Completion(
             message_log=[],
@@ -1927,12 +1999,16 @@ def _receipt_record(
                 "reward": 0.5,
                 "ng_receipt": receipt,
                 "ng_rollout_id": rid,
+                "agent_ref": {"name": "resolved-agent"},
                 **({"instance_config": cfg} if cfg is not None else {}),
+                **fields,
             },
             truncated=False,
             reward=0.5,
         )
-        for rid, receipt, cfg in zip(rollout_ids, receipts, instance_configs)
+        for rid, receipt, cfg, fields in zip(
+            rollout_ids, receipts, instance_configs, verify_fields
+        )
     ]
     return PromptGroupRecord(
         prompt_idx=0,
@@ -1952,6 +2028,7 @@ def _make_capture_manager(
     num_generations=2,
     retry_policy: RolloutRetryPolicy | None = None,
     instance_configs=None,
+    verify_fields=None,
     recovery_config: RolloutRecoveryConfig | None = None,
 ):
     mgr = object.__new__(RolloutManager)
@@ -2002,6 +2079,11 @@ def _make_capture_manager(
                 if instance_configs is not None
                 else None
             )
+            selected_fields = (
+                [verify_fields[index] for index in indices]
+                if verify_fields is not None
+                else None
+            )
             receipts = [
                 {
                     "rollout_id": rollout_id,
@@ -2014,6 +2096,7 @@ def _make_capture_manager(
                 receipts,
                 instance_configs=selected_configs,
                 loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
+                verify_fields=selected_fields,
             )
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
@@ -2025,19 +2108,70 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+    def test_resolved_route_survives_all_sealed_restore(self, granularity):
+        prompt = {
+            "prompt": "p",
+            "idx": 9,
+            "extra_env_info": {"task_source": "source-not-agent-name"},
+        }
+        first = _make_capture_manager(
+            _FakeCaptureBuffer(),
+            recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+        )
+        request = _run(first.generate_for_finalization(prompt))
+        assert request.resolved_agent_name == "resolved-agent"
+        assert "agent_ref" not in prompt["extra_env_info"]
+
+        async def unexpected_rollout(_sample):
+            pytest.fail("all-sealed recovery must not regenerate to resolve routing")
+
+        restored = _make_capture_manager(
+            _FakeCaptureBuffer(), on_run=unexpected_rollout
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.load_state_dict(
+                cut, first.recovery_ledger.state_dict()
+            ),
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
+        )
+        recovered = _run(
+            restored.generate_for_finalization(
+                prompt, lineage_group_id=request.group_id
+            )
+        )
+        assert recovered.resolved_agent_name == "resolved-agent"
+        assert recovered.receipts == request.receipts
+        assert restored._impl.seen_generation_indices is None
+
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(
-            buf, instance_configs=[{"mask_sample": True}, {"other": 1}]
+            buf,
+            # One row flagged through the first-class field alone, one through
+            # the nested mapping beside a false first-class field (what a
+            # nested-only environment emits on a Gym that defaults the
+            # first-class field to False), and one unflagged.
+            num_generations=3,
+            verify_fields=[
+                {"mask_sample": True},
+                {"mask_sample": False, "instance_config": {"mask_sample": True}},
+                {"other": 1},
+            ],
         )
 
         request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
 
         # The gym mask flag is read from env_extras exactly like the token
-        # path's _mask_sample_flags. truncated is not part of this request --
-        # the dispatcher has no real tokens to measure it from; the finalizer
-        # computes it from each row's rebuilt length instead.
-        assert request.mask_sample == (True, False)
+        # path's _mask_sample_flags: either form flags the row. truncated is
+        # not part of this request -- the dispatcher has no real tokens to
+        # measure it from; the finalizer computes it from each row's rebuilt
+        # length instead.
+        assert request.mask_sample == (True, True, False)
 
     def test_mints_ids_and_returns_metadata_request(self):
         buf = _FakeCaptureBuffer()

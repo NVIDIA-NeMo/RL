@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.experience.route_assembly import RouteLayout
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
 )
@@ -58,8 +59,8 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
     generation = config.get("generation") or {}
     megatron_cfg = config.get("megatron_cfg") or {}
 
-    if generation.get("backend") != "vllm":
-        raise ValueError("router_replay.enabled requires vLLM generation.")
+    if generation.get("backend") not in ("vllm", "megatron"):
+        raise ValueError("router_replay.enabled requires vLLM or Megatron generation.")
     if not megatron_cfg.get("enabled", False):
         raise ValueError("router_replay.enabled requires the Megatron policy backend.")
 
@@ -68,7 +69,40 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
         raise ValueError(
             "router_replay.enabled does not support virtual pipeline parallelism yet."
         )
+    if generation.get("backend") == "megatron":
+        _validate_megatron_generation_router_replay_config(config)
     _install_missing_route_fallback_patch()
+
+
+def _validate_megatron_generation_router_replay_config(config: PolicyConfig) -> None:
+    """Reject MInf layouts that cannot record whole-model routes.
+
+    Kept inside the ``backend == "megatron"`` branch: ``merged_inference_megatron_cfg``
+    raises on unrelated ``inference_optimized`` combinations that vLLM configs
+    never see.
+    """
+    # Deferred: nemo_rl.models.generation.megatron.config imports this module's
+    # package siblings; importing lazily keeps the pair cycle-free.
+    from nemo_rl.models.generation.megatron.config import (
+        merged_inference_megatron_cfg,
+    )
+
+    # MInf records routes into RouterReplay.global_router_replay_instances, which
+    # is rank-local, and only ever all-gathers them across TP. With inference
+    # PP > 1 the payload's layer axis covers one pipeline stage, and the
+    # RouteLayout column check rejects it a full rollout later. Inference
+    # PP defaults to training PP, so this is not opt-in.
+    inference_pp = merged_inference_megatron_cfg(config).get(
+        "pipeline_model_parallel_size", 1
+    )
+    if inference_pp != 1:
+        raise ValueError(
+            "router_replay.enabled with Megatron generation requires "
+            "pipeline_model_parallel_size=1 on the generation model (got "
+            f"{inference_pp}); MInf routing indices are recorded per pipeline "
+            "stage and are never gathered across PP. Set policy.generation."
+            "mcore_generation_config.pipeline_model_parallel_size=1."
+        )
 
 
 def _iter_model_modules_with_mtp_ancestry(
@@ -124,8 +158,48 @@ def _unwrap_model_config(model: Any) -> Optional[Any]:
     return None
 
 
+# Megatron-Core hybrid layer pattern symbols (megatron.core.models.hybrid.layers.utils.Symbols).
+_HYBRID_MOE_SYMBOL = "E"
+_HYBRID_PIPE_SYMBOL = "|"
+_HYBRID_MTP_SEPARATOR = "/"
+
+
+def _hybrid_layer_pattern(model_config: Any) -> Optional[str]:
+    """The main-decoder hybrid layer pattern, or None for a plain transformer.
+
+    Megatron-Bridge's ``HybridModelProvider`` carries ``hybrid_layer_pattern``
+    (``hybrid_override_pattern`` is the deprecated alias it normalizes from).
+    The MTP depths after ``/`` and the pipeline separators ``|`` are not layers.
+    """
+    for name in ("hybrid_layer_pattern", "hybrid_override_pattern"):
+        pattern = getattr(model_config, name, None)
+        if pattern:
+            main = str(pattern).split(_HYBRID_MTP_SEPARATOR)[0]
+            return main.replace(_HYBRID_PIPE_SYMBOL, "")
+    return None
+
+
 def _global_moe_layer_numbers(model_config: Any) -> list[int]:
     num_layers = int(getattr(model_config, "num_layers"))
+
+    # Hybrid (Mamba/attention/MoE) stacks place MoE layers by pattern symbol,
+    # not by moe_layer_freq: HybridBlock numbers every layer 1..len(pattern)
+    # and builds an MoE layer only at 'E'. MInf records one route column per
+    # RouterReplay instance, so the expected layer list must follow the same
+    # placement or the [T, L, K] payload is rejected as a layout mismatch.
+    hybrid_pattern = _hybrid_layer_pattern(model_config)
+    if hybrid_pattern is not None:
+        if len(hybrid_pattern) != num_layers:
+            raise ValueError(
+                f"hybrid layer pattern has {len(hybrid_pattern)} layers but "
+                f"num_layers={num_layers}"
+            )
+        return [
+            layer_idx + 1
+            for layer_idx, symbol in enumerate(hybrid_pattern)
+            if symbol == _HYBRID_MOE_SYMBOL
+        ]
+
     moe_layer_freq = getattr(model_config, "moe_layer_freq", 1)
 
     if isinstance(moe_layer_freq, int):
@@ -154,6 +228,32 @@ def router_replay_dimensions(model_config: Any) -> tuple[int, int]:
             f"num_moe_layers={num_moe_layers}, top_k={top_k}"
         )
     return num_moe_layers, top_k
+
+
+def router_replay_layout(model_config: Any) -> RouteLayout:
+    """Return the model-owned route layout: MoE layer numbers, total layers, top-k.
+
+    This is what the deferred route executor needs to accept a vLLM fragment
+    with one column per transformer layer next to a MInf fragment with one
+    column per MoE layer; :func:`router_replay_dimensions` is its
+    ``(num_moe_layers, top_k)`` projection.
+    """
+    num_moe_layers, top_k = router_replay_dimensions(model_config)
+    return RouteLayout(
+        moe_layer_numbers=tuple(_global_moe_layer_numbers(model_config)),
+        total_num_layers=int(getattr(model_config, "num_layers")),
+        top_k=top_k,
+    )
+
+
+def router_replay_dimensions_for_model(model: Any) -> tuple[int, int]:
+    """``router_replay_dimensions`` for a possibly wrapped (DDP/Float16) model."""
+    model_config = _unwrap_model_config(model)
+    if model_config is None:
+        raise ValueError(
+            "router replay could not resolve the model's TransformerConfig"
+        )
+    return router_replay_dimensions(model_config)
 
 
 def _router_replay_instances_for_model(model: Any) -> list[tuple[Any, int]]:
@@ -201,30 +301,6 @@ def _normalize_routed_experts_for_mcore(routed_experts: torch.Tensor) -> torch.T
     raise ValueError(
         "routed_experts must have shape [1, T, L, K], [B, S, L, K], or [T, L, K]; "
         f"got {tuple(routed_experts.shape)}"
-    )
-
-
-def _payload_indices_for_moe_layers(
-    *,
-    global_moe_layers: list[int],
-    num_payload_layers: int,
-    total_num_layers: int,
-) -> dict[int, int]:
-    if num_payload_layers == len(global_moe_layers):
-        return {
-            layer_number: payload_idx
-            for payload_idx, layer_number in enumerate(global_moe_layers)
-        }
-
-    if num_payload_layers == total_num_layers:
-        return {layer_number: layer_number - 1 for layer_number in global_moe_layers}
-
-    raise ValueError(
-        "routed_experts layer axis does not match a supported payload layout: "
-        f"payload={num_payload_layers}, moe_layers={len(global_moe_layers)}, "
-        f"total_layers={total_num_layers}. Expected exactly "
-        f"{len(global_moe_layers)} layers for compressed MoE-layer layout or "
-        f"{total_num_layers} layers for vLLM full-transformer-layer layout."
     )
 
 
@@ -465,14 +541,19 @@ def build_router_replay_assignments(
     local_routed_experts = _split_for_sequence_parallel(
         model_config, local_routed_experts
     )
-    global_moe_layers = _global_moe_layer_numbers(model_config)
-    total_num_layers = int(getattr(model_config, "num_layers"))
-    num_payload_layers = local_routed_experts.shape[1]
-    moe_layer_to_payload_idx = _payload_indices_for_moe_layers(
-        global_moe_layers=global_moe_layers,
-        num_payload_layers=num_payload_layers,
-        total_num_layers=total_num_layers,
-    )
+    layout = router_replay_layout(model_config)
+    global_moe_layers = list(layout.moe_layer_numbers)
+    num_payload_layers = int(local_routed_experts.shape[1])
+    payload_columns = layout.moe_column_indices(num_payload_layers)
+    if payload_columns is None:
+        raise ValueError(
+            "routed_experts layer axis does not match a supported payload layout: "
+            f"payload={num_payload_layers}, moe_layers={layout.num_moe_layers}, "
+            f"total_layers={layout.total_num_layers}. Expected exactly "
+            f"{layout.num_moe_layers} layers for compressed MoE-layer layout or "
+            f"{layout.total_num_layers} layers for vLLM full-transformer-layer layout."
+        )
+    moe_layer_to_payload_idx = dict(zip(global_moe_layers, payload_columns))
     model_instances = _router_replay_instances_for_model(model)
     if len(model_instances) == 0:
         local_moe_layers = _local_layer_numbers_for_model(model).intersection(
@@ -570,3 +651,28 @@ def clear_global_router_replay_instances() -> None:
     from megatron.core.transformer.moe.router_replay import RouterReplay
 
     RouterReplay.clear_global_router_replay_instances()
+
+
+def reset_global_router_replay_instances_for_model(model: Any) -> None:
+    """Point MInf's process-wide router registry at ``model``'s routers.
+
+    MInf records routes only through ``RouterReplay.global_router_replay_instances``:
+    the route buffer takes its layer count from ``len()`` of that list and
+    ``RECORD`` is broadcast to its members. The list is process-wide, so a
+    colocated worker that also built a reference model has either emptied it
+    (``setup_reference_model_state`` clears it in ``finally``) or left both
+    models' routers in it. Call before the inference engine is constructed:
+    the engine captures CUDA graphs and sizes the route buffer from the list.
+
+    MTP routers are skipped by default (``NRL_ROUTER_REPLAY_EXCLUDE_MTP``),
+    matching the layer count the trainer replays.
+    """
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    instances = [replay for replay, _ in _router_replay_instances_for_model(model)]
+    if not instances:
+        raise RuntimeError(
+            "router replay is enabled but the served model has no RouterReplay "
+            "instances; MInf cannot record routing indices for it"
+        )
+    RouterReplay.global_router_replay_instances[:] = instances

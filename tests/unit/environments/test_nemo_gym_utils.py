@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import types
+import warnings
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -38,40 +39,83 @@ from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    set_nemo_gym_log_dir,
     setup_nemo_gym_config,
     spinup_nemo_gym_actor,
 )
 
 
-@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron"])
+@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron", "trtllm"])
 def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
     generation = {
         "backend": backend,
         "vllm_cfg": {"async_engine": False, "expose_http_server": False},
         "mcore_generation_config": {"expose_http_server": False},
+        "trtllm_cfg": {"async_engine": False, "expose_http_server": False},
         "stop_strings": ["stop"],
         "stop_token_ids": [1],
     }
-    config = SimpleNamespace(policy={"generation": generation})
+    config = SimpleNamespace(policy={"generation": generation}, data={})
 
     setup_nemo_gym_config(config, tokenizer=None)
 
+    is_vllm_like = backend in ("vllm", "dynamo")
     assert generation["vllm_cfg"] == {
-        "async_engine": backend != "megatron",
-        "expose_http_server": backend != "megatron",
+        "async_engine": is_vllm_like,
+        "expose_http_server": is_vllm_like,
     }
     assert generation["mcore_generation_config"] == {
         "expose_http_server": backend == "megatron"
+    }
+    assert generation["trtllm_cfg"] == {
+        "async_engine": backend == "trtllm",
+        "expose_http_server": backend == "trtllm",
     }
     assert generation["stop_strings"] is None
     assert generation["stop_token_ids"] is None
 
 
 def test_setup_nemo_gym_config_rejects_unsupported_backend() -> None:
-    config = SimpleNamespace(policy={"generation": {"backend": "unsupported"}})
+    config = SimpleNamespace(policy={"generation": {"backend": "unsupported"}}, data={})
 
     with pytest.raises(ValueError, match="got 'unsupported'"):
         setup_nemo_gym_config(config, tokenizer=None)
+
+
+@pytest.mark.parametrize("capture_enabled", [False, True])
+@pytest.mark.parametrize("tile_cap", [0, 4])
+@pytest.mark.parametrize(
+    "section,as_list",
+    [
+        ("default", False),
+        ("train", False),
+        ("train", True),
+        ("validation", False),
+        ("validation", True),
+    ],
+)
+def test_setup_nemo_gym_config_rejects_image_tile_cap_before_worker_setup(
+    section: str, as_list: bool, tile_cap: int, capture_enabled: bool
+) -> None:
+    dataset = {"image_max_num_tiles": tile_cap}
+    config = SimpleNamespace(
+        data={section: [{}, dataset] if as_list else dataset},
+        token_capture={"enabled": capture_enabled},
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
+    )
+    with pytest.raises(ValueError, match="image_max_num_tiles is not supported"):
+        setup_nemo_gym_config(config, tokenizer=None)
+    assert config.policy["generation"] == {"backend": "vllm", "vllm_cfg": {}}
+
+
+@pytest.mark.parametrize("tile_option", [{}, {"image_max_num_tiles": None}])
+def test_setup_nemo_gym_config_allows_unset_image_tile_cap(tile_option: dict) -> None:
+    config = SimpleNamespace(
+        data={"default": tile_option, "train": [tile_option], "validation": None},
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
+    )
+    setup_nemo_gym_config(config, tokenizer=None)
+    assert config.policy["generation"]["vllm_cfg"]["expose_http_server"] is True
 
 
 @pytest.mark.parametrize(
@@ -161,6 +205,52 @@ def test_get_nemo_gym_uv_cache_dir_uses_uv_inside_container(monkeypatch):
         lambda *args, **kwargs: b"  /root/.cache/uv\n",
     )
     assert get_nemo_gym_uv_cache_dir() == "/root/.cache/uv"
+
+
+def test_set_nemo_gym_log_dir_resolves_the_run_log_dir_on_the_driver(
+    tmp_path, monkeypatch
+):
+    """A relative log dir is made absolute here, not by the Gym actor's cwd."""
+    monkeypatch.chdir(tmp_path)
+    env_config = {"should_use_nemo_gym": True}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        set_nemo_gym_log_dir(env_config, os.path.join("logs", "exp_001"))
+
+    assert env_config["nemo_gym"] == {
+        "nemo_gym_log_dir": str(tmp_path / "logs" / "exp_001" / "nemo_gym")
+    }
+
+
+def test_set_nemo_gym_log_dir_replaces_a_configured_dir_with_a_warning(tmp_path):
+    env_config = {
+        "nemo_gym": {"nemo_gym_log_dir": "logs/nemo_gym", "config_paths": ["a.yaml"]}
+    }
+
+    with pytest.warns(UserWarning) as record:
+        set_nemo_gym_log_dir(env_config, str(tmp_path / "exp_001"))
+
+    assert env_config["nemo_gym"] == {
+        "nemo_gym_log_dir": str(tmp_path / "exp_001" / "nemo_gym"),
+        "config_paths": ["a.yaml"],
+    }
+    assert [str(warning.message) for warning in record] == [
+        "Config value env.nemo_gym.nemo_gym_log_dir='logs/nemo_gym' is overridden; "
+        f"using {str(tmp_path / 'exp_001' / 'nemo_gym')!r} "
+        "(NeMo Gym server logs always go under this run's log directory)."
+    ]
+
+
+def test_set_nemo_gym_log_dir_is_silent_when_already_pointing_there(tmp_path):
+    gym_log_dir = str(tmp_path / "exp_001" / "nemo_gym")
+    env_config = {"nemo_gym": {"nemo_gym_log_dir": gym_log_dir}}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        set_nemo_gym_log_dir(env_config, str(tmp_path / "exp_001"))
+
+    assert env_config["nemo_gym"] == {"nemo_gym_log_dir": gym_log_dir}
 
 
 # The factory only forwards the tokenizer to the actors, so a sentinel is
@@ -884,6 +974,49 @@ def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dir
     )
 
 
+def test_build_nemo_gym_config_keeps_the_policy_api_key_out_of_gyms_config(
+    detected_uv_dirs,
+):
+    """The key is an actor field that Gym's servers receive through their
+    environment at spin-up, never a value in the serialized global config."""
+    cfg = build_nemo_gym_config(
+        _env_configs(),
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        policy_api_key="per-job-key",
+    )
+
+    assert cfg["policy_api_key"] == "per-job-key"
+    assert "policy_api_key" not in cfg["initial_global_config_dict"]
+
+
+@pytest.mark.parametrize(
+    "env_configs", [_env_configs, _shard_env_configs], ids=["unsharded", "sharded"]
+)
+def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
+    detected_uv_dirs, env_configs
+):
+    """Both builders forward the key: a dropped line in either would leave Gym
+    sending the placeholder against workers that enforce the real key."""
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            policy_api_key="per-job-key",
+        )
+
+    assert cluster.actor_configs
+    assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
+
+
 def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
     detected_uv_dirs,
 ):
@@ -1309,17 +1442,61 @@ def test_task_source_is_validated_before_gym_resolves_agent_ref():
     nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
 
 
-def test_an_unsharded_job_is_not_scanned_at_all():
-    """One actor hosts everything, so parsing every row would buy nothing."""
-    dataset = MagicMock()
+def test_an_unsharded_job_is_checked_against_the_actors_entries():
+    """The lone actor is asked which entries it spawned, and rows must name one.
 
-    with patch.object(nemo_gym_mod, "_load_agent_names_from_source") as load_names:
+    A stale name, such as a renamed agent or a typo, would otherwise fail only
+    at its first dispatched batch, after every server has started.
+    """
+    handle = MagicMock()
+    shard_set = nemo_gym_mod.as_nemo_gym_shard_set(handle)
+
+    with patch.object(nemo_gym_mod.ray, "get") as ray_get:
+        ray_get.return_value = {
+            "math_agent": ["responses_api_agents"],
+            "math_tools": ["resources_servers"],
+        }
         nemo_gym_mod.validate_dataset_agent_coverage(
-            nemo_gym_mod.as_nemo_gym_shard_set(MagicMock()), {"train": dataset}
+            shard_set, {"train": _gym_dataset("math_agent"), "validation": None}
         )
+        with pytest.raises(nemo_gym_mod.ShardSetupError) as excinfo:
+            nemo_gym_mod.validate_dataset_agent_coverage(
+                shard_set, {"train": _gym_dataset("search_agent")}
+            )
 
-    load_names.assert_not_called()
-    dataset.__iter__.assert_not_called()
+    ray_get.assert_called_with(handle.list_entries.remote.return_value)
+    assert "['search_agent']" in str(excinfo.value)
+    assert "math_agent" in str(excinfo.value)
+
+
+def test_an_unsharded_job_counts_only_routable_entries_as_hosted():
+    """A model-only entry is not a route on one actor any more than on many.
+
+    ``build_route_shard_map`` maps agents and resources servers only, so on a
+    sharded job a row naming a ``responses_api_models`` entry is rejected at
+    setup. The unsharded check must agree, and must not list the model among
+    the hosted routes in its error message.
+    """
+    handle = MagicMock()
+    shard_set = nemo_gym_mod.as_nemo_gym_shard_set(handle)
+    tool_row = {"extra_env_info": json.dumps({"task_source": "math_tools"})}
+
+    with patch.object(nemo_gym_mod.ray, "get") as ray_get:
+        ray_get.return_value = {
+            "math_agent": ["responses_api_agents"],
+            "math_tools": ["resources_servers"],
+            "policy_model": ["responses_api_models"],
+        }
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set, {"train": [*_gym_dataset("math_agent"), tool_row]}
+        )
+        with pytest.raises(nemo_gym_mod.ShardSetupError) as excinfo:
+            nemo_gym_mod.validate_dataset_agent_coverage(
+                shard_set, {"train": _gym_dataset("policy_model")}
+            )
+
+    assert "['policy_model']" in str(excinfo.value)
+    assert "Hosted routes: ['math_agent', 'math_tools']." in str(excinfo.value)
 
 
 def test_the_wrapped_dataset_is_unwrapped_before_scanning():

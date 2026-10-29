@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 from unittest.mock import AsyncMock
 
@@ -58,6 +59,59 @@ def test_external_staging_backend_rejects_missing_or_invalid_backend(
 ) -> None:
     with pytest.raises(ValueError, match="setup-derived generation_backend"):
         _external_staging_backend(token_capture)
+
+
+@pytest.mark.parametrize(
+    "content_part",
+    [
+        {"type": "image_url", "image_url": {"url": "data:,"}},
+        {"type": "video_url", "video_url": {"url": "data:,"}},
+    ],
+    ids=["image", "video"],
+)
+def test_megatron_capture_handler_admits_media_requests(content_part: dict) -> None:
+    """The pinned Gym must admit media on the Megatron capture path.
+
+    Older Gym revisions reject image and video parts there, which would only
+    surface on the first media request of a run.
+    """
+    from nemo_gym.token_id_capture.external_capture import (
+        make_external_capture_handler,
+    )
+    from nemo_gym.token_id_capture.lineage import InMemoryLineageStore
+    from nemo_gym.token_id_capture.sink import (
+        CaptureContext,
+        reset_token_sink,
+        set_token_sink,
+    )
+    from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+    admission = CaptureAdmission(rollout_id="r0", model_call_id="c1", mode="text")
+    context = CaptureContext(
+        rollout_id="r0",
+        model_call_id="c1",
+        token_sink=None,
+        lineage_store=InMemoryLineageStore(),
+        external_staging=True,
+        capture_admission=admission,
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "describe"}, content_part],
+        }
+    ]
+    handler = make_external_capture_handler(
+        _external_staging_backend({"generation_backend": "megatron"})
+    )
+    token = set_token_sink(context)
+    try:
+        payload = handler.prepare_request({"messages": copy.deepcopy(messages)})
+    finally:
+        reset_token_sink(token)
+
+    assert payload["messages"] == messages
+    assert payload["offload_params"]["ng_capture"] == admission.model_dump(mode="json")
 
 
 def _manifest_record(
@@ -502,6 +556,7 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
 
     config = MasterConfig.model_construct(
         env={"should_use_nemo_gym": True},
+        data={},
         policy={
             "generation": {
                 "backend": "megatron",
@@ -528,6 +583,7 @@ def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None
 
     config = MasterConfig.model_construct(
         env={"should_use_nemo_gym": True},
+        data={},
         policy={
             "generation": {
                 "backend": "dynamo",
