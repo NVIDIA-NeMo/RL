@@ -40,6 +40,7 @@ GPU headroom. The reshard only moves params, so releasing gradient buffers, opti
 state, and caches first is safe.
 """
 
+import time
 from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any, Optional
@@ -47,7 +48,7 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import Timer, refit_timing_log_enabled
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.membership import (
     RefitMembership,
@@ -55,6 +56,7 @@ from nemo_rl.weight_sync.membership import (
     should_rebuild,
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import (
+    check_trtllm_nccl_reshard_bulk_params,
     make_nccl_reshard_refit_info_wire_safe,
 )
 
@@ -165,7 +167,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 "generation backend exposes several layouts; use _gen_layouts()"
             )
         return {
-            key: layouts[0][key] for key in ("tp_size", "ep_size", "etp_size", "pp_size")
+            key: layouts[0][key]
+            for key in ("tp_size", "ep_size", "etp_size", "pp_size")
         }
 
     def _gen_layouts(self) -> list[dict[str, Any]]:
@@ -241,8 +244,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
-        import time
-
         refit_t0 = time.perf_counter()
         if self._offload_policy_before_refit:
             self._policy.offload_before_refit()
@@ -281,14 +282,15 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 )
                 raise
             results = ray.get(futures_inference)
-            print(
-                f"[refit-timing] controller "
-                f"offload_before_refit={offload_s:.2f}s "
-                f"transfer_and_update="
-                f"{time.perf_counter() - refit_t0 - offload_s:.2f}s "
-                f"total={time.perf_counter() - refit_t0:.2f}s",
-                flush=True,
-            )
+            if refit_timing_log_enabled():
+                print(
+                    f"[refit-timing] controller "
+                    f"offload_before_refit={offload_s:.2f}s "
+                    f"transfer_and_update="
+                    f"{time.perf_counter() - refit_t0 - offload_s:.2f}s "
+                    f"total={time.perf_counter() - refit_t0:.2f}s",
+                    flush=True,
+                )
             update_success = all(result for result in results if result is not None)
 
             if not update_success:
@@ -377,7 +379,9 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         layouts = self._gen_layouts()
         multi_layout = len(layouts) > 1 or "role" in layouts[0]
         layout_worlds = [
-            inference_world_size if layout["world_size"] is None else layout["world_size"]
+            inference_world_size
+            if layout["world_size"] is None
+            else layout["world_size"]
             for layout in layouts
         ]
         if sum(layout_worlds) != inference_world_size:
@@ -385,15 +389,19 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 f"generation layouts cover {sum(layout_worlds)} ranks but the inference "
                 f"world has {inference_world_size}"
             )
-        for layout_index, (layout, layout_world) in enumerate(zip(layouts, layout_worlds)):
+        for layout_index, (layout, layout_world) in enumerate(
+            zip(layouts, layout_worlds)
+        ):
             sub_world_size = train_ranks_per_stage + layout_world
             # An IP and free port for each stage's group (one when non-PP).
             pp_ips: list[str] = []
             pp_ports: list[int] = []
             for stage in range(pp_size):
                 node_idx = stage * train_ranks_per_stage // train_gpus_per_node
-                stage_ip, stage_port = self._train_cluster.get_available_address_and_port(
-                    pg_idx=node_idx, bundle_idx=0
+                stage_ip, stage_port = (
+                    self._train_cluster.get_available_address_and_port(
+                        pg_idx=node_idx, bundle_idx=0
+                    )
                 )
                 pp_ips.append(stage_ip)
                 pp_ports.append(stage_port)
@@ -439,9 +447,12 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         #    shard used to own and leaving their own unwritten -- with no error,
         #    because a stale mesh is still a valid mesh.
         wire_refit_infos = []
-        for layout_index, (layout, layout_world) in enumerate(zip(layouts, layout_worlds)):
+        for layout_index, (layout, layout_world) in enumerate(
+            zip(layouts, layout_worlds)
+        ):
             gen_parallelism = {
-                key: layout[key] for key in ("tp_size", "ep_size", "etp_size", "pp_size")
+                key: layout[key]
+                for key in ("tp_size", "ep_size", "etp_size", "pp_size")
             }
             refit_kwargs = {"layout_index": layout_index} if multi_layout else {}
             nccl_reshard_refit_info = self._policy.prepare_nccl_reshard_refit_info(
@@ -451,6 +462,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 layout_world,
                 **refit_kwargs,
             )
+            if self._policy.cfg["generation"]["backend"] == "trtllm":
+                check_trtllm_nccl_reshard_bulk_params(nccl_reshard_refit_info)
             # nccl_reshard_refit_info holds MeshInfo rank tensors created under
             # Megatron, whose pickles resolve a Megatron-patched storage loader and
             # therefore need `import megatron` on unpickle. Convert them to plain

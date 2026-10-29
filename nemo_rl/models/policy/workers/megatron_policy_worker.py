@@ -165,7 +165,7 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.path_utils import maybe_enable_msc
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.tensor_ops import pad_and_concat
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import Timer, refit_timing_log_enabled
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     _INDIVIDUAL_EXPERT_RE,
     _STR_TO_DTYPE,
@@ -697,6 +697,9 @@ class MegatronPolicyWorkerImpl(
     # Tests and extension classes that bypass __init__ retain the historical
     # training/source behavior unless they explicitly select destination.
     is_refit_destination: bool = False
+    # nccl_reshard source plans keyed by generation layout (one for vLLM and
+    # Megatron generation, one per engine role for disaggregated TRT-LLM).
+    nccl_reshard_refit_infos: Optional[dict[int, dict[str, Any]]] = None
     # Holds the split-API train-step state between begin/finish or
     # begin/abort; None when no step is open. Declared at class level so
     # ``self._train_step_state = None`` after finish/abort type-checks.
@@ -4262,7 +4265,7 @@ class MegatronPolicyWorkerImpl(
             train_world_size,
             gen_world_size,
         )
-        plans = dict(getattr(self, "nccl_reshard_refit_infos", None) or {})
+        plans = dict(self.nccl_reshard_refit_infos or {})
         plans[layout_index] = refit_info
         self.nccl_reshard_refit_infos = plans
         return refit_info
@@ -4439,7 +4442,7 @@ class MegatronPolicyWorkerImpl(
             )
             groups = [*generation_groups.values(), self.model_update_group]
         else:
-            layout_groups = getattr(self, "pp_comm_groups_by_layout", None) or {}
+            layout_groups = self.pp_comm_groups_by_layout or {}
             groups = [
                 *(layout_groups.values() or [self.pp_comm_group]),
                 self.model_update_group,
@@ -4499,13 +4502,13 @@ class MegatronPolicyWorkerImpl(
             )
         bulk_s = time.perf_counter() - bulk_t0
         per_layout = {
-            idx: bulk_start.elapsed_time(layout_done[idx]) / 1e3 for idx in layout_indices
+            idx: bulk_start.elapsed_time(layout_done[idx]) / 1e3
+            for idx in layout_indices
         }
-        # Same trade-off as offload_before_refit: releasing the cached segments
-        # here costs seconds on the critical path and the misc broadcast's packed
-        # buffers come out of the caching allocator anyway. This is the reshard
-        # path, so the default is to keep them; the env override still applies.
-        if os.environ.get("NRL_OFFLOAD_BEFORE_REFIT_EMPTY_CACHE", "0") != "0":
+        # TRT-LLM keeps the cached segments: returning them to the driver here
+        # costs seconds inside the refit bubble, and the misc broadcast's packed
+        # buffers come out of the caching allocator anyway.
+        if not self._refit_is_trtllm_nccl_reshard():
             torch.cuda.empty_cache()
         misc_t0 = time.perf_counter()
         self._broadcast_misc_params_packed(kv_scales=kv_scales)
@@ -4513,11 +4516,15 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.current_stream(), refit_timeout_s, "the misc broadcast"
         )
         if torch.distributed.get_rank() == 0:
-            layouts = " ".join(f"layout{idx}={sec:.2f}s" for idx, sec in per_layout.items())
-            print(
-                f"[nccl_reshard_refit] bulk send (train side): {bulk_s:.2f}s ({layouts})",
-                flush=True,
-            )
+            if refit_timing_log_enabled():
+                layouts = " ".join(
+                    f"layout{idx}={sec:.2f}s" for idx, sec in per_layout.items()
+                )
+                print(
+                    f"[nccl_reshard_refit] bulk send (train side): {bulk_s:.2f}s "
+                    f"({layouts})",
+                    flush=True,
+                )
             print(
                 f"[nccl_reshard_refit] misc broadcast (train side): "
                 f"{time.perf_counter() - misc_t0:.2f}s",
@@ -4526,7 +4533,7 @@ class MegatronPolicyWorkerImpl(
 
     def _nccl_reshard_layout_indices(self) -> list[int]:
         """Generation layouts this worker sends bulk params to, in order."""
-        plans = getattr(self, "nccl_reshard_refit_infos", None) or {}
+        plans = self.nccl_reshard_refit_infos or {}
         if not plans:
             return [0]
         return sorted(plans)
@@ -4537,7 +4544,7 @@ class MegatronPolicyWorkerImpl(
         streams: dict[int, torch.cuda.Stream],
         materialize_stream: torch.cuda.Stream,
     ) -> None:
-        """xferdtensor every bulk param of every generation layout, layer by layer.
+        """Send every bulk param of every generation layout via xferdtensor, by layer.
 
         Each layer's local sources are materialized once (on ``materialize_stream``)
         and enqueued to every layout on that layout's stream, so the layouts'
@@ -4545,8 +4552,8 @@ class MegatronPolicyWorkerImpl(
         """
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
-        plans = getattr(self, "nccl_reshard_refit_infos", None) or {}
-        groups = getattr(self, "pp_comm_groups_by_layout", None) or {}
+        plans = self.nccl_reshard_refit_infos or {}
+        groups = self.pp_comm_groups_by_layout or {}
         layouts = []
         for layout_index in layout_indices:
             refit_info = plans.get(layout_index, self.nccl_reshard_refit_info)
@@ -4595,7 +4602,8 @@ class MegatronPolicyWorkerImpl(
                             # which was just enqueued on the materialize stream.
                             stream.wait_stream(materialize_stream)
                         src_tensor = DTensorRef(
-                            local_tensor=ctx.buf, global_shape=param_info["global_shape"]
+                            local_tensor=ctx.buf,
+                            global_shape=param_info["global_shape"],
                         )
                         xferdtensor(
                             src_tensor,
@@ -4659,7 +4667,7 @@ class MegatronPolicyWorkerImpl(
             src=0,
             post_iter_func=lambda x: x[1].contiguous(),
         )
-        if torch.distributed.get_rank() == 0:
+        if refit_timing_log_enabled() and torch.distributed.get_rank() == 0:
             print(
                 f"[nccl_reshard_refit] misc produce (train side): {produce_s[0]:.2f}s "
                 f"over {n_params[0]} params (PP broadcast + TP gather, host wall)",
@@ -4917,49 +4925,23 @@ class MegatronPolicyWorkerImpl(
         # Ensure exporters cannot observe a partially gathered buffer.
         torch.cuda.synchronize()
 
-    def _refit_uses_nccl_reshard(self) -> bool:
-        """Whether this policy refits its generation engines shard-to-shard."""
+    def _refit_is_trtllm_nccl_reshard(self) -> bool:
+        """Whether this policy refits TRT-LLM engines shard-to-shard."""
         generation_cfg = self.cfg.get("generation") or {}
-        return generation_cfg.get("refit_transport") == "nccl_reshard"
-
-    def _offload_before_refit_release(self, env_name: str) -> bool:
-        """Run gc.collect() / torch.cuda.empty_cache() in the refit offload?
-
-        The collective transport packs the whole model through 5 GB buckets
-        and wants every freed byte back first. nccl_reshard sends the routed
-        experts shard-to-shard and only 19 GiB of misc through the buckets, so
-        the seconds spent on gc and on returning ~150 GB of freed segments to
-        the driver were pure refit bubble; the caching allocator reuses them on
-        the next step anyway. Default: run them unless the transport is
-        nccl_reshard; NRL_OFFLOAD_BEFORE_REFIT_GC / _EMPTY_CACHE = 0|1 override.
-        """
-        value = os.environ.get(env_name)
-        if value is not None:
-            return value != "0"
-        return not self._refit_uses_nccl_reshard()
+        return (
+            generation_cfg.get("backend") == "trtllm"
+            and generation_cfg.get("refit_transport") == "nccl_reshard"
+        )
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
         """Offload optimizer state and buffers that are safe to release."""
-        # Host-side phase timings; rank 0 prints them as ``[offload-timing]`` so the
-        # trainer-side share of the refit bubble can be read off the driver log.
-        offload_phases: dict[str, float] = {}
-        offload_t0 = time.perf_counter()
-        offload_last = offload_t0
-
-        def _mark(phase: str) -> None:
-            nonlocal offload_last
-            now = time.perf_counter()
-            offload_phases[phase] = now - offload_last
-            offload_last = now
-
         self._release_opd_full_teacher_lm_head()
         # An in-flight async checkpoint keeps references to the CUDA tensors in
         # its sharded state dict until the write is finalized. Offloading swaps
         # those tensors for CPU storage, so the checkpoint references would keep
         # the old CUDA storage alive and defeat the offload.
         self.finalize_async_save()
-        _mark("finalize_async_save")
 
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -4983,16 +4965,13 @@ class MegatronPolicyWorkerImpl(
         # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
         # buffers in offload_before_refit (before weight transfer to the inference
         # engine).
-        _mark("release_grads")
         if self.fp8_cfg and self.fp8_cfg.get("force_clear_fp8_caches", False):
             self._clear_fp8_caches()
-            _mark("clear_fp8_caches")
 
         if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
             self._clear_rope_and_moe_dispatcher_caches()
 
         torch.randn(1).cuda()  # wake up torch allocator
-        _mark("clear_memory_caches")
         if (
             hasattr(self, "optimizer")
             and self.optimizer is not None
@@ -5000,18 +4979,9 @@ class MegatronPolicyWorkerImpl(
             and self.offload_optimizer_for_refit
         ):
             self.move_optimizer("cpu")
-            _mark("move_optimizer")
 
-        # gc.collect() over a trainer-sized Python heap costs 0.4-1.8 s per rank and
-        # sits inside the refit bubble; see _offload_before_refit_release.
-        if self._offload_before_refit_release("NRL_OFFLOAD_BEFORE_REFIT_GC"):
-            gc.collect()
-        _mark("gc_collect")
-        # Returning the freed grad/activation segments to the driver costs 0.3-3 s
-        # per rank right after a training step; see _offload_before_refit_release.
-        if self._offload_before_refit_release("NRL_OFFLOAD_BEFORE_REFIT_EMPTY_CACHE"):
-            torch.cuda.empty_cache()
-        _mark("empty_cache")
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Print memory stats after offloading
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
@@ -5019,13 +4989,6 @@ class MegatronPolicyWorkerImpl(
         print(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            phases = " ".join(f"{name}={sec:.2f}s" for name, sec in offload_phases.items())
-            print(
-                "[offload-timing] offload_before_refit "
-                f"total={time.perf_counter() - offload_t0:.2f}s {phases}",
-                flush=True,
-            )
         no_grad.__exit__(None, None, None)
 
     def _clear_rope_and_moe_dispatcher_caches(self) -> None:

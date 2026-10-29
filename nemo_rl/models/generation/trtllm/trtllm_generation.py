@@ -940,7 +940,9 @@ class TrtllmGeneration(GenerationInterface):
         layout's bulk communicator after that stage's train ranks.
         """
         layouts: dict[str, dict[str, Any]] = {}
-        for engine_idx, (role, tp) in enumerate(zip(self._engine_roles, self._engine_tps)):
+        for engine_idx, (role, tp) in enumerate(
+            zip(self._engine_roles, self._engine_tps)
+        ):
             if self._disagg_cfg.enabled:
                 kwargs = role_engine_config(self.cfg, role)
             else:
@@ -1009,10 +1011,15 @@ class TrtllmGeneration(GenerationInterface):
             )
         self._refit_membership = membership
 
-    def rebuild_collective(self, membership: Any, ip: str, port: int) -> list[ray.ObjectRef]:
+    def rebuild_collective(
+        self, membership: Any, ip: str, port: int
+    ) -> list[ray.ObjectRef]:
         """Rebuild model_update_group over the full fleet (see set_refit_membership)."""
         return self.init_collective(
-            ip, port, membership.world_size, train_world_size=membership.train_world_size
+            ip,
+            port,
+            membership.world_size,
+            train_world_size=membership.train_world_size,
         )
 
     def init_nccl_reshard_comm_group(

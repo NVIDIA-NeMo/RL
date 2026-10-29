@@ -25,7 +25,9 @@ Injected into TRT-LLM's RayGPUWorker via ``ray_worker_extension_cls``.
 
 import gc
 import os
-from typing import Any
+import time
+from collections import OrderedDict
+from typing import Any, Optional
 
 import torch
 import zmq
@@ -39,6 +41,7 @@ from nemo_rl.models.policy.utils import (
     rebuild_cuda_tensor_from_ipc,
 )
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.utils.timer import refit_timing_log_enabled
 
 # Disable TRT-LLM weight loader's ThreadPoolExecutor: serial loading keeps
 # all copies on the caller's stream (same as NCCL writes), so the existing
@@ -72,7 +75,26 @@ class NcclExtension(WorkerExtension):
     Attributes set by TRT-LLM's mixin injection (from ``RayGPUWorker``):
         self.engine    – ``PyExecutor`` instance
         self.device_id – int GPU ordinal
+
+    The extension has no constructor of its own, so the refit state below is
+    declared here and populated by the refit setup calls.
     """
+
+    # Routed-expert prefix -> expert ids this rank stores (see
+    # fp8_quantization.build_local_expert_lookup); None converts every expert.
+    _local_expert_lookup: Optional[fp8_quantization.LocalExpertLookup] = None
+    # Per-refit timing counters, reset at the start of each refit.
+    _refit_stats_dict: Optional[dict[str, float]] = None
+    # nccl_reshard: per-PP-stage bulk communicators, the transfer plan, the misc
+    # broadcast's (shape, dtype) map, and the bulk param -> local slot specs.
+    pp_comm_groups: Optional[dict[int, Any]] = None
+    nccl_reshard_refit_info: Optional[dict[str, Any]] = None
+    misc_state_dict_info: Optional[dict[str, Any]] = None
+    hf_to_local_param_map: Optional[Any] = None
+    # nccl_reshard: converted expert stacks waiting for one batched reload, and
+    # the expert prefix -> MoE weight-owner module map (built once).
+    _pending_bulk_reload: Optional[dict[str, Any]] = None
+    _moe_weight_owner_map: Optional[dict[str, Any]] = None
 
     # ------------------------------------------------------------------ #
     #  Collective initialisation (called once during setup)
@@ -131,7 +153,9 @@ class NcclExtension(WorkerExtension):
             _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
             # Every rank receives the full expert stacks but loads only its
             # own slots; convert just those (EP16: 32 of 512 experts).
-            self._local_expert_lookup = fp8_quantization.build_local_expert_lookup(model)
+            self._local_expert_lookup = fp8_quantization.build_local_expert_lookup(
+                model
+            )
 
     # ------------------------------------------------------------------ #
     #  NCCL weight receive + reload
@@ -161,8 +185,6 @@ class NcclExtension(WorkerExtension):
         assert hasattr(self, "state_dict_info") and self.state_dict_info is not None, (
             "state_dict_info not set — call prepare_refit_info first"
         )
-        import time
-
         self._reset_refit_stats()
         phases: dict = {}
         t_start = time.perf_counter()
@@ -267,7 +289,7 @@ class NcclExtension(WorkerExtension):
                         is_mx=fp8_quantization.is_mxfp8_model(
                             model.model_config.quant_config
                         ),
-                        local_experts=getattr(self, "_local_expert_lookup", None),
+                        local_experts=self._local_expert_lookup,
                     )
                     # The mapper may retain split QKVZ/BA views across IPC chunks;
                     # detach them before ACK lets the trainer reuse the buffer.
@@ -321,8 +343,6 @@ class NcclExtension(WorkerExtension):
         self, recompute_kv: bool, phases: dict, t_start: float, path: str
     ) -> None:
         """Finalize a refit inside control_action and log its timing."""
-        import time
-
         t = time.perf_counter()
         self.finalize_weight_update()
         phases["finalize"] = time.perf_counter() - t
@@ -340,8 +360,6 @@ class NcclExtension(WorkerExtension):
 
     def _reload_bucket(self, weight_list) -> None:
         """Convert routed experts if the engine is FP8/MXFP8, then reload."""
-        import time
-
         model_engine = self.engine.model_engine
         model = model_engine.model
         quant_config = model.model_config.quant_config
@@ -351,7 +369,7 @@ class NcclExtension(WorkerExtension):
             weights = fp8_quantization.load_weights(
                 weight_list,
                 is_mx=fp8_quantization.is_mxfp8_model(quant_config),
-                local_experts=getattr(self, "_local_expert_lookup", None),
+                local_experts=self._local_expert_lookup,
             )
         else:
             weights = dict(weight_list)
@@ -370,7 +388,7 @@ class NcclExtension(WorkerExtension):
 
     @property
     def _refit_stats(self) -> dict:
-        stats = getattr(self, "_refit_stats_dict", None)
+        stats = self._refit_stats_dict
         if stats is None:
             stats = self._reset_refit_stats()
         return stats
@@ -389,6 +407,8 @@ class NcclExtension(WorkerExtension):
 
     def _log_refit_timing(self, path: str, phases: dict) -> None:
         """One rank-0 line per refit: where this engine's wall time went."""
+        if not refit_timing_log_enabled():
+            return
         if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
             return
         stats = self._refit_stats
@@ -435,7 +455,7 @@ class NcclExtension(WorkerExtension):
         gen_rank_in_group = (
             train_ranks_per_stage + rank_prefix + torch.distributed.get_rank()
         )
-        stale_groups = list((getattr(self, "pp_comm_groups", None) or {}).values())
+        stale_groups = list((self.pp_comm_groups or {}).values())
         self.pp_comm_groups = {}
         torch.cuda.empty_cache()
         for stage in range(pp_size):
@@ -457,7 +477,7 @@ class NcclExtension(WorkerExtension):
             release_within(
                 previous.abort, RELEASE_GRACE_S, "a previous reshard bulk communicator"
             )
-        refit_info = getattr(self, "nccl_reshard_refit_info", None)
+        refit_info = self.nccl_reshard_refit_info
         if refit_info is not None:
             self.hf_to_local_param_map = self._build_expert_local_param_map(refit_info)
 
@@ -488,12 +508,16 @@ class NcclExtension(WorkerExtension):
                 shape, dtype = meta["shape"], meta["dtype"]
             else:
                 shape, dtype = meta[0], meta[1]
-            dtype = _STR_TO_DTYPE[str(dtype)] if not isinstance(dtype, torch.dtype) else dtype
+            dtype = (
+                _STR_TO_DTYPE[str(dtype)]
+                if not isinstance(dtype, torch.dtype)
+                else dtype
+            )
             misc_state_dict_info[name] = (torch.Size(shape), dtype)
         self.misc_state_dict_info = misc_state_dict_info
         # The misc consumer reuses the collective path's per-bucket reload.
         self.state_dict_info = misc_state_dict_info
-        if getattr(self, "pp_comm_groups", None):
+        if self.pp_comm_groups:
             self.hf_to_local_param_map = self._build_expert_local_param_map(
                 self.nccl_reshard_refit_info
             )
@@ -540,12 +564,12 @@ class NcclExtension(WorkerExtension):
             RefitCtx,
         )
 
-        pp_comm_groups = getattr(self, "pp_comm_groups", None)
+        pp_comm_groups = self.pp_comm_groups
         if not pp_comm_groups:
             raise RuntimeError(
                 "nccl_reshard refit mapping needs the per-PP-stage communicators"
             )
-        lookup = getattr(self, "_local_expert_lookup", None)
+        lookup = self._local_expert_lookup
         assert lookup is not None, "prepare_nccl_reshard_refit_info must run first"
         device = torch.device("cuda", self.device_id)
         specs = {}
@@ -601,7 +625,9 @@ class NcclExtension(WorkerExtension):
                     else _STR_TO_DTYPE.get(str(dtype_value))
                 )
                 if dtype is None:
-                    raise ValueError(f"{name!r}: unsupported wire dtype {dtype_value!r}")
+                    raise ValueError(
+                        f"{name!r}: unsupported wire dtype {dtype_value!r}"
+                    )
 
                 def pre(_base, shape=local_shape, dtype=dtype):
                     return RefitCtx(buf=torch.empty(shape, dtype=dtype, device=device))
@@ -609,7 +635,9 @@ class NcclExtension(WorkerExtension):
                 def post(
                     ctx, prefix=prefix, projection=projection, expert_ids=expert_ids
                 ):
-                    self._queue_received_experts(prefix, projection, expert_ids, ctx.buf)
+                    self._queue_received_experts(
+                        prefix, projection, expert_ids, ctx.buf
+                    )
 
                 specs[name] = LocalParamSpec(base=None, pre=pre, post=post)
         return HFToLocalParamMap(specs=specs)
@@ -654,19 +682,15 @@ class NcclExtension(WorkerExtension):
         self, prefix: str, projection: str, expert_ids: list[int], stack: torch.Tensor
     ) -> None:
         """Convert one received stack and reload it, batched under the byte budget."""
-        import time
-
         stats = self._refit_stats
         t0 = time.perf_counter()
         weights = self._convert_received_experts(prefix, projection, expert_ids, stack)
         stats["bulk_convert_s"] += time.perf_counter() - t0
-        pending = getattr(self, "_pending_bulk_reload", None)
+        pending = self._pending_bulk_reload
         if pending is None:
             pending = self._pending_bulk_reload = {"weights": {}, "bytes": 0}
         pending["weights"].update(weights)
-        pending["bytes"] += sum(
-            t.numel() * t.element_size() for t in weights.values()
-        )
+        pending["bytes"] += sum(t.numel() * t.element_size() for t in weights.values())
         if pending["bytes"] >= self._bulk_reload_batch_bytes():
             self._flush_received_experts()
 
@@ -685,7 +709,7 @@ class NcclExtension(WorkerExtension):
 
     def _moe_weight_owners(self) -> dict:
         """``expert prefix -> module`` for every MoE weight owner, built once."""
-        owners = getattr(self, "_moe_weight_owner_map", None)
+        owners = self._moe_weight_owner_map
         if owners is not None:
             return owners
         try:
@@ -741,7 +765,9 @@ class NcclExtension(WorkerExtension):
                     module, module_name, module_weights, allow_partial_loading=True
                 )
             else:
-                module.load_weights(weights=[module_weights], allow_partial_loading=True)
+                module.load_weights(
+                    weights=[module_weights], allow_partial_loading=True
+                )
             for key in list(leftover):
                 if key.startswith(prefix + "."):
                     del leftover[key]
@@ -749,9 +775,7 @@ class NcclExtension(WorkerExtension):
 
     def _flush_received_experts(self) -> None:
         """Reload every queued converted stack in one loader call."""
-        import time
-
-        pending = getattr(self, "_pending_bulk_reload", None)
+        pending = self._pending_bulk_reload
         if not pending or not pending["weights"]:
             return
         weights = pending["weights"]
@@ -770,17 +794,8 @@ class NcclExtension(WorkerExtension):
         stats["bulk_reload_s"] += time.perf_counter() - t0
         stats["bulk_reload_calls"] += 1
 
-    def _load_received_experts(
-        self, prefix: str, projection: str, expert_ids: list[int], stack: torch.Tensor
-    ) -> None:
-        """Convert and reload one received stack immediately (unbatched)."""
-        self._queue_received_experts(prefix, projection, expert_ids, stack)
-        self._flush_received_experts()
-
     def _recv_bulk_params(self) -> None:
         """Receive every bulk param of every PP stage into its local slots."""
-        from collections import OrderedDict
-
         from nemo_rl.weight_sync.nccl_reshard_utils import RefitCtx
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
@@ -810,7 +825,11 @@ class NcclExtension(WorkerExtension):
                         f"nccl_reshard_refit: {param_info['name']!r} has no local spec "
                         "(its weights would be discarded)"
                     )
-                    ctx = spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
+                    ctx = (
+                        spec.pre(spec.base)
+                        if spec.pre is not None
+                        else RefitCtx(buf=spec.base)
+                    )
                     xferdtensor(
                         None,
                         param_info["src_mesh_info"],
@@ -834,7 +853,7 @@ class NcclExtension(WorkerExtension):
 
     def _receive_and_load_misc_params(self) -> None:
         """Misc params: the collective path's packed broadcast + per-bucket reload."""
-        misc_state_dict_info = getattr(self, "misc_state_dict_info", None) or {}
+        misc_state_dict_info = self.misc_state_dict_info or {}
         if not misc_state_dict_info:
             return
         packed_broadcast_consumer(
@@ -856,15 +875,15 @@ class NcclExtension(WorkerExtension):
         is delegated to ``WorkerExtension`` via ``begin_weight_update`` /
         ``finalize_weight_update`` / ``finish_weight_update``.
         """
-        refit_info = getattr(self, "nccl_reshard_refit_info", None)
+        refit_info = self.nccl_reshard_refit_info
         if refit_info is None:
-            raise RuntimeError("prepare_nccl_reshard_refit_info must run before the refit")
-        if not getattr(self, "pp_comm_groups", None):
+            raise RuntimeError(
+                "prepare_nccl_reshard_refit_info must run before the refit"
+            )
+        if not self.pp_comm_groups:
             raise RuntimeError("init_nccl_reshard_comm_group must run before the refit")
-        if getattr(self, "hf_to_local_param_map", None) is None:
+        if self.hf_to_local_param_map is None:
             self.hf_to_local_param_map = self._build_expert_local_param_map(refit_info)
-        import time
-
         self._reset_refit_stats()
         phases: dict = {}
         t_start = time.perf_counter()
