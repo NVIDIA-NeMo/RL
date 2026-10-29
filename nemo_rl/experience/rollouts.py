@@ -2059,6 +2059,11 @@ def resolve_reward_penalty_config(
         "penalize_unwanted_tokens",
         "penalize_malformed_think_tag",
         "rollout_scoped_penalties_on_all_segments",
+        # Read from the resolved dict by nemo_rl/experience/degenerate_reasoning.py when each rollout is scored.
+        "penalize_degenerate_reasoning",
+        "degenerate_reasoning_threshold",
+        "degenerate_reasoning_agents",
+        "degenerate_reasoning_unmask_rules",
     ):
         value = _get_reward_penalty_config_value(reward_penalty_config, flag)
         if value is not None:

@@ -23,9 +23,10 @@ from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.experience import degenerate_reasoning as dr
 from nemo_rl.experience.mask_sample_rules import apply_mask_sample_rules, parse_mask_sample_rules
-from nemo_rl.experience.rollouts import compute_reward_penalty_metrics
+from nemo_rl.experience.rollouts import compute_reward_penalty_metrics, resolve_reward_penalty_config
 
 CFG_ON = {"penalize_degenerate_reasoning": True}
+SWE_AGENT = "swe_rebench_opencode_sandboxed_agent"
 RULES = parse_mask_sample_rules(
     {
         "mask_sample_rules": [
@@ -156,6 +157,22 @@ def test_config_and_metric():
     counts = {"duplicated_reasoning": 0, "empty_final_answer": 0, "unwanted_token": 0, "malformed_think_tag": 0,
               "degenerate_reasoning": 3}
     assert compute_reward_penalty_metrics(counts, 10, cfg) == {"degenerate_reasoning_rate": 0.3}
+
+
+def test_resolved_config_keeps_the_penalty():
+    """The single controller scores with resolve_reward_penalty_config's dict, so the penalty's keys must survive it."""
+    cfg = RewardPenaltyConfig(
+        penalize_degenerate_reasoning=True, degenerate_reasoning_threshold=0.8, degenerate_reasoning_agents=[SWE_AGENT]
+    )
+    resolved = resolve_reward_penalty_config(cfg, tokenizer=None)
+    assert dr.enabled(resolved)
+    assert dr.applies_to(resolved, {"name": SWE_AGENT}, {})
+    assert not dr.applies_to(resolved, {"name": "browsecomp_sandboxed_agent"}, {})
+    assert dr.unmask_rule_names(resolved) == frozenset({"context_limited"})
+    assert resolved["degenerate_reasoning_threshold"] == 0.8
+    counts = {"duplicated_reasoning": 0, "empty_final_answer": 0, "unwanted_token": 0, "malformed_think_tag": 0,
+              "degenerate_reasoning": 0}
+    assert compute_reward_penalty_metrics(counts, 10, resolved) == {"degenerate_reasoning_rate": 0.0}
 
 
 def test_real_detector_flags_filler_not_prose():
