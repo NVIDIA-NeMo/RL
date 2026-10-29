@@ -371,6 +371,7 @@ debugging.md
 nsys-profiling.md
 fp8.md
 guides/use-custom-vllm.md
+guides/vllm-fp32-lm-head.md
 ```
 
 ```{toctree}

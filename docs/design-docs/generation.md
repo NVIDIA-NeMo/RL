@@ -136,6 +136,76 @@ The {py:class}`VllmGenerationWorker <nemo_rl.models.generation.vllm.VllmGenerati
 3. Supports dynamic weight updates through IPC handles.
 4. Implements sleep/wake mechanisms for efficient resource utilization.
 
+### FP32 LM-head logits
+
+Enable the head on both sides of a Megatron/vLLM training job:
+
+```yaml
+policy:
+  megatron_cfg:
+    fp32_lm_head: true
+    use_fused_linear_logprobs: false
+  generation:
+    backend: vllm
+    vllm_cfg:
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
+      logprobs_mode: raw_logprobs
+```
+
+The optional boolean defaults to `false` in the exemplar configurations. For
+standalone evaluation, set `generation.vllm_cfg.fp32_lm_head: true` without a
+trainer. Both synchronous and asynchronous workers pass the setting through
+vLLM's native `hf_overrides.head_dtype="float32"` (vLLM 0.29). This replaces the
+old Nemotron-H-only source patch and also supports models such as Qwen and Llama
+that use vLLM's `LogitsProcessor`.
+
+On CUDA with BF16/FP16 activations, the LM-head GEMM writes FP32 logits directly.
+Weights and inputs retain the model dtype; no persistent FP32 weight copy is
+created. This removes final BF16/FP16 logit rounding before log-softmax, following
+[TensorRT-LLM #19850](https://github.com/NVIDIA/TensorRT-LLM/pull/19850).
+It does not recover precision already lost in the transformer or in the weights.
+Tensor-parallel vocabulary gathering, padding removal, and refit continue to use
+vLLM's native implementation.
+
+The LM head itself must be unquantized; quantized transformer layers with an
+unquantized head are supported by vLLM. Custom model implementations that bypass
+`LogitsProcessor` are outside this feature's scope. NeMo RL rejects conflicting
+`hf_overrides.head_dtype` settings and the obsolete `NRL_VLLM_FP32_LM_HEAD`
+environment switch. Training requires matching Megatron and vLLM flags; Automodel
+has no matching switch, and Megatron's fused linear/logprob path bypasses the
+output layer, so those combinations are rejected.
+
+#### Validating precision and performance
+
+`tools/benchmarks/benchmark_vllm_fp32_lm_head.py` accepts a local/HF model and a
+JSON list of GSM8K records (`question` and `answer`). Run each arm in a fresh
+process on the same idle GPU; the second invocation enables the head:
+
+```bash
+uv run --extra vllm python tools/benchmarks/benchmark_vllm_fp32_lm_head.py \
+  --model Qwen/Qwen3-8B --prompts gsm8k-test-64.json \
+  --eager --analyze --output bf16.json
+uv run --extra vllm python tools/benchmarks/benchmark_vllm_fp32_lm_head.py \
+  --model Qwen/Qwen3-8B --prompts gsm8k-test-64.json \
+  --eager --fp32 --output fp32.json
+```
+
+The default workload is 64 prompts with exactly 256 generated tokens each,
+one untimed warmup and five timed repetitions. The script selects FlashAttention
+for both arms. `--analyze` then captures 2,048 real rollout hidden states, compares
+both head projections with an FP64 reference from identical inputs and weights,
+and measures GEMM-plus-FP32-upcast latency across batch sizes. Capturing and
+FP64 analysis occur after timing. The resulting JSON includes versions, effective
+settings, head dtypes, raw timing samples, token IDs and logprobs. These are
+projection and generation measurements, not an RL convergence experiment.
+
+For vocabulary sharding, padding and in-place weight reload coverage:
+
+```bash
+uv run --extra vllm torchrun --standalone --nproc-per-node=2 \
+  tests/functional/vllm_fp32_lm_head_tp.py
+```
+
 ### Custom VLLM Extensions
 
 The {py:class}`UpdatableVllmInternalWorker <nemo_rl.models.generation.vllm_backend.UpdatableVllmInternalWorker>` class in `vllm_backend.py` extends the VLLM worker with additional capabilities:
