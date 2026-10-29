@@ -2505,7 +2505,11 @@ class TestSetup:
         assert actor_config.capture_media is with_processor
         assert actor_config.reward_penalty_config == mc.reward_penalties
         assert actor_config.effort_config == effort
-        assert actor_kwargs == {"num_workers": 3}
+        assert actor_kwargs == {
+            "num_workers": 3,
+            "try_reuse_gym_env_for_finalizers": False,
+            "gym_is_setup": True,
+        }
         assert actor_args.finalizer_actors == fake_actors
         assert actor_args.tq_buffer._per_token_multimodal_fields == ()
         assert not hasattr(actor_args.rollout_manager, "_finalizer")

@@ -29,6 +29,9 @@ import nemo_rl.experience.rollout_reassembler_actor as actor_module
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+)
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import (
     ReassemblyRequest,
@@ -239,18 +242,61 @@ def test_forbidden_keys_cover_gym_staging_fields() -> None:
     assert per_token and per_token <= FORBIDDEN_RPC_KEYS
 
 
+def test_local_actor_names_match_their_definitions() -> None:
+    from nemo_rl.environments.nemo_gym import NEMO_GYM_ACTOR_FQN
+
+    assert actor_module._GYM_ACTOR_FQN == NEMO_GYM_ACTOR_FQN
+    # Ray's modified class keeps __module__ and __name__ but not __qualname__.
+    actor_class = RolloutReassemblerActor.__ray_metadata__.modified_class
+    assert (
+        actor_module._REASSEMBLER_ACTOR_FQN
+        == f"{actor_class.__module__}.{actor_class.__name__}"
+    )
+
+
+@pytest.mark.parametrize(
+    "gym_is_setup", [False, True], ids=["gym-not-prepared", "gym-prepared"]
+)
+@pytest.mark.parametrize(
+    "allow_gym_env_reuse", [False, True], ids=["reuse-disabled", "reuse-enabled"]
+)
+@pytest.mark.parametrize(
+    ("gym_extras", "gym_python", "reuse_gym_env"),
+    [
+        (["nemo_gym"], "/test/shared-python", True),
+        (["nemo_gym", "vllm"], "/test/shared-python", False),
+        (["nemo_gym"], "/test/custom-gym-python", False),
+        (None, "/test/shared-python", False),
+        (["nemo_gym"], None, False),
+    ],
+    ids=["compatible", "different-extras", "different-python", "no-extras", "no-env"],
+)
 @pytest.mark.parametrize(
     ("startup_fails", "cleanup_fails"),
     [(False, False), (True, False), (True, True)],
     ids=["ready", "startup-failure", "cleanup-failure"],
 )
-def test_factory_selects_gym_environment_and_waits_for_dependencies(
+def test_factory_selects_compatible_environment_and_waits_for_dependencies(
+    gym_is_setup: bool,
+    allow_gym_env_reuse: bool,
+    gym_extras: list[str] | None,
+    gym_python: str | None,
+    reuse_gym_env: bool,
     startup_fails: bool,
     cleanup_fails: bool,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    actor_fqn = "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+    actor_fqn = actor_module._REASSEMBLER_ACTOR_FQN
+    gym_fqn = actor_module._GYM_ACTOR_FQN
     assert ACTOR_ENVIRONMENTS[actor_fqn] == ["nemo_gym"]
+    assert ACTOR_ENVIRONMENTS[gym_fqn] == ["nemo_gym"]
+    monkeypatch.setitem(ACTOR_ENVIRONMENTS, gym_fqn, gym_extras)
+    monkeypatch.setitem(ACTOR_ENVIRONMENT_REGISTRY, actor_fqn, "/test/shared-python")
+    if gym_python is None:
+        monkeypatch.delitem(ACTOR_ENVIRONMENT_REGISTRY, gym_fqn)
+    else:
+        monkeypatch.setitem(ACTOR_ENVIRONMENT_REGISTRY, gym_fqn, gym_python)
     config = RolloutReassemblerActorConfig(
         partition_id="canonical",
         staging_partition="staging",
@@ -264,9 +310,25 @@ def test_factory_selects_gym_environment_and_waits_for_dependencies(
     dp_config = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
     actors = [MagicMock(), MagicMock()]
     runtime_env = {"py_executable": "/gym-venv/bin/python"}
+    prepared_gym_env = {"py_executable": "/prepared-gym/bin/python"}
+
+    def resolve_env(actor_name: str) -> dict[str, str]:
+        if actor_name == gym_fqn:
+            assert gym_is_setup
+            return prepared_gym_env
+        assert actor_name == actor_fqn
+        return runtime_env
+
     with (
         patch.object(
-            actor_module, "make_actor_runtime_env", return_value=runtime_env
+            actor_module, "ACTOR_ENVIRONMENTS", wraps=ACTOR_ENVIRONMENTS
+        ) as dependency_registry,
+        patch(
+            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
+            wraps=ACTOR_ENVIRONMENT_REGISTRY,
+        ) as python_registry,
+        patch.object(
+            actor_module, "make_actor_runtime_env", side_effect=resolve_env
         ) as make_env,
         patch.object(RolloutReassemblerActor, "options") as options,
         patch.object(ray, "get") as get,
@@ -279,7 +341,13 @@ def test_factory_selects_gym_environment_and_waits_for_dependencies(
             if cleanup_fails:
                 kill.side_effect = [RuntimeError("kill failed"), None]
             with pytest.raises(ray.exceptions.RayError) as exc_info:
-                create_rollout_reassembler_actors(dp_config, config, num_workers=2)
+                create_rollout_reassembler_actors(
+                    dp_config,
+                    config,
+                    num_workers=2,
+                    try_reuse_gym_env_for_finalizers=allow_gym_env_reuse,
+                    gym_is_setup=gym_is_setup,
+                )
             assert exc_info.value is startup_error
             assert kill.call_args_list == [call(actor) for actor in actors]
             if cleanup_fails:
@@ -289,13 +357,24 @@ def test_factory_selects_gym_environment_and_waits_for_dependencies(
                 )
         else:
             assert (
-                create_rollout_reassembler_actors(dp_config, config, num_workers=2)
+                create_rollout_reassembler_actors(
+                    dp_config,
+                    config,
+                    num_workers=2,
+                    try_reuse_gym_env_for_finalizers=allow_gym_env_reuse,
+                    gym_is_setup=gym_is_setup,
+                )
                 == actors
             )
             kill.assert_not_called()
 
-        make_env.assert_called_once_with(actor_fqn)
-        assert options.call_args_list == [call(runtime_env=runtime_env)] * 2
+        should_reuse = allow_gym_env_reuse and gym_is_setup and reuse_gym_env
+        make_env.assert_called_once_with(gym_fqn if should_reuse else actor_fqn)
+        if not allow_gym_env_reuse or not gym_is_setup:
+            dependency_registry.get.assert_not_called()
+            python_registry.get.assert_not_called()
+        expected_runtime = prepared_gym_env if should_reuse else runtime_env
+        assert options.call_args_list == [call(runtime_env=expected_runtime)] * 2
         assert (
             options.return_value.remote.call_args_list == [call(dp_config, config)] * 2
         )

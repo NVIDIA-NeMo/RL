@@ -2228,6 +2228,9 @@ def setup_single_controller(
                 ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
+            try_reuse_gym_env_for_finalizers=token_capture_cfg.try_reuse_gym_env_for_finalizers,
+            # Gym's initialization future was joined above.
+            gym_is_setup=nemo_gym_shards is not None,
         )
         if restore_data_plane_in_actor:
             # Actor creation is asynchronous. A Mooncake restore must not start
