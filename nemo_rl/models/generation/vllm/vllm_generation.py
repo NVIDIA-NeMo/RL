@@ -1543,7 +1543,6 @@ class VllmGeneration(GenerationInterface):
             rollout_result_from_wire(engine_data["rollout"]),
             input_ids=input_ids,
             input_length=input_length,
-            pad_token_id=self.cfg["_pad_token_id"],
         )
         output["gen_leader_worker_idx"] = [int(engine_data["gen_leader_worker_idx"])]
         return 0, output

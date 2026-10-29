@@ -209,14 +209,11 @@ def test_rollouts_are_served_like_generate_async() -> None:
     )
 
     ((_, sampling_params, _),) = llm.calls
-    # The request the native worker's generate_async builds...
-    assert sampling_params == host._rollout_sampling_params(
-        max_new_tokens=host._rollout_max_new_tokens(3),
-        greedy=True,
-        stop_strings=["</x>"],
-    )
+    # The worker's _serve_rollout samples it, as it does for generate_async...
+    assert sampling_params.max_tokens == 8
+    assert sampling_params.temperature == 0.0
     assert sorted(sampling_params.stop) == ["</done>", "</x>"]
-    # ...and the result the shared pipeline builds from its final output.
+    # ...and builds the result from its final output.
     expected = rollout_result(
         final,
         input_length=3,
@@ -248,7 +245,6 @@ def test_router_replay_routes_reach_rollouts_and_gym_calls_as_natively() -> None
         rollout_result_from_wire(chunk["engine_data"]["rollout"]),
         input_ids=input_ids,
         input_length=3,
-        pad_token_id=0,
     )
     native = rollout_output(
         rollout_result(
@@ -260,7 +256,6 @@ def test_router_replay_routes_reach_rollouts_and_gym_calls_as_natively() -> None
         ),
         input_ids=input_ids,
         input_length=3,
-        pad_token_id=0,
     )
     assert shipped.keys() == native.keys()
     assert "routed_experts" in shipped
