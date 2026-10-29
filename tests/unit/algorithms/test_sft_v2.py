@@ -94,7 +94,9 @@ def _valid_setup_config(
         "backend": "energon",
         "validation": None,
         "max_input_seq_length": 128,
-        "energon": SimpleNamespace(task_encoder=SimpleNamespace(packing=None)),
+        "energon": SimpleNamespace(
+            task_encoder=SimpleNamespace(packing=None), topology_mapper="default"
+        ),
     }
     data.update(data_overrides or {})
     policy = {
@@ -103,18 +105,31 @@ def _valid_setup_config(
             "context_parallel_size": 1,
             "tensor_model_parallel_size": 1,
             "sequence_parallel": False,
+            "use_fused_linear_logprobs": True,
         },
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
         "make_sequence_length_divisible_by": 1,
+        "tokenizer": {},
+        "train_global_batch_size": 8,
     }
     for section, values in (policy_overrides or {}).items():
         policy[section].update(values)
+    # Most callers raise during validation and never read the rest. The fields below are
+    # what `setup_sft_v2` needs once it gets past that, so one config serves both.
     return SimpleNamespace(
         sft=SimpleNamespace(**sft),
         data=data,
         policy=policy,
         checkpointing={"metric_name": metric_name},
+        cluster=SimpleNamespace(
+            num_nodes=1,
+            segment_size=1,
+            gpus_per_node=8,
+            master_port_range_low=1,
+            master_port_range_high=2,
+        ),
+        data_plane=SimpleNamespace(),
     )
 
 
@@ -820,3 +835,68 @@ def test_setup_keeps_policy_pretrained_checkpoint_when_checkpointing_is_null():
     with pytest.raises(ValueError, match="data.backend=energon"):
         setup_sft_v2(config, MagicMock())
     assert config.policy["pretrained_checkpoint"] == existing
+
+
+def test_setup_charges_the_placement_wait_to_cluster_init() -> None:
+    """The placement groups are created before the policy, so the wait is measured.
+
+    ``RayVirtualCluster.__init__`` only stores fields; the bundles are scheduled on the
+    first ``get_placement_groups()``, which blocks on ``pg.ready()``. Drop that call and
+    ``RayWorkerGroup`` triggers it during the ``TQPolicy`` build instead, so a wait that
+    can dominate a large start is reported as ``policy_init`` and ``cluster_init`` reads
+    zero. Every other test here raises during validation, so this is the only one that
+    reaches the timing at all.
+
+    The stubs advance a fake clock themselves, which makes each phase an exact number
+    rather than something that has to be bounded loosely against a real one.
+    """
+    from nemo_rl.algorithms import sft_v2
+
+    calls: list[str] = []
+    clock = {"t": 0.0}
+
+    def advance(label: str, seconds: float, result: Any = None):
+        def _advance(*args: Any, **kwargs: Any) -> Any:
+            calls.append(label)
+            clock["t"] += seconds
+            return result
+
+        return _advance
+
+    cluster = MagicMock()
+    cluster.get_placement_groups.side_effect = advance("placement", 7.0)
+    probe = MagicMock()
+    probe.get_latest_checkpoint_path.return_value = None
+    probe.load_training_info.return_value = None
+    probe.get_resume_paths.return_value = (None, None)
+
+    with (
+        patch.object(sft_v2, "time", SimpleNamespace(monotonic=lambda: clock["t"])),
+        patch.object(sft_v2, "set_seed"),
+        patch.object(sft_v2, "CheckpointManager", return_value=probe),
+        patch.object(
+            sft_v2, "prepare_segment_topology", return_value=(None, None, None)
+        ),
+        patch.object(sft_v2, "RayVirtualCluster", return_value=cluster),
+        patch.object(
+            sft_v2, "TQPolicy", side_effect=advance("policy", 3.0, MagicMock())
+        ),
+        patch.object(sft_v2, "resolve_topology_mapper") as resolve_mapper,
+        patch.object(sft_v2, "NLLLossFn"),
+        patch.object(sft_v2, "_restore_save_state"),
+        patch.object(sft_v2, "_max_train_steps", return_value=10),
+    ):
+        resolve_mapper.return_value.map.return_value = SimpleNamespace(
+            logical_world_size=4, placement_hash="hash"
+        )
+        actor_args = sft_v2.setup_sft_v2(_valid_setup_config(), MagicMock())
+
+    assert calls == ["placement", "policy"], (
+        f"the placement wait must be taken before the policy build, got {calls}"
+    )
+    timing = actor_args.setup_timing
+    assert timing.extras["cluster_init_time_s"] == 7.0
+    assert timing.policy_init_time_s == 3.0, (
+        "policy_init must cover the policy build alone, not the placement wait"
+    )
+    assert timing.total_setup_time_s == 10.0
