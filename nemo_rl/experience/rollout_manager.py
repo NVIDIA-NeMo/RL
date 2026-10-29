@@ -2077,6 +2077,13 @@ class RolloutManager:
             transition from its retained ledger record to either a replacement prompt
             or the shortfall for the training step it was stamped for.
 
+            ``FILTERED`` when dynamic sampling dropped the group before commit because
+            every generation scored the same reward. It carries the same two caller
+            obligations as ``SKIPPED`` -- the backpressure permit and the ledger
+            transition -- but the rollout itself succeeded, so its replacement is paid
+            for out of ``grpo.dynamic_sampling_max_replacements_per_slot`` rather than
+            the rollout fault-tolerance budget.
+
         Raises:
             RolloutRedispatchExhausted: The infra budget ran out and the fleet has not
                 committed anything since ``max_consecutive_dropped_prompts`` drops ago.
