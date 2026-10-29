@@ -128,3 +128,14 @@ def decode_routed_experts(payload: Union[str, Any], dtype: torch.dtype) -> torch
         return torch.empty(shape, dtype=dtype)
     tensor = torch.frombuffer(raw, dtype=wire_dtype).reshape(shape)
     return tensor if tensor.dtype == dtype else tensor.to(dtype)
+
+
+def slice_routed_experts(
+    routed_experts: torch.Tensor, start: int, end: int
+) -> torch.Tensor:
+    """Return ``routed_experts[start:end]`` with its own storage.
+
+    A plain slice is a view, so serializing one message would carry the full
+    sample buffer. Cloning makes each message own only its token span.
+    """
+    return routed_experts[start:end].clone()

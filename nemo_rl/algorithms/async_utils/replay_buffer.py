@@ -1109,6 +1109,7 @@ class TQReplayBuffer:
         *,
         pad_value_dict: Mapping[str, int],
         include_message_violation_fields: bool,
+        per_token_multimodal_fields: tuple[str, ...] = (),
         staging_partition_id: Optional[str] = None,
         require_routed_experts: bool = False,
     ):
@@ -1116,6 +1117,7 @@ class TQReplayBuffer:
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
         self._include_message_violation_fields = include_message_violation_fields
+        self._per_token_multimodal_fields = per_token_multimodal_fields
         # Token-capture mode only: the staging partition whose per-call delta
         # rows `remove` must clear alongside the canonical rows. None on the
         # legacy path.
@@ -1133,7 +1135,7 @@ class TQReplayBuffer:
         self._staging_keys_list: list[Optional[list[str]]] = []
         self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self._post_write_enricher: Optional[
-            Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]]
+            Callable[[KVBatchMeta, Optional[dict[str, Any]]], Awaitable[KVBatchMeta]]
         ] = None
         # Sampler selection removes ready slots from the live replay index but
         # deliberately leaves their rows in TQ until optimizer completion.
@@ -1163,7 +1165,9 @@ class TQReplayBuffer:
 
     def set_post_write_enricher(
         self,
-        enricher: Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]],
+        enricher: Callable[
+            [KVBatchMeta, Optional[dict[str, Any]]], Awaitable[KVBatchMeta]
+        ],
     ) -> None:
         """Install the required enrichment stage run before slots become ready."""
         self._post_write_enricher = enricher
@@ -1251,6 +1255,7 @@ class TQReplayBuffer:
             record,
             pad_value_dict=self._pad_value_dict,
             include_message_violation_fields=self._include_message_violation_fields,
+            per_token_multimodal_fields=self._per_token_multimodal_fields,
         )
         sample_ids, fields, tags = pack_payload(
             train_batch,
@@ -1291,7 +1296,9 @@ class TQReplayBuffer:
 
                 if self._post_write_enricher is not None:
                     try:
-                        meta = await self._post_write_enricher(meta, record)
+                        meta = await self._post_write_enricher(
+                            meta, record.extra_env_info
+                        )
                     except Exception as error:
                         raise PostWriteEnrichmentError(
                             f"post-write enrichment failed for group_id={group_id!r}"
@@ -1389,11 +1396,13 @@ class TQReplayBuffer:
         group_max_wv: int,
         *,
         staging_keys: Optional[list[str]] = None,
+        extra_env_info: Optional[dict[str, Any]] = None,
     ) -> KVBatchMeta:
         """Mark a slot ready from finalizer output (token-capture mode).
 
         Unlike :meth:`commit`, the canonical rows are already in TQ — the
-        finalizer tensorized and put them — so this only fills the slot.
+        finalizer tensorized and put them — so enrich them before filling the slot.
+        The caller owns canonical/staging cleanup if enrichment fails or is cancelled.
         The slot's effective version is the group's OLDEST call version
         (``group_min_wv``): staleness accounting stays conservative when a
         rollout straddles a refit.
@@ -1406,6 +1415,7 @@ class TQReplayBuffer:
             group_max_wv: Newest weight version any call in the group used.
             staging_keys: The group's staged delta keys, recorded so
                 :meth:`remove` can clear the staging partition too.
+            extra_env_info: Original prompt environment metadata for teacher routing.
 
         Raises:
             ValueError: group_id has no live slot (removed or never reserved).
@@ -1442,6 +1452,22 @@ class TQReplayBuffer:
                     f"provided={sorted(provided_staging_keys)!r}, "
                     f"planned={sorted(plan_cleanup_keys)!r}"
                 )
+        if self._post_write_enricher is not None:
+            try:
+                meta = await self._post_write_enricher(meta, extra_env_info)
+            except Exception as error:
+                raise PostWriteEnrichmentError(
+                    f"post-write enrichment failed for group_id={group_id!r}"
+                ) from error
+            # Enrichment awaits teacher inference. Other group removals can shift
+            # the slot index, or evict this group, while that work is in flight.
+            try:
+                idx = self._group_ids.index(group_id)
+            except ValueError:
+                raise ValueError(
+                    f"TQReplayBuffer.commit_finalized: group {group_id} was evicted "
+                    "during enrichment"
+                ) from None
         self.meta_list[idx] = meta
         self.start_weight_list[idx] = group_min_wv
         self.end_weight_list[idx] = group_max_wv

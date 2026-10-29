@@ -21,6 +21,7 @@ from nemo_rl.utils.routed_experts_codec import (
     decode_routed_experts,
     encode_routed_experts,
     routed_experts_tensor_metadata,
+    slice_routed_experts,
 )
 
 
@@ -84,3 +85,15 @@ def test_tensor_metadata_is_independent_of_storage_strides():
     assert routed_experts_tensor_metadata(routes) == routed_experts_tensor_metadata(
         routes.contiguous()
     )
+
+
+def test_slice_routed_experts_owns_only_its_span():
+    full = torch.arange(5 * 2 * 2, dtype=torch.int16).reshape(5, 2, 2)
+
+    piece = slice_routed_experts(full, 1, 4)
+
+    assert torch.equal(piece, full[1:4])
+    assert piece.storage_offset() == 0
+    assert piece.untyped_storage().nbytes() == piece.numel() * piece.element_size()
+    piece[0] = -1
+    assert full[1].tolist() == [[4, 5], [6, 7]]
