@@ -11,6 +11,10 @@ ppo:
   ppo_epochs: 4
   # null preserves legacy behavior by using ppo_epochs for critic updates.
   critic_train_epochs: null
+  # Optional critic-only MC replay; critic_train_epochs includes the fresh pass.
+  # For the SWE experiment: capacity=512 trajectories, batch_size=128, epochs=4.
+  critic_replay:
+    enabled: false
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
   val_period: 20
   val_at_start: true

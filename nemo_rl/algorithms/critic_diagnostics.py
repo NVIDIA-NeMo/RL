@@ -82,17 +82,17 @@ def critic_reward_auc_metrics(
     last = valid.shape[1] - 1 - valid.flip(1).float().argmax(1)
     rows = torch.arange(valid.shape[0], device=valid.device)
     metrics = {
+        "critic/auc_positive_samples": float(labels[has_response].sum()),
+        "critic/auc_negative_samples": float((~labels[has_response]).sum()),
         "critic/terminal_auc": _rank_auc(
             values[rows[has_response], last[has_response]].float(),
             labels[has_response],
-        )
+        ),
     }
-    if group_ids is None:
-        return metrics
-    if len(group_ids) != values.shape[0]:
+    if group_ids is not None and len(group_ids) != values.shape[0]:
         raise ValueError("group_ids must have one entry per trajectory")
     groups: dict[Hashable, list[int]] = {}
-    for row, group_id in enumerate(group_ids):
+    for row, group_id in enumerate(group_ids if group_ids is not None else []):
         if bool(has_response[row]):
             groups.setdefault(group_id, []).append(row)
     mixed_groups = [
@@ -102,7 +102,8 @@ def critic_reward_auc_metrics(
         and bool(labels[rows_in_group].any())
         and bool((~labels[rows_in_group]).any())
     ]
-    metrics["critic/n_mixed_groups"] = float(len(mixed_groups))
+    if group_ids is not None:
+        metrics["critic/n_mixed_groups"] = float(len(mixed_groups))
     positions = (valid.long().cumsum(1) - 1).float()
     lengths = valid.sum(1, keepdim=True).clamp_min(1)
     bins = (positions * 4 / lengths).long().clamp(max=3)
@@ -110,6 +111,13 @@ def critic_reward_auc_metrics(
         selected = valid & (bins == i)
         counts = selected.sum(1)
         scores = (values.float() * selected).sum(1) / counts.clamp_min(1)
+        eligible = counts > 0
+        metrics[f"critic/global_auc_q{i + 1}"] = _rank_auc(
+            scores[eligible], labels[eligible]
+        )
+        metrics[f"critic/auc_samples_q{i + 1}"] = float(eligible.sum())
+        if group_ids is None:
+            continue
         aucs = []
         for group in mixed_groups:
             members = [row for row in group if bool(counts[row])]

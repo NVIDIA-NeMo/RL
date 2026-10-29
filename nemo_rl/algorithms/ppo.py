@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import json
 import os
 import time
 import traceback
@@ -32,6 +33,8 @@ from nemo_rl.algorithms.advantage_estimator import (
     GeneralizedAdvantageEstimator,
     RawRewardAdvantageEstimator,
 )
+from nemo_rl.algorithms.critic_diagnostics import critic_position_metrics, critic_reward_auc_metrics
+from nemo_rl.algorithms.critic_replay import CriticReplayBuffer, CriticReplayConfig
 from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     RewardScalingConfig,
@@ -210,6 +213,7 @@ class PPOConfig(TypedDict):
     # Number of critic optimizer updates per rollout batch. null preserves the
     # legacy behavior by following ppo_epochs.
     critic_train_epochs: NotRequired[int | None]
+    critic_replay: NotRequired[CriticReplayConfig]
     reward_shaping: RewardShapingConfig
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
@@ -262,6 +266,67 @@ def _resolve_critic_train_epochs(ppo_config: PPOConfig) -> int:
         if configured_epochs is None
         else configured_epochs
     )
+
+
+def _critic_replay_config(master_config: "MasterConfig") -> CriticReplayConfig:
+    """Validate replay before allocating distributed models."""
+    raw = master_config.ppo.get("critic_replay")
+    config = (
+        CriticReplayConfig() if raw is None else CriticReplayConfig.model_validate(raw)
+    )
+    if not config.enabled:
+        return config
+    adv = master_config.ppo["adv_estimator"]
+    value_lambda = adv.get("gae_lambda_value")
+    if value_lambda is None:
+        value_lambda = adv.get("gae_lambda")
+    if (
+        adv["name"] != "gae"
+        or adv.get("gae_gamma") != 1.0
+        or value_lambda != 1.0
+        or adv.get("cross_trajectory")
+    ):
+        raise ValueError(
+            "Critic replay requires gamma=lambda_value=1 and no cross_trajectory"
+        )
+    if (
+        master_config.loss_fn.use_kl_in_reward
+        and master_config.loss_fn.reference_policy_kl_penalty != 0
+    ):
+        raise ValueError(
+            "Critic replay does not support policy-dependent KL reward targets"
+        )
+    if master_config.value_loss_fn.cliprange is not None:
+        raise ValueError("Critic replay requires value_loss_fn.cliprange=null")
+    if master_config.ppo["reward_shaping"]["enabled"]:
+        raise ValueError(
+            "Critic replay currently requires unshaped Monte Carlo rewards"
+        )
+    expected_batch = (
+        master_config.ppo["num_prompts_per_step"]
+        * master_config.ppo["num_generations_per_prompt"]
+    )
+    if (
+        config.batch_size != expected_batch
+        or config.batch_size != master_config.value["train_global_batch_size"]
+    ):
+        raise ValueError(
+            "Critic replay batch_size must equal rollout size and value train_global_batch_size"
+        )
+    if _resolve_critic_train_epochs(master_config.ppo) < 1:
+        raise ValueError("Critic replay requires at least one fresh critic update")
+    return config
+
+
+def _create_critic_replay(
+    master_config: "MasterConfig", checkpointer: CheckpointManager
+) -> CriticReplayBuffer | None:
+    config = _critic_replay_config(master_config)
+    if not config.enabled:
+        return None
+    buffer = CriticReplayBuffer(config)
+    buffer.restore(checkpointer.get_latest_checkpoint_path())
+    return buffer
 
 
 def _default_ppo_save_state() -> PPOSaveState:
@@ -511,6 +576,7 @@ def setup(
         )
 
     # Set seed for all random number generators
+    _critic_replay_config(master_config)
     set_seed(ppo_config["seed"])
 
     # ==========================
@@ -1550,17 +1616,18 @@ def _compute_rollout_critic_metrics(
     returns = train_data["returns"].detach().float()
     raw_advantages = returns - values
     valid = mask.bool()
+    if not valid.any():
+        return {
+            "critic/auc_positive_samples": 0.0,
+            "critic/auc_negative_samples": 0.0,
+            "critic/terminal_auc": float("nan"),
+            **{f"critic/global_auc_q{i}": float("nan") for i in range(1, 5)},
+        }
 
     metrics = {
-        **_masked_distribution_metrics(
-            "critic/pre_update_values", values, valid
-        ),
-        **_masked_distribution_metrics(
-            "critic/return_targets", returns, valid
-        ),
-        **_masked_distribution_metrics(
-            "critic/raw_advantages", raw_advantages, valid
-        ),
+        **_masked_distribution_metrics("critic/pre_update_values", values, valid),
+        **_masked_distribution_metrics("critic/return_targets", returns, valid),
+        **_masked_distribution_metrics("critic/raw_advantages", raw_advantages, valid),
     }
 
     selected_values = values[valid]
@@ -1586,16 +1653,77 @@ def _compute_rollout_critic_metrics(
     first_values = values[batch_indices, first_indices[valid_samples]]
     last_values = values[batch_indices, last_indices[valid_samples]]
     terminal_targets = returns[batch_indices, last_indices[valid_samples]]
+    metrics.update(critic_position_metrics(values, returns, valid))
+    metrics.update(critic_reward_auc_metrics(values, train_data["rewards"], valid))
     metrics.update(
         {
             "critic/first_response_token_value_mean": first_values.mean().item(),
             "critic/last_response_token_value_mean": last_values.mean().item(),
-            "critic/last_response_token_mae": (
-                last_values - terminal_targets
-            ).abs().mean().item(),
+            "critic/last_response_token_mae": (last_values - terminal_targets)
+            .abs()
+            .mean()
+            .item(),
         }
     )
     return metrics
+
+
+def _probe_critic_replay_update(
+    value_model: ValueInterface,
+    train_data: BatchedDataDict,
+    replay: CriticReplayBuffer,
+    *,
+    step: int,
+    update: int,
+) -> dict[str, float]:
+    """Evaluate each update on the same fresh data without changing advantages.
+
+    This is an in-sample fitting probe, not held-out generalization. The normal
+    next-rollout pre-update metrics remain the generalization comparison.
+    """
+    period = replay.config.probe_every_n_steps
+    if period == 0 or (step + 1) % period != 0:
+        return {}
+    value_model.prepare_for_inference()
+    try:
+        predictions = value_model.get_values(train_data)["values"].squeeze(-1)
+    finally:
+        value_model.finish_inference()
+    probe_data = BatchedDataDict(dict(train_data))
+    probe_data["values"] = predictions
+    mask = train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)
+    prefix = f"critic_replay/fresh_probe/after_update_{update + 1}/"
+    metrics = {
+        prefix + key.removeprefix("critic/").replace("pre_update_", ""): value
+        for key, value in _compute_rollout_critic_metrics(probe_data, mask).items()
+    }
+    valid = mask.bool()
+    if valid.any():
+        before = train_data["values"][valid].float()
+        after = predictions[valid].float()
+        targets = train_data["returns"][valid].float()
+        metrics[prefix + "value_shift_rmse"] = (
+            (after - before).square().mean().sqrt().item()
+        )
+        metrics[prefix + "mse_improvement_from_pre"] = (
+            (before - targets).square().mean() - (after - targets).square().mean()
+        ).item()
+    return metrics
+
+
+def _log_critic_replay_metrics(
+    logger: Logger, metrics: dict[str, Any], *, step: int
+) -> None:
+    """Persist scalar diagnostics locally as well as through the normal logger."""
+    scalars: dict[str, float | None] = {}
+    for key, value in metrics.items():
+        if key.startswith(("critic/", "critic_replay/")) or key == "actor/num_updates":
+            scalar = float(np.asarray(value).mean())
+            scalars[key] = scalar if np.isfinite(scalar) else None
+    logger.log_string_list_as_jsonl(
+        [json.dumps({"step": step, "metrics": scalars}, allow_nan=False)],
+        "critic_replay_metrics.jsonl",
+    )
 
 
 def _pad_compaction_batch(
@@ -1697,6 +1825,7 @@ def ppo_train(
     max_num_epochs = master_config.ppo["max_num_epochs"]
     ppo_epochs = master_config.ppo["ppo_epochs"]
     critic_train_epochs = _resolve_critic_train_epochs(master_config.ppo)
+    critic_replay = _create_critic_replay(master_config, checkpointer)
     # Number of PPO steps to train only the critic before starting policy
     # training.  Despite the legacy name, this is compared against total_steps
     # (not current_epoch) to match veRL's critic_warmup semantics.
@@ -2070,7 +2199,21 @@ def ppo_train(
                 # batch after the requested number of value updates.
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 value_results = None
+                if critic_replay is not None:
+                    critic_replay.append(train_data, step=total_steps)
                 for critic_epoch in range(critic_train_epochs):
+                    critic_update_data = train_data
+                    if critic_replay is not None and critic_epoch > 0:
+                        replay_data, replay_metrics = critic_replay.sample(
+                            step=total_steps
+                        )
+                        critic_update_data = BatchedDataDict(replay_data)
+                        metrics.update(
+                            {
+                                f"critic_replay/update_{critic_epoch}/{key}": val
+                                for key, val in replay_metrics.items()
+                            }
+                        )
                     print(
                         f"▶ Critic update {critic_epoch + 1}/{critic_train_epochs}...",
                         flush=True,
@@ -2080,12 +2223,42 @@ def ppo_train(
                     with timer.time("value_training"):
                         print("▶ Training value...", flush=True)
                         value_results = value_model.train(
-                            train_data,
+                            critic_update_data,
                             value_loss_fn,
                             timer=timer,
                         )
 
                         value_model.finish_training()
+                    if critic_replay is not None:
+                        critic_replay.record_update(
+                            fresh=critic_epoch == 0, step=total_steps
+                        )
+                        metrics.update(
+                            {
+                                f"critic_replay/{key}": val
+                                for key, val in critic_replay.metrics(
+                                    step=total_steps
+                                ).items()
+                            }
+                        )
+                        with timer.time("critic_replay/fresh_probe"):
+                            metrics.update(
+                                _probe_critic_replay_update(
+                                    value_model,
+                                    train_data,
+                                    critic_replay,
+                                    step=total_steps,
+                                    update=critic_epoch,
+                                )
+                            )
+                        update_metrics = _compute_critic_metrics(value_results)
+                        metrics.update(
+                            {
+                                f"critic_replay/update_{critic_epoch}/{key.removeprefix('critic/')}": val
+                                for key, val in update_metrics.items()
+                            }
+                        )
+                del critic_update_data
 
                 train_results = None
                 if total_steps >= policy_training_start_step:
@@ -2312,6 +2485,8 @@ def ppo_train(
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             total_steps + 1, ppo_save_state, master_config
                         )
+                        if critic_replay is not None:
+                            critic_replay.save(checkpoint_path)
 
                         # Always save policy weights so every PPO checkpoint has
                         # the same component layout. Before the first real policy
@@ -2433,6 +2608,8 @@ def ppo_train(
             )
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            if critic_replay is not None:
+                _log_critic_replay_metrics(logger, metrics, step=total_steps + 1)
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
@@ -2635,6 +2812,7 @@ def async_ppo_train(
     max_num_steps = master_config.ppo["max_num_steps"]
     ppo_epochs = master_config.ppo["ppo_epochs"]
     critic_train_epochs = _resolve_critic_train_epochs(master_config.ppo)
+    critic_replay = _create_critic_replay(master_config, checkpointer)
     val_period = master_config.ppo["val_period"]
     val_at_start = master_config.ppo["val_at_start"]
     val_at_end = master_config.ppo["val_at_end"]
@@ -3277,7 +3455,19 @@ def async_ppo_train(
                         ] = actor_gbs
                 train_results = None
                 value_results = None
+                if critic_replay is not None:
+                    critic_replay.append(train_data, step=step)
                 for critic_epoch in range(critic_train_epochs):
+                    critic_update_data = critic_train_data
+                    if critic_replay is not None and critic_epoch > 0:
+                        replay_data, replay_metrics = critic_replay.sample(step=step)
+                        critic_update_data = BatchedDataDict(replay_data)
+                        metrics.update(
+                            {
+                                f"critic_replay/update_{critic_epoch}/{key}": val
+                                for key, val in replay_metrics.items()
+                            }
+                        )
                     print(
                         f"▶ Critic update {critic_epoch + 1}/{critic_train_epochs}..."
                     )
@@ -3285,7 +3475,7 @@ def async_ppo_train(
                         value_model.prepare_for_training()
                     with timer.time("value_training"):
                         value_results = value_model.train(
-                            critic_train_data,
+                            critic_update_data,
                             value_loss_fn,
                             timer=timer,
                             gbs=critic_gbs,
@@ -3296,6 +3486,32 @@ def async_ppo_train(
                             ),
                         )
                         value_model.finish_training()
+                    if critic_replay is not None:
+                        critic_replay.record_update(fresh=critic_epoch == 0, step=step)
+                        metrics.update(
+                            {
+                                f"critic_replay/{key}": val
+                                for key, val in critic_replay.metrics(step=step).items()
+                            }
+                        )
+                        with timer.time("critic_replay/fresh_probe"):
+                            metrics.update(
+                                _probe_critic_replay_update(
+                                    value_model,
+                                    train_data,
+                                    critic_replay,
+                                    step=step,
+                                    update=critic_epoch,
+                                )
+                            )
+                        update_metrics = _compute_critic_metrics(value_results)
+                        metrics.update(
+                            {
+                                f"critic_replay/update_{critic_epoch}/{key.removeprefix('critic/')}": val
+                                for key, val in update_metrics.items()
+                            }
+                        )
+                del critic_update_data
 
                 if is_policy_training_step:
                     if (
@@ -3530,6 +3746,8 @@ def async_ppo_train(
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             step + 1, ppo_save_state, master_config
                         )
+                        if critic_replay is not None:
+                            critic_replay.save(checkpoint_path)
                         policy.prepare_for_training()
                         policy.save_checkpoint(
                             weights_path=os.path.join(
@@ -3685,6 +3903,8 @@ def async_ppo_train(
 
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
+            if critic_replay is not None:
+                _log_critic_replay_metrics(logger, metrics, step=step + 1)
             logger.log_metrics(efficiency_loggable, step + 1, prefix="")
             logger.log_metrics(
                 timing_metrics,
