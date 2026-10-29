@@ -335,10 +335,22 @@ def test_qwen3_235b_scripts_append_distributed_timeout_override() -> None:
         script_text = (PERF_SUITE_DIR / f"{case_name}.sh").read_text(encoding="utf-8")
 
         assert "export RAY_CGRAPH_get_timeout=2400" in script_text
-        assert (
+        timeout_override = (
             "+policy.generation.vllm_kwargs.distributed_timeout_seconds=2400"
-            in script_text
         )
+        if case_name == "grpo-qwen3-235b-16n4g-mxfp8-rollout":
+            # Inherits the timeout from grpo-qwen3-235b-16n4g.yaml, so a `+`
+            # append would fail Hydra parsing ("item already exists").
+            assert timeout_override not in script_text
+            config = _load_resolved_yaml(PERF_CONFIG_DIR / f"{case_name}.yaml")
+            assert (
+                config["policy"]["generation"]["vllm_kwargs"][
+                    "distributed_timeout_seconds"
+                ]
+                == 2400
+            )
+        else:
+            assert timeout_override in script_text
         assert (
             "\n    policy.generation.vllm_kwargs.distributed_timeout_seconds=2400 \\"
             not in script_text
