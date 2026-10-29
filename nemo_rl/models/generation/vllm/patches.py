@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from importlib.util import find_spec
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     import torch
+    from vllm.config import ModelConfig
 
 # Keep this module free of NeMo RL imports, including lazy ones inside
 # functions: tools/external_gym_vllm/serve_vllm_on_ray.py loads it by path and
@@ -570,7 +573,7 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
 
         return loaded_params
 """
-    new_snippet = """                loaded_params.add(vllm_key)
+    previous_snippet = """                loaded_params.add(vllm_key)
 
         initializer_factor = getattr(self.config, "initializer_factor", 1.0)
         # Refit calls load_weights once per batch. Remember every LayerScale name
@@ -585,9 +588,29 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
 
         return loaded_params
 """
+    new_snippet = """                loaded_params.add(vllm_key)
+
+        initializer_factor = getattr(self.config, "initializer_factor", 1.0)
+        ever_loaded_ls = getattr(self, "_nemo_rl_loaded_layerscale", set())
+        ever_loaded_ls.update(n for n in loaded_params if n.endswith((".ls1", ".ls2")))
+        self._nemo_rl_loaded_layerscale = ever_loaded_ls
+        for ls_name, ls_param in params_dict.items():
+            if (
+                ls_name.endswith((".ls1", ".ls2"))
+                and ls_name not in ever_loaded_ls
+                and not ls_param.is_meta
+            ):
+                # Native reload defers defaults until the complete refit ends.
+                weight_loader = getattr(ls_param, "weight_loader", default_weight_loader)
+                weight_loader(ls_param, torch.full_like(ls_param, initializer_factor))
+                ever_loaded_ls.add(ls_name)
+                loaded_params.add(ls_name)
+
+        return loaded_params
+"""
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
-        if "ls_param.data.fill_(initializer_factor)" in content:
+        if new_snippet in content:
             logger.info("vLLM RADIO LayerScale loader patch already applied.")
             return
 
@@ -596,7 +619,11 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
         if skip_removed:
             updated = updated.replace(skip_old, skip_new, 1)
 
-        if old_snippet not in updated:
+        if previous_snippet in updated:
+            updated = updated.replace(previous_snippet, new_snippet, 1)
+        elif old_snippet in updated:
+            updated = updated.replace(old_snippet, new_snippet, 1)
+        else:
             # Without the fill loop the parameters stay at dummy init, so refuse
             # to write a half-applied patch and make the reason loud.
             logger.warning(
@@ -607,8 +634,6 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
                 file_to_patch,
             )
             return
-        updated = updated.replace(old_snippet, new_snippet, 1)
-
         write_back(updated)
 
     logger.info(
@@ -933,7 +958,8 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
             """            for trimmed_name, w in final_layernorm_weights:
                 param = final_layernorm_dict[trimmed_name]
                 with torch.no_grad():
-                    default_weight_loader(param, w)
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, w)
                 self._loaded_vision_final_layernorm_params.add(trimmed_name)
             if final_layernorm_weights and (
                 self._loaded_vision_final_layernorm_params >= final_layernorm_dict.keys()
@@ -949,7 +975,21 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
         ),
     )
     with _locked_file_patch(file_to_patch) as (content, write_back):
+        # Upgrade installations that already contain the old final-norm patch.
+        previous_loader = """                param = final_layernorm_dict[trimmed_name]
+                with torch.no_grad():
+                    default_weight_loader(param, w)
+"""
+        hook_loader = """                param = final_layernorm_dict[trimmed_name]
+                with torch.no_grad():
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, w)
+"""
+        original_content = content
+        content = content.replace(previous_loader, hook_loader, 1)
         if all(new in content for _, new in replacements):
+            if content != original_content:
+                write_back(content)
             return
         if any(content.count(old) != 1 for old, _ in replacements):
             raise RuntimeError(
@@ -960,6 +1000,34 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
             content = content.replace(old, new, 1)
         write_back(content)
     logger.info("Patched checkpoint-backed Super Omni final vision LayerNorm.")
+
+
+def _patch_vllm_nano_vl_projector_loader(logger) -> None:
+    """Backport hook-aware Nano Nemotron VL projector loading."""
+    # TODO: Remove when vLLM #61287 is merged and main pins a fixed version.
+    # https://github.com/vllm-project/vllm/pull/61287
+    file_to_patch = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
+    old_snippet = """                param = adapter_dict[trimmed_name]
+                with torch.no_grad():
+                    default_weight_loader(param, w)
+"""
+    new_snippet = """                param = adapter_dict[trimmed_name]
+                with torch.no_grad():
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, w)
+"""
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if new_snippet in content:
+            return
+        if content.count(old_snippet) != 1:
+            raise RuntimeError(
+                "Nano Nemotron VL projector patch requires the pinned vLLM loader "
+                "or its hook-aware equivalent"
+            )
+        write_back(content.replace(old_snippet, new_snippet, 1))
+    logger.info("Patched Nano Nemotron VL projector parameter loading.")
 
 
 def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
@@ -1332,6 +1400,127 @@ from torch import nn"""
     return True
 
 
+def _radio_has_identity_checkpoint(model_config: "ModelConfig") -> bool:
+    """Verify the original checkpoint's optional, absent identity LayerScales."""
+    config = model_config.hf_config
+    vision = getattr(config, "vision_config", None)
+    if (
+        getattr(vision, "model_type", None) != "radio"
+        or getattr(vision, "layerscale_value", None) != 1.0
+    ):
+        return False
+
+    source = Path(model_config.model)
+    index = source / "model.safetensors.index.json"
+    if source.is_dir():
+        if not index.is_file():
+            return False
+    else:
+        revision = getattr(config, "_commit_hash", None) or model_config.revision
+        if (
+            not isinstance(revision, str)
+            or len(revision) != 40
+            or any(char not in "0123456789abcdefABCDEF" for char in revision)
+        ):
+            return False
+        # Only inspect an already cached immutable revision; never fetch here.
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(
+            model_config.model, "model.safetensors.index.json", revision=revision
+        )
+        if not isinstance(cached, str):
+            return False
+        index = Path(cached)
+    with index.open() as handle:
+        keys = json.load(handle)["weight_map"]
+    vision_keys = [key for key in keys if key.startswith("vision_model.")]
+    return bool(vision_keys) and not any(
+        part in ("ls1", "ls2", "layer_scale1", "layer_scale2", "lambda1")
+        for key in vision_keys
+        for part in key.split(".")
+    )
+
+
+def finalize_radio_layerscale_loading(
+    model: "torch.nn.Module", model_config: "ModelConfig"
+) -> None:
+    """Complete RADIO scales once all explicit refit weights have been loaded."""
+    unwrap = getattr(model, "unwrap", None)
+    if callable(unwrap):
+        model = cast("torch.nn.Module", unwrap())
+    radio = getattr(model, "vision_model", None)
+    initialized = getattr(radio, "_nemo_rl_loaded_layerscale", None)
+    if initialized is None:
+        return
+
+    # Read native metadata only while a real layerwise refit is active.
+    import torch
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    updates = []
+    for prefix, layer in radio.named_modules():
+        names = {name for name in ("ls1", "ls2") if name in layer._parameters}
+        if not names:
+            continue
+        info = get_layerwise_info(layer)
+        if info.kernel_tensors is None:
+            continue
+        pending = {name for name, _ in info.loaded_weights}
+        for name in names - pending:
+            full_name = f"{prefix}.{name}"
+            if full_name not in initialized:
+                updates.append((full_name, layer, name, None))
+            elif pending:
+                # A partially updated parent must retain its omitted partner.
+                updates.append((full_name, layer, name, info.kernel_tensors[0][name]))
+
+    if any(weight is None for _, _, _, weight in updates):
+        if not _radio_has_identity_checkpoint(model_config):
+            raise ValueError(
+                "RADIO refit omitted uninitialized LayerScale weights without a "
+                "verified identity-only checkpoint; export the explicit policy scales"
+            )
+    for full_name, layer, name, weight in updates:
+        param = getattr(layer, name)
+        if weight is None:
+            info = get_layerwise_info(layer)
+            weight = torch.ones_like(info.kernel_tensors[0][name])
+        param.weight_loader(param, weight)
+        initialized.add(full_name)
+
+
+@contextmanager
+def radio_layerscale_full_reload(
+    model: "torch.nn.Module", model_config: "ModelConfig"
+) -> Iterator[None]:
+    """Finish buffered RADIO vision loading before the runner finalizes reload."""
+    radio = getattr(model, "vision_model", None)
+    if getattr(getattr(radio, "config", None), "model_type", None) != "radio":
+        yield
+        return
+    # vLLM models add load_weights beyond nn.Module's declared interface.
+    reloadable = cast(Any, model)
+    original = reloadable.load_weights
+    had_override = "load_weights" in vars(model)
+
+    def load_weights(
+        weights: Iterable[tuple[str, "torch.Tensor"]],
+    ) -> set[str] | None:
+        result = original(weights)
+        finalize_radio_layerscale_loading(model, model_config)
+        return result
+
+    reloadable.load_weights = load_weights
+    try:
+        yield
+    finally:
+        if had_override:
+            reloadable.load_weights = original
+        else:
+            del reloadable.load_weights
+
+
 @contextmanager
 def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
     """Temporarily expose nested ModelOpt MoE amax buffers to vLLM's loader.
@@ -1392,6 +1581,7 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
+    _patch_vllm_nano_vl_projector_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 
 
@@ -1460,6 +1650,7 @@ def _apply_vllm_patches(
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
+    _patch_vllm_nano_vl_projector_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
     if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
         patch_logger

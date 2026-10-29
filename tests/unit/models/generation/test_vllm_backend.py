@@ -41,6 +41,7 @@ def _make_collective_update_extension(backend, *, extension_cls: type | None = N
         ),
         drafter=None,
     )
+    ext.model_runner.get_model = lambda: ext.model_runner.model
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
