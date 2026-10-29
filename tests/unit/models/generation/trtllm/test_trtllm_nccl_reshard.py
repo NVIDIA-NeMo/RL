@@ -266,7 +266,6 @@ def test_received_experts_reload_in_batches(monkeypatch):
         for e in (2, 3)
         for proj in ("gate_proj", "up_proj")
     }
-    assert ext._refit_stats["bulk_reload_calls"] == 1
     # Budget 0: every stack loads on the spot, as before batching.
     model_loader.reload.reset_mock()
     monkeypatch.setenv("NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES", "0")
@@ -320,7 +319,6 @@ def test_received_experts_load_directly_into_moe_modules(monkeypatch):
         (moe_module, "experts", ["2.down_proj.weight", "3.down_proj.weight"], True)
     ]
     model_loader.reload.assert_not_called()
-    assert ext._refit_stats["bulk_reload_calls"] == 1
     # A prefix no MoE module owns falls back to the generic loader.
     monkeypatch.setattr(ext, "_moe_weight_owners", lambda: {})
     ctx = spec.pre(spec.base)

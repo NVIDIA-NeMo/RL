@@ -165,7 +165,7 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.path_utils import maybe_enable_msc
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.tensor_ops import pad_and_concat
-from nemo_rl.utils.timer import Timer, refit_timing_log_enabled
+from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     _INDIVIDUAL_EXPERT_RE,
     _STR_TO_DTYPE,
@@ -4485,26 +4485,13 @@ class MegatronPolicyWorkerImpl(
             streams = {layout_indices[0]: materialize_stream}
         else:
             streams = {idx: torch.cuda.Stream() for idx in layout_indices}
-        bulk_t0 = time.perf_counter()
-        bulk_start = torch.cuda.Event(enable_timing=True)
-        bulk_start.record(materialize_stream)
         self._send_bulk_params(layout_indices, streams, materialize_stream)
-        layout_done = {}
-        for idx in layout_indices:
-            event = torch.cuda.Event(enable_timing=True)
-            event.record(streams[idx])
-            layout_done[idx] = event
         for idx in layout_indices:
             sync_stream_within(
                 streams[idx],
                 refit_timeout_s,
                 f"the bulk parameter transfer (generation layout {idx})",
             )
-        bulk_s = time.perf_counter() - bulk_t0
-        per_layout = {
-            idx: bulk_start.elapsed_time(layout_done[idx]) / 1e3
-            for idx in layout_indices
-        }
         # TRT-LLM keeps the cached segments: returning them to the driver here
         # costs seconds inside the refit bubble, and the misc broadcast's packed
         # buffers come out of the caching allocator anyway.
@@ -4516,15 +4503,6 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.current_stream(), refit_timeout_s, "the misc broadcast"
         )
         if torch.distributed.get_rank() == 0:
-            if refit_timing_log_enabled():
-                layouts = " ".join(
-                    f"layout{idx}={sec:.2f}s" for idx, sec in per_layout.items()
-                )
-                print(
-                    f"[nccl_reshard_refit] bulk send (train side): {bulk_s:.2f}s "
-                    f"({layouts})",
-                    flush=True,
-                )
             print(
                 f"[nccl_reshard_refit] misc broadcast (train side): "
                 f"{time.perf_counter() - misc_t0:.2f}s",
@@ -4644,35 +4622,12 @@ class MegatronPolicyWorkerImpl(
             if name in misc_meta
         )
 
-        # Split the misc phase between producing the full tensors (PP broadcast
-        # + TP gather per param) and the packed broadcast itself.
-        produce_s = [0.0]
-        n_params = [0]
-
-        def _timed(it):
-            while True:
-                t0 = time.perf_counter()
-                try:
-                    item = next(it)
-                except StopIteration:
-                    produce_s[0] += time.perf_counter() - t0
-                    return
-                produce_s[0] += time.perf_counter() - t0
-                n_params[0] += 1
-                yield item
-
         packed_broadcast_producer(
-            iterator=_timed(iter(misc_iter)),
+            iterator=misc_iter,
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1].contiguous(),
         )
-        if refit_timing_log_enabled() and torch.distributed.get_rank() == 0:
-            print(
-                f"[nccl_reshard_refit] misc produce (train side): {produce_s[0]:.2f}s "
-                f"over {n_params[0]} params (PP broadcast + TP gather, host wall)",
-                flush=True,
-            )
 
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         """Put the model in eval mode for logprob inference.
