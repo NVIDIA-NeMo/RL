@@ -56,7 +56,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_non_student_seq_keys,
     xtoken_off_policy_distillation_train,
 )
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
@@ -977,6 +977,67 @@ def test_setup_rejects_same_vocab_teacher_with_mismatched_vocab():
     assert mock_cluster.call_count == 0
 
 
+@pytest.mark.parametrize(
+    "student_cp,student_div,teacher_cp,teacher_div,same_vocab,match",
+    [
+        (
+            2,
+            1,
+            1,
+            8,
+            False,
+            r"^policy\.make_sequence_length_divisible_by \(1\) must be a multiple "
+            r"of policy\.automodel_cfg\.context_parallel_size \(2\)\.$",
+        ),
+        (
+            1,
+            8,
+            2,
+            1,
+            False,
+            r"^teachers\.0\.make_sequence_length_divisible_by \(1\) must be a "
+            r"multiple of its automodel_cfg\.context_parallel_size \(2\)\.$",
+        ),
+        # A same-vocab teacher forwards the student batch, so its own divisor
+        # does not apply.
+        (
+            1,
+            1,
+            2,
+            2,
+            True,
+            r"^teachers\.0 is a same-vocab teacher, which forwards the student "
+            r"batch: policy\.make_sequence_length_divisible_by \(1\) must be a "
+            r"multiple of its automodel_cfg\.context_parallel_size \(2\)\.$",
+        ),
+    ],
+)
+def test_setup_rejects_divisor_not_divisible_by_context_parallel_size(
+    student_cp, student_div, teacher_cp, teacher_div, same_vocab, match
+):
+    cfg = _make_master_config()
+    cfg.policy["automodel_cfg"]["context_parallel_size"] = student_cp
+    cfg.policy["make_sequence_length_divisible_by"] = student_div
+    teacher = cfg.teachers[0]
+    teacher.automodel_cfg["context_parallel_size"] = teacher_cp
+    teacher.make_sequence_length_divisible_by = teacher_div
+    if same_vocab:
+        teacher.aligner.projection_matrix_path = None
+    with (
+        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
+        pytest.raises(AssertionError, match=match),
+    ):
+        setup(
+            cfg,
+            student_tokenizer=_make_tokenizer(32),
+            teacher_tokenizers=[_make_tokenizer(32 if same_vocab else 24)],
+            train_dataset=MagicMock(),
+            val_dataset=None,
+        )
+    # The check fires before any cluster/policy construction.
+    assert mock_cluster.call_count == 0
+
+
 # ---------------------------------------------------------------------------
 # averaged_logits direct-KL guard
 # ---------------------------------------------------------------------------
@@ -993,7 +1054,7 @@ def _bare_averaged_logits_loss_fn(projection_matrix_paths):
     return fn
 
 
-def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
+def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path(monkeypatch):
     # Two cross-tokenizer teachers (non-null projection paths) whose logits
     # happen to share a shape must NOT take the direct per-position KL fast
     # path: it assumes the student's tokenizer and would mismatch the
@@ -1011,11 +1072,14 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
 
     def _fast_path(*args, **kwargs):
         raise AssertionError(
-            "direct_full_vocab_kl reached for cross-tokenizer teachers"
+            "same_tokenizer_full_vocab_kl reached for cross-tokenizer teachers"
         )
 
     fn._compute_teacher_kd = _fallback
-    fn._direct_full_vocab_kl = _fast_path
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.loss_functions.same_tokenizer_full_vocab_kl",
+        _fast_path,
+    )
 
     # Equal-shaped teacher logits (the misleading signal) but teacher length 13
     # vs the student's length 10.
@@ -1037,35 +1101,47 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
     assert total_kd.item() == pytest.approx(2.0 * 1.0 + 3.0 * 2.0)
 
 
-def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path():
+def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
     # All-null projection paths => genuine same-tokenizer teachers, so the
     # averaging + single direct-KL fast path is the correct branch.
     fn = _bare_averaged_logits_loss_fn([None, None])
+    fn.temperature = 2.0
+    fn.reverse_kl = True
+    fn.student_vocab_size = 30
 
-    fast_calls = []
+    seen = []
 
-    def _fast_path(*args, **kwargs):
-        fast_calls.append(1)
+    def _fast_path(student, teacher, **kwargs):
+        seen.append(kwargs)
         return torch.tensor(1.23)
 
-    fn._direct_full_vocab_kl = _fast_path
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.loss_functions.same_tokenizer_full_vocab_kl",
+        _fast_path,
+    )
     fn._compute_teacher_kd = MagicMock(
         side_effect=AssertionError("fallback reached for same-tokenizer teachers")
     )
 
     logits = torch.zeros(2, 10, 32)
     teacher_full = {0: logits.clone(), 1: logits.clone()}
+    align, global_valid_toks = MagicMock(), torch.tensor(20.0)
 
     kd, metrics = fn._averaged_logits_kd(
         logits,
         {},
         teacher_full,
-        {0: MagicMock()},
-        torch.tensor(20.0),
+        {0: align},
+        global_valid_toks,
         tp_group=None,
         cp_group=None,
     )
-    assert fast_calls == [1]  # fast path taken exactly once
+    (kwargs,) = seen  # fast path taken exactly once
+    assert kwargs["kd_mask"] is align.student_token_mask
+    assert kwargs["sample_mask"] is align.sample_mask
+    assert kwargs["num_kd_tokens"] is global_valid_toks
+    assert kwargs["vocab_size"] == 30
+    assert (kwargs["temperature"], kwargs["reverse_kl"]) == (2.0, True)
     assert "kl_loss" in metrics
     assert kd.item() == pytest.approx(1.23)
 
