@@ -3023,6 +3023,17 @@ class SingleControllerActor:
         # the empty step.
         floor = math.ceil(num_prompts_per_step * fraction)
         if target < floor:
+            # Under dynamic sampling a short step is more often an empty spare pool
+            # than a sick fleet, and the two generic causes below send the reader to
+            # the cluster instead. Name the third cause where it is actually read.
+            dynamic_sampling_cause = (
+                " With dynamic sampling on, a third cause is an empty spare pool: a "
+                "filtered group with no spare to draw on is credited short, so raise "
+                "async_rl.rollout_failure.replacement_reserve_prompts to at least "
+                "grpo.num_prompts_per_step."
+                if self._dynamic_sampling_enabled
+                else ""
+            )
             raise RuntimeError(
                 f"training step {step} lost {dropped} of {num_prompts_per_step} prompt "
                 f"group(s), leaving {target}, below the floor of {floor} set by "
@@ -3030,6 +3041,7 @@ class SingleControllerActor:
                 "Either the generation fleet is failing a whole step's worth of "
                 "prompts, or the drop budgets are set too high to catch it: they are "
                 "run-scoped and cannot bound how short a single step gets."
+                f"{dynamic_sampling_cause}"
             )
         return target
 

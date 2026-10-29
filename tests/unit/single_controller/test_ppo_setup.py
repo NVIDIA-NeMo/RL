@@ -600,7 +600,9 @@ def _dynamic_sampling_config(
     sampler: str = "in_order",
     num_generations_per_prompt: int = _NUM_GENERATIONS_PER_PROMPT,
     max_replacements_per_slot: int = 32,
-    replacement_reserve_prompts: int = 1,
+    # A full batch, the size setup stops warning at: the pool is a low-water mark and
+    # one refill diverts exactly one batch, so anything smaller reaches 0 in between.
+    replacement_reserve_prompts: int = _NUM_PROMPTS_PER_STEP,
 ) -> MasterConfig:
     """A GRPO SC config with dynamic sampling on and the knobs it validates."""
     mc = _make_master_config()
@@ -671,6 +673,25 @@ class TestDynamicSamplingValidation:
         )
 
         with pytest.raises(ValueError, match="replacement_reserve_prompts >= 1"):
+            validate_single_controller_config(mc)
+
+    def test_warns_when_the_spare_pool_is_smaller_than_one_batch(self):
+        # The key is a low-water mark and one refill diverts exactly one batch, so
+        # below num_prompts_per_step the pool reaches 0 between refills and groups
+        # filtered in that window shrink their step. A warning, not a raise: how much
+        # headroom a run needs depends on its drop rate, which setup cannot know.
+        mc = _dynamic_sampling_config(
+            replacement_reserve_prompts=_NUM_PROMPTS_PER_STEP - 1
+        )
+
+        with pytest.warns(UserWarning, match="reaches 0 between refills"):
+            validate_single_controller_config(mc)
+
+    def test_does_not_warn_when_the_spare_pool_holds_a_full_batch(self):
+        mc = _dynamic_sampling_config(replacement_reserve_prompts=_NUM_PROMPTS_PER_STEP)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
             validate_single_controller_config(mc)
 
     @pytest.mark.parametrize(

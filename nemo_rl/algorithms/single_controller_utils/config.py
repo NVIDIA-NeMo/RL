@@ -1273,6 +1273,27 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "is never refilled, so every filtered group shrinks its step instead "
                 "of being resampled."
             )
+        # A mark, not a size: _divert_batch_to_reserve refills only once the pool is
+        # below it, and one refill diverts exactly one batch of num_prompts_per_step.
+        # Below that the pool reaches 0 between refills, and the pump cannot top it up
+        # while it is parked in _launch awaiting buffer capacity or the weight-sync
+        # pause. A warning rather than a raise because the pool a run needs depends on
+        # its drop rate, which is only known once it reports zero_variance_fraction.
+        if rollout_failure.replacement_reserve_prompts < algo_cfg.num_prompts_per_step:
+            warnings.warn(
+                f"async_rl.rollout_failure.replacement_reserve_prompts="
+                f"{rollout_failure.replacement_reserve_prompts} is below "
+                f"{algo_prefix}.num_prompts_per_step="
+                f"{algo_cfg.num_prompts_per_step}, so the spare pool reaches 0 "
+                "between refills. Filtering is routine, so a group filtered in that "
+                "window shrinks its step instead of being resampled, and enough of "
+                "them fail the step against "
+                "async_rl.rollout_failure.min_step_batch_fraction. Size it from the "
+                "zero_variance_fraction the run reports: a step needs roughly "
+                f"{algo_prefix}.num_prompts_per_step * p / (1 - p) spares at drop "
+                "rate p.",
+                stacklevel=2,
+            )
         if grpo_cfg.dynamic_sampling_max_replacements_per_slot < 1:
             raise ValueError(
                 f"{algo_prefix}.dynamic_sampling_max_replacements_per_slot must be >= 1 "
