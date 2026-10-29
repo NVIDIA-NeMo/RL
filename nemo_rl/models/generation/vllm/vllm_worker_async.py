@@ -1848,8 +1848,8 @@ class VllmAsyncGenerationWorkerImpl(
         """Token budget for one rollout prompt; 0 means nothing fits.
 
         The configured cap, clipped to the context window and to speculative
-        decoding's lookahead. Shared by ``generate_async`` and the Dynamo engine,
-        so a rollout gets the same budget whichever path serves it.
+        decoding's lookahead. Kept apart from ``generate_async`` so every path that
+        serves a rollout from this engine gives it the same budget.
         """
         max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
         allowed_new_tokens = max(
@@ -1876,8 +1876,8 @@ class VllmAsyncGenerationWorkerImpl(
     ) -> Any:
         """The SamplingParams for one rollout.
 
-        Shared by ``generate_async`` and Dynamo serving, so a rollout is sampled
-        the same way whichever path serves it.
+        Kept apart from ``generate_async`` so every path that serves a rollout
+        from this engine samples it the same way.
 
         Args:
             max_new_tokens: The rollout's budget, from ``_rollout_max_new_tokens``.
