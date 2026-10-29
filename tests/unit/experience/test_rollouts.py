@@ -53,7 +53,12 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
 )
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    Metric,
+    calculate_single_metric,
+    pct,
+    reduce_step,
+)
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutTimeouts,
@@ -2688,7 +2693,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
                             {
                                 "value": "second",
                                 "input_message_log": [
-                                    {"role": "user", "token_ids": [1]}
+                                    {"role": "user", "token_ids": [1, 2]}
                                 ],
                                 "reasoning_token_count": 4,
                                 "response_token_count": 5,
@@ -2760,10 +2765,21 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         {},
     )
     manager._compute_reward_penalty_metrics = lambda counts, num_results: {}
-    manager._compute_rollout_metrics = lambda completions, agent, **_kwargs: {
-        "completion_count": len(completions),
-        "agent": agent,
-    }
+
+    def _compute_metrics(
+        completions: list[str],
+        agent: str,
+        *,
+        prompt_lengths: list[int] | None = None,
+        full_results: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "completion_count": len(completions),
+            "agent": agent,
+            "prompt_lengths": prompt_lengths,
+        }
+
+    manager._compute_rollout_metrics = _compute_metrics
 
     completions, prompt_message_log, metrics = asyncio.run(
         manager._run_rollouts(
@@ -2789,14 +2805,18 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     torch.testing.assert_close(prompt_message_log[0]["token_ids"], torch.tensor([1]))
     assert metrics["completion_count"] == 2
     assert metrics["agent"] == "agent"
-    assert metrics["remote_time"] == 2.0
-    assert metrics["timing/test/routing/group_share/nemo_gym"] == 1
-    assert metrics["reward_score_raw/mean"] == pytest.approx(1.5)
-    assert metrics["reward_rubric_aggregate_valid/mean"] == pytest.approx(1.0)
-    assert metrics["reasoning_tokens_per_sample/mean"] == pytest.approx(3.0)
-    assert metrics["response_tokens_per_sample/mean"] == pytest.approx(4.0)
-    assert metrics["reasoning_response_token_extraction_failure_rate"] == 0.0
-    assert metrics["zero_advantage_group_pct"] == 0.0
+    assert metrics["prompt_lengths"] == [1, 2]
+    reduced = reduce_step(
+        [{key: value for key, value in metrics.items() if isinstance(value, Metric)}]
+    )
+    assert reduced["remote_time"] == 2.0
+    assert reduced["timing/test/routing/group_share/nemo_gym"] == 1
+    assert reduced["reward_score_raw/mean"] == pytest.approx(1.5)
+    assert reduced["reward_rubric_aggregate_valid/mean"] == pytest.approx(1.0)
+    assert reduced["reasoning_tokens_per_sample/mean"] == pytest.approx(3.0)
+    assert reduced["response_tokens_per_sample/mean"] == pytest.approx(4.0)
+    assert reduced["reasoning_response_token_extraction_failure_rate"] == 0.0
+    assert reduced["zero_advantage_group_pct"] == 0.0
 
 
 def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
@@ -2970,7 +2990,20 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
 
     manager._stream_rows = fake_stream_rows
     manager._results_to_completions = lambda _results: ([object()], {})
-    manager._compute_rollout_metrics = lambda *_args, **_kwargs: {}
+
+    def _compute_metrics(
+        completions: list[object],
+        agent: str,
+        *,
+        prompt_lengths: list[int] | None = None,
+        full_results: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        assert len(completions) == 1
+        assert agent == "agent"
+        assert prompt_lengths == [1]
+        return {}
+
+    manager._compute_rollout_metrics = _compute_metrics
     manager._compute_reward_penalty_metrics = lambda *_args: {}
 
     async def run_group():
@@ -2983,10 +3016,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
     metrics = [asyncio.run(run_group())[2] for _ in range(3)]
 
     assert selected == [first, second, first]
-    per_group_metrics = {key: [group[key] for group in metrics] for key in metrics[0]}
-    from nemo_rl.algorithms.grpo import aggregate_rollout_metrics
-
-    aggregated = aggregate_rollout_metrics(per_group_metrics)
+    aggregated = reduce_step(metrics)
     assert aggregated["timing/test/routing/group_share/tools/0"] == pytest.approx(2 / 3)
     assert aggregated["timing/test/routing/group_share/tools/1"] == pytest.approx(1 / 3)
 

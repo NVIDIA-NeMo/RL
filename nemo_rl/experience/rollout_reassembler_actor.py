@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -23,6 +24,13 @@ import ray
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, UNKNOWN_ROLLOUT_ENVIRONMENT
+from nemo_rl.experience.metric_utils import (
+    Metric,
+    RolloutTelemetry,
+    distribution,
+    rollout_environment_metric_component,
+)
 from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
 from nemo_rl.utils.rpc_guard import assert_metadata_only
@@ -56,6 +64,8 @@ class ReassemblyRequest:
     reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
     # Resolved by Gym and persisted with the sealed receipts for teacher routing.
     resolved_agent_name: Optional[str] = None
+    rollout_environment: str = UNKNOWN_ROLLOUT_ENVIRONMENT
+    telemetry: tuple[Optional[RolloutTelemetry], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -92,6 +102,7 @@ class RolloutReassemblerActor:  # pragma: no cover
         dp_config: DataPlaneConfig,
         config: RolloutReassemblerActorConfig,
     ) -> None:
+        self._max_seq_len = config.max_seq_len
         dp_client = build_data_plane_client(dp_config, bootstrap=False)
         self._finalizer = RolloutReassembler(
             dp_client,
@@ -126,6 +137,15 @@ class RolloutReassemblerActor:  # pragma: no cover
     def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
         """Finalize one request without allowing tensor payloads across Ray RPC."""
         assert_metadata_only(request)
+        if request.telemetry and len(request.telemetry) != len(request.rollout_ids):
+            raise ValueError("Finalizer telemetry must align with logical siblings")
+        if any(
+            snapshot is not None
+            and rollout_environment_metric_component(snapshot.environment)
+            != request.rollout_environment
+            for snapshot in request.telemetry
+        ):
+            raise ValueError("Finalizer telemetry environment mismatch")
         if not (
             len(request.rollout_ids)
             == len(request.canonical_sample_ids)
@@ -146,6 +166,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
+            rollout_environment=request.rollout_environment,
             canonical_sample_ids=list(request.canonical_sample_ids),
             reward_checks=list(request.reward_checks)
             if request.reward_checks is not None
@@ -154,6 +175,75 @@ class RolloutReassemblerActor:  # pragma: no cover
             if request.reward_log_contexts is not None
             else None,
         )
+        if result.meta is not None:
+            if request.telemetry and all(s is not None for s in request.telemetry):
+                selected_metrics = []
+                lengths = result.meta.sequence_lengths
+                assert lengths is not None, "Finalized canonical rows require lengths"
+                rewards_by_sample = {
+                    row.sample_id: row.reward for row in result.reward_observations
+                }
+                for snapshot, length, sample_id in zip(
+                    request.telemetry, lengths, result.meta.sample_ids, strict=True
+                ):
+                    assert snapshot is not None
+                    metrics = snapshot.to_metrics()
+                    prefix = f"environment/{request.rollout_environment}"
+                    # Earlier declared snapshots may contain raw rewards. Drop
+                    # only those observations before adding finalized rewards;
+                    # never let rejected placeholders contribute stale values.
+                    for reward_name in ("total_reward", f"{prefix}/total_reward"):
+                        metrics.pop(reward_name, None)
+                        metrics.pop(f"{reward_name}/mean", None)
+                    for fields_prefix in (f"{prefix}/env_extra", snapshot.environment):
+                        fields_key = f"{fields_prefix}/"
+                        if fields_key in metrics:
+                            fields = metrics[fields_key]
+                            metrics[fields_key] = Metric(
+                                [
+                                    {
+                                        key: value
+                                        for key, value in row.items()
+                                        if key != f"{fields_prefix}/reward"
+                                    }
+                                    for row in fields.values
+                                ],
+                                fields.reduce,
+                            )
+                    # Receipts have no token payload: their producer uses a
+                    # placeholder False for truncated. Match the finalizer's
+                    # actual length-cap flag, never log that placeholder.
+                    truncated = int(length == self._max_seq_len)
+                    metrics.update(distribution(f"{prefix}/truncated", [truncated]))
+                    for scope in ("", f"{prefix}/"):
+                        metrics[f"{scope}truncation_rate"] = Metric([truncated], "mean")
+                        metrics[f"{scope}natural_termination_rate"] = Metric(
+                            [1 - truncated], "mean"
+                        )
+                    # Preserve the producer's raw agent alias as well as the
+                    # sanitized environment namespace, including names with '/'.
+                    metrics[f"{snapshot.environment}/truncation_rate"] = Metric(
+                        [truncated], "mean"
+                    )
+                    # Raw receipt rewards precede shaping/penalties. Only valid
+                    # canonical rows have authoritative finalized observations;
+                    # rejected placeholders must not vote in reward statistics.
+                    if sample_id in rewards_by_sample:
+                        reward = rewards_by_sample[sample_id]
+                        metrics.update(distribution(f"{prefix}/total_reward", [reward]))
+                        metrics.update(
+                            distribution(f"{prefix}/env_extra/reward", [reward])
+                        )
+                    selected_metrics.append(metrics)
+                result.meta.extra_info[ROLLOUT_METRICS] = selected_metrics
+            else:
+                # Older recovery sidecars do not contain observations. Do not
+                # present a partial sibling population as a complete distribution.
+                logging.getLogger(__name__).warning(
+                    "Group %s lacks complete rollout telemetry; omitting producer "
+                    "distributions, retaining selected-row validity accounting",
+                    request.group_id,
+                )
         assert_metadata_only(result)
         return result
 
