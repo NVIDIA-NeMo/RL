@@ -18,6 +18,7 @@
 import asyncio
 import copy
 import json
+import logging
 import statistics
 import uuid
 import warnings
@@ -104,6 +105,8 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.utils.routed_experts_codec import slice_routed_experts
 from nemo_rl.utils.timer import Timer
 
+logger = logging.getLogger(__name__)
+
 TokenizerType = PreTrainedTokenizerBase
 
 _REWARD_PENALTY_METRICS = {
@@ -139,6 +142,19 @@ _SHARED_GENRM_METRICS = (
     "genrm_output_tokens_total_per_group",
     "genrm_max_output_tokens_hit_rate_per_group",
 )
+
+# Metric keys of the first-prompt diagnostic of a prompt group, reported by
+# both NeMo-Gym rollout paths (``_postprocess_single_nemo_gym_group`` here and
+# ``AsyncNemoGymRolloutImpl._run_rollouts`` in rollout_manager.py).
+BASELINE_GROUPS_DISTINCT_FIRST_PROMPTS_METRIC = "baseline_groups/distinct_first_prompts"
+BASELINE_GROUPS_LOGICAL_GROUPS_METRIC = "baseline_groups/logical_groups"
+BASELINE_GROUPS_SAMPLES_METRIC = "baseline_groups/samples"
+
+# Agent names whose rollouts were already reported, in this process, for not
+# sharing a first prompt within a logical prompt group. Reported the first time
+# only: a harness that renders a per-rollout identifier does so in every group
+# of every step, and the baseline_groups/* keys carry the per-step signal.
+_DISTINCT_FIRST_PROMPT_WARNED: set[str] = set()
 
 
 def attach_initial_nemo_gym_image_payloads(
@@ -3429,6 +3445,41 @@ def _postprocess_single_nemo_gym_group(
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
     input_ids = batched_flat["token_ids"]
+    # Within one logical prompt group every rollout should start from the same
+    # first prompt. An agent harness that renders a per-rollout identifier (an
+    # id, a URL, a timestamp) into its prompt gives each rollout a distinct
+    # first prompt instead: the group's prefix is never shared across the
+    # engine's prefix cache, and any consumer that keys on the first-prompt
+    # tokens (a per-prompt baseline, a cache, a dedup) sees one group per
+    # rollout. GRPO's baselines key on the explicit group id, so they are not
+    # affected. Compare against the logical prompt groups rather than the row
+    # count: validation and distillation batches legitimately hold one rollout
+    # per prompt. _prepare_nemo_gym_rows stamps one group id per logical prompt
+    # group; rows handed in by a direct caller without the key form one group.
+    distinct_first_prompts = int(torch.unique(input_ids, dim=0).shape[0])
+    logical_groups = len({row.get(NEMO_GYM_GROUP_ID_KEY) for row in nemo_gym_rows})
+    rollout_metrics[BASELINE_GROUPS_DISTINCT_FIRST_PROMPTS_METRIC] = (
+        distinct_first_prompts
+    )
+    rollout_metrics[BASELINE_GROUPS_LOGICAL_GROUPS_METRIC] = logical_groups
+    rollout_metrics[BASELINE_GROUPS_SAMPLES_METRIC] = len(results)
+    if distinct_first_prompts > logical_groups:
+        unreported_agents = sorted(
+            {row["agent_ref"]["name"] for row in nemo_gym_rows}
+            - _DISTINCT_FIRST_PROMPT_WARNED
+        )
+        if unreported_agents:
+            _DISTINCT_FIRST_PROMPT_WARNED.update(unreported_agents)
+            logger.warning(
+                "%d NeMo-Gym rollouts form %d logical prompt group(s) but have %d "
+                "distinct first prompts, so the rollouts of a group do not share a "
+                "prompt prefix. Check that per-rollout identifiers are not changing "
+                "the agent harness prompt (agent(s) %s; reported once per agent).",
+                len(results),
+                logical_groups,
+                distinct_first_prompts,
+                unreported_agents,
+            )
 
     final_batch = BatchedDataDict[DatumSpec](
         {
