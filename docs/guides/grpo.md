@@ -405,14 +405,14 @@ baseline and token-level batch normalization, the `env_baseline` behind the
 `grpo.policy_failure_kinds` defaults to the Gym kinds the policy causes:
 `agent_timeout`, `agent_command_not_allowed`, `agent_limit`,
 `agent_invalid_output` and `model_context_limit`. Matching is exact, so an
-environment's namespaced `<server>:<kind>` names can be added. Only
+environment's namespaced `<server>:<kind>` names can be listed too. A recipe
+that sets the list replaces it, so list the defaults with any new name. Only
 `exclude_infra` reads the list; there is no list of infrastructure kinds,
 because any kind not known to be the policy's fault, including kinds added to
 Gym later, is treated as infrastructure. The rollout builders apply the rule:
 they give an infrastructure-failed row the dataset weight of an unusable row
-(`0`, see below), so every trainer leaves it out of the statistics; the legacy,
-asynchronous and TransferQueue rollouts also report its share as
-`infra_failure_sample_rate`. It never trains
+(`0`, see below), so every trainer leaves it out of the statistics and reports
+its share as `infra_failure_sample_rate`. It never trains
 either way, because `mask_sample` already removes it from the loss. With
 `env.should_mask_flagged_samples: false` nothing is masked, so nothing is an
 infrastructure failure. `exclude_infra` is opt-in: the default, `include`, keeps

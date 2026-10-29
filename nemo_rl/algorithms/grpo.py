@@ -386,7 +386,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Gym failure kinds (the verify response's top-level failure_kind) that the
     # policy caused. Under "exclude_infra" an environment-masked row with one of
     # these kinds votes; any other kind, or none, is an infrastructure failure.
-    # Exact match, so namespaced "<server>:<kind>" names may be listed. The
+    # Exact match, namespaced "<server>:<kind>" names included. A recipe that
+    # sets this list replaces it, so list the defaults with any new name. The
     # other policies ignore it.
     policy_failure_kinds: list[str] = Field(
         default_factory=lambda: list(DEFAULT_POLICY_FAILURE_KINDS)

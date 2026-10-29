@@ -675,6 +675,10 @@ class RolloutReassembler:
                 else 0.0
             ),
         }
+        if infra_failure is not None:
+            # grpo.masked_reward_policy=exclude_infra: the same flags give
+            # these rows a sample_mask of 0 below.
+            metrics["infra_failure_sample_rate"] = sum(infra_failure) / len(rows)
         # Per-row counts are pooled by the consuming controller once per
         # committed group, alongside the retained reward observations;
         # rejected placeholders never enter this population.

@@ -292,13 +292,18 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
 
 
-@pytest.mark.parametrize("infra_failure, expected", [(None, 0.25), ([True], 0.0)])
+@pytest.mark.parametrize(
+    "infra_failure, expected, expected_rate",
+    [(None, 0.25, None), ([True], 0.0, 1.0), ([False], 0.25, 0.0)],
+)
 def test_finalize_group_zeroes_infra_failure_weight(
-    tq_client, partitions, infra_failure, expected
+    tq_client, partitions, infra_failure, expected, expected_rate
 ):
     """Under exclude_infra the dispatcher flags an infrastructure-failed row;
     it publishes with the dataset weight of an unusable row (0), as the native
-    payload path does, while mask_sample still rides along unchanged."""
+    payload path does, while mask_sample still rides along unchanged. The
+    group reports the flagged share as infra_failure_sample_rate, like the
+    other trainers."""
     group_id = "grp_infra"
     receipt, expected_row = _stage_fixture(
         tq_client, "worked_example", rollout_id=f"{group_id}_g0"
@@ -321,6 +326,7 @@ def test_finalize_group_zeroes_infra_failure_weight(
     rows = _fetch_rows(tq_client, [f"{group_id}_g0"])
     assert torch.as_tensor(rows["sample_mask"]).flatten().tolist() == [expected]
     assert torch.as_tensor(rows["mask_sample"]).flatten().tolist() == [True]
+    assert finalized.metrics.get("infra_failure_sample_rate") == expected_rate
 
 
 def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):

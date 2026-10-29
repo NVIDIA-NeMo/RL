@@ -911,6 +911,12 @@ def test_rollout_manager_forwards_mask_env_flagged_samples():
     reward_penalty_config = {"penalize_empty_final_answer": True}
     manager = RolloutManager(**common, reward_penalty_config=reward_penalty_config)
     assert manager._impl._reward_penalty_config is reward_penalty_config
+    # grpo.masked_reward_policy=exclude_infra: token-capture finalization reads
+    # the kinds from the manager itself (generate_for_finalization).
+    assert RolloutManager(**common)._policy_failure_kinds is None
+    kinds = frozenset({"agent_timeout"})
+    manager = RolloutManager(**common, policy_failure_kinds=kinds)
+    assert manager._policy_failure_kinds == kinds
 
 
 @pytest.mark.parametrize("use_nemo_gym", [False, True], ids=["native", "nemo_gym"])
@@ -2178,6 +2184,7 @@ class TestGenerateForFinalizationFlow:
         # Only grpo.masked_reward_policy=exclude_infra asks for the flags.
         assert request.infra_failure is None
 
+    @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
     @pytest.mark.parametrize(
         "policy_failure_kinds, expected",
         [
@@ -2185,7 +2192,9 @@ class TestGenerateForFinalizationFlow:
             (None, None),
         ],
     )
-    def test_request_carries_infra_failure_flags(self, policy_failure_kinds, expected):
+    def test_request_carries_infra_failure_flags(
+        self, policy_failure_kinds, expected, granularity
+    ):
         """The receipt path classifies masks like the native payload path: a
         mask with no failure_kind (OSWorld's evaluator error) is an
         infrastructure failure, a listed policy kind is not, and an unmasked
@@ -2200,6 +2209,7 @@ class TestGenerateForFinalizationFlow:
                 {"mask_sample": False, "failure_kind": "judge_failed"},
             ],
             policy_failure_kinds=policy_failure_kinds,
+            recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
         )
 
         request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))

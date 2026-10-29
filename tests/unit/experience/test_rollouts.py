@@ -2048,6 +2048,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
 
     def _postprocess_group(**kwargs):
         assert kwargs["log_full_result_tables"] is False
+        assert kwargs["policy_failure_kinds"] == frozenset({"agent_timeout"})
         assert all(
             row["agent_ref"] == {"name": "agent"} for row in kwargs["nemo_gym_rows"]
         )
@@ -2116,6 +2117,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
             },
             num_generations=2,
             log_full_result_tables=False,
+            policy_failure_kinds=frozenset({"agent_timeout"}),
             deduplicate_multimodal_data=True,
             debug_payload_metrics=True,
         ):
@@ -2589,6 +2591,7 @@ def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
         assert kwargs["log_full_result_tables"] is False
         assert kwargs["deduplicate_multimodal_data"] is True
         assert kwargs["debug_payload_metrics"] is True
+        assert kwargs["policy_failure_kinds"] == frozenset({"agent_timeout"})
         yield expected
 
     monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_stream)
@@ -2601,6 +2604,7 @@ def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
         generation_config={},
         log_full_result_tables=False,
         num_generations_per_prompt=2,
+        policy_failure_kinds=frozenset({"agent_timeout"}),
         deduplicate_multimodal_data=True,
         debug_payload_metrics=True,
     )

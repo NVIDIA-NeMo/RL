@@ -9359,7 +9359,7 @@ def test_tq_pct_diagnostics_use_the_statistics_mask(
     )
 
 
-@pytest.mark.parametrize("reward_policy", ["exclude", "include"])
+@pytest.mark.parametrize("reward_policy", ["exclude", "include", "exclude_infra"])
 @pytest.mark.parametrize("mask_flagged", [True, False])
 def test_tq_forwards_should_mask_flagged_samples(
     mock_grpo_components,
@@ -9411,6 +9411,12 @@ def test_tq_forwards_should_mask_flagged_samples(
     )
     assert len(gym_calls) == 1
     assert gym_calls[0].get("mask_env_flagged_samples", True) is mask_flagged
+    # Only exclude_infra asks Gym ingestion to zero infrastructure-failed rows.
+    assert gym_calls[0]["policy_failure_kinds"] == (
+        frozenset(cfg.grpo.policy_failure_kinds)
+        if reward_policy == "exclude_infra"
+        else None
+    )
     loss_mask = torch.tensor([1.0, 1.0, 1.0, float(not mask_flagged)])
     # Under exclude the worker logprob passes drop a flagged row as well.
     torch.testing.assert_close(
@@ -9683,3 +9689,40 @@ def test_trainers_infra_masked_reward_never_moves_valid_siblings(
     if policy != "include":
         # Rewards [1, 0] among the voting rows: the 1 is above its baseline.
         assert (advantages_at_0[0] > 0).all() and (advantages_at_0[1] < 0).all()
+
+
+@pytest.mark.parametrize("policy", ["exclude_infra", "include", "exclude"])
+def test_grpo_train_forwards_policy_failure_kinds_to_gym_rollout(
+    mock_grpo_components, policy: str
+) -> None:
+    """The legacy loop asks Gym ingestion to zero infrastructure-failed rows
+    only under exclude_infra (the other trainers: see
+    ``test_tq_forwards_should_mask_flagged_samples``)."""
+    cfg = mock_grpo_components["master_config"]
+    cfg.grpo.masked_reward_policy = policy
+    cfg.logger.wandb_enabled = False
+    cfg.logger.wandb = WandbConfig.model_construct()
+    cfg.env = {}
+    batch = _osworld_evaluator_error_batch(mock_grpo_components, policy, 0.0)
+    policy_mock = mock_grpo_components["policy"]
+    policy_mock.get_logprobs.side_effect = lambda data, **_kw: {
+        "logprobs": torch.zeros_like(data["token_mask"], dtype=torch.float32)
+    }
+    policy_mock.get_reference_policy_logprobs.side_effect = lambda data, **_kw: {
+        "reference_logprobs": torch.zeros_like(data["token_mask"], dtype=torch.float32)
+    }
+    gym_rollout = MagicMock(
+        return_value=SimpleNamespace(
+            final_batch=batch, rollout_metrics={"mean_gen_tokens_per_sample": 2.0}
+        )
+    )
+    with (
+        patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True),
+        patch("nemo_rl.algorithms.grpo.run_nemo_gym_rollout_sync", gym_rollout),
+    ):
+        _run_grpo_train_step_on_batch(mock_grpo_components, grpo_train, batch)
+
+    gym_rollout.assert_called_once()
+    assert gym_rollout.call_args.kwargs["policy_failure_kinds"] == (
+        frozenset(cfg.grpo.policy_failure_kinds) if policy == "exclude_infra" else None
+    )

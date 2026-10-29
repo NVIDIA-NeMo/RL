@@ -1261,6 +1261,21 @@ class TQReplayBuffer:
             per_token_multimodal_fields=self._per_token_multimodal_fields,
             policy_failure_kinds=self._policy_failure_kinds,
         )
+        rollout_metrics = dict(record.rollout_metrics)
+        if self._policy_failure_kinds is not None:
+            from nemo_rl.experience.rollouts import infra_failure_flags
+
+            # grpo.masked_reward_policy=exclude_infra: the same rows
+            # record_to_train_batch just gave a sample_mask of 0.
+            rollout_metrics["infra_failure_sample_rate"] = (
+                infra_failure_flags(
+                    (c.env_extras for c in record.completions),
+                    self._policy_failure_kinds,
+                )
+                .float()
+                .mean()
+                .item()
+            )
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=start_weight_version,
@@ -1294,7 +1309,7 @@ class TQReplayBuffer:
                     sample_ids=list(sample_ids),
                     fields=list(fields.keys()),
                     sequence_lengths=[int(s) for s in lengths.tolist()],
-                    extra_info={ROLLOUT_METRICS: [dict(record.rollout_metrics)]},
+                    extra_info={ROLLOUT_METRICS: [rollout_metrics]},
                     tags=[dict(t) for t in tags],
                 )
 
