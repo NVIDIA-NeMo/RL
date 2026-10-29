@@ -33,6 +33,15 @@ env:
     config_paths:
       - resources_servers/math/configs/math.yaml
       - responses_api_agents/simple_agent/configs/simple_agent.yaml
+    # Driver-side knobs, read by the rollout loop in
+    # nemo_rl/experience/rollouts.py (synchronous GRPO, the asynchronous
+    # trajectory collector, PPO, distillation) and never forwarded to Gym. The
+    # single-controller rollout manager does not read the first two: it bounds a
+    # rollout with rollout_timeout_s and re-dispatches rows under max_row_attempts.
+    # All three are off by default: no polling, one dispatch per row, no hook.
+    health_check_interval_seconds: null  # poll Gym's servers after this long without a completed row
+    max_infra_attempts_per_rollout: 1    # dispatches one row may use after a /run infrastructure failure
+    rollout_metrics_hook: null           # dotted path of a callable(rows, full_results) -> {name: number}
 
 logger:
   wandb:
@@ -40,6 +49,61 @@ logger:
     # result payloads can produce many large W&B Table artifacts.
     log_nemo_gym_full_result_tables: false
 ```
+
+`max_infra_attempts_per_rollout` is the number of dispatches one row may use. A
+`/run` that failed at the infrastructure level comes back from NeMo Gym's
+collector as a failure marker; the row is sent again as a fresh session while
+the other rows keep running, and the same failure ends the step once the budget
+is spent. A re-dispatch picks its engine the way the first dispatch did, by
+hashing a fresh session id in NeMo Gym's `vllm_model`, so pair a budget above
+one with `route_around_failing_endpoints: true` in that server's configuration.
+Without it every retry lands on a failed engine with probability one in the
+number of engines, and a step with many rows on a dead engine still fails. An
+engine that refuses connections produces no failure marker at all: NeMo Gym's
+internal client retries a refused connection without bound unless an
+`endpoint_file` is configured, and its session sets no total deadline, so such a
+row never arrives and the rollout's deadline, not this budget, ends the step.
+`health_check_interval_seconds` ends it sooner: after that long without a
+completed row, every Gym actor's `health_check` runs with a bounded probe, and a
+dead or unresponsive actor fails the rollout with a transport error.
+
+Both settings belong to the rollout loop in `nemo_rl/experience/rollouts.py`,
+which synchronous GRPO, the asynchronous trajectory collector, PPO and
+distillation share. The single-controller rollout manager
+(`AsyncNemoGymRolloutImpl`) reads neither: it bounds a prompt group with
+`rollout_timeout_s` and re-dispatches failed rows under `max_row_attempts`, both
+under its own `rollout_failure` configuration.
+
+`rollout_metrics_hook` names a callable imported in the process that runs the
+rollout loop (under asynchronous GRPO that is the trajectory collector actor).
+It is called once per rollout group with the group's input rows and, aligned
+with them, each rollout's `full_result` mapping, and returns metrics merged
+into the group's rollout metrics after every built-in metric of the group; the
+timing and routing keys are added afterwards. The group is one prompt's
+rollouts under the asynchronous collector and the single-controller path, and
+the whole step batch under the synchronous entry point
+`run_nemo_gym_rollout_sync`; the hook also runs on validation batches, whose
+keys appear under `val/`. A hook that raises or returns something other than a
+mapping is warned once and contributes nothing to that group, and a value the
+step aggregation cannot average is dropped with one warning; the rollout never
+fails because of the hook. The full contract is documented on
+`get_nemo_gym_rollout_metrics_hook` in `nemo_rl/experience/rollouts.py`.
+
+The per-agent result metrics (`<agent>/<field>/mean` and the other statistics
+`calculate_single_metric` emits) aggregate the union of the numeric fields over
+the agent's rollouts, and the mean divides by the number of rollouts covered,
+so a field only some rollouts carry averages below its own minimum. While
+`env.should_mask_flagged_samples` is on, an environment-masked rollout
+(`mask_sample` on the result or under its `instance_config`) carries
+placeholder values and leaves every per-agent value metric; `<agent>/mask_sample/mean`
+is the masked share over every rollout, and an agent whose rollouts in a group
+are all masked emits only that share, so a `checkpointing.metric_name` that
+names a per-agent key fails the save of a step whose every group is fully
+masked. `total_reward/*`, `truncation_rate`, `<agent>/truncation_rate`,
+`<agent>/total_tokens_per_sample` and `<agent>/gen_tokens_per_sample` still
+count every rollout. With the gate off the masked rollouts vote like any other,
+since the operator has declared them worth training on. The hook receives every
+rollout's `full_result`, masked ones included.
 
 When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct
 the per-agent `full_result` Tables. This prevents those payloads from entering
