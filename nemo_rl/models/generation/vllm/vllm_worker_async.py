@@ -757,7 +757,10 @@ class VllmAsyncGenerationWorkerImpl(
         context. The dict itself is never mutated: the admission is the typed,
         read-only contract that the prefix resolution and ``begin_call`` share.
         """
-        context = getattr(request, "ng_capture", None)
+        return self._parse_capture_admission(getattr(request, "ng_capture", None))
+
+    def _parse_capture_admission(self, context: Any) -> Any | None:
+        """``_capture_admission`` for a raw ``ng_capture`` context (Dynamo's annotation)."""
         if self.token_capture is None or not context:
             return None
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.

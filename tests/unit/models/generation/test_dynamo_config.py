@@ -25,6 +25,7 @@ from nemo_rl.models.generation.dynamo.config import (
     dynamo_cfg,
     dynamo_chat_template,
     dynamo_parsers,
+    native_default_chat_template_kwargs,
 )
 
 
@@ -117,7 +118,15 @@ def test_frontend_argv_is_runtime_owned() -> None:
         host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=cfg
     )
     assert argv[argv.index("--router-mode") + 1] == "kv"
+    # Gym names a token-capture call's session; keep the session on one engine.
+    assert argv[argv.index("--router-session-affinity-ttl-secs") + 1] == "1800"
     assert argv[-2:] == ["--foo", "1"]
+    no_affinity = DynamoCfg.model_validate(
+        {"frontend_args": {"session_affinity_ttl_secs": None}}
+    )
+    assert "--router-session-affinity-ttl-secs" not in build_dynamo_frontend_argv(
+        host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=no_affinity
+    )
 
     clashing = DynamoCfg.model_validate(
         {"frontend_args": {"extra_cli_args": ["--http-port", "9"]}}
@@ -173,9 +182,16 @@ def test_a_parser_plugin_without_a_dynamo_parser_is_rejected_at_startup() -> Non
         configure_generation_config(config, _Tokenizer())
 
 
-def test_chat_template_follows_the_native_server() -> None:
-    config = _serving(chat_template="templates/chat.jinja")
+def test_chat_template_and_default_kwargs_follow_the_native_server() -> None:
+    config = _serving(
+        chat_template="templates/chat.jinja",
+        default_chat_template_kwargs={"enable_thinking": False},
+    )
     assert dynamo_chat_template(config) == "templates/chat.jinja"
+    assert native_default_chat_template_kwargs(config) == {"enable_thinking": False}
+    # The older spelling the native server also accepts.
+    legacy = _serving(chat_template_kwargs={"enable_thinking": True})
+    assert native_default_chat_template_kwargs(legacy) == {"enable_thinking": True}
     assert dynamo_chat_template(_serving()) is None
 
 
@@ -196,3 +212,11 @@ def test_chat_settings_the_frontend_has_no_counterpart_for_are_rejected(
         _serving(chat_template_content_format="auto", enable_auto_tools=True),
         _Tokenizer(),
     )
+
+
+def test_a_bearer_token_is_rejected_because_the_frontend_checks_none() -> None:
+    config = _vllm_config(dynamo=True)
+    config["vllm_cfg"]["http_server_api_key_required"] = True
+
+    with pytest.raises(ValueError, match="checks no bearer token"):
+        configure_generation_config(config, _Tokenizer())

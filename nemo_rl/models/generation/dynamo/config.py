@@ -67,6 +67,12 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
         "least-loaded",
         "device-aware-weighted",
     ] = "kv"
+    # Idle TTL in seconds for keeping one session on one engine, or None to
+    # disable it. NeMo-Gym names the session on token-capture calls only (its
+    # rollout id), as the native backend pins each Gym session to one server; the
+    # engine splices a call's staged prefix after routing, so the KV router alone
+    # cannot see where that prefix is cached.
+    session_affinity_ttl_secs: PositiveInt | None = 1800
     extra_cli_args: list[str] = Field(default_factory=list)
 
 
@@ -79,6 +85,7 @@ class DynamoCfg(BaseModel, extra="forbid"):
     # NRL_VLLM_ASYNC_TIMEOUT_SECONDS. A timeout fails the attempt as a native one
     # does (GenerationUnavailable), and the rollout retry policy re-dispatches it
     # (SingleController: async_rl.rollout_failure.max_infra_attempts_per_prompt).
+    # NeMo-Gym's own calls keep Gym's timeouts.
     request_timeout_s: PositiveFloat = 900.0
     worker_args: DynamoWorkerArgs = Field(default_factory=DynamoWorkerArgs)
     frontend_args: DynamoFrontendArgs = Field(default_factory=DynamoFrontendArgs)
@@ -187,6 +194,21 @@ def dynamo_chat_template(generation_config: Mapping[str, Any]) -> str | None:
         return configured
     serving = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs") or {}
     return serving.get("chat_template")
+
+
+def native_default_chat_template_kwargs(
+    generation_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The template kwargs the native server merges under every request's own.
+
+    ``default_chat_template_kwargs``, or the older ``chat_template_kwargs``
+    spelling, of ``vllm_cfg.http_server_serving_chat_kwargs``.
+    """
+    serving = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs") or {}
+    kwargs = serving.get("default_chat_template_kwargs")
+    if kwargs is None:
+        kwargs = serving.get("chat_template_kwargs")
+    return dict(kwargs or {})
 
 
 def dynamo_enabled(generation_config: Mapping[str, Any]) -> bool:

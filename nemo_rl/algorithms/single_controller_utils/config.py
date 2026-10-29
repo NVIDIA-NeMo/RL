@@ -679,7 +679,9 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     capture_dir: Optional[str] = None
     # Generation backend hosting token capture. This is derived from
     # policy.generation.backend during setup; users should not set it separately.
-    generation_backend: Optional[Literal["vllm", "megatron"]] = None
+    # "dynamo" is the vLLM backend served through Dynamo (policy.generation.dynamo):
+    # the same workers host capture, and NeMo-Gym reaches them through the frontend.
+    generation_backend: Optional[Literal["vllm", "megatron", "dynamo"]] = None
     # Keep routed_experts out of canonical rows and assemble them on policy
     # workers from strict staged-fragment plans.
     defer_routed_experts_to_policy: bool = False

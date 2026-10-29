@@ -191,16 +191,21 @@ class VllmGeneration(GenerationInterface):
         """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
         generation_config = cast(VllmConfig, master_config.policy["generation"])
         assert_reload_refit_config_supported(generation_config)
-        if (
-            dynamo_enabled(generation_config)
-            and master_config.async_rl.generation_fleet_health.enabled
-        ):
-            raise ValueError(
-                "async_rl.generation_fleet_health.enabled=true is not supported "
-                "with policy.generation.dynamo=true yet: the Dynamo frontend "
-                "picks engines itself, and a restarted shard does not register "
-                "with it. Disable fleet health."
-            )
+        if dynamo_enabled(generation_config):
+            if master_config.async_rl.generation_router.enabled:
+                raise ValueError(
+                    "async_rl.generation_router.enabled=true does not apply with "
+                    "policy.generation.dynamo=true: NeMo-Gym calls the Dynamo "
+                    "frontend, which routes the whole fleet behind one URL. "
+                    "Disable the generation router."
+                )
+            if master_config.async_rl.generation_fleet_health.enabled:
+                raise ValueError(
+                    "async_rl.generation_fleet_health.enabled=true is not supported "
+                    "with policy.generation.dynamo=true yet: the Dynamo frontend "
+                    "picks engines itself, and a restarted shard does not register "
+                    "with it. Disable fleet health."
+                )
 
     @staticmethod
     def init_cluster_placement_groups(
@@ -716,6 +721,18 @@ class VllmGeneration(GenerationInterface):
         # Save device UUIDs
         self.device_uuids = self._report_device_id()
         self._register_dynamo_engines()
+
+    @property
+    def client_base_urls(self) -> list[Optional[str]]:
+        """Where OpenAI clients such as NeMo-Gym send requests.
+
+        The Dynamo frontend when it serves this fleet (``policy.generation.dynamo``);
+        otherwise every data-parallel shard's own server, as
+        ``dp_openai_server_base_urls``. Known before a deferred model load.
+        """
+        if self.dynamo_frontend_url is not None:
+            return [self.dynamo_frontend_url]
+        return self.dp_openai_server_base_urls
 
     def _start_dynamo_services(self) -> None:
         """Start the etcd, NATS and frontend this fleet's engines register with."""

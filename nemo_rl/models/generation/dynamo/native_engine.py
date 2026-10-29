@@ -33,6 +33,7 @@ import time
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any, Optional
 
+import numpy as np
 import torch
 from dynamo._core import Context, get_reasoning_parser_names, get_tool_parser_names
 from dynamo.common.backend import (
@@ -65,6 +66,7 @@ from vllm.transformers_utils.processor import get_video_processor_cls_name
 from vllm.v1.kv_cache_interface import KVCacheSpecKind
 from vllm.v1.metrics.loggers import StatLoggerBase
 
+from nemo_rl.data.captured_media import MediaCaptureRejected
 from nemo_rl.models.generation.dynamo.config import (
     DynamoCfg,
     dynamo_cfg,
@@ -76,12 +78,22 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
     DYNAMO_ENDPOINT,
 )
 from nemo_rl.models.generation.dynamo.rollout_client import ROLLOUT_ANNOTATION
+from nemo_rl.models.generation.openai_server_utils import (
+    derive_prefix_eos_count,
+    splice_prefix_tokens,
+)
 from nemo_rl.models.generation.vllm.request_pipeline import (
     RolloutResult,
     rollout_result,
     rollout_result_to_wire,
 )
-from nemo_rl.models.generation.vllm.utils import validate_rollout_prompt
+from nemo_rl.models.generation.vllm.utils import (
+    chat_generation_tokens,
+    chat_routed_experts,
+    off_policy_sampling_error,
+    remap_multimodal_placeholders,
+    validate_rollout_prompt,
+)
 
 if TYPE_CHECKING:
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -89,6 +101,16 @@ if TYPE_CHECKING:
     )
 
 LOGGER = logging.getLogger(__name__)
+
+# Annotations NeMo-Gym's Dynamo dialect (vllm_model with dynamo_frontend, Gym#4817)
+# sets on its requests; Dynamo forwards nvext.annotations to the engine verbatim.
+GYM_ROLLOUT_ANNOTATION = "nemo_gym:rollout"
+# A token-capture call's admission JSON.
+GYM_CAPTURE_ANNOTATION_PREFIX = "ng_capture:"
+# Without capture: the last echoed assistant turn's prompt + generation token
+# IDs, which the native server reads from the messages instead.
+GYM_PREFIX_ANNOTATION_PREFIX = "ng_prefix:"
+_GYM_SAMPLING_KEYS = ("temperature", "top_p", "val_temperature", "val_top_p")
 
 # The vLLM modality each key of Dynamo's multi_modal_data holds.
 _DYNAMO_MEDIA_MODALITIES = {
@@ -148,6 +170,11 @@ def _rollout_request(request: GenerateRequest) -> Optional[dict[str, Any]]:
     """
     rollout = _annotation_value(request, ROLLOUT_ANNOTATION)
     return None if rollout is None else json.loads(rollout)
+
+
+def _as_f32(value: Optional[float]) -> Optional[float]:
+    """Dynamo's frontend carries sampling floats as f32 (0.7 arrives as 0.69999998)."""
+    return None if value is None else float(np.float32(value))
 
 
 def structured_outputs(guided_decoding: dict[str, Any]) -> StructuredOutputsParams:
@@ -298,6 +325,11 @@ class NativeVllmEngine(LLMEngine):
         self._llm = host.llm
         self._max_model_len = self._llm.vllm_config.model_config.max_model_len
         self._defaults = self._llm.model_config.get_diff_sampling_param()
+        # The train and validation sampling NeMo-Gym rollouts must match, at the
+        # f32 precision the frontend delivers.
+        self._gym_sampling_profile = {
+            key: _as_f32(host.cfg[key]) for key in _GYM_SAMPLING_KEYS
+        }
 
     @classmethod
     async def from_args(cls, argv=None):
@@ -359,6 +391,11 @@ class NativeVllmEngine(LLMEngine):
         rollout = _rollout_request(request)
         if rollout is not None:
             async for chunk in self._generate_rollout(request, rollout, context):
+                yield chunk
+            return
+        annotations = request.get("annotations") or ()
+        if GYM_ROLLOUT_ANNOTATION in annotations:
+            async for chunk in self._generate_gym(request, context):
                 yield chunk
             return
         engine_input = await self._engine_input(request)
@@ -474,6 +511,191 @@ class NativeVllmEngine(LLMEngine):
             chunk["completion_usage"] = _usage(final_output, len(result.token_ids))
         yield chunk
 
+    async def _generate_gym(
+        self, request: GenerateRequest, context: Context
+    ) -> AsyncGenerator[GenerateChunk, None]:
+        """One NeMo-Gym model call, served as the native chat endpoint serves it.
+
+        The request was rendered by the frontend. As on the native server, it must
+        sample on-policy, its echoed or staged prefix replaces the rendered
+        history, output is clamped to the context, and a token-capture call stages
+        its delta from this process. Tokens, log probabilities and routed experts
+        come from vLLM's final output through the native endpoint's helpers. One
+        chunk carries the whole completion and, in ``engine_data``, the token
+        arrays Gym's dialect reads, or a captured call's commit coordinates.
+        """
+        host = self._host
+        sampling: dict[str, Any] = request.get("sampling_options") or {}
+        sampling_error = off_policy_sampling_error(
+            temperature=_as_f32(sampling.get("temperature")),
+            top_p=_as_f32(sampling.get("top_p")),
+            top_k=sampling.get("top_k"),
+            generation_config=self._gym_sampling_profile,
+        )
+        if sampling_error is not None:
+            raise InvalidArgument(sampling_error)
+        if (sampling.get("n") or 1) != 1:
+            raise InvalidArgument(
+                "NeMo-Gym calls through Dynamo take n=1: engine_data carries one "
+                "choice's tokens."
+            )
+        # The profile's own values, so vLLM samples exactly as natively.
+        validation = (
+            _as_f32(sampling["temperature"])
+            != self._gym_sampling_profile["temperature"]
+            or _as_f32(sampling["top_p"]) != self._gym_sampling_profile["top_p"]
+        )
+        temperature, top_p = (
+            (host.cfg["val_temperature"], host.cfg["val_top_p"])
+            if validation
+            else (host.cfg["temperature"], host.cfg["top_p"])
+        )
+
+        capture_context = _annotation_value(request, GYM_CAPTURE_ANNOTATION_PREFIX)
+        admission = (
+            None
+            if capture_context is None
+            else host._parse_capture_admission(json.loads(capture_context))
+        )
+        prefix_token_ids = None
+        if admission is not None:
+            if admission.mode == "token_in":
+                # A blocking data-plane read; keep it off the engine loop.
+                prefix_token_ids = await asyncio.to_thread(
+                    host._resolve_admission_prefix, admission
+                )
+        elif (
+            echoed := _annotation_value(request, GYM_PREFIX_ANNOTATION_PREFIX)
+        ) is not None:
+            prefix_token_ids = json.loads(echoed)
+        # As the native endpoint does: a captured call reads the processor's own
+        # pixels, not cache references (#4124).
+        engine_input = await self._engine_input(
+            request, skip_mm_cache=admission is not None and host._capture_media
+        )
+        template_token_ids = engine_input["prompt_token_ids"]
+        self._check_prompt_fits(len(template_token_ids))
+        token_ids, splice = template_token_ids, None
+        if prefix_token_ids is not None:
+            # The frontend rendered the whole conversation; replace its history
+            # with the exact tokens the model generated for it. The engine sees no
+            # messages, so the prefix's EOS count stands in for the native
+            # endpoint's render of the history.
+            tokenizer = self._llm.tokenizer
+            splice = splice_prefix_tokens(
+                tokenizer=tokenizer,
+                model_prefix_token_ids=prefix_token_ids,
+                template_token_ids=template_token_ids,
+                template_prefix_eos_count=derive_prefix_eos_count(
+                    prefix_token_ids, eos_token_id=tokenizer.eos_token_id
+                ),
+            )
+            token_ids = splice.token_ids
+            self._check_prompt_fits(len(token_ids))
+        try:
+            # Off the loop: a retained-media check reads staged calls.
+            media = await asyncio.to_thread(
+                host._capture_request_media,
+                engine_input,
+                admission=admission,
+                splice=splice,
+            )
+        except MediaCaptureRejected as error:
+            raise InvalidArgument(f"{error} ({error.code})") from error
+        if (
+            media is None
+            and splice is not None
+            and (placeholders := engine_input.get("mm_placeholders"))
+        ):
+            # Media capture already moved them to spliced coordinates.
+            engine_input["mm_placeholders"] = remap_multimodal_placeholders(
+                template_token_ids=template_token_ids,
+                final_token_ids=token_ids,
+                mm_placeholders=placeholders,
+                splice=splice,
+            )
+        engine_input["prompt_token_ids"] = token_ids
+
+        stop = (request.get("stop_conditions") or {}).get("stop")
+        overrides: dict[str, Any] = {
+            "temperature": temperature,
+            "top_p": top_p,
+            # As the native endpoint does: Gym requests leave top_k to NeMo RL.
+            "top_k": -1,
+        }
+        if stop:
+            # vLLM stops on them as natively, so the token arrays match; the
+            # frontend then cuts the text at the same place.
+            overrides.update(stop=stop, detokenize=True)
+        if admission is not None:
+            # A captured call stages the sampled tokens' log probabilities.
+            overrides["logprobs"] = 0
+        sampling_params = build_sampling_params(
+            request,
+            self._defaults,
+            output_room=self._max_model_len - len(token_ids),
+            overrides=overrides,
+            output_kind=RequestOutputKind.FINAL_ONLY,
+        )
+        try:
+            self._llm.check_admission(1, context.id())
+        except GracefulHTTPError as error:
+            raise HttpError(int(error.http_status), error.message) from error
+
+        if admission is not None:
+            host._begin_request_capture(
+                request,
+                token_ids,
+                admission=admission,
+                prefix_token_ids=prefix_token_ids,
+                media=media,
+            )
+        staged = False
+        try:
+            final_output = None
+            async for output in self._llm.generate(
+                engine_input, sampling_params, context.id()
+            ):
+                final_output = output
+            if final_output is None:
+                raise RuntimeError(f"No output received for request {context.id()}")
+            if admission is not None and context.is_stopped():
+                # Dynamo aborts the vLLM request on a disconnect but never
+                # cancels this generator: fail the capture (below), as the
+                # native endpoint's cancellation does, instead of staging it.
+                return
+            completion = final_output.outputs[0]
+            chunk: GenerateChunk = {
+                "token_ids": list(completion.token_ids),
+                "index": 0,
+                "finish_reason": completion.finish_reason,
+                "completion_usage": _usage(final_output, len(completion.token_ids)),
+            }
+            if admission is not None:
+                chunk["engine_data"] = {
+                    "ng_commit_coords": await self._stage_gym_call(
+                        request, final_output
+                    )
+                }
+                staged = True
+            else:
+                chunk["engine_data"] = self._gym_token_data(final_output)
+                log_probs, top_logprobs = extract_from_completion_output(
+                    completion, 0, tokenizer=self._llm.tokenizer, include_bytes=True
+                )
+                if log_probs is not None:
+                    chunk["log_probs"] = log_probs
+                    chunk["top_logprobs"] = top_logprobs
+            yield chunk
+        finally:
+            if admission is not None and not staged:
+                host._abort_request_capture(
+                    request,
+                    reason=(
+                        "client_disconnect" if context.is_stopped() else "engine_error"
+                    ),
+                )
+
     async def _load_media(
         self, request: GenerateRequest
     ) -> Optional[tuple[dict[str, list[Any]], dict[str, list[Any]]]]:
@@ -526,7 +748,9 @@ class NativeVllmEngine(LLMEngine):
             mm_uuids[modality] = list(uuids.get(key) or [None] * len(items))
         return mm_data, mm_uuids
 
-    async def _engine_input(self, request: GenerateRequest) -> dict[str, Any]:
+    async def _engine_input(
+        self, request: GenerateRequest, *, skip_mm_cache: bool = False
+    ) -> dict[str, Any]:
         """The processed vLLM prompt for the request, as the native chat endpoint builds it.
 
         The frontend's tokens carry one unexpanded placeholder per media item;
@@ -539,13 +763,15 @@ class NativeVllmEngine(LLMEngine):
             prompt["multi_modal_data"], prompt["multi_modal_uuids"] = media
             if request.get("mm_processor_kwargs"):
                 prompt["mm_processor_kwargs"] = request["mm_processor_kwargs"]
-        return await self._llm.renderer.process_for_engine_async(prompt, time.time())
+        return await self._llm.renderer.process_for_engine_async(
+            prompt, time.time(), skip_mm_cache=skip_mm_cache
+        )
 
     def _check_prompt_fits(self, prompt_len: int) -> None:
         """Refuse a prompt that leaves no room for output, as the native endpoint does.
 
-        OpenAI clients read "context length" in a 400 as a length refusal rather
-        than an engine failure.
+        NeMo-Gym reads "context length" in a 400 as a length refusal rather than an
+        engine failure.
         """
         if prompt_len >= self._max_model_len:
             raise InvalidArgument(
@@ -553,6 +779,62 @@ class NativeVllmEngine(LLMEngine):
                 f"maximum context length ({self._max_model_len}). No room for "
                 "output tokens."
             )
+
+    def _gym_token_data(self, final_output: Any) -> dict[str, Any]:
+        """The token fields Gym's dialect lifts onto the message, as the native endpoint reports them."""
+        completion = final_output.outputs[0]
+        token_data: dict[str, Any] = {
+            "prompt_token_ids": list(final_output.prompt_token_ids),
+            "completion_token_ids": list(completion.token_ids),
+        }
+        if completion.logprobs is not None:
+            _, token_data["completion_logprobs"] = chat_generation_tokens(completion)
+        if self._host._return_routed_experts_enabled():
+            # Full prompt + generation rows, as the native endpoint attaches them.
+            token_data["routed_experts"] = chat_routed_experts(
+                final_output,
+                completion,
+                prompt_token_count=len(final_output.prompt_token_ids),
+                device=torch.device("cpu"),
+                logger=LOGGER,
+                routed_experts_dtype=self._host.routed_experts_dtype,
+            )
+        return token_data
+
+    async def _stage_gym_call(self, request: GenerateRequest, final_output: Any) -> Any:
+        """Stage a captured call from this process; return its commit coordinates."""
+        host = self._host
+        completion = final_output.outputs[0]
+        generation_token_ids, generation_log_probs = chat_generation_tokens(completion)
+        message: dict[str, Any] = {
+            "generation_token_ids": generation_token_ids,
+            "generation_log_probs": generation_log_probs,
+        }
+        if host._return_routed_experts_enabled():
+            message["routed_experts"] = chat_routed_experts(
+                final_output,
+                completion,
+                prompt_token_count=len(final_output.prompt_token_ids),
+                device=torch.device("cpu"),
+                logger=LOGGER,
+                routed_experts_dtype=host.routed_experts_dtype,
+            )
+        # The native endpoint's response shape; the prompt is the one recorded at
+        # begin_call.
+        content = {
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": completion.finish_reason,
+                    "message": message,
+                }
+            ]
+        }
+        # The sink write is a blocking data-plane round trip.
+        content = await asyncio.to_thread(
+            host._finish_request_capture, request, content
+        )
+        return content["ng_commit_coords"]
 
     async def abort(self, context: Context) -> None:
         await self._llm.abort(context.id())

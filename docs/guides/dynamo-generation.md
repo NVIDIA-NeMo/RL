@@ -51,10 +51,11 @@ shows them all:
 | Key | Default | Meaning |
 |---|---|---|
 | `startup_timeout_s` | 600 | Bounds service start-up and engine registration |
-| `request_timeout_s` | 900 | Timeout for one NeMo RL rollout through the frontend, in place of `NRL_VLLM_ASYNC_TIMEOUT_SECONDS`. A timeout fails the attempt as a native timeout does, and the rollout retry policy applies |
-| `worker_args.tool_call_parser`, `reasoning_parser` | null | Dynamo's built-in parser names. null follows the native server's settings; see [Chat settings](#chat-settings) |
+| `request_timeout_s` | 900 | Timeout for one NeMo RL rollout through the frontend, in place of `NRL_VLLM_ASYNC_TIMEOUT_SECONDS`. A timeout fails the attempt as a native timeout does, and the rollout retry policy applies; NeMo-Gym's calls keep Gym's timeouts |
+| `worker_args.tool_call_parser`, `reasoning_parser` | null | Dynamo's built-in parser names. null follows the native server's settings; see [NeMo-Gym](#nemo-gym) |
 | `worker_args.custom_jinja_template` | null | A chat template that replaces the model's own. null follows the native server's |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
+| `frontend_args.session_affinity_ttl_secs` | 1800 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it |
 | `frontend_args.tokenizer`, `tokenizer_cache*` | `default`, off | Frontend tokenizer |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags |
 
@@ -68,7 +69,7 @@ is set (the image sets it to `/opt/dynamo/bin`), and on `PATH` otherwise.
 | `generate_async` on text token prompts, router replay (R3) included | Frontend (KV-aware); the engine samples and assembles it exactly as native `generate_async` does |
 | NeMo RL's own multimodal rollouts | Native shard dispatch. Those rollouts send media to the engine directly rather than as OpenAI content |
 | `generate_text_async`, which evaluation uses | Native shard dispatch |
-| NeMo-Gym's OpenAI requests | Not served yet; see [Not supported](#not-supported) |
+| NeMo-Gym's OpenAI requests | Frontend, in Gym's Dynamo dialect; the engine serves them as the native chat endpoint does. See [NeMo-Gym](#nemo-gym) |
 
 A rollout through the frontend has the same `GenerationOutputSpec` as the
 native path: token IDs, log probabilities, truncation, routed experts with
@@ -86,38 +87,75 @@ OpenAI clients of the frontend get what vLLM's own OpenAI server applies:
   for output. The engine, not the frontend, checks the context, so it checks
   the prompt it actually runs.
 
-## Chat settings
+## NeMo-Gym
 
-The native server's chat settings carry over to the frontend:
+NeMo-Gym's policy model calls the frontend. Setup turns on Gym's Dynamo dialect
+(`vllm_model.dynamo_frontend`, from
+[NVIDIA-NeMo/Gym#4817](https://github.com/NVIDIA-NeMo/Gym/pull/4817)). Gym marks
+every call with an annotation, and the engine serves a marked call as the native
+chat endpoint does:
+
+- Sampling must match `temperature`/`top_p` or `val_temperature`/`val_top_p`,
+  with `top_k` unset. vLLM samples with the configured values.
+- The token prefix Gym echoes replaces the history the frontend rendered.
+- Output is clamped to the context, and a prompt that leaves no room is refused
+  with the native endpoint's "maximum context length" error.
+- Stop strings stop vLLM itself, so the token IDs match the native endpoint's.
+- The response carries `prompt_token_ids`, `completion_token_ids` and
+  `completion_logprobs` in `nvext.engine_data`, which Gym lifts onto the message.
+  With router replay on, it also carries the call's `routed_experts`, as the
+  native endpoint attaches them.
+- Images, video and audio in the messages are processed as on the native
+  endpoint. The frontend passes each media URL through with one unexpanded
+  placeholder per item. The engine loads the media with vLLM's media connector
+  and runs vLLM's multimodal processor on the frontend's tokens. The splice,
+  placeholder remap and media capture then work on that processed prompt.
+
+With `token_capture.enabled`, Gym uses its `dynamo_worker` capture backend. The
+same vLLM workers stage each call's tokens, log probabilities, routed experts and
+processed media from their own process, exactly as the native endpoint does, and
+only the commit coordinates travel back through the frontend. The frontend keeps a rollout on
+one engine (`session_affinity_ttl_secs`), as the native backend pins each Gym
+session to one server.
+
+The native server's chat settings carry over:
 
 | Native setting (`vllm_cfg`) | Under Dynamo |
 |---|---|
 | `http_server_serving_chat_kwargs.tool_parser`, `reasoning_parser` | The frontend's parsers, under Dynamo's names: NeMo RL's `nano_v3` plugin is `nemotron_v3`, vLLM's `openai` tool parser is `harmony` |
 | `tool_parser_plugin`, `reasoning_parser_plugin` | Python plugins cannot run in the Rust frontend. Startup asks for `dynamo_cfg.worker_args` to name a Dynamo parser, unless the plugin has a rename above |
 | `http_server_serving_chat_kwargs.chat_template` | The frontend's template, as a file, a vLLM template name or literal Jinja |
+| `http_server_serving_chat_kwargs.default_chat_template_kwargs` | Sent by Gym under its own `chat_template_kwargs` |
 | `http_server_serving_chat_kwargs.enable_auto_tools`, `chat_template_content_format` | The frontend always parses `tool_choice: auto` calls and has no content-format setting, so only the defaults (`true`, `auto`) are accepted |
 
-Where the behavior differs from the native endpoint: when a request sets
-`chat_template_kwargs.force_nonempty_content`, Dynamo reports a reasoning-only
-turn as content.
+Where the behavior differs from the native endpoint:
+
+- The engine sees the rendered prompt, not the messages. It finds where the
+  echoed prefix ends by counting the prefix's EOS tokens, not by rendering the
+  history.
+- When a request sets `chat_template_kwargs.force_nonempty_content`, Dynamo
+  reports a reasoning-only turn as content.
 
 ## Not supported
 
 Startup rejects these with `dynamo: true`:
 
-- NeMo-Gym (`env.should_use_nemo_gym`): the frontend does not serve Gym's
-  calls yet. Run Gym recipes with `dynamo: false`.
 - `colocated.enabled: true`: a colocated engine sleeps while the policy trains,
   and the frontend would keep routing to it. The SingleController never runs
   colocated vLLM; the other entrypoints need non-colocated generation.
 - `async_rl.generation_fleet_health.enabled`: the frontend picks engines itself,
   and a restarted shard does not register with it yet.
+- `async_rl.generation_router`: the frontend already routes the fleet behind one
+  URL.
+- `vllm_cfg.http_server_api_key_required`: the frontend checks no bearer token.
 - `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data
   parallelism inside vLLM, which the async engine Dynamo serves does not.
 - Parser plugins with no Dynamo parser, and the chat settings above that the
   frontend has no counterpart for.
 - `dynamo: true` on a backend other than vLLM, and a `dynamo_cfg` block without
   `dynamo: true`.
+
+A Gym call with `n > 1` is refused when it arrives.
 
 ## Build the image
 

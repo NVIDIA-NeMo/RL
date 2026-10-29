@@ -102,7 +102,3 @@ research/template_project/tests/test_suites/llm/single_update_1n8g.sh
 
 # Full Flow-GRPO recipe requires an externally served GenRM OCR judge.
 research/flow_grpo/tests/test_suites/flow_grpo_qwen_image_ocr.sh
-
-# A Dynamo + NeMo-Gym recipe: policy.generation.dynamo does not serve NeMo-Gym
-# rollouts yet, and setup refuses the pairing.
-tests/test_suites/llm/grpo-nanov3-30ba3b-3n8g-megatron-dynamo-swe1.sh

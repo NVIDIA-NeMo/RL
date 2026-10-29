@@ -98,7 +98,10 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
-from nemo_rl.models.generation.dynamo.config import dynamo_enabled
+from nemo_rl.models.generation.dynamo.config import (
+    dynamo_enabled,
+    native_default_chat_template_kwargs,
+)
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -301,12 +304,6 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         return False
 
     generation_config = master_config.policy["generation"]
-    if dynamo_enabled(generation_config):
-        raise ValueError(
-            "policy.generation.dynamo=true does not serve NeMo-Gym rollouts yet. "
-            "Set policy.generation.dynamo=false to run this NeMo-Gym config on "
-            "NeMo RL's vLLM servers."
-        )
     assert should_use_async_rollouts(generation_config), (
         "❌ Error: In order to use NeMo-Gym, you must use a generation "
         "backend with `async_engine: true`!"
@@ -492,9 +489,11 @@ def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
         return "vllm_worker"
     if generation_backend == "megatron":
         return "megatron_worker"
+    if generation_backend == "dynamo":
+        return "dynamo_worker"
     raise ValueError(
         "token_capture.enabled requires setup-derived generation_backend to be "
-        f"'vllm' or 'megatron'; got {generation_backend!r}"
+        f"'vllm', 'megatron' or 'dynamo'; got {generation_backend!r}"
     )
 
 
@@ -2057,6 +2056,16 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
 
+    if dynamo_enabled(generation_config):
+        # Gym's policy model calls the Dynamo frontend in Gym's Dynamo dialect.
+        # Each actor applies it to its own composed config (_apply_dynamo_dialect),
+        # so it never becomes a policy_model overlay that a shard must claim.
+        config.env.setdefault("nemo_gym", {})["dynamo_dialect"] = {
+            "default_chat_template_kwargs": native_default_chat_template_kwargs(
+                generation_config
+            )
+        }
+
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for
     # multi-turn multimodal postprocessing).
@@ -2125,6 +2134,39 @@ def build_nemo_gym_config(
     )
 
 
+def _apply_dynamo_dialect(
+    nemo_gym_dict: dict[str, Any], default_chat_template_kwargs: Mapping[str, Any]
+) -> None:
+    """Point one actor's policy model at the Dynamo frontend, in Gym's Dynamo dialect.
+
+    The frontend takes token data in nvext instead of vLLM's request extensions.
+    Applied to the actor's composed config (a shard's overrides included), so
+    settings the user wrote there win. Copies the policy_model levels it
+    changes, so the caller's config is not mutated.
+    """
+    policy_model = dict(nemo_gym_dict.get("policy_model") or {})
+    models = dict(policy_model.get("responses_api_models") or {})
+    vllm_model = dict(models.get("vllm_model") or {})
+    vllm_model["dynamo_frontend"] = True
+    # The frontend reads `reasoning` as another name for `reasoning_content` and
+    # refuses an echoed assistant turn that carries both, Gym's default.
+    vllm_model.setdefault("reasoning_field", "reasoning_content")
+    # The native server merges these under every request's own template
+    # kwargs; the frontend has no such default, so Gym sends them. They sit
+    # under the kwargs Gym sends: vllm_model's own, else extra_body's.
+    if default_chat_template_kwargs:
+        gym_kwargs = vllm_model.get("chat_template_kwargs") or (
+            (vllm_model.get("extra_body") or {}).get("chat_template_kwargs") or {}
+        )
+        vllm_model["chat_template_kwargs"] = {
+            **default_chat_template_kwargs,
+            **gym_kwargs,
+        }
+    models["vllm_model"] = vllm_model
+    policy_model["responses_api_models"] = models
+    nemo_gym_dict["policy_model"] = policy_model
+
+
 def _build_gym_actor_config(
     nemo_gym_dict: dict[str, Any],
     *,
@@ -2153,6 +2195,11 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    dynamo_dialect = nemo_gym_dict.pop("dynamo_dialect", None)
+    if dynamo_dialect is not None:
+        _apply_dynamo_dialect(
+            nemo_gym_dict, dynamo_dialect["default_chat_template_kwargs"]
+        )
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value

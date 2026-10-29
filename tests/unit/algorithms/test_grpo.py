@@ -4408,7 +4408,7 @@ def test_setup_hands_the_vllm_http_server_api_key_to_nemo_gym(monkeypatch) -> No
 
     class DummyVllmGeneration:
         weight_synchronizer = None
-        dp_openai_server_base_urls = ["http://vllm-worker.example/v1"]
+        client_base_urls = ["http://vllm-worker.example/v1"]
         # What the real class generates when the recipe requires a key.
         http_server_api_key = "per-job-key"
 

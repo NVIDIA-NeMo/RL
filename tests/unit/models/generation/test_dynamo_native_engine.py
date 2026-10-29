@@ -42,12 +42,17 @@ from nemo_rl.models.generation.dynamo.config import DynamoWorkerArgs  # noqa: E4
 from nemo_rl.models.generation.dynamo.rollout_client import (  # noqa: E402
     ROLLOUT_ANNOTATION,
 )
+from nemo_rl.models.generation.openai_server_utils import (  # noqa: E402
+    derive_prefix_eos_count,
+    splice_prefix_tokens,
+)
 from nemo_rl.models.generation.vllm.request_pipeline import (  # noqa: E402
     rollout_output,
     rollout_result,
     rollout_result_from_wire,
     rollout_result_to_wire,
 )
+from nemo_rl.models.generation.vllm.utils import chat_routed_experts  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
 )
@@ -105,9 +110,7 @@ class _FakeRenderer:
     def __init__(self) -> None:
         self.prompts = []
 
-    async def process_for_engine_async(
-        self, prompt, arrival_time, *, skip_mm_cache=False
-    ):
+    async def process_for_engine_async(self, prompt, arrival_time, *, skip_mm_cache):
         self.prompts.append((prompt, skip_mm_cache))
         if "multi_modal_data" not in prompt:
             return {"type": "token", "prompt_token_ids": prompt["prompt_token_ids"]}
@@ -227,7 +230,7 @@ def test_rollouts_are_served_like_generate_async() -> None:
     }
 
 
-def test_router_replay_routes_reach_rollouts_as_natively() -> None:
+def test_router_replay_routes_reach_rollouts_and_gym_calls_as_natively() -> None:
     routes = np.arange(5 * 2 * 2, dtype=np.int16).reshape(5, 2, 2)
     final = _output(
         [1, 2, 3],
@@ -262,6 +265,29 @@ def test_router_replay_routes_reach_rollouts_as_natively() -> None:
     assert "routed_experts" in shipped
     for key in native:
         assert torch.equal(shipped[key], native[key]), key
+
+    # A Gym call without capture carries the routes in engine_data, as the
+    # native chat endpoint attaches them to the response.
+    gym_final = _output(
+        [1, 3, 4],
+        _completion([10, 11], "stop", routed_experts=routes[3:]),
+        prompt_routed_experts=routes[:3],
+    )
+    gym_host = _host(
+        _FakeLLM([gym_final]), vllm_kwargs={"enable_return_routed_experts": True}
+    )
+    gym_engine = native_engine.NativeVllmEngine(gym_host, leader_worker_idx=0)
+
+    (gym_chunk,) = _collect(gym_engine, _gym_request())
+
+    assert gym_chunk["engine_data"]["routed_experts"] == chat_routed_experts(
+        gym_final,
+        gym_final.outputs[0],
+        prompt_token_count=3,
+        device=torch.device("cpu"),
+        logger=native_engine.LOGGER,
+        routed_experts_dtype=torch.int16,
+    )
 
 
 def test_a_rollout_with_no_room_returns_the_prompt_untruncated() -> None:
@@ -603,6 +629,160 @@ def test_prompts_the_engine_cannot_serve_are_refused(fields, error) -> None:
         _collect(engine, _openai_request(**fields))
 
     assert llm.calls == []
+
+
+# --- NeMo-Gym's Dynamo dialect -------------------------------------------------
+
+
+def _f32(value: float) -> float:
+    return float(np.float32(value))
+
+
+def _gym_request(
+    *, temperature=0.7, top_p=0.9, prefix=None, sampling=None, **fields
+) -> dict:
+    annotations = [native_engine.GYM_ROLLOUT_ANNOTATION]
+    if prefix is not None:
+        annotations.insert(
+            0, native_engine.GYM_PREFIX_ANNOTATION_PREFIX + json.dumps(prefix)
+        )
+    sampling_options = {"temperature": temperature, "top_p": top_p, **(sampling or {})}
+    return {
+        "token_ids": [1, 3, 4],
+        # The frontend carries sampling floats as f32.
+        "sampling_options": {
+            key: _f32(value) if isinstance(value, float) else value
+            for key, value in sampling_options.items()
+        },
+        # Gym's token information: logprobs=true, top_logprobs=0.
+        "output_options": {"logprobs": 0},
+        "annotations": annotations,
+        **fields,
+    }
+
+
+def test_gym_calls_sample_with_nemo_rls_exact_profile() -> None:
+    final = _output([1, 3, 4], _completion([10, 11], "stop"))
+    llm = _FakeLLM([final])
+    engine = native_engine.NativeVllmEngine(_host(llm), leader_worker_idx=0)
+
+    (chunk,) = _collect(
+        engine, _gym_request(stop_conditions={"max_tokens": 100, "stop": ["</s>"]})
+    )
+
+    ((prompt, params, _),) = llm.calls
+    assert prompt["prompt_token_ids"] == [1, 3, 4]
+    # The configured values, not the f32 values the frontend delivered.
+    assert (params.temperature, params.top_p) == (0.7, 0.9)
+    assert params.top_k == vllm.SamplingParams(top_k=-1).top_k
+    assert params.output_kind == vllm.sampling_params.RequestOutputKind.FINAL_ONLY
+    # Output fits the context, and vLLM stops on the stop strings itself.
+    assert params.max_tokens == MAX_MODEL_LEN - 3
+    assert (params.stop, params.detokenize) == (["</s>"], True)
+    assert chunk["engine_data"] == {
+        "prompt_token_ids": [1, 3, 4],
+        "completion_token_ids": [10, 11],
+        "completion_logprobs": [-0.5, -0.5],
+    }
+    assert (chunk["token_ids"], chunk["finish_reason"]) == ([10, 11], "stop")
+    assert chunk["log_probs"] == [-0.5, -0.5]
+
+
+def test_gym_validation_calls_sample_with_the_validation_profile() -> None:
+    llm = _FakeLLM([_output([1, 3, 4], _completion([10], "stop"))])
+    engine = native_engine.NativeVllmEngine(_host(llm), leader_worker_idx=0)
+
+    _collect(engine, _gym_request(temperature=0.0, top_p=1.0))
+
+    ((_, params, _),) = llm.calls
+    assert (params.temperature, params.top_p) == (0.0, 1.0)
+
+
+@pytest.mark.parametrize(
+    ("request_fields", "error"),
+    [
+        ({"temperature": 0.5}, "matches neither"),
+        ({"top_p": None}, "top_p must be set explicitly"),
+        ({"sampling": {"top_k": 5}}, "Top k sampling parameter"),
+        ({"sampling": {"n": 2}}, "take n=1"),
+    ],
+)
+def test_gym_calls_that_would_sample_off_policy_are_refused(
+    request_fields, error
+) -> None:
+    llm = _FakeLLM()
+    engine = native_engine.NativeVllmEngine(_host(llm), leader_worker_idx=0)
+
+    with pytest.raises(InvalidArgument, match=error):
+        _collect(engine, _gym_request(**request_fields))
+
+    assert llm.calls == []
+
+
+def test_gym_echoed_prefix_replaces_the_rendered_history() -> None:
+    # The model generated [5, 6, EOS]; the frontend re-rendered that turn as [7, EOS].
+    prefix, rendered = [1, 5, 6, EOS], [1, 7, EOS, 3, 4]
+    spliced = splice_prefix_tokens(
+        tokenizer=None,
+        model_prefix_token_ids=prefix,
+        template_token_ids=rendered,
+        template_prefix_eos_count=derive_prefix_eos_count(prefix, eos_token_id=EOS),
+        eos_token_id=EOS,
+    ).token_ids
+    assert spliced != rendered
+    llm = _FakeLLM([_output(spliced, _completion([10], "stop"))])
+    llm.tokenizer = _Tokenizer()
+    engine = native_engine.NativeVllmEngine(_host(llm), leader_worker_idx=0)
+
+    (chunk,) = _collect(engine, _gym_request(prefix=prefix, token_ids=rendered))
+
+    ((prompt, params, _),) = llm.calls
+    assert prompt["prompt_token_ids"] == spliced
+    assert params.max_tokens == MAX_MODEL_LEN - len(spliced)
+    assert chunk["engine_data"]["prompt_token_ids"] == spliced
+
+
+def test_gym_calls_whose_splice_fills_the_context_are_refused() -> None:
+    prefix = [1, *range(20, 20 + MAX_MODEL_LEN), EOS]
+    llm = _FakeLLM()
+    llm.tokenizer = _Tokenizer()
+    engine = native_engine.NativeVllmEngine(_host(llm), leader_worker_idx=0)
+
+    with pytest.raises(InvalidArgument, match="maximum context length"):
+        _collect(engine, _gym_request(prefix=prefix, token_ids=[1, 7, EOS, 3]))
+
+    assert llm.calls == []
+
+
+def test_gym_echoed_prefix_keeps_media_placeholders_on_their_tokens() -> None:
+    # Turn 1 ran [1, <image>, 3] and generated [5, 6, EOS]; the frontend
+    # re-rendered that turn as [7, EOS] and appended a turn with a second image.
+    turn1 = [1, *[IMAGE_TOKEN] * IMAGE_TOKENS, 3]
+    prefix = [*turn1, 5, 6, EOS]
+    rendered = [1, IMAGE_PLACEHOLDER, 3, 7, EOS, IMAGE_PLACEHOLDER, 4]
+    spliced = [*prefix, *[IMAGE_TOKEN] * IMAGE_TOKENS, 4]
+    llm = _FakeLLM([_output(spliced, _completion([10], "stop"))])
+    llm.tokenizer = _Tokenizer()
+    engine = native_engine.NativeVllmEngine(_host(llm), leader_worker_idx=0)
+
+    (chunk,) = _collect(
+        engine,
+        _gym_request(
+            prefix=prefix,
+            token_ids=rendered,
+            multi_modal_data={"image_url": [{"Url": _image_url()}] * 2},
+        ),
+    )
+
+    ((engine_input, params, _),) = llm.calls
+    assert engine_input["prompt_token_ids"] == spliced
+    # The first image sits in the model's own prefix; the second moved with the
+    # longer generated turn, as the native endpoint remaps them.
+    assert [
+        (span.offset, span.length) for span in engine_input["mm_placeholders"]["image"]
+    ] == [(1, IMAGE_TOKENS), (len(prefix), IMAGE_TOKENS)]
+    assert params.max_tokens == MAX_MODEL_LEN - len(spliced)
+    assert chunk["engine_data"]["prompt_token_ids"] == spliced
 
 
 @pytest.mark.parametrize(

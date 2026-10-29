@@ -191,6 +191,12 @@ def configure_generation_config(
             dynamo_cfg(config)
             dynamo_parsers(config)
             check_dynamo_serving_chat_kwargs(config)
+            if config["vllm_cfg"].get("http_server_api_key_required"):
+                raise ValueError(
+                    "policy.generation.vllm_cfg.http_server_api_key_required is not "
+                    "supported with policy.generation.dynamo=true: NeMo-Gym calls the "
+                    "Dynamo frontend, which checks no bearer token."
+                )
             colocated = config.get("colocated")
             if colocated is not None and colocated["enabled"]:
                 raise ValueError(

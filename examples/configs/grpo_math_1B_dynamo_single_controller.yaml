@@ -37,6 +37,9 @@ policy:
         tokenizer_cache_bytes: 52428800
         # kv: route each request to the engine holding most of its prefix.
         router_mode: kv
+        # Keep a NeMo-Gym token-capture rollout on one engine while it idles up
+        # to this many seconds (null disables it).
+        session_affinity_ttl_secs: 1800
         extra_cli_args: []
 
 logger:
