@@ -190,6 +190,11 @@ def _max_train_steps(master_config: MasterConfig) -> int:
 class SFTSingleControllerActor:
     """Drive colocated loaders and the existing TQPolicy from one actor."""
 
+    # sft.defer_async_checkpoint_finalize, and the tmp_step_N path of an async save
+    # that has been written but not yet finalized and published.
+    _defer_checkpoint_finalize: bool = False
+    _pending_checkpoint_path: Optional[str] = None
+
     def __init__(self, master_config: MasterConfig, actor_args: SFTV2ActorArgs) -> None:
         telemetry = init_telemetry_worker(
             rank=0, world_size=1, worker_group="sft_v2_controller"
@@ -214,6 +219,9 @@ class SFTSingleControllerActor:
             fit_last_save_time=True,
         )
         self._timeout.start_iterations()
+        self._defer_checkpoint_finalize = (
+            master_config.sft.defer_async_checkpoint_finalize
+        )
         self._setup_loaders()
 
     @accepts_trace_context
@@ -231,6 +239,7 @@ class SFTSingleControllerActor:
                     # pass is tagged with the step that is running rather than
                     # the one that just finished.
                     with iteration_scope(self._save_state.total_steps + 1):
+                        self._finish_pending_save(blocking=False)
                         metrics = self._run_train_step()
                         self._logger.log_metrics(metrics, self._save_state.total_steps)
                         metric = self._checkpoint_metric(metrics)
@@ -243,9 +252,17 @@ class SFTSingleControllerActor:
                             # would train unsaved until the walltime kill.
                             print("Timeout has been reached, stopping training early")
                             break
+                self._finish_pending_save(blocking=True)
                 return vars(self._save_state).copy()
         finally:
             for cleanup, name in (
+                # A save deferred by defer_async_checkpoint_finalize is published only
+                # here when the run raised after it. Before checkpoint close, so that
+                # close joins the rename this starts.
+                (
+                    lambda: self._finish_pending_save(blocking=True),
+                    "pending checkpoint publish",
+                ),
                 (self._close_loaders, "loader close"),
                 (self._logger.finish, "logger close"),
                 (self._checkpointer.shutdown, "checkpoint close"),
@@ -426,6 +443,8 @@ class SFTSingleControllerActor:
         return {metric_name: float(metrics[key])}
 
     def _save_checkpoint(self, metric: dict[str, float]) -> None:
+        # The workers would wait for a still-pending save anyway; publish it first.
+        self._finish_pending_save(blocking=True)
         step = self._save_state.total_steps
         loader_states = self._loader_state_dicts()
         if len(loader_states) != self._placement_plan.logical_world_size:
@@ -449,9 +468,35 @@ class SFTSingleControllerActor:
         save_checkpoint_object(
             loader_states, os.path.join(checkpoint_path, "sft_v2_loaders.pt")
         )
-        self._checkpointer.begin_finalization(
-            checkpoint_path, wait_fn=self._trainer.finalize_async_save
-        )
+        # Keep this last: the rename it leads to waits only for the policy's async
+        # weight write, so anything written into checkpoint_path after it races
+        # the rename.
+        if self._defer_checkpoint_finalize:
+            self._pending_checkpoint_path = checkpoint_path
+        else:
+            self._checkpointer.begin_finalization(
+                checkpoint_path, wait_fn=self._trainer.finalize_async_save
+            )
+
+    def _finish_pending_save(self, *, blocking: bool) -> None:
+        """Finalize and publish an async save deferred by defer_async_checkpoint_finalize.
+
+        Runs between steps, and once more at teardown so a run that raises after a
+        save still publishes it. A non-blocking poll finalizes the save on every
+        policy worker only once all ranks' background writes are done, so the write
+        overlaps training rather than holding back the next step. Finalization runs
+        collectives on the training communicator, so it stays on the workers' step
+        boundaries rather than in a background thread. tmp_step_N becomes step_N only
+        after it.
+        """
+        if self._pending_checkpoint_path is None:
+            return
+        if blocking:
+            self._trainer.finalize_async_save()
+        elif not self._trainer.poll_async_save():
+            return
+        self._checkpointer.begin_finalization(self._pending_checkpoint_path)
+        self._pending_checkpoint_path = None
 
     def _close_loaders(self) -> None:
         self._owner_call("close_sft_dataloader")
@@ -469,6 +514,16 @@ def setup_sft_v2(
         raise ValueError("SFTv2 requires data.backend=energon.")
     if not master_config.policy["megatron_cfg"]["enabled"]:
         raise ValueError("SFTv2 supports only the Megatron policy backend.")
+    if master_config.sft.defer_async_checkpoint_finalize:
+        megatron_checkpoint_cfg = master_config.policy["megatron_cfg"].get("checkpoint")
+        if not (
+            megatron_checkpoint_cfg is not None
+            and megatron_checkpoint_cfg.get("async_save")
+        ):
+            raise ValueError(
+                "sft.defer_async_checkpoint_finalize requires "
+                "policy.megatron_cfg.checkpoint.async_save=true."
+            )
     sequence_packing = master_config.policy["sequence_packing"]
     dynamic_batching = master_config.policy["dynamic_batching"]
     packing = master_config.data["energon"].task_encoder.packing

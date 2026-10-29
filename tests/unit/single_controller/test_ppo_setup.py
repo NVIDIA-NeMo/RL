@@ -690,6 +690,43 @@ class TestMegatronTrainIters:
         assert "train_iters" not in mc.value["megatron_cfg"]
 
 
+def test_build_value_forwards_algorithm_seed(monkeypatch):
+    value = MagicMock(name="value")
+    value_factory = MagicMock(return_value=value)
+    times = iter((10.0, 12.5))
+    monkeypatch.setattr(sc_setup_mod, "TQValue", value_factory)
+    monkeypatch.setattr(sc_setup_mod.time, "perf_counter", lambda: next(times))
+
+    cluster = MagicMock(name="train_cluster")
+    tokenizer = MagicMock(name="tokenizer")
+    master_config = _ppo_master_config()
+    weights_path = Path("value/weights")
+    optimizer_path = Path("value/optimizer")
+
+    actual, elapsed = sc_setup_mod._build_value(
+        cluster,
+        master_config,
+        tokenizer,
+        seed=123,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+    )
+
+    assert actual is value
+    assert elapsed == 2.5
+    value_factory.assert_called_once_with(
+        cluster=cluster,
+        config=master_config.value,
+        tokenizer=tokenizer,
+        seed=123,
+        name_prefix="lm_value",
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+        init_optimizer=True,
+        dp_cfg=master_config.data_plane,
+    )
+
+
 @pytest.fixture
 def patched_ppo_factories():
     """Patch every external factory the PPO setup path calls."""
@@ -830,6 +867,7 @@ class TestValueWarmStart:
         setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
 
         value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["seed"] == 42
         assert value_kwargs["weights_path"] is None
         assert value_kwargs["optimizer_path"] is None
 

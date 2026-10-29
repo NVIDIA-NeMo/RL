@@ -84,7 +84,11 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
+from nemo_rl.data.multimodal_utils import (
+    WIRE_MULTIMODAL_FIELDS,
+    per_token_multimodal_schema,
+    uses_image_placeholder,
+)
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -757,6 +761,7 @@ def _build_value(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
     *,
+    seed: int,
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
 ) -> tuple[TQValue, float]:
@@ -766,6 +771,7 @@ def _build_value(
         train_cluster: Ray virtual cluster the critic shares with the trainer.
         master_config: SC MasterConfig.
         tokenizer: Tokenizer used by the value model.
+        seed: Algorithm seed forwarded to the critic; the Megatron critic ignores it.
         weights_path: Checkpointed value weights to resume from, or None.
         optimizer_path: Checkpointed value optimizer state to resume from, or None.
 
@@ -777,6 +783,7 @@ def _build_value(
         cluster=train_cluster,
         config=master_config.value,
         tokenizer=tokenizer,
+        seed=seed,
         name_prefix="lm_value",
         weights_path=weights_path,
         optimizer_path=optimizer_path,
@@ -1765,6 +1772,7 @@ def setup_single_controller(
             train_cluster,
             master_config,
             tokenizer,
+            seed=algo_cfg.seed,
             weights_path=value_weights_path,
             optimizer_path=value_optimizer_path,
         )
@@ -2193,6 +2201,10 @@ def setup_single_controller(
         dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
+        # Captured rows use a separate producer and derive validity in workers.
+        per_token_multimodal_fields=(
+            () if token_capture_cfg.enabled else per_token_multimodal_schema(processor)
+        ),
         include_message_violation_fields=(
             algo_cfg.invalid_tool_call_advantage is not None
             or algo_cfg.malformed_thinking_advantage is not None

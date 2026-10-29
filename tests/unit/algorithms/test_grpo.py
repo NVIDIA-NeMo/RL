@@ -5499,6 +5499,62 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
     checkpointer.shutdown.assert_called_once()
 
 
+def test_grpo_train_without_epoch_limit_cycles_until_max_num_steps(
+    mock_grpo_components, tmp_path
+):
+    """max_num_epochs=None keeps cycling the dataloader until max_num_steps."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.checkpoint_dir = tmp_path
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_epochs = None
+    master_config.grpo.max_num_steps = 3
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.checkpointing["enabled"] = False
+
+    single_batch_dataloader = MagicMock(spec=StatefulDataLoader)
+    single_batch_dataloader.__iter__ = lambda self: iter([mock_batch])
+    single_batch_dataloader.__len__ = MagicMock(return_value=1)
+    single_batch_dataloader.state_dict = MagicMock(return_value={})
+
+    with (
+        _patched_logprob_phase(policy),
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+        patch("nemo_rl.algorithms.grpo.refit_policy_generation", return_value={}),
+    ):
+        grpo_mod.grpo_train(
+            policy,
+            _mock_policy_generation(),
+            single_batch_dataloader,
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert policy.train.call_count == 3
+
+
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
 def test_grpo_ft_save_period_triggers_periodic_saves(
     mock_grpo_components, train_func, tmp_path
@@ -8848,6 +8904,7 @@ def test_tq_rollout_and_trainer_masked_rewards(
     actor.policy_generation = None
     actor.tokenizer = components["tokenizer"]
     actor.task_to_env = components["task_to_env"]
+    actor.per_token_multimodal_fields = ()
     actor._dp_client = MagicMock()
     meta, carry, rollout_metrics, _ = actor.rollout_to_tq(
         batch, partition_id="train", group_size=4
@@ -8991,6 +9048,7 @@ def _tq_actor_rollout(
     actor.policy_generation = None
     actor.tokenizer = components["tokenizer"]
     actor.task_to_env = components["task_to_env"]
+    actor.per_token_multimodal_fields = ()
     actor._dp_client = MagicMock()
     meta, carry, rollout_metrics, _ = actor.rollout_to_tq(
         batch, partition_id="train", group_size=group_size
