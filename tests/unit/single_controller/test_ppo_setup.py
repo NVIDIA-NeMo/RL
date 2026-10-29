@@ -600,6 +600,7 @@ def _dynamic_sampling_config(
     sampler: str = "in_order",
     num_generations_per_prompt: int = _NUM_GENERATIONS_PER_PROMPT,
     max_replacements_per_slot: int = 32,
+    replacement_reserve_prompts: int = 1,
 ) -> MasterConfig:
     """A GRPO SC config with dynamic sampling on and the knobs it validates."""
     mc = _make_master_config()
@@ -617,7 +618,10 @@ def _dynamic_sampling_config(
         min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
         max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
         sampler=sampler_cfg,
-        rollout_failure={"on_dropped_prompt": on_dropped_prompt},
+        rollout_failure={
+            "on_dropped_prompt": on_dropped_prompt,
+            "replacement_reserve_prompts": replacement_reserve_prompts,
+        },
     )
     return mc
 
@@ -657,6 +661,37 @@ class TestDynamicSamplingValidation:
             ValueError, match="dynamic_sampling_max_replacements_per_slot must be >= 1"
         ):
             validate_single_controller_config(mc)
+
+    def test_rejects_an_unfillable_spare_pool(self):
+        # RolloutFailureConfig only enforces this under on_dropped_prompt="replace",
+        # and filtering does not read that knob, so under "shrink" a pool of 0 would
+        # otherwise be accepted and every filtered group would shrink its step.
+        mc = _dynamic_sampling_config(
+            on_dropped_prompt="shrink", replacement_reserve_prompts=0
+        )
+
+        with pytest.raises(ValueError, match="replacement_reserve_prompts >= 1"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [("dynamic_sampling_max_gen_batches", 20), ("batch_multiplier", 1.5)],
+    )
+    def test_warns_that_the_v1_budget_knobs_are_inert_here(self, key, value):
+        # Reachable but unread on this path. Silently ignoring them would let a config
+        # that looks tuned for a high drop rate behave as if it were not.
+        mc = _dynamic_sampling_config()
+        setattr(mc.grpo, key, value)
+
+        with pytest.warns(UserWarning, match="no effect on the SingleController"):
+            validate_single_controller_config(mc)
+
+    def test_does_not_warn_when_the_v1_knobs_are_left_at_their_defaults(self):
+        import warnings as _warnings
+
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", UserWarning)
+            validate_single_controller_config(_dynamic_sampling_config())
 
     def test_rejects_a_sampler_that_stamps_no_target_step(self):
         mc = _dynamic_sampling_config(sampler="ready_first")

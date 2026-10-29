@@ -417,10 +417,12 @@ class GRPOConfig(BaseModel, extra="allow"):
     #
     # Sized so that it fires only when the filter is genuinely mis-tuned, not on the
     # tail of an ordinary run. A slot exhausts the budget when its original group and
-    # all N replacements come back uniform, with probability p**(N+1) for a drop rate
-    # p, so the budget has to cover the whole step's slots across the whole run. At 32
-    # a 4096-group step over 1000 steps is quiet below roughly a 78% drop rate, well
-    # clear of the ~33% seen in practice, and raises above it.
+    # all N replacements come back uniform, which at a drop rate p has probability
+    # p**(N+1); every slot of every step takes that draw, so the expected number of
+    # runs-ending raises is p**(N+1) * num_prompts_per_step * max_num_steps. Size N
+    # from the zero_variance_fraction a run actually reports, not from how many
+    # resamples feel reasonable: the term is dominated by p**(N+1), so a budget that
+    # is ample at one drop rate fails constantly a little above it.
     dynamic_sampling_max_replacements_per_slot: int = 32
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)

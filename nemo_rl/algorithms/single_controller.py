@@ -1948,16 +1948,39 @@ class SingleControllerActor:
         ) as cut:
             await self._cleanup_known_finalization_request_unlocked(cut, request)
 
-    async def _discard_committed_group(self, request: "ReassemblyRequest") -> None:
-        """Release a committed group the controller declines to train on."""
+    async def _discard_committed_group(self, request: "ReassemblyRequest") -> bool:
+        """Release a committed group the controller declines to train on.
+
+        Returns:
+            True when the group was removed and its rows cleared. False when the train
+            pump claimed it for training before this ran, in which case the step is not
+            short and nothing was cleared.
+        """
         # The slot is already ready, and abort() ignores ready slots, so remove it
         # first; otherwise the sampler could pick it after its rows are cleared.
-        await self._buffer.remove_group(request.group_id)
+        #
+        # remove_group raises ValueError for a slot that is already gone, and mutation
+        # cuts do not exclude each other, so the train pump can claim this group while
+        # this coroutine waits on the barrier. That is not a cleanup failure and must
+        # not be reported as one: the claim moved the rows to a step that is already
+        # running, so returning early is what keeps this from clearing them underneath
+        # it. ValueError is the only thing remove_group raises for a missing slot;
+        # everything else still propagates.
+        try:
+            await self._buffer.remove_group(request.group_id)
+        except ValueError:
+            print(
+                f"  finalize: group {request.group_id} was claimed for training "
+                "before it could be discarded; its rows belong to that step now",
+                flush=True,
+            )
+            return False
         await self._cleanup_known_finalization_request(request)
         # The group left the buffer unconsumed, so the post-step release for
         # consumed groups never reaches its pending metrics and observations.
         self._finalizer_metrics_by_group.pop(request.group_id, None)
         self._finalizer_rewards_by_group.pop(request.group_id, None)
+        return True
 
     async def _finalize_with_actor(
         self, request: "ReassemblyRequest"
@@ -2339,7 +2362,7 @@ class SingleControllerActor:
                             # only the controller can act on: it is the one
                             # component that can source a replacement.
                             try:
-                                await self._discard_committed_group(request)
+                                discarded = await self._discard_committed_group(request)
                             except BaseException as cleanup_error:
                                 raise RuntimeError(
                                     "finalizer group fell below "
@@ -2347,6 +2370,13 @@ class SingleControllerActor:
                                     "known-key cleanup failed for group "
                                     f"{request.group_id}"
                                 ) from cleanup_error
+                            if not discarded:
+                                # The train pump claimed it first, so the step has its
+                                # group and owns the buffer permit. Seeking a
+                                # replacement here would over-fill the step.
+                                self._rollout_manager.stats.committed += 1
+                                ownership_transferred = True
+                                break
                             print(
                                 f"  finalize: group {request.group_id} below "
                                 "min_valid_fraction_per_group "
@@ -2401,7 +2431,8 @@ class SingleControllerActor:
                                     "rl.sc.generate_and_push",
                                     tracer=self._tracer,
                                     **{
-                                        "rl.rollout.attempt": replacements,
+                                        "rl.rollout.attempt": replacements
+                                        + filtered_replacements,
                                         **(
                                             {}
                                             if target_step is None

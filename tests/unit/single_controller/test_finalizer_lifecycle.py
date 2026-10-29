@@ -327,7 +327,7 @@ def test_below_threshold_group_releases_pending_finalizer_state() -> None:
         assert await ctrl._finalize_with_actor(request) is result
         assert "group" in ctrl._finalizer_metrics_by_group
         assert "group" in ctrl._finalizer_rewards_by_group
-        await ctrl._discard_committed_group(request)
+        assert await ctrl._discard_committed_group(request) is True
 
     asyncio.run(_below_threshold_branch())
 
@@ -366,11 +366,37 @@ def test_discarded_committed_group_leaves_no_ready_slot_in_the_buffer() -> None:
         async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
             await buffer.commit_finalized(cut, request.group_id, meta, 3, 3)
         assert buffer.size() == 1
-        await ctrl._discard_committed_group(request)
+        assert await ctrl._discard_committed_group(request) is True
 
     asyncio.run(_commit_then_discard())
 
     assert buffer.size() == 0
+
+
+def test_discard_yields_to_a_group_the_train_pump_already_claimed() -> None:
+    """Claiming removes the slot, after which remove_group raises for it.
+
+    Mutation cuts do not exclude one another, so the train pump can claim a ready group
+    while the discard waits on the barrier. Treating that ValueError as a cleanup
+    failure would turn a benign race into a fatal RuntimeError, and clearing the rows
+    anyway would pull them out from under a step that is already running.
+    """
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize()))
+    ctrl._buffer.remove_group = AsyncMock(
+        side_effect=ValueError("unknown group_ids=['group']")
+    )
+    request = _request()
+    ctrl._finalizer_metrics_by_group["group"] = {"finalize/invalid_row_rate": 0.0}
+    ctrl._finalizer_rewards_by_group["group"] = []
+
+    assert asyncio.run(ctrl._discard_committed_group(request)) is False
+
+    ctrl._buffer.abort.assert_not_called()
+    assert ctrl._dp_client.clear_calls == [], "rows belong to the claiming step"
+    # The claiming step consumes the group, so its post-step release still reaches
+    # these; popping them here would drop metrics the trainer is about to report.
+    assert "group" in ctrl._finalizer_metrics_by_group
+    assert "group" in ctrl._finalizer_rewards_by_group
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:

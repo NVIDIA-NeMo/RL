@@ -1247,6 +1247,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
         grpo_cfg = cast(GRPOConfig, algo_cfg)
+        rollout_failure = async_config.rollout_failure
         # The capture path replaces a dropped group by waiting out a fresh rollout: it
         # cannot borrow a finished group from a later step the way the non-capture path
         # does (_promote_into_step). An occasional fault-tolerance drop can afford that;
@@ -1258,6 +1259,19 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "token_capture.enabled: on the capture path a replacement cannot borrow "
                 "a finished group from a later step, so every dropped group stalls its "
                 "step for a full fresh rollout. Disable one of the two."
+            )
+        # RolloutFailureConfig only enforces this under on_dropped_prompt="replace",
+        # and filtering deliberately does not read that knob, so a "shrink" run with
+        # dynamic sampling on would otherwise accept a pool it can never fill:
+        # _divert_batch_to_reserve stops at len(pool) >= replacement_reserve_prompts,
+        # which 0 satisfies immediately.
+        if rollout_failure.replacement_reserve_prompts < 1:
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling requires "
+                "async_rl.rollout_failure.replacement_reserve_prompts >= 1, got "
+                f"{rollout_failure.replacement_reserve_prompts}: at 0 the spare pool "
+                "is never refilled, so every filtered group shrinks its step instead "
+                "of being resampled."
             )
         if grpo_cfg.dynamic_sampling_max_replacements_per_slot < 1:
             raise ValueError(
@@ -1273,6 +1287,30 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 f"sampler that stamps one), but got '{async_config.sampler.name}': "
                 "without a stamped step a filtered group cannot be credited short or "
                 "replaced, so every filtered group silently shrinks the batch."
+            )
+        # Reachable but unread on this path: SC resamples per dropped slot instead of
+        # regenerating whole batches. Silently ignoring them would let a config that
+        # looks tuned behave as if it were not.
+        inert = [
+            f"{algo_prefix}.{name}={value!r}"
+            for name, value, default in (
+                (
+                    "dynamic_sampling_max_gen_batches",
+                    grpo_cfg.dynamic_sampling_max_gen_batches,
+                    10,
+                ),
+                ("batch_multiplier", grpo_cfg.batch_multiplier, 1.0),
+            )
+            if value != default
+        ]
+        if inert:
+            warnings.warn(
+                f"{', '.join(inert)} has no effect on the SingleController path: "
+                "dynamic sampling resamples per dropped slot, budgeted by "
+                f"{algo_prefix}.dynamic_sampling_max_replacements_per_slot, rather "
+                "than regenerating whole batches. See "
+                "docs/guides/single-controller.md#dynamic-sampling.",
+                stacklevel=2,
             )
         if algo_cfg.num_generations_per_prompt < 2:
             raise ValueError(

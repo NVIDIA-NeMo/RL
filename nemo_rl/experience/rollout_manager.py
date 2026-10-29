@@ -2169,9 +2169,9 @@ class RolloutManager:
                     # and retrying the same prompt would likely be uniform again.
                     await self._tq_buffer.remove_group(tq_group_id)
                     # Generation succeeded, so the fleet is answering -- clear the
-                    # consecutive-drop run exactly as a commit does (L2277), and as the
-                    # finalizer path already does on a successful generation
-                    # (generate_for_finalization). A zero-variance drop is a data
+                    # consecutive-drop run exactly as the commit path in this method
+                    # does, and as the finalizer path already does on a successful
+                    # generation (generate_for_finalization). A zero-variance drop is a data
                     # decision, not an infra failure, so an earlier infra drop's run
                     # must not carry across this healthy generation and prematurely trip
                     # max_consecutive_dropped_prompts.
