@@ -82,17 +82,12 @@ from nemo_rl.models.generation.openai_server_utils import (
     derive_prefix_eos_count,
     splice_prefix_tokens,
 )
-from nemo_rl.models.generation.vllm.request_pipeline import (
-    RolloutResult,
-    rollout_result,
-    rollout_result_to_wire,
-)
+from nemo_rl.models.generation.vllm.request_pipeline import rollout_result_to_wire
 from nemo_rl.models.generation.vllm.utils import (
     chat_generation_tokens,
     chat_routed_experts,
     off_policy_sampling_error,
     remap_multimodal_placeholders,
-    validate_rollout_prompt,
 )
 
 if TYPE_CHECKING:
@@ -459,41 +454,20 @@ class NativeVllmEngine(LLMEngine):
     async def _generate_rollout(
         self, request: GenerateRequest, rollout: dict[str, Any], context: Context
     ) -> AsyncGenerator[GenerateChunk, None]:
-        """One NeMo RL rollout, served exactly as ``generate_async`` serves it.
+        """One NeMo RL rollout, served by the worker's own ``_serve_rollout``.
 
-        The worker builds the SamplingParams and the shared request pipeline
-        builds the result, routed experts included, from vLLM's final output.
-        One chunk carries it all in ``engine_data``; the driver assembles the
-        same output ``generate_async`` returns.
+        One chunk carries the result, routed experts included, in ``engine_data``;
+        the driver assembles the same output ``generate_async`` returns.
         """
-        host = self._host
         prompt_token_ids = list(request["token_ids"])
-        max_new_tokens = host._rollout_max_new_tokens(len(prompt_token_ids))
-        final_output = None
-        if max_new_tokens == 0:
-            result = RolloutResult.nothing_generated()
-        else:
-            sampling_params = host._rollout_sampling_params(
-                max_new_tokens=max_new_tokens,
-                greedy=rollout["greedy"],
-                stop_strings=rollout["stop_strings"],
-            )
-            async for output in self._llm.generate(
-                TokensPrompt(prompt_token_ids=prompt_token_ids),
-                sampling_params,
-                context.id(),
-            ):
-                final_output = output
-            if final_output is None:
-                raise RuntimeError(f"No output received for request {context.id()}")
-            validate_rollout_prompt(prompt_token_ids, final_output.prompt_token_ids)
-            result = rollout_result(
-                final_output,
-                input_length=len(prompt_token_ids),
-                return_routed_experts=host._return_routed_experts_enabled(),
-                routed_experts_dtype=host.routed_experts_dtype,
-                device=torch.device("cpu"),
-            )
+        result, final_output = await self._host._serve_rollout(
+            TokensPrompt(prompt_token_ids=prompt_token_ids),
+            prompt_token_ids=prompt_token_ids,
+            greedy=rollout["greedy"],
+            stop_strings=rollout["stop_strings"],
+            request_id=context.id(),
+            device=torch.device("cpu"),
+        )
         chunk: GenerateChunk = {
             "token_ids": result.token_ids,
             "index": 0,
