@@ -491,8 +491,10 @@ class _ScriptedAsyncLLM:
             outputs=[
                 types.SimpleNamespace(
                     token_ids=self.generated,
+                    # The second token has no reported logprob.
                     logprobs=[
-                        {t: types.SimpleNamespace(logprob=-0.5)} for t in self.generated
+                        {} if i == 1 else {t: types.SimpleNamespace(logprob=-0.5)}
+                        for i, t in enumerate(self.generated)
                     ],
                     finish_reason=self.finish_reason,
                     routed_experts=None,
@@ -552,51 +554,56 @@ async def test_async_vllm_generate_async_samples_and_returns_the_rollout() -> No
     assert sampling["top_k"] == -1
     assert sorted(sampling["stop"]) == ["</done>", "</x>"]
     assert output["output_ids"].tolist() == [[1, 2, 3, 4, 5, 10, 11, 2]]
-    assert output["logprobs"].tolist() == [[0.0] * 5 + [-0.5] * 3]
+    # A position without a reported logprob stays 0.0, aligned with its token.
+    assert output["logprobs"].tolist() == [[0.0] * 5 + [-0.5, 0.0, -0.5]]
     assert output["generation_lengths"].tolist() == [3]
     assert output["unpadded_sequence_lengths"].tolist() == [8]
     assert output["truncated"].tolist() == [False]
+    # No router replay keys when R3 is off.
+    assert set(output) == {
+        "output_ids",
+        "logprobs",
+        "generation_lengths",
+        "unpadded_sequence_lengths",
+        "truncated",
+    }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("speculative_config", "expected_max_tokens"),
+    ("prompt_length", "speculative_config", "expected_max_tokens"),
     [
         # min(max_new_tokens=8, max_model_len 16 - prompt 12)
-        (None, 4),
+        (12, None, 4),
         # The drafter reads 2 tokens ahead: 16 - 12 - (2 + 1)
-        ({"num_speculative_tokens": 2}, 1),
+        (12, {"num_speculative_tokens": 2}, 1),
+        # Nothing fits: the prompt comes back without calling vLLM.
+        (16, None, 0),
+        # The spec-decode clamp floors at 1 token; a full context must not reach it.
+        (16, {"num_speculative_tokens": 2}, 0),
     ],
 )
-async def test_async_vllm_generate_async_caps_the_budget_to_the_context(
-    speculative_config, expected_max_tokens
+async def test_async_vllm_generate_async_budget(
+    prompt_length, speculative_config, expected_max_tokens
 ) -> None:
     llm = _ScriptedAsyncLLM([10], finish_reason="length")
     worker = _rollout_worker(
         llm, vllm_kwargs={"speculative_config": speculative_config}
     )
-
-    output = await _generate_one(worker, list(range(1, 13)))
-
-    ((_, sampling),) = llm.calls
-    assert sampling["max_tokens"] == expected_max_tokens
-    assert output["truncated"].tolist() == [True]
-
-
-@pytest.mark.asyncio
-async def test_async_vllm_generate_async_returns_the_prompt_when_nothing_fits() -> None:
-    llm = _ScriptedAsyncLLM([10])
-    worker = _rollout_worker(llm)
-    prompt = list(range(1, 17))
+    prompt = list(range(1, prompt_length + 1))
 
     output = await _generate_one(worker, prompt)
 
-    assert llm.calls == []
-    assert output["output_ids"].tolist() == [prompt]
-    assert output["logprobs"].tolist() == [[0.0] * 16]
-    assert output["generation_lengths"].tolist() == [0]
-    assert output["unpadded_sequence_lengths"].tolist() == [16]
-    assert output["truncated"].tolist() == [False]
+    if expected_max_tokens == 0:
+        assert llm.calls == []
+        assert output["output_ids"].tolist() == [prompt]
+        assert output["logprobs"].tolist() == [[0.0] * prompt_length]
+        assert output["generation_lengths"].tolist() == [0]
+        assert output["truncated"].tolist() == [False]
+    else:
+        ((_, sampling),) = llm.calls
+        assert sampling["max_tokens"] == expected_max_tokens
+        assert output["truncated"].tolist() == [True]
 
 
 @pytest.mark.asyncio
@@ -1428,6 +1435,25 @@ async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
     error = json.loads(response.body)["error"]
     assert error["code"] == "retained_media_changed"
     assert error["param"] == "messages"
+
+
+@pytest.mark.asyncio
+async def test_chat_handler_rejects_off_policy_sampling_and_pins_top_k(monkeypatch):
+    """The route asserts on-policy sampling, then hands vLLM top_k=-1."""
+    _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    serving_chat.create_chat_completion = AsyncMock(return_value=iter(()))
+
+    off_policy = _fake_chat_request()
+    off_policy.temperature = 0.5
+    with pytest.raises(AssertionError, match="matches neither"):
+        await chat_handler(off_policy, MagicMock())
+    serving_chat.create_chat_completion.assert_not_awaited()
+
+    request = _fake_chat_request()
+    request.top_k = None
+    await chat_handler(request, MagicMock())
+    serving_chat.create_chat_completion.assert_awaited_once()
+    assert request.top_k == -1
 
 
 @pytest.mark.asyncio
