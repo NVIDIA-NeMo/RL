@@ -126,19 +126,20 @@ class TestHealthCheck:
             )
         )
         monkeypatch.setattr(gym_utils.ServerClient, "load_from_global_config", load)
-        # HTTP-session creation is covered by Gym's client-reuse test.
+        # Keep the real ServerClient/config-load path without opening sockets.
         monkeypatch.setattr(gym_utils, "is_global_aiohttp_client_setup", lambda: True)
 
         env = _unspun()
         clients = []
         for _ in range(2):
             env._spinup()
-            assert load.call_count == len(clients) * 2
+            assert load.call_count == len(clients) * 2 + 1
             clients.append(env.rch.setup_server_client(env.head_server_config))
             for _ in range(64):
                 assert (
                     env.rch.setup_server_client(env.head_server_config) is clients[-1]
                 )
+                assert list(env.rch.run_examples([], env.head_server_config)) == []
             assert load.call_count == len(clients) * 2 - 1
             # The existing control client remains independently cached.
             control = env._control_client()
@@ -147,6 +148,9 @@ class TestHealthCheck:
         assert load.call_count == 4
         assert clients[0] is not clients[1]
         assert [client.head_server_config.port for client in clients] == [11000, 11001]
+        with pytest.raises(ValueError, match="different Gym deployment"):
+            env.rch.setup_server_client(clients[0].head_server_config)
+        assert env.rch.setup_server_client() is clients[1]
 
     def test_a_healthy_gym_polls_the_run_helper(self):
         env = _unspun()

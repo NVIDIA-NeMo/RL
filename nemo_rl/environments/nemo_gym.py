@@ -881,7 +881,11 @@ class NemoGym(EnvironmentInterface):
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
-        from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
+        from nemo_gym.server_utils import (
+            HEAD_SERVER_KEY_NAME,
+            BaseServerConfig,
+            ServerClient,
+        )
         from omegaconf import DictConfig
 
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
@@ -1030,9 +1034,22 @@ Depending on your data shape, you may want to change these values."""
             host=self.node_ip,
             port=self.head_server_port,
         )
-        # Repeated synchronous config loads can delay capture receipts past
-        # their deadline. A fresh helper per startup keeps its cache current.
-        self.rch = RolloutCollectionHelper(reuse_server_client=True)
+        # Resolve once before dispatch: synchronous config loads during each
+        # rollout can block receipt delivery past its deadline. This helper is
+        # bound to this deployment and replaced on every startup.
+        rollout_client = ServerClient.load_from_global_config(self.head_server_config)
+
+        class DeploymentRolloutCollectionHelper(RolloutCollectionHelper):
+            def setup_server_client(
+                self, head_server_config: Optional[BaseServerConfig] = None
+            ) -> ServerClient:
+                if head_server_config not in (None, rollout_client.head_server_config):
+                    raise ValueError(
+                        "Rollout helper belongs to a different Gym deployment"
+                    )
+                return rollout_client
+
+        self.rch = DeploymentRolloutCollectionHelper()
 
     def set_tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         """Install the tokenizer run_rollouts postprocesses with.
