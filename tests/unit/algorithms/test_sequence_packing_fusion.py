@@ -251,7 +251,9 @@ def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group):
     }
 
 
-def _run_compare_sequence_packing_wrappers(rank, world_size, cp_size, tp_size):
+def _run_compare_sequence_packing_wrappers(
+    rank, world_size, cp_size, tp_size, chunk_size=None
+):
     """Compare SequencePackingFusionLossWrapper vs SequencePackingLossWrapper.
 
     Verifies that the fused wrapper produces identical loss values and
@@ -276,7 +278,8 @@ def _run_compare_sequence_packing_wrappers(rank, world_size, cp_size, tp_size):
 
     candidate_wrapper = SequencePackingFusionLossWrapper(
         loss_fn=base_loss_fn,
-        prepare_fn=prepare_packed_loss_input,
+        # With chunk_size the fused path writes the grad into the logits' storage.
+        prepare_fn=functools.partial(prepare_packed_loss_input, chunk_size=chunk_size),
         cu_seqlens_q=to_cpu_int_tuple(tc["cu_seqlens"]),
         cu_seqlens_q_padded=to_cpu_int_tuple(tc["cu_seqlens_padded"]),
         vocab_parallel_rank=my_tp_rank,
@@ -437,7 +440,10 @@ def _run_compare_sequence_packing_wrappers_with_sampling(
     ],
     ids=lambda cp_tp: f"cp{cp_tp[0]}_tp{cp_tp[1]}",
 )
-def test_sequence_packing_fusion_vs_baseline(distributed_test_runner, cp_tp):
+@pytest.mark.parametrize("chunk_size", [None, 3], ids=["nochunk", "chunk3"])
+def test_sequence_packing_fusion_vs_baseline(
+    distributed_test_runner, cp_tp, chunk_size
+):
     """Compare SequencePackingFusionLossWrapper vs SequencePackingLossWrapper.
 
     Verifies that the fused wrapper produces identical:
@@ -452,6 +458,7 @@ def test_sequence_packing_fusion_vs_baseline(distributed_test_runner, cp_tp):
         _run_compare_sequence_packing_wrappers,
         cp_size=cp_size,
         tp_size=tp_size,
+        chunk_size=chunk_size,
     )
     distributed_test_runner(test_fn, world_size=world_size)
 
