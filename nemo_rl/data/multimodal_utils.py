@@ -15,6 +15,7 @@
 import base64
 import inspect
 import logging
+import math
 import re
 import uuid
 from collections import defaultdict
@@ -47,6 +48,12 @@ AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
     {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
+# Provenance marker set on user messages whose media tensors were attached
+# rollout-matched (repaired to the rollout's per-image placeholder runs). The
+# driver-side static reattach must not overwrite such media; key presence
+# alone is not provenance (targets may carry placeholder or stale payloads
+# that the reattach is expected to replace).
+ROLLOUT_MATCHED_MEDIA_KEY = "_rollout_matched_media"
 
 # List of allowed placeholder strings for different media types in the dataset string
 # e.g. "This is an example of <image>"
@@ -72,6 +79,7 @@ _PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
         "NemotronH_Omni_Reasoning_V3Processor",
+        "NemotronH_Super_Omni_Reasoning_V3Processor",
     }
 )
 
@@ -191,6 +199,37 @@ def present_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
     deterministic field list across ranks.
     """
     return sorted(WIRE_MULTIMODAL_FIELDS & set(meta.fields or ()))
+
+
+def teacher_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
+    """Omit packed columns whose row shapes prove the whole teacher batch empty.
+
+    Capture keeps empty media columns for the trainer's partition schema, but
+    text teachers do not accept media arguments. Keep per-token fields and any
+    packed field with missing or malformed shapes for the decoder to validate.
+    """
+    fields = present_multimodal_fields(meta)
+    if not meta.tags or len(meta.tags) != meta.size:
+        return fields
+
+    def row_is_empty(tag: dict[str, Any], field: str) -> bool:
+        geometry = tag.get(row_shapes_key(field))
+        if not isinstance(geometry, dict):
+            return False
+        shapes = geometry.get(ROW_GEOMETRY_SHAPES)
+        return isinstance(shapes, (list, tuple)) and all(
+            isinstance(shape, (list, tuple))
+            and all(type(dim) is int and dim >= 0 for dim in shape)
+            and math.prod(shape) == 0
+            for shape in shapes
+        )
+
+    return [
+        field
+        for field in fields
+        if field not in PACKED_MULTIMODAL_FIELDS
+        or not all(row_is_empty(tag, field) for tag in meta.tags)
+    ]
 
 
 def multimodal_row_tags(
@@ -1298,6 +1337,16 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
     return list(all_keys)
 
 
+def per_token_multimodal_schema(processor) -> tuple[str, ...]:
+    """Per-token media fields a multimodal run writes on every row; none if text-only."""
+    if processor is None:
+        return ()
+    keys = set(get_multimodal_keys_from_processor(processor))
+    return tuple(
+        sorted({"media_token_validity_mask"} | (keys & PER_TOKEN_MULTIMODAL_FIELDS))
+    )
+
+
 def get_multimodal_default_settings_from_processor(
     processor,
 ) -> dict[str, dict[str, Any]]:
@@ -1499,6 +1548,24 @@ def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
         return Image.open(image_path_or_image).convert("RGB")
 
 
+def image_size_from_source(source: str | Image.Image) -> tuple[int, int]:
+    """Return ``(width, height)`` for an image source."""
+    if isinstance(source, Image.Image):
+        return source.width, source.height
+    if source.startswith("data:"):
+        _, encoded = source.split(",", 1)
+        with Image.open(BytesIO(base64.b64decode(encoded))) as image:
+            return image.width, image.height
+    if source.startswith("file://"):
+        with Image.open(source.removeprefix("file://")) as image:
+            return image.width, image.height
+    if not source.startswith(("http://", "https://")):
+        with Image.open(source) as image:
+            return image.width, image.height
+    image = resolve_to_image(source)
+    return image.width, image.height
+
+
 def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
     """Encode a PIL Image as a base64 ``data:`` URL.
 
@@ -1639,16 +1706,37 @@ def _restore_tensors(processed: dict[str, Any]) -> None:
                 continue
 
 
+def _image_num_tokens_from_processed(processed: dict[str, Any]) -> list[int]:
+    value = processed.get("num_tokens")
+    if value is None:
+        raise ValueError(
+            "Processor output has no per-image 'num_tokens'; cannot verify "
+            "image parity with the rollout tokens."
+        )
+    if isinstance(value, torch.Tensor):
+        return [int(item) for item in value.tolist()]
+    return [int(item) for item in value]
+
+
 def attach_image_model_inputs_to_message(
     message: dict[str, Any],
     *,
     images: list[Image.Image],
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
+    expected_num_tokens_per_image: Sequence[int] | None = None,
 ) -> None:
-    """Attach processor-owned image tensors without replacing rollout tokens."""
+    """Attach image tensors while preserving rollout-token/media parity."""
     if not images or processor is None:
         return
+    if expected_num_tokens_per_image is not None and len(
+        expected_num_tokens_per_image
+    ) != len(images):
+        raise ValueError(
+            f"Got {len(images)} images but {len(expected_num_tokens_per_image)} "
+            "rollout placeholder runs for this turn. Refusing to train on "
+            "misaligned media."
+        )
 
     image_token = getattr(processor, "image_token", "<image>")
     # Processors that emit dynamic per-image resolutions return a ragged CHW list
@@ -1662,6 +1750,17 @@ def attach_image_model_inputs_to_message(
         return_tensors=None if allow_ragged_output else "pt",
     )
     processed = dict(processed)
+    if expected_num_tokens_per_image is not None:
+        expected = [int(count) for count in expected_num_tokens_per_image]
+        if _image_num_tokens_from_processed(processed) != expected:
+            # Local import: exact-count repair is Nemotron-processor-specific.
+            from nemo_rl.environments.nemotron_utils import (
+                reprocess_images_at_rollout_budgets,
+            )
+
+            processed = reprocess_images_at_rollout_budgets(processor, images, expected)
+            # Corrected tiles may be ragged even when the originals were not.
+            allow_ragged_output = len(images) > 1
     if allow_ragged_output:
         processed = _materialize_ragged_pixel_values(processed, processor)
     model_inputs = extract_multimodal_model_inputs(processor, processed)
@@ -1673,6 +1772,8 @@ def attach_image_model_inputs_to_message(
         }
     )
     attach_processor_media_token_validity_mask(message, processor)
+    if expected_num_tokens_per_image is not None:
+        message[ROLLOUT_MATCHED_MEDIA_KEY] = True
 
 
 def attach_processor_media_token_validity_mask(

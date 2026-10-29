@@ -44,8 +44,10 @@ from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.models.generation import (
     configure_generation_config,
+    draft_full_refit_enabled,
     maybe_configure_engine_reaping_env,
 )
+from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.models.policy.draft_config import draft_refit_enabled
 from nemo_rl.telemetry.instrumentation import setup_span, startup_span
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
@@ -104,6 +106,10 @@ def main() -> None:
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
     config = MasterConfig(**config)
+    # Keep the processor, dataset and vLLM MediaIO on one frame-count contract.
+    # Without this, vLLM's VideoMediaIO silently falls back to 32 frames even
+    # when a video recipe requests (and caches) 64 frames.
+    materialize_vllm_video_config(config.policy, config.data)
     print("Applied CLI overrides")
 
     if is_ppo_run(config):
@@ -177,6 +183,9 @@ def main() -> None:
                     tokenizer,
                     has_refit_draft_weights=has_refit_draft_weights,
                     trains_mtp=trains_mtp,
+                    # Only used by Automodel draft co-training; SC supports only the
+                    # Megatron train backend today, so this is always False here.
+                    draft_full_refit=draft_full_refit_enabled(config.policy),
                 )
 
             # Its own phase rather than part of the tokenizer block: it resolves

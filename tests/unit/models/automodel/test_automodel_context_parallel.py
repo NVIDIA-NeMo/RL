@@ -15,6 +15,7 @@
 """Contract tests for NeMo-RL's Automodel context-parallel integration."""
 
 import os
+import time
 from contextlib import nullcontext
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
@@ -126,17 +127,26 @@ def test_real_cp_sharder_forward_and_gradient_fanout_parity(tmp_path) -> None:
         )
         for rank in range(2)
     ]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=60)
-        if process.is_alive():
-            for child in processes:
-                if child.is_alive():
-                    child.terminate()
-                    child.join()
-            pytest.fail("two-rank Gloo CP sharder test timed out")
-        assert process.exitcode == 0
+    try:
+        for process in processes:
+            process.start()
+        # Spawned workers import the Automodel/Transformers stack before the
+        # 30-second process-group timeout starts. Match the checkpoint test's
+        # startup allowance while keeping one deadline for both ranks.
+        deadline = time.monotonic() + 180
+        for process in processes:
+            process.join(timeout=max(0, deadline - time.monotonic()))
+            assert not process.is_alive(), "two-rank Gloo CP sharder test timed out"
+            assert process.exitcode == 0
+    finally:
+        # Also reap siblings when one worker fails before the other finishes.
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
 
 
 class _PermutationTokenLayout:

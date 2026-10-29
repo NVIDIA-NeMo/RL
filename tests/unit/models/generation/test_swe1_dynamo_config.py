@@ -41,7 +41,10 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
     configured_generation = configure_generation_config(generation, tokenizer)
     config["policy"]["generation"] = configured_generation
     setup_nemo_gym_config(
-        SimpleNamespace(policy=config["policy"], env=config["env"]), tokenizer
+        SimpleNamespace(
+            policy=config["policy"], env=config["env"], data=config["data"]
+        ),
+        tokenizer,
     )
     validated = DynamoConfig.model_validate(configured_generation)
     assert validated.vllm_cfg.async_engine is True

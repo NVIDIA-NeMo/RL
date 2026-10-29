@@ -77,6 +77,7 @@ from torch.distributed.distributed_c10d import (
     _world,
 )
 
+from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import CACHED_VIDEO_FRAME_MANIFEST_MAGIC
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import receive_held_socket
@@ -195,6 +196,20 @@ class _MegatronRefitTask:
     def is_mxfp8(self) -> bool:
         return isinstance(self.destination, MXFP8Tensor)
 
+    @property
+    def is_quantized(self) -> bool:
+        # MCore owns detection of TE tensor and grouped-parameter storage.
+        from megatron.core.fp8_utils import (
+            is_float8tensor,
+            is_grouped_tensor_with_quantized_storage,
+        )
+
+        return (
+            self.is_mxfp8
+            or is_float8tensor(self.destination)
+            or is_grouped_tensor_with_quantized_storage(self.destination)
+        )
+
 
 @dataclass
 class _MegatronBulkRefitPiece:
@@ -203,7 +218,6 @@ class _MegatronBulkRefitPiece:
     task: _MegatronRefitTask
     spec: Any
     shape: torch.Size
-    dtype: torch.dtype
     device: torch.device
     destination: torch.Tensor | None
 
@@ -300,6 +314,8 @@ class MegatronGenerationMixin:
      - processor: optional multimodal processor.
      - is_generation_colocated: Whether colocated or distributed.
      - _reserved_http_server_port: driver-reserved server port, or None.
+     - _router_replay_enabled: whether MInf must emit routing indices with
+       every captured payload (read by setup_token_capture).
     """
 
     # Colocated-reshard hosts assign the dedicated inference-layout model here
@@ -307,6 +323,7 @@ class MegatronGenerationMixin:
     processor: Optional[Any] = None
     inference_model = None
     _colocated_reshard_plan = None
+    _image_preprocessing_config: Optional[Any] = None
 
     def _gen_model(self) -> MegatronModule:
         """The model the inference engine wraps.
@@ -389,6 +406,21 @@ class MegatronGenerationMixin:
         ):
             return model, None
         return model.language_model, model
+
+    def _vision_pixel_dtype(self) -> torch.dtype:
+        """The dtype the vision encoder casts pixels to before encoding them.
+
+        Read from the encoder's own parameters rather than the policy dtype:
+        a config may keep the vision tower in fp32 under a bf16 language model.
+        """
+        _, media_model = self._inference_model_and_media_parts()
+        vision_model = getattr(media_model, "vision_model", None)
+        if vision_model is None:
+            raise RuntimeError(
+                "Megatron media capture requires the vision encoder on the "
+                "coordinator's model-parallel stage"
+            )
+        return next(vision_model.parameters()).dtype
 
     def _build_image_preprocessing_config(self, generation_config: dict[str, Any]):
         """Build raw-image preprocessing settings."""
@@ -548,6 +580,17 @@ class MegatronGenerationMixin:
         pg_collection = get_attr_wrapped_model(self._gen_model(), "pg_collection")
         model_config = inference_model.config
 
+        if self._router_replay_enabled:
+            # Must precede engine construction: the engine captures CUDA graphs
+            # and sizes its route buffer from the registry length. A colocated
+            # worker that built a reference model has already had the registry
+            # cleared (or double-filled) by setup_reference_model_state.
+            from nemo_rl.models.megatron.router_replay import (
+                reset_global_router_replay_instances_for_model,
+            )
+
+            reset_global_router_replay_instances_for_model(self._gen_model())
+
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
         num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
         block_size_tokens = mcore_generation_config["block_size_tokens"]
@@ -601,6 +644,7 @@ class MegatronGenerationMixin:
         image_preprocessing_config = self._build_image_preprocessing_config(
             mcore_generation_config
         )
+        self._image_preprocessing_config = image_preprocessing_config
         video_preprocessing_config = build_video_preprocessing_config(
             image_preprocessing_config,
             mcore_generation_config,
@@ -673,6 +717,25 @@ class MegatronGenerationMixin:
         self.inference_context = DynamicInferenceContext(
             engine_model.config, inference_config
         )
+        token_capacity = model_config.inference_flashinfer_mxfp8_token_capacity
+        if token_capacity is not None:
+            decode_rows = (
+                self.inference_context.max_requests
+                * (num_speculative_tokens + 1)
+                * model_config.expert_model_parallel_size
+            )
+            if decode_rows > token_capacity:
+                raise ValueError(
+                    "policy.generation.mcore_generation_config."
+                    f"inference_flashinfer_mxfp8_token_capacity={token_capacity} can never "
+                    "engage: MCore applies it only when max_requests * "
+                    "(num_speculative_tokens + 1) * expert_model_parallel_size <= capacity, "
+                    f"and this engine derived max_requests="
+                    f"{self.inference_context.max_requests} with EP="
+                    f"{model_config.expert_model_parallel_size}, i.e. {decode_rows} decode "
+                    "rows. Raise the capacity (it may go up to the full dispatcher buffer) "
+                    "or lower buffer_size_gb / max_requests."
+                )
         if media_model is None:
             self.inference_wrapped_model = GPTInferenceWrapper(
                 engine_model, self.inference_context
@@ -918,6 +981,14 @@ class MegatronGenerationMixin:
         if self.is_generation_colocated:
             if self._inference_engine_initialized and not self._inference_engine_asleep:
                 self._sleep()
+            if self._router_replay_enabled:
+                # MInf leaves RECORD and its route buffer on these routers; a
+                # non-replaying forward (the reference pass) would record into
+                # that buffer. MInf sets both again before its next step.
+                from megatron.core.transformer.moe.router_replay import RouterReplay
+
+                RouterReplay.clear_global_router_replay_action()
+                RouterReplay.clear_global_static_buffers()
             cuda_graph_impl = self.cfg["generation"]["mcore_generation_config"][
                 "cuda_graph_impl"
             ]
@@ -1029,13 +1100,29 @@ class MegatronGenerationMixin:
         return self.base_url
 
     def setup_token_capture(
-        self, dp_cfg: "DataPlaneConfig", staging_partition: str
-    ) -> bool:
-        """Install canonical TQ capture on each MInf model-parallel leader."""
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
+    ) -> MediaColumnSpec | None:
+        """Install canonical TQ capture on each MInf model-parallel leader.
+
+        ``capture_media`` builds the sink/source against the media-enabled
+        staging schema so the stager can hand the engine's media tensors to
+        TQ beside each call's tokens. Returns the media column spec the
+        coordinator pinned the staging column to (``None`` for text-only
+        capture and on followers, which host no hooks).
+        """
         engine = self.dynamic_inference_engine
         if engine is None:
             raise RuntimeError(
                 "Megatron token capture requires an initialized inference engine"
+            )
+        if capture_media and self._image_preprocessing_config is None:
+            raise ValueError(
+                "Megatron media capture requires an image-capable inference wrapper "
+                "(mcore_generation_config.megatron_inference_wrapper)"
             )
         missing = [
             name
@@ -1049,7 +1136,7 @@ class MegatronGenerationMixin:
             )
         self._token_capture_enabled = True
         if not engine.is_mp_coordinator:
-            return False
+            return None
 
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
@@ -1062,17 +1149,45 @@ class MegatronGenerationMixin:
         # generation-only worker. A trainer in this process attached first and
         # keeps its segment: TQ reuses a process's existing client.
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
+        # MInf emits float32 pixels and the trainer casts them to the vision
+        # encoder's weight dtype before encoding, so the stager casts first and
+        # the media column is pinned to that dtype (the rule vLLM follows).
+        pixel_dtype = self._vision_pixel_dtype() if capture_media else None
         prompt_preparer = TQMegatronPromptPreparer(
-            TQTokenSource(dp_client, staging_partition=staging_partition)
+            TQTokenSource(
+                dp_client,
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+            )
         )
         engine.prompt_preparer = prompt_preparer
         self._request_prompt_preparer = prompt_preparer
+        expected_route_dims = None
+        if self._router_replay_enabled:
+            from nemo_rl.models.megatron.router_replay import (
+                router_replay_dimensions_for_model,
+            )
+
+            expected_route_dims = router_replay_dimensions_for_model(self._gen_model())
         stager = TQMegatronTokenStager(
-            TQTokenSink(dp_client, staging_partition=staging_partition)
+            TQTokenSink(
+                dp_client,
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+                media_pixel_dtype=pixel_dtype,
+            ),
+            require_routed_experts=self._router_replay_enabled,
+            expected_route_dims=expected_route_dims,
         )
         engine.payload_stager = stager
         self._request_payload_stager = stager
-        return True
+        if not capture_media:
+            return None
+        assert pixel_dtype is not None
+        return MediaColumnSpec(
+            pixel_dtype=pixel_dtype,
+            patch_size=int(self._image_preprocessing_config.patch_dim),
+        )
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Stamp subsequent MInf requests with the trainer weight version."""
@@ -1666,7 +1781,7 @@ class MegatronGenerationRefitMixin:
                 f"of {piece.task.param_name!r}: expected {tuple(piece.shape)}, "
                 f"got {tuple(tensor.shape)}."
             )
-        if not piece.task.is_mxfp8:
+        if not piece.task.is_quantized:
             assert piece.destination is not None
             piece.spec.select(piece.destination).copy_(tensor)
             return
@@ -1680,7 +1795,20 @@ class MegatronGenerationRefitMixin:
             logical_weight = piece.task.conversion_task.combine_local_hf_weights(
                 pending
             )
-            self._write_generation_refit_weight(piece.task, logical_weight)
+            if piece.task.is_mxfp8:
+                self._write_generation_refit_weight(piece.task, logical_weight)
+            else:
+                if logical_weight.shape != piece.task.expected_shape:
+                    raise ValueError(
+                        f"Shape mismatch for Megatron parameter {piece.task.param_name!r}: "
+                        f"expected {tuple(piece.task.expected_shape)}, "
+                        f"got {tuple(logical_weight.shape)}."
+                    )
+                # Only bulk hooks use MCore's TE/grouped quantized writer.
+                # Keep this optional API out of the packed collective/misc path.
+                from megatron.core.fp8_utils import copy_tensor_to_quantized_param
+
+                copy_tensor_to_quantized_param(piece.task.destination, logical_weight)
             del self._generation_m2n_pending[piece.task.target_id]
 
     def _build_destination_hf_to_local_param_map(
@@ -1696,17 +1824,11 @@ class MegatronGenerationRefitMixin:
                 raise RuntimeError(
                     f"Duplicate Megatron M-to-N target for {spec.name!r}."
                 )
-            destination = None if task.is_mxfp8 else task.destination
-            # MXFP8 destinations stage through BF16: the wire payload is logical
-            # BF16 by design, and MXFP8Tensor.dtype is optional metadata that is
-            # None until the destination's first successful update. Pin the
-            # staging dtype rather than inferring it from the quantized store.
-            dtype = torch.bfloat16 if task.is_mxfp8 else task.destination.dtype
+            destination = None if task.is_quantized else task.destination
             pieces[spec.name] = _MegatronBulkRefitPiece(
                 task=task,
                 spec=spec,
                 shape=spec.selected_shape(task.expected_shape),
-                dtype=dtype,
                 device=task.destination.device,
                 destination=destination,
             )
@@ -1728,6 +1850,7 @@ class MegatronGenerationRefitMixin:
 
         def grouped_spec(
             grouped: tuple[_MegatronBulkRefitPiece, ...],
+            wire_dtype: torch.dtype,
         ) -> LocalParamSpec:
             first = grouped[0]
 
@@ -1735,7 +1858,7 @@ class MegatronGenerationRefitMixin:
                 return RefitCtx(
                     buf=torch.empty(
                         (len(grouped), *first.shape),
-                        dtype=first.dtype,
+                        dtype=wire_dtype,
                         device=first.device,
                     )
                 )
@@ -1744,31 +1867,48 @@ class MegatronGenerationRefitMixin:
                 for received, piece in zip(ctx.buf.unbind(0), grouped, strict=True):
                     self._commit_megatron_bulk_refit_piece(piece, received)
 
-            return LocalParamSpec(base=None, pre=pre, post=post)
+            return LocalParamSpec(base=None, pre=pre, post=post, wire_dtype=wire_dtype)
 
-        def staged_spec(piece: _MegatronBulkRefitPiece) -> LocalParamSpec:
+        def staged_spec(
+            piece: _MegatronBulkRefitPiece, wire_dtype: torch.dtype
+        ) -> LocalParamSpec:
             def pre(_base: Any) -> RefitCtx:
                 return RefitCtx(
-                    buf=torch.empty(piece.shape, dtype=piece.dtype, device=piece.device)
+                    buf=torch.empty(piece.shape, dtype=wire_dtype, device=piece.device)
                 )
 
             def post(ctx: RefitCtx) -> None:
                 self._commit_megatron_bulk_refit_piece(piece, ctx.buf)
 
-            return LocalParamSpec(base=None, pre=pre, post=post)
+            return LocalParamSpec(base=None, pre=pre, post=post, wire_dtype=wire_dtype)
 
-        def direct_spec(piece: _MegatronBulkRefitPiece) -> LocalParamSpec:
+        def direct_spec(
+            piece: _MegatronBulkRefitPiece, wire_dtype: torch.dtype
+        ) -> LocalParamSpec:
             assert piece.destination is not None
 
             def pre(base: torch.Tensor) -> RefitCtx:
                 return RefitCtx(buf=piece.spec.select(base))
 
-            return LocalParamSpec(base=piece.destination, pre=pre)
+            return LocalParamSpec(
+                base=piece.destination, pre=pre, wire_dtype=wire_dtype
+            )
 
         specs = {}
         for layer_name in refit_info["layer_names"]:
             for param_info in refit_info["per_layer_params"][layer_name]:
                 name = param_info["name"]
+                wire_dtype_value = param_info.get("dtype")
+                wire_dtype = _STR_TO_DTYPE.get(str(wire_dtype_value))
+                if wire_dtype is None or wire_dtype not in (
+                    torch.bfloat16,
+                    torch.float16,
+                    torch.float32,
+                ):
+                    raise ValueError(
+                        f"Unsupported Megatron bulk refit wire dtype "
+                        f"{wire_dtype_value!r} for {name!r}."
+                    )
                 grouped_proj = param_info.get("grouped_expert_proj")
                 if grouped_proj is not None:
                     prefix = name.rsplit(f".{grouped_proj}.weight", 1)[0]
@@ -1782,7 +1922,7 @@ class MegatronGenerationRefitMixin:
                         raise ValueError(
                             f"No local Megatron experts map to M-to-N weight {name!r}."
                         )
-                    specs[name] = grouped_spec(grouped)
+                    specs[name] = grouped_spec(grouped, wire_dtype)
                     continue
 
                 piece = pieces.get(name)
@@ -1791,7 +1931,9 @@ class MegatronGenerationRefitMixin:
                         f"No local Megatron destination maps to M-to-N weight {name!r}."
                     )
                 specs[name] = (
-                    staged_spec(piece) if piece.task.is_mxfp8 else direct_spec(piece)
+                    staged_spec(piece, wire_dtype)
+                    if piece.task.is_quantized or piece.destination.dtype != wire_dtype
+                    else direct_spec(piece, wire_dtype)
                 )
 
         return HFToLocalParamMap(specs=specs)
@@ -1987,9 +2129,7 @@ class MegatronGenerationRefitMixin:
                 raise RuntimeError(
                     f"Megatron M-to-N refit has no destination for {param_info['name']!r}."
                 )
-            ctx = (
-                spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
-            )
+            ctx = spec.materialize()
             destination = DTensorRef(ctx.buf, param_info["global_shape"])
             xferdtensor(
                 None,
@@ -2042,7 +2182,7 @@ class MegatronGenerationRefitMixin:
             )
             if self._generation_m2n_pending:
                 raise RuntimeError(
-                    "Megatron M-to-N refit ended with incomplete fused MXFP8 weights: "
+                    "Megatron M-to-N refit ended with incomplete fused quantized weights: "
                     f"{sorted(self._generation_m2n_pending)}"
                 )
             torch.cuda.empty_cache()

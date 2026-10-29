@@ -72,6 +72,57 @@ def test_from_wire_densifies_uniform_nested_rows() -> None:
     assert torch.equal(back["input_ids"], torch.stack(rows))
 
 
+@pytest.mark.parametrize("lengths", [[1588], [1588, 1588], [3, 5]])
+def test_from_wire_keeps_routes_jagged_until_microbatch_padding(
+    lengths: list[int],
+) -> None:
+    """Single-row and uniform shards must not expose short dense routes."""
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
+    from nemo_rl.data_plane.codec import materialize, pad_batch, pad_field
+    from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
+
+    width = 6478
+    route_rows = [
+        torch.arange(length * 52 * 6, dtype=torch.int16).reshape(length, 52, 6)
+        for length in lengths
+    ]
+    token_rows = [torch.arange(length) for length in lengths]
+    wire = TensorDict(
+        {
+            "input_ids": torch.nested.as_nested_tensor(token_rows, layout=torch.jagged),
+            "input_lengths": torch.tensor(lengths),
+            "routed_experts": torch.nested.as_nested_tensor(
+                route_rows, layout=torch.jagged
+            ),
+        },
+        batch_size=[len(lengths)],
+    )
+
+    # The replica-leader fetch materializes jagged fields, broadcasts them,
+    # then pads everything except fields owned by microbatch processing.
+    data = materialize(_from_wire(wire), layout="jagged")
+    data = pad_batch(data, None, width, skip=MICROBATCH_PADDED_FIELDS)
+
+    assert data["input_ids"].shape == (len(lengths), width)
+    routes = data["routed_experts"]
+    assert routes.is_nested
+    assert routes.dtype == torch.int16
+    for actual, expected in zip(routes.unbind(), route_rows, strict=True):
+        assert torch.equal(actual, expected)
+
+    # Existing microbatch processing widens routes with the missing-route
+    # sentinel only after batch validation has accepted their jagged layout.
+    padded = pad_field(
+        "routed_experts", routes, MICROBATCH_PADDED_FIELDS["routed_experts"], width
+    )
+    assert padded.shape == (len(lengths), width, 52, 6)
+    for index, (length, expected) in enumerate(zip(lengths, route_rows, strict=True)):
+        assert torch.equal(padded[index, :length], expected)
+        assert bool(padded[index, length:].eq(-1).all())
+
+
 def test_from_wire_squeezes_nothing_even_for_scalar_field_names() -> None:
     """``_from_wire`` densifies; it never reinterprets a row's rank.
 

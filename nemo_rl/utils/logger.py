@@ -32,6 +32,7 @@ import requests
 import swanlab
 import torch
 import wandb
+from hydra.utils import get_class
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
@@ -45,8 +46,9 @@ from torch.utils.tensorboard import SummaryWriter
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.telemetry.host_memory import RAY_NODE_MEM_TOTAL, RAY_NODE_MEM_USED
 from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
-from nemo_rl.utils.train_data_dump import json_safe_nonfinite
+from nemo_rl.utils.json_utils import json_safe_nonfinite
 
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
@@ -58,7 +60,6 @@ _rich_logging_configured = False
 # catch-all ``*`` definition is intentionally avoided because wandb-core does
 # not deterministically resolve overlapping glob definitions.
 WANDB_CALLER_STEP_METRIC = "nemo_rl/step"
-TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 
 
 class WandbConfig(BaseModel, extra="allow"):
@@ -107,6 +108,8 @@ class LoggerConfig(BaseModel, extra="allow"):
     monitor_gpus: bool = True
     gpu_monitoring: GPUMonitoringConfig = Field(default_factory=GPUMonitoringConfig)
     num_val_samples_to_print: int = 0
+    # LoggerInterface subclasses as "pkg.module.Class", constructed without arguments.
+    extra_backends: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _require_block_for_enabled_backends(self) -> "LoggerConfig":
@@ -230,6 +233,10 @@ class TensorboardLogger(LoggerInterface):
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
 
+    def finish(self) -> None:
+        """Flush queued TensorBoard events before a worker or actor exits."""
+        self.writer.close()
+
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to Tensorboard."""
         if len(histogram) > 0:
@@ -284,11 +291,45 @@ class WandbLogger(LoggerInterface):
             wandb.save("/tmp/ray/session_latest/logs/raylet.out", policy="live")
             wandb.save("/tmp/ray/session_latest/logs/raylet.err", policy="live")
 
-        self._log_code()
-        self._log_diffs()
+        skip_reason = self._git_artifacts_skip_reason()
+        if skip_reason is None:
+            self._log_code()
+            self._log_diffs()
+        else:
+            print(
+                f"{skip_reason}; skipping the wandb source-code and git-diff artifacts."
+            )
         print(
             f"Initialized WandbLogger for project {cfg.project}, run {cfg.name} at {log_dir}"
         )
+
+    @staticmethod
+    def _git_artifacts_skip_reason() -> Optional[str]:
+        """Why the git-based artifacts cannot be logged, or None when they can.
+
+        A job launched from an uploaded copy of the code tree has no ``.git``
+        directory there, so ``git ls-files`` and ``git diff`` would only fail.
+        The reason is reported as git states it, so a checkout git refuses
+        (``fatal: detected dubious ownership``) or a missing git binary is not
+        reported as "not a work tree".
+        """
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as error:
+            return f"git is not available ({error})"
+        if result.returncode != 0:
+            first_line = result.stderr.strip().splitlines()
+            return (
+                first_line[0] if first_line else f"git exited with {result.returncode}"
+            )
+        if result.stdout.strip() != "true":
+            return "Not inside a git work tree"
+        return None
 
     def _log_diffs(self):
         """Log git diffs to wandb.
@@ -867,10 +908,10 @@ class RayGpuMonitorLogger:
             metric_name = f"node.{node_idx}.gpu.{index}.mem_gb"
             # NOTE: It appears their docs say bytes, but it appears to be MB
             value /= 1024
-        elif metric_name == "ray_node_mem_used":
+        elif metric_name == RAY_NODE_MEM_USED:
             metric_name = f"node.{node_idx}.mem_gb"
             value /= 1024 * 1024 * 1024
-        elif metric_name == "ray_node_mem_total":
+        elif metric_name == RAY_NODE_MEM_TOTAL:
             metric_name = f"node.{node_idx}.mem_total_gb"
             value /= 1024 * 1024 * 1024
         else:
@@ -1257,6 +1298,9 @@ class Logger(LoggerInterface):
                 os.makedirs(mlflow_log_dir, exist_ok=True)
             mlflow_logger = MLflowLogger(cfg.mlflow, log_dir=mlflow_log_dir)
             self.loggers.append(mlflow_logger)
+
+        for name in cfg.extra_backends:
+            self.loggers.append(get_class(name)())
 
         # Initialize GPU monitoring if requested
         self.gpu_monitor = None

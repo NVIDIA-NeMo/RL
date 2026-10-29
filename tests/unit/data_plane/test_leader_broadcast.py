@@ -453,7 +453,7 @@ def test_get_replica_group_default_is_none():
 
     The base default lets ``_fetch(fetch_policy="leader_broadcast")``
     fall back to the independent path when no backend override exists
-    (Phase 1 / FSDP2 with TP=CP=PP=1).
+    (Phase 1 / Automodel with TP=CP=PP=1).
     """
     from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 
