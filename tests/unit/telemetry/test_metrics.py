@@ -8,6 +8,10 @@ import logging
 import pytest
 
 from nemo_rl.telemetry.metrics import map_efficiency_seconds
+from nemo_rl.telemetry.vocabulary import (
+    TELEMETRY_TRAIN_STEP_KEY,
+    TELEMETRY_WALL_TIME_METRIC,
+)
 
 
 def _import_teed_metric_owners() -> None:
@@ -26,11 +30,22 @@ def _import_teed_metric_owners() -> None:
         pytest.importorskip(owner)
 
 
-def test_tee_noop_when_not_exporting():
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "train",
+        "timing/rollout_checkpoint",
+        "timing/rollout_recovery",
+        "rollout/checkpoint_outcome",
+    ],
+)
+def test_tee_noop_when_not_exporting(prefix):
     # No telemetry handle set -> must be a silent no-op (no exception).
     from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
 
-    tee_rl_metrics_to_otel({"efficiency/idle/refit_bubble_s": 12.0}, "train")
+    tee_rl_metrics_to_otel(
+        {"efficiency/idle/refit_bubble_s": 12.0, "total_save_seconds": 3.0}, prefix
+    )
 
 
 _MEASUREMENTS = {
@@ -143,8 +158,20 @@ def _gauge_points(data, name):
 
 def _start_exporting_telemetry():
     """Install an exporting telemetry handle; returns its metric reader."""
+    return _start_exporting_telemetry_with_spans()[0]
+
+
+def _start_exporting_telemetry_with_spans(span_groups="default"):
+    """Install an exporting telemetry handle with in-memory span capture.
+
+    Returns ``(metric reader, span exporter, handle)``. Spans always go to
+    memory, so a test that does not look at them still exports nowhere.
+    """
     from nemo.lens import NemoLensConfig, setup_telemetry
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
 
     import nemo_rl.telemetry.setup as setup_mod
 
@@ -157,9 +184,296 @@ def _start_exporting_telemetry():
         pytest.skip("installed nemo-lens has no metric registry (lens PR #46)")
 
     reader = InMemoryMetricReader()
-    cfg = NemoLensConfig(enabled=True)
-    setup_mod._TELEMETRY_HANDLE = setup_telemetry(cfg, metric_reader=reader)
-    return reader
+    exporter = InMemorySpanExporter()
+    cfg = NemoLensConfig(enabled=True, span_groups=span_groups)
+    handle = setup_telemetry(cfg, metric_reader=reader, span_exporter=exporter)
+    setup_mod._TELEMETRY_HANDLE = handle
+    return reader, exporter, handle
+
+
+def test_checkpoint_save_and_restore_emit_separate_phase_histograms():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(
+        {
+            "total_save_seconds": 30,
+            "tq_save_seconds": 12,
+            "snapshot_sequence": 99,
+            "replay_rows": 256,
+            "controller_sidecar_bytes": 4096,
+            # Added to every checkpoint dict by _log_telemetry_metrics; neither
+            # is a phase, and neither may become a label.
+            TELEMETRY_TRAIN_STEP_KEY: 7,
+            TELEMETRY_WALL_TIME_METRIC: 1.7e9,
+        },
+        "timing/rollout_checkpoint",
+    )
+    tee_rl_metrics_to_otel(
+        {"total_load_seconds": 8, "tq_load_seconds": 5, "siblings_reused": 16},
+        "timing/rollout_recovery",
+    )
+    data = reader.get_metrics_data()
+    durations = _gauge_points(data, "rl.checkpoint.duration")
+    assert {
+        (
+            p.attributes["rl.checkpoint.operation"],
+            p.attributes["rl.checkpoint.phase"],
+        ): p.sum
+        for p in durations
+    } == {
+        ("save", "total"): 30,
+        ("save", "tq"): 12,
+        ("restore", "total"): 8,
+        ("restore", "tq"): 5,
+    }
+    assert all(p.count == 1 for p in durations)
+    assert all("rl.bucket" not in p.attributes for p in durations)
+    assert _gauge_points(data, "rl.checkpoint.rows")[0].value == 256
+    assert _gauge_points(data, "rl.checkpoint.siblings")[0].value == 16
+    assert _gauge_points(data, "rl.checkpoint.sidecar_bytes")[0].value == 4096
+
+
+_SAVE_END_SECONDS = 1_700_000_000.5
+
+
+def _tee_completed_save(**overrides):
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    metrics = {
+        "total_save_seconds": 30.0,
+        "barrier_wait_seconds": 4.0,
+        "snapshot_commit_seconds": 0.25,
+        "snapshot_sequence": 99.0,
+        "replay_rows": 256.0,
+        TELEMETRY_TRAIN_STEP_KEY: 7.0,
+        TELEMETRY_WALL_TIME_METRIC: _SAVE_END_SECONDS,
+    }
+    metrics.update(overrides)
+    tee_rl_metrics_to_otel(
+        {key: value for key, value in metrics.items() if value is not None},
+        "timing/rollout_checkpoint",
+    )
+
+
+def _finished_spans(exporter, handle):
+    # Spans are batched; shutting down flushes them to the exporter.
+    handle.shutdown()
+    return exporter.get_finished_spans()
+
+
+def test_checkpoint_save_emits_one_unbucketed_span_from_logged_timings():
+    from nemo_rl.telemetry.instrumentation import RL_BUCKET_ATTR
+    from nemo_rl.telemetry.metrics import RL_CHECKPOINT_SAVE_SPAN
+
+    _, exporter, handle = _start_exporting_telemetry_with_spans()
+    _tee_completed_save()
+    (span,) = _finished_spans(exporter, handle)
+
+    assert span.name == RL_CHECKPOINT_SAVE_SPAN
+    end_ns = int(_SAVE_END_SECONDS * 1e9)
+    assert span.end_time == end_ns
+    assert span.start_time == end_ns - 30 * 10**9
+    assert dict(span.attributes) == {
+        "rl.checkpoint.total_save_seconds": 30,
+        "rl.checkpoint.barrier_wait_seconds": 4,
+        "rl.checkpoint.snapshot_commit_seconds": 0.25,
+        "rl.checkpoint.replay_rows": 256,
+        # Identity is fine on a span -- it is what ties a slow save to its
+        # snapshot -- though it must never become a metric label.
+        "rl.checkpoint.snapshot_sequence": 99,
+        "rl.iteration": 7,
+    }
+    # CHECKPOINT is an overhead group, but the pump runs beside training.
+    assert RL_BUCKET_ATTR not in span.attributes
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"total_save_seconds": None}, id="no-total"),
+        pytest.param({TELEMETRY_WALL_TIME_METRIC: None}, id="no-wall-time"),
+        pytest.param({"total_save_seconds": float("nan")}, id="nan-total"),
+    ],
+)
+def test_checkpoint_save_span_needs_a_placeable_interval(overrides):
+    _, exporter, handle = _start_exporting_telemetry_with_spans()
+    _tee_completed_save(**overrides)
+    assert _finished_spans(exporter, handle) == ()
+
+
+def test_checkpoint_save_span_follows_the_checkpoint_group():
+    reader, exporter, handle = _start_exporting_telemetry_with_spans("setup")
+    _tee_completed_save()
+    # The metrics do not depend on the span group.
+    assert _gauge_points(reader.get_metrics_data(), "rl.checkpoint.duration")
+    assert _finished_spans(exporter, handle) == ()
+
+
+def test_checkpoint_save_span_survives_a_failed_metric_registration(monkeypatch):
+    import nemo_rl.telemetry.metrics as metrics_mod
+
+    reader, exporter, handle = _start_exporting_telemetry_with_spans()
+    monkeypatch.setattr(metrics_mod, "ensure_metric_group_registered", lambda: False)
+    _tee_completed_save()
+    assert _gauge_points(reader.get_metrics_data(), "rl.checkpoint.duration") == []
+    (span,) = _finished_spans(exporter, handle)
+    assert span.name == metrics_mod.RL_CHECKPOINT_SAVE_SPAN
+
+
+def test_checkpoint_save_span_parents_to_the_current_span():
+    # In the controller the snapshot pump task is created inside rl.sc.job, so
+    # the save span joins the run's trace rather than starting its own.
+    _, exporter, handle = _start_exporting_telemetry_with_spans()
+    with handle.tracer.start_as_current_span("rl.sc.job") as parent:
+        _tee_completed_save()
+    spans = {span.name: span for span in _finished_spans(exporter, handle)}
+    save = spans["rl.sc.rollout_checkpoint.save"]
+    assert save.context.trace_id == parent.get_span_context().trace_id
+    assert save.parent is not None
+    assert save.parent.span_id == parent.get_span_context().span_id
+
+
+def test_checkpoint_restore_emits_no_span():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    _, exporter, handle = _start_exporting_telemetry_with_spans()
+    tee_rl_metrics_to_otel(
+        {
+            "total_load_seconds": 8.0,
+            TELEMETRY_WALL_TIME_METRIC: _SAVE_END_SECONDS,
+        },
+        "timing/rollout_recovery",
+    )
+    assert _finished_spans(exporter, handle) == ()
+
+
+def _attempt_outcome(outcome, reason, **extra):
+    """An attempt dict shaped like ``_log_rollout_checkpoint_outcome``'s."""
+    from nemo_rl.algorithms.metric_utils import (
+        ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
+        ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
+        rollout_checkpoint_reason_key,
+    )
+
+    return {
+        "attempt": 1.0,
+        "configured_interval_seconds": 60.0,
+        **{
+            rollout_checkpoint_reason_key(r): float(r == reason)
+            for r in ROLLOUT_CHECKPOINT_ATTEMPT_REASONS
+        },
+        **{o: float(o == outcome) for o in ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES},
+        **extra,
+    }
+
+
+def test_skipped_snapshot_attempts_are_counted_with_their_reason():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    for _ in range(3):
+        tee_rl_metrics_to_otel(
+            _attempt_outcome(
+                "skipped",
+                "missing_trainer_anchor",
+                attempt_duration_seconds=0.02,
+                seconds_since_last_success=840.0,
+            ),
+            "rollout/checkpoint_outcome",
+        )
+    data = reader.get_metrics_data()
+    (attempts,) = _gauge_points(data, "rl.checkpoint.attempts")
+    assert dict(attempts.attributes) == {
+        "rl.checkpoint.outcome": "skipped",
+        "rl.checkpoint.reason": "missing_trainer_anchor",
+    }
+    assert attempts.value == 3
+    (duration,) = _gauge_points(data, "rl.checkpoint.attempt_duration")
+    assert dict(duration.attributes) == {"rl.checkpoint.outcome": "skipped"}
+    assert duration.count == 3
+    (staleness,) = _gauge_points(data, "rl.checkpoint.seconds_since_last_success")
+    assert staleness.value == 840.0
+
+
+def test_snapshot_staleness_is_zero_on_success_and_absent_before_one():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    # No success yet: the controller logs no staleness, so neither does Lens.
+    tee_rl_metrics_to_otel(
+        _attempt_outcome("skipped", "no_data_plane_mutations"),
+        "rollout/checkpoint_outcome",
+    )
+    assert (
+        _gauge_points(
+            reader.get_metrics_data(), "rl.checkpoint.seconds_since_last_success"
+        )
+        == []
+    )
+    tee_rl_metrics_to_otel(
+        _attempt_outcome("completed", "completed", seconds_since_previous_success=90),
+        "rollout/checkpoint_outcome",
+    )
+    (staleness,) = _gauge_points(
+        reader.get_metrics_data(), "rl.checkpoint.seconds_since_last_success"
+    )
+    assert staleness.value == 0.0
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        pytest.param(
+            {**_attempt_outcome("skipped", "timeout"), "failed": 1.0},
+            id="two-outcomes",
+        ),
+        pytest.param(
+            {**_attempt_outcome("failed", "timeout"), "reason_timeout": 0.0},
+            id="no-reason",
+        ),
+    ],
+)
+def test_malformed_snapshot_attempt_is_not_counted(metrics):
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(metrics, "rollout/checkpoint_outcome")
+    assert _gauge_points(reader.get_metrics_data(), "rl.checkpoint.attempts") == []
+
+
+def test_checkpoint_mapping_skips_invalid_values_and_unknown_keys():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(
+        {
+            "total_save_seconds": float("nan"),
+            "tq_save_seconds": float("inf"),
+            "barrier_wait_seconds": -1,
+            "sidecar_save_seconds": True,
+            "exclusive_hold_seconds": 0,
+            "replay_rows": "256",
+            "unknown_seconds": 123,
+            "snapshot_sequence": 100000,
+        },
+        "timing/rollout_checkpoint",
+    )
+    data = reader.get_metrics_data()
+    durations = _gauge_points(data, "rl.checkpoint.duration")
+    assert len(durations) == 1
+    assert durations[0].attributes["rl.checkpoint.phase"] == "exclusive_hold"
+    assert durations[0].sum == 0
+    assert _gauge_points(data, "rl.checkpoint.rows") == []
+
+
+def test_checkpoint_metrics_are_not_duplicated_under_train_or_other_prefixes():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    for prefix in ("train", "timing/checkpoint", "", None):
+        tee_rl_metrics_to_otel({"total_save_seconds": 10}, prefix)
+    assert _gauge_points(reader.get_metrics_data(), "rl.checkpoint.duration") == []
 
 
 def test_tee_emits_efficiency_seconds_tagged_by_measurement(monkeypatch):

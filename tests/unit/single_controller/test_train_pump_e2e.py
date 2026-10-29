@@ -440,6 +440,7 @@ def test_train_pump_drives_mcore_training_step(
             assert math.isfinite(metrics["advantages/mean"])
             assert metrics["evicted_stale_prompt_groups"] == 0
             assert metrics["aborted_stale_inflight_groups"] == 0
+            assert metrics["weight_version_lag"] >= 0
 
         # The final "timing/train" log of each step must carry step_finished=True
         # (the behavior this restores) so W&B commits the step; the "train" log must not.
