@@ -288,6 +288,33 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
 
 
+def test_finalize_group_keep_truncated_rows_are_not_truncated(tq_client, partitions):
+    """A rollout the degenerate-reasoning penalty flagged keeps its max-length row (no overlong filtering)."""
+    group_id = "grp_keep_trunc"
+    receipt, expected = _stage_fixture(
+        tq_client, "worked_example", rollout_id=f"{group_id}_g0"
+    )
+    receipt["rollout_id"] = f"{group_id}_g0"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    finalizer = _finalizer(tq_client, max_seq_len=len(expected.token_ids))
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],
+        [0.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=9,
+        prompt_idx=17,
+        keep_truncated=[True, False],
+    )
+    assert not finalized.dropped
+    assert finalized.metrics["finalize/keep_truncated_rows"] == 1.0
+    rows = _fetch_rows(tq_client, rollout_ids)
+    assert torch.as_tensor(rows["truncated"]).flatten().tolist() == [False, False]
+    assert torch.as_tensor(rows["mask_sample"]).flatten().tolist() == [False, False]
+    assert torch.as_tensor(rows["total_reward"]).flatten().tolist() == [0.0, 0.0]
+
+
 def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
     group_id = "grp_unset"
     receipt, expected = _stage_fixture(

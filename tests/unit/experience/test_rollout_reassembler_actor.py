@@ -108,6 +108,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
         rollout_infos=None,
+        keep_truncated=None,
     )
 
 
@@ -131,6 +132,25 @@ def test_finalize_forwards_rollout_infos_to_reassembler() -> None:
     assert actor._finalizer.finalize_group.call_args.kwargs["rollout_infos"] == list(
         infos
     )
+
+
+def test_finalize_forwards_keep_truncated_to_reassembler() -> None:
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._finalizer = MagicMock()
+    result = FinalizedGroup(
+        meta=None,
+        group_min_wv=4,
+        group_max_wv=4,
+        staging_keys=[],
+        dropped=True,
+        drop_reason="test",
+    )
+    actor._finalizer.finalize_group.return_value = result
+    request = replace(_request(), keep_truncated=(True,))
+
+    assert actor.finalize(request) is result
+    assert actor._finalizer.finalize_group.call_args.kwargs["keep_truncated"] == [True]
 
 
 def test_finalizer_forwards_mooncake_checkpoint_commands(
@@ -207,6 +227,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "loss_multiplier",
         # One compact rollout_debug_info dict per rollout (scalars, no tokens).
         "rollout_infos",
+        # One bool per rollout.
+        "keep_truncated",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",

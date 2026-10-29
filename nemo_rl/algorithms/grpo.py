@@ -301,6 +301,16 @@ class RewardPenaltyConfig(BaseModel, extra="allow"):
     penalize_empty_final_answer: bool = False
     penalize_unwanted_tokens: bool = False
     penalize_malformed_think_tag: bool = False
+    # Degenerate ("looping") reasoning, see nemo_rl/experience/degenerate_reasoning.py: a rollout the loop detector
+    # flags gets reward 0 and is exempt from the mask rules named in degenerate_reasoning_unmask_rules and from
+    # overlong filtering (its rows at max_seq_len are not marked truncated), so it trains instead of being masked for
+    # running out of context; every other mask still applies. degenerate_reasoning_threshold: the detector's rollout
+    # score at or above which a rollout is flagged (None: the detector's frozen threshold).
+    # degenerate_reasoning_agents: agent names to score (None: every agent).
+    penalize_degenerate_reasoning: bool = False
+    degenerate_reasoning_threshold: Optional[float] = None
+    degenerate_reasoning_agents: Optional[list[str]] = None
+    degenerate_reasoning_unmask_rules: list[str] = ["context_limited"]
     # Multi-trace rollouts only. False (legacy async PPO): the rollout-scoped
     # penalties (duplicated reasoning, empty final answer) are checked once, on the
     # rollout's aggregate response. True: they are checked on every session
@@ -328,6 +338,7 @@ _REWARD_PENALTY_FLAGS = (
     "penalize_empty_final_answer",
     "penalize_unwanted_tokens",
     "penalize_malformed_think_tag",
+    "penalize_degenerate_reasoning",
 )
 
 

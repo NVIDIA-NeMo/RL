@@ -1,0 +1,6 @@
+{
+ "A": {"turn": {"penalty": 0.8, "monitor": 0.5}, "rollout": {"penalty": 0.8, "monitor": 0.5}},
+ "B": {"turn": {"penalty": 0.97, "monitor": 0.9}, "rollout": {"penalty": 0.97, "monitor": 0.9}},
+ "min_chars": 5000,
+ "provenance": "Chosen before val/test on train out-of-fold scores and the train-task audit of flagged old-hybrid / penalty rollouts (metrics.md)."
+}

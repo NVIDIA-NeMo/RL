@@ -71,6 +71,9 @@ class ReassemblyRequest:
     # Per-rollout rollout_debug_info (empty when unavailable); the finalizer
     # stamps it on the rows' rollout_debug tag like the echo path's commit.
     rollout_infos: tuple[dict[str, Any], ...] = ()
+    # Per-rollout: its rows that reach max_seq_len are not marked truncated, so overlong
+    # filtering keeps them (rollouts the degenerate-reasoning penalty flagged). Empty: none.
+    keep_truncated: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -214,6 +217,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),
             rollout_infos=list(request.rollout_infos) or None,
+            keep_truncated=list(request.keep_truncated) or None,
         )
         assert_metadata_only(result)
         return result

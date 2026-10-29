@@ -103,6 +103,10 @@ _REWARD_PENALTY_METRICS = {
         "penalize_malformed_think_tag",
         "malformed_think_tag_rate",
     ),
+    "degenerate_reasoning": (
+        "penalize_degenerate_reasoning",
+        "degenerate_reasoning_rate",
+    ),
 }
 
 
@@ -2169,6 +2173,8 @@ def apply_reward_penalties(
         "empty_final_answer": 0,
         "unwanted_token": 0,
         "malformed_think_tag": 0,
+        # Scored when the result arrives (nemo_rl/experience/degenerate_reasoning.py); the rollout manager fills it in.
+        "degenerate_reasoning": 0,
     }
     if not reward_penalty_config or not results:
         return counts

@@ -1076,6 +1076,7 @@ class RolloutReassembler:
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
         rollout_infos: Optional[list[dict[str, Any]]] = None,
+        keep_truncated: Optional[list[bool]] = None,
     ) -> FinalizedGroup:
         """Publish the N canonical rows (plus any segment rows) for one prompt group.
 
@@ -1098,7 +1099,9 @@ class RolloutReassembler:
         ``record_to_train_batch`` path. ``truncated`` is not carried from the
         dispatcher -- the receipt path has no real tokens to measure it from
         at dispatch time -- so it is computed here instead, per row, from the
-        rebuilt length against ``max_seq_len``.
+        rebuilt length against ``max_seq_len``; a rollout whose ``keep_truncated``
+        is set (the degenerate-reasoning penalty flagged it) never marks its rows
+        truncated, so overlong filtering trains them with their reward.
         """
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
@@ -1110,6 +1113,9 @@ class RolloutReassembler:
         )
         assert rollout_infos is None or len(rollout_infos) == len(rollout_ids), (
             "rollout_infos must be one per rollout"
+        )
+        assert keep_truncated is None or len(keep_truncated) == len(rollout_ids), (
+            "keep_truncated must be one per rollout"
         )
         _group_t0 = time.perf_counter()
         per_rollout = [
@@ -1343,6 +1349,13 @@ class RolloutReassembler:
         metrics["finalize/nan_logprob_rows_masked"] = float(
             sum(row.nan_logprobs_masked for row in rows)
         )
+        metrics["finalize/keep_truncated_rows"] = float(
+            sum(
+                1
+                for seq_len, i in zip(seq_lens, row_rollout_idx)
+                if seq_len == self._max_seq_len and keep_truncated and keep_truncated[i]
+            )
+        )
         topk_ids = topk_logprobs = None
         if self._top_logprobs > 0:
             topk_shape = (n, max_len, self._top_logprobs)
@@ -1370,7 +1383,11 @@ class RolloutReassembler:
             "total_reward": rewards_t,
             MASK_SAMPLE: torch.tensor(mask_sample_rows, dtype=torch.bool),
             TRUNCATED: torch.tensor(
-                [seq_len == self._max_seq_len for seq_len in seq_lens],
+                [
+                    seq_len == self._max_seq_len
+                    and not (keep_truncated and keep_truncated[i])
+                    for seq_len, i in zip(seq_lens, row_rollout_idx)
+                ],
                 dtype=torch.bool,
             ),
         }

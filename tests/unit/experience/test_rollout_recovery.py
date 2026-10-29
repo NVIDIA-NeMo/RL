@@ -220,6 +220,49 @@ def _sealed_attempt_state() -> dict[str, Any]:
     return ledger.state_dict()
 
 
+def test_keep_truncated_survives_restart_and_defaults_false() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    for index, keep in ((0, True), (1, False)):
+        gate_id = group.gate_rollout_id(index)
+        _mutate(
+            lambda cut, gate_id=gate_id, index=index, keep=keep: ledger.mark_sibling_sealed(
+                cut,
+                "g7",
+                generation_index=index,
+                gate_rollout_id=gate_id,
+                receipt={
+                    "rollout_id": gate_id,
+                    "manifest": [{"staging_key": f"g7/sibling-{index}/call-0"}],
+                },
+                reward=0.0,
+                mask_sample=False,
+                keep_truncated=keep,
+            )
+        )
+    assert ledger.finalization_keep_truncated("g7") == [True, False]
+    state = ledger.state_dict()
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    assert restored.finalization_keep_truncated("g7") == [True, False]
+    for sibling in state["groups"][0]["siblings"]:
+        for attempt in sibling["attempts"]:
+            del attempt["keep_truncated"]
+    older = RolloutRecoveryLedger.from_state_dict(state)
+    assert older.finalization_keep_truncated("g7") == [False, False]
+    assert len(older.finalization_inputs("g7")[0]) == 2
+
+
 @pytest.mark.parametrize(
     ("case", "error_fragment"),
     [

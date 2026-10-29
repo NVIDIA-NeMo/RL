@@ -73,6 +73,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "reward",
         "mask_sample",
         "staging_keys",
+        "keep_truncated",
     }
 )
 
@@ -178,6 +179,9 @@ class RolloutAttemptRecord:
     reward: Optional[float] = None
     mask_sample: Optional[bool] = None
     staging_keys: list[str] = field(default_factory=list)
+    # The rollout's rows that reach max_seq_len still train (no overlong filtering):
+    # set for rollouts reward_penalties.penalize_degenerate_reasoning flagged.
+    keep_truncated: bool = False
 
     @property
     def attempt_id(self) -> str:
@@ -282,6 +286,7 @@ class SiblingSealResult:
     receipt: Optional[dict[str, Any]]
     reward: float
     mask_sample: bool
+    keep_truncated: bool = False
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -448,6 +453,7 @@ class RolloutRecoveryLedger:
             attempt.status = RolloutAttemptStatus.ABANDONED
             attempt.receipt = None
             attempt.reward = None
+            attempt.keep_truncated = False
             attempt.staging_keys.clear()
         record.status = PromptGroupStatus.GENERATING
 
@@ -578,6 +584,7 @@ class RolloutRecoveryLedger:
         receipt: Optional[dict[str, Any]],
         reward: float,
         mask_sample: bool,
+        keep_truncated: bool = False,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -605,6 +612,7 @@ class RolloutRecoveryLedger:
                 attempt.receipt == receipt
                 and attempt.reward == float(reward)
                 and attempt.mask_sample is mask_sample
+                and attempt.keep_truncated is bool(keep_truncated)
                 and attempt.staging_keys == staging_keys
             ):
                 return
@@ -622,6 +630,7 @@ class RolloutRecoveryLedger:
         attempt.receipt = copy.deepcopy(receipt)
         attempt.reward = float(reward)
         attempt.mask_sample = mask_sample
+        attempt.keep_truncated = bool(keep_truncated)
         attempt.staging_keys = staging_keys
         attempt.status = RolloutAttemptStatus.SEALED
         if all(
@@ -691,6 +700,7 @@ class RolloutRecoveryLedger:
             attempt.receipt = copy.deepcopy(result.receipt)
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
+            attempt.keep_truncated = bool(result.keep_truncated)
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
         record.status = PromptGroupStatus.READY_TO_FINALIZE
@@ -766,6 +776,11 @@ class RolloutRecoveryLedger:
             rewards,
             mask_sample,
         )
+
+    def finalization_keep_truncated(self, group_id: str) -> list[bool]:
+        """Per sealed sibling, in ``finalization_inputs`` order: whether its max-length rows still train."""
+        record = self._require_group(group_id)
+        return [bool(sibling.current_attempt.keep_truncated) for sibling in record.siblings]
 
     def mark_finalization_started(
         self,
@@ -867,6 +882,7 @@ class RolloutRecoveryLedger:
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
                                     "staging_keys": list(attempt.staging_keys),
+                                    "keep_truncated": attempt.keep_truncated,
                                 }
                                 for attempt in sibling.attempts
                             ],
@@ -1054,6 +1070,10 @@ class RolloutRecoveryLedger:
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
                 staging_keys = attempt_state.get("staging_keys")
+                # Optional in the sidecar: a missing key reads as False.
+                keep_truncated = attempt_state.get("keep_truncated", False)
+                if not isinstance(keep_truncated, bool):
+                    raise ValueError("keep_truncated must be a bool")
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
                 ):
@@ -1094,6 +1114,10 @@ class RolloutRecoveryLedger:
                         reward=float(reward) if reward is not None else None,
                         mask_sample=mask_sample,
                         staging_keys=list(staging_keys),
+                        keep_truncated=(
+                            keep_truncated
+                            and attempt_status == RolloutAttemptStatus.SEALED
+                        ),
                     )
                 )
             siblings.append(

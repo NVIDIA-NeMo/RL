@@ -49,6 +49,7 @@ from nemo_rl.environments.nemo_gym import (
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
 )
+from nemo_rl.experience import degenerate_reasoning
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -1289,6 +1290,12 @@ class AsyncNemoGymRolloutImpl:
                 raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
             received.add(rowidx)
             inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
+            # reward_penalties.penalize_degenerate_reasoning: scored once per rollout, here, so the zeroed reward is
+            # what effort shaping and any recovery record see.
+            if isinstance(result.get("full_result"), dict):
+                await degenerate_reasoning.check_result(
+                    result["full_result"], resolved_agent_ref, self._reward_penalty_config
+                )
             # A streamed completion may become durable recovery ownership before
             # the rest of its prompt group finishes. Shape its reward first so a
             # checkpoint never preserves a raw reward that finalization will later
@@ -1591,9 +1598,17 @@ class AsyncNemoGymRolloutImpl:
         mask_rule_counts: dict[str, int] = {}
         mask_rule_reward_sums: dict[str, float] = {}
         mask_rule_any_count = 0
+        unmask_for_degenerate = degenerate_reasoning.unmask_rule_names(
+            self._reward_penalty_config
+        )
         for result in results:
             matched = apply_mask_sample_rules(
-                result["full_result"], self._mask_sample_rules
+                result["full_result"],
+                degenerate_reasoning.rules_for_result(
+                    result["full_result"],
+                    self._mask_sample_rules,
+                    unmask_for_degenerate,
+                ),
             )
             if not matched:
                 continue
@@ -1628,6 +1643,11 @@ class AsyncNemoGymRolloutImpl:
         ]
         penalty_counts = apply_reward_penalties(
             single_trace, self._reward_penalty_config
+        )
+        penalty_counts["degenerate_reasoning"] = sum(
+            1
+            for r in results
+            if r["full_result"].get(degenerate_reasoning.FLAG_KEY)
         )
         for result in token_results:
             if "session_traces" in result:
@@ -1688,14 +1708,18 @@ class AsyncNemoGymRolloutImpl:
                             truncated=sum(
                                 len(m["token_ids"]) for m in trace["message_log"]
                             )
-                            == self._max_seq_len,
+                            == self._max_seq_len
+                            and not degenerate_reasoning.keeps_truncated(
+                                result["full_result"]
+                            ),
                             reward=reward,
                         )
                     )
                 continue
-            truncated = (
-                sum(len(m["token_ids"]) for m in result["message_log"])
-                == self._max_seq_len
+            truncated = sum(
+                len(m["token_ids"]) for m in result["message_log"]
+            ) == self._max_seq_len and not degenerate_reasoning.keeps_truncated(
+                result["full_result"]
             )
             completions.append(
                 Completion(
@@ -2597,6 +2621,7 @@ class RolloutManager:
                     )
                 )
             )
+            keep_truncated = degenerate_reasoning.keeps_truncated(env_extras)
             # JSON round trip: the finalizer RPC carries metadata-only primitives.
             rollout_infos[generation_index] = json.loads(
                 json.dumps(rollout_debug_info(env_extras), default=str)
@@ -2608,6 +2633,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    keep_truncated=keep_truncated,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2637,6 +2663,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    keep_truncated=keep_truncated,
                 )
 
         try:
@@ -2686,6 +2713,9 @@ class RolloutManager:
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
                 rollout_infos=tuple(
                     rollout_infos.get(i, {}) for i in range(len(physical_rollout_ids))
+                ),
+                keep_truncated=tuple(
+                    self._recovery_ledger.finalization_keep_truncated(group_id)
                 ),
             )
             from nemo_rl.experience.rollout_reassembler_actor import (
