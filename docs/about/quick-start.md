@@ -1,6 +1,6 @@
 # Quick Start
 
-Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends.
+Use this quick start to get going with either the Automodel or Megatron Core training backends.
 
 > [!NOTE]
 > Both training backends are independent — you can install and use either one on its own.
@@ -9,7 +9,7 @@ For more examples and setup details, continue to the [Prerequisites](installatio
 
 ## Quick Start Options
 
-| Native PyTorch (DTensor) | Megatron Core |
+| Automodel | Megatron Core |
 |--------------------------|---------------|
 | **Clone and create the environment** | |
 
@@ -23,12 +23,12 @@ uv venv
 > [!NOTE]
 > If you previously ran without checking out the submodules, you may need to rebuild virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true`. See [Tips and Tricks](tips-and-tricks.md).
 
-| Native PyTorch (DTensor) | Megatron Core |
+| Automodel | Megatron Core |
 |--------------------------|---------------|
-| **Run GRPO (DTensor)** | **Run GRPO (Megatron)** |
+| **Run GRPO (Automodel)** | **Run GRPO (Megatron)** |
 
 ```sh
-# DTensor
+# Automodel
 uv run python examples/run_grpo.py
 ```
 

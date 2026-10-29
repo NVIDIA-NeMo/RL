@@ -756,7 +756,10 @@ def test_quant_ignore_name_candidates_include_model_prefix_and_base_names():
     ]
 
 
-def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, tmp_path):
+@pytest.mark.parametrize("llm_kwargs", [{}, {"moe_backend": "triton"}])
+def test_configure_quant_engine_kwargs_for_fake_quant(
+    monkeypatch, tmp_path, llm_kwargs
+):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
     )
@@ -767,7 +770,7 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, tmp_path):
     (tmp_path / quant_cfg).touch()
     monkeypatch.chdir(tmp_path)
 
-    llm_kwargs = {}
+    llm_kwargs = dict(llm_kwargs)
     worker_mod._configure_quant_engine_kwargs(
         {"quant_cfg": quant_cfg},
         llm_kwargs,
@@ -780,7 +783,31 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, tmp_path):
         "nemo_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
     )
     assert os.environ["VLLM_QUANT_CFG"] == os.path.abspath(quant_cfg)
+    assert llm_kwargs["moe_backend"] == "triton"
     assert "quantization" not in llm_kwargs
+
+
+@pytest.mark.parametrize(
+    "moe_backend", ["auto", "flashinfer_trtllm", "flashinfer_cutlass", None]
+)
+def test_configure_fake_quant_rejects_non_triton_backend(monkeypatch, moe_backend):
+    worker_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
+    )
+    monkeypatch.delenv("VLLM_QUANT_CFG", raising=False)
+    monkeypatch.delenv("VLLM_MODELOPT_REAL_QUANT", raising=False)
+    llm_kwargs = {"moe_backend": moe_backend}
+
+    with pytest.raises(
+        ValueError, match="fake quantization requires moe_backend='triton'"
+    ):
+        worker_mod._configure_quant_engine_kwargs(
+            {"quant_cfg": "NVFP4_DEFAULT_CFG"}, llm_kwargs
+        )
+
+    assert llm_kwargs["moe_backend"] == moe_backend
+    assert "VLLM_QUANT_CFG" not in os.environ
+    assert "VLLM_MODELOPT_REAL_QUANT" not in os.environ
 
 
 def test_quant_worker_forwards_snapshot_pythonpath_to_inner_vllm_workers():
@@ -837,7 +864,7 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
         modelopt_utils, "resolve_nvfp4_real_quant_mode", lambda _: "w4a16"
     )
 
-    llm_kwargs = {}
+    llm_kwargs = {"moe_backend": "flashinfer_trtllm"}
     worker_mod._configure_quant_engine_kwargs(
         {
             "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
@@ -851,6 +878,7 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     assert os.environ["VLLM_MODELOPT_REAL_QUANT"] == "1"
     assert "VLLM_QUANT_CFG" not in os.environ
     assert "worker_cls" not in llm_kwargs
+    assert llm_kwargs["moe_backend"] == "flashinfer_trtllm"
     assert llm_kwargs["quantization"] == NEMO_MODELOPT_W4A16
     assert llm_kwargs["hf_overrides"]["quantization_config"] == (
         build_vllm_modelopt_nvfp4_config(mode="w4a16", ignore=["lm_head"])
@@ -907,16 +935,21 @@ def test_configure_quant_engine_kwargs_preserves_hf_overrides(monkeypatch):
     )
 
 
-def test_configure_quant_engine_kwargs_for_fake_quant_without_quant_cfg(monkeypatch):
+@pytest.mark.parametrize("llm_kwargs", [{}, {"moe_backend": "flashinfer_trtllm"}])
+def test_configure_quant_engine_kwargs_for_fake_quant_without_quant_cfg(
+    monkeypatch, llm_kwargs
+):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
     )
     monkeypatch.delenv("VLLM_QUANT_CFG", raising=False)
     monkeypatch.delenv("VLLM_MODELOPT_REAL_QUANT", raising=False)
 
-    llm_kwargs = {}
+    llm_kwargs = dict(llm_kwargs)
+    expected_backend = llm_kwargs.get("moe_backend", "triton")
     worker_mod._configure_quant_engine_kwargs({"quant_cfg": None}, llm_kwargs)
 
+    assert llm_kwargs["moe_backend"] == expected_backend
     assert "VLLM_QUANT_CFG" not in os.environ
     assert llm_kwargs["worker_cls"] == (
         "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
@@ -1171,9 +1204,9 @@ def test_real_quant_load_weights_expands_non_gated_experts_per_expert(
 
     batched_forwarded = []
     extension = _make_real_quant_extension(backend, make_model(None), [])
+    _patch_real_quant_load(monkeypatch, backend, batched_forwarded)
     extension.prepare_refit_info(state_dict_info)
     extension._nrl_w13_num_shards_by_prefix = {prefix: 1}
-    _patch_real_quant_load(monkeypatch, backend, batched_forwarded)
     w13_block_scale = torch.arange(8).reshape(2, 4, 1)
     assert (
         extension._load_weights(

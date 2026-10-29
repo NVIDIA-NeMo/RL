@@ -28,6 +28,7 @@ from nemo_rl.algorithms.sft_v2 import (
     SFTV2SaveState,
     _max_train_steps,
 )
+from nemo_rl.data.energon.config import EnergonLoaderConfig
 from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.models.policy.lm_policy import Policy
@@ -92,7 +93,7 @@ def _valid_setup_config(
         "backend": "energon",
         "validation": None,
         "max_input_seq_length": 128,
-        "energon": SimpleNamespace(packing_buffer_size=None),
+        "energon": SimpleNamespace(task_encoder=SimpleNamespace(packing=None)),
     }
     data.update(data_overrides or {})
     policy = {
@@ -400,7 +401,14 @@ def test_setup_rejects_invalid_energon_packing_config(
     config = _valid_setup_config(
         data_overrides={
             "max_input_seq_length": max_sequence_length,
-            "energon": SimpleNamespace(packing_buffer_size=64),
+            "energon": SimpleNamespace(
+                task_encoder=SimpleNamespace(
+                    packing=SimpleNamespace(
+                        name=sequence_packing.get("algorithm", "greedy_knapsack"),
+                        options=SimpleNamespace(),
+                    )
+                )
+            ),
         },
         policy_overrides={
             "megatron_cfg": megatron_overrides,
@@ -414,12 +422,42 @@ def test_setup_rejects_invalid_energon_packing_config(
         setup_sft_v2(config, MagicMock())
 
 
-def test_setup_loaders_enables_packing_from_energon_buffer() -> None:
+@pytest.mark.parametrize(
+    "field", ["max_sequence_length", "sequence_length_pad_multiple"]
+)
+def test_packing_options_reject_removed_geometry_fields(field: str) -> None:
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        EnergonLoaderConfig(
+            model_family="qwen",
+            task_encoder={
+                "packing": {
+                    "name": "greedy_knapsack",
+                    "buffer_size": 64,
+                    "options": {field: 8},
+                }
+            },
+        )
+
+
+@pytest.mark.parametrize("restored", [False, True])
+def test_setup_loaders_passes_canonical_geometry_and_nested_packing(
+    restored: bool,
+) -> None:
+    loader_config = EnergonLoaderConfig(
+        model_family="qwen",
+        task_encoder={
+            "packing": {
+                "name": "balanced_greedy_knapsack",
+                "buffer_size": 64,
+                "options": {"max_sequences_per_bin": 16, "balanced_knapsack_delta": 2},
+            }
+        },
+    )
     controller = object.__new__(_ACTOR_CLS)
     controller._master_config = SimpleNamespace(
         data={
             "max_input_seq_length": 128,
-            "energon": SimpleNamespace(packing_buffer_size=64),
+            "energon": loader_config,
         },
         policy={
             "train_global_batch_size": 4,
@@ -435,19 +473,34 @@ def test_setup_loaders_enables_packing_from_energon_buffer() -> None:
         logical_world_size=2,
         placement_hash="placement",
     )
-    controller._loader_states = None
+    controller._loader_states = [{"shard": 0}, {"shard": 1}] if restored else None
     controller._trainer = MagicMock()
     futures = [object(), object()]
     controller._trainer.worker_group.run_all_workers_single_data.return_value = futures
+    controller._trainer.worker_group.run_all_workers_multiple_data.return_value = (
+        futures
+    )
 
     with patch("nemo_rl.algorithms.sft_v2.ray.get", return_value=[True, True]):
         controller._setup_loaders()
 
-    kwargs = (
-        controller._trainer.worker_group.run_all_workers_single_data.call_args.kwargs
+    if restored:
+        call_kwargs = controller._trainer.worker_group.run_all_workers_multiple_data.call_args.kwargs
+        assert call_kwargs["restored_state"] == controller._loader_states
+        kwargs = call_kwargs["common_kwargs"]
+    else:
+        kwargs = controller._trainer.worker_group.run_all_workers_single_data.call_args.kwargs
+    assert kwargs["data_config"]["energon"] is loader_config
+    assert kwargs["batch_size"] == 2
+    assert kwargs["max_sequence_length"] == 128
+    assert kwargs["sequence_length_pad_multiple"] == 8
+    assert (
+        not {
+            "packing_algorithm",
+            "max_sequences_per_bin",
+        }
+        & kwargs.keys()
     )
-    assert kwargs["packing_algorithm"] == "balanced_greedy_knapsack"
-    assert kwargs["max_sequences_per_bin"] == 16
 
 
 @pytest.mark.parametrize(
@@ -477,7 +530,14 @@ def test_setup_rejects_unsupported_energon_packing_layouts(
     config = _valid_setup_config(
         data_overrides={
             "max_input_seq_length": 130,
-            "energon": SimpleNamespace(packing_buffer_size=64),
+            "energon": SimpleNamespace(
+                task_encoder=SimpleNamespace(
+                    packing=SimpleNamespace(
+                        name="greedy_knapsack",
+                        options=SimpleNamespace(),
+                    )
+                )
+            ),
         },
         policy_overrides={
             "megatron_cfg": megatron_overrides,
@@ -516,3 +576,54 @@ def test_max_steps_is_bounded_by_virtual_epochs() -> None:
     )
 
     assert _max_train_steps(config) == 21
+
+
+@pytest.mark.parametrize("pad_multiple", [0, -1])
+def test_setup_rejects_nonpositive_canonical_packing_alignment(
+    pad_multiple: int,
+) -> None:
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    config = _valid_setup_config(
+        data_overrides={
+            "energon": EnergonLoaderConfig(
+                model_family="qwen",
+                task_encoder={
+                    "packing": {
+                        "name": "greedy_knapsack",
+                        "buffer_size": 64,
+                        "options": {},
+                    }
+                },
+            )
+        },
+        policy_overrides={"sequence_packing": {"enabled": True, "fuse_loss": True}},
+    )
+    config.policy["make_sequence_length_divisible_by"] = pad_multiple
+    with pytest.raises(ValueError, match="to be positive"):
+        setup_sft_v2(config, MagicMock())
+
+
+@pytest.mark.parametrize(
+    "pretrained", [None, {"format": "megatron_bridge", "path": "/checkpoint"}]
+)
+def test_setup_propagates_pretrained_checkpoint_before_validation(pretrained):
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    config = _valid_setup_config(data_overrides={"backend": "invalid"})
+    config.checkpointing["pretrained_checkpoint"] = pretrained
+    with pytest.raises(ValueError, match="data.backend=energon"):
+        setup_sft_v2(config, MagicMock())
+    assert config.policy.get("pretrained_checkpoint") == pretrained
+
+
+def test_setup_keeps_policy_pretrained_checkpoint_when_checkpointing_is_null():
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    existing = {"format": "megatron_bridge", "path": "/policy-level"}
+    config = _valid_setup_config(data_overrides={"backend": "invalid"})
+    config.policy["pretrained_checkpoint"] = existing
+    config.checkpointing["pretrained_checkpoint"] = None
+    with pytest.raises(ValueError, match="data.backend=energon"):
+        setup_sft_v2(config, MagicMock())
+    assert config.policy["pretrained_checkpoint"] == existing

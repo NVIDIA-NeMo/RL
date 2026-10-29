@@ -53,7 +53,7 @@ class ValueConfig(TypedDict):
     # Reward model config (value models use regression head)
     reward_model_cfg: RewardModelConfig
 
-    # Backend configuration - DTensor or Megatron
+    # Backend configuration - Automodel or Megatron
     automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
 

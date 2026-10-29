@@ -43,6 +43,8 @@ env:
       - name: workplace
         port_range_low: 5000
         port_range_high: 5499
+        inherited_overlays:
+          - workplace_assistant_environment_server
         config_paths:
           - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
           - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
@@ -53,6 +55,14 @@ env:
         config_paths:
           - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
           - resources_servers/math_with_judge/configs/math_with_judge.yaml
+        overrides:
+          math_with_judge_environment_server:
+            environment_servers:
+              legacy_agent:
+                entrypoint: app.py
+                agent_server:
+                  type: responses_api_agents
+                  name: math_with_judge_simple_agent
 
         # `replicas: N` makes N identical instances of a shard.
         # Each instance runs on one node.

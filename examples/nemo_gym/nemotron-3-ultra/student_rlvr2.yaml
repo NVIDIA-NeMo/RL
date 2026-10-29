@@ -14,6 +14,8 @@
 # by https://github.com/NVIDIA-NeMo/RL/issues/1101).
 # =============================================================================
 
+defaults: ../legacy_environment_servers/ultra_rlvr.yaml
+
 # =============================================================================
 # Cluster — read by ultra_launch.sh to size the SLURM allocation
 # =============================================================================
@@ -143,6 +145,8 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   automodel_cfg:
     enabled: false
@@ -388,7 +392,14 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: true
   nemo_gym:
-    nemo_gym_log_dir: "logs/nemo_gym"
+    litmus_agent_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: rdkit_chemistry_agent
+
     skip_venv_if_present: true
     num_gpu_nodes: 20
     # NeMo-RL-side effort shaping; stripped before forwarding to Gym.

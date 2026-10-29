@@ -4,9 +4,33 @@
 #     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_super_all_envs.yaml" .
 # Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy values below satisfy the bundled
 # configs' interpolations during the dry run. terminal_pivot is omitted (absent at our Gym pin).
+defaults: legacy_environment_servers/super_rlvr.yaml
+
 env:
   should_use_nemo_gym: true
   nemo_gym:
+    swe_pivot_single_step_tool_use_with_argument_comparison_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_pivot_single_step_tool_use_with_argument_comparison_agent
+    swe_agents_train_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_train
+    swe_agents_val_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_val
+
     skip_venv_if_present: true
     port_range_low: 5000
     port_range_high: 5999
