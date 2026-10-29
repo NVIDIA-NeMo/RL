@@ -55,6 +55,112 @@ def test_clipped_pg_loss_config_rejects_invalid_reference_kl_penalty(
         ClippedPGLossConfig(reference_policy_kl_penalty=invalid_penalty)
 
 
+@pytest.mark.parametrize("missing", ["token_mask", "sample_mask", "both"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("kl_type", ["forward", "reverse", "mixed"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_distillation_unmasked_pipeline_preserves_full_upcast(
+    missing: str, dtype: torch.dtype, kl_type: str, device: str
+) -> None:
+    """Legacy unmasked callers keep fp32 accumulation for duplicate indices."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    torch.manual_seed(42)
+    logits = torch.randn(2, 8, 128, dtype=dtype, device=device)
+    teacher_logits, indices = torch.randn(2, 8, 128, device=device).topk(4, dim=-1)
+    indices[..., 1] = indices[..., 0]
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(2, 8, dtype=torch.long, device=device),
+            "token_mask": torch.ones(2, 8, device=device),
+            "sample_mask": torch.ones(2, device=device),
+            "teacher_topk_logits": teacher_logits,
+            "teacher_topk_indices": indices,
+        }
+    )
+    for key in ("token_mask", "sample_mask") if missing == "both" else (missing,):
+        del data[key]
+    loss_fn = DistillationLossFn(DistillationLossConfig(kl_type=kl_type))
+    student = logits.clone().requires_grad_(True)
+    reference = logits.clone().requires_grad_(True)
+    loss_input, prepared_data = prepare_loss_input(student, data, loss_fn)
+    actual, _ = loss_fn(
+        **loss_input,
+        data=prepared_data,
+        global_valid_seqs=torch.tensor(2),
+        global_valid_toks=torch.tensor(14),
+    )
+    student_lp = reference.float().gather(-1, indices).log_softmax(-1)[:, :-1]
+    teacher_lp = teacher_logits.log_softmax(-1)[:, :-1]
+    forward = teacher_lp.exp() * (teacher_lp - student_lp)
+    reverse = student_lp.exp() * (student_lp - teacher_lp)
+    if kl_type == "forward":
+        expected = forward.sum(-1).mean()
+    elif kl_type == "reverse":
+        expected = reverse.sum(-1).mean()
+    else:
+        expected = (0.5 * forward + 0.5 * reverse).sum(-1).mean()
+    actual.backward()
+    expected.backward()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(student.grad, reference.grad, rtol=0, atol=0)
+    assert torch.count_nonzero(student.grad) > 0
+
+
+@pytest.mark.parametrize("kl_type", ["forward", "reverse", "mixed"])
+@pytest.mark.parametrize("zero_outside_topk", [False, True])
+def test_distillation_pipeline_matches_full_upcast(
+    kl_type: str, zero_outside_topk: bool
+) -> None:
+    """Real loss masks preserve gradients for padding and excluded samples."""
+    torch.manual_seed(42)
+    logits = torch.randn(2, 8, 128, dtype=torch.bfloat16)
+    teacher_logits, indices = torch.randn(2, 8, 128).topk(4, dim=-1)
+    indices[:, 6:] = 0
+    token_mask = torch.ones(2, 8)
+    token_mask[:, 6:] = 0
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(2, 8, dtype=torch.long),
+            "token_mask": token_mask,
+            "sample_mask": torch.tensor([1.0, 0.0]),
+            "teacher_topk_logits": teacher_logits,
+            "teacher_topk_indices": indices,
+        }
+    )
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(kl_type=kl_type, zero_outside_topk=zero_outside_topk)
+    )
+    student = logits.clone().requires_grad_(True)
+    reference = logits.clone().requires_grad_(True)
+    results = []
+    saved: list[tuple[torch.Size, torch.dtype]] = []
+
+    def record(tensor: torch.Tensor) -> torch.Tensor:
+        saved.append((tensor.shape, tensor.dtype))
+        return tensor
+
+    for index, candidate in enumerate((student, reference.float())):
+        saved.clear()
+        with torch.autograd.graph.saved_tensors_hooks(record, lambda tensor: tensor):
+            loss_input, prepared_data = prepare_loss_input(candidate, data, loss_fn)
+            loss, _ = loss_fn(
+                **loss_input,
+                data=prepared_data,
+                global_valid_seqs=torch.tensor(1.0),
+                global_valid_toks=token_mask[0, 1:].sum(),
+            )
+        if index == 0:
+            assert ((student.shape, torch.float32) in saved) == zero_outside_topk
+        loss.backward()
+        results.append(loss.detach())
+
+    torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
+    torch.testing.assert_close(student.grad, reference.grad, rtol=0, atol=0)
+    assert torch.count_nonzero(student.grad[1]) == 0
+    assert torch.count_nonzero(student.grad[:, 6:]) == 0
+
+
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
     seq_len = 4
     data = {
