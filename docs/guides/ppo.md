@@ -224,6 +224,28 @@ Because the optimizer is rebuilt, the seed and this run **do not** have to agree
 
 The warm start applies to a fresh run only: once the run has written a checkpoint of its own, that checkpoint wins. That is what lets the setting stay in the config across resumes — a resubmitted run restores its own critic instead of re-seeding from the pretrained one, with no config edit in between.
 
+### SWE Privileged Critic
+
+On SWE agent rollouts (SingleController path only) the critic can see what the policy never does: the instance's accepted fix and its grading tests. Every critic row is prefixed with a reference block holding the golden patch, the test patch, `PASS_TO_PASS` and `FAIL_TO_PASS`, so the critic can check the agent's work against the answer instead of guessing the outcome from the trajectory alone. The policy's inputs are untouched, so its gradient stays unbiased: the reference is only part of the critic's baseline.
+
+```yaml
+value:
+  # policy length + max_total_tokens + 256 tokens of chat-template slack
+  max_total_sequence_length: ${add:${policy.max_total_sequence_length}, 33024}
+  swe_privileged_critic:
+    enabled: true
+    max_total_tokens: 32768  # budget for the whole reference block
+    caps: {}                 # optional per-field ceilings: golden_patch, test_patch, pass_to_pass, fail_to_pass
+```
+
+- **Placement**: the block is a system turn *before* the first assistant token. The value head is causal, so this is the only position every supervised token can attend to.
+- **Budget**: fields are truncated to fit `max_total_tokens` in the order `fail_to_pass` > `golden_patch` > `test_patch` > `pass_to_pass`, and a cut field is marked in the block. `value.max_total_sequence_length` and every enabled value `sequence_packing` / `dynamic_batching` token budget must cover `policy.max_total_sequence_length + max_total_tokens + 256`; setup checks this at startup.
+- **Data**: each prompt's `extra_env_info` must carry the instance's fields, either under `responses_create_params.metadata` (directly or in its `instance_dict` JSON) or at the row's top level. The golden patch is read from `golden_patch`, `gold_patch` or `patch`; R2E-Gym's structured `parsed_commit_content` is reassembled into a diff. A prompt without a golden patch fails the run rather than silently training a blind critic.
+- **Constraints**: not combinable with on-policy distillation teachers, which use the same replay-buffer enrichment stage. The legacy `run_ppo.py` entrypoint rejects the block.
+- **Warm start**: keep `max_total_tokens` and `caps` identical to the critic-pretraining run you warm-start from; they decide what gets truncated.
+- **Metrics**: `privilege/*` per trained instance, e.g. `privilege/frac_truncated` (share of instances whose block was cut), `privilege/block_tokens_mean` and `privilege/dropped_tokens_mean`.
+- **Checkpoints**: the cached blocks are saved as `privilege_prefixes.pt` next to the replay-buffer metadata and restored with the replay groups on resume.
+
 ## Loss
 
 ### Policy Loss
