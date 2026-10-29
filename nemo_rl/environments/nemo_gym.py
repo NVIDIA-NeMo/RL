@@ -1493,7 +1493,7 @@ Depending on your data shape, you may want to change these values."""
         elif terminal_record is None:
             failure_reason = selection_reason or "missing_terminal_row"
         return {
-            "rollout_id": rollout_id,
+            "capture_key": rollout_id,
             "reward": reward,
             "terminal_model_call_id": (
                 terminal_record.get("model_call_id")

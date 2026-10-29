@@ -123,7 +123,7 @@ def test_a_captured_token_in_call_is_staged_from_the_engine() -> None:
     # The staged prefix [1, 5, 6, EOS] replaces the rendered history [1, 7, EOS].
     prefix = [1, 5, 6, EOS]
     admission = CaptureAdmission(
-        rollout_id="rollout-1",
+        capture_key="rollout-1",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=len(prefix),
@@ -172,7 +172,7 @@ def test_a_captured_token_in_call_is_staged_from_the_engine() -> None:
 
 def test_a_call_that_fails_after_admission_fails_its_capture() -> None:
     admission = CaptureAdmission(
-        rollout_id="rollout-1", model_call_id="c1", mode="text"
+        capture_key="rollout-1", model_call_id="c1", mode="text"
     )
 
     class _FailingLLM(_FakeLLM):
@@ -192,7 +192,7 @@ def test_a_call_that_fails_after_admission_fails_its_capture() -> None:
 
 def test_without_capture_installed_a_captured_call_is_served_uncaptured() -> None:
     admission = CaptureAdmission(
-        rollout_id="rollout-1", model_call_id="c1", mode="text"
+        capture_key="rollout-1", model_call_id="c1", mode="text"
     )
     llm = _FakeLLM([_output([1, 3, 4], _completion([10], "stop"))])
     host = _host(llm)
@@ -206,7 +206,7 @@ def test_without_capture_installed_a_captured_call_is_served_uncaptured() -> Non
 
 def test_a_captured_media_call_stages_the_media_the_engine_ran_on() -> None:
     admission = CaptureAdmission(
-        rollout_id="rollout-1", model_call_id="c1", mode="text"
+        capture_key="rollout-1", model_call_id="c1", mode="text"
     )
     processed = [1, *[IMAGE_TOKEN] * IMAGE_TOKENS, 3]
     llm = _FakeLLM([_output(processed, _completion([10], "stop"))])

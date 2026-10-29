@@ -1077,7 +1077,7 @@ def test_worker_bounds_cyclic_inline_chain_lookup(retained_call):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("rollout_id", "other"),
+        ("capture_key", "other"),
         ("parent_call_id", "other"),
         ("prev_len", 1),
         ("chain_hash", "invalid"),
