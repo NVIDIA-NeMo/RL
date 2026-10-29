@@ -2419,8 +2419,13 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
-    async def reset_prefix_cache_async(self):
-        """Async version of reset_prefix_cache."""
+    async def reset_prefix_cache_async(self) -> bool:
+        """Reset the prefix cache of vLLM engine.
+
+        Returns:
+            vLLM's result: False when vLLM skipped the reset because a request
+            still holds KV blocks, so nothing was cleared.
+        """
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )
@@ -2430,9 +2435,10 @@ class VllmAsyncGenerationWorkerImpl(
                 "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
             )
 
-        await self.llm.reset_prefix_cache()
+        result = await self.llm.reset_prefix_cache()
         gc.collect()
         torch.cuda.empty_cache()
+        return result
 
     async def pause_generation_async(self, *, clear_cache: bool) -> bool:
         """Pause vLLM generation for an in-flight weight update."""
