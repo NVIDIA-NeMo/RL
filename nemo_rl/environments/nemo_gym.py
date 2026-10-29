@@ -818,8 +818,16 @@ class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: NemoGymConfig):
-        # Import first so lens sees Gym's span groups when it validates the spec.
-        import nemo_gym.telemetry  # noqa: F401
+        # Import ahead of init_telemetry_worker so lens sees Gym's span groups when
+        # it validates the spec. Guarded because NemoGym is also constructed without
+        # the optional nemo_gym extra (unit tests), and the early import only avoids
+        # a cosmetic lens warning; a genuine missing dep inside nemo_gym.telemetry
+        # still raises.
+        try:
+            import nemo_gym.telemetry  # noqa: F401
+        except ModuleNotFoundError as exc:
+            if (exc.name or "").split(".")[0] != "nemo_gym":
+                raise
 
         # Named explicitly: built from the environment registry rather than
         # by RayWorkerGroup, so nothing sets NRL_WORKER_GROUP for it.
