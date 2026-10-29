@@ -89,8 +89,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
-    InOrderSampler,
-    ReadyFirstSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -658,14 +656,6 @@ class SingleControllerActor:
             self._async_cfg.sampler,
             min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
         )
-        if self._is_ppo:
-            if (
-                not isinstance(self._sampler, (InOrderSampler, ReadyFirstSampler))
-                or self._value is None
-            ):
-                raise TypeError(
-                    "PPO requires an in-order or ready-first sampler and value worker"
-                )
         restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
         # The saved dispatch index counts groups dispatched ahead of training, which
         # only a data-plane snapshot can give back. Without one (e.g. msc://), those
