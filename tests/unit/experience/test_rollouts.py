@@ -2806,7 +2806,9 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     assert metrics["completion_count"] == 2
     assert metrics["agent"] == "agent"
     assert metrics["prompt_lengths"] == [1, 2]
-    reduced = reduce_step([{key: value for key, value in metrics.items() if isinstance(value, Metric)}])
+    reduced = reduce_step(
+        [{key: value for key, value in metrics.items() if isinstance(value, Metric)}]
+    )
     assert reduced["remote_time"] == 2.0
     assert reduced["timing/test/routing/group_share/nemo_gym"] == 1
     assert reduced["reward_score_raw/mean"] == pytest.approx(1.5)

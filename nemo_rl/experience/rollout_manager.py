@@ -1336,9 +1336,7 @@ class AsyncNemoGymRolloutImpl:
                     resolved_agent_ref
                 )
                 agent_name = _nemo_gym_metric_namespace(inputs_by_rowidx[rowidx])
-                row_metrics = self._compute_rollout_metrics(
-                    row_completions, agent_name
-                )
+                row_metrics = self._compute_rollout_metrics(row_completions, agent_name)
                 row_shaping = shaping_by_rowidx[rowidx]
                 if row_shaping is not None:
                     row_metrics.update(_declared_effort_metrics(row_shaping))
@@ -1784,7 +1782,14 @@ class AsyncNemoGymRolloutImpl:
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
         if full_results is not None:
-            agent_extras = [dict(full_result) for full_result in full_results]
+            agent_extras = [
+                {
+                    key: value
+                    for key, value in full_result.items()
+                    if not (receipt_mode and key == "reward")
+                }
+                for full_result in full_results
+            ]
         else:
             agent_extras = [
                 {

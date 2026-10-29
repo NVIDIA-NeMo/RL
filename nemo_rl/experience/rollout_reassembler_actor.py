@@ -180,14 +180,40 @@ class RolloutReassemblerActor:  # pragma: no cover
                 selected_metrics = []
                 lengths = result.meta.sequence_lengths
                 assert lengths is not None, "Finalized canonical rows require lengths"
-                for snapshot, length in zip(request.telemetry, lengths, strict=True):
+                rewards_by_sample = {
+                    row.sample_id: row.reward for row in result.reward_observations
+                }
+                for snapshot, length, sample_id in zip(
+                    request.telemetry, lengths, result.meta.sample_ids, strict=True
+                ):
                     assert snapshot is not None
                     metrics = snapshot.to_metrics()
+                    prefix = f"environment/{request.rollout_environment}"
+                    # Earlier declared snapshots may contain raw rewards. Drop
+                    # only those observations before adding finalized rewards;
+                    # never let rejected placeholders contribute stale values.
+                    for reward_name in ("total_reward", f"{prefix}/total_reward"):
+                        metrics.pop(reward_name, None)
+                        metrics.pop(f"{reward_name}/mean", None)
+                    for fields_prefix in (f"{prefix}/env_extra", snapshot.environment):
+                        fields_key = f"{fields_prefix}/"
+                        if fields_key in metrics:
+                            fields = metrics[fields_key]
+                            metrics[fields_key] = Metric(
+                                [
+                                    {
+                                        key: value
+                                        for key, value in row.items()
+                                        if key != f"{fields_prefix}/reward"
+                                    }
+                                    for row in fields.values
+                                ],
+                                fields.reduce,
+                            )
                     # Receipts have no token payload: their producer uses a
                     # placeholder False for truncated. Match the finalizer's
                     # actual length-cap flag, never log that placeholder.
                     truncated = int(length == self._max_seq_len)
-                    prefix = f"environment/{request.rollout_environment}"
                     metrics.update(distribution(f"{prefix}/truncated", [truncated]))
                     for scope in ("", f"{prefix}/"):
                         metrics[f"{scope}truncation_rate"] = Metric([truncated], "mean")
@@ -199,6 +225,15 @@ class RolloutReassemblerActor:  # pragma: no cover
                     metrics[f"{snapshot.environment}/truncation_rate"] = Metric(
                         [truncated], "mean"
                     )
+                    # Raw receipt rewards precede shaping/penalties. Only valid
+                    # canonical rows have authoritative finalized observations;
+                    # rejected placeholders must not vote in reward statistics.
+                    if sample_id in rewards_by_sample:
+                        reward = rewards_by_sample[sample_id]
+                        metrics.update(distribution(f"{prefix}/total_reward", [reward]))
+                        metrics.update(
+                            distribution(f"{prefix}/env_extra/reward", [reward])
+                        )
                     selected_metrics.append(metrics)
                 result.meta.extra_info[ROLLOUT_METRICS] = selected_metrics
             else:

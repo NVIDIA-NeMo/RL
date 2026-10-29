@@ -62,7 +62,14 @@ from nemo_rl.experience.metric_utils import (
     Metric,
     RolloutTelemetry,
     distribution,
+    metrics_from_plain,
     reduce_step,
+)
+from nemo_rl.experience.reward_penalties import (
+    FinalizedReward,
+    RewardLogContext,
+    aggregate_capture_reward_metrics,
+    finalize_capture_reward,
 )
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
@@ -86,6 +93,7 @@ from nemo_rl.experience.rollout_recovery import (
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     _aggregate_multi_turn_rollout_metrics,
+    _nemo_gym_group_metrics,
     _postprocess_single_nemo_gym_group,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -1157,8 +1165,12 @@ def test_gate_off_keeps_the_mask_flag_in_the_per_agent_metrics():
     # The caller's result is untouched by the gate.
     assert result["full_result"]["mask_sample"] is True
 
-    metrics = impl._compute_rollout_metrics(
-        completions, "agent", full_results=[result["full_result"]]
+    metrics = reduce_step(
+        [
+            impl._compute_rollout_metrics(
+                completions, "agent", full_results=[result["full_result"]]
+            )
+        ]
     )
     assert metrics["agent/mask_sample/mean"] == 1.0
 
@@ -1207,7 +1219,9 @@ def test_capture_proxy_metrics_cannot_be_confused_with_v1_messages():
         assert f"{scope}gen_tokens_per_sample/histogram" not in metrics
     assert "mean_gen_tokens_per_sample" not in metrics
     assert "mean_prompt_length" not in metrics
-    assert metrics["total_reward/mean"] == 1.0
+    # Capture rewards are authoritative only after canonical finalization.
+    assert "total_reward/mean" not in metrics
+    assert "environment/swe/total_reward/mean" not in metrics
 
 
 def test_receipt_completion_drops_mask_flag_when_gate_off():
@@ -1363,20 +1377,47 @@ def test_streamed_capture_effort_median_survives_recovery_and_finalization(level
     snapshots = tuple(
         RolloutTelemetry.from_state(c.telemetry.to_state()) for c in completed
     )
+    assert all(f"median_length_{level}" not in s.metrics for s in snapshots)
     actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
     actor._max_seq_len = 100
     actor._finalizer = MagicMock()
-    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+    canonical = FinalizedGroup(
         meta=KVBatchMeta(
             partition_id="canonical",
             task_name="train",
             sample_ids=["g0", "g1", "g2"],
-            sequence_lengths=[2, 2, 2],
+            sequence_lengths=[10, 20, 90],
         ),
         group_min_wv=4,
         group_max_wv=4,
         staging_keys=[],
     )
+
+    def finalize_reward_stage(group_id, rollout_ids, receipts, rewards, **kwargs):
+        # Tensor reconstruction is stubbed; use the real post-reconstruction
+        # reward function with canonical lengths, not response.usage estimates.
+        for index, length in enumerate([10, 20, 90]):
+            reward, _, row_metrics = finalize_capture_reward(
+                rewards[index],
+                checks=kwargs["reward_checks"][index],
+                penalty_config=None,
+                effort_config=impl._effort_config,
+                token_ids=[1] * length,
+                link_spans=[(f"call{index}", 0, length)],
+            )
+            for key, value in row_metrics.items():
+                canonical.metrics[key] = canonical.metrics.get(key, 0.0) + value
+            canonical.reward_observations.append(
+                FinalizedReward(
+                    f"g{index}",
+                    f"g{index}",
+                    reward,
+                    kwargs["reward_log_contexts"][index],
+                )
+            )
+        return canonical
+
+    actor._finalizer.finalize_group.side_effect = finalize_reward_stage
     result = actor.finalize(
         ReassemblyRequest(
             group_id="group",
@@ -1384,6 +1425,10 @@ def test_streamed_capture_effort_median_survives_recovery_and_finalization(level
             canonical_sample_ids=("g0", "g1", "g2"),
             receipts=(None, None, None),
             rewards=tuple(c.reward for c in completed),
+            reward_checks=tuple(c.env_extras["ng_reward_checks"] for c in completed),
+            reward_log_contexts=tuple(
+                c.env_extras["ng_reward_log_context"] for c in completed
+            ),
             fallback_weight_version=4,
             prompt_idx=17,
             mask_sample=(False, False, False),
@@ -1392,6 +1437,12 @@ def test_streamed_capture_effort_median_survives_recovery_and_finalization(level
         )
     )
     metrics = reduce_step(result.meta.extra_info[ROLLOUT_METRICS])
+    metrics.update(
+        aggregate_capture_reward_metrics(
+            {key: [value] for key, value in result.metrics.items()},
+            result.reward_observations,
+        )
+    )
     assert metrics[f"median_length_{level}"] == 20
     assert metrics[f"mean_length_{level}"] == 40
     assert_metadata_only(result)
@@ -1577,6 +1628,12 @@ def test_capture_agent_summaries_match_selected_population(
         group_min_wv=4,
         group_max_wv=4,
         staging_keys=[],
+        reward_observations=[
+            FinalizedReward(
+                f"g{index}", f"g{index}", reward, RewardLogContext(agent_name, None)
+            )
+            for index, reward in enumerate([0.0, 0.0, 0.5])
+        ],
     )
     finalized = actor.finalize(
         ReassemblyRequest(
@@ -1593,6 +1650,10 @@ def test_capture_agent_summaries_match_selected_population(
         )
     )
     actual = reduce_step(finalized.meta.extra_info[ROLLOUT_METRICS])
+    actual.update(aggregate_capture_reward_metrics({}, finalized.reward_observations))
+    expected.update(
+        reduce_step([distribution(f"{agent_name}/reward", [0.0, 0.0, 0.5])])
+    )
     for name in (
         "truncation_rate",
         f"environment/{environment}/truncation_rate",
@@ -1647,9 +1708,16 @@ def test_nemo_gym_telemetry_matches_v1_postprocessing(mask_env_flagged_samples):
     impl = _nemo_gym_impl(mask_env_flagged_samples)
     impl._max_seq_len = 9
     completions, _ = impl._results_to_completions(deepcopy(results))
-    actual = reduce_step(
-        [impl._compute_rollout_metrics(completions, "swe", prompt_lengths=[1, 1, 1])]
+    # Match _run_rollouts: include the shared Gym group diagnostics added on
+    # main, then reduce both producers at the same step boundary as V1.
+    declared = impl._compute_rollout_metrics(
+        completions,
+        "swe",
+        prompt_lengths=[1, 1, 1],
+        full_results=[result["full_result"] for result in results],
     )
+    declared.update(metrics_from_plain(_nemo_gym_group_metrics(results)))
+    actual = reduce_step([declared])
     legacy_result = _postprocess_single_nemo_gym_group(
         nemo_gym_rows=[{"agent_ref": {"name": "swe"}} for _ in results],
         results=deepcopy(results),
@@ -1661,7 +1729,9 @@ def test_nemo_gym_telemetry_matches_v1_postprocessing(mask_env_flagged_samples):
         log_full_result_tables=False,
         mask_env_flagged_samples=mask_env_flagged_samples,
     )
-    legacy = legacy_result.rollout_metrics
+    legacy = aggregate_rollout_metrics(
+        {name: [value] for name, value in legacy_result.rollout_metrics.items()}
+    )
     # Guard the complete V1 producer output, including existing agent names,
     # rather than only the distributions named below.
     for name, value in legacy.items():
@@ -2594,7 +2664,6 @@ class TestGenerateForFinalizationFlow:
         assert recovered.resolved_agent_name == "resolved-agent"
         assert recovered.receipts == request.receipts
         assert restored._impl.seen_generation_indices is None
-
 
     @pytest.mark.parametrize("partial", [False, True])
     @pytest.mark.parametrize("agent_name", ["resolved", "resolved/agent"])

@@ -34,8 +34,10 @@ from nemo_rl.experience.metric_utils import (
     Metric,
     RolloutTelemetry,
     distribution,
+    optional_distributions,
     reduce_step,
 )
+from nemo_rl.experience.reward_penalties import FinalizedReward
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import (
     ReassemblyRequest,
@@ -271,6 +273,67 @@ def test_finalizer_rejects_misaligned_telemetry_before_publication():
     with pytest.raises(ValueError, match="environment mismatch"):
         actor.finalize(replace(_request(), telemetry=(RolloutTelemetry("wrong", {}),)))
     actor._finalizer.finalize_group.assert_not_called()
+
+
+@pytest.mark.parametrize("legacy_rewards", [False, True])
+def test_environment_rewards_use_finalized_values_and_exclude_placeholders(
+    legacy_rewards: bool,
+) -> None:
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._max_seq_len = 10
+    actor._finalizer = MagicMock()
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["invalid", "valid"],
+        sequence_lengths=[0, 3],
+    )
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        meta=meta,
+        group_min_wv=4,
+        group_max_wv=4,
+        staging_keys=[],
+        reward_observations=[FinalizedReward("valid", "valid", 0.25, None)],
+        valid_row_count=1,
+        total_row_count=2,
+    )
+    snapshots = []
+    for raw_reward in (999.0, 1.0):
+        metrics = {}
+        if legacy_rewards:
+            metrics.update(distribution("total_reward", [raw_reward]))
+            metrics.update(distribution("environment/swe/total_reward", [raw_reward]))
+            for prefix in ("environment/swe/env_extra", "swe"):
+                metrics.update(
+                    optional_distributions(
+                        prefix, [{"reward": raw_reward, "score": 2.0}]
+                    )
+                )
+        snapshots.append(RolloutTelemetry.from_metrics("swe", metrics))
+    saved = [snapshot.to_state() for snapshot in snapshots]
+    actor.finalize(
+        replace(
+            _request(),
+            rollout_ids=("invalid", "valid"),
+            canonical_sample_ids=("invalid", "valid"),
+            receipts=(None, None),
+            rewards=(999.0, 1.0),
+            mask_sample=(False, False),
+            rollout_environment="swe",
+            telemetry=tuple(RolloutTelemetry.from_state(state) for state in saved),
+        )
+    )
+    rows = meta.extra_info[ROLLOUT_METRICS]
+    assert "environment/swe/total_reward" not in rows[0]
+    reduced = reduce_step(rows)
+    assert [snapshot.to_state() for snapshot in snapshots] == saved
+    assert "total_reward/histogram" not in reduced  # Global rewards use main's reducer.
+    assert "swe/reward/histogram" not in reduced
+    if legacy_rewards:
+        assert reduced["environment/swe/env_extra/score/histogram"] == [2.0, 2.0]
+    for name in ("total_reward", "env_extra/reward"):
+        assert reduced[f"environment/swe/{name}/histogram"] == [0.25]
+        assert reduced[f"environment/swe/{name}/mean"] == 0.25
 
 
 @pytest.mark.parametrize("key", sorted(FORBIDDEN_RPC_KEYS))

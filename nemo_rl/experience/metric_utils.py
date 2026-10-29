@@ -23,10 +23,21 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Self, cast
 
+import numpy as np
+
 _METRIC_COMPONENT_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
 Reduction = Literal[
-    "sum", "mean", "min", "max", "median", "dist", "concat", "sum_by_key", "field_dist"
+    "sum",
+    "mean",
+    "min",
+    "max",
+    "median",
+    "dist",
+    "concat",
+    "sum_by_key",
+    "field_dist",
+    "group_stats",
 ]
 
 
@@ -38,6 +49,8 @@ class Metric(NamedTuple):
     These two explicit reductions keep non-scalar logging out of name heuristics.
     "field_dist" preserves optional-field rows, including empty rows, so means
     include groups where a field is entirely absent.
+    "group_stats" summarizes per-group observations with a mean and linearly
+    interpolated p05/p95, matching the shared V1 group-diagnostic reducer.
     """
 
     values: list[Any]
@@ -101,6 +114,7 @@ def _distribution_stats(
 ) -> dict[str, Any]:
     result = calculate_single_metric(values, rows, name)
     result[f"{name}/p50"] = result[f"{name}/median"]
+    result[f"{name}/p05"] = pct(values, 5)
     result[f"{name}/p95"] = pct(values, 95)
     result[f"{name}/p99"] = pct(values, 99)
     return result
@@ -110,7 +124,7 @@ def reduce_step(groups: Sequence[dict[str, Metric]]) -> dict[str, Any]:
     """Pool observations across selected groups and apply declared reducers.
 
     No metric name determines a reduction. Distribution outputs are min, max,
-    median, sample stddev, p50, discrete p95/p99, and raw histogram observations;
+    median, sample stddev, p50, discrete p05/p95/p99, and raw histogram observations;
     their means are separate declarations so missing fields need not affect
     other statistics. Inputs are not mutated.
 
@@ -158,6 +172,14 @@ def reduce_step(groups: Sequence[dict[str, Metric]]) -> dict[str, Any]:
                 continue
             reduced = _distribution_stats(name, values, len(values))
             del reduced[f"{name}/mean"]
+        elif reduction == "group_stats":
+            if not values:
+                continue
+            reduced = {
+                f"{name}/mean": statistics.fmean(values),
+                f"{name}/p05": float(np.percentile(values, 5)),
+                f"{name}/p95": float(np.percentile(values, 95)),
+            }
         elif reduction == "field_dist":
             # Names and the population are explicit producer data, not inferred
             # from agent names or environment/sample_count output keys. Two raw
@@ -189,12 +211,13 @@ def reduce_step(groups: Sequence[dict[str, Metric]]) -> dict[str, Any]:
 
 
 def metrics_from_plain(plain: dict[str, Any]) -> dict[str, Metric]:
-    """Adapt native V1 producer output using the pre-PR numeric name rules.
+    """Adapt shared V1 producer output using its existing numeric name rules.
 
     This adapter belongs at the native producer, never at the replay boundary:
     older replay rows lack the observations/denominators needed for safe mixing.
     Histogram-derived summaries are pooled, but numeric means preserve V1's
     average-of-group-means behavior. Non-numeric payloads are not inferred.
+    Per-group reward deviations retain V1's mean and interpolated percentiles.
 
     Args:
         plain: One native prompt group's V1 rollout metrics.
@@ -206,7 +229,7 @@ def metrics_from_plain(plain: dict[str, Any]) -> dict[str, Metric]:
         TypeError: If a native histogram is not a list of observations.
     """
     out: dict[str, Metric] = {}
-    summaries = {"min", "max", "median", "stddev", "p50", "p95", "p99"}
+    summaries = {"min", "max", "median", "stddev", "p05", "p50", "p95", "p99"}
     for name, value in plain.items():
         if is_histogram_metric(name):
             if not isinstance(value, list):
@@ -217,6 +240,8 @@ def metrics_from_plain(plain: dict[str, Any]) -> dict[str, Metric]:
                 out[name.removesuffix("/histogram")] = Metric(list(value), "dist")
         elif not isinstance(value, (int, float)):
             continue
+        elif name.endswith("/std_in_group"):
+            out[name] = Metric([value], "group_stats")
         elif (
             name.rsplit("/", 1)[-1] in summaries
             and f"{name.rsplit('/', 1)[0]}/histogram" in plain
@@ -348,6 +373,7 @@ class RolloutTelemetry:
                     "dist",
                     "concat",
                     "field_dist",
+                    "group_stats",
                 }
             ):
                 raise ValueError("Invalid rollout telemetry metric declaration")

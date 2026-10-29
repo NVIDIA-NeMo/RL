@@ -886,7 +886,9 @@ def test_sealed_telemetry_roundtrip_and_duplicate_seal(granularity, tmp_path):
     ledger = RolloutRecoveryLedger.from_state_dict(state)
     _bind(ledger, "g7", _prompt())
     group = ledger.get_group("g7")
-    result = SiblingSealResult(group.gate_rollout_id(0), None, 1.0, True, snapshot)
+    result = SiblingSealResult(
+        group.gate_rollout_id(0), None, 1.0, True, telemetry=snapshot
+    )
     if granularity is RecoveryGranularity.PROMPT_GROUP:
         _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", {0: result}))
     else:

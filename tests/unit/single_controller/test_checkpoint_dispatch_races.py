@@ -1429,6 +1429,9 @@ def test_recovery_rejects_mismatched_sidecar_version(tmp_path) -> None:
     torch.save(state, path)
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._master_config = SimpleNamespace(
+        token_capture=SimpleNamespace(enabled=False)
+    )
     controller._last_checkpoint_path = str(tmp_path)
     controller._data_plane_checkpoint_metadata = {
         "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
