@@ -172,6 +172,11 @@ class ManagedDynamoRuntime:
             "DYN_ENABLE_EXPERIMENTAL_PARSERS_V2": "1",
             "DYN_REQUEST_PLANE": "tcp",
             "DYN_EVENT_PLANE": "nats",
+            # NeMo-Gym sends media inline: raise the frontend's 45 MB HTTP body
+            # limit, and the 32 MiB request-plane limit above it (the engine
+            # request carries the same media plus token IDs).
+            "DYN_HTTP_BODY_LIMIT_MB": "512",
+            "DYN_TCP_MAX_MESSAGE_SIZE": str(1 << 30),
             # A canary request would stall behind a refit pause; engine liveness
             # is the Ray actor's, as for every other vLLM worker.
             "DYN_HEALTH_CHECK_ENABLED": "false",

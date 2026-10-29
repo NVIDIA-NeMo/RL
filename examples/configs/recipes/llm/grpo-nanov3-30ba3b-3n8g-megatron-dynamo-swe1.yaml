@@ -85,7 +85,6 @@ policy:
     dynamo: true
     dynamo_cfg:
       startup_timeout_s: 1800
-      request_timeout_s: 7200
       frontend_args:
         tokenizer: fastokens
         tokenizer_cache: true

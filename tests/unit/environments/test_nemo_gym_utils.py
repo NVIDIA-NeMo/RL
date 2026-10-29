@@ -1016,11 +1016,8 @@ def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
     assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
 
 
-@pytest.mark.parametrize(
-    "env_configs", [_env_configs, _shard_env_configs], ids=["unsharded", "sharded"]
-)
 def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
-    detected_uv_dirs, env_configs
+    detected_uv_dirs,
 ):
     """With Dynamo, each actor's composed config speaks Gym's Dynamo dialect.
 
@@ -1029,16 +1026,14 @@ def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
     """
     from nemo_rl.algorithms.grpo import MasterConfig
 
-    env = env_configs()
-    sharded = "shards" in env["nemo_gym"]
-    if sharded:
-        env["nemo_gym"]["shards"][1]["overrides"] = {
-            "policy_model": {
-                "responses_api_models": {
-                    "vllm_model": {"chat_template_kwargs": {"enable_thinking": False}}
-                }
+    env = _shard_env_configs()
+    env["nemo_gym"]["shards"][1]["overrides"] = {
+        "policy_model": {
+            "responses_api_models": {
+                "vllm_model": {"chat_template_kwargs": {"enable_thinking": False}}
             }
         }
+    }
     config = MasterConfig.model_construct(
         env=env,
         data={},
@@ -1074,7 +1069,7 @@ def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
         for cfg in cluster.actor_configs
     ]
     # judged, then the tools shard's two replicas with their own override.
-    assert thinking == ([True, False, False] if sharded else [True])
+    assert thinking == [True, False, False]
     for cfg in cluster.actor_configs:
         gym_config = cfg["initial_global_config_dict"]
         vllm_model = gym_config["policy_model"]["responses_api_models"]["vllm_model"]

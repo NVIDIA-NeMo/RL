@@ -55,7 +55,7 @@ shows them all:
 | `worker_args.tool_call_parser`, `reasoning_parser` | null | Dynamo's built-in parser names. null follows the native server's settings; see [NeMo-Gym](#nemo-gym) |
 | `worker_args.custom_jinja_template` | null | A chat template that replaces the model's own. null follows the native server's |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
-| `frontend_args.session_affinity_ttl_secs` | 1800 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it |
+| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it. Dynamo keeps at most 65,536 sessions and answers a new one past that with HTTP 529 |
 | `frontend_args.tokenizer`, `tokenizer_cache*` | `default`, off | Frontend tokenizer |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags |
 
@@ -96,27 +96,20 @@ every call with an annotation, and the engine serves a marked call as the native
 chat endpoint does:
 
 - Sampling must match `temperature`/`top_p` or `val_temperature`/`val_top_p`,
-  with `top_k` unset. vLLM samples with the configured values.
+  with `top_k` unset and `n` 1. vLLM samples with the configured values.
 - The token prefix Gym echoes replaces the history the frontend rendered.
-- Output is clamped to the context, and a prompt that leaves no room is refused
-  with the native endpoint's "maximum context length" error.
 - Stop strings stop vLLM itself, so the token IDs match the native endpoint's.
 - The response carries `prompt_token_ids`, `completion_token_ids` and
   `completion_logprobs` in `nvext.engine_data`, which Gym lifts onto the message.
   With router replay on, it also carries the call's `routed_experts`, as the
   native endpoint attaches them.
-- Images, video and audio in the messages are processed as on the native
-  endpoint. The frontend passes each media URL through with one unexpanded
-  placeholder per item. The engine loads the media with vLLM's media connector
-  and runs vLLM's multimodal processor on the frontend's tokens. The splice,
-  placeholder remap and media capture then work on that processed prompt.
+- Images, video and audio in the messages work as on the native endpoint,
+  token capture included.
 
 With `token_capture.enabled`, Gym uses its `dynamo_worker` capture backend. The
 same vLLM workers stage each call's tokens, log probabilities, routed experts and
 processed media from their own process, exactly as the native endpoint does, and
-only the commit coordinates travel back through the frontend. The frontend keeps a rollout on
-one engine (`session_affinity_ttl_secs`), as the native backend pins each Gym
-session to one server.
+only the commit coordinates travel back through the frontend.
 
 The native server's chat settings carry over:
 
@@ -135,6 +128,11 @@ Where the behavior differs from the native endpoint:
   history.
 - When a request sets `chat_template_kwargs.force_nonempty_content`, Dynamo
   reports a reasoning-only turn as content.
+- `default_chat_template_kwargs` sit under the template kwargs set in
+  `env.nemo_gym` only. A key that a Gym YAML also sets loses to the default, and
+  template kwargs sent through `extra_body` from a Gym YAML or a row's
+  `metadata.extra_body` are dropped.
+- The frontend refuses more than 4 `stop` strings or `stop_token_ids` (HTTP 500).
 
 ## Not supported
 
@@ -148,14 +146,16 @@ Startup rejects these with `dynamo: true`:
 - `async_rl.generation_router`: the frontend already routes the fleet behind one
   URL.
 - `vllm_cfg.http_server_api_key_required`: the frontend checks no bearer token.
+- `extra_body.bad_words` on the policy model
+  (`env.nemo_gym.policy_model.responses_api_models.vllm_model`): the frontend
+  answers every request carrying it with HTTP 400. Startup checks only this
+  overlay, not Gym's own YAMLs.
 - `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data
   parallelism inside vLLM, which the async engine Dynamo serves does not.
 - Parser plugins with no Dynamo parser, and the chat settings above that the
   frontend has no counterpart for.
 - `dynamo: true` on a backend other than vLLM, and a `dynamo_cfg` block without
   `dynamo: true`.
-
-A Gym call with `n > 1` is refused when it arrives.
 
 ## Build the image
 

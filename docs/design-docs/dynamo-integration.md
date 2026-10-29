@@ -33,13 +33,10 @@ implements its `LLMEngine` over the worker's `AsyncLLM`:
   output with `request_pipeline.rollout_output`.
 
   NeMo-Gym's calls also carry an annotation (Gym's Dynamo dialect). The engine
-  applies the native chat endpoint's rules to them: the on-policy sampling check
-  (`vllm/utils.off_policy_sampling_error`), the prefix splice
-  (`openai_server_utils.splice_prefix_tokens`) and the context clamp. A
-  token-capture call stages through the worker's own capture lifecycle
-  (`_begin_request_capture` / `_finish_request_capture`), and the token fields
-  and routed experts come from the native endpoint's helpers
-  (`chat_generation_tokens`, `chat_routed_experts`).
+  applies the native chat endpoint's rules to them (on-policy sampling, the
+  prefix splice, the context clamp), stages a token-capture call through the
+  worker's own capture lifecycle, and takes the token fields and routed experts
+  from the native endpoint's helpers.
 
   A request with media carries the frontend's tokens, with one unexpanded
   placeholder per item, and the media URLs. The adapter loads the media with

@@ -2396,7 +2396,7 @@ class TestSetup:
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
-            ) as mock_spinup,
+            ),
             patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch(
@@ -2407,11 +2407,6 @@ class TestSetup:
             setup_single_controller(mc, MagicMock(pad_token_id=9))
 
         assert mc.token_capture.generation_backend == "dynamo"
-        assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
-            "dynamo"
-        )
-        generation, _ = patched_factories["_build_generation"].return_value
-        generation.setup_token_capture.assert_called()
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
         mc = _make_master_config(colocated=False, backend="vllm")

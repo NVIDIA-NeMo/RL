@@ -78,10 +78,7 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
     DYNAMO_ENDPOINT,
 )
 from nemo_rl.models.generation.dynamo.rollout_client import ROLLOUT_ANNOTATION
-from nemo_rl.models.generation.openai_server_utils import (
-    derive_prefix_eos_count,
-    splice_prefix_tokens,
-)
+from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.vllm.request_pipeline import rollout_result_to_wire
 from nemo_rl.models.generation.vllm.utils import (
     chat_generation_tokens,
@@ -106,6 +103,12 @@ GYM_CAPTURE_ANNOTATION_PREFIX = "ng_capture:"
 # IDs, which the native server reads from the messages instead.
 GYM_PREFIX_ANNOTATION_PREFIX = "ng_prefix:"
 _GYM_SAMPLING_KEYS = ("temperature", "top_p", "val_temperature", "val_top_p")
+# The engine_data name Gym's dialect reads for each native message field.
+_GYM_ENGINE_DATA_KEYS = {
+    "generation_token_ids": "completion_token_ids",
+    "generation_log_probs": "completion_logprobs",
+    "routed_experts": "routed_experts",
+}
 
 # The vLLM modality each key of Dynamo's multi_modal_data holds.
 _DYNAMO_MEDIA_MODALITIES = {
@@ -500,9 +503,11 @@ class NativeVllmEngine(LLMEngine):
         """
         host = self._host
         sampling: dict[str, Any] = request.get("sampling_options") or {}
+        temperature = _as_f32(sampling.get("temperature"))
+        top_p = _as_f32(sampling.get("top_p"))
         sampling_error = off_policy_sampling_error(
-            temperature=_as_f32(sampling.get("temperature")),
-            top_p=_as_f32(sampling.get("top_p")),
+            temperature=temperature,
+            top_p=top_p,
             top_k=sampling.get("top_k"),
             generation_config=self._gym_sampling_profile,
         )
@@ -513,23 +518,17 @@ class NativeVllmEngine(LLMEngine):
                 "NeMo-Gym calls through Dynamo take n=1: engine_data carries one "
                 "choice's tokens."
             )
-        # The profile's own values, so vLLM samples exactly as natively.
-        validation = (
-            _as_f32(sampling["temperature"])
-            != self._gym_sampling_profile["temperature"]
-            or _as_f32(sampling["top_p"]) != self._gym_sampling_profile["top_p"]
-        )
-        temperature, top_p = (
-            (host.cfg["val_temperature"], host.cfg["val_top_p"])
-            if validation
-            else (host.cfg["temperature"], host.cfg["top_p"])
-        )
+        # The train or validation profile's own values, so vLLM samples exactly
+        # as natively.
+        profile = self._gym_sampling_profile
+        if (temperature, top_p) == (profile["temperature"], profile["top_p"]):
+            temperature, top_p = host.cfg["temperature"], host.cfg["top_p"]
+        else:
+            temperature, top_p = host.cfg["val_temperature"], host.cfg["val_top_p"]
 
         capture_context = _annotation_value(request, GYM_CAPTURE_ANNOTATION_PREFIX)
-        admission = (
-            None
-            if capture_context is None
-            else host._parse_capture_admission(json.loads(capture_context))
+        admission = host._parse_capture_admission(
+            None if capture_context is None else json.loads(capture_context)
         )
         prefix_token_ids = None
         if admission is not None:
@@ -553,16 +552,13 @@ class NativeVllmEngine(LLMEngine):
         if prefix_token_ids is not None:
             # The frontend rendered the whole conversation; replace its history
             # with the exact tokens the model generated for it. The engine sees no
-            # messages, so the prefix's EOS count stands in for the native
-            # endpoint's render of the history.
-            tokenizer = self._llm.tokenizer
+            # messages, so the prefix stands in for the native endpoint's render
+            # of the history.
             splice = splice_prefix_tokens(
-                tokenizer=tokenizer,
+                tokenizer=self._llm.tokenizer,
                 model_prefix_token_ids=prefix_token_ids,
+                template_prefix_token_ids=None,
                 template_token_ids=template_token_ids,
-                template_prefix_eos_count=derive_prefix_eos_count(
-                    prefix_token_ids, eos_token_id=tokenizer.eos_token_id
-                ),
             )
             token_ids = splice.token_ids
             self._check_prompt_fits(len(token_ids))
@@ -599,8 +595,14 @@ class NativeVllmEngine(LLMEngine):
         }
         if stop:
             # vLLM stops on them as natively, so the token arrays match; the
-            # frontend then cuts the text at the same place.
-            overrides.update(stop=stop, detokenize=True)
+            # frontend then cuts the text at the same place, so both must decode
+            # special tokens alike (the frontend defaults this off for some parsers).
+            skip = (request.get("output_options") or {}).get("skip_special_tokens")
+            overrides.update(
+                stop=stop,
+                detokenize=True,
+                skip_special_tokens=True if skip is None else skip,
+            )
         if admission is not None:
             # A captured call stages the sampled tokens' log probabilities.
             overrides["logprobs"] = 0
@@ -624,7 +626,6 @@ class NativeVllmEngine(LLMEngine):
                 prefix_token_ids=prefix_token_ids,
                 media=media,
             )
-        staged = False
         try:
             final_output = None
             async for output in self._llm.generate(
@@ -639,6 +640,9 @@ class NativeVllmEngine(LLMEngine):
                 # native endpoint's cancellation does, instead of staging it.
                 return
             completion = final_output.outputs[0]
+            if completion.finish_reason == "error":
+                # As vLLM's chat server does (_raise_if_error): never stage a failed call.
+                raise RuntimeError(f"Generation failed for request {context.id()}")
             chunk: GenerateChunk = {
                 "token_ids": list(completion.token_ids),
                 "index": 0,
@@ -646,14 +650,12 @@ class NativeVllmEngine(LLMEngine):
                 "completion_usage": _usage(final_output, len(completion.token_ids)),
             }
             if admission is not None:
-                chunk["engine_data"] = {
-                    "ng_commit_coords": await self._stage_gym_call(
-                        request, final_output
-                    )
-                }
-                staged = True
+                chunk["engine_data"] = await self._stage_gym_call(request, final_output)
             else:
-                chunk["engine_data"] = self._gym_token_data(final_output)
+                engine_data = {"prompt_token_ids": list(final_output.prompt_token_ids)}
+                for field, value in self._gym_message(final_output).items():
+                    engine_data[_GYM_ENGINE_DATA_KEYS[field]] = value
+                chunk["engine_data"] = engine_data
                 log_probs, top_logprobs = extract_from_completion_output(
                     completion, 0, tokenizer=self._llm.tokenizer, include_bytes=True
                 )
@@ -662,7 +664,8 @@ class NativeVllmEngine(LLMEngine):
                     chunk["top_logprobs"] = top_logprobs
             yield chunk
         finally:
-            if admission is not None and not staged:
+            # A no-op once the call was staged: staging pops its capture state.
+            if admission is not None:
                 host._abort_request_capture(
                     request,
                     reason=(
@@ -754,18 +757,15 @@ class NativeVllmEngine(LLMEngine):
                 "output tokens."
             )
 
-    def _gym_token_data(self, final_output: Any) -> dict[str, Any]:
-        """The token fields Gym's dialect lifts onto the message, as the native endpoint reports them."""
+    def _gym_message(self, final_output: Any) -> dict[str, Any]:
+        """The token fields the native endpoint puts on the call's message."""
         completion = final_output.outputs[0]
-        token_data: dict[str, Any] = {
-            "prompt_token_ids": list(final_output.prompt_token_ids),
-            "completion_token_ids": list(completion.token_ids),
-        }
+        message: dict[str, Any] = {"generation_token_ids": list(completion.token_ids)}
         if completion.logprobs is not None:
-            _, token_data["completion_logprobs"] = chat_generation_tokens(completion)
+            _, message["generation_log_probs"] = chat_generation_tokens(completion)
         if self._host._return_routed_experts_enabled():
             # Full prompt + generation rows, as the native endpoint attaches them.
-            token_data["routed_experts"] = chat_routed_experts(
+            message["routed_experts"] = chat_routed_experts(
                 final_output,
                 completion,
                 prompt_token_count=len(final_output.prompt_token_ids),
@@ -773,42 +773,31 @@ class NativeVllmEngine(LLMEngine):
                 logger=LOGGER,
                 routed_experts_dtype=self._host.routed_experts_dtype,
             )
-        return token_data
+        return message
 
-    async def _stage_gym_call(self, request: GenerateRequest, final_output: Any) -> Any:
-        """Stage a captured call from this process; return its commit coordinates."""
-        host = self._host
-        completion = final_output.outputs[0]
-        generation_token_ids, generation_log_probs = chat_generation_tokens(completion)
-        message: dict[str, Any] = {
-            "generation_token_ids": generation_token_ids,
-            "generation_log_probs": generation_log_probs,
-        }
-        if host._return_routed_experts_enabled():
-            message["routed_experts"] = chat_routed_experts(
-                final_output,
-                completion,
-                prompt_token_count=len(final_output.prompt_token_ids),
-                device=torch.device("cpu"),
-                logger=LOGGER,
-                routed_experts_dtype=host.routed_experts_dtype,
-            )
+    async def _stage_gym_call(
+        self, request: GenerateRequest, final_output: Any
+    ) -> dict[str, Any]:
+        """Stage a captured call from this process; return the engine_data carrying its commit coordinates."""
+        # Deferred: only captured calls reach here, and capture already imports nemo_gym.
+        from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD
+
         # The native endpoint's response shape; the prompt is the one recorded at
         # begin_call.
         content = {
             "choices": [
                 {
                     "index": 0,
-                    "finish_reason": completion.finish_reason,
-                    "message": message,
+                    "finish_reason": final_output.outputs[0].finish_reason,
+                    "message": self._gym_message(final_output),
                 }
             ]
         }
         # The sink write is a blocking data-plane round trip.
         content = await asyncio.to_thread(
-            host._finish_request_capture, request, content
+            self._host._finish_request_capture, request, content
         )
-        return content["ng_commit_coords"]
+        return {NG_COMMIT_COORDS_FIELD: content[NG_COMMIT_COORDS_FIELD]}
 
     async def abort(self, context: Context) -> None:
         await self._llm.abort(context.id())

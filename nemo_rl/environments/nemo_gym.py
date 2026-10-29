@@ -1493,7 +1493,7 @@ Depending on your data shape, you may want to change these values."""
         elif terminal_record is None:
             failure_reason = selection_reason or "missing_terminal_row"
         return {
-            "capture_key": rollout_id,
+            "rollout_id": rollout_id,
             "reward": reward,
             "terminal_model_call_id": (
                 terminal_record.get("model_call_id")
@@ -2057,14 +2057,13 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config["stop_token_ids"] = None
 
     if dynamo_enabled(generation_config):
-        # Gym's policy model calls the Dynamo frontend in Gym's Dynamo dialect.
-        # Each actor applies it to its own composed config (_apply_dynamo_dialect),
-        # so it never becomes a policy_model overlay that a shard must claim.
-        config.env.setdefault("nemo_gym", {})["dynamo_dialect"] = {
-            "default_chat_template_kwargs": native_default_chat_template_kwargs(
-                generation_config
-            )
-        }
+        # Gym's policy model calls the Dynamo frontend in Gym's Dynamo dialect,
+        # with the native server's default template kwargs. Each actor applies it
+        # to its own composed config (_apply_dynamo_dialect), so it never becomes
+        # a policy_model overlay that a shard must claim.
+        config.env.setdefault("nemo_gym", {})["dynamo_dialect"] = (
+            native_default_chat_template_kwargs(generation_config)
+        )
 
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for
@@ -2141,12 +2140,19 @@ def _apply_dynamo_dialect(
 
     The frontend takes token data in nvext instead of vLLM's request extensions.
     Applied to the actor's composed config (a shard's overrides included), so
-    settings the user wrote there win. Copies the policy_model levels it
-    changes, so the caller's config is not mutated.
+    settings the user wrote there win. Sets ``policy_model`` on ``nemo_gym_dict``
+    in place, so pass a per-actor copy; the nested policy_model levels are
+    copied, so dicts shared with the user's config are not mutated.
     """
     policy_model = dict(nemo_gym_dict.get("policy_model") or {})
     models = dict(policy_model.get("responses_api_models") or {})
     vllm_model = dict(models.get("vllm_model") or {})
+    if "bad_words" in (vllm_model.get("extra_body") or {}):
+        raise ValueError(
+            "vllm_model.extra_body.bad_words is not supported with "
+            "policy.generation.dynamo=true: the Dynamo frontend answers every "
+            "request carrying it with HTTP 400."
+        )
     vllm_model["dynamo_frontend"] = True
     # The frontend reads `reasoning` as another name for `reasoning_content` and
     # refuses an echoed assistant turn that carries both, Gym's default.
@@ -2197,9 +2203,7 @@ def _build_gym_actor_config(
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
     dynamo_dialect = nemo_gym_dict.pop("dynamo_dialect", None)
     if dynamo_dialect is not None:
-        _apply_dynamo_dialect(
-            nemo_gym_dict, dynamo_dialect["default_chat_template_kwargs"]
-        )
+        _apply_dynamo_dialect(nemo_gym_dict, dynamo_dialect)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value
