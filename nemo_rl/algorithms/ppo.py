@@ -69,7 +69,11 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data.utils import (
+    extract_necessary_env_names,
+    load_dataloader_state,
+    save_dataloader_state,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     TOPO_RANK_UNKNOWN,
@@ -100,6 +104,7 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -131,6 +136,7 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.path_utils import path_exists
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.factory import (
@@ -377,6 +383,7 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+    configure_lora_refit(policy_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="ppo")
         vllm_config = cast(VllmConfig, generation_config)
@@ -2115,10 +2122,7 @@ def ppo_train(
                         )
                         value_model.finish_training()
 
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        save_dataloader_state(dataloader.state_dict(), checkpoint_path)
                         # The value worker finalizes its own write synchronously
                         # (blocking=True) inside save_checkpoint, so only the
                         # policy's async write needs to be awaited before rename.
@@ -2439,7 +2443,7 @@ def async_ppo_train(
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     if last_checkpoint_path is not None:
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
-        if os.path.exists(replay_buffer_path):
+        if path_exists(replay_buffer_path):
             print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
             restore_max_age = _async_ppo_buffer_max_age(
                 step=step,
@@ -3093,10 +3097,7 @@ def async_ppo_train(
                         dataloader_state = ray.get(
                             trajectory_collector.get_dataloader_state.remote()
                         )
-                        torch.save(
-                            dataloader_state,
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        save_dataloader_state(dataloader_state, checkpoint_path)
                         print("📦 Saving replay buffer state...")
                         num_buffered_trajectories = ray.get(
                             replay_buffer.save_to_path.remote(

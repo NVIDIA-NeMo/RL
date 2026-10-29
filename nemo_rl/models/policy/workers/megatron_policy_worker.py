@@ -69,6 +69,7 @@ from nemo_rl.data.multimodal_utils import (
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.experience.route_assembly import RouteLayout
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
@@ -104,8 +105,8 @@ from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_tensors_from_last_stage,
 )
 from nemo_rl.models.megatron.router_replay import (
-    router_replay_dimensions,
     router_replay_enabled,
+    router_replay_layout,
 )
 from nemo_rl.models.megatron.setup import (
     _distributed_timeout_minutes,
@@ -143,6 +144,7 @@ from nemo_rl.models.policy.utils import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
     get_runtime_env_for_policy_worker,
+    make_empty_cache_best_effort_under_expandable_segments,
     send_hf_buckets_via_ipc_actor_impl,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -160,6 +162,7 @@ from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.path_utils import maybe_enable_msc
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
@@ -720,9 +723,9 @@ class MegatronPolicyWorkerImpl(
             "pipeline_parallel": parallel_state.get_pipeline_model_parallel_rank(),
         }
 
-    def _routed_experts_dimensions(self) -> tuple[int, int]:
-        """Return route dimensions from the initialized Megatron model config."""
-        return router_replay_dimensions(self._get_model_config())
+    def _routed_experts_layout(self) -> RouteLayout:
+        """Return the route layout from the initialized Megatron model config."""
+        return router_replay_layout(self._get_model_config())
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
@@ -830,6 +833,10 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        # Resume loads from weights_path/optimizer_path during setup, before any
+        # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
+        maybe_enable_msc(weights_path, optimizer_path)
+        make_empty_cache_best_effort_under_expandable_segments()
         self.is_refit_destination = is_refit_destination
         self._bulk_refit_conversion_tasks: list[Any] = []
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
@@ -5024,6 +5031,8 @@ class MegatronPolicyWorkerImpl(
             raise RuntimeError(
                 "Megatron core state or model is not initialized. Cannot save checkpoint."
             )
+
+        maybe_enable_msc(weights_path)
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
         is_async = self.mcore_state.cfg.checkpoint.async_save

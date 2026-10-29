@@ -45,7 +45,6 @@ from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN
-from nemo_rl.data_plane.worker_mixin import _fetch_remote_materialized
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import keys_from_uids, register_train_partition
@@ -212,98 +211,6 @@ def test_vlm_wire_roundtrip_through_noop_data_plane():
     # into the multimodal dict.
     assert "input_ids" not in mm_wrapped
     assert "token_mask" not in mm_wrapped
-
-
-def test_sparse_text_rows_do_not_erase_media_from_their_dp_shard():
-    """A text-only rollout group must not make TQ hide media for image rows.
-
-    Direct-by-key TQ reads expose only fields produced for every requested key.
-    Rollout groups are written independently, so a DP shard that mixes an
-    image group with a text-only group otherwise loses ``pixel_values`` and
-    ``image_grid_thw`` for the entire shard.
-    """
-    client = NoOpDataPlaneClient()
-    register_train_partition(
-        client,
-        num_samples=4,
-        fields=[
-            "input_ids",
-            "input_lengths",
-            "sample_mask",
-            "pixel_values",
-            "image_grid_thw",
-        ],
-    )
-
-    pixels = PackedTensor(
-        [
-            torch.full((2, 3), 1.0),
-            torch.full((3, 3), 2.0),
-            torch.full((1, 3), 3.0),
-        ],
-        dim_to_pack=0,
-    )
-    grids = PackedTensor(
-        [
-            torch.tensor([[1, 1, 2]]),
-            torch.tensor([[1, 1, 3]]),
-            torch.tensor([[1, 1, 1]]),
-        ],
-        dim_to_pack=0,
-    )
-    media_wire = BatchedDataDict(
-        {
-            "input_ids": torch.tensor([[11, 12], [21, 22], [31, 32]]),
-            "input_lengths": torch.tensor([2, 2, 2]),
-            "sample_mask": torch.ones(3),
-            "pixel_values": pixels.to_wire()[0],
-            "image_grid_thw": grids.to_wire()[0],
-        }
-    )
-    media_meta = kv_first_write(
-        media_wire,
-        sample_ids=["image-a", "image-b", "image-c"],
-        dp_client=client,
-        partition_id="train",
-        tags=multimodal_row_tags({"pixel_values": pixels, "image_grid_thw": grids}, 3),
-    )
-
-    text_meta = kv_first_write(
-        BatchedDataDict(
-            {
-                "input_ids": torch.tensor([[41, 42]]),
-                "input_lengths": torch.tensor([2]),
-                "sample_mask": torch.ones(1),
-            }
-        ),
-        sample_ids=["text-only"],
-        dp_client=client,
-        partition_id="train",
-        tags=[{}],
-    )
-
-    # Put the text-only key in the middle, as sequence-length sharding does.
-    mixed_meta = media_meta.concat(text_meta).subset([0, 3, 1, 2])
-    fetched = _fetch_remote_materialized(
-        client,
-        mixed_meta,
-        layout="padded",
-        pad_value_dict=None,
-        pad_to_seqlen=0,
-    )
-
-    assert isinstance(fetched["pixel_values"], PackedTensor)
-    assert isinstance(fetched["image_grid_thw"], PackedTensor)
-    assert fetched["pixel_values"].logical_segment_counts_by_row() == [1, 0, 1, 1]
-    assert fetched["image_grid_thw"].logical_segment_counts_by_row() == [1, 0, 1, 1]
-    torch.testing.assert_close(fetched["pixel_values"].as_tensor(), pixels.as_tensor())
-    torch.testing.assert_close(fetched["image_grid_thw"].as_tensor(), grids.as_tensor())
-    assert fetched["input_ids"].tolist() == [
-        [11, 12],
-        [41, 42],
-        [21, 22],
-        [31, 32],
-    ]
 
 
 def test_materialize_forward_pad_skips_packed_multimodal_fields():

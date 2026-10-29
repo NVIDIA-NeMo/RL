@@ -101,8 +101,16 @@ from nemo_rl.algorithms.grpo import (
     aggregate_rollout_metrics,
 )
 from nemo_rl.algorithms.metric_utils import (
+    ROLLOUT_CHECKPOINT_ATTEMPT_DURATION_KEY,
+    ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
+    ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
+    ROLLOUT_CHECKPOINT_OUTCOME_PREFIX,
+    ROLLOUT_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_KEY,
     SETUP_TIMING_PREFIX,
+    RolloutCheckpointAttemptOutcome,
+    RolloutCheckpointAttemptReason,
     SetupTimingMetrics,
+    rollout_checkpoint_reason_key,
 )
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
@@ -119,14 +127,14 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
 )
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    ChunkReceipt,
+    make_debug_writer,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
-    ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
-    ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
     BootstrapCompatibilityIdentity,
-    RolloutCheckpointAttemptOutcome,
-    RolloutCheckpointAttemptReason,
     RolloutSnapshotManifest,
     commit_snapshot,
     ensure_bootstrap_anchor,
@@ -144,6 +152,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data.utils import save_dataloader_state
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
     KVBatchMeta,
@@ -212,18 +221,26 @@ from nemo_rl.telemetry.setup import (
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vocabulary import (
+    TELEMETRY_TRAIN_STEP_KEY,
+    TELEMETRY_WALL_TIME_METRIC,
+)
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     PathLike,
 )
 from nemo_rl.utils.logger import (
-    TELEMETRY_WALL_TIME_METRIC,
     Logger,
     should_log_nemo_gym_full_result_tables,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.path_utils import (
+    is_msc_path,
+    load_checkpoint_object,
+    path_exists,
+    save_checkpoint_object,
+)
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -628,7 +645,15 @@ class SingleControllerActor:
             min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
         )
         restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
-        if restored_dispatch_index is None:
+        # The saved dispatch index counts groups dispatched ahead of training, which
+        # only a data-plane snapshot can give back. Without one (e.g. msc://), those
+        # groups are gone, so counting them as dispatched would stall the resume.
+        buffered_groups_not_restored = (
+            self._sampler.supports_buffer_checkpoint
+            and actor_args.last_checkpoint_path is not None
+            and data_plane_checkpoint_metadata is None
+        )
+        if restored_dispatch_index is None or buffered_groups_not_restored:
             # Checkpoints predating exact sampler state reconstruct the original
             # fresh-step invariant from the restored trainer version.
             self._sampler.set_dispatch_index(restored_trainer_version)
@@ -638,6 +663,9 @@ class SingleControllerActor:
             self._master_config.checkpointing["enabled"]
             and self._sampler.supports_buffer_checkpoint
             and not self._master_config.checkpointing.get("save_data_plane")
+            # msc:// cannot hold data-plane snapshots; setup warns that buffered
+            # rollouts are then discarded on resume.
+            and not is_msc_path(self._master_config.checkpointing["checkpoint_dir"])
         ):
             raise ValueError(
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -759,12 +787,12 @@ class SingleControllerActor:
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
         self._train_data_dump = (
-            TrainDataDump(self._logger.base_log_dir)
+            make_debug_writer(self._async_cfg.debug_writer, self._logger.base_log_dir)
             if self._async_cfg.log_full_train_data
             else None
         )
-        # Rows the stage reported writing this step, across every shard.
-        self._train_data_dump_rows = 0
+        # Receipts of the chunks the stage stored this step, across every shard.
+        self._train_data_dump_receipts: list[ChunkReceipt] = []
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -923,6 +951,11 @@ class SingleControllerActor:
                 except Exception as error:
                     print(f"finalizer actor termination failed: {error}", flush=True)
             await stop_storage_units(self._storage_units)
+            if self._train_data_dump is not None:
+                try:
+                    await asyncio.to_thread(self._train_data_dump.close)
+                except Exception as e:  # teardown must not mask the original failure
+                    print(f"Error during debug-writer close: {e}", flush=True)
             try:
                 self._weight_synchronizer.shutdown()
             except Exception as e:  # teardown must not mask the original failure
@@ -958,7 +991,7 @@ class SingleControllerActor:
         try:
             wall_time_ns = time.time_ns()
             event_metrics = dict(metrics)
-            event_metrics["train_step"] = float(step)
+            event_metrics[TELEMETRY_TRAIN_STEP_KEY] = float(step)
             event_metrics[TELEMETRY_WALL_TIME_METRIC] = wall_time_ns / 1_000_000_000
             self._logger.log_metrics(
                 event_metrics,
@@ -1699,12 +1732,12 @@ class SingleControllerActor:
         # Absent for every run that never diverted a batch, which is every run that
         # does not use "replace" -- so silence here rather than the buffer restore's
         # warning, since this is the ordinary case rather than a lost artifact.
-        if not os.path.exists(reserve_path):
+        if not path_exists(reserve_path):
             return
         # weights_only=False: spares are pickled DatumSpecs, and the checkpoint is a
         # trusted same-job artifact (the replay buffer restore loads on the same terms).
         reserve_state = await asyncio.to_thread(
-            torch.load, reserve_path, weights_only=False
+            load_checkpoint_object, reserve_path, weights_only=False
         )
         self._replacement_reserve.extend(reserve_state)
         print(
@@ -1992,6 +2025,11 @@ class SingleControllerActor:
                             finalized.group_min_wv,
                             finalized.group_max_wv,
                             staging_keys=finalized.staging_keys,
+                            extra_env_info=(
+                                {"agent_ref": {"name": request.resolved_agent_name}}
+                                if request.resolved_agent_name is not None
+                                else None
+                            ),
                         )
                     except BaseException as commit_error:
                         try:
@@ -3648,9 +3686,9 @@ class SingleControllerActor:
                         await asyncio.to_thread(
                             self._train_data_dump.finish_step,
                             self._train_steps,
-                            self._train_data_dump_rows,
+                            self._train_data_dump_receipts,
                         )
-                    self._train_data_dump_rows = 0
+                    self._train_data_dump_receipts = []
 
                 if not early_refit_done:
                     self._trainer_version += 1
@@ -3833,6 +3871,10 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
+            # min sample version refers to the version each consumed sample was
+            # generated with; lag = training version - oldest sample version.
+            lag = version_during_step - min_sample_version  # type: ignore
+            step_metrics["weight_version_lag"] = lag
             # TODO: vllm metrics logger,
             #   histogram log, pretty-print "Training Results" block,
             #   print_performance_metrics.
@@ -3859,9 +3901,6 @@ class SingleControllerActor:
             )
             self._timer.reset()
 
-            # min sample version refers to the version each consumed sample was
-            # generated with; lag = training version - oldest sample version.
-            lag = version_during_step - min_sample_version  # type: ignore
             print(
                 f"train step {self._train_steps}/{self._algo_cfg.max_num_steps}  "
                 f"trainer_v={self._trainer_version}  "
@@ -4859,13 +4898,13 @@ class SingleControllerActor:
         """Record every scheduled checkpoint attempt, including no-op cuts."""
         metrics = {
             "attempt": 1.0,
-            "attempt_duration_seconds": attempt_duration_seconds,
+            ROLLOUT_CHECKPOINT_ATTEMPT_DURATION_KEY: attempt_duration_seconds,
             "configured_interval_seconds": float(
                 self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
                 or 0.0
             ),
             **{
-                f"reason_{candidate}": float(reason == candidate)
+                rollout_checkpoint_reason_key(candidate): float(reason == candidate)
                 for candidate in ROLLOUT_CHECKPOINT_ATTEMPT_REASONS
             },
             **{
@@ -4881,13 +4920,13 @@ class SingleControllerActor:
                 )
             self._last_successful_rollout_checkpoint_time = completed_at
         elif self._last_successful_rollout_checkpoint_time is not None:
-            metrics["seconds_since_last_success"] = (
+            metrics[ROLLOUT_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_KEY] = (
                 completed_at - self._last_successful_rollout_checkpoint_time
             )
         self._log_telemetry_metrics(
             metrics,
             step=self._train_steps,
-            prefix="rollout/checkpoint_outcome",
+            prefix=ROLLOUT_CHECKPOINT_OUTCOME_PREFIX,
         )
 
     async def _rollout_checkpoint_pump(self) -> None:
@@ -5318,19 +5357,17 @@ class SingleControllerActor:
         )
 
         await asyncio.to_thread(
-            torch.save,
-            dataloader_state,
-            os.path.join(checkpoint_path, "train_dataloader.pt"),
+            save_dataloader_state, dataloader_state, checkpoint_path
         )
         if reserve_state:
             await asyncio.to_thread(
-                torch.save,
+                save_checkpoint_object,
                 reserve_state,
                 os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
             )
         if replay_metadata is not None:
             await asyncio.to_thread(
-                torch.save,
+                save_checkpoint_object,
                 replay_metadata,
                 os.path.join(checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME),
             )
@@ -5791,7 +5828,8 @@ class SingleControllerActor:
             self._timer.record(
                 "train_data_dump", outcome.train_data_dump_s, should_log=False
             )
-        self._train_data_dump_rows += outcome.train_data_dump_rows
+        if outcome.train_data_dump_receipt is not None:
+            self._train_data_dump_receipts.append(outcome.train_data_dump_receipt)
 
     # ── utility helpers ────────────────────────────────────────────────────
 
