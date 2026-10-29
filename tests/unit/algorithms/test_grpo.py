@@ -9489,3 +9489,130 @@ def test_trainers_never_let_over_length_prompts_vote(
     counterfactual = all_rows[response] / all_rows[response].var(correction=0).sqrt()
     assert counterfactual.abs().max().item() == pytest.approx(2.236, abs=1e-3)
     assert not torch.allclose(counterfactual[:2], advantages[0][response[0]])
+
+
+def _ds_round(tag: str, rewards: list[float]):
+    """One stubbed ``rollout_to_tq`` return: a single prompt group of ``len(rewards)`` rows."""
+    n = len(rewards)
+    meta = KVBatchMeta(
+        sample_ids=[f"{tag}_g{i}" for i in range(n)],
+        partition_id="train",
+        task_name="train",
+        fields=["input_ids"],
+        tags=[{GROUP_ID_TAG: tag} for _ in range(n)],
+    )
+    carry = BatchedDataDict(
+        {
+            "total_reward": torch.tensor(rewards),
+            # The driver groups rows by prompt ids here and by GROUP_ID_TAG on
+            # newer main; both are set so the test reads the same either way.
+            "prompt_ids_for_adv": torch.tensor([[1, 2, 3]] * n),
+            "input_lengths": torch.tensor([4] * n),
+            "loss_multiplier": torch.ones(n),
+            "truncated": torch.tensor([False] * n),
+            "length": torch.tensor([3] * n),
+        }
+    )
+    rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    return meta, carry, rollout_metrics, {}
+
+
+def test_grpo_train_sync_jsonl_rewards_are_the_trained_rows_under_dynamic_sampling(
+    mock_grpo_components,
+):
+    """Under dynamic sampling the jsonl ``rewards`` column must be the trained rows'.
+
+    Round 1 is a zero-variance group (rewards [1, 1]) that dynamic sampling
+    drops; round 2 ([0, 1]) is kept and trained. The pre-filter aggregate that
+    feeds ``metrics["reward"]`` is ``cat([1, 1], [0, 1])[:2] == [1, 1]`` --
+    same length as the trained batch, so a misrouted tensor is not caught by
+    ``log_batched_dict_as_jsonl``. The dump must carry ``[0, 1]`` while the
+    aggregate metric keeps its pre-filter population. The helper-level test in
+    ``tests/unit/data_plane/test_sync_one_hop.py`` cannot see which tensor the
+    trainer hands the helper; this one drives ``grpo_train_sync`` itself.
+    """
+    policy = mock_grpo_components["policy"]
+    logger = mock_grpo_components["logger"]
+    cfg = mock_grpo_components["master_config"]
+    cfg.data_plane = {"enabled": True}
+    cfg.grpo.max_num_steps = 1
+    cfg.grpo.val_period = 0
+    cfg.grpo.val_at_start = False
+    cfg.grpo.val_at_end = False
+    cfg.grpo.use_dynamic_sampling = True
+    cfg.grpo.num_prompts_per_step = 1
+    cfg.grpo.num_generations_per_prompt = 2
+    cfg.grpo.dynamic_sampling_max_gen_batches = 3
+
+    rounds = [_ds_round("dropped", [1.0, 1.0]), _ds_round("trained", [0.0, 1.0])]
+    # Two trained rows: widen the harness' one-row per-token stubs.
+    dp_bank = {
+        "generation_logprobs": torch.zeros(2, 4),
+        "token_mask": torch.ones(2, 4),
+        "prev_logprobs": torch.zeros(2, 4),
+        "reference_policy_logprobs": torch.zeros(2, 4),
+        "input_ids": torch.ones(2, 4, dtype=torch.long),
+    }
+
+    with mock_sync_grpo_infrastructure(policy):
+        import nemo_rl.algorithms.grpo_sync as grpo_sync_mod
+
+        actor = grpo_sync_mod.SyncRolloutActor.options.return_value.remote.return_value
+        actor.rollout_to_tq.remote.side_effect = rounds
+        policy.read_from_dataplane.side_effect = lambda meta, select_fields, **kw: (
+            BatchedDataDict({k: dp_bank[k].clone() for k in select_fields})
+        )
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo_sync._compute_seq_logprob_error_metrics",
+                return_value=(torch.ones(2), _mock_seq_logprob_error_result()),
+            ),
+            patch("nemo_rl.algorithms.grpo_sync._create_advantage_estimator") as mk_adv,
+            patch("nemo_rl.algorithms.grpo_sync.validate_sync", return_value=({}, {})),
+        ):
+            mk_adv.return_value.compute_advantage.return_value = torch.zeros(2, 4)
+            grpo_train_sync(
+                policy,
+                _mock_policy_generation(),
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                logger,
+                mock_grpo_components["checkpointer"],
+                _initial_grpo_save_state(),
+                cfg,
+            )
+
+    assert actor.rollout_to_tq.remote.call_count == 2, (
+        "dynamic sampling did not resample"
+    )
+
+    dumps = [
+        c.args
+        for c in logger.log_batched_dict_as_jsonl.call_args_list
+        if c.args[1].startswith("train_data_step")
+    ]
+    assert len(dumps) == 1, [
+        c.args[1] for c in logger.log_batched_dict_as_jsonl.call_args_list
+    ]
+    log_data, _ = dumps[0]
+    assert log_data["rewards"] == [0.0, 1.0], log_data["rewards"]
+    assert log_data["filtered_rewards"] == [0.0, 1.0]
+    assert len(log_data["rewards"]) == len(log_data["input_lengths"]) == 2
+
+    # The aggregate metric keeps its pre-filter population: mean([1, 1]) vs mean([0, 1]).
+    step_metrics = [
+        c.args[0]
+        for c in logger.log_metrics.call_args_list
+        if c.kwargs.get("prefix") == "train" and "filtered_reward" in c.args[0]
+    ]
+    assert step_metrics, [c.kwargs for c in logger.log_metrics.call_args_list]
+    assert step_metrics[-1]["reward"] == pytest.approx(1.0)
+    assert step_metrics[-1]["filtered_reward"] == pytest.approx(0.5)
