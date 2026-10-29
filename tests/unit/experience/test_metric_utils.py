@@ -19,6 +19,7 @@ import statistics
 
 import pytest
 
+from nemo_rl.algorithms.grpo import aggregate_rollout_metrics
 from nemo_rl.experience.metric_utils import (
     Metric,
     RolloutTelemetry,
@@ -170,6 +171,27 @@ def test_native_adapter_retains_old_scalar_rules_and_pools_distributions() -> No
 def test_native_adapter_rejects_scalar_histograms(name: str) -> None:
     with pytest.raises(TypeError, match="must contain a list"):
         metrics_from_plain({name: 3.0})
+
+
+@pytest.mark.parametrize(
+    "name", ["total_reward/std_in_group", "reward_score_raw/std_in_group"]
+)
+def test_adapter_preserves_v1_group_reward_statistics(name: str) -> None:
+    values = [1.0, 3.0, 9.0]
+    declared = [metrics_from_plain({name: value}) for value in values]
+    assert reduce_step(declared) == aggregate_rollout_metrics({name: values})
+    assert reduce_step(declared)[f"{name}/p05"] == pytest.approx(1.2)
+    assert reduce_step(declared)[f"{name}/p95"] == pytest.approx(8.4)
+    snapshot = RolloutTelemetry.from_metrics("agent", declared[0])
+    assert RolloutTelemetry.from_state(snapshot.to_state()) == snapshot
+
+
+def test_adapter_pools_new_histogram_lower_percentile() -> None:
+    groups = [
+        metrics_from_plain({"tokens/histogram": values, "tokens/p05": min(values)})
+        for values in ([1, 2], [50, 100])
+    ]
+    assert reduce_step(groups)["tokens/p05"] == 1
 
 
 def test_optional_fields_include_empty_groups_without_other_environments() -> None:
