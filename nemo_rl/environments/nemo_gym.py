@@ -104,6 +104,7 @@ from nemo_rl.environments.utils import (
 )
 from nemo_rl.experience.failures import (
     GymAdmissionClosed,
+    GymRowFailure,
     GymTransportError,
     RolloutDataFailure,
     http_status_is_infra,
@@ -1292,6 +1293,7 @@ Depending on your data shape, you may want to change these values."""
         checkpoint_root: str,
         episodes: tuple[GymCheckpointEpisode, ...],
         *,
+        participants: tuple[str, ...],
         source_checkpoint_id: str,
         deadline_ts: float,
     ) -> None:
@@ -1300,6 +1302,7 @@ Depending on your data shape, you may want to change these values."""
             checkpoint_id,
             checkpoint_root,
             episodes,
+            participants=participants,
             source_checkpoint_id=source_checkpoint_id,
             deadline_ts=deadline_ts,
         )
@@ -1395,7 +1398,9 @@ Depending on your data shape, you may want to change these values."""
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
         per_prompt: bool = False,
-    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None] | GymAdmissionClosed, None]:
+    ) -> AsyncGenerator[
+        tuple[int, dict, dict, dict | None] | GymAdmissionClosed | GymRowFailure, None
+    ]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete.
 
         A thin span-opening wrapper over :meth:`_stream_rollouts`, which holds
@@ -1428,7 +1433,8 @@ Depending on your data shape, you may want to change these values."""
             ``timing_metrics`` is ``None`` on every tuple but the last, which
             carries the batch totals. A row Gym refused because a checkpoint
             had admission closed is yielded as a ``GymAdmissionClosed``
-            naming its ``rowidx`` instead of a tuple.
+            naming its ``rowidx`` instead of a tuple, and a row whose ``/run``
+            failed as a ``GymRowFailure``, so the other rows keep streaming.
         """
         attributes = {"rl.gym.batch_size": len(nemo_gym_examples)}
         # Two branches rather than a group variable, so the drift test can read
@@ -1463,7 +1469,9 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
-    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None] | GymAdmissionClosed, None]:
+    ) -> AsyncGenerator[
+        tuple[int, dict, dict, dict | None] | GymAdmissionClosed | GymRowFailure, None
+    ]:
         """Body of :meth:`run_rollouts`; see there for the tracing wrapper."""
         self._require_spinup()
         if not nemo_gym_examples:
@@ -1557,7 +1565,6 @@ Depending on your data shape, you may want to change these values."""
                         nemo_gym_result.get("_ng_failure_response_body"),
                         file=sys.stderr,
                     )
-                    raise failure
 
             if isinstance(failure, GymAdmissionClosed):
                 # Yielded, not raised: rows Gym admitted before the checkpoint
@@ -1566,6 +1573,15 @@ Depending on your data shape, you may want to change these values."""
                 yield GymAdmissionClosed(
                     failure.detail,
                     failure.rowidx,
+                    finish_row(nemo_gym_row["agent_ref"]["name"]),
+                )
+                continue
+            if failure is not None:
+                # Yielded, not raised, for the same reason: the other rows'
+                # /runs keep going in Gym, so they keep streaming too.
+                yield GymRowFailure(
+                    nemo_gym_row["_rowidx"],
+                    failure,
                     finish_row(nemo_gym_row["agent_ref"]["name"]),
                 )
                 continue
