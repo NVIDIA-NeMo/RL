@@ -32,6 +32,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
@@ -56,7 +57,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, GROUP_TOKEN_MEAN_WEIGHT
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
@@ -73,6 +74,7 @@ def _config(**overrides) -> AdvantageStageConfig:
         opd_full_enabled=False,
         message_level_advantage_penalties_enabled=False,
         shardable=True,
+        objective_reduction=make_objective_reduction("global_token_mean"),
         train_data_dump_dir=None,
     )
     base.update(overrides)
@@ -621,6 +623,7 @@ def _controller(
     dump_dir: str | None = None,
     opd_full_enabled: bool = False,
     seq_logprob_error_threshold: float | None = None,
+    group_token_mean: bool = False,
 ):
     """Build the controller stub _advantage_stage needs, and nothing more.
 
@@ -652,6 +655,9 @@ def _controller(
         opd_full_enabled=opd_full_enabled,
         message_level_advantage_penalties_enabled=False,
         shardable=estimator_name in SHARD_INVARIANT_ESTIMATORS,
+        objective_reduction=make_objective_reduction(
+            "group_token_mean" if group_token_mean else "global_token_mean"
+        ),
         train_data_dump_dir=dump_dir,
     )
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
@@ -780,6 +786,35 @@ def test_opd_normalization_gap_and_tokenless_rows_match_across_shards(
             torch.testing.assert_close(local, sharded)
         else:
             assert local == pytest.approx(sharded)
+
+
+def test_group_token_mean_weights_use_complete_groups_and_final_masks() -> None:
+    rows = _rows()
+    rows["s0"]["mask_sample"] = torch.tensor(True)
+    rows["s1"]["token_mask"][2:] = 0
+    # The last group has no surviving response and must carry no group mass.
+    for index in range((NUM_GROUPS - 1) * GROUP_SIZE, NUM_GROUPS * GROUP_SIZE):
+        rows[f"s{index}"]["sample_mask"] = torch.tensor(0.0)
+    store = _RowStore(rows)
+    ctrl = _controller("grpo", 3, store, group_token_mean=True)
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    for group in range(NUM_GROUPS):
+        siblings = [
+            rows[f"s{group * GROUP_SIZE + member}"] for member in range(GROUP_SIZE)
+        ]
+        total_tokens = sum(
+            row["token_mask"][1:].sum() * row["sample_mask"] for row in siblings
+        )
+        expected = 1.0 / total_tokens if total_tokens > 0 else 0.0
+        for row in siblings:
+            assert row[GROUP_TOKEN_MEAN_WEIGHT].item() == pytest.approx(float(expected))
+            assert row[GROUP_TOKEN_MEAN_WEIGHT].dtype == torch.float32
+
+    incomplete = _pool_meta()
+    incomplete.sample_ids.pop()
+    incomplete.tags.pop()
+    with pytest.raises(ValueError, match="incomplete group"):
+        asyncio.run(ctrl._advantage_stage(incomplete))
 
 
 @pytest.mark.parametrize("num_actors", [0, 3])

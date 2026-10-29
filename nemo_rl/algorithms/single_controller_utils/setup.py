@@ -58,7 +58,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
@@ -346,6 +346,12 @@ def _register_single_controller_partitions(
             DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
+    # Reducers declare their columns before any producer can publish values.
+    partition_fields.extend(
+        make_objective_reduction(
+            master_config.loss_fn.resolved_normalization
+        ).extra_fields
+    )
     if include_multimodal_fields:
         partition_fields.extend(
             field

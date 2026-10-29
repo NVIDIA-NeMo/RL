@@ -22,6 +22,7 @@ hour three of a run.
 
 import warnings
 from typing import get_args
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
@@ -39,7 +40,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     WatchdogConfig,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    _build_retry_policy,
+    setup_single_controller,
+)
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
@@ -97,6 +101,19 @@ def test_single_forward_threshold_rejected_before_streaming_setup(
         cfg.grpo = None
     with pytest.raises(ValueError, match="advantage baselines"):
         validate_single_controller_config(cfg)
+
+
+def test_group_token_mean_requires_megatron_before_setup() -> None:
+    cfg = _master_config()
+    cfg.loss_fn.normalization = "group_token_mean"
+    cfg.policy["megatron_cfg"] = {"enabled": True}
+    validate_single_controller_config(cfg)
+    cfg.policy["megatron_cfg"]["enabled"] = False
+    # Missing setup fields must not hide this compatibility error.
+    with pytest.raises(
+        ValueError, match="group_token_mean requires SingleController GRPO"
+    ):
+        setup_single_controller(cfg, MagicMock(pad_token_id=0))
 
 
 class TestDefaultsAreInert:

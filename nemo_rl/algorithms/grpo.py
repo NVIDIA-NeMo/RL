@@ -46,7 +46,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, make_objective_reduction
 from nemo_rl.algorithms.metric_utils import (
     GRAD_NORM_KEY,
     LOSS_KEY,
@@ -565,10 +565,13 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
             "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
         )
     loss = master_config.loss_fn
-    if not loss.force_on_policy_ratio or not loss.token_level_loss:
+    if (
+        not loss.force_on_policy_ratio
+        or loss.resolved_normalization != "global_token_mean"
+    ):
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
-            "and token_level_loss=true"
+            "and normalization=global_token_mean (legacy token_level_loss=true)"
         )
     if master_config.grpo.adv_estimator.name != "grpo" or loss.use_kl_in_reward:
         raise ValueError(
@@ -699,6 +702,13 @@ def setup(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     loss_config: ClippedPGLossConfig = master_config.loss_fn
+    megatron_cfg = policy_config.get("megatron_cfg")
+    make_objective_reduction(loss_config.resolved_normalization).validate_setup(
+        trainer="grpo",
+        algorithm="grpo",
+        megatron_enabled=megatron_cfg is not None and megatron_cfg["enabled"],
+        on_policy_distillation=opd_module.is_opd_enabled(master_config),
+    )
     env_configs = master_config.env
     data_config = master_config.data
     grpo_config = master_config.grpo

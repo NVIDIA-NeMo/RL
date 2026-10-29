@@ -13,10 +13,13 @@
 # limitations under the License.
 
 import enum
-from typing import Any, Protocol
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, ClassVar, Protocol
 
 import torch
 
+from nemo_rl.data_plane.schema import GROUP_TOKEN_MEAN_WEIGHT
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -41,13 +44,358 @@ class MetricNormalizer(enum.Enum):
     from the same flags that pick the denominators, so it lives next to the
     metric definitions instead of in a consumer-side table. Metrics absent
     from the mapping fall back to the gradient normalization (the
-    ``loss_type`` denominator) in split-API trainers. Survivor rescaling only
+    objective denominator) in split-API trainers. Survivor rescaling only
     changes advertised denominators and leaves unadvertised metrics unchanged.
     """
 
     TOKENS = "tokens"  # divided by global_valid_toks
     SEQUENCES = "sequences"  # divided by global_valid_seqs
     NONE = "none"  # not normalized: raw counts, local means, min/max
+
+
+@dataclass(frozen=True)
+class ObjectiveReduction:
+    """Own the objective formula and its independently accumulated denominator."""
+
+    loss_type: ClassVar[LossType]
+    metric_normalizer: ClassVar[MetricNormalizer]
+    requires_explicit_denominator: ClassVar[bool] = False
+    token_normalized: ClassVar[bool] = False
+    extra_fields: ClassVar[tuple[str, ...]] = ()
+
+    def prepare_batch(
+        self,
+        *,
+        sample_ids: Sequence[str],
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        group_indices: torch.Tensor,
+        expected_group_size: int | None,
+    ) -> dict[str, torch.Tensor]:
+        """Prepare declared fields while final masks and complete groups coexist."""
+        return {}
+
+    def validate_setup(
+        self,
+        *,
+        trainer: str,
+        algorithm: str,
+        megatron_enabled: bool,
+        on_policy_distillation: bool,
+    ) -> None:
+        """Validate the execution path before model construction."""
+
+    def validate_loss_options(
+        self,
+        *,
+        sequence_level_importance_ratios: bool,
+        opd_full: bool,
+        positive_example_nll_weight: float,
+        seq_logprob_error_in_loss: bool,
+    ) -> None:
+        """Validate loss options that could change the reduction's meaning."""
+
+    def per_response_weights(
+        self, data: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor | None:
+        """Return one weight per unpacked response ([B]), or None."""
+        return None
+
+    def local_counts(
+        self, data: Mapping[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Count sequence, token and objective mass before packing/CP splitting."""
+        sample_mask = data["sample_mask"].float()
+        if "token_mask" in data:
+            valid_tokens_per_response = (
+                data["token_mask"][:, 1:].sum(-1, dtype=torch.float32) * sample_mask
+            )
+        else:
+            # Preserve legacy losses that count every input position without a mask.
+            valid_tokens_per_response = sample_mask * data["input_ids"].shape[1]
+        sequence_count = sample_mask.sum()
+        token_count = valid_tokens_per_response.sum()
+        contribution = self.denominator_contribution(
+            data,
+            valid_tokens_per_response=valid_tokens_per_response,
+            sequence_count=sequence_count,
+            token_count=token_count,
+        )
+        return sequence_count, token_count, contribution
+
+    def denominator_contribution(
+        self,
+        data: Mapping[str, torch.Tensor],
+        *,
+        valid_tokens_per_response: torch.Tensor,
+        sequence_count: torch.Tensor,
+        token_count: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a scalar contribution to sum across chunks and DP ranks."""
+        raise NotImplementedError
+
+    def loss_divisor(
+        self,
+        *,
+        global_valid_toks: torch.Tensor,
+        global_valid_seqs: torch.Tensor,
+        global_objective_denominator: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return this call's scalar divisor; streaming supplies one."""
+        raise NotImplementedError
+
+    def reduce(
+        self,
+        values: torch.Tensor,
+        *,
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        mask: torch.Tensor,
+        denominator: torch.Tensor,
+        per_response_weights: torch.Tensor | None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class GlobalTokenMeanReduction(ObjectiveReduction):
+    """Sum valid token losses and divide by total valid token mass."""
+
+    loss_type: ClassVar[LossType] = LossType.TOKEN_LEVEL
+    metric_normalizer: ClassVar[MetricNormalizer] = MetricNormalizer.TOKENS
+    token_normalized: ClassVar[bool] = True
+
+    def denominator_contribution(
+        self,
+        data: Mapping[str, torch.Tensor],
+        *,
+        valid_tokens_per_response: torch.Tensor,
+        sequence_count: torch.Tensor,
+        token_count: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a scalar contribution to sum across chunks and DP ranks."""
+        return token_count
+
+    def loss_divisor(
+        self,
+        *,
+        global_valid_toks: torch.Tensor,
+        global_valid_seqs: torch.Tensor,
+        global_objective_denominator: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return this call's scalar divisor; streaming supplies one."""
+        return global_valid_toks
+
+    def reduce(
+        self,
+        values: torch.Tensor,
+        *,
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        mask: torch.Tensor,
+        denominator: torch.Tensor,
+        per_response_weights: torch.Tensor | None,
+    ) -> torch.Tensor:
+        # Keep the interface importable without the optional tokenizer dependencies.
+        from nemo_rl.algorithms.utils import masked_mean
+
+        return masked_mean(values, mask, global_normalization_factor=denominator)
+
+
+@dataclass(frozen=True)
+class SequenceMeanReduction(ObjectiveReduction):
+    """Average tokens within each response, then average weighted responses."""
+
+    loss_type: ClassVar[LossType] = LossType.SEQUENCE_LEVEL
+    metric_normalizer: ClassVar[MetricNormalizer] = MetricNormalizer.SEQUENCES
+
+    def denominator_contribution(
+        self,
+        data: Mapping[str, torch.Tensor],
+        *,
+        valid_tokens_per_response: torch.Tensor,
+        sequence_count: torch.Tensor,
+        token_count: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a scalar contribution to sum across chunks and DP ranks."""
+        return sequence_count
+
+    def loss_divisor(
+        self,
+        *,
+        global_valid_toks: torch.Tensor,
+        global_valid_seqs: torch.Tensor,
+        global_objective_denominator: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return this call's scalar divisor; streaming supplies one."""
+        return global_valid_seqs
+
+    def reduce(
+        self,
+        values: torch.Tensor,
+        *,
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        mask: torch.Tensor,
+        denominator: torch.Tensor,
+        per_response_weights: torch.Tensor | None,
+    ) -> torch.Tensor:
+        # Keep the interface importable without the optional tokenizer dependencies.
+        from nemo_rl.algorithms.utils import masked_mean
+
+        # Keep sample weights outside the inner mean so fractional weights survive.
+        return masked_mean(
+            masked_mean(values, token_mask, dim=-1),
+            sample_mask,
+            global_normalization_factor=denominator,
+        )
+
+
+@dataclass(frozen=True)
+class GroupTokenMeanReduction(GlobalTokenMeanReduction):
+    """Average valid tokens within each prompt group, then average groups equally."""
+
+    requires_explicit_denominator: ClassVar[bool] = True
+    token_normalized: ClassVar[bool] = False
+    extra_fields: ClassVar[tuple[str, ...]] = (GROUP_TOKEN_MEAN_WEIGHT,)
+
+    def validate_setup(
+        self,
+        *,
+        trainer: str,
+        algorithm: str,
+        megatron_enabled: bool,
+        on_policy_distillation: bool,
+    ) -> None:
+        if (
+            trainer != "single_controller"
+            or algorithm != "grpo"
+            or not megatron_enabled
+            or on_policy_distillation
+        ):
+            raise ValueError(
+                "group_token_mean requires SingleController GRPO with "
+                "on_policy_distillation.enabled=false and policy.megatron_cfg.enabled=true."
+            )
+
+    def validate_loss_options(
+        self,
+        *,
+        sequence_level_importance_ratios: bool,
+        opd_full: bool,
+        positive_example_nll_weight: float,
+        seq_logprob_error_in_loss: bool,
+    ) -> None:
+        if sequence_level_importance_ratios:
+            raise ValueError(
+                "group_token_mean requires sequence_level_importance_ratios=False"
+            )
+        if opd_full or positive_example_nll_weight != 0:
+            raise ValueError("group_token_mean does not support OPD-full or NLL")
+        if seq_logprob_error_in_loss:
+            raise ValueError(
+                "group_token_mean requires masks finalized before training"
+            )
+
+    def prepare_batch(
+        self,
+        *,
+        sample_ids: Sequence[str],
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        group_indices: torch.Tensor,
+        expected_group_size: int | None,
+    ) -> dict[str, torch.Tensor]:
+        # The numerical helper also imports the reduction interfaces.
+        from nemo_rl.algorithms.loss.utils import group_token_mean_weights
+
+        return {
+            GROUP_TOKEN_MEAN_WEIGHT: group_token_mean_weights(
+                sample_ids,
+                token_mask,
+                sample_mask,
+                group_indices=group_indices,
+                expected_group_size=expected_group_size,
+            )
+        }
+
+    def per_response_weights(self, data: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Return each response's inverse group-token mass, shape [B]."""
+        weights = data[GROUP_TOKEN_MEAN_WEIGHT]
+        if weights.ndim != 1 or weights.shape != data["sample_mask"].shape:
+            raise ValueError(
+                f"{GROUP_TOKEN_MEAN_WEIGHT} row weights must match sample_mask[B]"
+            )
+        return weights.float()
+
+    def denominator_contribution(
+        self,
+        data: Mapping[str, torch.Tensor],
+        *,
+        valid_tokens_per_response: torch.Tensor,
+        sequence_count: torch.Tensor,
+        token_count: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return this batch's scalar share of complete nonempty groups."""
+        return (valid_tokens_per_response * self.per_response_weights(data)).sum()
+
+    def loss_divisor(
+        self,
+        *,
+        global_valid_toks: torch.Tensor,
+        global_valid_seqs: torch.Tensor,
+        global_objective_denominator: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return this call's scalar divisor; streaming supplies one."""
+        if global_objective_denominator is None:
+            raise ValueError(
+                "group_token_mean requires the split training path or an explicit "
+                "global_objective_denominator"
+            )
+        return global_objective_denominator
+
+    def reduce(
+        self,
+        values: torch.Tensor,
+        *,
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        mask: torch.Tensor,
+        denominator: torch.Tensor,
+        per_response_weights: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert per_response_weights is not None
+        return super().reduce(
+            values * per_response_weights.unsqueeze(-1),
+            token_mask=token_mask,
+            sample_mask=sample_mask,
+            mask=mask,
+            denominator=denominator,
+            per_response_weights=None,
+        )
+
+
+def make_objective_reduction(normalization: str) -> ObjectiveReduction:
+    """Resolve the configured formula once, before training."""
+    if normalization == "global_token_mean":
+        return GlobalTokenMeanReduction()
+    if normalization == "sequence_mean":
+        return SequenceMeanReduction()
+    if normalization == "group_token_mean":
+        return GroupTokenMeanReduction()
+    raise ValueError(f"Unsupported loss normalization: {normalization}")
+
+
+def get_objective_reduction(loss_fn: "LossFunction") -> ObjectiveReduction:
+    """Use the explicit reducer, falling back to the legacy LossType contract."""
+    reduction = getattr(loss_fn, "objective_reduction", None)
+    if isinstance(reduction, ObjectiveReduction):
+        return reduction
+
+    legacy_loss_type = getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL)
+    if legacy_loss_type == LossType.SEQUENCE_LEVEL:
+        return SequenceMeanReduction()
+    return GlobalTokenMeanReduction()
 
 
 class LossInputType(enum.Enum):
@@ -65,10 +413,14 @@ class LossFunction(Protocol):
     Loss functions compute a scalar loss value and associated metrics from
     model logprobs and other data contained in a BatchedDataDict.
 
+    Losses may expose an ``objective_reduction: ObjectiveReduction`` describing
+    streaming denominator counts. Losses without it retain their ``loss_type``
+    token/sequence normalization.
+
     Losses may additionally expose a ``metric_normalizations:
     dict[str, MetricNormalizer]`` attribute advertising the global denominator
     each returned metric was normalized by (see ``MetricNormalizer``). It is
-    optional: split-API trainers fall back to the ``loss_type`` denominator for
+    optional: split-API trainers fall back to the objective denominator for
     metrics (or losses) that do not advertise. Survivor rescaling instead
     leaves metrics absent from the mapping unchanged.
     """

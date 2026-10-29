@@ -35,6 +35,9 @@ ROLLOUT_METRICS = "rollout_metrics"
 # prompt tokens, which two distinct groups can share.
 GROUP_ID_TAG = "group_id"
 
+# Per-response inverse valid-token mass for equal prompt-group loss reduction.
+GROUP_TOKEN_MEAN_WEIGHT = "group_token_mean_inverse_tokens"
+
 # The per-token members of `tq_token_sink.STAGING_FIELDS` (Gym's
 # `StagedCallRecord` deltas, under the names `stage()` renames them to). Named
 # here rather than inside the sink so `nemo_rl.utils.rpc_guard` can build its

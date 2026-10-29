@@ -3815,9 +3815,8 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
 ):
     """Capture rows carry their own media, so dedup has nothing to share: a GRPO
     run asking for it is rejected. A PPO run has no ``grpo`` block; the guard
-    must not read it. The guard is the last check in the token-capture block,
-    so reaching the OPD lookup that follows it proves the guard let the PPO
-    config through.
+    must not read it. Reaching seed initialization after the token-capture
+    block proves that the PPO config passed the guard.
     """
 
     class _PassedTokenCaptureBlock(Exception):
@@ -3838,8 +3837,8 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
         patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
         patch.object(
-            sc_setup_mod.opd_module,
-            "get_opd_full_config",
+            sc_setup_mod,
+            "set_seed",
             side_effect=_PassedTokenCaptureBlock,
         ) as mock_gate,
         expectation,

@@ -90,6 +90,9 @@ def _make_mock_model():
     # hook need to be able to clear it to a real None.
     model.config.finalize_model_grads_func = MagicMock(name="ORIGINAL_FINALIZE")
     model.config.num_moe_experts = None  # disable MoE branch
+    model.config.moe_router_load_balancing_type = "none"
+    model.config.moe_aux_loss_coeff = 0.0
+    model.config.moe_z_loss_coeff = None
     model.config.mtp_num_layers = None  # disable MTP unless a test opts in
     model.config.mtp_grad_scale_func = None
     # Explicit values prevent MagicMock's auto-created attributes from making
@@ -304,7 +307,47 @@ def _fake_batch():
 # ── BEGIN ────────────────────────────────────────────────────────────────
 
 
+def _normalization_loss_fn(normalization: str) -> Any:
+    # Keep optional mcore dependencies inside the marked tests.
+    from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+
+    return ClippedPGLossFn(ClippedPGLossConfig(normalization=normalization))
+
+
 class TestBegin:
+    @pytest.mark.parametrize(
+        "normalization,balancing,aux,z_loss,allowed",
+        [
+            ("sequence_mean", "aux_loss", 0.1, None, False),
+            ("sequence_mean", "aux_loss", 0.0, None, True),
+            ("sequence_mean", "none", 0.1, None, True),
+            ("sequence_mean", "none", 0.0, 0.1, False),
+            ("global_token_mean", "aux_loss", 0.1, 0.1, True),
+        ],
+    )
+    def test_streaming_router_auxiliary_validation(
+        self,
+        mock_module_symbols,
+        normalization: str,
+        balancing: str,
+        aux: float,
+        z_loss: float | None,
+        allowed: bool,
+    ) -> None:
+        loss_fn = _normalization_loss_fn(normalization)
+        worker = _make_worker(loss_fn.loss_type)
+        worker.model.config.num_moe_experts = 8
+        worker.model.config.moe_router_load_balancing_type = balancing
+        worker.model.config.moe_aux_loss_coeff = aux
+        worker.model.config.moe_z_loss_coeff = z_loss
+        if allowed:
+            worker.begin_train_step(loss_fn=loss_fn)
+        else:
+            with pytest.raises(
+                ValueError, match="Streaming non-token objective normalization"
+            ):
+                worker.begin_train_step(loss_fn=loss_fn)
+
     def test_opens_state(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
@@ -803,19 +846,86 @@ class TestFinish:
         arg = w.model.scale_gradients.call_args.args[0]
         assert arg == pytest.approx(1.0 / 8.0, rel=1e-4)
 
-    @pytest.mark.parametrize("token_level_loss", [False, True])
-    @pytest.mark.parametrize("draft_loss_weight", [0.0, 0.5, 1.0])
+    def test_group_token_mean_preserves_detached_mtp_normalization_across_dp(
+        self, mock_module_symbols
+    ) -> None:
+        # Keep optional MCore test dependencies inside the marked test.
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.data_plane.schema import GROUP_TOKEN_MEAN_WEIGHT
+
+        worker = _make_worker(LossType.TOKEN_LEVEL)
+        worker.model.config.mtp_num_layers = 2
+        worker.mtp_enabled = True
+        mtp_param, policy_param = self._mtp_params()
+        worker.model.parameters.return_value = [mtp_param, policy_param]
+
+        def scale_gradients(factor: float) -> None:
+            for param in (mtp_param, policy_param):
+                param.main_grad.mul_(factor)
+
+        worker.model.scale_gradients.side_effect = scale_gradients
+        loss_fn = _normalization_loss_fn("group_token_mean")
+        with pytest.raises(ValueError, match="mtp_detach_heads"):
+            worker.begin_train_step(loss_fn=loss_fn)
+        worker.model.config.mtp_detach_heads = True
+        worker.begin_train_step(loss_fn=loss_fn)
+        batch = _fake_batch()
+        # These two chunks are halves of the same complete group.
+        batch[GROUP_TOKEN_MEAN_WEIGHT] = torch.full((8,), 1 / 4096, dtype=torch.float32)
+        worker.train_microbatch(batch)
+        worker.train_microbatch(batch)
+        assert worker._train_step_state["local_objective_denominator"].item() == 1
+        grads_at_finalize = []
+        worker._train_step_state["saved_finalize_model_grads_func"] = (
+            lambda models, num_tokens: grads_at_finalize.append(
+                (mtp_param.main_grad.clone(), policy_param.main_grad.clone())
+            )
+        )
+
+        def reduce_counts(counts: torch.Tensor, *, group: Any) -> None:
+            assert (
+                group
+                is mock_module_symbols["pstate"].get_data_parallel_group.return_value
+            )
+            counts.add_(counts.new_tensor([4, 1024, 1]))
+
+        mock_module_symbols["all_reduce"].side_effect = reduce_counts
+        worker.finish_train_step()
+        mock_module_symbols["all_reduce"].assert_called_once()
+        worker.model.scale_gradients.assert_called_once_with(0.5)
+        # Two chunks contribute 4096 tokens and one group; the other DP rank
+        # contributes 1024 tokens and one group. MTP still uses 1/T, policy 1/G.
+        expected_mtp = torch.full((4,), 1 / 5120)
+        expected_policy = torch.full((4,), 1 / 2)
+        torch.testing.assert_close(mtp_param.main_grad, expected_mtp)
+        torch.testing.assert_close(policy_param.main_grad, expected_policy)
+        torch.testing.assert_close(grads_at_finalize[0][0], expected_mtp)
+        torch.testing.assert_close(grads_at_finalize[0][1], expected_policy)
+
+    @pytest.mark.parametrize(
+        "normalization,draft_loss_weight",
+        [
+            ("global_token_mean", 0.0),
+            ("global_token_mean", 0.5),
+            ("sequence_mean", 0.5),
+            ("group_token_mean", 0.5),
+        ],
+    )
     def test_draft_uses_independent_denominator_and_existing_reduce(
-        self, mock_module_symbols, token_level_loss: bool, draft_loss_weight: float
+        self, mock_module_symbols, normalization: str, draft_loss_weight: float
     ):
         from nemo_rl.algorithms.loss.draft import DraftLossStats
-        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.data_plane.schema import GROUP_TOKEN_MEAN_WEIGHT
         from nemo_rl.models.megatron.draft.step_state import (
             DRAFT_STEP_PAYLOAD_KEY,
             DraftStepState,
         )
 
-        policy_count = 2048.0 if token_level_loss else 8.0
+        policy_count = {
+            "global_token_mean": 2048.0,
+            "sequence_mean": 8.0,
+            "group_token_mean": 2.0,
+        }[normalization]
         payload = DraftStepState.metric_payload(
             DraftLossStats(
                 numerators=torch.tensor([4096.0]),
@@ -830,25 +940,37 @@ class TestFinish:
                 DRAFT_STEP_PAYLOAD_KEY: payload,
             }
         ]
-        w = _make_worker(
-            LossType.TOKEN_LEVEL if token_level_loss else LossType.SEQUENCE_LEVEL
-        )
+        loss_fn = _normalization_loss_fn(normalization)
+        w = _make_worker(loss_fn.loss_type)
         w.cfg["draft"] = SimpleNamespace(enabled=True, loss_weight=draft_loss_weight)
         draft_param = torch.nn.Parameter(torch.tensor(1.0))
         draft_param.grad_norm_group = "draft"
         draft_param.main_grad = torch.tensor(3.0)
-        w.model.parameters.return_value = iter([draft_param])
+        policy_param = torch.nn.Parameter(torch.tensor(1.0))
+        policy_param.main_grad = torch.tensor(5.0)
+        w.model.parameters.return_value = [draft_param, policy_param]
+
+        def scale_gradients(factor: float) -> None:
+            for param in (draft_param, policy_param):
+                param.main_grad.mul_(factor)
+
+        w.model.scale_gradients.side_effect = scale_gradients
         w.optimizer.grad_norms_by_group = {"draft": 0.25}
 
-        w.begin_train_step(loss_fn=w._test_loss_fn)
-        w.train_microbatch(_fake_batch())  # policy count = 2048
-        w.model.parameters.return_value = iter([draft_param])
+        w.begin_train_step(loss_fn=loss_fn)
+        batch = _fake_batch()
+        if normalization == "group_token_mean":
+            batch[GROUP_TOKEN_MEAN_WEIGHT] = torch.full((8,), 1 / 1024)
+        w.train_microbatch(batch)
         metrics = w.finish_train_step()
 
         reduced = mock_module_symbols["all_reduce"].call_args.args[0]
-        assert torch.equal(reduced, reduced.new_tensor([8.0, 2048.0, 1024.0]))
+        expected_counts = [8.0, 2048.0, policy_count]
+        expected_counts.append(1024.0)
+        assert torch.equal(reduced, reduced.new_tensor(expected_counts))
         # Draft gradients use their own denominator after policy scaling.
-        assert draft_param.main_grad.item() == pytest.approx(3.0 * policy_count / 1024)
+        assert draft_param.main_grad.item() == pytest.approx(3.0 / 1024)
+        assert policy_param.main_grad.item() == pytest.approx(5.0 / policy_count)
         mb = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"][0]
         assert mb["draft_loss"].item() == pytest.approx(4.0)
         # Sync metrics report policy and draft losses separately. Preserve the
@@ -906,7 +1028,7 @@ class TestFinish:
         w.finish_train_step()
 
         reduced = mock_module_symbols["all_reduce"].call_args.args[0]
-        assert torch.equal(reduced, reduced.new_tensor([16.0, 4096.0, 20.0]))
+        assert torch.equal(reduced, reduced.new_tensor([16.0, 4096.0, 4096.0, 20.0]))
         assert draft_param.main_grad.item() == pytest.approx(614.4)
         metrics = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"]
         assert metrics[0]["draft_loss"].item() == pytest.approx(1.0)
@@ -962,7 +1084,7 @@ class TestFinish:
         w.finish_train_step()
 
         reduced = mock_module_symbols["all_reduce"].call_args.args[0]
-        assert torch.equal(reduced, reduced.new_tensor([8.0, 2048.0]))
+        assert torch.equal(reduced, reduced.new_tensor([8.0, 2048.0, 2048.0]))
 
     def test_without_draft_payload_still_reduces_draft_grad_norm(
         self, mock_module_symbols

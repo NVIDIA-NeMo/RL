@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
@@ -19,6 +20,57 @@ import torch
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
+
+
+def group_token_mean_weights(
+    sample_ids: Sequence[str],
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    *,
+    group_indices: torch.Tensor,
+    expected_group_size: int | None = None,
+) -> torch.Tensor:
+    """Build float32 row weights using the advantage stage's integer group indices.
+
+    Nonnegative fractional masks contribute their full mass. An entirely
+    excluded group receives zero weight and zero denominator mass. The
+    controller supplies its configured group size to reject incomplete groups.
+    """
+    if token_mask.ndim != 2 or sample_mask.shape != (token_mask.shape[0],):
+        raise ValueError("group token mean expects token_mask[B,S], sample_mask[B]")
+    if len(sample_ids) != token_mask.shape[0] or len(set(sample_ids)) != len(
+        sample_ids
+    ):
+        raise ValueError("group token mean requires one unique sample ID per response")
+    if not torch.isfinite(token_mask).all() or not torch.isfinite(sample_mask).all():
+        raise ValueError("group token mean masks must be finite")
+    if (token_mask < 0).any() or (sample_mask < 0).any():
+        raise ValueError("group token mean masks must be nonnegative")
+    if group_indices.shape != sample_mask.shape or group_indices.dtype != torch.long:
+        raise ValueError(
+            "group token mean requires one integer group index per response"
+        )
+    group_sizes = torch.bincount(group_indices)
+    if (
+        expected_group_size is not None
+        and (group_sizes[group_sizes > 0] != expected_group_size).any()
+    ):
+        raise ValueError(
+            f"incomplete group: expected {expected_group_size} responses per group"
+        )
+    valid_lengths = token_mask[:, 1:].sum(-1, dtype=torch.float32)
+    valid_lengths = valid_lengths * sample_mask.float()
+
+    # Sum lengths by group, then look up the group total for each response.
+    group_totals = valid_lengths.new_zeros(group_sizes.shape)
+    group_totals.scatter_add_(0, group_indices, valid_lengths)
+    row_totals = group_totals[group_indices]
+
+    # Entirely masked groups keep zero weight.
+    weights = torch.zeros_like(valid_lengths)
+    nonempty = row_totals > 0
+    weights[nonempty] = row_totals[nonempty].reciprocal()
+    return weights.detach()
 
 
 def rescale_loss_metrics(
