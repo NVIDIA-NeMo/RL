@@ -67,6 +67,7 @@ from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.megatron.manual_gc import ManualGCMixin
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
 )
@@ -247,7 +248,7 @@ def _value_loss_prepare_fn(
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
+class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker):
     """Megatron-Core based value function worker for PPO.
 
     This worker wraps a Megatron-Core GPT model backbone with a value head
@@ -401,6 +402,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
         self.cfg = config
         self.rank = get_rank_safe()
+        # Fail on a bad manual_gc config before the expensive setup below; GC itself
+        # is disabled at the end of __init__ (_maybe_enable_manual_gc).
+        self._manual_gc_interval_from_cfg()
 
         # Step 1: Setup distributed
         setup_distributed(config)
@@ -508,6 +512,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         )
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
+        self._maybe_enable_manual_gc()
 
     def enable_forward_pre_hook(self):
         if isinstance(self.model, DistributedDataParallel):
@@ -632,6 +637,8 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
+                    # Once per optimizer step, as in the policy worker.
+                    self._maybe_run_manual_gc()
 
                     pg_collection = get_pg_collection(self.model)
                     update_successful = logical_and_across_model_parallel_group(
