@@ -65,8 +65,8 @@ when you mean removed: nothing here warns, everything raises.
 Add a section for the new function (the file is grouped by function, with banner
 comments). Cover the rejected shape, the accepted shape, and absence of the key.
 
-`tests/unit/test_config_validation.py::test_no_shipped_config_is_outdated` runs
-`check_outdated_config` over every shipped config, so step 1 automatically constrains
+The `outdated_config` subtest of `tests/unit/test_config_validation.py::test_shipped_config`
+runs `check_outdated_config` over every shipped config, so step 1 automatically constrains
 `examples/` and `research/` too — no second implementation, and no way for the two to
 drift.
 
@@ -77,7 +77,7 @@ uv run --group test pytest tests/unit/utils/test_outdated_config_checks.py \
     tests/unit/test_config_validation.py -q
 ```
 
-`test_no_shipped_config_is_outdated` failing means a config in the repo still carries the
+The `outdated_config` subtest failing means a config in the repo still carries the
 old shape. Fix the YAML — do not weaken the check.
 
 The tests only see parsed config, so finish with a grep for everything they cannot reach:
