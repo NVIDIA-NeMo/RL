@@ -365,6 +365,101 @@ GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollo
 
 **Known issue (Qwen models):** For some Qwen-based models, a `ValueError: Token id 151708 is out of vocabulary` error may occur when the policy drifts from its initial distribution. Setting `top_p` to `0.9999` in the generation config is a recommended workaround. For details and discussion, see [#237](https://github.com/NVIDIA-NeMo/RL/issues/237).
 
+### Masked rewards in advantage statistics
+
+`grpo.masked_reward_policy` decides which rollout rows vote in the advantage
+statistics. It never changes the sample or token loss masks. It applies to
+synchronous GRPO (legacy and TransferQueue trainers), asynchronous GRPO and
+SingleController, and it covers GRPO's group baseline/std, GDPO's per-reward
+baseline/std and final batch normalization, Reinforce++'s optional group
+baseline and token-level batch normalization, the `env_baseline` behind the
+`baseline_reward/pct_*` diagnostics, and dynamic-sampling admission:
+
+- `include` (default): every row with a nonzero dataset weight votes, including
+  rows the environment flagged with `mask_sample`, truncated rows under
+  `overlong_filtering`, and rows removed by sequence-logprob-error masking.
+  Their rewards still shape their siblings' baselines although they contribute
+  no loss. Rows whose dataset-level `loss_multiplier` is `0` never vote, on any
+  trainer (see below). For the legacy and TransferQueue loops the GRPO and GDPO
+  group statistics are unchanged from earlier releases, which let every row
+  vote: a dataset-level weight is shared by a whole prompt group, so excluding
+  it moves no trainable row's baseline. SingleController previously excluded
+  all of these rows (`valid_mask=final_sample_mask`) and now lets the masked,
+  truncated and sequence-error rows vote under `include`.
+- `exclude`: only rows with a nonzero loss weight vote, using the masks known at
+  each stage: the environment, pre-existing loss-weight and overlong masks
+  before the logprob pass (dynamic-sampling admission, baseline/std,
+  `env_baseline`), and the final sample mask, including sequence-logprob-error
+  masking, at the estimator.
+
+Participation is binary. A fractional `loss_multiplier` such as `0.5` still
+weights the loss, but the row votes with full weight in the statistics; only a
+weight of exactly `0` removes it under `exclude`. For example, with rewards
+`[1, 1, 0]`, a masked last row and leave-one-out disabled, the valid rows'
+baseline is `2/3` under `include` and `1` under `exclude`; with rewards `[0, 1]`
+and loss weights `[0.5, 0.5]` the baseline is `0.5` for both rows under either
+policy.
+
+Rows whose dataset-level `loss_multiplier` is `0` never vote, on any trainer
+and under either policy. The data processors assign that weight to prompts
+that do not fit the sequence limit before any rollout happens, so their
+rollouts are unusable rows, not masked rewards; counting them would, for
+example, let their response tokens enter Reinforce++'s batch normalization,
+which earlier releases never did. SingleController reads the weight from its
+data-plane `sample_mask`, which also carries the token-capture placeholders
+(no usable tokens) that it excludes under both policies; the legacy and
+TransferQueue trainers take it from `loss_multiplier` before their own filters
+rewrite that column, and carry no placeholder rows. An environment-masked row
+with a usable rollout is a masked reward; a placeholder or an over-length
+prompt is not.
+
+The `train/baseline_reward/histogram` and `baseline_reward/pct_{0,1,mixed}`
+diagnostics of the legacy and TransferQueue trainers count the rows that vote
+under the configured policy, the same mask the estimator receives: every row
+with a nonzero dataset weight under `include`, the rows with a nonzero final
+loss weight under `exclude`. A
+non-voting row still receives a baseline entry (under the leave-one-out baseline
+it is the mean of its voting siblings' rewards, which is neither 0 nor 1), so
+counting it would report an all-correct group as mixed. When no row votes, the
+three percentages are reported as 0.
+
+Independently of the policy, the TransferQueue trainer now zeroes the loss
+weight of rows the environment flags with `mask_sample` after dynamic sampling
+and reports `num_mask_sample_filtered`, as the legacy loop does. Earlier
+releases ignored the flag in that trainer and trained those rows at full loss
+weight.
+
+The policy and reference logprob passes receive the statistics participation
+mask instead of the loss weights. Under top-k/top-p filtering the workers zero
+every policy logprob outside `token_mask * sample_mask`; the reference pass is
+computed without filtering (see
+[Top-p and top-k filtering](#top-p-and-top-k-filtering)), so its logprobs are
+always real. A loss-masked row that votes under `include` therefore keeps real
+policy logprobs, and Reinforce++'s KL-in-reward and batch normalization see
+its real KL term instead of a zeroed policy logprob against a real reference.
+Under `exclude` both masks select the same rows. Training always receives the
+loss weights.
+
+Reinforce++ normalizes over the response tokens of participating rows, never
+over prompt or padding tokens; this also applies when `minus_baseline=false`.
+GDPO normalizes over participating rows with an unbiased standard deviation and
+returns zeros when at most one row participates; Reinforce++ returns zeros when
+no token participates. Groups with at most one participating reward keep a zero
+group-relative reward difference. SingleController skips advantage computation
+when a whole chunk has no trainable tokens, under either policy.
+
+The default is a policy decision made with the post-training team, not a
+finding that `exclude` is numerically wrong, and no controlled convergence
+comparison between the two settings has been established. To run one, use the
+paired
+[exclude experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-exclude.yaml)
+and [include experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-include.yaml),
+which differ only in `grpo.masked_reward_policy`, or override that key on your
+existing config. Keep the revisions and all other settings identical.
+
+This setting does not change PPO, OPD, DPO, SFT, or reward-model training. They
+do not use these group-relative reward estimators.
+
 ## Performance Optimizations
 
 RL generations typically produce highly variable sequence lengths, which result in a significant amount of padding if approached naively. We address this with Sequence Packing and Dynamic Batching, which are techniques to reduce the amount of padding required. You can read more about these in the [design doc](../design-docs/sequence-packing-and-dynamic-batching.md).
@@ -556,6 +651,28 @@ By multiplying the first term of the loss function by the importance weights $\f
 
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
+##### Adaptive PPO clip
+
+`truncated_importance_sampling_type: adaptive-ppo-clip` filters tokens by importance weight $w$ according to the sign of their advantage, with an upper bound that adapts to policy entropy. It is intended for async RL and requires `force_on_policy_ratio: true`. It also requires `metrics_level: full` (the default), because the trainer reads `approx_entropy` to update the bound:
+
+```yaml
+loss_fn:
+  use_importance_sampling_correction: true
+  force_on_policy_ratio: true
+  truncated_importance_sampling_type: adaptive-ppo-clip
+  truncated_importance_sampling_ratio: 2.5      # base upper bound for A > 0
+  truncated_importance_sampling_ratio_min: 0.4  # lower bound for A < 0
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
+  sequence_level_importance_ratios: false
+```
+
+The loss zeroes the weight of negative-advantage tokens with $w$ below `truncated_importance_sampling_ratio_min`, positive-advantage tokens with $w$ above `truncated_importance_sampling_ratio + k`, and every token with $w$ above `truncated_importance_sampling_adaptive_outer_bound`. `is_oob_ratio` reports the fraction of filtered tokens.
+
+The offset $k$ starts at 0. After each training step, the trainer compares the step's `approx_entropy` with `truncated_importance_sampling_adaptive_target_entropy`: entropy above the target lowers $k$ by `truncated_importance_sampling_adaptive_k_step`, and entropy below the target raises it by the same amount. $k$ is clamped between 0 and `truncated_importance_sampling_adaptive_k_max`. The legacy GRPO trainers and the single controller log `cur_adaptive_ppo_clip_k`, the $k$ each step trained with, and save the updated $k$ in checkpoints so a resumed run continues from the same bound. The legacy PPO trainer rejects this mode. Sequence-level importance ratios are not supported. See the [MAI-1 paper](https://microsoft.ai/pdf/mai-thinking-1.pdf) for more details.
+
 
 #### Single-forward sequence-logprob filtering
 
@@ -572,7 +689,7 @@ loss_fn:
   reference_policy_kl_penalty: 0.0
 ```
 
-The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation. SingleController is rejected because its advantage baselines depend on the earlier filtering decision. DTensor, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or Automodel must first satisfy these constraints; setting the flag alone does not make them compatible.
+The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation. SingleController is rejected because its advantage baselines depend on the earlier filtering decision. Automodel, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or Automodel must first satisfy these constraints; setting the flag alone does not make them compatible.
 
 The [Qwen2.5-Math-1.5B single-forward recipe](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-forward.yaml) provides a complete configuration for one node with eight GPUs. The comparison below used two GB300 nodes with four GPUs each, with overrides `cluster.num_nodes=2 cluster.gpus_per_node=4 cluster.segment_size=2`. The reported step times therefore do not describe the recipe's default topology and also depend on the benchmark hardware and runtime.
 
@@ -613,7 +730,7 @@ $$
 L_{\text{effective}} = \sum_{i} m_i \cdot L_i
 $$
 
-where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update while remaining in the batch for reward baseline calculations.
+where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update. Under the default `grpo.masked_reward_policy: include` they remain in the batch for reward baseline calculations; `exclude` removes them from the statistics as well (see [Masked rewards in advantage statistics](#masked-rewards-in-advantage-statistics)).
 
 To configure:
 ```yaml
@@ -850,16 +967,17 @@ The headline metric is per-reward convergence, not just aggregate reward. NeMo-R
 
 ## LoRA Configuration
 
-GRPO supports LoRA on both the DTensor and Megatron backends. To enable LoRA on the default DTensor backend:
+GRPO supports LoRA on both the Automodel and Megatron backends. To enable LoRA on the default Automodel backend:
 
 ```bash
 uv run examples/run_grpo.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
-The DTensor GRPO LoRA path uses a merge-weight approach: during generation, LoRA adapter weights are merged into the base linear weights. This improves performance, with a small training-inference mismatch that we consider acceptable. If you require strict training-inference parity, use the [split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async), which may trade off some performance. For a comparison between merge-weight and split-weight, see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).
+Automodel GRPO with synchronous vLLM uses native A/B adapter refit by default. Set
+`policy.generation.lora_refit_mode=merged` to switch to merged refit.
 
-For the full reference — backend support, the DTensor vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).
+For the full reference — backend support, the Automodel vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).
 
 ## Evaluate the Trained Model
 
-Upon completion of the training process, you can refer to our [evaluation guide](eval.md) to assess model capabilities.
+Upon completion of the training process, see the [evaluation overview](../about/evaluation.md) to assess model capabilities.

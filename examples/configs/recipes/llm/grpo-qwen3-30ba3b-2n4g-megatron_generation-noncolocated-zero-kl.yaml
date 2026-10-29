@@ -38,10 +38,10 @@ policy:
       moe_router_dtype: fp32
       logprobs_mode: raw_logprobs
       enable_chunked_prefill: false
+      enable_prefix_caching: false  # Exactness gate: keep every prefill token recomputed.
       inference_grouped_gemm_backend: vllm
       inference_moe_token_dispatcher_type: nvls
       refit_backend: nccl
-      num_cuda_graphs: -1
       moe_pad_experts_for_cuda_graph_inference: false
 cluster:
   gpus_per_node: 4

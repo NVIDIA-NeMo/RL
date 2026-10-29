@@ -51,9 +51,10 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
-    # HSDP replicate dimension size for Automodel DTensor v2.
+    # HSDP replicate dimension size for Automodel.
     # Typically set to the number of nodes; set to 1 to disable HSDP.
     dp_replicate_size: 1
     custom_parallel_plan: null
@@ -103,7 +104,7 @@ policy:
       weight_decay: 0.1
       betas: [0.9, 0.98]
       eps: 1e-5
-      # when using Dtensor, we need to set foreach
+      # when using Automodel, we need to set foreach
       # and fused to False
       foreach: False
       fused: False
@@ -153,6 +154,9 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
 
@@ -307,6 +311,7 @@ logger:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
   num_val_samples_to_print: 0
+  extra_backends: []
 
 cluster:
   gpus_per_node: 1

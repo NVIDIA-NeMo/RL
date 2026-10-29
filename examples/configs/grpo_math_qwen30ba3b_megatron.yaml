@@ -24,9 +24,9 @@ policy:
   sequence_packing:
     enabled: False
 
-  optimizer: null # remove default FSDP optimizer
+  optimizer: null # remove default Automodel optimizer
 
-  scheduler: null # remove default FSDP scheduler
+  scheduler: null # remove default Automodel scheduler
 
   megatron_cfg:
     enabled: true

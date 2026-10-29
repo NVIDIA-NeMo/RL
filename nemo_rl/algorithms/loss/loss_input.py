@@ -98,7 +98,7 @@ def _prepare_opd_full_loss_input(
     if vocab_parallel_group is None:
         raise NotImplementedError(
             "opd_full currently requires the Megatron vocabulary-parallel path; "
-            "the DTensor-only logit path is not supported."
+            "the Automodel-only logit path is not supported."
         )
 
     payload_field = opd_full_payload_field(full_cfg)
@@ -232,7 +232,8 @@ def prepare_loss_input(
             projects each row's teacher payload into teacher logits with them.
 
     Notes:
-        vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
+        Parallel groups are supplied by Megatron and Automodel workers.
+        Automodel uses a singleton vocabulary group for chunked local logprobs.
         sampling_params is only used for LossInputType.LOGPROB, and currently only supported for ClippedPGLossFn.
         d2t is only used for LossInputType.DRAFT.
         teacher_output_layer_weight_by_index is only used for LossInputType.OPD_FULL.

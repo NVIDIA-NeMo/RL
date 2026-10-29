@@ -29,6 +29,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
 )
+from nemo_rl.models.generation.vllm.lora_utils import LoraRefitMode
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
     MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
@@ -82,6 +83,11 @@ class VllmSpecificArgs(TypedDict):
     cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
+    # With is_mx, quantize weights to MXFP8 on the trainer during refit and
+    # stream E4M3 data plus scales (~47% smaller payload) instead of BF16;
+    # the vLLM worker then skips its per-refit re-quantization. Requires the
+    # Megatron policy backend.
+    refit_prequantize: NotRequired[bool]
     # Deprecated in 0.8. Use quantization_ignore_patterns instead.
     quantization_ignored_layer_kws: NotRequired[list[str]]
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
@@ -101,6 +107,15 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Require `Authorization: Bearer <key>` on the exposed server's OpenAI routes
+    # (/v1/* and /tokenize). VllmGeneration generates one random key per job, hands
+    # it to the workers, and exposes it as `http_server_api_key` for the NeMo-Gym
+    # model server. Needs expose_http_server; refused at setup without it.
+    # Absent or false: the routes accept unauthenticated requests.
+    http_server_api_key_required: NotRequired[bool]
+    # The generated key. Filled by VllmGeneration in the copy of the config the
+    # workers receive; never set in a YAML.
+    http_server_api_key: NotRequired[str]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
     # Invalidate weight-dependent multimodal encoder outputs after a successful
@@ -214,6 +229,9 @@ class VllmConfig(GenerationConfig):
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
     refit_transport: NotRequired[VllmRefitSelector | str | None]
     refit_cfg: NotRequired[VllmRefitConfig | None]
+    # LoRA policies use vLLM's factorized adapter runtime by default. Set to
+    # ``merged`` to opt into materializing and refitting full ``W + BA`` weights.
+    lora_refit_mode: NotRequired[LoraRefitMode]
 
     # quantization config
     quant_cfg: NotRequired[str | None]
@@ -233,9 +251,46 @@ class VllmConfig(GenerationConfig):
     worker_extension_cls_fqn: NotRequired[str | None]
 
 
+def validate_vllm_quantization_config(config: VllmConfig) -> None:
+    """Reject quantization options that would otherwise be silently ignored."""
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    refit_prequantize = vllm_cfg.get("refit_prequantize")
+    if refit_prequantize is not None and not isinstance(refit_prequantize, bool):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize must be a boolean."
+        )
+    if refit_prequantize and not (
+        vllm_cfg.get("precision") == "fp8" and vllm_cfg.get("is_mx") is True
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize requires "
+            "precision='fp8' and is_mx=true."
+        )
+    if refit_prequantize and config.get("refit_transport") == "nccl_reshard":
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize is not supported with "
+            "nccl_reshard; that transport owns its weight-format conversion."
+        )
+    if refit_prequantize and vllm_cfg.get("refit_with_reload_api"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize is not supported with "
+            "refit_with_reload_api; prequantized refit uses receiver scale names "
+            "that are not accepted by vLLM's native reload path."
+        )
+
+
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
     """Validate and return the optional vLLM video sampling contract."""
-    raw_video_config = config["vllm_cfg"].get("video")
+    vllm_config = cast(dict[str, Any], config["vllm_cfg"])
+    if "video_loader" in vllm_config:
+        raise ValueError(
+            "policy.generation.vllm_cfg.video_loader is not supported; "
+            "use policy.generation.vllm_cfg.video"
+        )
+
+    raw_video_config = vllm_config.get("video")
     if raw_video_config is None:
         return None
     return VllmVideoConfig.model_validate(raw_video_config)
@@ -471,6 +526,7 @@ def validate_nvfp4_pertoken_model(hf_config: Any) -> None:
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     """Validate the selected refit transport and resolve its scoped defaults."""
+    validate_vllm_quantization_config(config)
     rollout = parse_nvfp4_pertoken_rollout(config)
     if cast(dict[str, Any], config).get("checkpoint_engine") is not None:
         raise ValueError(
