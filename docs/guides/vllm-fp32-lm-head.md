@@ -103,11 +103,15 @@ No claim of identical outputs between BF16 and FP32 is made.
 
 ## Validation
 
-- Configuration, policy validation and source-compatibility regressions: 86
-  distinct CPU test cases, including seven dtype-alias cases added after the
-  initial 79-case run.
+- Configuration, policy validation and source-compatibility regressions: 96
+  distinct CPU test cases, including mixed-case dtype aliases and rejection of
+  FP32 overrides when the switch is disabled or omitted.
 - Native CUDA numerical tests: seven cases for BF16/FP16, strided and batched
   states, FP64 comparison, live weight updates, and quantized-head rejection.
+- Real worker initialization: two automated GPU cases load a tiny Qwen3
+  checkpoint through NeMo RL's worker. They verify both the configured head
+  dtype and actual `compute_logits` output for the disabled/enabled switch,
+  while checking that the head weights remain BF16.
 - Two-GPU native LM-head test: 16 combinations covering BF16/FP16 output,
   FP32 output, divisible/padded vocabulary sizes and in-place weight reloads.
 - NeMo RL worker smoke test: Qwen3-0.6B generated successfully with an FP32
