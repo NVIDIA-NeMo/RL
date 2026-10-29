@@ -62,6 +62,7 @@ from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym_harnesses import parse_harness_pool
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
@@ -1364,6 +1365,20 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    env_config = getattr(master_config, "env", None)
+    gym_config = env_config.get("nemo_gym") if env_config is not None else None
+    if gym_config is not None and gym_config.get("harness_pool") is not None:
+        parse_harness_pool(gym_config["harness_pool"])
+        if not should_use_nemo_gym(master_config):
+            raise ValueError("harness_pool requires env.should_use_nemo_gym=true")
+        if is_ppo_run(master_config) or opd_module.is_opd_enabled(master_config):
+            raise ValueError("harness_pool supports SingleController GRPO without OPD")
+        if not master_config.token_capture.enabled:
+            raise ValueError("harness_pool requires token_capture.enabled=true")
+        if gym_config.get("shards") is not None:
+            raise ValueError("harness_pool requires an unsharded NeMo-Gym stack")
+        if master_config.policy.get("is_vlm"):
+            raise ValueError("harness_pool currently supports text-only policies")
     if master_config.loss_fn.seq_logprob_error_in_loss:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "

@@ -602,6 +602,7 @@ class RolloutReassembler:
         canonical_sample_ids: Optional[list[str]] = None,
         reward_checks: Optional[list[RewardChecks | None]] = None,
         reward_log_contexts: Optional[list[RewardLogContext | None]] = None,
+        resolved_agent_names: Optional[list[str]] = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -622,6 +623,15 @@ class RolloutReassembler:
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
         )
+        if resolved_agent_names is not None and (
+            len(resolved_agent_names) != len(rollout_ids)
+            or any(
+                not isinstance(name, str) or not name for name in resolved_agent_names
+            )
+        ):
+            raise ValueError(
+                "resolved_agent_names must contain one non-empty agent name per rollout"
+            )
         if canonical_sample_ids is None:
             canonical_sample_ids = rollout_ids
         assert len(canonical_sample_ids) == len(rollout_ids), (
@@ -858,6 +868,9 @@ class RolloutReassembler:
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
+        if resolved_agent_names is not None:
+            for tag, agent_name in zip(tags, resolved_agent_names):
+                tag["agent_name"] = agent_name
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0

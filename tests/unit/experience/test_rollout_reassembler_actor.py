@@ -111,6 +111,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         canonical_sample_ids=["group_g0"],
         reward_checks=None,
         reward_log_contexts=None,
+        resolved_agent_names=None,
     )
 
 
@@ -126,6 +127,20 @@ def test_finalizer_forwards_mooncake_checkpoint_commands(
 
     assert actor.mooncake_checkpoint(command) is response
     dispatch.assert_called_once_with(command)
+
+
+def test_finalizer_forwards_per_rollout_agents() -> None:
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._finalizer = MagicMock()
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        meta=None, group_min_wv=4, group_max_wv=4, staging_keys=[], dropped=True
+    )
+    request = replace(_request(), resolved_agent_names=("pi_agent",))
+    actor.finalize(request)
+    assert actor._finalizer.finalize_group.call_args.kwargs["resolved_agent_names"] == [
+        "pi_agent"
+    ]
 
 
 @pytest.mark.parametrize("capture_media", [False, True])
@@ -193,6 +208,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "mask_sample",
         "loss_multiplier",
         "resolved_agent_name",
+        "resolved_agent_names",
         "reward_checks",
         "reward_log_contexts",
     }

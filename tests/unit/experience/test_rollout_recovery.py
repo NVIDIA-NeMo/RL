@@ -1065,7 +1065,7 @@ def test_restore_rejects_unsupported_schema_version(version: int) -> None:
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [2, 3, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
     state = {
         "schema_version": version,
@@ -1073,7 +1073,7 @@ def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
         "batch_shortfall": {},
         "sampler_stamps_target_steps": False,
     }
-    if version == ROLLOUT_RECOVERY_SCHEMA_VERSION:
+    if version >= 3:
         state.update(
             reward_settings=None,
             finalizer_metrics_by_group={},
@@ -1088,7 +1088,7 @@ def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
     assert parsed.sampler_stamps_target_steps is False
 
 
-@pytest.mark.parametrize("version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [2, 3, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> None:
     state = _sealed_attempt_state()
     state["schema_version"] = version
@@ -1154,6 +1154,127 @@ def test_seal_rejects_conflicting_agent_names_atomically(granularity) -> None:
             )
         )
     assert ledger.state_dict() == before
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_mixed_agents_survive_sealing_and_checkpoint(granularity) -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="mixed",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=granularity,
+        allow_mixed_agents=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, group.group_id))
+    results = {
+        index: SiblingSealResult(
+            gate_rollout_id=group.gate_rollout_id(index),
+            receipt=None,
+            reward=float(index),
+            mask_sample=True,
+            resolved_agent_name=name,
+        )
+        for index, name in enumerate(("opencode_agent", "pi_agent"))
+    }
+    if granularity is RecoveryGranularity.PROMPT_GROUP:
+        _mutate(lambda cut: ledger.mark_group_sealed(cut, group.group_id, results))
+    else:
+        _mutate(
+            lambda cut: ledger.mark_sibling_sealed(
+                cut,
+                group.group_id,
+                generation_index=0,
+                **dataclasses.asdict(results[0]),
+            )
+        )
+        # The first seal survives a process restart; a different second harness
+        # remains legal because the explicit opt-in is durable too.
+        ledger = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+        _bind(ledger, group.group_id, _prompt())
+        _mutate(lambda cut: ledger.prepare_for_restart(cut))
+        retry = _mutate(
+            lambda cut: ledger.prepare_incomplete_retry(cut, group.group_id)
+        )
+        _mutate(
+            lambda cut: ledger.mark_group_dispatched(
+                cut, group.group_id, generation_indices=[1]
+            )
+        )
+        second = dataclasses.replace(
+            results[1], gate_rollout_id=retry.gate_rollout_id(1)
+        )
+        _mutate(
+            lambda cut: ledger.mark_sibling_sealed(
+                cut, group.group_id, generation_index=1, **dataclasses.asdict(second)
+            )
+        )
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    actual = restored.get_group(group.group_id)
+    assert actual.allow_mixed_agents
+    assert actual.resolved_agent_name is None
+    assert [s.resolved_agent_name for s in actual.siblings] == [
+        "opencode_agent",
+        "pi_agent",
+    ]
+    assert restored.finalization_inputs(group.group_id) == ledger.finalization_inputs(
+        group.group_id
+    )
+
+
+def test_mixed_group_cannot_reassign_a_sealed_sibling() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="mixed",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        allow_mixed_agents=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, group.group_id))
+    values = dict(
+        generation_index=0,
+        gate_rollout_id=group.gate_rollout_id(0),
+        receipt=None,
+        reward=0.0,
+        mask_sample=True,
+    )
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut, group.group_id, **values, resolved_agent_name="pi_agent"
+        )
+    )
+    before = ledger.state_dict()
+    with pytest.raises(ValueError, match="different agent on retry"):
+        _mutate(
+            lambda cut: ledger.mark_sibling_sealed(
+                cut, group.group_id, **values, resolved_agent_name="opencode_agent"
+            )
+        )
+    assert ledger.state_dict() == before
+
+
+@pytest.mark.parametrize("version", [2, 3])
+def test_legacy_group_agent_migrates_to_siblings(version: int) -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = version
+    group_state = state["groups"][0]
+    group_state["resolved_agent_name"] = "legacy_agent"
+    group_state.pop("allow_mixed_agents")
+    for sibling in group_state["siblings"]:
+        sibling.pop("resolved_agent_name")
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    group = restored.get_group(group_state["group_id"])
+    assert not group.allow_mixed_agents
+    assert group.resolved_agent_name == "legacy_agent"
+    assert all(s.resolved_agent_name == "legacy_agent" for s in group.siblings)
 
 
 @pytest.mark.parametrize("agent_name", ["", 42, {"name": "agent"}])
