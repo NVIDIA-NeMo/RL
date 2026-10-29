@@ -29,6 +29,7 @@ TP=CP=PP=1) and inherit ``train`` / ``get_logprobs`` /
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Literal, Optional
@@ -39,6 +40,8 @@ import torch
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.codec import pad_batch
+from nemo_rl.data_plane.column_io import fetch_columns
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
 from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
@@ -46,6 +49,7 @@ from nemo_rl.data_plane.schema import (
     GLOBAL_FORWARD_PAD_SEQLEN,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
+    MICROBATCH_PADDED_FIELDS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_ENCODING_FIELD,
@@ -54,7 +58,11 @@ from nemo_rl.data_plane.schema import (
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
-from nemo_rl.experience.route_assembly import RouteFragment, execute_route_plan
+from nemo_rl.experience.route_assembly import (
+    RouteFragment,
+    RouteLayout,
+    execute_route_plan,
+)
 from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
@@ -67,6 +75,68 @@ if TYPE_CHECKING:
     )
 
 FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
+
+_ROUTE_BLOB = "_route_fragment_blob"
+_ROUTE_INDEX = "_route_fragment_index"
+
+
+def _pack_route_fragments(
+    plans: list[Any], fragments_by_row: list[dict[str, RouteFragment]]
+) -> tuple[torch.Tensor, np.ndarray]:
+    """Flatten the fragments each row's plan uses into one byte blob.
+
+    Returns the ``uint8`` blob (each fragment once, 8-byte aligned so it can be
+    viewed back in place) and a per-row object array of
+    ``(key, offset, nbytes, dtype, shape, encoding, extras_metadata_json)``.
+    """
+    offsets: dict[str, int] = {}
+    parts: list[torch.Tensor] = []
+    index = np.empty(len(plans), dtype=object)
+    nbytes = 0
+    for row, (plan, fragments) in enumerate(zip(plans, fragments_by_row)):
+        entries = []
+        for key in dict.fromkeys(span.staging_key for span in plan.spans):
+            if key not in fragments:
+                continue
+            fragment = fragments[key]
+            routes = fragment.routes.detach().cpu().contiguous()
+            raw = routes.view(-1).view(torch.uint8)
+            if key not in offsets:
+                pad = -nbytes % 8
+                parts += [torch.zeros(pad, dtype=torch.uint8), raw]
+                offsets[key] = nbytes + pad
+                nbytes = offsets[key] + raw.numel()
+            entries.append(
+                (
+                    key,
+                    offsets[key],
+                    raw.numel(),
+                    routes.dtype,
+                    tuple(routes.shape),
+                    fragment.encoding,
+                    fragment.extras_metadata_json,
+                )
+            )
+        index[row] = entries
+    blob = torch.cat(parts) if parts else torch.empty(0, dtype=torch.uint8)
+    return blob, index
+
+
+def _unpack_route_fragments(
+    blob: torch.Tensor, index: np.ndarray
+) -> list[dict[str, RouteFragment]]:
+    """Inverse of :func:`_pack_route_fragments`; fragments are views of ``blob``."""
+    return [
+        {
+            key: RouteFragment(
+                routes=blob[offset : offset + size].view(dtype).view(shape),
+                encoding=encoding,
+                extras_metadata_json=extras,
+            )
+            for key, offset, size, dtype, shape, encoding, extras in entries
+        }
+        for entries in index
+    ]
 
 
 def _broadcast_batched_data_dict(
@@ -81,8 +151,11 @@ def _broadcast_batched_data_dict(
     Two-phase to avoid pickling tensor payloads on the hot path: a small
     descriptor (per-key dtype/shape) ships via ``broadcast_object_list``
     first, then each tensor's data ships via ``broadcast`` on its
-    current device. The leader supplies ``data``; non-leaders pass
+    transport device. The leader supplies ``data``; non-leaders pass
     ``None`` and get an empty BatchedDataDict filled in-place.
+
+    Int16 payloads use byte views because Gloo and NCCL do not support that
+    collective dtype. This preserves the original storage without widening.
     """
     # NCCL groups can only broadcast CUDA tensors; pick the broadcast
     # device from the group backend so CPU TQ outputs are moved to GPU
@@ -100,7 +173,18 @@ def _broadcast_batched_data_dict(
             assert data is not None, "leader must provide non-None data"
             descriptor: list[Any] = []
             for k, v in data.items():
-                if isinstance(v, torch.Tensor):
+                if isinstance(v, torch.Tensor) and v.is_nested:
+                    descriptor.append(
+                        (
+                            k,
+                            "nested",
+                            str(v.dtype),
+                            tuple(v.values().shape),
+                            v.offsets().cpu(),
+                            str(v.device),
+                        )
+                    )
+                elif isinstance(v, torch.Tensor):
                     descriptor.append(
                         (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
                     )
@@ -158,31 +242,49 @@ def _broadcast_batched_data_dict(
         kind = entry[1]
         if kind == "tensor":
             dtype_str, shape, src_device = entry[2], entry[3], entry[4]
+            dtype = getattr(torch, dtype_str.split(".")[-1])
             if is_leader:
-                tensor = out[key]
-                if tensor.device.type != torch.device(bcast_device).type:
-                    tensor = tensor.to(bcast_device)
-                    out[key] = tensor
+                # Send logical order without replacing the leader's original view.
+                tensor = (
+                    out[key]
+                    .to(
+                        device=bcast_device,
+                        memory_format=torch.contiguous_format,
+                    )
+                    .contiguous()
+                )
+            else:
+                tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
+            # Flatten first so scalars also support dtype reinterpretation.
+            wire = (
+                tensor.reshape(-1).view(torch.uint8) if dtype == torch.int16 else tensor
+            )
+            torch.distributed.broadcast(wire, src=src, group=group)
+            del wire
+            if not is_leader:
+                if torch.device(src_device).type != torch.device(bcast_device).type:
+                    tensor = tensor.to(src_device)
+                out[key] = tensor
+            del tensor
+        elif kind == "nested":
+            dtype_str, shape, offsets, src_device = entry[2:]
+            if is_leader:
+                values = out[key].values().to(bcast_device)
             else:
                 dtype = getattr(torch, dtype_str.split(".")[-1])
-                tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
-                out[key] = tensor
-            # NCCL has no int16 ("Short") type; ship as int32 and narrow back
-            # (routed_experts rides TQ as int16).
-            if tensor.dtype == torch.int16:
-                wire = tensor.to(torch.int32)
+                values = torch.empty(shape, dtype=dtype, device=bcast_device)
+            if values.numel():
+                wire = (
+                    values.view(torch.uint8) if values.dtype == torch.int16 else values
+                )
                 torch.distributed.broadcast(wire, src=src, group=group)
-                tensor = wire.to(torch.int16)
-                out[key] = tensor
-            else:
-                torch.distributed.broadcast(tensor, src=src, group=group)
-            # Restore non-leader tensors to the leader's source device
-            # so downstream code sees the same layout pre-broadcast.
-            if (
-                not is_leader
-                and torch.device(src_device).type != torch.device(bcast_device).type
-            ):
-                out[key] = tensor.to(src_device)
+                del wire
+            if not is_leader:
+                values = values.to(src_device)
+                out[key] = torch.nested.nested_tensor_from_jagged(
+                    values, offsets.to(values.device)
+                )
+            del values
         elif kind == "packed_tensor":
             header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
@@ -208,13 +310,11 @@ def _broadcast_batched_data_dict(
                 )
                 tensor = torch.empty(numel, dtype=dtype, device=bcast_device)
             if tensor.numel():
-                if tensor.dtype == torch.int16:
-                    wire = tensor.to(torch.int32)
-                    torch.distributed.broadcast(wire, src=src, group=group)
-                    tensor = wire.to(torch.int16)
-                    del wire
-                else:
-                    torch.distributed.broadcast(tensor, src=src, group=group)
+                wire = (
+                    tensor.view(torch.uint8) if tensor.dtype == torch.int16 else tensor
+                )
+                torch.distributed.broadcast(wire, src=src, group=group)
+                del wire
             if not is_leader:
                 if torch.device(source_device).type != torch.device(bcast_device).type:
                     tensor = tensor.to(source_device)
@@ -345,17 +445,17 @@ class TQWorkerMixin:
         """NCCL group of TP×CP×PP siblings within this DP rank.
 
         ``None`` means "no siblings" (TP=CP=PP=1). Subclasses must
-        override using their parallelism state (DTensor ``device_mesh``,
+        override using their parallelism state (Automodel ``device_mesh``,
         Megatron ``parallel_state``). Returning ``None`` makes
         :meth:`_fetch` use independent fetch; returning a group makes
         it use leader-fetch + NCCL broadcast.
         """
         return None
 
-    def _routed_experts_dimensions(self) -> tuple[int, int]:
-        """Return model-owned ``(num_moe_layers, top_k)`` route dimensions."""
+    def _routed_experts_layout(self) -> RouteLayout:
+        """Return the model-owned route layout (MoE layer numbers, total layers, top-k)."""
         raise NotImplementedError(
-            "the router-replay policy worker must provide route dimensions"
+            "the router-replay policy worker must provide the route layout"
         )
 
     def _pad_value_dict(self) -> dict[str, Any]:
@@ -443,6 +543,19 @@ class TQWorkerMixin:
         if replica_group is not None and replica_group.size() > 1:
             is_leader = self._is_replica_leader()
             leader = torch.distributed.get_global_rank(replica_group, 0)
+            # Ship route fragments (~valid tokens) instead of the padded table
+            # and let every rank assemble locally; see _pack_route_fragments.
+            route_passthrough = bool(
+                (meta.extra_info or {}).get(ROUTE_PASSTHROUGH_FLAG)
+            )
+            ship_fragments = (
+                route_passthrough
+                and os.environ.get("NRL_ROUTE_BCAST", "fragments") != "dense"
+            )
+            plans = self._route_plans(meta) if ship_fragments else []
+            wire_layout = (
+                "padded" if route_passthrough and not ship_fragments else "jagged"
+            )
             if is_leader:
                 dp_client = self._require_dp_client()
                 if local_batch:
@@ -451,20 +564,22 @@ class TQWorkerMixin:
                         select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
                     )
                 else:
-                    td = dp_client.get_samples(
-                        sample_ids=meta.sample_ids,
-                        partition_id=meta.partition_id,
-                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-                    )
+                    td = fetch_columns(dp_client, meta, meta.fields)
                 data = _materialize_fetched(
                     td,
                     local_batch=local_batch,
-                    layout=layout,
+                    layout=wire_layout,
                     pad_value_dict=pad_value_dict,
                     pad_to_seqlen=pad_to_seqlen,
                     tags=meta.tags,
                 )
-                data = self._maybe_assemble_routed_experts(meta, data)
+                if ship_fragments:
+                    fragments_by_row, _, _ = self._route_fragments_by_row(plans)
+                    data[_ROUTE_BLOB], data[_ROUTE_INDEX] = _pack_route_fragments(
+                        plans, fragments_by_row
+                    )
+                else:
+                    data = self._maybe_assemble_routed_experts(meta, data)
             else:
                 data = None
             data = _broadcast_batched_data_dict(
@@ -473,6 +588,17 @@ class TQWorkerMixin:
                 src=leader,
                 group=replica_group,
             )
+            if wire_layout != layout:
+                data = pad_batch(
+                    data, pad_value_dict, pad_to_seqlen, skip=MICROBATCH_PADDED_FIELDS
+                )
+            if ship_fragments:
+                fragments_by_row = _unpack_route_fragments(
+                    data.pop(_ROUTE_BLOB), data.pop(_ROUTE_INDEX)
+                )
+                data = self._assemble_routed_experts(
+                    meta, data, plans, fragments_by_row, record_fallbacks=is_leader
+                )
             # Reconstruct message_log after broadcast so the views alias
             # the per-rank local ``input_ids`` rather than the leader's.
             attach_message_log_view(data)
@@ -492,11 +618,7 @@ class TQWorkerMixin:
                 select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
             )
         else:
-            td = dp_client.get_samples(
-                sample_ids=meta.sample_ids,
-                partition_id=meta.partition_id,
-                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-            )
+            td = fetch_columns(dp_client, meta, meta.fields)
         data = _materialize_fetched(
             td,
             local_batch=local_batch,
@@ -555,12 +677,9 @@ class TQWorkerMixin:
 
     def _route_fragments_by_row(
         self,
-        plans: list[Any],
+        decoded: list[Any],
     ) -> tuple[list[dict[str, RouteFragment]], int, float]:
         """Use one normal-path batch read; isolate error retries per rollout."""
-        from nemo_rl.experience.route_plan import decode_route_plan
-
-        decoded = [decode_route_plan(plan) for plan in plans]
         partitions = {plan.staging_partition for plan in decoded}
         if len(partitions) != 1:
             raise RuntimeError(
@@ -623,11 +742,14 @@ class TQWorkerMixin:
         """Materialize deferred routes at the policy worker consumption boundary."""
         if not (meta.extra_info or {}).get(ROUTE_PASSTHROUGH_FLAG):
             return data
-
-        from nemo_rl.experience.route_plan import decode_route_plan
-        from nemo_rl.models.generation.interfaces import (
-            ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+        plans = self._route_plans(meta)
+        fragments_by_row, _, _ = self._route_fragments_by_row(plans)
+        return self._assemble_routed_experts(
+            meta, data, plans, fragments_by_row, record_fallbacks=True
         )
+
+    def _route_plans(self, meta: "KVBatchMeta") -> list[Any]:
+        from nemo_rl.experience.route_plan import decode_route_plan
 
         tags = meta.tags or []
         if len(tags) != len(meta.sample_ids):
@@ -635,37 +757,46 @@ class TQWorkerMixin:
                 "deferred route tags must align with sample_ids: "
                 f"{len(tags)} tags for {len(meta.sample_ids)} rows"
             )
-        encoded_plans = []
         for index, tag in enumerate(tags):
             if ROUTE_PLAN_TAG not in tag:
                 raise RuntimeError(
                     f"deferred route plan missing for row {meta.sample_ids[index]!r}"
                 )
-            encoded_plans.append(tag[ROUTE_PLAN_TAG])
-        plans = [decode_route_plan(plan) for plan in encoded_plans]
-        fragments_by_row, _, _ = self._route_fragments_by_row(encoded_plans)
+        return [decode_route_plan(tag[ROUTE_PLAN_TAG]) for tag in tags]
 
-        # The worker supplies real model dims — the authoritative shape check.
-        num_moe_layers, top_k = self._routed_experts_dimensions()
-        input_ids = data["input_ids"]
-        input_lengths = data["input_lengths"].reshape(-1)
-        routed = torch.full(
-            (
-                len(meta.sample_ids),
-                int(input_ids.shape[1]),
-                num_moe_layers,
-                top_k,
-            ),
+    def _assemble_routed_experts(
+        self,
+        meta: "KVBatchMeta",
+        data: BatchedDataDict[Any],
+        plans: list[Any],
+        fragments_by_row: list[dict[str, RouteFragment]],
+        *,
+        record_fallbacks: bool,
+    ) -> BatchedDataDict[Any]:
+        """Build the padded routes table from already-fetched fragments."""
+        from nemo_rl.models.generation.interfaces import (
+            ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+        )
+
+        # The worker supplies the real model layout — the authoritative shape
+        # check, and what lets a full-layer vLLM fragment be reduced to the
+        # MoE columns a hybrid model trains.
+        layout = self._routed_experts_layout()
+        num_moe_layers, top_k = layout.dims
+        input_lengths = data["input_lengths"].reshape(-1).cpu().long()
+        offsets = torch.nn.functional.pad(input_lengths.cumsum(0), (1, 0))
+        values = torch.full(
+            (int(offsets[-1]), num_moe_layers, top_k),
             ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
             dtype=torch.int16,
         )
         request_fallbacks: Counter[str] = Counter()
         for row_index, (plan, fragments) in enumerate(zip(plans, fragments_by_row)):
-            canonical_len = int(input_lengths[row_index].item())
+            canonical_len = int(input_lengths[row_index])
             tensor, reason = execute_route_plan(
                 plan,
                 fragments,
-                dims=(num_moe_layers, top_k),
+                layout=layout,
                 canonical_len=canonical_len,
             )
             if tensor is None:
@@ -673,17 +804,21 @@ class TQWorkerMixin:
                 # router for exactly these positions (counted, not fatal).
                 request_fallbacks[reason or "unknown"] += 1
             else:
-                routed[row_index, :canonical_len] = tensor
+                start = int(offsets[row_index])
+                values[start : start + canonical_len] = tensor
 
-        self._route_fallback_counts.update(request_fallbacks)
-        if request_fallbacks:
-            logging.getLogger(__name__).warning(
-                "deferred route fallback for %d/%d rollouts: %s",
-                sum(request_fallbacks.values()),
-                len(plans),
-                dict(request_fallbacks),
-            )
-        data[ROUTED_EXPERTS_FIELD] = routed
+        if record_fallbacks:
+            self._route_fallback_counts.update(request_fallbacks)
+            if request_fallbacks:
+                logging.getLogger(__name__).warning(
+                    "deferred route fallback for %d/%d rollouts: %s",
+                    sum(request_fallbacks.values()),
+                    len(plans),
+                    dict(request_fallbacks),
+                )
+        data[ROUTED_EXPERTS_FIELD] = torch.nested.nested_tensor_from_jagged(
+            values, offsets
+        )
         return data
 
     def _apply_packing_prep(self, data: BatchedDataDict[Any]) -> BatchedDataDict[Any]:
@@ -762,7 +897,7 @@ class TQWorkerMixin:
     def _local_coords(self) -> dict[str, int]:
         """This worker's (axis -> local-rank) mapping.
 
-        Subclasses MUST override: DTensor reads ``device_mesh``,
+        Subclasses MUST override: Automodel reads ``device_mesh``,
         Megatron reads ``parallel_state``. There's no honest default —
         a missing impl would silently make every rank a writeback
         leader and re-create the ``-601 ILLEGAL_CLIENT`` duplicate-write
@@ -922,7 +1057,7 @@ class TQWorkerMixin:
         """Per-rank logprob entrypoint. Fetch → packing prep → run → write back.
 
         Returns ``None`` — the per-token tensor is committed to TQ via
-        :meth:`_write_back_result_field` under ``prev_logprobs``.
+        :meth:`_write_back_result_field` under ``prev_logprobs``;
         Callers fetch it through :meth:`TQPolicy.read_from_dataplane` —
         skipping the Ray plasma roundtrip on the (B, S) tensor.
         ``del result`` drops the local reference before returning so the

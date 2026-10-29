@@ -33,6 +33,7 @@ _SPAN_EMITTING_DIRS = (
     _REPO / "nemo_rl" / "distributed",
     _REPO / "nemo_rl" / "data_plane",
     _REPO / "nemo_rl" / "environments",
+    _REPO / "nemo_rl" / "utils",
     _REPO / "examples",
 )
 
@@ -310,6 +311,10 @@ def _emitted_span_names(
     if called == "evaluate_span":
         algorithm = _string_arg(node)
         return {f"rl.{algorithm}.evaluate"} if algorithm else set()
+    if called == "checkpoint_finalize_span":
+        # Fixed name: CheckpointManager is shared across algorithms, so there
+        # is no algorithm to interpolate.
+        return {"rl.checkpoint.finalize"}
     if called == "efficiency_span":
         category = _string_arg(node)
         return {f"rl.{category.replace('/', '.')}"} if category else set()
@@ -342,6 +347,28 @@ def _data_plane_span_names() -> dict[str, str]:
     return names
 
 
+def _telemetry_module_span_names() -> dict[str, str]:
+    """``{name: where}`` for spans the metrics tee emits itself.
+
+    The tee builds spans from logged timings with the tracer directly, so no
+    span helper call names them; the module-level ``RL_*_SPAN`` constants do.
+    """
+    source = _REPO / "nemo_rl" / "telemetry" / "metrics.py"
+    where = source.relative_to(_REPO).as_posix()
+    return {
+        node.value.value: where
+        for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Constant)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id.startswith("RL_")
+            and target.id.endswith("_SPAN")
+            for target in node.targets
+        )
+    }
+
+
 def test_every_emitted_span_name_is_documented():
     """Direction is ``emitted <= documented``.
 
@@ -358,6 +385,7 @@ def test_every_emitted_span_name_is_documented():
     )
 
     emitted: dict[str, str] = dict(_data_plane_span_names())
+    emitted.update(_telemetry_module_span_names())
     for directory in _SPAN_EMITTING_DIRS:
         for source in _python_sources(directory):
             tree = ast.parse(source.read_text())
@@ -401,6 +429,7 @@ def test_every_registered_group_has_an_emitter():
         "startup_span": RLSpanGroup.SETUP,
         "setup_span": RLSpanGroup.SETUP,
         "evaluate_span": RLSpanGroup.U_EVALUATE,
+        "checkpoint_finalize_span": RLSpanGroup.CHECKPOINT,
         "efficiency_span": RLSpanGroup.EFFICIENCY,
         "traced_worker_init": RLSpanGroup.MODEL_INIT,
     }
@@ -450,19 +479,20 @@ def test_every_context_accepting_method_is_dispatched_with_a_carrier():
 
     dispatched: set[str] = set()
     unwired: dict[str, str] = {}
-    for source in _python_sources(_REPO / "nemo_rl"):
-        for node in ast.walk(ast.parse(source.read_text())):
-            if not isinstance(node, ast.Call):
-                continue
-            targets = _dispatch_targets(node, decorated, indirect)
-            if not targets:
-                continue
-            where = f"{source.relative_to(_REPO).as_posix()}:{node.lineno}"
-            for target, sends_carrier in targets:
-                if sends_carrier:
-                    dispatched.add(target)
-                else:
-                    unwired[target] = where
+    for directory in (_REPO / "nemo_rl", _REPO / "examples"):
+        for source in _python_sources(directory):
+            for node in ast.walk(ast.parse(source.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                targets = _dispatch_targets(node, decorated, indirect)
+                if not targets:
+                    continue
+                where = f"{source.relative_to(_REPO).as_posix()}:{node.lineno}"
+                for target, sends_carrier in targets:
+                    if sends_carrier:
+                        dispatched.add(target)
+                    else:
+                        unwired[target] = where
 
     assert not unwired, (
         "methods decorated with @accepts_trace_context whose dispatch site does "
@@ -641,6 +671,195 @@ def _keyword_string(node: ast.Call, name: str) -> str | None:
             value = keyword.value.value
             return value if isinstance(value, str) else None
     return None
+
+
+# The prefixes the Single-Controller logs completed rollout save/restore dicts
+# under. The tee maps these key by key onto ``rl.checkpoint.*``.
+_ROLLOUT_CHECKPOINT_PREFIXES = frozenset(
+    {"timing/rollout_checkpoint", "timing/rollout_recovery"}
+)
+# Snapshot identity, not a measurement: deliberately never a value or a label.
+_UNMAPPED_ROLLOUT_CHECKPOINT_KEYS = frozenset({"snapshot_sequence"})
+
+
+def _leaf_name(node: ast.expr) -> str | None:
+    """``x`` / ``self._x`` / ``args.x`` as ``x``, so aliases of one dict match."""
+    if isinstance(node, ast.Name):
+        return node.id.lstrip("_")
+    if isinstance(node, ast.Attribute):
+        return node.attr.lstrip("_")
+    return None
+
+
+def _dict_keys_assigned_to(tree: ast.AST, name: str) -> set[str]:
+    """String keys that reach the dict held under *name* within *tree*.
+
+    ``name = {...}`` (including a literal inside a conditional expression),
+    ``name["key"] = ...``, ``name.update({...}, key=...)`` and ``name |= {...}``.
+    """
+    keys: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "update"
+            and _leaf_name(node.func.value) == name
+        ):
+            for arg in node.args:
+                if isinstance(arg, ast.Dict):
+                    keys |= {
+                        key.value for key in arg.keys if isinstance(key, ast.Constant)
+                    }
+            keys |= {kw.arg for kw in node.keywords if kw.arg is not None}
+            continue
+        if (
+            isinstance(node, ast.AugAssign)
+            and isinstance(node.op, ast.BitOr)
+            and _leaf_name(node.target) == name
+            and isinstance(node.value, ast.Dict)
+        ):
+            keys |= {
+                key.value for key in node.value.keys if isinstance(key, ast.Constant)
+            }
+            continue
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        for target in targets:
+            if _leaf_name(target) == name:
+                for literal in ast.walk(value):
+                    if isinstance(literal, ast.Dict):
+                        keys |= {
+                            key.value
+                            for key in literal.keys
+                            if isinstance(key, ast.Constant)
+                        }
+            elif (
+                isinstance(target, ast.Subscript)
+                and _leaf_name(target.value) == name
+                and isinstance(target.slice, ast.Constant)
+            ):
+                keys.add(target.slice.value)
+    return keys
+
+
+def _copied_dict_sources(function: ast.AST, name: str) -> set[str]:
+    """Names whose dict *name* starts as a copy of: ``name = dict(source)``."""
+    sources: set[str] = set()
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.Assign)
+            and any(_leaf_name(target) == name for target in node.targets)
+            and isinstance(node.value, ast.Call)
+            and getattr(node.value.func, "id", None) == "dict"
+            and node.value.args
+        ):
+            source = _leaf_name(node.value.args[0])
+            if source is not None:
+                sources.add(source)
+    return sources
+
+
+def _logged_rollout_checkpoint_keys() -> set[str]:
+    """Every key the controller logs under a rollout save/restore prefix.
+
+    The restore dict is assembled across processes and files -- started in
+    setup.py, carried to the controller on its actor args, then extended and
+    totalled there -- so a key added at any of those sites is followed.
+    """
+    trees = [
+        ast.parse(source.read_text())
+        for source in (
+            _ALGORITHMS / "single_controller.py",
+            _ALGORITHMS / "single_controller_utils" / "setup.py",
+        )
+    ]
+    keys: set[str] = set()
+    for tree in trees:
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for call in ast.walk(function):
+                if not (
+                    isinstance(call, ast.Call)
+                    and getattr(call.func, "attr", None) == "_log_telemetry_metrics"
+                    and _keyword_string(call, "prefix") in _ROLLOUT_CHECKPOINT_PREFIXES
+                    and call.args
+                ):
+                    continue
+                logged = call.args[0]
+                if isinstance(logged, ast.Dict):
+                    keys |= {
+                        key.value
+                        for key in logged.keys
+                        if isinstance(key, ast.Constant)
+                    }
+                    continue
+                name = _leaf_name(logged)
+                assert name is not None, (
+                    f"{function.name} logs a rollout checkpoint dict this test "
+                    "cannot follow; log a named dict or a dict literal"
+                )
+                keys |= _dict_keys_assigned_to(function, name)
+                for source in _copied_dict_sources(function, name):
+                    for other in trees:
+                        keys |= _dict_keys_assigned_to(other, source)
+    return keys
+
+
+def _mapped_rollout_checkpoint_keys() -> set[str]:
+    """Logger keys the tee maps onto ``rl.checkpoint.*``."""
+    tree = ast.parse((_REPO / "nemo_rl" / "telemetry" / "metrics.py").read_text())
+    keys: set[str] = set()
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Dict)
+            and any(
+                _leaf_name(target)
+                in ("CHECKPOINT_DURATION_PHASES", "CHECKPOINT_LEVELS")
+                for target in node.targets
+            )
+        ):
+            keys |= {
+                key.value for key in node.value.keys if isinstance(key, ast.Constant)
+            }
+    return keys
+
+
+def test_rollout_checkpoint_mapping_matches_logged_keys():
+    """A rollout save/restore key the tee does not map never reaches Lens.
+
+    The controller sums restore phases by suffix precisely so a new timer
+    cannot be left out of ``total_load_seconds``; the tee's explicit mapping is
+    the second inventory that can still miss it. W&B would show the new key,
+    the restore total would include it, and Lens would never see it. The
+    reverse direction catches a mapped key the controller no longer logs.
+    """
+    logged = _logged_rollout_checkpoint_keys()
+    # Sanity: one key from each assembly site, or the comparisons are vacuous.
+    assert {
+        "total_save_seconds",  # save dict literal
+        "snapshot_resolution_seconds",  # setup.py restore dict
+        "tq_load_seconds",  # setup.py / actor-args restore dict extension
+        "total_load_seconds",  # controller restore total
+        "redispatch_schedule_seconds",  # redispatch dict literal
+    } <= logged, f"key collector has gone stale; found only {sorted(logged)}"
+
+    mapped = _mapped_rollout_checkpoint_keys()
+    unmapped = logged - _UNMAPPED_ROLLOUT_CHECKPOINT_KEYS - mapped
+    assert not unmapped, (
+        "rollout checkpoint keys logged but not mapped to rl.checkpoint.* in "
+        f"nemo_rl/telemetry/metrics.py: {sorted(unmapped)}"
+    )
+    stale = mapped - logged
+    assert not stale, (
+        "rl.checkpoint.* mapping names keys the controller no longer logs: "
+        f"{sorted(stale)}"
+    )
 
 
 def _span_names_in(markdown: str) -> set[str]:

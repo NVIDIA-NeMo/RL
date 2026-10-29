@@ -17,9 +17,10 @@ import random
 import socket
 import sys
 import time
-from typing import NamedTuple, NotRequired, Optional, Sequence, TypedDict
+from typing import NamedTuple, Optional, Sequence
 
 import ray
+from pydantic import BaseModel
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -42,9 +43,13 @@ RAY_CLUSTER_SOURCE_ATTR = "rl.ray.cluster_source"
 RAY_CLUSTER_EXTERNAL = "attached_external"
 RAY_CLUSTER_REUSED_LOCAL = "reused_local"
 RAY_CLUSTER_STARTED_LOCAL = "started_local"
+# See nemo_rl.distributed.ray_worker_setup.
+_WORKER_PROCESS_SETUP_HOOK = (
+    "nemo_rl.distributed.ray_worker_setup.ray_worker_process_setup"
+)
 
 
-class ClusterConfig(TypedDict):
+class ClusterConfig(BaseModel, extra="allow"):
     gpus_per_node: int
     num_nodes: int
     # Port range for the distributed master address (TCPStore / NCCL rendezvous)
@@ -53,11 +58,10 @@ class ClusterConfig(TypedDict):
     # TOCTOU collisions with kernel-assigned source ports.  When absent,
     # RayVirtualCluster falls back to DEFAULT_MASTER_PORT_RANGE_LOW/HIGH
     # (1400-1999).  See ray.sub for the full port layout.
-    master_port_range_low: NotRequired[int]
-    master_port_range_high: NotRequired[int]
-    segment_size: NotRequired[
-        int | None
-    ]  # Nodes per NVLink domain segment for topology-aware alignment; None to disable
+    master_port_range_low: Optional[int] = None
+    master_port_range_high: Optional[int] = None
+    # Nodes per NVLink domain segment for topology-aware alignment; None to disable
+    segment_size: Optional[int] = None
 
 
 # Get the directory path of the current module and the root of the package
@@ -160,6 +164,9 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #                                                 sidecar per allocated node, driver included)
 #   6001-6999    NeMo-Skills sandbox uWSGI       (SANDBOX_BASE_PORT)
 #   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)
+#   [8300, 8556) PD-disagg frontends             (generation.disaggregation.frontend_base_port;
+#                                                 carved out of the vLLM band like SGLang below,
+#                                                 256 = the replicas * frontends cap)
 #   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
 #                                                 carved out of the vLLM band — only one rollout
 #                                                 backend runs at a time)
@@ -185,6 +192,13 @@ DEFAULT_VLLM_PORTS_PER_ENGINE = 100
 # safe because only one rollout backend runs at a time, and a vLLM run only
 # climbs past 8600 with >=16 engines on a single node.  Both bands also steer
 # clear of the Ray dashboard carve-out at 8265 (see ray.sub).
+# PD-disagg frontend ports: deterministic, base + replica_idx *
+# num_frontend_workers + frontend_idx, so a restarted frontend re-binds the URL
+# Gym holds. Carved out of the vLLM band (TRT-LLM is the only backend with
+# disaggregation) above the Ray dashboard at 8265; 256 ports is the
+# replicas * frontends cap that TRT-LLM's request ids impose.
+DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW = 8300
+DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH = 8556
 DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW = 8600
 DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH = 8799
 DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW = 8800
@@ -447,20 +461,6 @@ def _init_ray(log_dir: Optional[str] = None) -> str:
     Returns:
         How the cluster was obtained: one of the ``RAY_CLUSTER_*`` constants.
     """
-    # Strip MPI/PMIx/SLURM launcher vars from the driver env before they get
-    # captured into runtime_env (both by `dict(os.environ)` below and by
-    # RayWorkerGroup, which re-reads os.environ). Otherwise they are forwarded
-    # into every actor, where they cause two failures in the TRT-LLM generation
-    # worker: (1) PMIX_/SLURM_STEP_ID make OMPI's MPI_Init abort with "OMPI was
-    # not built with SLURM's PMI support"; (2) any residual OMPI_/MPI_/SLURM_
-    # var makes TRT-LLM think it runs under an MPI launcher and pick the MPI
-    # orchestrator (MPI_Comm_Spawn -> MPI_ERR_SPAWN) instead of the Ray
-    # orchestrator. init_ray() runs before any worker group is built, so
-    # popping here cleans the env for all downstream captures.
-    for _k in list(os.environ):
-        if _k.startswith(("PMIX_", "PMI_", "MPI_", "OMPI_", "SLURM_")):
-            os.environ.pop(_k, None)
-
     # Ray actors deserialize constructor arguments before importing NeMo-RL.
     # Put Hugging Face's generated ``transformers_modules`` package on the
     # cluster-wide PYTHONPATH so trust_remote_code objects can be unpickled at
@@ -470,6 +470,11 @@ def _init_ray(log_dir: Optional[str] = None) -> str:
 
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
+        # A module path, not the function: Ray rewrites a callable hook's
+        # runtime_env entry to its bare name, so a nested ray.init (vLLM's
+        # EngineCore at TP>1) sees a hook that no longer matches and refuses
+        # to connect.
+        "worker_process_setup_hook": _WORKER_PROCESS_SETUP_HOOK,
     }
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
@@ -1283,6 +1288,62 @@ class RayVirtualCluster:
             f"to pin nodes to complete segments before creating this cluster."
         )
         return reordered_bundle_indices
+
+    def get_topology_sorted_pg_indices(self) -> list[int]:
+        """Placement group indices ordered by physical topology.
+
+        The unified-PG path sorts *bundles* (see ``_get_sorted_bundle_indices``),
+        but with per-node placement groups the caller consumes whole PGs, and Ray
+        decides which physical node backs each one. Two PGs that are adjacent in
+        creation order can therefore sit in different NVLink domains, which for a
+        consumer whose unit spans several nodes (a TRT-LLM disaggregated replica,
+        say) silently demotes its inter-node traffic from NVLink to InfiniBand.
+
+        Sorting by ``(nvlink_domain's smallest topo_rank, topo_rank)`` puts nodes
+        of one domain next to each other, so consecutive PGs belong to the same
+        domain wherever the allocation allows it. Ordering *within* a domain is
+        not a bandwidth concern (an NVL72 fabric is uniform) but keeps a given
+        config reproducible across runs.
+
+        Returns:
+            Indices into ``get_placement_groups()``. Falls back to the existing
+            order when the cluster is CPU-only, is a single unified PG, or has no
+            topology information -- ordering is an optimization, never a
+            requirement.
+        """
+        pgs = self.get_placement_groups()
+        identity = list(range(len(pgs)))
+        if not self.use_gpus or len(pgs) <= 1:
+            return identity
+
+        topology = get_ray_cluster_topology()
+        if not any(domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()):
+            return identity
+
+        node_of_pg: list[str] = []
+        for pg in pgs:
+            bundles_to_node = placement_group_table(pg)["bundles_to_node_id"]
+            if not bundles_to_node:
+                return identity
+            node_of_pg.append(next(iter(bundles_to_node.values())))
+        if any(node_id not in topology for node_id in node_of_pg):
+            return identity
+
+        # Rank domains by their smallest topo_rank so domain order is stable and
+        # follows the fabric, not dict iteration order.
+        domain_rank: dict[str, int] = {}
+        for domain, topo_rank in topology.values():
+            if domain not in domain_rank or topo_rank < domain_rank[domain]:
+                domain_rank[domain] = topo_rank
+
+        return sorted(
+            identity,
+            key=lambda i: (
+                domain_rank[topology[node_of_pg[i]][0]],
+                topology[node_of_pg[i]][1],
+                i,
+            ),
+        )
 
     def shutdown(self) -> bool:
         """Cleans up and releases all resources associated with this virtual cluster.

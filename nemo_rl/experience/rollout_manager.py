@@ -65,6 +65,7 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.reward_penalties import RewardLogContext, compute_reward_checks
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
@@ -74,6 +75,7 @@ from nemo_rl.experience.rollout_recovery import (
     SiblingSealResult,
 )
 from nemo_rl.experience.rollouts import (
+    _SHARED_GENRM_METRICS,
     EffortLevelsConfig,
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
@@ -81,11 +83,13 @@ from nemo_rl.experience.rollouts import (
     _effort_shaping_metrics,
     _EffortShapingMetrics,
     _find_routed_experts_template,
+    _nemo_gym_group_metrics,
     _tensorize_by_key,
     apply_reward_penalties,
     attach_static_multimodal_payload,
     calculate_rewards,
     compute_reward_penalty_metrics,
+    nemo_gym_rollout_hit_max_tokens,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -96,6 +100,8 @@ from nemo_rl.telemetry.instrumentation import (
     dispatch_with_trace_context,
     in_per_prompt_scope,
 )
+from nemo_rl.utils.routed_experts_codec import slice_routed_experts
+from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -830,7 +836,9 @@ class AsyncRolloutImpl:
                     "message_log token length does not match generation input_length "
                     f"({prefix_length} != {input_len})."
                 )
-            assistant_message["routed_experts"] = routed_experts[input_len:total_len]
+            assistant_message["routed_experts"] = slice_routed_experts(
+                routed_experts, input_len, total_len
+            )
 
         # Calculate generation metrics
         gen_metrics: dict[str, Any] = {}
@@ -1008,19 +1016,31 @@ class AsyncNemoGymRolloutImpl:
             on_completion=on_completion,
             recovery_granularity=recovery_granularity,
         )
-        # Token-capture receipt rows carry empty message logs by design — the
-        # canonical row (and any media it needs) is rebuilt by the finalizer
-        # from the capture ledger, so there is nothing here to attach media to
-        # and the fewer-user-turns guard would reject every receipt group.
+        # Token-capture receipt rows carry empty message logs by design: the
+        # finalizer rebuilds the canonical row (and its media) from the capture
+        # ledger, and attach_static_multimodal_payload's fewer-user-turns guard
+        # would reject every receipt group.
         receipt_mode = bool(completions) and "ng_receipt" in (
             completions[0].env_extras or {}
         )
         if not receipt_mode:
             source_message_log = input_sample["message_log"]
-            attach_static_multimodal_payload(prompt_message_log, source_message_log)
+            # Prompt and completion logs may alias message dictionaries. Share
+            # one identity set so rollout-matched media cannot be overwritten
+            # through a second view after its marker is consumed.
+            processed_target_ids: set[int] = set()
+            attach_static_multimodal_payload(
+                prompt_message_log,
+                source_message_log,
+                processed_target_ids=processed_target_ids,
+                tokenizer=self._tokenizer,
+            )
             for completion in completions:
                 attach_static_multimodal_payload(
-                    completion.message_log, source_message_log
+                    completion.message_log,
+                    source_message_log,
+                    processed_target_ids=processed_target_ids,
+                    tokenizer=self._tokenizer,
                 )
 
         timer.stop(f"{timer_prefix}/total")
@@ -1183,16 +1203,27 @@ class AsyncNemoGymRolloutImpl:
                 raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
             received.add(rowidx)
             inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
-            # A streamed completion may become durable recovery ownership before
-            # the rest of its prompt group finishes. Shape its reward first so a
-            # checkpoint never preserves a raw reward that finalization will later
-            # train on. The shaping rule is row-local; aggregation below is metrics
-            # only.
-            shaping_by_rowidx[rowidx] = _apply_effort_shaping(
-                [result],
-                [inputs_by_rowidx[rowidx]],
-                self._effort_config,
-            )
+            if "receipt" in result:
+                result["reward_checks"] = compute_reward_checks(
+                    result["full_result"], inputs_by_rowidx[rowidx], self._effort_config
+                )
+                result["reward_log_context"] = RewardLogContext(
+                    agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
+                    full_result_json=json.dumps(
+                        {
+                            key: value
+                            for key, value in result["full_result"].items()
+                            if key != "reward"
+                        },
+                        separators=(",", ":"),
+                    )
+                    if self._log_full_result_tables
+                    else None,
+                )
+            else:
+                shaping_by_rowidx[rowidx] = _apply_effort_shaping(
+                    [result], [inputs_by_rowidx[rowidx]], self._effort_config
+                )
             results[rowidx] = result
             if on_completion is not None:
                 # Use the same conversion path as completed groups so streamed
@@ -1200,6 +1231,10 @@ class AsyncNemoGymRolloutImpl:
                 # Completion callbacks are token-capture receipt-only, making this
                 # conversion lightweight and safe to repeat during group metrics.
                 row_completions, _ = self._results_to_completions([result])
+                assert row_completions[0].env_extras is not None
+                row_completions[0].env_extras["agent_ref"] = copy.deepcopy(
+                    resolved_agent_ref
+                )
                 await on_completion(rowidx, row_completions[0])
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
@@ -1368,13 +1403,22 @@ class AsyncNemoGymRolloutImpl:
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
             rollout_metrics = self._compute_rollout_metrics(
-                completions, _nemo_gym_metric_namespace(inputs[0])
+                completions,
+                _nemo_gym_metric_namespace(inputs[0]),
+                full_results=[
+                    result.get("full_result") or {} for result in completed_results
+                ],
             )
+            # Receipt metrics come from their manifests, not token-bearing results.
+            receipt_mode = bool(completed_results) and "receipt" in completed_results[0]
+            if not receipt_mode:
+                rollout_metrics.update(_nemo_gym_group_metrics(completed_results))
             # Same helper the batched path uses, so the two cannot drift apart.
             rollout_metrics.update(_effort_shaping_metrics(shaping))
             rollout_metrics.update(
                 self._compute_reward_penalty_metrics(
-                    penalty_counts, len(completed_results)
+                    penalty_counts,
+                    sum("receipt" not in result for result in completed_results),
                 )
             )
 
@@ -1405,15 +1449,24 @@ class AsyncNemoGymRolloutImpl:
                 "generation_logprobs",
             )
 
-        # Same gate as the batched path: when masking is off, drop the env mask
-        # flag so later batch building never sees it. Receipt rollouts take the
-        # same gate because the capture finalization request reads the flag
-        # from the completion's env_extras.
-        if not self._mask_env_flagged_samples:
-            for result in results:
-                (result["full_result"].get("instance_config") or {}).pop(
-                    "mask_sample", None
-                )
+        def completion_extras(full_result: dict) -> dict:
+            # Same gate as the batched path: when masking is off, the completion
+            # carries no env mask flag so later batch building never sees it.
+            # Receipt rollouts take the same gate because the capture
+            # finalization request reads the flag from the completion's
+            # env_extras. The gate works on copies: the caller's result keeps
+            # both forms of the flag, so the per-agent metrics still report the
+            # flagged rate while the flag is not honored.
+            if self._mask_env_flagged_samples:
+                return full_result
+            extras = dict(full_result)
+            extras.pop(MASK_SAMPLE, None)
+            instance_config = extras.get("instance_config")
+            if isinstance(instance_config, dict):
+                extras["instance_config"] = {
+                    k: v for k, v in instance_config.items() if k != MASK_SAMPLE
+                }
+            return extras
 
         penalty_counts = apply_reward_penalties(
             token_results, self._reward_penalty_config
@@ -1421,9 +1474,11 @@ class AsyncNemoGymRolloutImpl:
         completions = []
         for result in results:
             if "receipt" in result:
-                env_extras = dict(result["full_result"])
+                env_extras = dict(completion_extras(result["full_result"]))
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
+                env_extras["ng_reward_checks"] = result.get("reward_checks")
+                env_extras["ng_reward_log_context"] = result.get("reward_log_context")
                 completions.append(
                     Completion(
                         message_log=result["message_log"],
@@ -1436,14 +1491,15 @@ class AsyncNemoGymRolloutImpl:
                     )
                 )
                 continue
-            truncated = (
-                sum(len(m["token_ids"]) for m in result["message_log"])
-                == self._max_seq_len
+            truncated = nemo_gym_rollout_hit_max_tokens(
+                result["full_result"],
+                total_tokens=sum(len(m["token_ids"]) for m in result["message_log"]),
+                max_total_tokens_per_sample=self._max_seq_len,
             )
             completions.append(
                 Completion(
                     message_log=result["message_log"],
-                    env_extras=result["full_result"],
+                    env_extras=completion_extras(result["full_result"]),
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
                 )
@@ -1464,8 +1520,16 @@ class AsyncNemoGymRolloutImpl:
         self,
         completions: list[Completion],
         agent_name: str,
+        full_results: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
-        """Aggregate per-sample and per-agent metrics."""
+        """Aggregate per-sample and per-agent metrics.
+
+        ``full_results`` are the Gym results the completions were built from,
+        aligned with them. When given, the per-agent metrics aggregate those
+        rather than the completions' env_extras, so a field the completion
+        conversion drops on purpose (the env mask flag under
+        ``env.should_mask_flagged_samples: false``) is still reported.
+        """
         # Prepare lists of values for each metric.
         total_reward = [c.reward for c in completions]
         receipt_mode = bool(completions) and "ng_receipt" in (
@@ -1529,8 +1593,13 @@ class AsyncNemoGymRolloutImpl:
 
         # Aggregate metrics across all samples.
         n = len(completions)
+        truncation_rate = sum(truncated) / n
         rollout_metrics: dict[str, Any] = {
-            **calculate_single_metric(total_reward, n, "total_reward"),
+            **(
+                calculate_single_metric(total_reward, n, "total_reward")
+                if not receipt_mode
+                else {}
+            ),
             # turn metrics
             **calculate_single_metric(turn_count, n, "turns_per_sample"),
             "turns_per_sample/p95": pct(turn_count, 95),
@@ -1544,16 +1613,28 @@ class AsyncNemoGymRolloutImpl:
             "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
             # truncated metrics
             "natural_termination_rate": sum(not t for t in truncated) / n,
-            "truncation_rate": sum(truncated) / n,
+            "truncation_rate": truncation_rate,
+            f"{agent_name}/truncation_rate": truncation_rate,
         }
 
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
-        agent_extras = [
-            {k: v for k, v in (c.env_extras or {}).items() if k not in ("ng_receipt",)}
-            for c in completions
-        ]
+        if full_results is not None:
+            agent_extras = [dict(full_result) for full_result in full_results]
+        else:
+            agent_extras = [
+                {
+                    k: v
+                    for k, v in (c.env_extras or {}).items()
+                    if k
+                    not in ("ng_receipt", "ng_reward_checks", "ng_reward_log_context")
+                    and not (receipt_mode and k == "reward")
+                }
+                for c in completions
+            ]
         for key in agent_extras[0].keys():
+            if key in _SHARED_GENRM_METRICS:
+                continue
             values = [
                 float(r[key])  # type: ignore
                 for r in agent_extras
@@ -1563,7 +1644,21 @@ class AsyncNemoGymRolloutImpl:
                 rollout_metrics.update(
                     calculate_single_metric(values, n, f"{agent_name}/{key}")
                 )
-        if self._log_full_result_tables:
+
+        # Emit authoritative live token metrics after full-result metrics so
+        # similarly named environment metadata cannot overwrite them. In receipt
+        # mode these come from the manifest-derived token counts above.
+        rollout_metrics.update(
+            calculate_single_metric(
+                total_tokens, n, f"{agent_name}/total_tokens_per_sample"
+            )
+        )
+        rollout_metrics.update(
+            calculate_single_metric(
+                assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
+            )
+        )
+        if self._log_full_result_tables and not receipt_mode:
             rollout_metrics[f"{agent_name}/full_result"] = Table(
                 data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
                 columns=["Full result"],
@@ -2250,6 +2345,14 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain environment extras"
                 )
+            agent_ref = env_extras.get("agent_ref")
+            resolved_agent_name = (
+                agent_ref.get("name") if isinstance(agent_ref, dict) else None
+            )
+            if not isinstance(resolved_agent_name, str) or not resolved_agent_name:
+                raise ValueError(
+                    "token-capture completion requires resolved agent_ref.name"
+                )
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
@@ -2281,10 +2384,9 @@ class RolloutManager:
                     f"expected={gate_rollout_id!r}"
                 )
             mask_sample = bool(
-                (
-                    ((completion.env_extras or {}).get("instance_config") or {}).get(
-                        MASK_SAMPLE, False
-                    )
+                (completion.env_extras or {}).get(MASK_SAMPLE)
+                or ((completion.env_extras or {}).get("instance_config") or {}).get(
+                    MASK_SAMPLE, False
                 )
             )
 
@@ -2294,6 +2396,9 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    resolved_agent_name=resolved_agent_name,
+                    reward_checks=env_extras.get("ng_reward_checks"),
+                    reward_log_context=env_extras.get("ng_reward_log_context"),
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2323,6 +2428,9 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    resolved_agent_name=resolved_agent_name,
+                    reward_checks=env_extras.get("ng_reward_checks"),
+                    reward_log_context=env_extras.get("ng_reward_log_context"),
                 )
 
         try:
@@ -2354,22 +2462,25 @@ class RolloutManager:
                 receipts,
                 rewards,
                 mask_sample,
+                reward_checks,
+                reward_log_contexts,
             ) = self._recovery_ledger.finalization_inputs(group_id)
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
                 canonical_sample_ids=tuple(canonical_sample_ids),
                 receipts=tuple(receipts),
+                reward_checks=tuple(reward_checks),
+                reward_log_contexts=tuple(reward_log_contexts),
                 rewards=tuple(rewards),
                 fallback_weight_version=start_version,
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
+                resolved_agent_name=self._recovery_ledger.get_group(
+                    group_id
+                ).resolved_agent_name,
             )
-            from nemo_rl.experience.rollout_reassembler_actor import (
-                assert_metadata_only,
-            )
-
             assert_metadata_only(request)
             return request
         except BaseException:

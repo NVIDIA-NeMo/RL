@@ -37,7 +37,7 @@ uv run --group test coverage run -a \
     --config ${PROJECT_ROOT}/examples/configs/grpo_math_1B_trtllm.yaml \
     policy.model_name=Qwen/Qwen2.5-0.5B \
     policy.tokenizer.name=Qwen/Qwen2.5-0.5B \
-    policy.dtensor_cfg.enabled=false \
+    policy.automodel_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
     policy.make_sequence_length_divisible_by=1 \
     policy.max_total_sequence_length=512 \

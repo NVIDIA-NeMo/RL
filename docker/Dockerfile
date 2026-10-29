@@ -24,8 +24,26 @@
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 # Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
 #   --build-arg BUILD_DYNAMO=1
+# Optional: drop the uv cache from the image (smaller, but no offline `uv run --extra`):
+#   --build-arg STRIP_UV_CACHE=1
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
+# Global so every stage's uv cache mount id (BASE_IMAGE-UV_VERSION-HYBRID_EP_MULTINODE)
+# can redeclare it bare and stay in sync -- a single-node-built DeepEP wheel is not
+# safe to reuse for a multi-node build, so this must be part of the cache identity,
+# not just a fixed hermetic-stage ENV.
+ARG HYBRID_EP_MULTINODE=1
+# Unprivileged runtime identity (for example the NeMo CI agent workloads) that owns the shared
+# uv cache and the prebuilt venvs. The image still runs as root by default.
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+# Set to any non-empty value to delete the materialized uv cache from the final image
+# after every uv-writing layer, trading the RUNTIME_UID's offline `uv run --extra
+# <backend>` capability (see UV_CACHE_DIR below) for a smaller image. The BuildKit
+# cache mount that backs the materialized copy is unaffected either way -- this only
+# controls what ends up in the committed layers. Off by default (main/nightly keep the
+# cache); size-sensitive builds (e.g. nemotron) opt in with --build-arg STRIP_UV_CACHE=1.
+ARG STRIP_UV_CACHE
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -46,11 +64,18 @@ FROM scratch AS trtllm-ccache-seed
 # empty when periodically compacting the cache into a full snapshot.
 FROM scratch AS trtllm-wheel-cache-output-base
 FROM scratch AS trtllm-ccache-output-base
+FROM scratch AS uv-cache-output-base
 
 # Default custom-setup stage: installs apptainer.
 # Override with: --build-context custom-setup=<your-dir>
 FROM scratch AS custom-setup
 COPY docker/install_apptainer.sh /
+
+# Shared helper for the uv cache mount's materialize/sync-back/strip dance
+# (docker/uv_cache_mount.sh), bind-mounted into every uv-writing RUN below so
+# the logic lives in one place instead of being pasted into each RUN body.
+FROM scratch AS uv-cache-helper
+COPY docker/uv_cache_mount.sh /
 
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
@@ -74,13 +99,26 @@ apt-get install -y --no-install-recommends \
     vim \
     ccache \
     protobuf-compiler \
+    libzmq3-dev \
 
-# Nsight
+# Nsight: install a pinned release from NVIDIA's devtools apt repo instead of
+# the CUDA base image's bundled copy, which is built against an outdated Go
+# toolchain with known CVEs. Also remove that bundled copy outright, and pin
+# an exact version + signed-by keyring instead of the previous unpinned
+# install with a mismatched (CUDA repo) apt-key. Same fix as
+# NVIDIA-NeMo/Gym#3739 and NVIDIA-NeMo/Megatron-Bridge#6128.
 apt install -y --no-install-recommends gnupg
-echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list
-apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(uname -m | sed 's/aarch64/sbsa/')/7fa2af80.pub
+rm -rf /usr/local/cuda*/NsightSystems-cli-* /opt/nvidia/nsight-systems*
+apt-get remove --purge -y --allow-change-held-packages 'nsight-systems*' || true
+NSYS_VERSION="2026.5.1.161-265138896106v0"
+NSYS_RELEASE=$(echo "${NSYS_VERSION}" | cut -d. -f1-3)
+NSYS_REPO="https://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture)"
+curl -fsSL "${NSYS_REPO}/nvidia.pub" -o /usr/share/keyrings/nvidia-devtools.asc
+echo "deb [signed-by=/usr/share/keyrings/nvidia-devtools.asc] ${NSYS_REPO}/ /" \
+    | tee /etc/apt/sources.list.d/nvidia-devtools.list
 apt update
-apt install -y nsight-systems-cli
+apt install -y --no-install-recommends "nsight-systems-cli-${NSYS_RELEASE}=${NSYS_VERSION}"
+rm -f /etc/apt/sources.list.d/nvidia-devtools.list /usr/share/keyrings/nvidia-devtools.asc
 
 # To fix CVE-2025-68973
 apt install -y --only-upgrade gnupg
@@ -95,6 +133,9 @@ apt-get autoremove -y
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
+
+# Grafana Alloy (Apache-2.0), started by ray.sub when LOKI_PUSH_URL is set.
+COPY --from=grafana/alloy:v1.18.0 /bin/alloy /usr/local/bin/alloy
 
 # CMake (for CUDA extension builds: transformer-engine, mamba-ssm, etc.)
 RUN GITHUB_ARTIFACTORY=github.com \
@@ -121,6 +162,10 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 ARG UV_VERSION=0.11.28
 ARG PYTHON_VERSION=3.13.14
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+# One uv cache for the build and for every runtime identity. It holds every wheel the venvs are
+# hardlinked from, so `uv run --extra <backend>` can install an extra offline. It lives outside
+# /root for the same reason as uv itself, and the layers that fill it hand it to RUNTIME_UID.
+ENV UV_CACHE_DIR=/opt/nemo_rl_cache/uv
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
         | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && \
     uv python install ${PYTHON_VERSION}
@@ -172,18 +217,26 @@ ARG SKIP_SGLANG_BUILD
 ARG SKIP_TRTLLM_BUILD
 ARG BASE_IMAGE
 ARG UV_VERSION
+ARG HYBRID_EP_MULTINODE
 ARG TARGETARCH
 ARG TRTLLM_CCACHE_MAXSIZE=20G
 ARG TRTLLM_BUILD_JOBS=24
-
+ARG RUNTIME_UID
+ARG RUNTIME_GID
+ARG STRIP_UV_CACHE
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
-# Build HybridEP with inter-node transport support.
-ENV HYBRID_EP_MULTINODE=1
+# Build HybridEP with inter-node transport support. Derived from the ARG (not
+# hardcoded) so a non-default --build-arg HYBRID_EP_MULTINODE=0 is reflected
+# consistently in this stage's cache mount IDs and in uv-cache-export's --
+# an ENV literal here would silently override the ARG for ${...} expansion
+# in this stage and its descendants, while uv-cache-export (FROM base, no
+# such ENV) would expand the real ARG value, desyncing the two cache IDs.
+ENV HYBRID_EP_MULTINODE=${HYBRID_EP_MULTINODE}
 
 # Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
 ENV CUDA_HOME=/usr/local/cuda
@@ -225,16 +278,27 @@ COPY --from=nemo-rl --link \
     3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
-    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
-CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}" | md5sum | cut -c1-12)
-SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
-if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
-    echo "Cache key mismatch (base image, uv version, or build mode changed) — skipping stale seed"
-elif [ -n "$SEED_KEY" ]; then
-    echo "Seeding uv cache (key=${CACHE_KEY})"
-    mkdir -p /root/.cache/uv
-    rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
-fi
+    --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+# /root/.uv-cache-store is a BuildKit cache mount: durable across builds on
+# this id (seeded from the :uv-cache registry image on first-ever use), but
+# never part of this or any layer's diff by construction. uv's installs below
+# use UV_LINK_MODE=hardlink, which needs the cache and the venvs on the SAME
+# filesystem -- hardlinks silently fall back to full copies across a mount
+# boundary. So materialize a plain working copy at UV_CACHE_DIR for this RUN
+# (hardlinking stays exactly as before), and sync it back on exit so new
+# downloads persist for the next build. This is the first uv-writing RUN in
+# the stage, so it force-copies the whole store in and prunes on sync-back
+# (see docker/uv_cache_mount.sh). Every later RUN in this stage that also
+# invokes uv (TRT-LLM build, Dynamo install, worker-venv prefetch phase 2,
+# Gym prefetch) sources the same helper but only tops up what it adds,
+# instead of re-shipping the whole store again in its own layer.
+# Whether the materialized copy also ships in the final image (for the
+# RUNTIME_UID's offline `uv run --extra <backend>`, see base) or is stripped
+# back out is controlled by STRIP_UV_CACHE below.
+source /tmp/uv-cache-helper/uv_cache_mount.sh
+uv_cache_restore force
+trap 'uv_cache_persist prune' EXIT
 
 uv venv --seed
 # The custom build scripts will alter the pyproject.toml and uv.lock
@@ -323,10 +387,19 @@ apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
-# The ray install will include the older aiohttp version in its cache
-find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+# Ray bundles an older aiohttp and yarl; remove both so the installed aiohttp
+# uses a compatible yarl instead of Ray's bundled copy.
+find "${UV_CACHE_DIR}" -type d \
+    \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
+       -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
-echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
+# Hand the cache and the venvs built from it to the runtime UID in the layer that creates
+# them. The venvs are hardlinked against the cache, so each inode changes owner once and
+# nothing is copied. A later layer could not do this without copying every file up, so this
+# stays unconditional even when STRIP_UV_CACHE is set -- the cache still exists at this
+# point (the trap above deletes it only on EXIT, after this chown has already run), and
+# skipping it here would force the final ownership sweep to copy up the whole venv instead.
+chown -R "${RUNTIME_UID}:${RUNTIME_GID}" "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
 EOF
 
 # Keep the frequently changing TRT-LLM build inputs after the other backend
@@ -335,10 +408,36 @@ EOF
 COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
 COPY --from=nemo-rl --link 3rdparty/TensorRT-LLM-workspace/ ./3rdparty/TensorRT-LLM-workspace/
 
+# NIXL is only consumed by the TRT-LLM wheel build below, so it is built inside
+# that block rather than in `base`. Keep in sync with the pinned TRT-LLM ref's
+# docker/common/install_nixl.sh; re-check on every [tool.trtllm].ref bump.
+#
+# Declared here rather than with the other ARGs: BuildKit puts ARG and ENV into
+# the environment of every later RUN, so declaring it above the dependency RUN
+# would make a NIXL bump bust that hour-long layer for every image, including
+# SKIP_TRTLLM_BUILD=1 ones.
+ARG NIXL_VERSION=v1.4.0
+# The NGC base image sets ENV NIXL_VERSION=1.0.1, and an ARG only changes the
+# build-time environment. Re-export so the image -- and _backend.py's wheel
+# cache key, since build_wheel.py bundles NIXL into the wheel -- see the
+# version actually built here.
+ENV NIXL_VERSION=${NIXL_VERSION}
+
 RUN --mount=type=ssh \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
-    --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked \
+    --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+# Same materialize/sync-back/strip dance as the dependency-install RUN above,
+# repeated here because a BuildKit cache mount only applies to the RUN
+# instruction it's declared on -- this RUN's own uv sync calls below need the
+# plain, same-filesystem UV_CACHE_DIR too. UV_CACHE_DIR already exists from
+# that layer, so this only tops it up if STRIP_UV_CACHE removed it there.
+source /tmp/uv-cache-helper/uv_cache_mount.sh
+uv_cache_restore
+trap 'uv_cache_persist' EXIT
+
 # Lock/pyproject consistency is verified LATE here, for the whole image. The
 # dependency syncs above run --frozen (read-only on uv.lock: they neither update
 # nor validate it), so this uv lock --check is the ONLY place a stale lock is
@@ -353,6 +452,80 @@ if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
     echo "SKIP_TRTLLM_BUILD is set; skipping the isolated TRT-LLM build"
     exit 0
 fi
+
+# KV cache transceiver (TRT-LLM prefill/decode disaggregation).
+#
+# TensorRT-LLM compiles every non-MPI cache-transceiver backend out of the wheel
+# unless it is built against UCX, and the NIXL backend additionally needs NIXL
+# headers/libs at cmake time (cpp/CMakeLists.txt only runs find_package(NIXL)
+# inside its ENABLE_UCX block). backend=DEFAULT resolves to NIXL, so an image
+# without NIXL can only serve an explicit backend=UCX.
+#
+# Built here rather than in `base` so SKIP_TRTLLM_BUILD images don't pay for it:
+# nothing outside the wheel build below consumes NIXL, and build_wheel.py
+# vendors both UCX and NIXL into the wheel with $ORIGIN rpaths, so the runtime
+# image needs neither on LD_LIBRARY_PATH.
+#
+# UCX itself ships in the NGC base image under /usr/local/ucx, but cmake's
+# find_package(ucx) does not search that prefix on its own -- hence ucx_ROOT.
+# libzmq (apt-installed in `base`) is the UCX wrapper's control plane: a hard
+# cmake requirement to build, and a runtime dependency on every node that runs
+# an engine, since the wrapper is dlopen()ed on the first KV transfer.
+export ucx_ROOT=/usr/local/ucx
+export LD_LIBRARY_PATH="/usr/local/ucx/lib:${LD_LIBRARY_PATH:-}"
+
+if [[ ! -d /usr/local/ucx/lib/cmake/ucx ]]; then
+    echo "UCX missing from the base image; NIXL's UCX plugin cannot build" >&2
+    exit 1
+fi
+
+(
+# NIXL builds with meson/ninja and links Python bindings against pybind11. Like
+# the other from-source builds in this repo (tools/build-custom-flashinfer.sh,
+# tools/build-custom-vllm.sh), the build-time Python deps go into a uv venv
+# rather than the system interpreter -- and this one is thrown away in the same
+# layer, so nothing survives into the runtime environment.
+uv venv /tmp/nixl-build-venv
+uv pip install --python /tmp/nixl-build-venv/bin/python meson ninja pybind11 setuptools
+export PATH="/tmp/nixl-build-venv/bin:${PATH}"
+
+GDS_PATH=/usr/local/cuda/targets/x86_64-linux
+if [[ "$(uname -m)" != "x86_64" ]]; then
+    GDS_PATH=/usr/local/cuda/targets/sbsa-linux
+fi
+# NIXL links against the CUDA driver stub, which does not live on the default
+# loader path inside the build container.
+CUDA_SO=$(find /usr/local -name libcuda.so.1 | head -n1)
+if [[ -z "${CUDA_SO}" ]]; then
+    echo "libcuda.so.1 not found under /usr/local; NIXL cannot link against the CUDA driver" >&2
+    exit 1
+fi
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$(dirname "${CUDA_SO}")"
+
+cd /tmp
+git clone --depth 1 -b "${NIXL_VERSION}" https://github.com/ai-dynamo/nixl.git
+cd nixl
+meson setup builddir \
+    -Ducx_path=/usr/local/ucx \
+    -Dcudapath_lib=/usr/local/cuda/lib64 \
+    -Dcudapath_inc=/usr/local/cuda/include \
+    -Dgds_path="${GDS_PATH}" \
+    -Dinstall_headers=true \
+    -Ddisable_plugins=POSIX \
+    -Dbuild_tests=false \
+    -Dbuild_examples=false \
+    --buildtype=release
+cd builddir && ninja install
+cd /tmp && rm -rf /tmp/nixl /tmp/nixl-build-venv
+)
+
+test -f /opt/nvidia/nvda_nixl/include/nixl.h
+# ldconfig rather than ENV: this runs inside a conditional block, so the arch
+# dir is discovered rather than hardcoded, and SKIP_TRTLLM_BUILD images get
+# neither the libraries nor the loader entry.
+NIXL_LIB=$(dirname "$(find /opt/nvidia/nvda_nixl -name libnixl.so -print -quit)")
+printf '%s\n' "${NIXL_LIB}" "${NIXL_LIB}/plugins" > /etc/ld.so.conf.d/nixl.conf
+ldconfig
 
 # These settings are build-only and intentionally do not persist in the final
 # NeMo-RL image. COMPILERCHECK=content is robust to compiler timestamp changes
@@ -374,7 +547,7 @@ rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ "${CCACHE_DIR}/"
 # current content-addressed wheel into /opt/trtllm_wheels, which IS part of this
 # layer; the release stage and runtime `uv run --extra trtllm` read it from there.
 echo "TRT-LLM cache state before build:"
-du -sh /root/.cache/uv /root/.cache/trtllm-wheels
+du -sh "${UV_CACHE_DIR}" /root/.cache/trtllm-wheels
 
 TRTLLM_SYNC_LOG=$(mktemp /tmp/trtllm-sync.XXXXXX.log)
 set +e
@@ -389,8 +562,7 @@ set +e
 # the registry cache and re-executes the release stage (any NeMo-RL source
 # change does that), the mount is empty there. The release stage reads the
 # wheel from this mirror instead of failing on TRTLLM_REQUIRE_CACHED_WHEEL.
-UV_CACHE_DIR=/root/.cache/uv \
-    TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
+TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
     TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels \
     UV_PROJECT_ENVIRONMENT=/tmp/trtllm-build-venv \
     uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
@@ -408,7 +580,7 @@ fi
 rm -f "$TRTLLM_SYNC_LOG"
 
 echo "TRT-LLM cache state after build:"
-du -sh /root/.cache/uv /root/.cache/trtllm-wheels
+du -sh "${UV_CACHE_DIR}" /root/.cache/trtllm-wheels
 
 # Worker-venv prefetch, phase 1 for the "trtllm"-stage actors:
 # the dependency layer gave them a base-only warm; now that the tensorrt_llm wheel exists,
@@ -435,7 +607,15 @@ rm -rf /tmp/trtllm-build-venv
 
 # The syncs above can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.
-find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+find "${UV_CACHE_DIR}" -type d \
+    \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
+       -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
+
+# Hand this layer's new cache and venv entries to the runtime UID. Entries from the
+# dependency layer already belong to it, so only files created here change owner and none
+# is copied up. Stays unconditional even when STRIP_UV_CACHE is set -- see the dependency
+# layer's chown above for why.
+find "${UV_CACHE_DIR}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -457,6 +637,9 @@ WORKDIR /opt/nemo-rl
 FROM hermetic AS release
 
 # Re-declare build args for this stage
+ARG BASE_IMAGE
+ARG UV_VERSION
+ARG HYBRID_EP_MULTINODE
 ARG BUILD_DYNAMO
 ARG DYNAMO_PYTHON_VERSION=3.12.11
 ARG ETCD_VERSION=v3.5.21
@@ -469,6 +652,9 @@ ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
 ARG RC_DATE=00.00
 ARG TARGETARCH
+ARG RUNTIME_UID
+ARG RUNTIME_GID
+ARG STRIP_UV_CACHE
 ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
 ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
 ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
@@ -494,23 +680,41 @@ COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 
 # Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
 # Ray/vLLM environments. Default image builds do not create this environment.
-RUN <<"EOF" bash -exu -o pipefail
+RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu -o pipefail
 if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
     echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
     exit 0
 fi
+# Same materialize/sync-back/strip dance as the other uv-writing RUNs --
+# docker/dynamo/install.sh calls uv sync with no explicit UV_CACHE_DIR override, so
+# it uses the image-wide UV_CACHE_DIR (set in base), which must be a plain
+# same-filesystem directory for hardlink installs. Already exists from the
+# hermetic stage unless STRIP_UV_CACHE removed it there.
+source /tmp/uv-cache-helper/uv_cache_mount.sh
+uv_cache_restore
+trap 'uv_cache_persist' EXIT
 bash docker/dynamo/install.sh
 EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN <<"EOF" bash -exu
+RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+# Same materialize/sync-back/strip dance as the dependency-install and
+# TRT-LLM RUNs -- this RUN's uv run/prefetch_venvs.py call below also needs
+# the plain, same-filesystem UV_CACHE_DIR to hardlink installs from. Already
+# exists from an earlier layer unless STRIP_UV_CACHE removed it there.
+source /tmp/uv-cache-helper/uv_cache_mount.sh
+uv_cache_restore
+trap 'uv_cache_persist' EXIT
+
 # Reuse the custom wheel the hermetic stage mirrored into /opt/trtllm_wheels
 # (the runtime default of the TRT-LLM build backend). It lives in that layer,
 # so it is present whether the TRT-LLM RUN executed on this builder or was
 # restored from the layer cache; do not read it from the builder-local cache
-# mount here. Normal uv artifacts stay in /root/.cache/uv.
+# mount here. Normal uv artifacts stay in UV_CACHE_DIR.
 export TRTLLM_WHEEL_CACHE_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # Worker-venv prefetch, phase 2: the nemo_rl project itself.
@@ -530,6 +734,12 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # deliberately skipped. prefetch_venvs.py matches these positionally as substrings,
 # and a full FQN matches only itself.
 UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py $(cut -f1 /opt/actor_venvs.tsv)
+# The editable installs, wrapper metadata, and build-backend wheels added above are new in
+# this layer; hand only those to the runtime UID so it can re-sync the venvs offline. Stays
+# unconditional even when STRIP_UV_CACHE is set -- see the dependency layer's chown above
+# for why.
+find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
+    -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
 EOF
 
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
@@ -539,12 +749,31 @@ EOF
 # themselves are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
 # UV_LINK_MODE=hardlink in the Gym actor's runtime_env, because Gym's setup scripts shell
 # out to `uv pip install --no-cache`, which uv refuses to combine with symlink installs.
-# Gym pins vllm==0.25.1; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
+# Gym pins vllm==0.29.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
-ARG NEMO_GYM_VLLM_VERSION=0.25.1
-RUN <<"EOF" bash -exu
+ARG NEMO_GYM_VLLM_VERSION=0.29.0
+RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
+    # ether0 imports rdkit, whose bundled cairo links these libraries. The dry run below
+    # starts ether0, and so does every job that runs it, but the base stage has no X11
+    # libraries. swe_agents' `playwright install --with-deps` adds them only sometimes, and
+    # never when no swe_agents config precedes ether0, so install them here. The install
+    # stays inside this gate, so images built without prefetch configs don't get them.
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends libexpat1 libx11-6 libxext6 libxrender1
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+    # Same materialize/sync-back/strip dance as the other uv-writing RUNs.
+    # The outer `uv run` here is symlink-mode (safe across the mount), but
+    # prefetch_venvs.py's inner Gym venvs install with UV_LINK_MODE=hardlink,
+    # which needs the plain same-filesystem UV_CACHE_DIR. Already exists from
+    # an earlier layer unless STRIP_UV_CACHE removed it there.
+    source /tmp/uv-cache-helper/uv_cache_mount.sh
+    uv_cache_restore
+    trap 'uv_cache_persist' EXIT
     case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
     GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
     printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_28_%s.whl\n' \
@@ -555,6 +784,14 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
 EOF
+# ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
+# (GHSA-hf6x-8p5f-cgmf). NeMo-RL never uses Ray's Java cross-language worker,
+# and removing the jar doesn't affect ray.init(), remote tasks, actors, or
+# ray.serve (verified in NVIDIA-NeMo/Gym#3779/#3826). Sweep every venv (base,
+# per-backend worker venvs, gym-prefetched venvs) and the shared uv cache
+# (UV_CACHE_DIR, under /opt) that it could have landed in; /root still holds the
+# builder-local TRT-LLM caches.
+RUN find /opt /root -name ray_dist.jar -delete
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
 RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
@@ -567,9 +804,8 @@ RUN echo "This distribution includes open source which is archived at the follow
 # image, which stays root by default. Create its home and the writable runtime paths callers
 # point caches and sources at, and hand it the prebuilt environment roots so it can create
 # entries there. Only the directories change owner: a recursive chown would copy every
-# hardlinked venv file into this layer.
-ARG RUNTIME_UID=65532
-ARG RUNTIME_GID=65532
+# hardlinked venv file into this layer. The uv cache and the venv contents already belong to
+# it; the layers that created them set that.
 RUN <<"EOF" bash -exu
 getent group "${RUNTIME_GID}" >/dev/null || groupadd --gid "${RUNTIME_GID}" nemo-runtime
 getent passwd "${RUNTIME_UID}" >/dev/null || useradd --no-log-init --uid "${RUNTIME_UID}" \
@@ -577,6 +813,15 @@ getent passwd "${RUNTIME_UID}" >/dev/null || useradd --no-log-init --uid "${RUNT
 install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /home/nemo-runtime /nemo_run \
     "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python
 chown "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
+# Sweep up anything still root-owned in the cache and venvs (the arm64 build left
+# nvidia/cusparselt root-owned). The runtime UID must be able to remove and replace files there
+# when it re-syncs offline. Only root-owned entries are touched, so files that already belong to
+# the runtime UID stay as they are and are not copied into this layer.
+find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
+    -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
+# Local build contexts can come from a checkout with umask 0007. COPY preserves those
+# root-owned modes; the runtime UID needs to read source files and traverse directories.
+chmod -R a+rX /opt/nemo-rl
 EOF
 USER ${RUNTIME_UID}:${RUNTIME_GID}
 RUN <<"EOF" bash -exu
@@ -586,8 +831,54 @@ for dir in /home/nemo-runtime /nemo_run /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}"
         "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python; do
     test -w "${dir}"
 done
+# The runtime UID owns the image's uv cache and the main venv's site-packages, and uv can open
+# that cache and check the venv against the lock with no network: what an offline
+# `uv run --extra <backend>` does before it installs the extra from the cache.
+test "$(uv cache dir)" = "${UV_CACHE_DIR}"
+test -O "${UV_CACHE_DIR}"
+test -O "$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+# STRIP_UV_CACHE builds intentionally ship an empty UV_CACHE_DIR (see the uv-writing
+# RUNs above), so there is no offline extra-install capability left to verify here.
+if [ -z "${STRIP_UV_CACHE:-}" ]; then
+    UV_OFFLINE=1 uv sync --frozen --inexact --no-install-project --no-install-workspace
+fi
 EOF
 USER root
+
+# Export the builder-local uv cache as a separate scratch image, same pattern
+# as the TRT-LLM ccache/wheel-cache below. CI builds this target immediately
+# after the release target with the same Buildx builder, so it can read the
+# cache mount without the uv/pip download cache ever entering the release image.
+FROM base AS uv-cache-export
+ARG BASE_IMAGE
+ARG TARGETARCH
+ARG UV_VERSION
+ARG HYBRID_EP_MULTINODE
+ARG UV_CACHE_EXPORT_NONCE
+RUN --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+echo "Exporting uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
+# The hermetic layer may have been reused from BuildKit without executing its
+# RUN command, leaving this builder-local mount empty. Restore the seed only in
+# that case; unconditionally merging it would resurrect wheels uv evicted.
+if [[ -z "$(find /root/.uv-cache-store -mindepth 1 -print -quit)" ]]; then
+    rsync -a /tmp/uv-cache-seed/ /root/.uv-cache-store/
+fi
+mkdir -p /tmp/uv-cache-export
+cp -a /root/.uv-cache-store/. /tmp/uv-cache-export/
+# Keep only wheels built from source (e.g. DeepEP) in the next seed. Prebuilt
+# wheels (torch, vLLM, ...) are downloaded again by the next build into
+# UV_CACHE_DIR regardless, so versions the lock no longer uses don't pile up
+# in the seed across every build that doesn't bump BASE_IMAGE, UV_VERSION, or
+# HYBRID_EP_MULTINODE -- the only things that otherwise reset this cache.
+UV_CACHE_DIR=/tmp/uv-cache-export uv cache prune --ci
+echo "uv cache export payload:"
+du -sh /tmp/uv-cache-export
+EOF
+
+FROM uv-cache-output-base AS uv-cache
+COPY --link --from=uv-cache-export /tmp/uv-cache-export/ /
+LABEL com.nvidia.nemo-rl.cache-layout="uv-v1"
 
 # Export the builder-local ccache as a separate scratch image. CI builds this
 # target immediately after the release target with the same Buildx builder, so

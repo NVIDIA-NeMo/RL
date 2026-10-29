@@ -55,10 +55,10 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     ],
     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": ["sglang"],
     "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": None,
-    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": [
+    "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": [
         "automodel"
     ],
-    "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2": [
+    "nemo_rl.models.value.workers.automodel_value_worker.AutomodelValueWorker": [
         "automodel"
     ],
     # MegatronPolicyWorker also gets nemo_gym: Megatron token capture
@@ -103,6 +103,8 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor": [
         "nemo_gym"
     ],
+    # transfer_queue + mooncake are core dependencies: no extra venv.
+    "nemo_rl.data_plane.mooncake_storage_unit.MooncakeStorageUnit": None,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": None,
     "nemo_rl.environments.nemo_gym.NemoGym": ["nemo_gym"],
     # ModelOpt quantization-aware workers
@@ -114,7 +116,7 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
         "modelopt",
         "vllm",
     ],
-    "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2": [
+    "nemo_rl.modelopt.models.policy.workers.automodel_quant_policy_worker.AutomodelQuantPolicyWorker": [
         "modelopt",
         "automodel",
     ],

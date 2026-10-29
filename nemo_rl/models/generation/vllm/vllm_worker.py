@@ -50,6 +50,7 @@ from nemo_rl.models.generation.vllm.config import (
     validate_nvfp4_pertoken_model,
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
+from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     FINISHED_REASON_LABEL,
@@ -58,14 +59,16 @@ from nemo_rl.models.generation.vllm.utils import (
     encode_counter_key,
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
+    validate_rollout_prompt,
 )
 from nemo_rl.models.generation.vllm.video_utils import (
     register_torchcodec_vllm_video_loader,
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
     find_tokenizer_required_architectures,
-    resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
+    resolve_vllm_dp_settings,
+    resolve_vllm_dp_size,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
@@ -437,7 +440,7 @@ class BaseVllmGenerationWorker:
         # Only bind single-GPU workers to their GPU's NUMA node.
         # For TP>1 workers, the parent process spans multiple NUMA nodes;
         # binding it would incorrectly constrain the EngineCore subprocess
-        # (which inherits sched_setaffinity + numa_set_membind via fork).
+        # (which inherits sched_setaffinity + numa_set_preferred via fork).
         # Individual TP workers get their own NUMA binding via collective_rpc
         # in post_init / post_init_async.
         # ray.get_gpu_ids()[0] is this worker's physical GPU index, which keys
@@ -492,6 +495,7 @@ class BaseVllmGenerationWorker:
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
         self._extra_env_vars = extra_env_vars
+        self._native_lora_request: Any = None
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -542,6 +546,7 @@ class BaseVllmGenerationWorker:
             import vllm
 
             self.SamplingParams = vllm.SamplingParams
+            self._native_lora_request = make_native_lora_request(self.cfg)
         except ImportError:
             raise ImportError(
                 "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
@@ -612,23 +617,22 @@ class BaseVllmGenerationWorker:
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
-        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
-        if self.expert_parallel_size > self.tensor_parallel_size:
-            # set vLLM DP rank
-            world_size = int(os.environ["VLLM_DP_SIZE"]) * model_parallel_size
-            rank = int(os.environ["RANK"]) % world_size
-            os.environ["VLLM_DP_RANK"] = str(rank // model_parallel_size)
-            os.environ["VLLM_DP_RANK_LOCAL"] = str(
-                resolve_data_parallel_local_rank(
-                    rank, model_parallel_size, executor_backend
-                )
+        if (
+            resolve_vllm_dp_size(self.tensor_parallel_size, self.expert_parallel_size)
+            > 1
+        ):
+            env_updates, kwarg_updates = resolve_vllm_dp_settings(
+                rank=int(os.environ["RANK"]),
+                tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                expert_parallel_size=self.expert_parallel_size,
+                addresses=eval(os.environ["AVAILABLE_ADDR_LIST"]),
+                ports=eval(os.environ["AVAILABLE_PORT_LIST"]),
+                async_engine=self.cfg["vllm_cfg"]["async_engine"],
+                executor_backend=executor_backend,
             )
-            # set vLLM DP address and port
-            leader_rank = int(os.environ["RANK"]) // world_size * world_size
-            addr_list = eval(os.environ["AVAILABLE_ADDR_LIST"])
-            port_list = eval(os.environ["AVAILABLE_PORT_LIST"])
-            os.environ["VLLM_DP_MASTER_IP"] = addr_list[leader_rank]
-            os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
+            os.environ.update(env_updates)
+            vllm_kwargs.update(kwarg_updates)
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
@@ -802,6 +806,32 @@ class BaseVllmGenerationWorker:
     def is_alive(self):
         """Check if the worker is alive."""
         return True
+
+    def _tokenize_prompt_with_bos(
+        self, prompt: str | dict[str, Any]
+    ) -> str | dict[str, Any]:
+        """Tokenize an explicit BOS once, before vLLM expands media placeholders."""
+        if isinstance(prompt, dict):
+            if "prompt_token_ids" in prompt or "prompt_embeds" in prompt:
+                return prompt
+            text = prompt.get("prompt")
+        else:
+            text = prompt
+        if not isinstance(text, str):
+            return prompt
+
+        tokenizer = self.llm.renderer.get_tokenizer()
+        bos = tokenizer.bos_token
+        if not bos or not text.startswith(bos):
+            return prompt
+
+        # Per-prompt tokenization preserves mixed batches: vLLM's generate()
+        # tokenization_kwargs apply to the entire synchronous batch.
+        fields = {"prompt": text} if isinstance(prompt, str) else prompt
+        return {
+            **fields,
+            "prompt_token_ids": tokenizer.encode(text, add_special_tokens=False),
+        }
 
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()
@@ -1006,6 +1036,19 @@ class BaseVllmGenerationWorker:
 
 
 class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationWorker):
+    def _generate_idle_dp_batch(self) -> None:
+        assert self.llm is not None
+        sampling_params = self.SamplingParams(
+            temperature=0.0,
+            max_tokens=self.cfg["max_new_tokens"],
+            ignore_eos=True,
+        )
+        self.llm.generate(
+            [{"prompt_token_ids": [self.cfg["_pad_token_id"]]}],
+            sampling_params,
+            use_tqdm=False,
+        )
+
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         import vllm
 
@@ -1074,6 +1117,14 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         """
         # Handle empty input case
         if len(data["input_ids"]) == 0:
+            if (
+                not self.cfg["vllm_cfg"]["async_engine"]
+                and resolve_vllm_dp_size(
+                    self.tensor_parallel_size, self.expert_parallel_size
+                )
+                > 1
+            ):
+                self._generate_idle_dp_batch()
             # Return empty BatchedDataDict with all required fields
             return BatchedDataDict[GenerationOutputSpec](
                 {
@@ -1137,8 +1188,14 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
         # Convert inputs to vLLM format and generate outputs.
         prompts = format_prompt_for_vllm_generation(data)
+        prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in prompts]
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
-        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
+        outputs = self.llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=use_tqdm,
+            lora_request=self._native_lora_request,
+        )
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
@@ -1160,6 +1217,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         for i, output in enumerate(outputs):
             # Extract generated tokens
             sequence_length = input_lengths[i]
+            validate_rollout_prompt(
+                input_ids[i, :sequence_length].tolist(), output.prompt_token_ids
+            )
             generation = output.outputs[0]
             generated_tokens = list(generation.token_ids)
 
@@ -1302,6 +1362,16 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 "generate_text cannot be used with async_engine=True. Use generate_text_async instead."
             )
 
+        if len(data["prompts"]) == 0:
+            if (
+                resolve_vllm_dp_size(
+                    self.tensor_parallel_size, self.expert_parallel_size
+                )
+                > 1
+            ):
+                self._generate_idle_dp_batch()
+            return BatchedDataDict[GenerationOutputSpec]({"texts": []})
+
         # Extract stop_strings if provided, else use default from config
         batch_stop_strings: list[list[str] | None] = data.get(
             "stop_strings", [self.cfg.get("stop_strings")] * len(data["prompts"])
@@ -1336,7 +1406,13 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
-        outputs = self.llm.generate(data["prompts"], sampling_params, use_tqdm=use_tqdm)
+        prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in data["prompts"]]
+        outputs = self.llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=use_tqdm,
+            lora_request=self._native_lora_request,
+        )
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict
@@ -1361,9 +1437,24 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         return cast(list[str], list_of_worker_results)
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
-        self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
+
+        Returns the parameter names the engine wants pre-quantized on the
+        trainer (vllm_cfg.refit_prequantize), or None.
+        """
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        results = self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(state_dict_info, fp8.serialize_fp8_config()),
+        )
+        # Union across the engine's TP/PP workers: with pipeline parallelism
+        # each shard only classifies its local parameters as fp8-eligible.
+        names = sorted({name for result in results if result for name in result})
+        return names or None
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:

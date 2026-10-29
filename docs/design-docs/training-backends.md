@@ -4,15 +4,15 @@ NeMo RL supports multiple training backends to accommodate different model sizes
 
 ## Available Backends
 
-- **DTensor (FSDP2)** - PyTorch's next-generation distributed training with improved memory efficiency.
+- [**Automodel**](https://github.com/NVIDIA-NeMo/Automodel) - Accelerated PyTorch training with improved memory efficiency (PyTorch-native TP, SP, CP, EP, and FSDP2)
 - **Megatron** - NVIDIA's high-performance training framework for scaling to large models (>100B parameters).
 
 ## Supported Input Checkpoint Format
 
 At this time, NeMo RL only supports Hugging Face checkpoints as inputs to the training scripts. This applies to both
-the `DTensor` backend and the `Megatron` backend.
+the `Automodel` backend and the `Megatron` backend.
 
-* `DTensor` uses the Hugging Face checkpoint both to initialize the training backend and to configure `vllm`, ensuring the model implementations match exactly. This is crucial for correctness.
+* `Automodel` uses the Hugging Face checkpoint both to initialize the training backend and to configure `vllm`, ensuring the model implementations match exactly. This is crucial for correctness.
 * `Megatron` also uses the Hugging Face checkpoint to configure `vllm`, and performs a one-time conversion to a Megatron-format checkpoint to initialize the training backend.
 
 If you would like to see direct support for Megatron checkpoints, please share your use case on
@@ -134,13 +134,62 @@ state remains GPU resident; choose a fraction that leaves enough GPU memory for
 the colocated generation backend. Optimizer CPU offload is independent of
 activation CPU offload.
 
-### DTensor Backend
-To enable DTensor (FSDP2) training:
+#### Manual garbage collection
 
-1. Set `policy.dtensor_cfg.enabled=True`.
+Python's automatic garbage collector runs a full (generation-2) collection on
+whichever process crosses its allocation threshold first. In a multi-rank Megatron
+job that rank stops for the length of the collection, and every other rank waits
+for it at the next collective. With many ranks, these unaligned pauses add up: on
+a 32-node SFT run, collections of about 1 s landed on up to 90 of 128 ranks at
+different points of one step, stretching 66 s steps to 75-85 s.
+
+`manual_gc` mirrors Megatron-LM's option of the same name. The Megatron policy
+workers turn automatic garbage collection off at the end of worker setup and run
+a full collection on every rank together, once every `manual_gc_interval`
+optimizer steps:
+
+```yaml
+policy:
+  megatron_cfg:
+    manual_gc: true
+    manual_gc_interval: 10  # optimizer steps between collections
+```
+
+- `manual_gc_interval` must be a positive integer when `manual_gc` is `true`;
+  anything else is rejected at worker setup. NeMo RL has no counterpart to
+  Megatron-LM's collections around evaluation, so without an interval nothing
+  would ever collect.
+- The interval counts optimizer steps on both training paths: the monolithic
+  `train()` used by SFT, DPO and RM (one optimizer step per global batch), and the
+  split-step API used by the single controller (`finish_train_step`).
+- Model, optimizer and checkpoint setup run with automatic collection on; the
+  first manual collection, at the end of setup, frees their garbage.
+- Processes forked from the worker, such as data loader workers, get automatic
+  collection back.
+- For PPO, the Megatron value workers have the same stall and take the same keys
+  under `value.megatron_cfg`; set them there separately.
+- Distillation teachers never run a training step, so they do not inherit the
+  student's `manual_gc`, and setting it in a teacher's `megatron_cfg_overrides`
+  is rejected.
+
+Choosing the interval is a trade between step-time consistency and host memory.
+Reference counting still frees most objects immediately; only garbage held in
+reference cycles waits for the next collection, so host memory grows between
+collections by however much cyclic garbage a step creates. Each manual
+collection also costs about as much as one automatic full collection did, just
+on every rank at the same point. Start with `10`, then compare runs with
+`manual_gc` off and on: mean and p99 step time, and the peak host RSS of the
+policy workers. Raise the interval if the collection time is visible in every
+tenth step; lower it if host memory keeps climbing. The option only changes the
+Megatron workers that train; vLLM and other actors keep the default collector.
+
+### Automodel Backend
+To enable Automodel training:
+
+1. Set `policy.automodel_cfg.enabled=True`.
 2. Refer to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml) for a configuration example.
 
-For multi-node runs, set `policy.dtensor_cfg.dp_replicate_size > 1` to enable Hybrid Sharded Data Parallel (HSDP). This keeps FSDP collectives intra-node and only replicates gradients across nodes. See [HSDP (`dp_replicate_size`)](fsdp2-parallel-plan.md#hsdp-dp_replicate_size).
+For multi-node runs, set `policy.automodel_cfg.dp_replicate_size > 1` to enable Hybrid Sharded Data Parallel (HSDP). This keeps FSDP collectives intra-node and only replicates gradients across nodes. See [HSDP (`dp_replicate_size`)](automodel-parallel-plan.md#hsdp-dp_replicate_size).
 
 ## Configuration Examples
 

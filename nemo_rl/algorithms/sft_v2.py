@@ -26,7 +26,6 @@ from typing import Any, Optional, cast
 
 import numpy as np
 import ray
-import torch
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 
@@ -55,9 +54,58 @@ from nemo_rl.models.megatron.alignment import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.instrumentation import (
+    accepts_trace_context,
+    iteration_scope,
+    managed_span,
+    trace_context_kwargs,
+    umbrella_span,
+    umbrella_trace_fn,
+)
+from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
+from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
+from nemo_rl.utils.path_utils import (
+    load_checkpoint_object,
+    path_exists,
+    save_checkpoint_object,
+)
 from nemo_rl.utils.timer import TimeoutChecker
+
+LOADER_LATENCY_MAX_KEY = "loader_latency_max"
+POLICY_TIME_KEY = "policy_time"
+TOTAL_STEP_TIME_KEY = "total_step_time"
+VALID_TOKENS_PER_SECOND_KEY = "valid_tokens_per_second"
+
+SFT_V2_TEED_METRICS = (
+    TeedMetric(
+        LOADER_LATENCY_MAX_KEY,
+        "rl.sft_v2.loader.latency.max",
+        unit="s",
+        description="Slowest data-loader rank per SFT v2 step.",
+    ),
+    TeedMetric(
+        POLICY_TIME_KEY,
+        "rl.sft_v2.policy.duration",
+        unit="s",
+        description="Controller policy update duration per SFT v2 step.",
+    ),
+    TeedMetric(
+        TOTAL_STEP_TIME_KEY,
+        "rl.sft_v2.step.duration",
+        unit="s",
+        description="Wall-clock duration of an SFT v2 step.",
+    ),
+    TeedMetric(
+        VALID_TOKENS_PER_SECOND_KEY,
+        "rl.sft_v2.valid_tokens_per_second",
+        unit="{token}/s",
+        description="Supervised token throughput per SFT v2 step.",
+    ),
+)
+register_teed_metrics(SFT_V2_TEED_METRICS)
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -142,7 +190,16 @@ def _max_train_steps(master_config: MasterConfig) -> int:
 class SFTSingleControllerActor:
     """Drive colocated loaders and the existing TQPolicy from one actor."""
 
+    # sft.defer_async_checkpoint_finalize, and the tmp_step_N path of an async save
+    # that has been written but not yet finalized and published.
+    _defer_checkpoint_finalize: bool = False
+    _pending_checkpoint_path: Optional[str] = None
+
     def __init__(self, master_config: MasterConfig, actor_args: SFTV2ActorArgs) -> None:
+        telemetry = init_telemetry_worker(
+            rank=0, world_size=1, worker_group="sft_v2_controller"
+        )
+        self._tracer = telemetry.tracer if telemetry is not None else None
         self._master_config = master_config
         self._trainer = actor_args.trainer
         self._loss_fn = actor_args.loss_fn
@@ -162,31 +219,54 @@ class SFTSingleControllerActor:
             fit_last_save_time=True,
         )
         self._timeout.start_iterations()
+        self._defer_checkpoint_finalize = (
+            master_config.sft.defer_async_checkpoint_finalize
+        )
         self._setup_loaders()
+
+    @accepts_trace_context
+    def run_with_trace_context(self) -> dict[str, Any]:
+        """Run under the driver's trace context when called through Ray."""
+        return self.run()
 
     def run(self) -> dict[str, Any]:
         """Run SFT training."""
         try:
-            self._trainer.prepare_for_training()
-            while self._save_state.total_steps < self._max_steps:
-                metrics = self._run_train_step()
-                self._logger.log_metrics(metrics, self._save_state.total_steps)
-                metric = self._checkpoint_metric(metrics)
-                self._timeout.mark_iteration()
-                save_by_timeout = self._timeout.check_save()
-                if self._should_save(save_by_timeout=save_by_timeout):
-                    self._save_checkpoint(metric)
-                if save_by_timeout:
-                    # check_save fires once and then latches, so continuing
-                    # would train unsaved until the walltime kill.
-                    print("Timeout has been reached, stopping training early")
-                    break
-            return vars(self._save_state).copy()
+            with umbrella_span(RLSpanGroup.U_JOB, "rl.sft_v2.job", tracer=self._tracer):
+                self._trainer.prepare_for_training()
+                while self._save_state.total_steps < self._max_steps:
+                    # Read before _run_train_step increments it, so the whole
+                    # pass is tagged with the step that is running rather than
+                    # the one that just finished.
+                    with iteration_scope(self._save_state.total_steps + 1):
+                        self._finish_pending_save(blocking=False)
+                        metrics = self._run_train_step()
+                        self._logger.log_metrics(metrics, self._save_state.total_steps)
+                        metric = self._checkpoint_metric(metrics)
+                        self._timeout.mark_iteration()
+                        save_by_timeout = self._timeout.check_save()
+                        if self._should_save(save_by_timeout=save_by_timeout):
+                            self._save_checkpoint(metric)
+                        if save_by_timeout:
+                            # check_save fires once and then latches, so continuing
+                            # would train unsaved until the walltime kill.
+                            print("Timeout has been reached, stopping training early")
+                            break
+                self._finish_pending_save(blocking=True)
+                return vars(self._save_state).copy()
         finally:
             for cleanup, name in (
+                # A save deferred by defer_async_checkpoint_finalize is published only
+                # here when the run raised after it. Before checkpoint close, so that
+                # close joins the rename this starts.
+                (
+                    lambda: self._finish_pending_save(blocking=True),
+                    "pending checkpoint publish",
+                ),
                 (self._close_loaders, "loader close"),
                 (self._logger.finish, "logger close"),
                 (self._checkpointer.shutdown, "checkpoint close"),
+                (shutdown_telemetry, "telemetry flush"),
             ):
                 try:
                     cleanup()
@@ -200,18 +280,10 @@ class SFTSingleControllerActor:
             "batch_size": config.policy["train_global_batch_size"]
             // self._placement_plan.logical_world_size,
             "max_sequence_length": config.data["max_input_seq_length"],
-            "placement_fingerprint": self._placement_plan.placement_hash,
-            "packing_algorithm": config.policy["sequence_packing"]["algorithm"]
-            if config.data["energon"].packing_buffer_size is not None
-            else None,
-            # This caps sources per physical pack. Energon's similarly named
-            # max_samples_per_sequence instead controls sequential shard reads.
-            "max_sequences_per_bin": config.policy["sequence_packing"].get(
-                "max_sequences_per_bin"
-            ),
             "sequence_length_pad_multiple": config.policy[
                 "make_sequence_length_divisible_by"
             ],
+            "placement_fingerprint": self._placement_plan.placement_hash,
             "only_unmask_final": config.sft.only_unmask_final,
         }
         if self._loader_states is None:
@@ -243,6 +315,7 @@ class SFTSingleControllerActor:
             make_sequence_length_divisible_by=self._master_config.policy[
                 "make_sequence_length_divisible_by"
             ],
+            **trace_context_kwargs(),
         )
         envelopes = ray.get(futures)
         logical_ranks = [envelope.logical_rank for envelope in envelopes]
@@ -253,19 +326,26 @@ class SFTSingleControllerActor:
             )
         return envelopes
 
+    @umbrella_trace_fn(RLSpanGroup.U_STEP, "rl.sft_v2.step")
     def _run_train_step(self) -> dict[str, Any]:
         started = time.monotonic()
         envelopes = self._load_envelopes()
         train_started = time.monotonic()
         step_open = False
         try:
-            self._trainer.begin_train_step(self._loss_fn)
-            step_open = True
-            self._trainer.train_placed_microbatches(
-                [envelope.meta for envelope in envelopes]
-            )
-            train_results = self._trainer.finish_train_step()
-            step_open = False
+            with managed_span(
+                RLSpanGroup.POLICY_UPDATE,
+                "rl.sft_v2.policy_training",
+                tracer=self._tracer,
+            ):
+                self._trainer.begin_train_step(self._loss_fn)
+                step_open = True
+                self._trainer.train_placed_microbatches(
+                    [envelope.meta for envelope in envelopes]
+                )
+                train_results = self._trainer.finish_train_step()
+                step_open = False
+            policy_seconds = time.monotonic() - train_started
             self._owner_call("commit_sft_batch")
         except Exception:
             if step_open:
@@ -279,7 +359,6 @@ class SFTSingleControllerActor:
                 warnings.warn(f"SFTv2 loader abort failed: {error}", stacklevel=2)
             raise
 
-        policy_seconds = time.monotonic() - train_started
         valid_tokens = sum(envelope.valid_tokens for envelope in envelopes)
         self._save_state.total_steps += 1
         self._save_state.consumed_samples += sum(
@@ -289,17 +368,17 @@ class SFTSingleControllerActor:
         loader_seconds = [envelope.load_seconds for envelope in envelopes]
         loader_latency_max = max(loader_seconds)
         metrics: dict[str, Any] = {
-            "loader_latency_max": loader_latency_max,
+            LOADER_LATENCY_MAX_KEY: loader_latency_max,
             "loader_latency_mean": statistics.fmean(loader_seconds),
             "loader_copy_imbalance": loader_latency_max - min(loader_seconds),
-            "policy_time": policy_seconds,
-            "total_step_time": time.monotonic() - started,
+            POLICY_TIME_KEY: policy_seconds,
+            TOTAL_STEP_TIME_KEY: time.monotonic() - started,
             "valid_tokens": valid_tokens,
             "source_samples": sum(len(envelope.source_ids) for envelope in envelopes),
             "physical_packs": sum(
                 len(envelope.meta.sample_ids) for envelope in envelopes
             ),
-            "valid_tokens_per_second": valid_tokens
+            VALID_TOKENS_PER_SECOND_KEY: valid_tokens
             / max(time.monotonic() - started, 1e-12),
         }
         metrics.update(self._policy_metrics(train_results))
@@ -364,6 +443,8 @@ class SFTSingleControllerActor:
         return {metric_name: float(metrics[key])}
 
     def _save_checkpoint(self, metric: dict[str, float]) -> None:
+        # The workers would wait for a still-pending save anyway; publish it first.
+        self._finish_pending_save(blocking=True)
         step = self._save_state.total_steps
         loader_states = self._loader_state_dicts()
         if len(loader_states) != self._placement_plan.logical_world_size:
@@ -384,10 +465,38 @@ class SFTSingleControllerActor:
             tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
             is_final_checkpoint=step == self._max_steps,
         )
-        torch.save(loader_states, os.path.join(checkpoint_path, "sft_v2_loaders.pt"))
-        self._checkpointer.begin_finalization(
-            checkpoint_path, wait_fn=self._trainer.finalize_async_save
+        save_checkpoint_object(
+            loader_states, os.path.join(checkpoint_path, "sft_v2_loaders.pt")
         )
+        # Keep this last: the rename it leads to waits only for the policy's async
+        # weight write, so anything written into checkpoint_path after it races
+        # the rename.
+        if self._defer_checkpoint_finalize:
+            self._pending_checkpoint_path = checkpoint_path
+        else:
+            self._checkpointer.begin_finalization(
+                checkpoint_path, wait_fn=self._trainer.finalize_async_save
+            )
+
+    def _finish_pending_save(self, *, blocking: bool) -> None:
+        """Finalize and publish an async save deferred by defer_async_checkpoint_finalize.
+
+        Runs between steps, and once more at teardown so a run that raises after a
+        save still publishes it. A non-blocking poll finalizes the save on every
+        policy worker only once all ranks' background writes are done, so the write
+        overlaps training rather than holding back the next step. Finalization runs
+        collectives on the training communicator, so it stays on the workers' step
+        boundaries rather than in a background thread. tmp_step_N becomes step_N only
+        after it.
+        """
+        if self._pending_checkpoint_path is None:
+            return
+        if blocking:
+            self._trainer.finalize_async_save()
+        elif not self._trainer.poll_async_save():
+            return
+        self._checkpointer.begin_finalization(self._pending_checkpoint_path)
+        self._pending_checkpoint_path = None
 
     def _close_loaders(self) -> None:
         self._owner_call("close_sft_dataloader")
@@ -398,14 +507,27 @@ def setup_sft_v2(
 ) -> SFTV2ActorArgs:
     """Build the V2 cluster, TQPolicy, placement, and resume state."""
     set_seed(master_config.sft.seed)
+    pretrained_checkpoint = master_config.checkpointing.get("pretrained_checkpoint")
+    if pretrained_checkpoint is not None:
+        master_config.policy["pretrained_checkpoint"] = pretrained_checkpoint
     if master_config.data.get("backend") != "energon":
         raise ValueError("SFTv2 requires data.backend=energon.")
     if not master_config.policy["megatron_cfg"]["enabled"]:
         raise ValueError("SFTv2 supports only the Megatron policy backend.")
+    if master_config.sft.defer_async_checkpoint_finalize:
+        megatron_checkpoint_cfg = master_config.policy["megatron_cfg"].get("checkpoint")
+        if not (
+            megatron_checkpoint_cfg is not None
+            and megatron_checkpoint_cfg.get("async_save")
+        ):
+            raise ValueError(
+                "sft.defer_async_checkpoint_finalize requires "
+                "policy.megatron_cfg.checkpoint.async_save=true."
+            )
     sequence_packing = master_config.policy["sequence_packing"]
     dynamic_batching = master_config.policy["dynamic_batching"]
-    energon_packing = master_config.data["energon"].packing_buffer_size is not None
-    if not energon_packing:
+    packing = master_config.data["energon"].task_encoder.packing
+    if packing is None:
         if sequence_packing["enabled"] or dynamic_batching["enabled"]:
             raise ValueError("SFTv2 without Energon packing requires fixed batching.")
     else:
@@ -415,9 +537,7 @@ def setup_sft_v2(
             raise ValueError(
                 "Energon packing requires sequence_packing enabled with fuse_loss."
             )
-        if sequence_packing.get("algorithm") not in {
-            algorithm.value for algorithm in PackingAlgorithm
-        }:
+        if packing.name not in {algorithm.value for algorithm in PackingAlgorithm}:
             raise ValueError("Energon SFT requires a supported packing algorithm.")
         if dynamic_batching["enabled"]:
             raise ValueError("Energon packing does not support dynamic batching.")
@@ -449,7 +569,7 @@ def setup_sft_v2(
     max_sequence_length = master_config.data["max_input_seq_length"]
     if max_sequence_length is None:
         raise ValueError("SFTv2 requires data.max_input_seq_length.")
-    if energon_packing:
+    if packing is not None:
         megatron_cfg = master_config.policy["megatron_cfg"]
         if (
             megatron_cfg.get("moe_token_dispatcher_type") == "flex"
@@ -458,6 +578,10 @@ def setup_sft_v2(
             raise ValueError("Energon packing does not support HybridEP flex dispatch.")
 
         pad_multiple = master_config.policy["make_sequence_length_divisible_by"]
+        if pad_multiple <= 0:
+            raise ValueError(
+                "Energon packing requires make_sequence_length_divisible_by to be positive."
+            )
         parallel_multiple = get_parallel_token_alignment(megatron_cfg)
         if pad_multiple % parallel_multiple != 0:
             raise ValueError(
@@ -469,7 +593,6 @@ def setup_sft_v2(
                 "Energon packing requires max_input_seq_length to be divisible by "
                 "make_sequence_length_divisible_by."
             )
-
         fp8_multiple = get_fp8_token_alignment(megatron_cfg) * parallel_multiple
         if fp8_multiple > parallel_multiple:
             if max_sequence_length % fp8_multiple != 0:
@@ -498,17 +621,17 @@ def setup_sft_v2(
     checkpoint_probe.shutdown()
 
     cluster_config = master_config.cluster
-    num_nodes = cluster_config["num_nodes"]
-    segment_size = cluster_config.get("segment_size")
+    num_nodes = cluster_config.num_nodes
+    segment_size = cluster_config.segment_size
     node_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="sft_v2_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
-        port_range_low=cluster_config.get("master_port_range_low"),
-        port_range_high=cluster_config.get("master_port_range_high"),
+        port_range_low=cluster_config.master_port_range_low,
+        port_range_high=cluster_config.master_port_range_high,
         segment_size=segment_size,
         node_resource_constraints=node_constraints,
     )
@@ -543,10 +666,10 @@ def setup_sft_v2(
     )
     loader_states = None
     if latest is not None:
-        loader_path = Path(latest) / "sft_v2_loaders.pt"
-        if not loader_path.exists():
-            raise ValueError(f"SFTv2 checkpoint is missing {loader_path.name}.")
-        loader_states = torch.load(loader_path, weights_only=False)
+        loader_path = os.path.join(latest, "sft_v2_loaders.pt")
+        if not path_exists(loader_path):
+            raise ValueError(f"SFTv2 checkpoint is missing {Path(loader_path).name}.")
+        loader_states = load_checkpoint_object(loader_path, weights_only=False)
     loss_fn = NLLLossFn(
         use_fused_linear_logprobs=megatron_config["use_fused_linear_logprobs"]
     )

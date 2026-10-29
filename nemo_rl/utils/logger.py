@@ -23,7 +23,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
+from typing import Any, Callable, Mapping, Optional, TypedDict
 
 import mlflow
 import numpy as np
@@ -32,9 +32,11 @@ import requests
 import swanlab
 import torch
 import wandb
+from hydra.utils import get_class
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
+from pydantic import BaseModel, Field, model_validator
 from rich.box import ROUNDED
 from rich.console import Console
 from rich.logging import RichHandler
@@ -44,7 +46,9 @@ from torch.utils.tensorboard import SummaryWriter
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.telemetry.host_memory import RAY_NODE_MEM_TOTAL, RAY_NODE_MEM_USED
 from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+from nemo_rl.utils.json_utils import json_safe_nonfinite
 
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
@@ -56,62 +60,77 @@ _rich_logging_configured = False
 # catch-all ``*`` definition is intentionally avoided because wandb-core does
 # not deterministically resolve overlapping glob definitions.
 WANDB_CALLER_STEP_METRIC = "nemo_rl/step"
-TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 
 
-class WandbConfig(TypedDict):
-    project: NotRequired[str]
-    name: NotRequired[str]
-    entity: NotRequired[str]
-    id: NotRequired[str]
-    resume: NotRequired[str]
+class WandbConfig(BaseModel, extra="allow"):
+    project: str
+    name: str
+    entity: Optional[str] = None
+    id: Optional[str] = None
+    resume: Optional[str] = None
     # Log complete NeMo Gym result payloads as W&B Tables. These payloads can be
     # very large, so the recommended default is false.
-    log_nemo_gym_full_result_tables: NotRequired[bool]
+    log_nemo_gym_full_result_tables: bool = False
 
 
-class SwanlabConfig(TypedDict):
-    project: NotRequired[str]
-    name: NotRequired[str]
+class SwanlabConfig(BaseModel, extra="allow"):
+    project: str
+    name: str
 
 
-class TensorboardConfig(TypedDict):
-    log_dir: NotRequired[str]
+class TensorboardConfig(BaseModel, extra="allow"):
+    log_dir: Optional[str] = None
 
 
-class MLflowConfig(TypedDict):
-    experiment_name: NotRequired[str | None]
-    run_id: NotRequired[str | None]
-    run_name: NotRequired[str | None]
-    tracking_uri: NotRequired[str | None]
-    artifact_location: NotRequired[str | None]
+class MLflowConfig(BaseModel, extra="allow"):
+    experiment_name: Optional[str] = None
+    run_id: Optional[str] = None
+    run_name: Optional[str] = None
+    tracking_uri: Optional[str] = None
+    artifact_location: Optional[str] = None
 
 
-class GPUMonitoringConfig(TypedDict):
-    collection_interval: int | float
-    flush_interval: int | float
+class GPUMonitoringConfig(BaseModel, extra="allow"):
+    collection_interval: float = 10
+    flush_interval: float = 10
 
 
-class LoggerConfig(TypedDict):
+class LoggerConfig(BaseModel, extra="allow"):
     log_dir: str
-    wandb_enabled: bool
-    swanlab_enabled: bool
-    tensorboard_enabled: bool
-    mlflow_enabled: bool
-    wandb: WandbConfig
-    tensorboard: NotRequired[TensorboardConfig]
-    swanlab: NotRequired[SwanlabConfig]
-    mlflow: NotRequired[MLflowConfig]
-    monitor_gpus: bool
-    gpu_monitoring: GPUMonitoringConfig
-    num_val_samples_to_print: NotRequired[int]
+    wandb_enabled: bool = False
+    swanlab_enabled: bool = False
+    tensorboard_enabled: bool = False
+    mlflow_enabled: bool = False
+    wandb: Optional[WandbConfig] = None
+    tensorboard: Optional[TensorboardConfig] = None
+    swanlab: Optional[SwanlabConfig] = None
+    mlflow: Optional[MLflowConfig] = None
+    monitor_gpus: bool = True
+    gpu_monitoring: GPUMonitoringConfig = Field(default_factory=GPUMonitoringConfig)
+    num_val_samples_to_print: int = 0
+    # LoggerInterface subclasses as "pkg.module.Class", constructed without arguments.
+    extra_backends: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _require_block_for_enabled_backends(self) -> "LoggerConfig":
+        for name, enabled, block in (
+            ("wandb", self.wandb_enabled, self.wandb),
+            ("swanlab", self.swanlab_enabled, self.swanlab),
+            ("tensorboard", self.tensorboard_enabled, self.tensorboard),
+            ("mlflow", self.mlflow_enabled, self.mlflow),
+        ):
+            if enabled and block is None:
+                raise ValueError(
+                    f"logger.{name}_enabled=true requires a logger.{name} block."
+                )
+        return self
 
 
 def should_log_nemo_gym_full_result_tables(
-    *, wandb_enabled: bool, wandb_config: WandbConfig
+    *, wandb_enabled: bool, wandb_config: Optional[WandbConfig]
 ) -> bool:
     """Return whether complete NeMo Gym results should become W&B Tables."""
-    return wandb_enabled and bool(wandb_config.get("log_nemo_gym_full_result_tables"))
+    return wandb_enabled and wandb_config.log_nemo_gym_full_result_tables
 
 
 class LoggerInterface(ABC):
@@ -214,6 +233,10 @@ class TensorboardLogger(LoggerInterface):
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
 
+    def finish(self) -> None:
+        """Flush queued TensorBoard events before a worker or actor exits."""
+        self.writer.close()
+
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to Tensorboard."""
         if len(histogram) > 0:
@@ -243,7 +266,8 @@ class WandbLogger(LoggerInterface):
 
     def __init__(self, cfg: WandbConfig, log_dir: Optional[str] = None):
         # NeMo RL logging controls are not valid wandb.init keyword arguments.
-        wandb_init_config = dict(cfg)
+        # exclude_none: unset Optional fields must not reach wandb.init.
+        wandb_init_config = cfg.model_dump(exclude_none=True)
         wandb_init_config.pop("log_nemo_gym_full_result_tables", None)
         self.run = wandb.init(**wandb_init_config, dir=log_dir)
         self._log_lock = threading.Lock()
@@ -267,11 +291,45 @@ class WandbLogger(LoggerInterface):
             wandb.save("/tmp/ray/session_latest/logs/raylet.out", policy="live")
             wandb.save("/tmp/ray/session_latest/logs/raylet.err", policy="live")
 
-        self._log_code()
-        self._log_diffs()
+        skip_reason = self._git_artifacts_skip_reason()
+        if skip_reason is None:
+            self._log_code()
+            self._log_diffs()
+        else:
+            print(
+                f"{skip_reason}; skipping the wandb source-code and git-diff artifacts."
+            )
         print(
-            f"Initialized WandbLogger for project {cfg.get('project')}, run {cfg.get('name')} at {log_dir}"
+            f"Initialized WandbLogger for project {cfg.project}, run {cfg.name} at {log_dir}"
         )
+
+    @staticmethod
+    def _git_artifacts_skip_reason() -> Optional[str]:
+        """Why the git-based artifacts cannot be logged, or None when they can.
+
+        A job launched from an uploaded copy of the code tree has no ``.git``
+        directory there, so ``git ls-files`` and ``git diff`` would only fail.
+        The reason is reported as git states it, so a checkout git refuses
+        (``fatal: detected dubious ownership``) or a missing git binary is not
+        reported as "not a work tree".
+        """
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as error:
+            return f"git is not available ({error})"
+        if result.returncode != 0:
+            first_line = result.stderr.strip().splitlines()
+            return (
+                first_line[0] if first_line else f"git exited with {result.returncode}"
+            )
+        if result.stdout.strip() != "true":
+            return "Not inside a git work tree"
+        return None
 
     def _log_diffs(self):
         """Log git diffs to wandb.
@@ -594,7 +652,12 @@ class WandbLogger(LoggerInterface):
     def log_table(
         self, columns: list[str], rows: list[list[Any]], step: int, name: str
     ) -> None:
-        """Log a table to wandb.
+        """Log one step's rows as a table, with a leading ``step`` column.
+
+        Each step logs its own table under ``name`` (like ``log_plot``), so the
+        per-step cost stays constant. The ``step`` column keeps rows
+        distinguishable when steps are viewed together, e.g. a query panel
+        concatenating the key's history.
 
         Args:
             columns: Column headers
@@ -603,8 +666,11 @@ class WandbLogger(LoggerInterface):
             name: Panel name
         """
         with self._log_lock:
+            table = wandb.Table(
+                columns=["step", *columns], data=[[step, *row] for row in rows]
+            )
             self._buffer_step_metrics_locked(
-                {name: wandb.Table(columns=columns, data=rows)},
+                {name: table},
                 step=step,
                 step_finished=False,
             )
@@ -667,9 +733,9 @@ class SwanlabLogger(LoggerInterface):
             cfg (SwanlabConfig): Configuration for the Swanlab run (e.g., project and name).
             log_dir (Optional[str]): Optional offline log directory passed to Swanlab's init.
         """
-        self.run = swanlab.init(**cfg, logdir=log_dir)
+        self.run = swanlab.init(**cfg.model_dump(exclude_none=True), logdir=log_dir)
         print(
-            f"Initialized SwanlabLogger for project {cfg.get('project')}, run {cfg.get('name')} (with offline logdir={log_dir})"
+            f"Initialized SwanlabLogger for project {cfg.project}, run {cfg.name} (with offline logdir={log_dir})"
         )
 
     def log_metrics(
@@ -842,10 +908,10 @@ class RayGpuMonitorLogger:
             metric_name = f"node.{node_idx}.gpu.{index}.mem_gb"
             # NOTE: It appears their docs say bytes, but it appears to be MB
             value /= 1024
-        elif metric_name == "ray_node_mem_used":
+        elif metric_name == RAY_NODE_MEM_USED:
             metric_name = f"node.{node_idx}.mem_gb"
             value /= 1024 * 1024 * 1024
-        elif metric_name == "ray_node_mem_total":
+        elif metric_name == RAY_NODE_MEM_TOTAL:
             metric_name = f"node.{node_idx}.mem_total_gb"
             value /= 1024 * 1024 * 1024
         else:
@@ -1067,15 +1133,13 @@ class MLflowLogger(LoggerInterface):
             cfg: MLflow configuration
             log_dir: Optional log directory (used as fallback if artifact_location not in cfg)
         """
-        tracking_uri = cfg.get("tracking_uri") or os.getenv("MLFLOW_TRACKING_URI")
+        tracking_uri = cfg.tracking_uri or os.getenv("MLFLOW_TRACKING_URI")
         if tracking_uri and not mlflow.is_tracking_uri_set():
             mlflow.set_tracking_uri(tracking_uri)
 
-        run_id = cfg.get("run_id") or os.getenv("MLFLOW_RUN_ID")
-        experiment_name = cfg.get("experiment_name") or os.getenv(
-            "MLFLOW_EXPERIMENT_NAME"
-        )
-        run_name = cfg.get("run_name") or os.getenv("MLFLOW_RUN_NAME")
+        run_id = cfg.run_id or os.getenv("MLFLOW_RUN_ID")
+        experiment_name = cfg.experiment_name or os.getenv("MLFLOW_EXPERIMENT_NAME")
+        run_name = cfg.run_name or os.getenv("MLFLOW_RUN_NAME")
 
         run = mlflow.active_run()
 
@@ -1102,7 +1166,7 @@ class MLflowLogger(LoggerInterface):
                 if experiment is None:
                     mlflow.create_experiment(
                         name=experiment_name,
-                        artifact_location=cfg.get("artifact_location") or log_dir,
+                        artifact_location=cfg.artifact_location or log_dir,
                     )
                 # set the experiment context manager
                 mlflow.set_experiment(experiment_name)
@@ -1204,50 +1268,53 @@ class Logger(LoggerInterface):
         self.wandb_logger = None
         self.swanlab_logger = None
 
-        self.base_log_dir = cfg["log_dir"]
+        self.base_log_dir = cfg.log_dir
         os.makedirs(self.base_log_dir, exist_ok=True)
 
-        if cfg["wandb_enabled"]:
+        if cfg.wandb_enabled:
             wandb_log_dir = os.path.join(self.base_log_dir, "wandb")
             os.makedirs(wandb_log_dir, exist_ok=True)
-            self.wandb_logger = WandbLogger(cfg["wandb"], log_dir=wandb_log_dir)
+            self.wandb_logger = WandbLogger(cfg.wandb, log_dir=wandb_log_dir)
             self.loggers.append(self.wandb_logger)
 
-        if cfg["swanlab_enabled"]:
+        if cfg.swanlab_enabled:
             swanlab_log_dir = os.path.join(self.base_log_dir, "swanlab")
             os.makedirs(swanlab_log_dir, exist_ok=True)
-            self.swanlab_logger = SwanlabLogger(cfg["swanlab"], log_dir=swanlab_log_dir)
+            self.swanlab_logger = SwanlabLogger(cfg.swanlab, log_dir=swanlab_log_dir)
             self.loggers.append(self.swanlab_logger)
 
-        if cfg["tensorboard_enabled"]:
+        if cfg.tensorboard_enabled:
             tensorboard_log_dir = os.path.join(self.base_log_dir, "tensorboard")
             os.makedirs(tensorboard_log_dir, exist_ok=True)
             tensorboard_logger = TensorboardLogger(
-                cfg["tensorboard"], log_dir=tensorboard_log_dir
+                cfg.tensorboard, log_dir=tensorboard_log_dir
             )
             self.loggers.append(tensorboard_logger)
 
-        if cfg["mlflow_enabled"]:
+        if cfg.mlflow_enabled:
             mlflow_log_dir = self.base_log_dir
             if mlflow_log_dir:
                 mlflow_log_dir = os.path.join(mlflow_log_dir, "mlflow")
                 os.makedirs(mlflow_log_dir, exist_ok=True)
-            mlflow_logger = MLflowLogger(cfg["mlflow"], log_dir=mlflow_log_dir)
+            mlflow_logger = MLflowLogger(cfg.mlflow, log_dir=mlflow_log_dir)
             self.loggers.append(mlflow_logger)
+
+        for name in cfg.extra_backends:
+            self.loggers.append(get_class(name)())
 
         # Initialize GPU monitoring if requested
         self.gpu_monitor = None
-        if cfg["monitor_gpus"]:
+        if cfg.monitor_gpus:
             metric_prefix = "ray"
             step_metric = f"{metric_prefix}/ray_step"
-            if cfg["wandb_enabled"] and self.wandb_logger:
+            if cfg.wandb_enabled and self.wandb_logger:
                 self.wandb_logger.define_metric(
                     f"{metric_prefix}/*", step_metric=step_metric
                 )
 
             self.gpu_monitor = RayGpuMonitorLogger(
-                collection_interval=cfg["gpu_monitoring"]["collection_interval"],
-                flush_interval=cfg["gpu_monitoring"]["flush_interval"],
+                collection_interval=cfg.gpu_monitoring.collection_interval,
+                flush_interval=cfg.gpu_monitoring.flush_interval,
                 metric_prefix=metric_prefix,
                 step_metric=step_metric,
                 parent_logger=self,
@@ -1364,7 +1431,14 @@ class Logger(LoggerInterface):
                     elif isinstance(value, np.ndarray):
                         sample[key] = value.tolist()
                 # default=str is a fallback for non-JSON-serializable types (e.g., datetime, custom objects)
-                f.write(json.dumps({**sample, "idx": i}, default=str) + "\n")
+                f.write(
+                    json.dumps(
+                        json_safe_nonfinite({**sample, "idx": i}),
+                        default=str,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                )
 
         print(f"Logged data to {filepath}")
 
@@ -1502,7 +1576,7 @@ class Logger(LoggerInterface):
             logger.log_plot(figure, step, name)
 
     def log_plot_token_mult_prob_error(
-        self, data: dict[str, Any], step: int, name: str
+        self, data: dict[str, Any], step: int, name: str, *, filtering_on: bool = False
     ) -> None:
         """Log a plot of log probability errors in samples.
 
@@ -1521,10 +1595,23 @@ class Logger(LoggerInterface):
         prev_logprobs = data["prev_logprobs"][:, 1:]
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        diff = (generation_logprobs - prev_logprobs).abs() * token_mask
-        mask = token_mask * sample_mask.unsqueeze(-1)
-
-        mult_prob_error = (torch.exp(diff) * mask).sum(dim=-1) / mask.sum(dim=-1)
+        valid = mask.bool()
+        if filtering_on:
+            valid = (
+                valid
+                & ~torch.isneginf(generation_logprobs)
+                & ~torch.isneginf(prev_logprobs)
+            )
+        counts = valid.sum(dim=-1)
+        if not counts.any():
+            return
+        generation_logprobs = torch.where(valid, generation_logprobs, 0.0)
+        prev_logprobs = torch.where(valid, prev_logprobs, 0.0)
+        diff = (generation_logprobs - prev_logprobs).abs()
+        mult_prob_error = torch.where(valid, torch.exp(diff), 0.0).sum(
+            dim=-1
+        ) / counts.clamp_min(1)
+        mult_prob_error = mult_prob_error.masked_fill(counts == 0, -torch.inf)
 
         sample_idx = torch.argmax(mult_prob_error)
         sample_error = mult_prob_error[sample_idx]
@@ -1545,23 +1632,30 @@ class Logger(LoggerInterface):
         generation_logprob = generation_logprobs[
             sample_idx, int(generation_start_idx) : int(generation_end_idx)
         ]
-        prev_logprob = (
-            prev_logprobs[
-                sample_idx, int(generation_start_idx) : int(generation_end_idx)
-            ]
-            * mask[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
-        )
+        prev_logprob = prev_logprobs[
+            sample_idx, int(generation_start_idx) : int(generation_end_idx)
+        ]
+        valid_i = valid[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
+        if not valid_i.any():
+            return
         diff_i = diff[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
+        diff_i = diff_i.masked_fill(~valid_i, float("nan"))
+        generation_logprob = generation_logprob.masked_fill(~valid_i, float("nan"))
+        prev_logprob = prev_logprob.masked_fill(~valid_i, float("nan"))
 
         # Find max absolute error token
-        max_abs_error_idx = torch.argmax(diff_i).item()
+        max_abs_error_idx = torch.argmax(
+            diff_i.masked_fill(~valid_i, -torch.inf)
+        ).item()
         max_abs_error = diff_i[max_abs_error_idx].item()
 
         # Find max relative error token (ratio of probabilities)
         gen_prob = torch.exp(generation_logprob)
         prev_prob = torch.exp(prev_logprob)
         relative_error = torch.abs((gen_prob - prev_prob) / gen_prob)
-        max_rel_error_idx = torch.argmax(relative_error).item()
+        max_rel_error_idx = torch.argmax(
+            relative_error.masked_fill(~valid_i, -torch.inf)
+        ).item()
         max_rel_error = relative_error[max_rel_error_idx].item()
 
         fig = plt.figure()

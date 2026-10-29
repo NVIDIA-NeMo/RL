@@ -302,7 +302,7 @@ spec:
                       policy.train_global_batch_size=32 \
                       policy.train_micro_batch_size=1 \
                       policy.max_total_sequence_length=1024 \
-                      policy.dtensor_cfg.tensor_parallel_size=1 \
+                      policy.automodel_cfg.tensor_parallel_size=1 \
                       sft.max_num_steps=10 \
                       sft.val_period=5 \
                       checkpointing.enabled=false \

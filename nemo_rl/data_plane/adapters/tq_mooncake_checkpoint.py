@@ -16,15 +16,19 @@
 Normal Mooncake PUTs remain memory-only. At an explicit TQ checkpoint, the
 controller commands the existing workers through their Ray actor handles.
 Workers discover disjoint key slices and route ownership metadata through Ray
-object references. Each payload is written directly from its owning process's
-CPU segment: no payload crosses Ray, no native GET or staging copy is needed,
-and the coordinator never collects detailed object addresses/sizes. No new
-actors, registry, or normal PUT/CLEAR bookkeeping are introduced.
+object references. With hard-pinned replicas each payload is written directly
+from its owning process's CPU segment: no payload crosses Ray, no native GET or
+staging copy is needed, and the coordinator never collects detailed object
+addresses/sizes. With SSD offload (evictable replicas) a borrowed address could
+be freed mid-write, so each owner instead copies its objects through native GET,
+which holds a lease per read and also serves objects already offloaded to SSD.
+No new actors, registry, or normal PUT/CLEAR bookkeeping are introduced.
 
 Restore reverses the process: the current Mooncake clients read size-balanced
 sets of durable objects and upsert them into their own preferred segments
-before TQ restores controller metadata.  Saved client identities are not
-reused across restarts.
+before TQ restores controller metadata; with SSD offload, an upsert into a full
+segment is retried while eviction moves older objects to SSD. Saved client
+identities are not reused across restarts.
 
 During save, objects selected by the controller snapshot must remain unchanged
 until every owner's ACK. Generation may continue writing unrelated fresh keys,
@@ -55,13 +59,15 @@ import os
 import pickle
 import uuid
 from collections.abc import Mapping
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator, cast
 
 import ray
 import torch
+
+from nemo_rl.data_plane.adapters.mooncake_ssd_offload import upsert_waiting_for_memory
 
 _STORAGE_DIR = "mooncake_storage"
 _MANIFEST_FILE = "manifest.json"
@@ -128,17 +134,18 @@ def _validate_checkpoint_runtime(manager: Any) -> None:
         raise NotImplementedError(
             "Direct Mooncake checkpoints require TCP/RDMA CPU storage segments"
         )
-    replica_config = manager.storage_client.replica_config
-    if getattr(replica_config, "with_hard_pin", None) is not True:
-        raise NotImplementedError(
-            "Owner-distributed Mooncake checkpoints require hard-pinned memory replicas"
-        )
     offload = manager.config.get("offload")
     if isinstance(offload, Mapping) and offload.get("enabled") is True:
         raise NotImplementedError(
-            "Owner-distributed Mooncake checkpoints do not support enabled "
-            "Mooncake offload"
+            "Owner-distributed Mooncake checkpoints do not support TQ's own "
+            "Mooncake offload client"
         )
+
+
+def _replicas_are_pinned(manager: Any) -> bool:
+    """Hard-pinned replicas never move, so a save may read them in place."""
+    replica_config = manager.storage_client.replica_config
+    return getattr(replica_config, "with_hard_pin", None) is True
 
 
 def _has_no_named_dims(tensor: torch.Tensor) -> bool:
@@ -486,6 +493,21 @@ def _complete_memory_replicas(
     ]
 
 
+def _has_complete_local_disk_replica(descriptors: Any) -> bool:
+    """True when an object has a COMPLETE copy on its owner's SSD."""
+    if not isinstance(descriptors, (list, tuple)):
+        return False
+    for descriptor in descriptors:
+        is_local_disk = getattr(descriptor, "is_local_disk_replica", None)
+        if (
+            callable(is_local_disk)
+            and is_local_disk()
+            and _status_is_complete(getattr(descriptor, "status", None))
+        ):
+            return True
+    return False
+
+
 def _complete_memory_buffers(descriptors: Any) -> list[Any]:
     replicas: list[Any] = []
     if not isinstance(descriptors, (list, tuple)):
@@ -711,6 +733,8 @@ class _CheckpointParticipant:
         _validate_checkpoint_runtime(manager)
         self._manager = manager
         self._store = manager.storage_client._store
+        # False with SSD offload: replicas may be evicted, so read via native GET.
+        self._pinned = _replicas_are_pinned(manager)
         segment_name = self._store.get_hostname()
         if not isinstance(segment_name, str) or not segment_name:
             raise RuntimeError("Mooncake client did not expose its segment name")
@@ -773,9 +797,22 @@ class _CheckpointParticipant:
                     if replica.transport_endpoint in current_endpoints
                 ]
                 if not eligible:
+                    if not self._pinned and _has_complete_local_disk_replica(values):
+                        # Offloaded and evicted. Python cannot see the disk
+                        # replica's owner; native GET reaches it from here.
+                        size = self._store.get_size(key)
+                        if type(size) is not int or size <= 0:
+                            raise RuntimeError(
+                                f"Mooncake reported an invalid size for {key!r}"
+                            )
+                        groups.setdefault(self.info.transport_endpoint, []).append(
+                            _StoredObject(key, size, 0)
+                        )
+                        continue
                     raise RuntimeError(
                         f"Mooncake key {key!r} has no COMPLETE memory replica "
                         "owned by a live checkpoint participant"
+                        + ("" if self._pinned else ", nor one on SSD")
                     )
                 size = eligible[0].size
                 if any(
@@ -795,11 +832,14 @@ class _CheckpointParticipant:
                     if len(eligible) == 1
                     else min(eligible, key=lambda value: value.transport_endpoint)
                 )
-                address = getattr(replica, "buffer_address", None)
-                if type(address) is not int or address <= 0:
-                    raise RuntimeError(
-                        f"Mooncake replica has no CPU address for {key!r}"
-                    )
+                # Only a pinned replica is read in place; others go through GET.
+                address = 0
+                if self._pinned:
+                    address = getattr(replica, "buffer_address", None)
+                    if type(address) is not int or address <= 0:
+                        raise RuntimeError(
+                            f"Mooncake replica has no CPU address for {key!r}"
+                        )
                 groups.setdefault(replica.transport_endpoint, []).append(
                     _StoredObject(key, size, address)
                 )
@@ -841,7 +881,8 @@ class _CheckpointParticipant:
                     or type(obj.size) is not int
                     or obj.size <= 0
                     or type(obj.address) is not int
-                    or obj.address <= 0
+                    or obj.address < 0
+                    or (self._pinned and obj.address == 0)
                 ):
                     raise ValueError("Malformed Mooncake owner memory descriptor")
                 objects.append(obj)
@@ -868,15 +909,20 @@ class _CheckpointParticipant:
             batch = entries[start : start + _BATCH_KEYS]
             descriptors = _batch_replicas(self._store, [entry.key for entry in batch])
             for entry in batch:
-                replicas = _complete_memory_replicas(descriptors[entry.key])
-                if not any(
+                values = descriptors[entry.key]
+                if any(
                     endpoint in current_endpoints and size == entry.size
-                    for endpoint, size in replicas
+                    for endpoint, size in _complete_memory_replicas(values)
                 ):
-                    raise RuntimeError(
-                        f"Restored Mooncake key {entry.key!r} has no COMPLETE memory "
-                        "replica on a current checkpoint participant"
-                    )
+                    continue
+                # With offload, it may already be evicted to its owner's SSD;
+                # only current participants own segments, so the owner is one.
+                if not self._pinned and _has_complete_local_disk_replica(values):
+                    continue
+                raise RuntimeError(
+                    f"Restored Mooncake key {entry.key!r} has no COMPLETE memory "
+                    "replica on a current checkpoint participant"
+                )
 
     def _save_shard(self, body: Mapping[str, Any]) -> dict[str, Any]:
         root = self._checkpoint_root(body)
@@ -894,15 +940,12 @@ class _CheckpointParticipant:
 
         entries: list[dict[str, Any]] = []
         offset = 0
-        with partial.open("xb") as output:
-            for obj in objects:
-                # Borrow this process's hard-pinned CPU allocation, not a copy.
-                # Selected objects must not be overwritten, cleared or moved,
-                # and their stores must stay alive until all SAVE ACKs complete.
-                allocation = (ctypes.c_ubyte * obj.size).from_address(obj.address)
-                # ctypes arrays expose a buffer; their type stubs omit it.
-                with memoryview(cast(Any, allocation)).cast("B") as view:
-                    _write_buffer(output, view, obj.size, label=obj.key)
+        with (
+            partial.open("xb") as output,
+            closing(self._object_payloads(objects)) as payloads,
+        ):
+            for obj, payload, position in payloads:
+                _write_buffer(output, payload, obj.size, label=obj.key, offset=position)
                 entries.append(
                     {
                         "key": obj.key,
@@ -929,6 +972,51 @@ class _CheckpointParticipant:
             "shard": asdict(descriptor),
             "saved_keys": [obj.key for obj in objects],
         }
+
+    def _object_payloads(
+        self, objects: list[_StoredObject]
+    ) -> Iterator[tuple[_StoredObject, Any, int]]:
+        """Yield each object's bytes as ``(object, buffer, offset)``, in order."""
+        if self._pinned:
+            for obj in objects:
+                # Borrow this process's hard-pinned CPU allocation, not a copy.
+                # Selected objects must not be overwritten, cleared or moved,
+                # and their stores must stay alive until all SAVE ACKs complete.
+                allocation = (ctypes.c_ubyte * obj.size).from_address(obj.address)
+                # ctypes arrays expose a buffer; their type stubs omit it.
+                with memoryview(cast(Any, allocation)).cast("B") as view:
+                    yield obj, view, 0
+            return
+        # Evictable: copy through native GET, which leases each object for the
+        # read and fetches offloaded ones from their owner's SSD.
+        sizes = [obj.size for obj in objects]
+        with _checkpoint_buffer(self._store, sizes, label="save") as buffer:
+            for start, stop, offsets in _checkpoint_batches(sizes):
+                batch = objects[start:stop]
+                results = self._store.batch_get_into(
+                    [obj.key for obj in batch],
+                    [buffer.pointer + position for position in offsets],
+                    sizes[start:stop],
+                )
+                _check_batch_results(results, sizes[start:stop], operation="save")
+                for obj, position in zip(batch, offsets, strict=True):
+                    yield obj, buffer.payload, position
+
+    def _upsert(
+        self, keys: list[str], pointers: list[int], sizes: list[int], config: Any
+    ) -> None:
+        """Upsert one batch; with SSD offload, wait out a full segment."""
+
+        def upsert(k: list[str], p: list[int], s: list[int]) -> Any:
+            return self._store.batch_upsert_from(k, p, s, config)
+
+        def check(k: list[str], p: list[int], s: list[int], results: Any) -> None:
+            _check_batch_results(results, [0] * len(k), operation="restore")
+
+        if self._pinned:  # hard-pinned memory never frees itself
+            check(keys, pointers, sizes, upsert(keys, pointers, sizes))
+        else:
+            upsert_waiting_for_memory(upsert, keys, pointers, sizes, on_error=check)
 
     def _load_shards(self, body: Mapping[str, Any]) -> dict[str, Any]:
         root = self._checkpoint_root(body)
@@ -972,13 +1060,12 @@ class _CheckpointParticipant:
                         label=entry.key,
                         offset=position,
                     )
-                results = self._store.batch_upsert_from(
+                self._upsert(
                     [entry.key for entry in batch],
                     [buffer.pointer + position for position in offsets],
                     sizes[start:stop],
                     config,
                 )
-                _check_batch_results(results, [0] * len(batch), operation="restore")
                 restored.extend(entry.key for entry in batch)
 
         # Each owner verifies only its disjoint assignment before acknowledging;
@@ -1061,7 +1148,7 @@ def _live_participants(
     if local is not None:
         participants[local.info.participant_id] = local.info
     for worker, response in zip(workers, responses, strict=True):
-        # Some generation ranks do not host token capture or a TQ client.
+        # Ranks without a TQ client, or that disowned storage, own nothing.
         if response is None:
             continue
         if not isinstance(response, Mapping) or response.get("ok") is not True:
@@ -1404,11 +1491,15 @@ class _CheckpointManagerMixin:
 
 
 def configure_checkpoint_workers(workers: list[Any]) -> None:
-    """Bind existing actor handles for this process's checkpoint coordinator.
+    """Bind the actors that own checkpointable storage for this coordinator.
 
     Call after all intended owners have attached, before save or restore. Do
     not include the calling actor: its shard is executed directly, including
     when restoring inside SingleController's constructor.
+
+    Candidates that own no segment -- ranks without a TQ client, or a
+    generation worker whose token-capture client disowned storage -- are
+    dropped here, once, so a save never waits on an actor with nothing to save.
     """
     # TransferQueue is optional outside this backend.
     import transfer_queue as tq
@@ -1417,6 +1508,8 @@ def configure_checkpoint_workers(workers: list[Any]) -> None:
     if not isinstance(manager, _CheckpointManagerMixin):
         raise RuntimeError("Mooncake checkpoint manager is not installed")
     manager._checkpoint_workers = list(workers)
+    _, owners = _live_participants(manager)
+    manager._checkpoint_workers = list(owners.values())
 
 
 def run_checkpoint_command(body: Mapping[str, Any]) -> dict[str, Any] | None:

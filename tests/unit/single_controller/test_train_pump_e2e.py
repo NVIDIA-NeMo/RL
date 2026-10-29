@@ -39,9 +39,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.utils.logger import LoggerConfig
 from tests.unit.models.policy.test_megatron_worker import create_megatron_test_config
 from tests.unit.single_controller._dp_fakes import _PARTITION_ID
 from tests.unit.test_utils import SimpleLossFn
@@ -113,7 +115,10 @@ def _populate_group(
         },
         batch_size=(group_size,),
     )
-    tags = [{"weight_version": int(weight_version)} for _ in range(group_size)]
+    tags = [
+        {"weight_version": int(weight_version), GROUP_ID_TAG: group_uuid}
+        for _ in range(group_size)
+    ]
     dp_client.put_samples(
         sample_ids=sample_ids,
         partition_id=_PARTITION_ID,
@@ -180,6 +185,28 @@ class _FakeAdvEstimator:
         **kwargs,
     ) -> torch.Tensor:
         return rewards.detach().unsqueeze(-1).expand_as(mask).clone()
+
+
+class _FakeGeneration:
+    """Generation stand-in with native pause/clear support for the training pump."""
+
+    def blocks_training(self) -> bool:
+        return False
+
+    def snapshot_step_metrics(self) -> None:
+        pass
+
+    def get_step_metrics(self) -> dict[str, float]:
+        return {}
+
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: float | None = None
+    ) -> bool:
+        del clear_cache, timeout_s
+        return True
+
+    def resume_generation_after_refit(self, *, timeout_s: float | None = None) -> bool:
+        return True
 
 
 @ray.remote(num_cpus=0)  # pragma: no cover
@@ -328,7 +355,11 @@ def test_train_pump_drives_mcore_training_step(
             },
             policy={
                 "train_global_batch_size": train_gbs,
-                "generation": {"colocated": {"enabled": False}},
+                "generation": {
+                    "top_k": None,
+                    "top_p": 1.0,
+                    "colocated": {"enabled": False},
+                },
             },
             # _sync_weights gates stale-abort on should_use_nemo_gym(env); empty
             # env -> native path (nemo_gym disabled).
@@ -346,14 +377,7 @@ def test_train_pump_drives_mcore_training_step(
                 max_inflight_prompts=num_prompts,
                 max_buffered_rollouts=num_prompts,
             ),
-            logger={
-                "log_dir": str(tmp_path / "logs"),
-                "wandb_enabled": False,
-                "swanlab_enabled": False,
-                "tensorboard_enabled": False,
-                "mlflow_enabled": False,
-                "monitor_gpus": False,
-            },
+            logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
             # Actor __init__ builds a CheckpointManager + TimeoutChecker from
             # this block; enabled=False keeps the run write-free.
             checkpointing={
@@ -369,13 +393,7 @@ def test_train_pump_drives_mcore_training_step(
         )
 
         actor_args = SingleControllerActorArgs(
-            # Continuous-serving stub: the pump asks blocks_training() before
-            # every step's trainer GPU work.
-            gen_handle=SimpleNamespace(
-                blocks_training=lambda: False,
-                snapshot_step_metrics=lambda: None,
-                get_step_metrics=lambda: {},
-            ),  # type: ignore[arg-type]
+            gen_handle=_FakeGeneration(),
             trainer_handle=trainer,
             env_handles={},
             train_cluster=None,  # type: ignore[arg-type]
@@ -391,6 +409,7 @@ def test_train_pump_drives_mcore_training_step(
             save_state=_initial_grpo_save_state(),
             last_checkpoint_path=None,
             finalizer_actors=[],
+            advantage_actors=[],
         )
         ctrl = _RecordingSingleControllerActor.remote(
             metric_log_handle=log,
@@ -421,6 +440,7 @@ def test_train_pump_drives_mcore_training_step(
             assert math.isfinite(metrics["advantages/mean"])
             assert metrics["evicted_stale_prompt_groups"] == 0
             assert metrics["aborted_stale_inflight_groups"] == 0
+            assert metrics["weight_version_lag"] >= 0
 
         # The final "timing/train" log of each step must carry step_finished=True
         # (the behavior this restores) so W&B commits the step; the "train" log must not.

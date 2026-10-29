@@ -39,13 +39,17 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
     GRPOConfig,
-    GRPOLoggerConfig,
     RewardPenaltyConfig,
+)
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data_plane.schema import (
@@ -67,6 +71,7 @@ from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 # ── User-facing SingleController configs ────────────────────────────────────
 
@@ -318,8 +323,9 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # with RefitAborted -- still far better than hanging forever inside NCCL, but choose
     # the deadline knowing there is no second chance.
     #
-    # None disarms it: no watchdog thread is started and the refit path is byte-identical
-    # to before. Set it well above a healthy refit, because the cost of firing early is
+    # None disables the collective watchdog and controller's transfer deadline.
+    # Generation pause/resume still have a 360s timeout. Set this well above a healthy
+    # refit, because the cost of firing early is
     # aborting a run that was merely slow, while the cost of firing late is only that a
     # wedge lasts longer before it is broken.
     #
@@ -471,6 +477,23 @@ class WatchdogConfig(BaseModel, extra="allow"):
 
 
 class AsyncRLConfig(BaseModel, extra="allow"):
+    # Stream every consumed sample's untruncated token tensors to JSONL. Files
+    # are published only after the optimizer step completes; disabled by default.
+    log_full_train_data: bool = False
+    # Where the dump above is written: the JSONL writer by default, or an external
+    # DebugWriter selected by target.
+    debug_writer: DebugWriterConfig = Field(default_factory=DebugWriterConfig)
+    # Finalize async policy checkpoints (policy.megatron_cfg.checkpoint.async_save)
+    # at a later step boundary, once every rank's background write is done, instead
+    # of from a background thread whose blocking finalize holds the policy workers
+    # until the write lands. tmp_step_N is renamed to step_N after that finalize; the
+    # next save and training exit still finalize blocking. Shortens steps only with
+    # non-colocated generation: colocated refits finish the write before offloading.
+    # Cost: until the finalize, only tmp_step_N exists and resume ignores it, so a
+    # crash in that window (typically one step) resumes from the previous checkpoint.
+    # Teardown after a controller-side failure still publishes it. Cannot be combined
+    # with rollout snapshots (rollout_checkpointing.snapshot_attempt_interval_s).
+    defer_async_checkpoint_finalize: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
@@ -490,7 +513,7 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         default_factory=GenerationRouterConfig
     )
     # Recompute generation KV caches after each weight update.
-    recompute_kv_cache_after_weight_updates: bool = False
+    recompute_kv_cache_after_weight_updates: bool = True
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
     # Cap on in-flight generate_and_push calls in the rollout pump.
@@ -499,6 +522,19 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+    # CPU actors that run the advantage stage. 0 keeps it in the controller
+    # process, which is the historical behaviour and is correct, but it both
+    # holds a whole cohort's advantage inputs in the controller's heap and
+    # blocks the controller's event loop for the duration of the computation --
+    # long enough at Ultra scale to miss Ray's actor liveness ping. A positive
+    # value moves both costs onto dedicated CPU actors. Only grpo and opd are
+    # sharded across the pool; other estimators run as one call on one actor.
+    # Under data_plane.backend=mooncake_cpu each worker is its own TQ client and
+    # mounts a full global_segment_size + local_buffer_size, like each
+    # token-capture finalizer; budget it on top of
+    # gpus_per_node x (segment + buffer). With storage units on
+    # (storage_unit_segment_size > 0) the segment is 0; only the buffer remains.
+    num_advantage_workers: NonNegativeInt = 0
 
     @model_validator(mode="after")
     def _reject_renamed_blocks(self) -> "AsyncRLConfig":
@@ -818,7 +854,7 @@ class MasterConfig(BaseModel, extra="allow"):
     # common configs
     env: dict[str, Any]
     data: DataConfig
-    logger: GRPOLoggerConfig
+    logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
@@ -953,6 +989,18 @@ def _validate_opd_full_config(
             "reconstructed from its hidden states would not, silently optimizing a "
             "mismatched objective. Use teacher_payload='logits', where both sides "
             "come from the same scaled tensor."
+        )
+
+    if generation_config is not None and need_top_k_or_top_p_filtering(
+        TrainingSamplingParams(
+            top_k=generation_config["top_k"], top_p=generation_config["top_p"]
+        )
+    ):
+        warnings.warn(
+            "on_policy_distillation.full does not apply top-k/top-p filtering "
+            "to policy logprobs or the full-vocabulary KL. "
+            "policy.generation.top_k/top_p are still applied during rollout.",
+            stacklevel=2,
         )
 
     if full_cfg.teacher_payload == "logits":
@@ -1105,6 +1153,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
             ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
+            # getattr: PPO's config has no length_penalty field.
+            ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
         )
         if enabled
     ]
@@ -1114,6 +1164,20 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             f"{names} not supported on the SingleController path, which "
             "implements none of them -- the run would silently skip the "
             "shaping. Disable them."
+        )
+
+    # Rejected here rather than at the first advantage call, which is a whole
+    # round of rollouts and logprobs later: gdpo needs one reward column per
+    # component and SC's payload writes a single total_reward, with
+    # AdvantageConfig.repeated_batch_fields never populated.
+    if algo_cfg.adv_estimator.name == "gdpo":
+        raise NotImplementedError(
+            "adv_estimator 'gdpo' is not supported on the SingleController "
+            "path. It needs per-component reward columns (reward/<name>), and "
+            "the SC payload writes only total_reward, so the first advantage "
+            "call would raise 'GDPO requires multiple reward components' after "
+            "the run had already paid for a full step of rollouts. Set "
+            "adv_estimator.name to 'grpo'."
         )
 
     async_config = master_config.async_rl
@@ -1176,6 +1240,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 )
         return
 
+    algo_cfg = cast(PPOConfig, algo_cfg)
     for name in ("value", "value_loss_fn"):
         if getattr(master_config, name, None) is None:
             raise ValueError(
@@ -1184,30 +1249,63 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
 
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
-    # setup_data_plane unconditionally, so a DTensor critic dies in Ray with the
-    # model already on GPU. ppo_math_1B.yaml ships dtensor_cfg.enabled=true.
+    # setup_data_plane unconditionally, so an Automodel critic dies in Ray with the
+    # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
     value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
     if not value_megatron_cfg.get("enabled"):
         raise ValueError(
             "PPO on the SingleController path requires a Megatron critic "
-            "(value.megatron_cfg.enabled=true). The DTensor value worker does not "
+            "(value.megatron_cfg.enabled=true). The Automodel value worker does not "
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
-    # Each PPO epoch must consume the complete RL batch. Without this guard, every
-    # chunk would independently run the configured actor and critic optimizer steps.
-    if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
-        raise ValueError(
-            "PPO on the SingleController path requires "
-            "async_rl.min_groups_for_streaming_train "
-            f"({async_config.min_groups_for_streaming_train}) == "
-            f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) so that each RL "
-            "step is assembled from a single chunk. Otherwise each chunk would "
-            "run ppo.critic_ppo_epochs critic optimizer steps and ppo.ppo_epochs "
-            "policy optimizer steps on only part of the RL batch. Streaming PPO "
-            "needs a split train API on the value workers, which they do not have "
-            "yet (#2625)."
-        )
+    policy_megatron_cfg = master_config.policy.get("megatron_cfg")
+    if async_config.min_groups_for_streaming_train < algo_cfg.num_prompts_per_step:
+        # Policy chunks accumulate into one optimizer update; critic epochs
+        # still consume the complete batch after the final policy chunk.
+        if algo_cfg.ppo_epochs != 1:
+            raise ValueError(
+                "Streaming PPO requires ppo.ppo_epochs=1 when "
+                "async_rl.min_groups_for_streaming_train < ppo.num_prompts_per_step. "
+                f"Got ppo.ppo_epochs={algo_cfg.ppo_epochs}. Use a full-batch chunk "
+                "to run multiple policy epochs."
+            )
+        if not policy_megatron_cfg or not policy_megatron_cfg.get("enabled"):
+            raise ValueError(
+                "Streaming PPO requires a Megatron policy "
+                "(policy.megatron_cfg.enabled=true) to preserve accumulated "
+                "gradients across policy/value model switches."
+            )
+        policy_megatron_cfg = cast(MegatronConfig, policy_megatron_cfg)
+        ddp_config = policy_megatron_cfg.get("distributed_data_parallel_config")
+        if ddp_config is not None and (
+            ddp_config.get("use_custom_fsdp") or ddp_config.get("use_megatron_fsdp")
+        ):
+            raise ValueError(
+                "Streaming PPO requires classic Megatron DDP; policy gradient "
+                "offload during an open step does not support Megatron FSDP."
+            )
+        fp8_config = policy_megatron_cfg.get("fp8_cfg")
+        if (
+            fp8_config is not None
+            and fp8_config.get("enabled")
+            and fp8_config.get("fp8_param")
+            and fp8_config.get("fp8_recipe") == "mxfp8"
+            and policy_megatron_cfg["optimizer"]["use_distributed_optimizer"]
+        ):
+            raise ValueError(
+                "Streaming PPO does not support MXFP8 parameters with "
+                "the distributed optimizer: parameters and accumulated gradients "
+                "share storage even when overlap_param_gather=false. Disable "
+                "policy.megatron_cfg.fp8_cfg.fp8_param or use full-batch PPO."
+            )
+        if algo_cfg.adv_estimator.normalize_advantages:
+            warnings.warn(
+                "Streaming PPO with ppo.adv_estimator.normalize_advantages=true "
+                "normalizes GAE advantages per chunk instead of across the full "
+                "batch. Changing chunk boundaries can change normalized advantages.",
+                stacklevel=2,
+            )
 
     failure_config = async_config.rollout_failure
     drop_budget = (
@@ -1225,15 +1323,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "inside the value workers (#2625)."
         )
 
-    policy_megatron_cfg = master_config.policy.get("megatron_cfg", {})  # type: ignore
     if (
         getattr(algo_cfg, "policy_training_start_step", 0) > 0
         and master_config.checkpointing["enabled"]
         and master_config.checkpointing["save_optimizer"]
+        and policy_megatron_cfg is not None
         and policy_megatron_cfg.get("enabled")
-        and policy_megatron_cfg.get("checkpoint", {}).get(
-            "ckpt_assume_constant_structure"
-        )
+        and cast(MegatronConfig, policy_megatron_cfg)
+        .get("checkpoint", {})
+        .get("ckpt_assume_constant_structure")
     ):
         raise ValueError(
             "policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true "
@@ -1243,10 +1341,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     sampler_name = async_config.sampler.name
-    if sampler_name != "in_order":
+    if sampler_name not in ("in_order", "ready_first"):
         raise ValueError(
             "PPO on the SingleController path only supports "
-            f"async_rl.sampler.name='in_order', but got '{sampler_name}'. "
+            f"async_rl.sampler.name in ('in_order', 'ready_first'), but got '{sampler_name}'. "
             "Other samplers are not supported yet (in particular during critic "
             "warmup) (#2625)."
         )
@@ -1276,6 +1374,30 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    if async_config.defer_async_checkpoint_finalize:
+        megatron_cfg = master_config.policy.get("megatron_cfg")
+        megatron_checkpoint_cfg = (
+            megatron_cfg.get("checkpoint")
+            if megatron_cfg is not None and megatron_cfg["enabled"]
+            else None
+        )
+        if megatron_checkpoint_cfg is None or not megatron_checkpoint_cfg.get(
+            "async_save"
+        ):
+            raise ValueError(
+                "async_rl.defer_async_checkpoint_finalize requires the Megatron "
+                "policy backend with policy.megatron_cfg.checkpoint.async_save=true."
+            )
+        # A rollout snapshot needs step_N published while training is still on
+        # step N; a deferred finalize publishes it at a later step boundary.
+        if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
+            raise ValueError(
+                "async_rl.defer_async_checkpoint_finalize cannot be combined with "
+                "rollout_checkpointing.snapshot_attempt_interval_s: rollout snapshots "
+                "need each step's policy checkpoint published before the next "
+                "optimizer step, and a deferred finalize publishes it later."
+            )
 
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
@@ -1323,10 +1445,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
             )
-        if master_config.loss_fn.force_on_policy_ratio:
+        if (
+            master_config.loss_fn.force_on_policy_ratio
+            and not master_config.loss_fn.use_cispo
+        ):
             raise ValueError(
                 "the ready_first sampler requires "
-                "loss_fn.force_on_policy_ratio=false so prev_logprobs are used"
+                "loss_fn.force_on_policy_ratio=false unless loss_fn.use_cispo=true"
             )
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no
@@ -1364,6 +1489,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "token_capture.defer_routed_experts_to_policy requires "
             "token_capture.enabled=true"
         )
+    policy_config = master_config.policy
+    if token_capture_config.defer_routed_experts_to_policy and not (
+        "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
+    ):
+        raise NotImplementedError(
+            "token_capture.defer_routed_experts_to_policy is only wired for the Megatron "
+            "policy; the Automodel worker does not assemble deferred routes."
+        )
     if (
         token_capture_config.enabled
         and token_capture_config.num_reassembler_workers
@@ -1374,15 +1507,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
             stacklevel=2,
         )
-    if token_capture_config.enabled and reward_penalties_enabled:
-        warnings.warn(
-            "reward_penalties are enabled but token-capture receipt rollouts "
-            "carry no generated tokens/text at rollout time, so the penalty "
-            "checks are skipped and capture-path rewards stay unpenalized "
-            "(penalty-rate metrics will read 0). Disable the reward_penalties "
-            "flags to make this explicit, or run without token capture to "
-            "train with penalized rewards.",
-            stacklevel=2,
+    if (
+        token_capture_config.enabled
+        and master_config.reward_penalties.penalize_malformed_think_tag
+    ):
+        raise ValueError(
+            "token_capture.enabled does not support reward_penalties.penalize_malformed_think_tag"
         )
     if (
         token_capture_config.enabled
@@ -1481,6 +1611,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "on_policy_distillation.enabled=true."
         )
     if opd_enabled:
+        algo_cfg = cast(GRPOConfig, algo_cfg)
         opd_config = master_config.on_policy_distillation
         assert opd_config is not None
         if algo_cfg.adv_estimator.name != "opd":
@@ -1505,7 +1636,22 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "at least one teacher mapping."
             )
         opd_module.assert_prev_logprobs_available(master_config)
+        opd_module.assert_trust_region_supported(master_config)
         _validate_opd_full_config(master_config, opd_config)
+        if (
+            algo_cfg.adv_estimator.subtract_global_baseline
+            and async_config.min_groups_for_streaming_train
+            != algo_cfg.num_prompts_per_step
+        ):
+            # The advantage stage runs once per streaming chunk, so a smaller
+            # chunk would center each chunk on its own mean, not the step's.
+            raise ValueError(
+                "grpo.adv_estimator.subtract_global_baseline=true requires "
+                "async_rl.min_groups_for_streaming_train "
+                f"({async_config.min_groups_for_streaming_train}) == "
+                f"grpo.num_prompts_per_step ({algo_cfg.num_prompts_per_step}) "
+                "so the baseline covers the whole step."
+            )
 
     if (
         reference_policy_kl_penalty == 0
@@ -1553,7 +1699,6 @@ class AdvantageConfig:
     """Internal DataPlane field mapping for advantage calculation."""
 
     output_field: str = "advantages"
-    prompt_ids_field: str = "prompt_ids_for_adv"
     reward_field: str = "total_reward"
     token_mask_field: str = "token_mask"
     sample_mask_field: str = "sample_mask"
@@ -1570,3 +1715,7 @@ class AdvantageConfig:
     # regression target for it (output).
     values_field: str = "values"
     returns_field: str = "returns"
+    # Dump-only. The estimators key their baseline on the group-id tag now, so
+    # nothing else fetches the raw prompt tokens; the training dump still
+    # records them per row.
+    prompt_ids_field: str = "prompt_ids_for_adv"

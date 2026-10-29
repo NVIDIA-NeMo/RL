@@ -1,6 +1,6 @@
 # Reward Model Training in NeMo RL
 
-This document explains how to train reward models (RM) within NeMo RL. Currently, only Bradley-Terry reward models are supported on the DTensor backend. Megatron backend support is tracked [here](https://github.com/NVIDIA-NeMo/RL/issues/720).
+This document explains how to train reward models (RM) within NeMo RL. Currently, only Bradley-Terry reward models are supported on the Automodel backend. Megatron backend support is tracked [here](https://github.com/NVIDIA-NeMo/RL/issues/720).
 
 ## Launch a Training Job
 
@@ -188,7 +188,7 @@ parent directory to `PYTHONPATH` before launching training.
 
 Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
-- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
+- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `val:validation-<NameOfValidationDataset1>_loss`.
 
 ## Using Reward Models as Environments
 

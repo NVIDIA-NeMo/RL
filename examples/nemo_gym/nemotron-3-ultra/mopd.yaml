@@ -31,6 +31,8 @@
 # vLLM parallelism: TP=8, EP=8.
 # =============================================================================
 
+defaults: ../legacy_environment_servers/ultra_rlvr.yaml
+
 # =============================================================================
 # Cluster — overridden by launch script
 # =============================================================================
@@ -165,9 +167,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
     cpu_offload: false
     sequence_parallel: false
@@ -333,7 +336,7 @@ policy:
     stop_strings: null
     # TP=8 EP=8: EP=TP so vllm_dp_size=1, async_engine=true works with NeMo Gym.
     # Same memory as EP=1 but uses all-to-all for expert routing.
-    # EP > TP blocked by https://github.com/NVIDIA-NeMo/RL/issues/1101.
+    # EP=TP keeps vLLM DP disabled for this recipe.
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
@@ -405,7 +408,49 @@ env:
   # true: skip expensive train_data_step*.jsonl (recommended for large Gym runs); false: write full jsonl.
   should_log_nemo_gym_responses: true
   nemo_gym:
-    nemo_gym_log_dir: "logs/nemo_gym"
+    swe_pivot_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_pivot_tool_simulation_agent
+    terminal_multi_harness_stirrup_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_stirrup_agent
+    terminal_multi_harness_agent006_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_agent006_agent
+    terminal_multi_harness_opencode_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_opencode_agent
+    terminal_multi_harness_codex_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_codex_agent
+    litmus_agent_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: rdkit_chemistry_agent
+
     skip_venv_if_present: true
     num_gpu_nodes: 12
     # NeMo-RL-side effort shaping; stripped before forwarding to Gym.

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 
@@ -33,6 +35,35 @@ def test_policy_waits_for_param_sync_before_refit(monkeypatch):
 
     assert calls == [("sync_params_before_refit", {})]
     assert waited_for == [["future"]]
+
+
+def _poll_policy(monkeypatch, worker_results):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return worker_results
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
+    )
+    policy = Policy.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+    return policy, calls
+
+
+def test_policy_poll_async_save_returns_the_workers_shared_answer(monkeypatch):
+    for answer in (True, False):
+        policy, calls = _poll_policy(monkeypatch, [answer, answer, answer])
+        assert policy.poll_async_save() is answer
+        assert calls == [("poll_async_save", {})]
+
+
+def test_policy_poll_async_save_rejects_disagreeing_workers(monkeypatch):
+    policy, _ = _poll_policy(monkeypatch, [True, False])
+    with pytest.raises(RuntimeError, match="disagree"):
+        policy.poll_async_save()
 
 
 def test_policy_forwards_nccl_peer_to_workers():
@@ -153,7 +184,7 @@ def test_policy_worker_offsets_its_rank_in_the_collective(monkeypatch):
     )
 
 
-def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
+def test_policy_forwards_final_checkpoint_marker_to_automodel(monkeypatch):
     calls = []
 
     class WorkerGroup:
@@ -168,7 +199,7 @@ def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
         "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
     )
     policy = Policy.__new__(Policy)
-    policy.cfg = {"dtensor_cfg": {"enabled": True, "_v2": True}}
+    policy.cfg = {"automodel_cfg": {"enabled": True}}
     policy.worker_group = WorkerGroup()
 
     policy.save_checkpoint(
@@ -189,7 +220,7 @@ def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
     ]
 
 
-def test_policy_uses_megatron_save_path_when_dtensor_is_disabled(monkeypatch):
+def test_policy_uses_megatron_save_path_when_automodel_is_disabled(monkeypatch):
     calls = []
 
     class WorkerGroup:
@@ -202,9 +233,8 @@ def test_policy_uses_megatron_save_path_when_dtensor_is_disabled(monkeypatch):
     )
     policy = Policy.__new__(Policy)
     policy.cfg = {
-        # Disabled DTensor settings must not select the Automodel save path,
-        # even if their dormant _v2 value is true.
-        "dtensor_cfg": {"enabled": False, "_v2": True},
+        # Disabled Automodel settings must not select the Automodel save path.
+        "automodel_cfg": {"enabled": False},
         "megatron_cfg": {"enabled": True},
     }
     policy.worker_group = WorkerGroup()
@@ -302,6 +332,7 @@ def test_policy_forwards_packed_collective_options_to_workers():
                 "refit_timeout_s": None,
                 "buffer_size_bytes": 1024**3,
                 "num_buffers": 2,
+                "use_legacy_packing": False,
             },
         )
     ]

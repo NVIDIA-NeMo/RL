@@ -69,8 +69,19 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
-from nemo_rl.models.policy import LoRAConfig, PolicyConfig, TokenizerConfig
-from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
+from nemo_rl.models.automodel.router_replay import (
+    enable_routing_replay_in_automodel_kwargs,
+    require_automodel_moe_model,
+    validate_automodel_router_replay_config,
+)
+from nemo_rl.models.automodel.utils import resolve_model_class
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
+from nemo_rl.models.policy import (
+    LoRAConfig,
+    PolicyConfig,
+    TokenizerConfig,
+)
+from nemo_rl.models.policy.utils import configure_dynamo_cache
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
@@ -160,7 +171,7 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
             f"force_hf=False but the custom model for {arch} uses an adapter that "
             f"does not implement 'convert_single_tensor_to_hf', which is required "
             f"for weight syncing. Please set "
-            f"`policy.dtensor_cfg.automodel_kwargs.force_hf=true` or file an issue "
+            f"`policy.automodel_cfg.automodel_kwargs.force_hf=true` or file an issue "
             f"at https://github.com/NVIDIA-NeMo/Automodel to add support."
         )
 
@@ -169,7 +180,7 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
         f"WARNING: Custom model for {arch} uses an adapter that does not implement "
         f"'convert_single_tensor_to_hf' (required for weight syncing). "
         f"Auto-setting force_hf=True. To silence this warning, explicitly set "
-        f"`policy.dtensor_cfg.automodel_kwargs.force_hf=true` in your config."
+        f"`policy.automodel_cfg.automodel_kwargs.force_hf=true` in your config."
     )
     automodel_kwargs["force_hf"] = True
 
@@ -325,7 +336,7 @@ def validate_and_prepare_config(
     dtype = STRING_TO_DTYPE[precision]
 
     # Get other configuration values
-    cpu_offload = config["dtensor_cfg"]["cpu_offload"]
+    cpu_offload = config["automodel_cfg"]["cpu_offload"]
     offload_optimizer_for_logprob = config.get("offload_optimizer_for_logprob", False)
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]
@@ -346,14 +357,14 @@ def validate_and_prepare_config(
 
     rope_scaling = hf_config_overrides.get("rope_scaling") or {}
     assert rope_scaling.get("rope_type") != "yarn", (
-        "YaRN RoPE scaling is not supported with the automodel (DTensor) backend. "
+        "YaRN RoPE scaling is not supported with the Automodel backend. "
         "Please use the Megatron backend (policy.megatron_cfg.enabled=True) for YaRN."
     )
 
     # NeMoAutoModelForCausalLM uses flash_attention_2 by default
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
-    cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
+    cp_size_cfg = config["automodel_cfg"]["context_parallel_size"]
     attn_impl = (
         "flash_attention_2"
         if (enable_seq_packing and cp_size_cfg == 1)
@@ -412,15 +423,15 @@ def validate_and_prepare_config(
         model_class = resolve_model_class(model_config.model_type)
 
     # Get parallelization sizes
-    tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
-    cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
-    sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
+    tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
+    cp_size = config["automodel_cfg"].get("context_parallel_size", 1)
+    sequence_parallel_enabled = config["automodel_cfg"]["sequence_parallel"]
 
     # Validate parallelization configuration
     if cp_size > 1 and enable_seq_packing:
         raise ValueError(
             "Context parallel is not supported for sequence packing. "
-            "Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+            "Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-automodel for more details."
         )
 
     if sequence_parallel_enabled and tp_size == 1:
@@ -494,11 +505,11 @@ def setup_distributed(
     cpu_offload = runtime_config.cpu_offload
 
     # Extract parallelization config
-    tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
-    cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
-    ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
-    dp_replicate_size = config["dtensor_cfg"].get("dp_replicate_size", 1)
-    sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
+    tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
+    cp_size = config["automodel_cfg"].get("context_parallel_size", 1)
+    ep_size = config["automodel_cfg"].get("expert_parallel_size", 1)
+    dp_replicate_size = config["automodel_cfg"].get("dp_replicate_size", 1)
+    sequence_parallel_enabled = config["automodel_cfg"]["sequence_parallel"]
 
     # HSDP requires the data-parallel axis to evenly contain the replicate dim.
     model_parallel_size = tp_size * cp_size * ep_size
@@ -511,7 +522,7 @@ def setup_distributed(
         )
 
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
-    tp_plan = config["dtensor_cfg"].get("custom_parallel_plan", None)
+    tp_plan = config["automodel_cfg"].get("custom_parallel_plan", None)
 
     # Create FSDP2Config
     fsdp2_config = FSDP2Config(
@@ -523,12 +534,12 @@ def setup_distributed(
             output_dtype=torch.float32,
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
-        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
-        defer_fsdp_grad_sync=config["dtensor_cfg"].get("defer_fsdp_grad_sync", True),
+        activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
+        defer_fsdp_grad_sync=config["automodel_cfg"].get("defer_fsdp_grad_sync", True),
     )
 
     # Create MoEParallelizerConfig from nested moe_parallelizer options
-    moe_parallelizer_cfg = config["dtensor_cfg"].get("moe_parallelizer", {})
+    moe_parallelizer_cfg = config["automodel_cfg"].get("moe_parallelizer", {})
     moe_config = MoEParallelizerConfig(**moe_parallelizer_cfg)
 
     # Handle world_size=1 + cpu_offload
@@ -580,7 +591,7 @@ def _validate_lora_adapter_config(
     config_path = os.path.join(adapter_dir, "adapter_config.json")
     if not os.path.isfile(config_path):
         raise FileNotFoundError(
-            f"dtensor_cfg.lora_cfg.restore_from: {config_path} not found. The "
+            f"automodel_cfg.lora_cfg.restore_from: {config_path} not found. The "
             "donor checkpoint must carry an adapter_config.json so its "
             "provenance can be validated."
         )
@@ -588,20 +599,20 @@ def _validate_lora_adapter_config(
         adapter_config = json.load(f)
     if adapter_config.get("peft_type") != "LORA":
         raise ValueError(
-            f"dtensor_cfg.lora_cfg.restore_from: {config_path} has "
+            f"automodel_cfg.lora_cfg.restore_from: {config_path} has "
             f"peft_type={adapter_config.get('peft_type')!r}; only 'LORA' "
             "adapters can be warm-started from."
         )
     for config_key, lora_key in (("r", "dim"), ("lora_alpha", "alpha")):
         if config_key not in adapter_config:
             raise ValueError(
-                f"dtensor_cfg.lora_cfg.restore_from: {config_path} has no "
+                f"automodel_cfg.lora_cfg.restore_from: {config_path} has no "
                 f"{config_key!r} field; cannot verify compatibility with this "
                 "run's lora_cfg."
             )
         if int(adapter_config[config_key]) != int(lora_cfg[lora_key]):
             raise ValueError(
-                f"dtensor_cfg.lora_cfg.restore_from: donor adapter "
+                f"automodel_cfg.lora_cfg.restore_from: donor adapter "
                 f"{config_key}={adapter_config[config_key]} does not match this "
                 f"run's lora_cfg.{lora_key}={lora_cfg[lora_key]}. Warm starting "
                 "requires the same LoRA rank and scaling; train a new adapter "
@@ -610,7 +621,7 @@ def _validate_lora_adapter_config(
     donor_base = adapter_config.get("base_model_name_or_path")
     if donor_base and donor_base != "N/A" and donor_base != model_name:
         raise ValueError(
-            f"dtensor_cfg.lora_cfg.restore_from: donor adapter was trained on "
+            f"automodel_cfg.lora_cfg.restore_from: donor adapter was trained on "
             f"base model {donor_base!r} but this run uses model_name="
             f"{model_name!r}."
         )
@@ -633,7 +644,7 @@ def _validate_lora_adapter_keys(
         donor_keys = set(f.keys())
     if not donor_keys:
         raise ValueError(
-            f"dtensor_cfg.lora_cfg.restore_from: {adapter_dir}/"
+            f"automodel_cfg.lora_cfg.restore_from: {adapter_dir}/"
             "adapter_model.safetensors contains no tensors."
         )
     # HF PEFT exports prefix keys with "base_model.model."; the loader strips
@@ -667,7 +678,7 @@ def _validate_lora_adapter_keys(
     unexpected = sorted(normalized_donor_keys - normalized_expected_keys)
     if missing or unexpected:
         raise ValueError(
-            "dtensor_cfg.lora_cfg.restore_from: donor adapter key mismatch "
+            "automodel_cfg.lora_cfg.restore_from: donor adapter key mismatch "
             f"against this run's LoRA parameters. Missing from donor: "
             f"{missing[:5]}{' ...' if len(missing) > 5 else ''}; unexpected in "
             f"donor: {unexpected[:5]}{' ...' if len(unexpected) > 5 else ''}. "
@@ -748,7 +759,7 @@ def setup_model_and_optimizer(
     tp_size = distributed_context.tp_size
     cp_size = distributed_context.cp_size
     sequence_parallel_enabled = fsdp2_config.sequence_parallel
-    ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
+    ep_size = config["automodel_cfg"].get("expert_parallel_size", 1)
 
     model_name = config["model_name"]
 
@@ -778,7 +789,7 @@ def setup_model_and_optimizer(
             raise AssertionError(
                 "Context parallel is not supported for Gemma3ForCausalLM. "
                 "Torch context parallel has many limitations. "
-                "Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+                "Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-automodel for more details."
             )
 
         if model_config.model_type == "gemma4_unified":
@@ -786,13 +797,13 @@ def setup_model_and_optimizer(
                 "Context parallel is not supported for the Gemma 4 unified "
                 "checkpoint (model_type='gemma4_unified'). Its global-attention "
                 "GQA uses head_dim=512, for which no CP SDPA kernel is available. "
-                "Set policy.dtensor_cfg.context_parallel_size = 1. See "
+                "Set policy.automodel_cfg.context_parallel_size = 1. See "
                 "docs/guides/models/gemma/gemma4.md."
             )
 
         if tp_size > 1 and sequence_parallel_enabled:
             raise AssertionError(
-                "It's a known issue that context parallel can't be used together with sequence parallel in DTensor worker. "
+                "It's a known issue that context parallel can't be used together with sequence parallel in the Automodel worker. "
                 "Please either set cp_size = 1 or disable sequence parallel. "
                 "See https://github.com/NVIDIA-NeMo/RL/issues/659 for more details."
             )
@@ -812,13 +823,13 @@ def setup_model_and_optimizer(
                 )
 
     # LoRA configuration
-    lora_cfg = config["dtensor_cfg"].get("lora_cfg", None)
+    lora_cfg = config["automodel_cfg"].get("lora_cfg", None)
     peft_config = None
     lora_enabled = lora_cfg is not None and lora_cfg["enabled"]
     if not lora_enabled and (lora_cfg or {}).get("restore_from"):
         raise ValueError(
-            "dtensor_cfg.lora_cfg.restore_from is set but "
-            "dtensor_cfg.lora_cfg.enabled is False. Enable LoRA to warm start "
+            "automodel_cfg.lora_cfg.restore_from is set but "
+            "automodel_cfg.lora_cfg.enabled is False. Enable LoRA to warm start "
             "from an adapter checkpoint."
         )
     if lora_enabled:
@@ -833,7 +844,9 @@ def setup_model_and_optimizer(
     print(f"[Rank {rank}] Initializing model via from_pretrained...")
 
     # Prepare automodel kwargs
-    automodel_kwargs = config["dtensor_cfg"].get("automodel_kwargs", {})
+    automodel_kwargs = config["automodel_cfg"].get("automodel_kwargs", {})
+    if router_replay_enabled(config):
+        validate_automodel_router_replay_config(config)
     if automodel_kwargs.get("backend", None) is not None:
         backend_class = _resolve_target(
             automodel_kwargs.get("backend", None)["_target_"]
@@ -872,7 +885,7 @@ def setup_model_and_optimizer(
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
         ]
-    elif config["dtensor_cfg"]["activation_checkpointing"]:
+    elif config["automodel_cfg"]["activation_checkpointing"]:
         # For activation checkpointing, we must disable the cudnn SDPA backend because
         # it may not be selected during recomputation.
         # In that case, we will get the following error:
@@ -887,7 +900,7 @@ def setup_model_and_optimizer(
 
     # For activation checkpointing, we also must globally disable the cudnn SDPA backend
     # to ensure that cudnn does not get selected during recomputation.
-    if config["dtensor_cfg"]["activation_checkpointing"]:
+    if config["automodel_cfg"]["activation_checkpointing"]:
         from torch.backends import cuda
 
         cuda.enable_cudnn_sdp(False)
@@ -906,6 +919,9 @@ def setup_model_and_optimizer(
     # Auto-set force_hf if the custom model's adapter doesn't support per-tensor
     # HF conversion (required for weight syncing).
     _maybe_set_force_hf(automodel_kwargs, model_config)
+    if router_replay_enabled(config):
+        require_automodel_moe_model(automodel_kwargs, model_config)
+        enable_routing_replay_in_automodel_kwargs(automodel_kwargs)
 
     # Bundle distributed topology + policies into a single DistributedSetup. Automodel
     # r0.6.0's from_pretrained rejects the old separate distributed kwargs
@@ -917,7 +933,7 @@ def setup_model_and_optimizer(
         strategy_config=fsdp2_config,
         pipeline_config=None,
         moe_parallel_config=moe_config if ep_size > 1 else None,
-        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
+        activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
     )
 
     # Create model via from_pretrained - handles meta device init, parallelization,
@@ -964,6 +980,77 @@ def setup_model_and_optimizer(
             v.data = v.data.to("cpu")
         model = model.to("cpu")
 
+    # Build the DSpark draft model before optimizer construction so its params
+    # join the optimizer (and any optimizer-state resume) from the start.
+    # lm_policy.py's Policy.__init__ already coerced policy.draft into a
+    # validated Eagle3DraftConfig/DSparkDraftConfig/DFlashDraftConfig
+    # instance (and validated speculator_type in DRAFT_ALGOS when
+    # enabled=true), so this reads it by attribute rather than re-validating.
+    draft_config = config.get("draft")
+    draft_enabled = draft_config is not None and draft_config.enabled
+    draft_model = None
+    composite_model = None
+    draft_runtime = None
+    if draft_enabled:
+        draft_algo = draft_config.speculator_type
+        from nemo_rl.models.automodel.draft.runtime import build_draft_runtime
+        from nemo_rl.models.automodel.draft.setup import (
+            PolicyWithDraft,
+            build_dspark_draft_model,
+            build_eagle3_draft_model,
+        )
+
+        # Use the configured training precision, NOT model_config.torch_dtype:
+        # validate_and_prepare_config pins the policy config to float32 for
+        # master weights, and a float32 draft would double its parameter and
+        # transient memory in the already memory-tight co-training recipe.
+        # The shared optimizer's FP32 master weights preserve update precision
+        # -- without them, updates smaller than half a bf16 ULP are silently
+        # dropped, so require master weights rather than train a draft that
+        # looks like it's learning but isn't.
+        if init_optimizer and not _has_optimizer_fp32_master(
+            optimizer_cls, optimizer_kwargs
+        ):
+            raise ValueError(
+                "Draft co-training requires an optimizer with FP32 master "
+                "weights (e.g. transformer_engine's FusedAdam with "
+                "master_weights=true): without them the draft trains in pure "
+                f"{runtime_config.dtype}, silently dropping sub-ULP updates. "
+                f"Got {optimizer_cls.__name__} with "
+                f"master_weights={optimizer_kwargs.get('master_weights')!r}."
+            )
+        draft_dtype = runtime_config.dtype
+        if draft_algo == "eagle3":
+            target_text_config = (
+                getattr(model_config, "text_config", None) or model_config
+            )
+            draft_model = build_eagle3_draft_model(
+                model_name=draft_config.model_name,
+                eagle3_options=draft_config,
+                torch_dtype=draft_dtype,
+                mesh=device_mesh["dp_cp"],
+                target_num_hidden_layers=target_text_config.num_hidden_layers,
+                policy_model=model,
+            )
+        else:
+            draft_model = build_dspark_draft_model(
+                model_name=draft_config.model_name,
+                dspark_options=draft_config.model_dump(),
+                torch_dtype=draft_dtype,
+                mesh=device_mesh["dp_cp"],
+                algo=draft_algo,
+            )
+        composite_model = PolicyWithDraft(policy=model, draft=draft_model)
+        draft_runtime = build_draft_runtime(
+            draft_model=draft_model,
+            draft_config=draft_config,
+            policy_model=model,
+            policy_config=config,
+            dp_group=device_mesh["dp"].get_group(),
+            tp_group=device_mesh["tp"].get_group(),
+            cp_group=device_mesh["cp"].get_group() if cp_size > 1 else None,
+        )
+
     # Initialize optimizer
     optimizer = None
     if init_optimizer:
@@ -972,10 +1059,29 @@ def setup_model_and_optimizer(
         # p.grad-is-None check, so passing frozen params (e.g. the visual
         # encoder in text-only training) causes DCP to save unused state that
         # later fails to reshard on resume.
-        optimizer = optimizer_cls(
-            (p for p in model.parameters() if p.requires_grad),
-            **optimizer_kwargs,
-        )
+        if draft_model is not None:
+            # Named [policy, draft] param groups in stable order; the layout
+            # record saved with the checkpoint validates names, order, and
+            # per-group param counts on resume (hard error on mismatch). The
+            # draft group carries its own learning rate: the policy's RL lr is
+            # orders of magnitude below the draft's native training lr, and a
+            # shared lr leaves the draft unable to track policy drift.
+            from nemo_rl.models.automodel.draft.setup import (
+                build_policy_and_draft_optimizer,
+            )
+
+            optimizer = build_policy_and_draft_optimizer(
+                optimizer_cls,
+                optimizer_kwargs,
+                model=model,
+                draft_model=draft_model,
+                draft_config=draft_config,
+            )
+        else:
+            optimizer = optimizer_cls(
+                (p for p in model.parameters() if p.requires_grad),
+                **optimizer_kwargs,
+            )
 
     # Initialize scheduler
     scheduler = None
@@ -1010,13 +1116,30 @@ def setup_model_and_optimizer(
 
     # Load NeMo RL checkpoint if provided
     if weights_path:
-        checkpoint_manager.load_checkpoint(
-            model=model,
-            weights_path=weights_path,
-            optimizer=optimizer,
-            optimizer_path=optimizer_path,
-            scheduler=scheduler,
-        )
+        if draft_model is not None:
+            from nemo_rl.models.automodel.draft.checkpoint import (
+                load_checkpoint_with_draft,
+            )
+
+            load_checkpoint_with_draft(
+                checkpoint_manager,
+                model=model,
+                draft_model=draft_model,
+                composite_model=composite_model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                draft_config=draft_config,
+            )
+        else:
+            checkpoint_manager.load_checkpoint(
+                model=model,
+                weights_path=weights_path,
+                optimizer=optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=scheduler,
+            )
     elif lora_enabled and lora_cfg.get("restore_from") is not None:
         # Warm start: base weights were already loaded by from_pretrained above;
         # restore only the donor adapter weights. This runs before the worker
@@ -1047,4 +1170,7 @@ def setup_model_and_optimizer(
         model_config=model.config,
         peft_config=peft_config,
         autocast_enabled=autocast_enabled,
+        draft_model=draft_model,
+        composite_model=composite_model,
+        draft_runtime=draft_runtime,
     )

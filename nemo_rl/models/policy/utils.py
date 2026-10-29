@@ -18,99 +18,44 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, cast
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, cast
 
 import torch
 import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForTextToWaveform,
-)
-
-from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
-
-# Try to import nemo_automodel classes, fallback to None if not available
-try:
-    from nemo_automodel._transformers.auto_model import (
-        NeMoAutoModelForCausalLM,
-        NeMoAutoModelForImageTextToText,
-        NeMoAutoModelForTextToWaveform,
-    )
-
-    # Side-effect import: installs the resolver hook that routes FP8-native
-    # Mistral 3.5 configs to Mistral3FP8VLM. Without it, HF's stock FP8Linear
-    # path runs and produces 0-d weight_scale_inv params that FSDP2 rejects.
-    try:
-        import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
-    except ImportError:
-        pass
-
-    NEMO_AUTOMODEL_AVAILABLE = True
-except ImportError:
-    # nemo_automodel is not installed, classes will be None
-    NeMoAutoModelForCausalLM = None  # type: ignore
-    NeMoAutoModelForImageTextToText = None  # type: ignore
-    NeMoAutoModelForTextToWaveform = None  # type: ignore
-    NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.vllm.config import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
     VllmSpecificArgs,
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
+from nemo_rl.models.generation.vllm.patches import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+)
+from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
 
-# Plain Hugging Face classes remain separate from the NeMo AutoModel wrappers so
-# callers that manage distribution can request them when NeMo AutoModel is installed.
-# Add an entry here whenever a model's architecture isn't loadable via
-# AutoModelForCausalLM (e.g. VLMs using ForConditionalGeneration /
-# ForImageTextToText). Unlike AUTOMODEL_FACTORY below, this dict is also read on
-# the ``use_nemo_automodel=False`` path (DTensor V1), where no NeMo custom impl
-# intercepts from_pretrained -- so a model that has a custom NeMo automodel impl
-# still needs an entry here when its parent AutoModel class is not
-# AutoModelForCausalLM. Check MODEL_ARCH_MAPPING in the NeMo automodel registry
-# to see which architectures have custom impls:
-# https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
-HF_AUTOMODEL_FACTORY: Dict[str, Any] = {
-    "qwen2_5_vl": AutoModelForImageTextToText,
-    "qwen2_vl": AutoModelForImageTextToText,
-    "qwen2_5_omni": AutoModelForTextToWaveform,
-    "qwen3_5": AutoModelForImageTextToText,
-    "llava": AutoModelForImageTextToText,
-    "internvl": AutoModelForImageTextToText,
-    "gemma3": AutoModelForImageTextToText,
-    "gemma4": AutoModelForImageTextToText,
-    "gemma4_unified": AutoModelForImageTextToText,
-    "smolvlm": AutoModelForImageTextToText,
-    "mistral3": AutoModelForImageTextToText,
-    "llama4": AutoModelForImageTextToText,
+# Environment for bitwise-reproducible policy workers. These are read when the
+# worker creates its cuBLAS handles and selects Transformer Engine kernels, so
+# they are set in the worker's runtime environment, before the process starts.
+DETERMINISTIC_ENV_VARS = {
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
 }
 
-AUTOMODEL_FACTORY: Dict[str, Any] = HF_AUTOMODEL_FACTORY
 
-if NEMO_AUTOMODEL_AVAILABLE:
-    AUTOMODEL_FACTORY = {
-        # NeMo wrappers — keep in sync with the vanilla HF dict above.
-        # See comment above for when to add entries.
-        "qwen2_5_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
-        "qwen3_5": NeMoAutoModelForImageTextToText,
-        "llava": NeMoAutoModelForImageTextToText,
-        "internvl": NeMoAutoModelForImageTextToText,
-        "gemma3": NeMoAutoModelForImageTextToText,
-        "gemma4": NeMoAutoModelForImageTextToText,
-        "gemma4_unified": NeMoAutoModelForImageTextToText,
-        "smolvlm": NeMoAutoModelForImageTextToText,
-        "mistral3": NeMoAutoModelForImageTextToText,
-        "llama4": NeMoAutoModelForImageTextToText,
-    }
+def enable_deterministic_algorithms() -> None:
+    """Switch torch to deterministic algorithms in this process.
+
+    ``warn_only=True`` keeps ops without a deterministic implementation running
+    (torch warns instead of raising), so enabling this never breaks a model.
+    """
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class IPCProtocol(Enum):
@@ -126,39 +71,100 @@ class IPCProtocol(Enum):
 # worker classes.
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
+    "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": "nemo_rl.modelopt.models.policy.workers.automodel_quant_policy_worker.AutomodelQuantPolicyWorker",
 }
 
 _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
 _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
 
+LoraRefitMode = Literal["native", "merged"]
 
-def reject_dtensor_v1(
-    dtensor_cfg: dict[str, Any],
-    config_path: str,
-    *,
-    suggest_megatron: bool = True,
-) -> None:
-    """Fail at setup when a config still selects the DTensor v1 backend.
 
-    Args:
-        dtensor_cfg: The resolved dtensor_cfg mapping to inspect.
-        config_path: Dotted path used in the error message, e.g. policy.dtensor_cfg.
-        suggest_megatron: Whether to offer Megatron-Core as an alternative. Callers whose
-            config has no megatron_cfg, or that require DTensor, pass False.
-    """
-    if dtensor_cfg.get("_v2") is False:
-        message = (
-            f"{config_path}._v2=false selects the DTensor v1 backend, which has been "
-            f"removed. Set {config_path}._v2=true (v2 is the only supported DTensor "
-            f"backend)"
+def is_lora_enabled(policy_config: "PolicyConfig") -> bool:
+    """Return whether either supported training backend has LoRA enabled."""
+    automodel_config = policy_config.get("automodel_cfg") or {}
+    automodel_lora = automodel_config.get("lora_cfg") or {}
+    megatron_config = policy_config.get("megatron_cfg") or {}
+    megatron_lora = megatron_config.get("peft") or {}
+    return bool(
+        (automodel_config.get("enabled") and automodel_lora.get("enabled"))
+        or (megatron_config.get("enabled") and megatron_lora.get("enabled"))
+    )
+
+
+def validate_lora_refit_policy_config(
+    policy_config: "PolicyConfig",
+) -> LoraRefitMode | None:
+    """Validate backend-independent policy requirements for LoRA refit."""
+    if not is_lora_enabled(policy_config):
+        return None
+
+    raw_generation_config = policy_config.get("generation")
+    if raw_generation_config is None:
+        return None
+    generation_config = cast(dict[str, Any], raw_generation_config)
+
+    if "lora_refit_mode" not in generation_config:
+        raise KeyError(
+            "LoRA training with rollout requires policy.generation.lora_refit_mode."
         )
-        if suggest_megatron:
-            message += (
-                f", or set {config_path.rsplit('.', 1)[0]}.megatron_cfg.enabled=true "
-                f"together with {config_path}.enabled=false to train with Megatron-Core"
-            )
-        raise ValueError(message + ".")
+    mode = generation_config["lora_refit_mode"]
+    if mode not in ("native", "merged"):
+        raise ValueError(
+            "policy.generation.lora_refit_mode must be 'native' or 'merged'."
+        )
+    if mode == "merged":
+        return cast(LoraRefitMode, mode)
+
+    if generation_config["backend"] != "vllm":
+        raise ValueError(
+            "Native LoRA refit requires policy.generation.backend=vllm. "
+            "Use lora_refit_mode=merged with other rollout backends."
+        )
+
+    automodel_config = policy_config.get("automodel_cfg") or {}
+    automodel_lora = automodel_config.get("lora_cfg") or {}
+    if not automodel_lora.get("enabled"):
+        raise ValueError(
+            "Native LoRA refit currently requires the Automodel LoRA policy. "
+            "Set policy.generation.lora_refit_mode=merged for Megatron LoRA."
+        )
+    if automodel_lora.get("use_dora"):
+        raise ValueError(
+            "Native LoRA refit does not support use_dora=true because vLLM "
+            "cannot apply the additional trainable magnitude vector."
+        )
+    if automodel_lora.get("moe_rank_scaling"):
+        raise ValueError(
+            "Native LoRA refit does not support moe_rank_scaling=true because "
+            "vLLM currently accepts one adapter rank and scaling factor."
+        )
+    if policy_config["precision"] not in (
+        "bfloat16",
+        "bf16",
+        "float16",
+        "fp16",
+    ):
+        raise ValueError(
+            "Native LoRA refit currently supports bfloat16 or float16 policy "
+            f"precision, got {policy_config['precision']!r}."
+        )
+    return cast(LoraRefitMode, mode)
+
+
+def configure_lora_refit(policy_config: "PolicyConfig") -> None:
+    """Validate LoRA refit for every backend and configure native vLLM."""
+    mode = validate_lora_refit_policy_config(policy_config)
+    if mode != "native":
+        return
+
+    from nemo_rl.models.generation.vllm.lora_utils import (
+        configure_vllm_lora_refit,
+        validate_vllm_lora_refit,
+    )
+
+    validate_vllm_lora_refit(policy_config)
+    configure_vllm_lora_refit(policy_config)
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
@@ -225,7 +231,7 @@ def validate_fp32_lm_head_config(
     config: "PolicyConfig",
     *,
     megatron_enabled: bool,
-    dtensor_enabled: bool,
+    automodel_enabled: bool,
     model_config: object | None = None,
 ) -> None:
     """Reject fp32 LM-head settings that the selected backends cannot match."""
@@ -273,11 +279,11 @@ def validate_fp32_lm_head_config(
         )
 
     vllm_fp32 = vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg)
-    if dtensor_enabled and vllm_fp32:
+    if automodel_enabled and vllm_fp32:
         raise ValueError(
             "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
-            "with the Megatron trainer because DTensor has no matching "
-            "policy.dtensor_cfg fp32 LM-head implementation."
+            "with the Megatron trainer because Automodel has no matching "
+            "policy.automodel_cfg fp32 LM-head implementation."
         )
     if megatron_enabled and megatron_fp32 != vllm_fp32:
         raise ValueError(
@@ -303,23 +309,6 @@ def validate_fp32_lm_head_config(
             UserWarning,
             stacklevel=2,
         )
-
-
-def resolve_model_class(
-    model_name: str,
-    *,
-    use_nemo_automodel: bool = True,
-) -> Any:
-    """Resolve the model class for a model type.
-
-    Args:
-        model_name: Model type to resolve.
-        use_nemo_automodel: Whether to prefer NeMo AutoModel wrappers when they
-            are available.
-    """
-    if use_nemo_automodel and NEMO_AUTOMODEL_AVAILABLE:
-        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
-    return HF_AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
 
 
 def is_vllm_v1_engine_enabled() -> bool:
@@ -405,6 +394,41 @@ def configure_dynamo_cache() -> None:
     See https://github.com/pytorch/pytorch/issues/153791 for more details.
     """
     torch._inductor.config.autotune_local_cache = False
+
+
+def make_empty_cache_best_effort_under_expandable_segments() -> None:
+    """Skip torch.cuda.empty_cache() when expandable segments are on.
+
+    With ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``,
+    ``torch._C._cuda_emptyCache()`` can raise ``RuntimeError: std::get: wrong
+    index for variant`` and leave the caching allocator corrupted (the process
+    later dies of cudaErrorIllegalAddress), so catching the exception is not
+    enough. empty_cache is memory hygiene, not a correctness requirement, and
+    expandable segments already return freed blocks to the segment pool.
+
+    Opt-in via ``NRL_BEST_EFFORT_EMPTY_CACHE=1``: patching a global torch API
+    is intrusive. Without the flag this is a no-op.
+    """
+    if os.environ.get("NRL_BEST_EFFORT_EMPTY_CACHE", "0") != "1":
+        return
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments:True" not in alloc_conf:
+        return
+    original_empty_cache = torch.cuda.empty_cache
+    if getattr(original_empty_cache, "_nrl_best_effort", False):
+        return
+
+    def _best_effort_empty_cache() -> None:
+        # Never call through: the failing flush corrupts the allocator even
+        # when its exception is caught (see the docstring above).
+        warnings.warn(
+            "torch.cuda.empty_cache() skipped under expandable_segments "
+            "(allocator-corrupting torch bug; see NRL empty_cache guard)",
+            stacklevel=2,
+        )
+
+    _best_effort_empty_cache._nrl_best_effort = True  # type: ignore[attr-defined]
+    torch.cuda.empty_cache = _best_effort_empty_cache
 
 
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
@@ -546,7 +570,11 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
 
 
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -620,58 +648,89 @@ def stream_weights_via_ipc_zmq_impl(
 
     try:
         for name, tensor in params_generator:
-            # Initialize device and buffers on first tensor
-            if buffer_a is None:
-                buffer_device = tensor.device
-                if buffer_device.type == "cpu" and torch.cuda.is_available():
-                    buffer_device = torch.device("cuda", torch.cuda.current_device())
-                buffer_a = allocate_buffer(buffer_device)
-                buffer_b = allocate_buffer(buffer_device)
-                current_buffer = buffer_a
-
             aligned_size = calculate_aligned_size(tensor.nbytes)
+            # Resolve the transfer device without allocating staging storage.
+            # CPU exports still need CUDA storage for the IPC reducer.
+            buffer_device = (
+                current_buffer.device if current_buffer is not None else tensor.device
+            )
+            if buffer_device.type == "cpu" and torch.cuda.is_available():
+                buffer_device = torch.device("cuda", torch.cuda.current_device())
 
             # A parameter larger than a single staging buffer cannot be packed
-            # at all. Ship it on its own in a buffer sized to fit rather than
-            # failing the refit. The staging buffers are sized from *free
+            # with ordinary parameters. Ship it on its own rather than failing
+            # the refit. The staging buffers are sized from *free
             # memory* (NRL_REFIT_BUFFER_MEMORY_RATIO, default 0.3, halved again
             # for ping-pong) with no floor at the largest parameter, so a big
             # embedding can exceed one: DeepSeek-V3's model.embed_tokens.weight
-            # is 1.73 GiB against a 1.65 GiB buffer. This mirrors the HTTP
-            # streaming path, which already gives an oversized parameter a
-            # bucket of its own instead of raising.
+            # is 1.73 GiB against a 1.65 GiB buffer.
             if aligned_size > buffer_size_bytes:
                 if param_names:
                     await_recv = send_buffer_group_overlap(
                         current_buffer, param_names, used_bytes, await_recv
                     )
                     count_of_groups += 1
-                    current_buffer = (
-                        buffer_b if current_buffer is buffer_a else buffer_a
-                    )
                     used_bytes, param_names = 0, []
 
-                oversized_buffer = torch.empty(
-                    aligned_size,
-                    device=current_buffer.device,
-                    dtype=torch.uint8,
-                    requires_grad=False,
-                )
+                # The regular staging pair is no longer needed for this
+                # transfer. Wait for its last consumer before releasing it;
+                # keeping both buffers alive can consume the only headroom
+                # available for a multi-GiB expert parameter.
+                if await_recv:
+                    zmq_socket.recv()
+                    await_recv = False
+                release_staging_buffers()
+
+                # The policy generators already yield contiguous tensors. A
+                # uint8 view can therefore be exported through CUDA IPC
+                # directly, avoiding a second allocation as large as the
+                # parameter. Retain the copy fallback for other callers that
+                # may yield a non-contiguous oversized tensor.
+                direct_ipc_buffer = None
+                oversized_buffer = None
+                transfer_buffer = None
                 try:
-                    packed_bytes = pack_tensor(oversized_buffer, tensor, 0)
-                    send_buffer_group_overlap(
-                        oversized_buffer, [name], packed_bytes, await_recv
+                    # Only CUDA storage has a CUDA IPC reducer. A contiguous
+                    # CPU tensor (notably grouped-expert fallback output) must
+                    # still be copied to CUDA, but do so only after releasing
+                    # the regular ping-pong pair to recover enough headroom.
+                    if tensor.is_cuda and tensor.is_contiguous():
+                        direct_ipc_buffer = tensor.reshape(-1).view(torch.uint8)
+                        transfer_buffer = direct_ipc_buffer
+                    else:
+                        oversized_buffer = torch.empty(
+                            aligned_size,
+                            device=buffer_device,
+                            dtype=torch.uint8,
+                            requires_grad=False,
+                        )
+                        pack_tensor(oversized_buffer, tensor, 0)
+                        transfer_buffer = oversized_buffer
+
+                    await_recv = send_buffer_group_overlap(
+                        transfer_buffer, [name], aligned_size, await_recv=False
                     )
                     count_of_groups += 1
-                    # Unlike the ping-pong pair, this buffer is not kept alive
-                    # across the next send, so its ACK must be consumed here
-                    # before it is freed.
+                    # The exported tensor or fallback buffer is not kept alive
+                    # across the next send, so consume its ACK before releasing
+                    # the last reference to its CUDA storage.
                     zmq_socket.recv()
                     await_recv = False
                 finally:
-                    del oversized_buffer
+                    del transfer_buffer, direct_ipc_buffer, oversized_buffer
                     torch.cuda.empty_cache()
+                # Drop the caller-side reference before requesting the next
+                # generator item; otherwise the next bridge conversion can
+                # overlap with this multi-GiB tensor after its consumer ACKed.
+                del tensor
                 continue
+
+            # Oversized exports never use the regular pair. Allocate it only
+            # when an ordinary parameter arrives, including after oversized ones.
+            if buffer_a is None:
+                buffer_a = allocate_buffer(buffer_device)
+                buffer_b = allocate_buffer(buffer_device)
+                current_buffer = buffer_a
 
             # Check if we need to send current buffer and switch to the other one
             if used_bytes + aligned_size > buffer_size_bytes:
@@ -779,7 +838,7 @@ def connect_colocate_topology(
     engine_gpu_offsets: Optional[list[int]] = None,
     worker_state: dict,
 ) -> None:
-    """Generalized colocate rollout-engine connect for FSDP and Megatron.
+    """Generalized colocate rollout-engine connect for Automodel and Megatron.
 
     Builds a Gloo gather subgroup for each engine's GPU rank range and stashes
     rank-only routing state into ``worker_state``:

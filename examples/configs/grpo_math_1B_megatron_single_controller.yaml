@@ -27,7 +27,7 @@ async_rl:
     # How far generation may run ahead of the trainer.
     max_lookahead_versions: 1
   # Recompute generation KV caches after each weight update.
-  recompute_kv_cache_after_weight_updates: false
+  recompute_kv_cache_after_weight_updates: true
   # Min ready groups the streaming trainer waits for before dispatching a batch.
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   # Cap on in-flight generate_and_push calls in the rollout pump.
@@ -36,6 +36,20 @@ async_rl:
   max_buffered_rollouts: 64
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
+  # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
+  log_full_train_data: false
+  # Writer used by log_full_train_data. json writes JSONL files; set target to a
+  # dotted import path of a DebugWriter defined outside this repo to store the dump
+  # elsewhere (extra keys are passed to its constructor).
+  debug_writer:
+    target: json
+  # With policy.megatron_cfg.checkpoint.async_save: finalize async checkpoints at a
+  # later step boundary so the disk write overlaps training (non-colocated generation).
+  defer_async_checkpoint_finalize: false
+  # CPU actors that run the advantage stage. 0 keeps it in the controller
+  # process, which both holds a whole cohort's advantage inputs in the
+  # controller's heap and blocks its event loop while the stage runs.
+  num_advantage_workers: 0
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are
@@ -175,7 +189,7 @@ rollout_checkpointing:
   extra_fingerprint_excluded_paths: []
 
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
@@ -183,7 +197,6 @@ policy:
   generation:
     # HTTP ports inherit the shared [3000, 4999) band from grpo_math_1B.yaml.
     mcore_generation_config:
-      unified_memory_level: 0
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512
       prefix_caching_mamba_gb: null

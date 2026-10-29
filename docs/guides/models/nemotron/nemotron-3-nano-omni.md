@@ -37,7 +37,7 @@ Key knobs in the config:
 | Field | Value |
 |---|---|
 | `policy.model_name` | path to the Nemotron-Omni HF checkpoint |
-| `policy.dtensor_cfg.expert_parallel_size` | 8 |
+| `policy.automodel_cfg.expert_parallel_size` | 8 |
 | `policy.generation.vllm_cfg.tensor_parallel_size` | 8 |
 | `policy.max_total_sequence_length` | 8192 |
 | `data.train.dataset_name` | `clevr-cogent` (split `train`) |
@@ -147,19 +147,13 @@ Use the `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` Hugging Face checkp
 
 | Workload | Recipe | Topology |
 |---|---|---|
-| CLEVR-CoGenT | [`vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml) | 1 node, 8 GPUs, TP=8, EP=8 |
+| CLEVR-CoGenT | [`vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1.yaml) | 2 nodes, 8 GPUs per node, TP=8, EP=8 |
 | MMPR-Tiny | [`vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml) | 4 nodes, 8 GPUs per node, TP=8, EP=16, vLLM TP=2 |
 
-Launch the single-node Megatron recipe from inside the container on an 8-GPU node:
+For a Slurm run, use the `ray.sub` example above with the matching configuration path and omit the AutoModel-specific `PYTHONPATH` addition:
 
 ```bash
-uv run examples/run_vlm_grpo.py \
-    --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml
-```
-
-For a four-node Slurm run, use the `ray.sub` example above with the following configuration path and omit the AutoModel-specific `PYTHONPATH` addition:
-
-```bash
+CONFIG_PATH=examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1.yaml
 CONFIG_PATH=examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-megatron-tp8ep16.v1.yaml
 ```
 

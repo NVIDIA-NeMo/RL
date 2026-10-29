@@ -37,6 +37,7 @@ from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.deepseek_v4_tokenizer import get_deepseek_v4_tokenizer
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 @pytest.fixture
@@ -149,6 +150,66 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     formatted = tokenizer.apply_chat_template(conversation_messages, tokenize=False)
     expected = get_format_with_simple_role_header(conversation_messages)
     assert formatted == expected
+
+
+def test_get_processor_custom_template_updates_processor_and_tokenizer():
+    class NemotronH_Super_Omni_Reasoning_V3Processor:
+        pass
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.bos_token = "<bos>"
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    tokenizer.bos_token_id = 2
+    tokenizer.name_or_path = "test-processor"
+    processor = NemotronH_Super_Omni_Reasoning_V3Processor()
+    processor.tokenizer = tokenizer
+    processor.chat_template = "stale-template"
+
+    with patch(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ):
+        result = get_tokenizer(
+            {"name": "test-processor", "chat_template": "new-template"},
+            get_processor=True,
+        )
+
+    assert result is processor
+    assert tokenizer.chat_template == "new-template"
+    assert processor.chat_template == "new-template"
+
+
+def test_get_processor_custom_template_preserves_native_multimodal_template():
+    class Qwen2_5_VLProcessor:
+        pass
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.bos_token = "<bos>"
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    tokenizer.bos_token_id = 2
+    tokenizer.name_or_path = "test-processor"
+    processor = Qwen2_5_VLProcessor()
+    processor.tokenizer = tokenizer
+    processor.chat_template = "native-multimodal-template"
+
+    with patch(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ):
+        result = get_tokenizer(
+            {"name": "test-processor", "chat_template": "new-template"},
+            get_processor=True,
+        )
+
+    assert result is processor
+    assert tokenizer.chat_template == "new-template"
+    assert processor.chat_template == "native-multimodal-template"
 
 
 def test_get_tokenizer_forwards_tokenizer_kwargs():
@@ -375,12 +436,76 @@ def test_maybe_pad_last_batch_preserves_multimodal_rows():
     assert all(shard.size == 3 for shard in shards)
 
 
+def _single_direct_packed_validation_row() -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "target_ids": torch.tensor([[2, 3, 4, -100]]),
+            "token_mask": torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+            "position_ids": torch.tensor([[0, 1, 2, 3]]),
+            "input_lengths": torch.tensor([4]),
+            "sample_mask": torch.tensor([1.0]),
+            "packed_cu_seqlens": torch.tensor([[0, 2, 4]], dtype=torch.int32),
+            "packed_cu_seqlens_lengths": torch.tensor([3]),
+            "packed_max_seqlen": torch.tensor([2]),
+            "idx": ["row-0"],
+            "task_name": ["sft"],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "input_ids",
+        "target_ids",
+        "token_mask",
+        "position_ids",
+        "input_lengths",
+        "packed_cu_seqlens",
+        "packed_cu_seqlens_lengths",
+        "packed_max_seqlen",
+    ],
+)
+def test_maybe_pad_last_direct_packed_batch_duplicates_tensor_row_fields(key: str):
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert torch.equal(result[key][1], result[key][0])
+
+
+@pytest.mark.parametrize("key", ["idx", "task_name"])
+def test_maybe_pad_last_direct_packed_batch_duplicates_list_row_fields(key: str):
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert result[key] == [result[key][0], result[key][0]]
+
+
+def test_maybe_pad_last_direct_packed_batch_marks_padding_row_invalid():
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert torch.equal(result["sample_mask"], torch.tensor([1.0, 0.0]))
+
+
+def test_maybe_pad_last_direct_packed_batch_rejects_unaligned_field():
+    batch = _single_direct_packed_validation_row()
+    batch["metadata"] = object()
+
+    with pytest.raises(TypeError, match="Unsupported type .* for index selection"):
+        maybe_pad_last_batch(batch, dp_size=2, mbs=1)
+
+
 # Performance Metrics Tests
 
 
 def _base_master_config(colocated: bool):
     return MasterConfig.model_construct(
-        cluster={"num_nodes": 2, "gpus_per_node": 8},
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         policy={
             "generation": {
                 "temperature": 1.0,
@@ -400,7 +525,7 @@ def _base_master_config(colocated: bool):
 
 def _base_ppo_master_config(colocated: bool):
     return PPOMasterConfig.model_construct(
-        cluster={"num_nodes": 2, "gpus_per_node": 8},
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         policy={
             "generation": {
                 "temperature": 1.0,

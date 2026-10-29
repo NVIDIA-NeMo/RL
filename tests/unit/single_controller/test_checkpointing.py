@@ -59,6 +59,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_STORAGE,
     DataPlaneCheckpointBarrier,
     DataPlaneCheckpointMetadata,
+    DataPlaneMutationCut,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
@@ -71,7 +72,7 @@ from nemo_rl.algorithms.grpo import (
     _get_grpo_save_state,
     _initial_grpo_save_state,
 )
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
@@ -97,7 +98,8 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -108,8 +110,9 @@ from nemo_rl.experience.route_plan import (
     RouteAssemblyPlan,
     encode_route_plan,
 )
+from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
 from nemo_rl.utils.checkpoint import CheckpointManager
-from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC
+from nemo_rl.utils.logger import LoggerConfig
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
@@ -223,6 +226,45 @@ class _GatedFinalizeTrainer(_FakeTrainer):
         super().finalize_async_save()
 
 
+class _PollingTrainer(_FakeTrainer):
+    """Async-save stand-in for deferred finalize: poll_async_save answers in order."""
+
+    def __init__(self, poll_answers: list[bool], checkpoint_dir: Path) -> None:
+        super().__init__()
+        self._poll_answers = list(poll_answers)
+        self._checkpoint_dir = checkpoint_dir
+        self.poll_calls = 0
+        self._train_step_open = False
+        self.polled_inside_a_train_step = False
+        # Published step_N dirs at each save_checkpoint call, in call order. The
+        # tmp_step_N of the save in progress already exists then, so it's excluded.
+        self.published_at_save: list[set[str]] = []
+
+    def begin_train_step(self, loss_fn: Any) -> None:
+        self._train_step_open = True
+
+    def finish_train_step(self) -> dict[str, Any]:
+        self._train_step_open = False
+        return super().finish_train_step()
+
+    def poll_async_save(self) -> bool:
+        # The finalize runs collectives on the training communicator, so the poll
+        # has to land between steps, never inside an open one.
+        self.polled_inside_a_train_step |= self._train_step_open
+        self.poll_calls += 1
+        return self._poll_answers.pop(0) if self._poll_answers else False
+
+    def save_checkpoint(self, **kwargs: Any) -> None:
+        self.published_at_save.append(
+            {
+                name
+                for name in _step_dir_names(self._checkpoint_dir)
+                if name.startswith("step_")
+            }
+        )
+        super().save_checkpoint(**kwargs)
+
+
 class _FailingFinalizeTrainer(_FakeTrainer):
     def finalize_async_save(self) -> None:
         raise RuntimeError("injected async-writer failure")
@@ -257,7 +299,13 @@ class _FakeSampler:
             task_name=None,
             sample_ids=sample_ids,
             sequence_lengths=[16] * n,
-            tags=[{"weight_version": current_train_weight}] * n,
+            # One group per row, since the selection is sized in prompt groups.
+            # The train pump reads this tag off every row and raises when it is
+            # absent, so a shared dict here would also collapse the group count.
+            tags=[
+                {"weight_version": current_train_weight, GROUP_ID_TAG: sample_id}
+                for sample_id in sample_ids
+            ],
         )
         return meta, n
 
@@ -298,6 +346,18 @@ class _ExhaustingSampler(_FakeSampler):
             return None, 0
         self._remaining -= 1
         return await super().select(**kwargs)
+
+
+class _EvictOnceSampler(_FakeSampler):
+    """Reports one stale group evicted on the first train step."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.evict_calls = 0
+
+    async def evict(self, *, current_train_weight: int) -> int:
+        self.evict_calls += 1
+        return 1 if self.evict_calls == 1 else 0
 
 
 class _RestoredGroupsSampler(_FakeSampler):
@@ -440,6 +500,20 @@ class _FakeGeneration:
     def get_step_metrics(self) -> dict[str, float]:
         return {}
 
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: float | None = None
+    ) -> bool:
+        # Model native pause/clear support; unsupported backends are covered in
+        # test_single_controller_actor.py rather than these checkpoint tests.
+        del clear_cache, timeout_s
+        return True
+
+    def resume_generation_after_refit(self, *, timeout_s: float | None = None) -> bool:
+        return True
+
+    def invalidate_kv_cache(self) -> bool:
+        return False
+
     def wake_carries_weight_updates(self) -> bool:
         return True
 
@@ -503,6 +577,7 @@ class _FakeRolloutManager:
         self._tq_buffer = None
         self.recovery_ledger = RolloutRecoveryLedger()
         self._events = events
+        self.reserved_prompts: list[dict[str, Any]] = []
         self.telemetry = {
             "committed_groups": 0,
             "committed_output_tokens": 0,
@@ -515,6 +590,25 @@ class _FakeRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    def reserve_prompt_group(
+        self,
+        cut: Any,
+        input_sample: dict[str, Any],
+        *,
+        target_step: Optional[int],
+        admitted: bool = True,
+        admission_id: Optional[str] = None,
+    ) -> str:
+        del cut, admission_id
+        self.reserved_prompts.append(
+            {
+                "prompt": input_sample,
+                "target_step": target_step,
+                "admitted": admitted,
+            }
+        )
+        return f"regenerated-{len(self.reserved_prompts)}"
 
     def suspend_request_deadlines(self) -> None:
         if self._events is not None:
@@ -560,6 +654,7 @@ class _FakeTQBuffer:
         self.load_return = load_return
         self.metadata_state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
+        self.remove_calls: list[dict[str, Any]] = []
         self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self.training_claims: list[dict[str, Any]] = []
 
@@ -650,6 +745,10 @@ class _FakeTQBuffer:
         ]
         return self.load_return
 
+    async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
+        self.remove_calls.append({"idxs": list(idxs), "remove_in_dp": remove_in_dp})
+        return len(idxs)
+
 
 # Default position sentinel the fake dataloader reports via state_dict().
 _SENTINEL_DL_STATE = {"fake_position": 42}
@@ -663,9 +762,16 @@ class _FakeDataloader(list):
     train_dataloader.pt.
     """
 
-    def __init__(self, batches: Any = (), state: Optional[dict[str, Any]] = None):
+    def __init__(
+        self,
+        batches: Any = (),
+        state: Optional[dict[str, Any]] = None,
+        dataset: Optional[Any] = None,
+    ) -> None:
         super().__init__(batches)
         self._state = dict(state) if state is not None else dict(_SENTINEL_DL_STATE)
+        self.dataset = dataset
+        self.collate_fn = None
 
     def state_dict(self) -> dict[str, Any]:
         return dict(self._state)
@@ -690,6 +796,8 @@ def _actor_master_config(
     data_plane_checkpoint: bool = True,
     rollout_checkpoint_attempt_interval_s: Optional[float] = None,
     token_capture_enabled: bool = False,
+    load_replay_buffer: bool = True,
+    defer_finalize: bool = False,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -705,7 +813,12 @@ def _actor_master_config(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
             "train_global_batch_size": num_prompts_per_step * 2,
-            "generation": {"backend": "vllm", "colocated": {"enabled": False}},
+            "generation": {
+                "backend": "vllm",
+                "top_k": None,
+                "top_p": 1.0,
+                "colocated": {"enabled": False},
+            },
         },
         loss_fn=ClippedPGLossConfig(),
         env={},
@@ -717,15 +830,8 @@ def _actor_master_config(
             num_generations_per_prompt=2,
             seed=42,
         ),
-        logger={
-            "log_dir": str(tmp_path / "logs"),
-            "wandb_enabled": False,
-            "swanlab_enabled": False,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "monitor_gpus": False,
-        },
-        cluster={"num_nodes": 1, "gpus_per_node": 1},
+        logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
+        cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
         checkpointing={
             "enabled": enabled,
             "checkpoint_dir": str(tmp_path / "checkpoints"),
@@ -735,6 +841,7 @@ def _actor_master_config(
             "save_period": save_period,
             "save_optimizer": save_optimizer,
             "save_data_plane": data_plane_checkpoint,
+            "load_replay_buffer": load_replay_buffer,
             "checkpoint_must_save_by": checkpoint_must_save_by,
             "ft_save_period": ft_save_period,
         },
@@ -748,6 +855,7 @@ def _actor_master_config(
             min_groups_for_streaming_train=1,
             max_inflight_prompts=4,
             max_buffered_rollouts=4,
+            defer_async_checkpoint_finalize=defer_finalize,
         ),
         rollout_checkpointing=RolloutCheckpointConfig(
             snapshot_attempt_interval_s=rollout_checkpoint_attempt_interval_s
@@ -770,6 +878,7 @@ def _make_actor_args(
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None,
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None,
+    loss_fn: Optional[Any] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=gen if gen is not None else _FakeGeneration(),
@@ -785,7 +894,7 @@ def _make_actor_args(
             else _FakeWeightSynchronizer()
         ),
         advantage_estimator=None,
-        loss_fn=object(),  # type: ignore[arg-type]
+        loss_fn=loss_fn if loss_fn is not None else object(),  # type: ignore[arg-type]
         rollout_manager=(  # type: ignore[arg-type]
             rollout_manager if rollout_manager is not None else _FakeRolloutManager()
         ),
@@ -796,6 +905,7 @@ def _make_actor_args(
         ),
         last_checkpoint_path=last_checkpoint_path,
         finalizer_actors=[],
+        advantage_actors=[],
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
@@ -1144,6 +1254,8 @@ class TestSaveTrigger:
         assert info_2["consumed_samples"] == 4  # 2 prompts/step * 2 steps
         # No validation ran, so the default val_reward is dropped.
         assert "val_reward" not in info_2
+        # No adaptive loss, so its controller state is None.
+        assert info_2["cur_adaptive_ppo_clip_k"] is None
 
         info_4 = _training_info(ckpt_dir, 4)
         assert info_4["current_step"] == 4
@@ -1368,6 +1480,210 @@ class TestSaveTrigger:
         # step_2 from ft_save_period, step_3 from last-step.
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_2", "step_3"}
 
+    def test_deferred_finalize_publishes_after_a_successful_poll(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=4, save_period=2, defer_finalize=True
+        )
+        ckpt_dir = tmp_path / "checkpoints"
+        # Step 3's poll finds the step-2 writes unfinished; step 4's finds them done.
+        trainer = _PollingTrainer([False, True], ckpt_dir)
+
+        _run_train_pump(mc, _make_actor_args(trainer=trainer))
+
+        assert trainer.poll_calls == 2
+        assert not trainer.polled_inside_a_train_step
+        # step_2 was published by the poll, before the step-4 save started.
+        assert trainer.published_at_save == [set(), {"step_2"}]
+        # Only the save left pending at exit was finalized blocking.
+        assert trainer.finalize_calls == 1
+        assert _step_dir_names(ckpt_dir) == {"step_2", "step_4"}
+        with open(ckpt_dir / "latest_checkpoint_status.json") as status_file:
+            assert json.load(status_file)["last_checkpoint_step"] == 4
+
+    def test_deferred_finalize_blocks_at_the_next_save_if_writes_are_unfinished(
+        self, tmp_path
+    ):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=4, save_period=2, defer_finalize=True
+        )
+        ckpt_dir = tmp_path / "checkpoints"
+        trainer = _PollingTrainer([False, False], ckpt_dir)
+
+        _run_train_pump(mc, _make_actor_args(trainer=trainer))
+
+        assert trainer.poll_calls == 2
+        assert not trainer.polled_inside_a_train_step
+        # The step-4 save first finalized and published step_2 itself.
+        assert trainer.published_at_save == [set(), {"step_2"}]
+        assert trainer.finalize_calls == 2
+        assert _step_dir_names(ckpt_dir) == {"step_2", "step_4"}
+
+    @staticmethod
+    def _run_with_pending_save_and_failing_pump(mc, trainer) -> None:
+        async def _main():
+            actor = _ACTOR_CLS(
+                mc, _make_actor_args(trainer=trainer), SetupTimingMetrics()
+            )
+            # A step-1 save is still pending when the train pump fails.
+            path = actor._checkpointer.init_tmp_checkpoint(1, {}, mc)
+            actor._pending_checkpoint = (path, 1)
+
+            async def _failing_train_pump():
+                raise RuntimeError("injected train failure")
+
+            actor._train_pump = _failing_train_pump
+            await asyncio.wait_for(actor.run(), timeout=60.0)
+
+        with pytest.raises(RuntimeError, match="injected train failure"):
+            asyncio.run(_main())
+
+    def test_deferred_finalize_publishes_the_pending_save_when_the_run_fails(
+        self, tmp_path
+    ):
+        mc = _actor_master_config(tmp_path, max_num_steps=0, defer_finalize=True)
+        trainer = _FakeTrainer()
+
+        self._run_with_pending_save_and_failing_pump(mc, trainer)
+
+        assert trainer.finalize_calls == 1
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
+
+    def test_failed_teardown_publish_does_not_mask_the_run_failure(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=0, defer_finalize=True)
+
+        # Raises the train failure, not the finalize one.
+        self._run_with_pending_save_and_failing_pump(mc, _FailingFinalizeTrainer())
+
+        assert _step_dir_names(tmp_path / "checkpoints") == {"tmp_step_1"}
+
+    def test_pending_save_survives_a_cancel_while_waiting_for_the_lock(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=0, defer_finalize=True)
+        trainer = _FakeTrainer()
+
+        async def _main():
+            actor = _ACTOR_CLS(
+                mc, _make_actor_args(trainer=trainer), SetupTimingMetrics()
+            )
+            path = actor._checkpointer.init_tmp_checkpoint(1, {}, mc)
+            actor._pending_checkpoint = (path, 1)
+            # Another publication (e.g. a rollout snapshot) holds the lock.
+            await actor._checkpoint_save_lock.acquire()
+            finish = asyncio.create_task(actor._finish_pending_save(blocking=True))
+            while trainer.finalize_calls == 0:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0.05)  # now parked on the lock
+            finish.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await finish
+            actor._checkpoint_save_lock.release()
+            # Still pending, so the teardown publish finds it.
+            assert actor._pending_checkpoint == (path, 1)
+            await actor._finish_pending_save(blocking=True)
+            assert actor._pending_checkpoint is None
+            actor._checkpointer.shutdown()
+
+        asyncio.run(_main())
+
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
+
+    @pytest.mark.parametrize("defer_finalize", [False, True])
+    def test_nothing_is_written_into_the_checkpoint_after_publish_starts(
+        self, tmp_path, defer_finalize
+    ):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=2, save_period=2, defer_finalize=defer_finalize
+        )
+        at_publish: list[set[str]] = []
+
+        def _files(path) -> set[str]:
+            return {
+                str(p.relative_to(path)) for p in Path(path).rglob("*") if p.is_file()
+            }
+
+        def _seed(actor):
+            publish = actor._publish_when_policy_write_done
+
+            async def _record(checkpoint_path):
+                at_publish.append(_files(checkpoint_path))
+                await publish(checkpoint_path)
+
+            actor._publish_when_policy_write_done = _record
+
+        _run_train_pump(mc, _make_actor_args(trainer=_FakeTrainer()), seed=_seed)
+
+        # The rename waits only for the policy's async write, so every other part
+        # must already be on disk when publishing starts.
+        assert at_publish == [_files(tmp_path / "checkpoints" / "step_2")]
+        assert at_publish[0]
+        # A write that lost the race to the rename recreates tmp_step_2/.
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_2"}
+
+    @pytest.mark.parametrize(
+        "megatron_cfg",
+        [
+            None,
+            {"enabled": False, "checkpoint": {"async_save": True}},
+            {"enabled": True, "checkpoint": {"async_save": False}},
+            {"enabled": True},
+        ],
+        ids=["no-megatron", "megatron-disabled", "sync-save", "no-checkpoint-block"],
+    )
+    def test_deferred_finalize_requires_megatron_async_save(
+        self, tmp_path, megatron_cfg
+    ):
+        mc = _actor_master_config(tmp_path, defer_finalize=True)
+        if megatron_cfg is not None:
+            mc.policy["megatron_cfg"] = megatron_cfg
+
+        with pytest.raises(ValueError, match="checkpoint.async_save=true"):
+            validate_single_controller_config(mc)
+
+    def test_deferred_finalize_accepts_megatron_async_save(self, tmp_path):
+        mc = _actor_master_config(tmp_path, defer_finalize=True)
+        mc.policy["megatron_cfg"] = {
+            "enabled": True,
+            "checkpoint": {"async_save": True},
+        }
+
+        validate_single_controller_config(mc)
+
+    def test_deferred_finalize_rejects_rollout_snapshots(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path, defer_finalize=True, rollout_checkpoint_attempt_interval_s=30.0
+        )
+        mc.policy["megatron_cfg"] = {
+            "enabled": True,
+            "checkpoint": {"async_save": True},
+        }
+
+        with pytest.raises(ValueError, match="rollout_checkpointing"):
+            validate_single_controller_config(mc)
+
+
+class TestFinalizerStateRelease:
+    def test_evicted_group_releases_pending_finalizer_state(self, tmp_path: Path):
+        """Staleness eviction returns only a count; the pump prunes both maps."""
+        from nemo_rl.experience.reward_penalties import FinalizedReward
+
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=100)
+
+        def seed(actor) -> None:
+            actor._sampler = _EvictOnceSampler()
+            # A committed, never-consumed group that the sampler evicts as stale.
+            actor._finalizer_metrics_by_group["evicted-group"] = {
+                "finalize/invalid_row_rate": 0.0
+            }
+            actor._finalizer_rewards_by_group["evicted-group"] = [
+                FinalizedReward("evicted-group_g0", "attempt", 1.0, None)
+            ]
+
+        actor = _run_train_pump(mc, _make_actor_args(), seed=seed)
+
+        assert actor._train_steps == 2
+        assert actor._sampler.evict_calls >= 1
+        assert "evicted-group" not in actor._finalizer_metrics_by_group
+        assert "evicted-group" not in actor._finalizer_rewards_by_group
+
 
 class TestPeriodicRolloutCheckpoint:
     def test_restore_mode_rejects_removed_none_value(self):
@@ -1403,7 +1719,12 @@ class TestPeriodicRolloutCheckpoint:
             SetupTimingMetrics(),
         )
 
-    def test_pre_step_snapshot_contains_only_rollout_state(self, tmp_path: Path):
+    @pytest.mark.parametrize(
+        "changed_setting", [None, "penalty", "effort", "extras", "inactive"]
+    )
+    def test_pre_step_snapshot_contains_only_rollout_state(
+        self, tmp_path: Path, changed_setting
+    ):
         actor = self._actor(tmp_path)
         try:
             actor._sampler.restore_dispatch_index(5)
@@ -1430,6 +1751,45 @@ class TestPeriodicRolloutCheckpoint:
         assert (snapshot / REPLAY_BUFFER_METADATA_FILENAME).is_file()
         assert (snapshot / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
         assert not (snapshot / "policy").exists()
+        state = torch.load(
+            snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
+        )
+        assert state["reward_settings"] == actor._capture_reward_settings().to_state()
+        actor._last_checkpoint_path = str(snapshot)
+        actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
+            "metadata"
+        ]
+        if changed_setting == "penalty":
+            actor._master_config.reward_penalties.penalize_empty_final_answer = True
+        elif changed_setting == "effort":
+            actor._master_config.env["nemo_gym"] = {
+                "effort_levels": {"low_weight": 1, "low_string": "budget"}
+            }
+        elif changed_setting == "extras":
+            actor._master_config.reward_penalties = (
+                actor._master_config.reward_penalties.model_validate(
+                    {
+                        "experiment_note": "resume",
+                        "token_ids": {"unwanted": [42], "note": "unused"},
+                    }
+                )
+            )
+            actor._master_config.env["nemo_gym"] = {"effort_levels": {"note": "unused"}}
+        elif changed_setting == "inactive":
+            actor._master_config.env["nemo_gym"] = {
+                "effort_levels": {
+                    "low_weight": 0,
+                    "low_ub": 10,
+                    "low_string": "different",
+                }
+            }
+        if changed_setting in ("penalty", "effort"):
+            with pytest.raises(ValueError, match="reward settings differ"):
+                asyncio.run(
+                    actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                )
+        else:
+            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
 
     def test_logs_snapshot_phase_durations(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
@@ -1674,6 +2034,120 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["generation_counter_discontinuity"] == 1.0
         assert "generation_output_tokens_per_second" not in logged
 
+    def _saved_snapshot(self, actor, tmp_path: Path) -> Path:
+        try:
+            assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+        return (
+            tmp_path
+            / "checkpoints"
+            / BOOTSTRAP_DIRNAME
+            / "rollout_snapshots"
+            / "snapshot_000001"
+        )
+
+    def test_restore_rejects_capture_disabled_sidecar_under_capture(
+        self, tmp_path: Path
+    ):
+        """A sidecar saved with capture off carries no reward settings to compare."""
+        actor = self._actor(tmp_path)
+        snapshot = self._saved_snapshot(actor, tmp_path)
+        recovery_path = snapshot / ROLLOUT_RECOVERY_STATE_FILENAME
+        state = torch.load(recovery_path, weights_only=True)
+        state["reward_settings"] = None
+        torch.save(state, recovery_path)
+        actor._last_checkpoint_path = str(snapshot)
+        actor._data_plane_checkpoint_metadata = {
+            **actor._dp_client.save_calls[-1]["metadata"],
+            "rollout_recovery_payload_sha256": hashlib.sha256(
+                recovery_path.read_bytes()
+            ).hexdigest(),
+        }
+        with pytest.raises(ValueError, match="saved with token capture disabled"):
+            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
+
+    @pytest.mark.parametrize("checkpoint_kind", ["snapshot", "full"])
+    def test_snapshot_persists_and_restores_pending_finalizer_metrics(
+        self, tmp_path: Path, checkpoint_kind: str
+    ):
+        """Only canonical groups' pending statistics are saved; restore keeps them."""
+        from nemo_rl.experience.reward_penalties import (
+            FinalizedReward,
+            RewardLogContext,
+        )
+        from nemo_rl.experience.rollout_recovery import parse_rollout_recovery_state
+
+        actor = self._actor(tmp_path)
+        claimed_meta = KVBatchMeta(
+            partition_id=_PARTITION_ID,
+            task_name=None,
+            sample_ids=["claimed-group_g0"],
+            sequence_lengths=[16],
+            tags=[{"weight_version": 0}],
+        )
+        canonical_group = {
+            "meta": claimed_meta,
+            "start_weight": 0,
+            "end_weight": 0,
+            "target_step": 0,
+            "group_id": "claimed-group",
+        }
+        actor._buffer.training_claims = [canonical_group]
+        actor._dp_client.sample_ids = list(claimed_meta.sample_ids)
+        pending = {"finalize/reward_count": 1.0, "finalize/reward_sum": 2.0}
+        actor._finalizer_metrics_by_group = {
+            "claimed-group": dict(pending),
+            "unfinished-group": {"finalize/reward_count": 9.0},
+        }
+        observations = [
+            FinalizedReward(
+                "claimed-group_g0",
+                "physical-attempt",
+                2.0,
+                RewardLogContext("agent", '{"answer":"ok"}'),
+            )
+        ]
+        actor._finalizer_rewards_by_group = {
+            "claimed-group": observations,
+            "unfinished-group": [],
+        }
+        if checkpoint_kind == "snapshot":
+            snapshot = self._saved_snapshot(actor, tmp_path)
+        else:
+            actor._buffer.training_claims = []
+            actor._buffer._metadata_state["groups"] = [canonical_group]
+            actor._train_steps = 1
+            actor._trainer_version = 1
+            try:
+                asyncio.run(
+                    actor._save_checkpoint(
+                        {}, is_policy_training_step=True, is_final_checkpoint=False
+                    )
+                )
+            finally:
+                actor._checkpointer.shutdown()
+            snapshot = tmp_path / "checkpoints" / "step_1"
+        state = torch.load(
+            snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
+        )
+        assert state["finalizer_metrics_by_group"] == {"claimed-group": pending}
+        assert parse_rollout_recovery_state(state).finalizer_rewards_by_group == {
+            "claimed-group": observations
+        }
+
+        actor._finalizer_metrics_by_group = {}
+        actor._finalizer_rewards_by_group = {}
+        actor._buffer.training_claims = []
+        actor._buffer._metadata_state["groups"] = [canonical_group]
+        actor._last_checkpoint_path = str(snapshot)
+        actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
+            "metadata"
+        ]
+        asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=1))
+        assert actor._finalizer_metrics_by_group == {"claimed-group": pending}
+        assert actor._finalizer_rewards_by_group == {"claimed-group": observations}
+
     def test_snapshot_reindexes_rows_owned_by_active_streamed_step(
         self, tmp_path: Path
     ):
@@ -1684,7 +2158,7 @@ class TestPeriodicRolloutCheckpoint:
             task_name=None,
             sample_ids=["claimed-group_g0"],
             sequence_lengths=[16],
-            tags=[{"weight_version": 0}],
+            tags=[{"weight_version": 0, GROUP_ID_TAG: "claimed-group"}],
         )
         actor._buffer.training_claims = [
             {
@@ -1916,8 +2390,8 @@ class TestDataPlaneCheckpoint:
                         fields=["input_ids"],
                         sequence_lengths=[16, 16],
                         tags=[
-                            {"weight_version": 0},
-                            {"weight_version": 0},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
                         ],
                     ),
                     "start_weight": 0,
@@ -2006,8 +2480,8 @@ class TestDataPlaneCheckpoint:
                         fields=["input_ids"],
                         sequence_lengths=[16, 16],
                         tags=[
-                            {"weight_version": 0},
-                            {"weight_version": 0},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
                         ],
                     ),
                     "start_weight": 0,
@@ -2323,6 +2797,8 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._consumed_samples = 0
     actor._total_valid_tokens = 0
     actor._replacement_reserve = []
+    actor._finalizer_metrics_by_group = {}
+    actor._finalizer_rewards_by_group = {}
     actor._async_cfg = SimpleNamespace(
         sampler=SimpleNamespace(name="in_order"),
         max_buffered_rollouts=4,
@@ -2338,6 +2814,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._checkpointer.save_optimizer = True
     actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
     actor._is_ppo = True
+    actor._loss_fn = object()
     actor._trainer = _OrderRecordingPolicy(calls)
     actor._value = _OrderRecordingCritic(calls)
     return actor
@@ -2360,6 +2837,13 @@ class TestPPOSaveOrder:
         )
         calls: list[str] = []
         actor = _ppo_save_actor(tmp_path, calls)
+        publish = actor._publish_when_policy_write_done
+
+        async def _record_publish(checkpoint_path):
+            calls.append("publish")
+            await publish(checkpoint_path)
+
+        actor._publish_when_policy_write_done = _record_publish
 
         asyncio.run(
             actor._save_checkpoint(
@@ -2367,6 +2851,7 @@ class TestPPOSaveOrder:
             )
         )
 
+        # Publishing comes last: the rename waits only for the policy's write.
         assert calls == [
             "policy.offload_to_cpu",
             "critic.prepare_for_training",
@@ -2374,6 +2859,7 @@ class TestPPOSaveOrder:
             "critic.finish_training",
             "policy.prepare_for_training",
             "policy.save_checkpoint",
+            "publish",
         ]
         assert actor._trainer.save_kwargs["is_final_checkpoint"] is True
         assert actor._value.save_kwargs["is_final_checkpoint"] is True
@@ -2461,6 +2947,40 @@ class TestMetricName:
 
         info = _training_info(tmp_path / "checkpoints", 2)
         assert info["train:loss"] == 0.5
+
+    def test_adaptive_ppo_clip_state_advances_and_lands_in_training_info(
+        self, tmp_path
+    ):
+        # Checkpoint on the logged k to read back the value step 2 logged.
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=2,
+            save_period=2,
+            metric_name="train:cur_adaptive_ppo_clip_k",
+        )
+        loss_fn = ClippedPGLossFn(
+            ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                force_on_policy_ratio=True,
+                truncated_importance_sampling_type="adaptive-ppo-clip",
+                truncated_importance_sampling_ratio=1.0,
+                truncated_importance_sampling_ratio_min=0.5,
+                truncated_importance_sampling_adaptive_target_entropy=0.3,
+            )
+        )
+        # Entropy below target widens the bound by one step per train step.
+        trainer = _FakeTrainer(
+            step_metrics={"all_mb_metrics": {"approx_entropy": [0.04, 0.06]}}
+        )
+
+        _run_train_pump(mc, _make_actor_args(trainer=trainer, loss_fn=loss_fn))
+
+        assert loss_fn.cur_adaptive_ppo_clip_k == 0.5
+        info = _training_info(tmp_path / "checkpoints", 2)
+        assert info["cur_adaptive_ppo_clip_k"] == 0.5
+        # Step 2 logs the k it trained with; the saved k is the one step 3 uses.
+        assert info["train:cur_adaptive_ppo_clip_k"] == 0.25
+        assert "last_entropy" not in info
 
     def test_train_metric_missing_key_raises(self, tmp_path):
         mc = _actor_master_config(
@@ -2574,7 +3094,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             val_at_start=False,
             val_at_end=False,
         ),
-        logger={"wandb_enabled": False, "wandb": {}},
+        logger=LoggerConfig.model_construct(),
         policy={
             "train_global_batch_size": 8,
             "max_total_sequence_length": 32,
@@ -2587,6 +3107,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
         },
         loss_fn=ClippedPGLossConfig(),
         env={},
+        cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=4,
             max_buffered_rollouts=8,
@@ -2688,7 +3209,7 @@ class TestSetupResumeWiring:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger["log_dir"] = str(tmp_path / "logs")
+        mc.logger.log_dir = str(tmp_path / "logs")
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -2969,7 +3490,10 @@ class TestReplayBufferPersistence:
                     task_name=None,
                     sample_ids=[f"g{i}-0", f"g{i}-1"],
                     sequence_lengths=[16, 16],
-                    tags=[{"weight_version": 0}, {"weight_version": 0}],
+                    tags=[
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                    ],
                 ),
                 "start_weight": 0,
                 "end_weight": 0,
@@ -3016,6 +3540,148 @@ class TestReplayBufferPersistence:
         # run()'s finally must tear the synchronizer down exactly once.
         assert actor._weight_synchronizer.shutdown_count == 1
 
+    @pytest.mark.parametrize(
+        ("checkpointing_enabled", "save_data_plane"),
+        [(True, True), (False, True), (False, False)],
+    )
+    def test_replay_free_restore_discards_rows_and_queues_original_prompt(
+        self, tmp_path, checkpointing_enabled, save_data_plane
+    ):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        group = {
+            "meta": KVBatchMeta(
+                partition_id=_PARTITION_ID,
+                task_name=None,
+                sample_ids=["g0-0", "g0-1"],
+                sequence_lengths=[16, 16],
+                tags=[
+                    {"weight_version": 0, "prompt_idx": 1},
+                    {"weight_version": 0, "prompt_idx": 1},
+                ],
+            ),
+            "start_weight": 0,
+            "end_weight": 0,
+            "target_step": 3,
+            "group_id": "g0",
+        }
+        envelope = {"groups": [group]}
+        torch.save(envelope, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
+        mc = _actor_master_config(
+            tmp_path,
+            enabled=checkpointing_enabled,
+            max_num_steps=0,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=save_data_plane,
+            load_replay_buffer=False,
+        )
+        buffer = _FakeTQBuffer(load_return=1)
+
+        class RecordingRolloutManager(_FakeRolloutManager):
+            def reserve_prompt_group(
+                self,
+                cut: DataPlaneMutationCut,
+                input_sample: dict[str, Any],
+                *,
+                target_step: Optional[int],
+                admitted: bool = True,
+                admission_id: Optional[str] = None,
+            ) -> str:
+                super().reserve_prompt_group(
+                    cut,
+                    input_sample,
+                    target_step=target_step,
+                    admitted=admitted,
+                    admission_id=admission_id,
+                )
+                return self.recovery_ledger.reserve_group(
+                    cut,
+                    prompt_id=str(input_sample["idx"]),
+                    prompt_payload=input_sample,
+                    expected_generations=2,
+                    target_step=target_step,
+                    start_weight_version=0,
+                    admitted=admitted,
+                    admission_id=admission_id,
+                ).group_id
+
+        rollout_manager = RecordingRolloutManager()
+        rollout_manager.generate_and_push = AsyncMock()
+        dataloader = _FakeDataloader(
+            dataset=[{"idx": 0}, {"idx": 1, "message_log": ["fresh"]}]
+        )
+
+        async def _restore() -> Any:
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(
+                    tq_buffer=buffer,
+                    rollout_manager=rollout_manager,
+                    dataloader=dataloader,
+                    dp_client=_FakeDPClient(sample_ids=["g0-0", "g0-1"]),
+                    last_checkpoint_path=str(ckpt_dir),
+                    data_plane_checkpoint_metadata=(
+                        _data_plane_checkpoint_metadata(group_count=1)
+                    ),
+                ),
+                SetupTimingMetrics(),
+            )
+            restored = await actor._maybe_restore_replay_buffer()
+            await actor._maybe_restore_rollout_recovery(restored_replay_groups=restored)
+            assert actor._buffer_capacity._value == 4
+            actor._rollout_permitted.set()
+            try:
+                await asyncio.wait_for(actor._rollout_pump(), timeout=5)
+            finally:
+                actor._checkpointer.shutdown()
+            return actor
+
+        actor = asyncio.run(_restore())
+
+        assert buffer.remove_calls == [{"idxs": [0], "remove_in_dp": True}]
+        rollout_manager.generate_and_push.assert_awaited_once()
+        dispatch = rollout_manager.generate_and_push.await_args
+        assert dispatch.args == ({"idx": 1, "message_log": ["fresh"]},)
+        assert dispatch.kwargs["target_step"] == 3
+        assert dispatch.kwargs["lineage_group_id"] in {
+            group.group_id for group in rollout_manager.recovery_ledger.groups()
+        }
+        assert actor._buffer_capacity._value == 3
+        assert rollout_manager.reserved_prompts == [
+            {
+                "prompt": {"idx": 1, "message_log": ["fresh"]},
+                "target_step": 3,
+                "admitted": True,
+            }
+        ]
+
+    @pytest.mark.parametrize("dataset_idx", [99, True])
+    def test_replay_free_restore_rejects_changed_prompt_identity(self, dataset_idx):
+        actor = object.__new__(_ACTOR_CLS)
+        actor._dataloader = _FakeDataloader(dataset=[{"idx": 0}, {"idx": dataset_idx}])
+        actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        actor._rollout_manager = _FakeRolloutManager()
+        actor._restored_replay_groups_to_regenerate = [
+            {
+                "meta": KVBatchMeta(
+                    partition_id=_PARTITION_ID,
+                    task_name=None,
+                    sample_ids=["g0-0", "g0-1"],
+                    tags=[{"prompt_idx": 1}, {"prompt_idx": 1}],
+                ),
+                "target_step": 3,
+                "group_id": "g0",
+            }
+        ]
+
+        async def regenerate() -> None:
+            async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                await actor._queue_restored_replay_groups_for_regeneration(cut)
+
+        with pytest.raises(ValueError, match="prompt"):
+            asyncio.run(regenerate())
+        assert actor._rollout_manager.reserved_prompts == []
+
     def test_restored_permits_are_released_by_a_live_pump(self, tmp_path):
         # The restore takes one capacity permit per group; a running pump must
         # give them all back. Every other restore test uses max_num_steps=0,
@@ -3033,7 +3699,14 @@ class TestReplayBufferPersistence:
                     task_name=None,
                     sample_ids=[f"g{i}-0", f"g{i}-1"],
                     sequence_lengths=[16, 16],
-                    tags=[{"weight_version": 0}, {"weight_version": 0}],
+                    # Has to agree with "group_id" below: this test is the one
+                    # restore case that actually runs the pump body, and the
+                    # pump cross-checks the ids it selects against the
+                    # training claims the restore created.
+                    tags=[
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                    ],
                 ),
                 "start_weight": 0,
                 "end_weight": 0,
@@ -3093,7 +3766,10 @@ class TestReplayBufferPersistence:
                         task_name=None,
                         sample_ids=["g0-0", "g0-1"],
                         sequence_lengths=[16, 16],
-                        tags=[{"weight_version": 0}, {"weight_version": 0}],
+                        tags=[
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                        ],
                     ),
                     "start_weight": 0,
                     "end_weight": 0,
