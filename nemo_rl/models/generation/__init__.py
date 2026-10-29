@@ -17,12 +17,7 @@ from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.models.generation.dynamo.config import (
-    check_dynamo_serving_chat_kwargs,
-    dynamo_cfg,
-    dynamo_enabled,
-    dynamo_parsers,
-)
+from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
@@ -186,11 +181,8 @@ def configure_generation_config(
         # vision parameters; freezing alone does not exclude them from refit.
         config["vllm_cfg"].setdefault("load_format", "auto" if is_eval else "dummy")
         if dynamo_enabled(config):
-            # Validate before any Ray allocation; dynamo_parsers also rejects
-            # parser plugins that Dynamo's Rust frontend cannot run.
+            # Validate before any Ray allocation.
             dynamo_cfg(config)
-            dynamo_parsers(config)
-            check_dynamo_serving_chat_kwargs(config)
             colocated = config.get("colocated")
             if colocated is not None and colocated["enabled"]:
                 raise ValueError(
@@ -274,8 +266,6 @@ def configure_generation_config(
                 is_eval
                 or config["stop_strings"] is not None
                 or config["vllm_cfg"].get("expose_http_server", None)
-                # Dynamo serves OpenAI clients as the exposed server does.
-                or dynamo_enabled(config)
             ):
                 config["vllm_cfg"]["skip_tokenizer_init"] = False
             else:

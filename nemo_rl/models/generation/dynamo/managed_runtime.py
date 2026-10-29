@@ -120,7 +120,7 @@ class ManagedDynamoRuntime:
         if not self._started:
             raise RuntimeError("Managed Dynamo runtime has not been started")
         # An OS-assigned system port makes each engine serve its own model-card
-        # files (a custom chat template included) to a frontend on another node.
+        # files to a frontend on another node.
         return {**self._manager_env, "DYN_SYSTEM_PORT": "0"}
 
     def start(self) -> None:
@@ -166,10 +166,6 @@ class ManagedDynamoRuntime:
             "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
             "DYN_NAMESPACE": self._namespace,
             "DYN_DISCOVERY_BACKEND": "etcd",
-            # Dynamo's legacy tool jail rebuilds response chunks with nvext=None.
-            # Its v2 parser path preserves engine_data, which carries every NeMo
-            # RL rollout's result.
-            "DYN_ENABLE_EXPERIMENTAL_PARSERS_V2": "1",
             "DYN_REQUEST_PLANE": "tcp",
             "DYN_EVENT_PLANE": "nats",
             # A canary request would stall behind a refit pause; engine liveness

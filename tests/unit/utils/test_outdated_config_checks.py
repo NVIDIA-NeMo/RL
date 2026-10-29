@@ -405,7 +405,8 @@ def test_dynamo_backend_is_rejected_with_the_migration():
         ({"control_timeout_s": 600}, r"dynamo_cfg\.control_timeout_s"),
         ({"metrics_include_prefixes": None}, r"dynamo_cfg\.metrics_include_prefixes"),
         ({"metrics_exclude_prefixes": None}, r"dynamo_cfg\.metrics_exclude_prefixes"),
-        ({"worker_args": {"extra_cli_args": []}}, r"worker_args\.extra_cli_args"),
+        ({"worker_args": {"extra_cli_args": []}}, r"dynamo_cfg\.worker_args was"),
+        ({"worker_args": {"reasoning_parser": None}}, r"dynamo_cfg\.worker_args was"),
     ],
 )
 def test_removed_dynamo_cfg_keys_are_rejected(dynamo_cfg, removed):

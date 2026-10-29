@@ -23,18 +23,14 @@ quantization and speculative decoding are that worker's own.
 from __future__ import annotations
 
 import asyncio
-import functools
-import hashlib
 import json
 import logging
 import os
-import tempfile
-import time
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from dynamo._core import Context, get_reasoning_parser_names, get_tool_parser_names
+from dynamo._core import Context
 from dynamo.common.backend import (
     EngineConfig,
     GenerateChunk,
@@ -44,33 +40,13 @@ from dynamo.common.backend import (
     Worker,
     WorkerConfig,
 )
-from dynamo.common.backend.logprobs import (
-    extract_from_completion_output,
-    extract_prompt_logprobs_from_completion_output,
-    parse_logprob_options,
-)
 from dynamo.common.backend.publisher import ComponentSnapshot, KvEventSource, ZmqSource
-from dynamo.llm.exceptions import HttpError, InvalidArgument
-from vllm import envs as vllm_envs
-from vllm.entrypoints.chat_utils import load_chat_template
-from vllm.exceptions import GracefulHTTPError, VLLMClientError
+from dynamo.llm.exceptions import InvalidArgument
 from vllm.inputs import TokensPrompt
-from vllm.multimodal.media import MEDIA_CONNECTOR_REGISTRY
-from vllm.sampling_params import (
-    RequestOutputKind,
-    SamplingParams,
-    StructuredOutputsParams,
-)
-from vllm.transformers_utils.processor import get_video_processor_cls_name
 from vllm.v1.kv_cache_interface import KVCacheSpecKind
 from vllm.v1.metrics.loggers import StatLoggerBase
 
-from nemo_rl.models.generation.dynamo.config import (
-    DynamoCfg,
-    dynamo_cfg,
-    dynamo_chat_template,
-    dynamo_parsers,
-)
+from nemo_rl.models.generation.dynamo.config import DynamoCfg
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     DYNAMO_COMPONENT,
     DYNAMO_ENDPOINT,
@@ -84,29 +60,6 @@ if TYPE_CHECKING:
     )
 
 LOGGER = logging.getLogger(__name__)
-
-# The vLLM modality each key of Dynamo's multi_modal_data holds.
-_DYNAMO_MEDIA_MODALITIES = {
-    "image_url": "image",
-    "video_url": "video",
-    "audio_url": "audio",
-}
-
-# Filled from the model's generation config when a request leaves them unset,
-# as vLLM's OpenAI server fills them.
-_GENERATION_CONFIG_KEYS = (
-    "repetition_penalty",
-    "temperature",
-    "top_k",
-    "top_p",
-    "min_p",
-)
-_SAMPLING_KEYS = (
-    *_GENERATION_CONFIG_KEYS,
-    "seed",
-    "presence_penalty",
-    "frequency_penalty",
-)
 
 
 def dynamo_kv_events_config(
@@ -143,111 +96,6 @@ def _rollout_request(request: GenerateRequest) -> Optional[dict[str, Any]]:
     """
     rollout = _annotation_value(request, ROLLOUT_ANNOTATION)
     return None if rollout is None else json.loads(rollout)
-
-
-def structured_outputs(guided_decoding: dict[str, Any]) -> StructuredOutputsParams:
-    """Structured outputs for Dynamo's ``sampling_options.guided_decoding``.
-
-    Dynamo sets at most one constraint. The decoding backend is the engine's
-    own (``structured_outputs_config``), as for the native server.
-    """
-    structural_tag = guided_decoding.get("structural_tag")
-    if isinstance(structural_tag, dict):
-        structural_tag = json.dumps(structural_tag)
-    return StructuredOutputsParams(
-        json=guided_decoding.get("json"),
-        regex=guided_decoding.get("regex"),
-        choice=guided_decoding.get("choice"),
-        grammar=guided_decoding.get("grammar"),
-        whitespace_pattern=guided_decoding.get("whitespace_pattern"),
-        structural_tag=structural_tag,
-    )
-
-
-def build_sampling_params(
-    request: GenerateRequest,
-    defaults: dict[str, Any],
-    *,
-    output_room: int,
-    overrides: Optional[dict[str, Any]] = None,
-    output_kind: RequestOutputKind = RequestOutputKind.DELTA,
-) -> SamplingParams:
-    """Map an OpenAI-shaped Dynamo request onto vLLM SamplingParams.
-
-    As vLLM's OpenAI server builds them: the model's generation-config
-    ``defaults`` for what the request leaves unset, and ``max_tokens`` capped
-    by the context. Stop strings are applied by Dynamo's Rust detokenizer, so
-    only token-level stops reach vLLM unless ``overrides`` sets them.
-
-    Args:
-        request: Dynamo's preprocessed request.
-        defaults: ``ModelConfig.get_diff_sampling_param()``.
-        output_room: The context left after the prompt the engine runs, which
-            media expansion or a prefix splice can make longer than the
-            request's ``token_ids``.
-        overrides: SamplingParams fields that replace the request's.
-        output_kind: How vLLM reports outputs.
-    """
-    sampling = request.get("sampling_options") or {}
-    passthrough = (request.get("extra_args") or {}).get("sampling_options") or {}
-    stop = request.get("stop_conditions") or {}
-    n = sampling.get("n") or 1
-    if sampling.get("best_of") not in (None, n):
-        raise InvalidArgument("best_of is not supported by vLLM's V1 engine")
-
-    kwargs: dict[str, Any] = {
-        key: defaults[key] for key in _GENERATION_CONFIG_KEYS if key in defaults
-    }
-    kwargs.update(
-        {key: sampling[key] for key in _SAMPLING_KEYS if sampling.get(key) is not None}
-    )
-    kwargs["n"] = n
-    # As vLLM's get_max_tokens: the generation config's max_tokens applies only
-    # when the request leaves max_tokens unset.
-    requested_max_tokens = stop.get("max_tokens")
-    if requested_max_tokens is None:
-        requested_max_tokens = defaults.get("max_tokens")
-    kwargs["max_tokens"] = min(
-        limit
-        for limit in (max(1, output_room), requested_max_tokens)
-        if limit is not None
-    )
-    if stop.get("min_tokens") is not None:
-        kwargs["min_tokens"] = stop["min_tokens"]
-    if stop.get("ignore_eos") is not None:
-        kwargs["ignore_eos"] = stop["ignore_eos"]
-    stop_ids = set(stop.get("stop_token_ids") or ()) | set(
-        stop.get("stop_token_ids_hidden") or ()
-    )
-    if stop_ids:
-        kwargs["stop_token_ids"] = sorted(stop_ids)
-    if sampling.get("guided_decoding"):
-        kwargs["structured_outputs"] = structured_outputs(sampling["guided_decoding"])
-    for key in ("allowed_token_ids", "logprob_token_ids"):
-        if passthrough.get(key) is not None:
-            kwargs[key] = passthrough[key]
-
-    logprobs, prompt_logprobs = parse_logprob_options(
-        request.get("output_options") or {}
-    )
-    # Explicit logprob_token_ids replace top-k selection; vLLM rejects both.
-    if logprobs is not None and "logprob_token_ids" not in kwargs:
-        kwargs["logprobs"] = logprobs
-    if prompt_logprobs is not None:
-        kwargs["prompt_logprobs"] = prompt_logprobs
-    kwargs["detokenize"] = False
-    kwargs.update(overrides or {})
-    params = SamplingParams(**kwargs, output_kind=output_kind)
-    if passthrough.get("bad_words_token_ids") is not None:
-        # vLLM only tokenizes bad_words strings into this field; a token-in
-        # client sends the token IDs themselves.
-        if not hasattr(params, "_bad_words_token_ids"):
-            raise RuntimeError(
-                "vLLM SamplingParams has no _bad_words_token_ids; update the "
-                "bad_words_token_ids passthrough for this vLLM"
-            )
-        params._bad_words_token_ids = passthrough["bad_words_token_ids"]
-    return params
 
 
 class SnapshotStatLogger(StatLoggerBase):
@@ -292,7 +140,6 @@ class NativeVllmEngine(LLMEngine):
         self._leader_worker_idx = leader_worker_idx
         self._llm = host.llm
         self._max_model_len = self._llm.vllm_config.model_config.max_model_len
-        self._defaults = self._llm.model_config.get_diff_sampling_param()
 
     @classmethod
     async def from_args(cls, argv=None):
@@ -335,84 +182,14 @@ class NativeVllmEngine(LLMEngine):
     async def generate(
         self, request: GenerateRequest, context: Context
     ) -> AsyncGenerator[GenerateChunk, None]:
-        try:
-            async for chunk in self._generate(request, context):
-                yield chunk
-        except VLLMClientError as error:
-            # vLLM's request errors are not ValueErrors; the native server
-            # answers them with a 4xx that carries the message.
-            raise InvalidArgument(str(error)) from error
-
-    async def _generate(
-        self, request: GenerateRequest, context: Context
-    ) -> AsyncGenerator[GenerateChunk, None]:
-        if request.get("prompt_embeds"):
-            raise InvalidArgument(
-                "Embedding prompts are not served through Dynamo by NeMo RL's "
-                "vLLM engines."
-            )
         rollout = _rollout_request(request)
-        if rollout is not None:
-            async for chunk in self._generate_rollout(request, rollout, context):
-                yield chunk
-            return
-        engine_input = await self._engine_input(request)
-        prompt_len = len(engine_input["prompt_token_ids"])
-        self._check_prompt_fits(prompt_len)
-        sampling_params = build_sampling_params(
-            request, self._defaults, output_room=self._max_model_len - prompt_len
-        )
-        try:
-            # vLLM's queue limits (max_num_queued_reqs / max_num_queued_tokens),
-            # checked before every request as the native server checks them.
-            self._llm.check_admission(sampling_params.n, context.id())
-        except GracefulHTTPError as error:
-            raise HttpError(int(error.http_status), error.message) from error
-        logprobs_requested, prompt_logprobs_requested = parse_logprob_options(
-            request.get("output_options") or {}
-        )
-        tokenizer = self._llm.tokenizer
-        completion_tokens: dict[int, int] = {}
-        prompt_output = None
-        async for output in self._llm.generate(
-            engine_input, sampling_params, context.id()
-        ):
-            # Under DELTA, vLLM sends every prompt logprob once, at the end of
-            # prefill; later outputs carry an empty list.
-            if getattr(output, "prompt_logprobs", None):
-                prompt_output = output
-            for completion in output.outputs:
-                token_ids = list(completion.token_ids)
-                completion_tokens[completion.index] = completion_tokens.get(
-                    completion.index, 0
-                ) + len(token_ids)
-                if not token_ids and completion.finish_reason is None:
-                    continue
-                chunk: GenerateChunk = {
-                    "token_ids": token_ids,
-                    "index": completion.index,
-                }
-                log_probs, top_logprobs = extract_from_completion_output(
-                    completion, 0, tokenizer=tokenizer, include_bytes=True
-                )
-                if log_probs is not None:
-                    chunk["log_probs"] = log_probs
-                    if logprobs_requested:
-                        chunk["top_logprobs"] = top_logprobs
-                if completion.finish_reason is not None:
-                    chunk["finish_reason"] = completion.finish_reason
-                    chunk["completion_usage"] = _usage(
-                        output, sum(completion_tokens.values())
-                    )
-                    if prompt_logprobs_requested is not None and prompt_output:
-                        prompt_logprobs = (
-                            extract_prompt_logprobs_from_completion_output(
-                                prompt_output, tokenizer=tokenizer
-                            )
-                        )
-                        if prompt_logprobs is not None:
-                            chunk["engine_data"] = {"prompt_logprobs": prompt_logprobs}
-                yield chunk
+        if rollout is None:
+            raise InvalidArgument(
+                "NeMo RL's vLLM engines serve only NeMo RL rollouts through Dynamo "
+                f"(requests annotated {ROLLOUT_ANNOTATION!r})."
+            )
+        async for chunk in self._generate_rollout(request, rollout, context):
+            yield chunk
 
     async def _generate_rollout(
         self, request: GenerateRequest, rollout: dict[str, Any], context: Context
@@ -448,86 +225,6 @@ class NativeVllmEngine(LLMEngine):
             chunk["completion_usage"] = _usage(final_output, len(result.token_ids))
         yield chunk
 
-    async def _load_media(
-        self, request: GenerateRequest
-    ) -> Optional[tuple[dict[str, list[Any]], dict[str, list[Any]]]]:
-        """The request's media and their UUIDs by modality, as vLLM's chat parser loads them.
-
-        Dynamo passes each media URL through (data: URIs included); the engine
-        fetches and decodes it with vLLM's own media connector and settings.
-        """
-        media = request.get("multi_modal_data")
-        if not media:
-            return None
-        model_config = self._llm.model_config
-        mm_config = model_config.multimodal_config
-        connector = MEDIA_CONNECTOR_REGISTRY.load(
-            vllm_envs.VLLM_MEDIA_CONNECTOR,
-            media_io_kwargs=request.get("media_io_kwargs")
-            or (mm_config.media_io_kwargs if mm_config else None),
-            allowed_local_media_path=model_config.allowed_local_media_path,
-            allowed_media_domains=model_config.allowed_media_domains,
-        )
-        fetch = {
-            "image": connector.fetch_image_async,
-            "audio": connector.fetch_audio_async,
-        }
-        if "video_url" in media:
-            fetch["video"] = functools.partial(
-                connector.fetch_video_async,
-                video_processor=get_video_processor_cls_name(model_config),
-            )
-        uuids = request.get("multi_modal_uuids") or {}
-        mm_data: dict[str, list[Any]] = {}
-        mm_uuids: dict[str, list[Any]] = {}
-        for key, items in media.items():
-            modality = _DYNAMO_MEDIA_MODALITIES.get(key)
-            if modality is None:
-                raise InvalidArgument(f"Unsupported media type {key!r}")
-            if any("Url" not in item for item in items):
-                raise InvalidArgument(
-                    f"{key} items must carry their URL: NeMo RL's vLLM engines load "
-                    "media themselves"
-                )
-            try:
-                mm_data[modality] = list(
-                    await asyncio.gather(
-                        *(fetch[modality](item["Url"]) for item in items)
-                    )
-                )
-            except ValueError as error:
-                raise InvalidArgument(f"Cannot load {key}: {error}") from error
-            mm_uuids[modality] = list(uuids.get(key) or [None] * len(items))
-        return mm_data, mm_uuids
-
-    async def _engine_input(self, request: GenerateRequest) -> dict[str, Any]:
-        """The processed vLLM prompt for the request, as the native chat endpoint builds it.
-
-        The frontend's tokens carry one unexpanded placeholder per media item;
-        vLLM's processor expands them and processes the media, exactly as after
-        the native endpoint renders and tokenizes the messages.
-        """
-        prompt = TokensPrompt(prompt_token_ids=list(request["token_ids"]))
-        media = await self._load_media(request)
-        if media is not None:
-            prompt["multi_modal_data"], prompt["multi_modal_uuids"] = media
-            if request.get("mm_processor_kwargs"):
-                prompt["mm_processor_kwargs"] = request["mm_processor_kwargs"]
-        return await self._llm.renderer.process_for_engine_async(prompt, time.time())
-
-    def _check_prompt_fits(self, prompt_len: int) -> None:
-        """Refuse a prompt that leaves no room for output, as the native endpoint does.
-
-        OpenAI clients read "context length" in a 400 as a length refusal rather
-        than an engine failure.
-        """
-        if prompt_len >= self._max_model_len:
-            raise InvalidArgument(
-                f"Prompt length ({prompt_len}) fills or exceeds this model's "
-                f"maximum context length ({self._max_model_len}). No room for "
-                "output tokens."
-            )
-
     async def abort(self, context: Context) -> None:
         await self._llm.abort(context.id())
 
@@ -558,37 +255,6 @@ def _usage(output: Any, num_output_tokens: int) -> dict[str, Any]:
     }
 
 
-def _check_parser_name(name: Optional[str], known: list[str], field: str) -> None:
-    if name is not None and name not in known:
-        raise ValueError(
-            f"Dynamo has no {field.replace('_', ' ')} named {name!r}; set "
-            f"policy.generation.dynamo_cfg.worker_args.{field} to one of "
-            f"{sorted(known)}."
-        )
-
-
-def _chat_template_file(chat_template: Optional[str]) -> Optional[str]:
-    """A file holding ``chat_template``, which Dynamo reads by path.
-
-    Resolved as the native server resolves it (vLLM's ``load_chat_template``):
-    a file, a vLLM built-in template name, or literal Jinja. Named by content,
-    so every engine on a node, and every restart, shares one file.
-    """
-    if chat_template is None:
-        return None
-    content = load_chat_template(chat_template)
-    digest = hashlib.sha256(content.encode()).hexdigest()[:16]
-    path = os.path.join(tempfile.gettempdir(), f"nemo_rl_chat_template_{digest}.jinja")
-    if not os.path.exists(path):
-        # Written aside and renamed, so a concurrent reader never sees a part.
-        with tempfile.NamedTemporaryFile(
-            "w", dir=os.path.dirname(path), suffix=".jinja", delete=False
-        ) as template_file:
-            template_file.write(content)
-        os.replace(template_file.name, path)
-    return path
-
-
 def start_dynamo_endpoint(
     host: "VllmAsyncGenerationWorkerImpl",
     *,
@@ -608,31 +274,17 @@ def start_dynamo_endpoint(
     publishes = kv_events is not None and kv_events.enable_kv_cache_events
     # The Dynamo functional overlays check the router applied these.
     print(f"  [Dynamo] engine publishes KV events: {publishes}", flush=True)
-    worker_args = dynamo_cfg(host.cfg).worker_args
-    tool_call_parser, reasoning_parser = dynamo_parsers(host.cfg)
-    _check_parser_name(tool_call_parser, get_tool_parser_names(), "tool_call_parser")
-    _check_parser_name(
-        reasoning_parser, get_reasoning_parser_names(), "reasoning_parser"
-    )
     config = WorkerConfig(
         namespace=namespace,
         component=DYNAMO_COMPONENT,
         endpoint=DYNAMO_ENDPOINT,
         model_name=host.model_name,
         served_model_name=host.model_name,
-        endpoint_types=",".join(worker_args.endpoint_types),
+        # NeMo RL's rollouts go to /v1/completions only.
+        endpoint_types="completions",
         discovery_backend=engine_env["DYN_DISCOVERY_BACKEND"],
         request_plane=engine_env["DYN_REQUEST_PLANE"],
         event_plane=engine_env["DYN_EVENT_PLANE"],
-        custom_jinja_template=_chat_template_file(dynamo_chat_template(host.cfg)),
-        tool_call_parser=tool_call_parser,
-        reasoning_parser=reasoning_parser,
-        exclude_tools_when_tool_choice_none=(
-            worker_args.exclude_tools_when_tool_choice_none
-        ),
-        structural_tag_mode="on" if worker_args.enable_structural_tag else "off",
-        structural_tag_scope=worker_args.structural_tag_scope,
-        structural_tag_schema=worker_args.structural_tag_schema,
     )
     return asyncio.get_running_loop().create_task(
         Worker(NativeVllmEngine(host, leader_worker_idx), config).run()

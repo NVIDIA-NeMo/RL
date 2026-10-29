@@ -14,7 +14,6 @@
 from nemo_rl.models.generation.dynamo.config import (
     DynamoCfg,
     DynamoFrontendArgs,
-    DynamoWorkerArgs,
     dynamo_cfg,
     dynamo_enabled,
 )
@@ -22,7 +21,6 @@ from nemo_rl.models.generation.dynamo.config import (
 __all__ = [
     "DynamoCfg",
     "DynamoFrontendArgs",
-    "DynamoWorkerArgs",
     "dynamo_cfg",
     "dynamo_enabled",
 ]

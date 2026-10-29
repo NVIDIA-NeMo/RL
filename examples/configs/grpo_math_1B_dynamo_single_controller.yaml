@@ -18,19 +18,6 @@ policy:
       # NRL_VLLM_ASYNC_TIMEOUT_SECONDS). A timeout fails the attempt as a native
       # timeout does, and the rollout retry policy applies.
       request_timeout_s: 900
-      worker_args:
-        # Dynamo's built-in parser names. null follows the native server's
-        # vllm_cfg.http_server_serving_chat_kwargs (tool_parser, reasoning_parser).
-        tool_call_parser: null
-        reasoning_parser: null
-        exclude_tools_when_tool_choice_none: false
-        enable_structural_tag: false
-        structural_tag_scope: auto
-        structural_tag_schema: auto
-        # A chat template that replaces the model's own. null follows
-        # vllm_cfg.http_server_serving_chat_kwargs.chat_template.
-        custom_jinja_template: null
-        endpoint_types: [chat, completions]
       frontend_args:
         tokenizer: default
         tokenizer_cache: false

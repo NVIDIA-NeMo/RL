@@ -20,12 +20,7 @@ from nemo_rl.models.generation.dynamo.arguments import (
     redact_argv,
     redact_environment,
 )
-from nemo_rl.models.generation.dynamo.config import (
-    DynamoCfg,
-    dynamo_cfg,
-    dynamo_chat_template,
-    dynamo_parsers,
-)
+from nemo_rl.models.generation.dynamo.config import DynamoCfg, dynamo_cfg
 
 
 class _Tokenizer:
@@ -53,10 +48,10 @@ def _vllm_config(**overrides) -> dict:
 def test_dynamo_true_alone_is_a_complete_config() -> None:
     config = configure_generation_config(_vllm_config(dynamo=True), _Tokenizer())
 
-    # Dynamo serves the AsyncLLM, so the switch selects the async engine, and it
-    # serves OpenAI clients, which need the engine's tokenizer.
+    # Dynamo serves the AsyncLLM, so the switch selects the async engine.
+    # Rollouts read token IDs only, so the engine skips its tokenizer as natively.
     assert config["vllm_cfg"]["async_engine"] is True
-    assert config["vllm_cfg"]["skip_tokenizer_init"] is False
+    assert config["vllm_cfg"]["skip_tokenizer_init"] is True
     assert dynamo_cfg(config) == DynamoCfg()
     assert dynamo_cfg(config).frontend_args.router_mode == "kv"
 
@@ -103,10 +98,8 @@ def test_configs_dynamo_would_not_serve_as_written_fail_at_startup(
 
 
 def test_dynamo_cfg_rejects_unknown_keys() -> None:
-    with pytest.raises(ValidationError, match="extra_cli_args"):
-        dynamo_cfg({"dynamo_cfg": {"worker_args": {"extra_cli_args": []}}})
-    with pytest.raises(ValidationError, match="duplicates"):
-        dynamo_cfg({"dynamo_cfg": {"worker_args": {"endpoint_types": ["chat"] * 2}}})
+    with pytest.raises(ValidationError, match="worker_args"):
+        dynamo_cfg({"dynamo_cfg": {"worker_args": {}}})
 
 
 def test_frontend_argv_is_runtime_owned() -> None:
@@ -134,65 +127,3 @@ def test_redaction_hides_credentials() -> None:
         "HF_TOKEN": "<redacted>",
         "NCCL_DEBUG": "INFO",
     }
-
-
-def _serving(**serving_chat_kwargs) -> dict:
-    return _vllm_config(
-        dynamo=True,
-        vllm_cfg={
-            "async_engine": True,
-            "max_model_len": 512,
-            "tensor_parallel_size": 1,
-            "expert_parallel_size": 1,
-            "http_server_serving_chat_kwargs": serving_chat_kwargs,
-        },
-    )
-
-
-def test_parsers_follow_the_native_server_under_dynamos_names() -> None:
-    assert dynamo_parsers(_serving(tool_parser="hermes", reasoning_parser="qwen3")) == (
-        "hermes",
-        "qwen3",
-    )
-    # NeMo RL's nano_v3 vLLM plugin is Dynamo's nemotron_v3 parser.
-    nano_v3 = _serving(reasoning_parser="nano_v3")
-    nano_v3["vllm_cfg"]["reasoning_parser_plugin"] = "nano_v3_reasoning_parser.py"
-    assert dynamo_parsers(nano_v3) == (None, "nemotron_v3")
-    assert dynamo_parsers(_serving(tool_parser="openai")) == ("harmony", None)
-    # dynamo_cfg names them explicitly.
-    explicit = _serving(tool_parser="hermes")
-    explicit["dynamo_cfg"] = {"worker_args": {"tool_call_parser": "qwen3_coder"}}
-    assert dynamo_parsers(explicit) == ("qwen3_coder", None)
-
-
-def test_a_parser_plugin_without_a_dynamo_parser_is_rejected_at_startup() -> None:
-    config = _serving(tool_parser="my_parser")
-    config["vllm_cfg"]["tool_parser_plugin"] = "my_parser.py"
-
-    with pytest.raises(ValueError, match="worker_args.tool_call_parser"):
-        configure_generation_config(config, _Tokenizer())
-
-
-def test_chat_template_follows_the_native_server() -> None:
-    config = _serving(chat_template="templates/chat.jinja")
-    assert dynamo_chat_template(config) == "templates/chat.jinja"
-    assert dynamo_chat_template(_serving()) is None
-
-
-@pytest.mark.parametrize(
-    ("serving_chat_kwargs", "error"),
-    [
-        ({"chat_template_content_format": "string"}, "no content-format setting"),
-        ({"enable_auto_tools": False}, "always parses"),
-    ],
-)
-def test_chat_settings_the_frontend_has_no_counterpart_for_are_rejected(
-    serving_chat_kwargs, error
-) -> None:
-    with pytest.raises(ValueError, match=error):
-        configure_generation_config(_serving(**serving_chat_kwargs), _Tokenizer())
-    # The native defaults are what the frontend does anyway.
-    configure_generation_config(
-        _serving(chat_template_content_format="auto", enable_auto_tools=True),
-        _Tokenizer(),
-    )

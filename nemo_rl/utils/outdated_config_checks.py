@@ -208,6 +208,10 @@ _REMOVED_DYNAMO_CFG_KEYS = {
     "control_timeout_s": "refit and pause use the vLLM backend's own controls",
     "metrics_include_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
     "metrics_exclude_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
+    "worker_args": (
+        "Dynamo serves only NeMo RL's own rollouts, which need no chat parsers or "
+        "templates; engines are configured through vllm_cfg and vllm_kwargs"
+    ),
 }
 
 
@@ -242,12 +246,6 @@ def reject_outdated_dynamo_backend(config: dict[str, Any]) -> None:
                 problems.append(
                     f"policy.generation.dynamo_cfg.{key} was removed: {replacement}."
                 )
-        worker_args = dynamo_cfg.get("worker_args")
-        if isinstance(worker_args, dict) and "extra_cli_args" in worker_args:
-            problems.append(
-                "policy.generation.dynamo_cfg.worker_args.extra_cli_args was "
-                "removed: engines are configured through vllm_cfg and vllm_kwargs."
-            )
     if problems:
         raise ValueError(" ".join(problems))
 
