@@ -344,6 +344,37 @@ def _train_fields_for_step(
     )
 
 
+def trainer_warmup_kwargs(stage_cfg: AdvantageStageConfig) -> dict[str, Any]:
+    """Step-shape arguments of ``TQPolicy.warmup_first_pass`` for this run."""
+    return {
+        "train_fields": _train_fields_for_step(
+            policy_logprobs_required=stage_cfg.policy_logprobs_required,
+            reference_logprobs_required=stage_cfg.reference_logprobs_required,
+        ),
+        "run_logprobs": stage_cfg.policy_logprobs_required,
+    }
+
+
+def trainer_warmup_skip_reason(
+    master_config: MasterConfig, *, is_ppo: bool, opd: bool, steps_left: bool
+) -> Optional[str]:
+    """Why NRL_TRAINER_WARMUP=1 does not apply to this run, or None if it does."""
+    policy_config = master_config.policy
+    if not (
+        "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
+    ):
+        return "the trainer is not Megatron"
+    if policy_config["generation"]["colocated"]["enabled"]:
+        return "generation shares the trainer's GPUs"
+    if is_ppo:
+        return "PPO steps are not covered"
+    if opd:
+        return "on-policy distillation is not covered"
+    if not steps_left:
+        return "no train step is left"
+    return None
+
+
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
@@ -744,6 +775,9 @@ class SingleControllerActor:
 
         self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
 
+        self._trainer_warmup_task: Optional[asyncio.Task[dict[str, Any]]] = None
+        self._trainer_warmup_ran = getattr(actor_args, "trainer_warmup_ran", False)
+
         # Groups that will never arrive, keyed by the training step they were stamped
         # for. A sampler that matches batches to steps exactly (InOrderSampler) can only
         # ever select num_prompts_per_step groups carrying that stamp, so a dropped
@@ -864,6 +898,8 @@ class SingleControllerActor:
             restored_replay_groups=restored_replay_groups,
         )
 
+        self._maybe_start_trainer_warmup()
+
         # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
@@ -952,6 +988,10 @@ class SingleControllerActor:
                 await self._finish_pending_save(blocking=True)
             except Exception as e:  # teardown must not mask the original failure
                 print(f"Error publishing the pending checkpoint: {e}", flush=True)
+            if self._trainer_warmup_task is not None:
+                # Not in `tasks`: the train pump awaits it and surfaces its failure.
+                self._trainer_warmup_task.cancel()
+                await asyncio.gather(self._trainer_warmup_task, return_exceptions=True)
             if self._engine_supervisor is not None:
                 # Not in `tasks`: the supervisor creates a task per restart, on demand, so
                 # there is nothing to cancel in that list. Without this an in-flight
@@ -984,6 +1024,37 @@ class SingleControllerActor:
             "train_steps": self._train_steps,
             "trainer_version": self._trainer_version,
         }
+
+    def _maybe_start_trainer_warmup(self) -> None:
+        """Start NRL_TRAINER_WARMUP's pass, overlapping the first rollouts."""
+        if os.environ.get("NRL_TRAINER_WARMUP") != "1" or self._trainer_warmup_ran:
+            return
+        reason = trainer_warmup_skip_reason(
+            self._master_config,
+            is_ppo=self._is_ppo,
+            opd=self._teacher_logprobs_required,
+            steps_left=self._train_steps < self._algo_cfg.max_num_steps,
+        )
+        if reason is not None:
+            print(f"  ⚠ NRL_TRAINER_WARMUP=1 ignored: {reason}.", flush=True)
+            return
+        self._trainer_warmup_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._trainer.warmup_first_pass,
+                self._loss_fn,
+                train_fields=self._train_fields,
+                run_logprobs=self._policy_logprobs_required,
+            )
+        )
+
+    async def _finish_trainer_warmup(self) -> None:
+        task = self._trainer_warmup_task
+        if task is None:
+            return
+        with self._timer.time("trainer_warmup_wait"):
+            summary = await task
+        self._trainer_warmup_task = None
+        print(f"  ✓ Trainer warm-up (rank 0): {summary}", flush=True)
 
     async def ping(self) -> dict[str, Any]:
         """Liveness check — returns immediately if event loop is running."""
@@ -3213,6 +3284,9 @@ class SingleControllerActor:
                         # the switch to training must not tick them down.
                         self._rollout_manager.suspend_request_deadlines()
                         await asyncio.to_thread(self._gen.finish_generation)
+
+                    if self._trainer_warmup_task is not None:
+                        await self._finish_trainer_warmup()
 
                     # ---- 2. Prepare the batch ----
                     if self._is_ppo:

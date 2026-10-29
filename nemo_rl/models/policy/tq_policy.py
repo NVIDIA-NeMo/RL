@@ -855,3 +855,37 @@ class TQPolicy(TQDriverMixin, Policy):
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
+
+    def start_warmup_first_pass(
+        self,
+        loss_fn: LossFunction,
+        *,
+        train_fields: tuple[str, ...],
+        run_logprobs: bool,
+    ) -> list[ray.ObjectRef]:
+        """Start ``warmup_first_pass`` on every worker; returns one future per rank.
+
+        Resolve the futures before anything else uses the trainer.
+        """
+        return self.worker_group.run_all_workers_single_data(
+            "warmup_first_pass",
+            loss_fn=loss_fn,
+            train_fields=train_fields,
+            run_logprobs=run_logprobs,
+        )
+
+    def warmup_first_pass(
+        self,
+        loss_fn: LossFunction,
+        *,
+        train_fields: tuple[str, ...],
+        run_logprobs: bool,
+    ) -> dict[str, Any]:
+        """Run the synthetic warm-up pass on every worker; returns rank 0's summary.
+
+        Must not overlap a train step.
+        """
+        futures = self.start_warmup_first_pass(
+            loss_fn, train_fields=train_fields, run_logprobs=run_logprobs
+        )
+        return ray.get(futures)[0]

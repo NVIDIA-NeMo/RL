@@ -21,6 +21,7 @@ import dataclasses
 import json
 import threading
 import warnings
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -3137,6 +3138,290 @@ class TestAdaptiveLossRestore:
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert actor_args.loss_fn.cur_adaptive_ppo_clip_k == 0.5
+
+
+def _gym_vllm_config(**kwargs: Any) -> MasterConfig:
+    # One epoch of the patched 4-batch dataloader; more steps get clamped by the
+    # dataset, which rebuilds the trainer.
+    kwargs.setdefault("max_num_steps", 4)
+    mc = TestSetup._gym_vllm_config(**kwargs)
+    mc.policy["model_name"] = "test-model"
+    return mc
+
+
+class TestStartupOverlapToggles:
+    """Opt-in NRL_* switches that overlap startup work; all are off by default."""
+
+    def test_early_submit_starts_the_trainer_before_the_vllm_reserve(
+        self, patched_factories, monkeypatch
+    ):
+        monkeypatch.setenv("NRL_EARLY_TRAINER_SUBMIT", "1")
+        mc = _gym_vllm_config()
+        mc.cluster.segment_size = 1
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        trainer_started = threading.Event()
+        trainer_started_before_reserve: list[bool] = []
+
+        def build_trainer(*args: Any, **kwargs: Any):
+            trainer_started.set()
+            return patched_factories["fake_policy"], 0.0
+
+        def build_generation(*args: Any, **kwargs: Any):
+            # Blocks the reserve until the trainer starts; times out without the toggle.
+            trainer_started_before_reserve.append(trainer_started.wait(timeout=5))
+            return patched_factories["fake_gen"], 0.0
+
+        patched_factories["_build_trainer"].side_effect = build_trainer
+        patched_factories["_build_generation"].side_effect = build_generation
+
+        with TestSetup._gym_patches():
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert trainer_started_before_reserve == [True]
+        patched_factories["_build_trainer"].assert_called_once()
+        train_cluster = patched_factories["_build_clusters"].return_value[0]
+        train_cluster.get_placement_groups.assert_called()
+        assert actor_args.trainer_handle is patched_factories["fake_policy"]
+        assert mc.policy["generation"]["model_name"] == "test-model"
+
+    def test_early_submit_is_ignored_without_a_segment_size(
+        self, patched_factories, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("NRL_EARLY_TRAINER_SUBMIT", "1")
+        mc = _gym_vllm_config()
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        order: list[str] = []
+
+        def build_trainer(*args: Any, **kwargs: Any):
+            order.append("trainer")
+            return patched_factories["fake_policy"], 0.0
+
+        def build_generation(*args: Any, **kwargs: Any):
+            order.append("reserve")
+            return patched_factories["fake_gen"], 0.0
+
+        patched_factories["_build_trainer"].side_effect = build_trainer
+        patched_factories["_build_generation"].side_effect = build_generation
+
+        with TestSetup._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert order == ["reserve", "trainer"]
+        assert "NRL_EARLY_TRAINER_SUBMIT=1 ignored" in capsys.readouterr().out
+
+    def test_early_trainer_is_rebuilt_when_the_dataset_clamps_the_steps(
+        self, patched_factories, monkeypatch
+    ):
+        monkeypatch.setenv("NRL_EARLY_TRAINER_SUBMIT", "1")
+        mc = _gym_vllm_config(
+            megatron_enabled=True, max_num_steps=100, max_num_epochs=1
+        )
+        mc.cluster.segment_size = 1
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with TestSetup._gym_patches():
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert patched_factories["_build_trainer"].call_count == 2
+        patched_factories["fake_policy"].shutdown.assert_called_once_with()
+        assert mc.policy["megatron_cfg"]["train_iters"] == 4
+        assert actor_args.trainer_handle is patched_factories["fake_policy"]
+
+    def test_overlapped_route_scan_hands_its_names_to_the_check(
+        self, patched_factories, monkeypatch
+    ):
+        monkeypatch.setenv("NRL_OVERLAP_ROUTE_SCAN", "1")
+        mc = _gym_vllm_config()
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+        names = {"training": {"alpha"}, "validation": set()}
+
+        with (
+            TestSetup._gym_patches(fake_gym_shards),
+            patch.object(
+                sc_setup_mod, "collect_dataset_agent_names", return_value=names
+            ) as mock_collect,
+            patch.object(
+                sc_setup_mod, "validate_dataset_agent_coverage"
+            ) as mock_validate,
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        datasets = {"training": list(range(8)), "validation": None}
+        mock_collect.assert_called_once_with(datasets)
+        mock_validate.assert_called_once_with(
+            fake_gym_shards, datasets, agent_names=names
+        )
+
+    def test_vllm_generation_config_writes_are_idempotent(self):
+        # The early submit applies them before the reserve applies them again.
+        mc = _make_master_config(backend="vllm")
+        mc.policy["model_name"] = "test-model"
+        mc.policy["hf_config_overrides"] = {"rope_theta": 1.0}
+
+        sc_setup_mod._apply_vllm_generation_config(mc)
+        keys_after_first = set(mc.policy["generation"])
+        sc_setup_mod._apply_vllm_generation_config(mc)
+
+        assert set(mc.policy["generation"]) == keys_after_first
+        assert mc.policy["generation"]["model_name"] == "test-model"
+        assert mc.policy["generation"]["vllm_kwargs"] == {
+            "hf_overrides": {"rope_theta": 1.0}
+        }
+
+    @staticmethod
+    def _warmup_config() -> MasterConfig:
+        mc = _make_master_config(megatron_enabled=True)
+        # Read by AdvantageStageConfig, which the warm-up's step fields come from.
+        mc.policy["generation"]["top_k"] = None
+        mc.policy["generation"]["top_p"] = 1.0
+        return mc
+
+    def test_trainer_warmup_starts_once_the_trainer_is_built(
+        self, patched_factories, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("NRL_TRAINER_WARMUP", "1")
+        mc = self._warmup_config()
+        fake_policy = patched_factories["fake_policy"]
+        warmup_started = threading.Event()
+        order: list[str] = []
+
+        def start_warmup(*args: Any, **kwargs: Any) -> list[str]:
+            warmup_started.set()
+            return ["warmup_ref"]
+
+        def build_generation(*args: Any, **kwargs: Any):
+            # Generation stays down until the warm-up starts; times out without it.
+            order.append(f"generation waited: {warmup_started.wait(timeout=5)}")
+            return patched_factories["fake_gen"], 0.0
+
+        real_get = sc_setup_mod.ray.get
+
+        def get(refs: Any, *args: Any, **kwargs: Any) -> Any:
+            if refs == ["warmup_ref"]:
+                order.append("warmup waited")
+                return [{"total_s": 1.0}]
+            return real_get(refs, *args, **kwargs)
+
+        fake_policy.start_warmup_first_pass.side_effect = start_warmup
+        patched_factories["_build_generation"].side_effect = build_generation
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = lambda: order.append(
+            "init_communicator"
+        )
+
+        with patch.object(sc_setup_mod.ray, "get", side_effect=get):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert order == [
+            "generation waited: True",
+            "warmup waited",
+            "init_communicator",
+        ]
+        fake_policy.start_warmup_first_pass.assert_called_once_with(
+            patched_factories["ClippedPGLossFn"].return_value,
+            train_fields=ANY,
+            run_logprobs=True,
+        )
+        assert actor_args.trainer_warmup_ran is True
+        assert "setup waited" in capsys.readouterr().out
+
+
+class TestEarlyTrainerWarmup:
+    """The setup-side start of NRL_TRAINER_WARMUP=1's pass."""
+
+    _KWARGS = {"train_fields": ("input_ids",), "run_logprobs": True}
+
+    @staticmethod
+    def _trainer_future(trainer: Any) -> Future:
+        future: Future = Future()
+        future.set_result((trainer, None, {"trainer_time": 0.0}))
+        return future
+
+    def test_generation_up_first_leaves_the_pass_to_the_controller(self):
+        generation_future: Future = Future()
+        generation_future.set_result((MagicMock(name="gen"), 0.0))
+        early = sc_setup_mod._EarlyTrainerWarmup(
+            MagicMock(name="loss_fn"), self._KWARGS, generation_future
+        )
+        trainer = MagicMock(name="trainer")
+
+        early.start(self._trainer_future(trainer))
+
+        trainer.start_warmup_first_pass.assert_not_called()
+        assert early.finish() is False
+
+    def test_a_failed_start_fails_setup(self):
+        early = sc_setup_mod._EarlyTrainerWarmup(
+            MagicMock(name="loss_fn"), self._KWARGS, Future()
+        )
+        trainer = MagicMock(name="trainer")
+        trainer.start_warmup_first_pass.side_effect = RuntimeError("dispatch failed")
+
+        early.start(self._trainer_future(trainer))
+
+        with pytest.raises(RuntimeError, match="dispatch failed"):
+            early.finish()
+
+    def test_finish_waits_for_the_done_callback(self):
+        early = sc_setup_mod._EarlyTrainerWarmup(
+            MagicMock(name="loss_fn"), self._KWARGS, Future()
+        )
+        trainer = MagicMock(name="trainer")
+        trainer.start_warmup_first_pass.return_value = ["warmup_ref"]
+        finished: list[bool] = []
+        waiter = threading.Thread(
+            target=lambda: finished.append(early.finish()), daemon=True
+        )
+
+        with patch.object(sc_setup_mod.ray, "get", return_value=[{"total_s": 1.0}]):
+            waiter.start()
+            waiter.join(timeout=0.2)
+            assert waiter.is_alive()
+            early.start(self._trainer_future(trainer))
+            waiter.join(timeout=5)
+
+        assert finished == [True]
+
+    @pytest.mark.parametrize(
+        ("env", "stage", "current_step"),
+        [
+            (None, {}, 0),
+            ("1", {"is_ppo": True}, 0),
+            ("1", {"teacher_logprobs_required": True}, 0),
+            ("1", {}, 10),
+        ],
+        ids=["off", "ppo", "opd", "no-step-left"],
+    )
+    def test_no_early_pass_where_the_warmup_does_not_apply(
+        self, monkeypatch, env, stage, current_step
+    ):
+        if env is None:
+            monkeypatch.delenv("NRL_TRAINER_WARMUP", raising=False)
+        else:
+            monkeypatch.setenv("NRL_TRAINER_WARMUP", env)
+        stage_cfg = SimpleNamespace(
+            **{
+                "is_ppo": False,
+                "teacher_logprobs_required": False,
+                "algo": SimpleNamespace(max_num_steps=10),
+                **stage,
+            }
+        )
+        monkeypatch.setattr(
+            sc_setup_mod.AdvantageStageConfig,
+            "from_master_config",
+            lambda master_config: stage_cfg,
+        )
+
+        early = sc_setup_mod._EarlyTrainerWarmup.maybe_create(
+            TestStartupOverlapToggles._warmup_config(),
+            MagicMock(name="loss_fn"),
+            current_step=current_step,
+            generation_future=Future(),
+        )
+
+        assert early is None
 
 
 class TestNativeTQRecoverySetup:

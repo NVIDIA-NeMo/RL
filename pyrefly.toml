@@ -307,6 +307,7 @@ project-includes = [
   "nemo_rl/models/policy/draft_config.py",
   "nemo_rl/models/policy/interfaces.py",
   "nemo_rl/models/policy/tq_policy.py",
+  "nemo_rl/models/policy/trainer_warmup.py",
   "nemo_rl/models/policy/utils.py",
   "nemo_rl/models/policy/workers/__init__.py",
   "nemo_rl/models/policy/workers/checkpoint_engine.py",

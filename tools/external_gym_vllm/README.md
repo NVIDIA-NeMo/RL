@@ -211,6 +211,8 @@ bash $TOOLS/cache_sync.sh seed-once /shared/compile_cache/policy /tmp/nemo_rl_co
 bash $TOOLS/cache_sync.sh sidecar-types /tmp/nemo_rl_compile_cache /shared/compile_cache 60 "$LOG_DIR/ENDED" policy megatron &
 ```
 
+`NRL_MEGATRON_TRITON_CACHE_AUTOTUNING=1` also caches Triton autotune results. `NRL_MEGATRON_TORCH_COMPILE_JOB_ID=<id>`, kept the same between runs, makes torch.compile keep its shape profiles in the inductor cache, so later runs compile dynamic shapes from the start. When the inductor cache is inside the `megatron` cache, the profiles are copied first, and the worker waits up to 60 s for them before its first compile.
+
 ## Slurm submission
 
 The wrapper requires exactly two hetgroups. Submit the NeMo RL nodes first and

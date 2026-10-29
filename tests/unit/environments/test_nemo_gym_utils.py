@@ -1601,6 +1601,36 @@ def test_same_size_source_replacement_falls_back_to_loaded_rows(tmp_path):
         )
 
 
+def test_route_names_are_collected_per_split_without_a_shard_set():
+    names = nemo_gym_mod.collect_dataset_agent_names(
+        {"train": _gym_dataset("alpha", "beta", "alpha"), "validation": None}
+    )
+
+    assert names == {"train": {"alpha", "beta"}, "validation": set()}
+
+
+def test_prescanned_route_names_are_checked_without_rescanning():
+    dataset = MagicMock()
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="ghost"):
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            _sharded_set({"alpha": "left"}),
+            {"train": dataset},
+            agent_names={"train": {"alpha", "ghost"}},
+        )
+
+    dataset.__iter__.assert_not_called()
+
+
+def test_a_split_missing_from_the_prescan_is_scanned_at_check_time():
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="validation"):
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            _sharded_set({"alpha": "left"}),
+            {"train": _gym_dataset("alpha"), "validation": _gym_dataset("ghost")},
+            agent_names={"train": {"alpha"}},
+        )
+
+
 def test_shard_set_shutdown_releases_the_placement_group_once():
     pg = MagicMock()
     shard_set = nemo_gym_mod.NemoGymShardSet(

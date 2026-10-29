@@ -89,6 +89,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
+from nemo_rl.utils import compile_cache
 from nemo_rl.utils.path_utils import (
     listdir,
     maybe_enable_msc,
@@ -2518,6 +2519,9 @@ def setup_model_and_optimizer(
     if megatron_cfg.ft and megatron_cfg.ft.enable_ft_package:
         fault_tolerance.setup(megatron_cfg, state)
         fault_tolerance.maybe_setup_simulated_fault(megatron_cfg.ft)
+
+    # Before the JIT warm-up's first torch.compile, which reads the shape profiles.
+    compile_cache.wait_for_shape_profiles("megatron")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options(megatron_cfg.model, megatron_cfg.train.micro_batch_size)

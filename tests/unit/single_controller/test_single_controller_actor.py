@@ -2305,6 +2305,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
+    ctrl._trainer_warmup_task = None
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
     ctrl._ppo_epochs = 1

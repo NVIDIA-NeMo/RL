@@ -2756,9 +2756,17 @@ def spinup_nemo_gym_actor(
     ).sole_handle()
 
 
+def collect_dataset_agent_names(datasets: Mapping[str, Any]) -> dict[str, set[str]]:
+    """Map each split to the route names its rows reference; needs no shard."""
+    return {
+        split: _iter_dataset_agent_names(dataset) for split, dataset in datasets.items()
+    }
+
+
 def validate_dataset_agent_coverage(
     shard_set: NemoGymShardSet,
     datasets: Mapping[str, Any],
+    agent_names: Optional[Mapping[str, set[str]]] = None,
 ) -> None:
     """Fail at setup if any row names a route no shard hosts.
 
@@ -2777,6 +2785,8 @@ def validate_dataset_agent_coverage(
             built at setup; an unsharded set is asked for its entries here.
         datasets: Split name to dataset, for the error message. ``None`` values
             and datasets without gym rows are skipped.
+        agent_names: ``collect_dataset_agent_names`` of these datasets, if
+            already scanned. Splits it lacks are scanned here.
 
     Raises:
         ShardSetupError: A split references routes no shard hosts.
@@ -2789,7 +2799,11 @@ def validate_dataset_agent_coverage(
         entries = ray.get(shard_set.all_handles[0].list_entries.remote())
         hosted = frozenset(build_route_shard_map({DEFAULT_SHARD_NAME: entries}))
     for split, dataset in datasets.items():
-        unhosted = sorted(_iter_dataset_agent_names(dataset) - hosted)
+        if agent_names is not None and split in agent_names:
+            referenced = agent_names[split]
+        else:
+            referenced = _iter_dataset_agent_names(dataset)
+        unhosted = sorted(referenced - hosted)
         if unhosted:
             raise ShardSetupError(
                 f"The {split} dataset references routes that no shard hosts: "

@@ -133,12 +133,18 @@ from nemo_rl.models.megatron.train import (
     should_reduce_loss_across_context_parallel,
     strip_context_parallel_local_loss_metric,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import Fp4Config, PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
     TeacherFullPayloadOutputSpec,
+)
+from nemo_rl.models.policy.trainer_warmup import (
+    SEQLENS_ENV,
+    build_warmup_batch,
+    may_draw_token_id,
+    warmup_seqlens,
 )
 from nemo_rl.models.policy.utils import (
     broadcast_hf_buckets_via_distributed_impl,
@@ -2592,6 +2598,131 @@ class MegatronPolicyWorkerImpl(
             self.model.zero_grad_buffer()
             self.optimizer.zero_grad()
             self._train_step_state = None
+
+    def _trainer_warmup_skip_reason(self) -> Optional[str]:
+        """Why warmup_first_pass would leave state behind on this model, else None."""
+        megatron_cfg = self.cfg["megatron_cfg"]
+        fp8_recipe = self.fp8_cfg.get("fp8_recipe") if self.fp8_cfg else None
+        raw_fp4_cfg = megatron_cfg.get("fp4_cfg")
+        fp4_enabled = (
+            raw_fp4_cfg is not None and Fp4Config.model_validate(raw_fp4_cfg).enabled
+        )
+        if self.optimizer is None:
+            return "no optimizer"
+        if self._router_replay_enabled:
+            return "router replay needs the routes recorded during generation"
+        if (
+            self.fp8_cfg
+            and self.fp8_cfg["enabled"]
+            and str(getattr(fp8_recipe, "value", fp8_recipe)) == "delayed"
+        ):
+            return "FP8 delayed scaling would keep the synthetic batch's amax history"
+        if fp4_enabled or megatron_cfg.get("te_precision_config_file"):
+            return "FP4 and per-module precision recipes are not covered"
+        if "draft" in self.cfg and self.cfg["draft"].enabled:
+            return "draft-model training is not covered"
+        if self.delegate_pack_to_model:
+            return "models that pack their own inputs are not covered"
+        if self.media_placeholder_token_id is not None and may_draw_token_id(
+            self.media_placeholder_token_id
+        ):
+            return "the synthetic batch could hold the media placeholder token"
+        return None
+
+    def warmup_first_pass(
+        self,
+        loss_fn: LossFunction,
+        train_fields: tuple[str, ...],
+        run_logprobs: bool,
+        seqlens: Optional[list[int]] = None,
+    ) -> dict[str, Any]:
+        """Run one synthetic logprob pass and forward/backward, keeping nothing.
+
+        Ends in ``abort_train_step`` instead of an optimizer step, then resets what
+        the first real step would otherwise count: the routers' token counts, the
+        MoE and MTP metric trackers, the RNG states and the step timer. Returns the
+        phase timings, or ``{"skipped": reason}``.
+        """
+        reason = self._trainer_warmup_skip_reason()
+        if reason is not None:
+            return {"skipped": reason}
+        if getattr(self, "_train_step_state", None) is not None:
+            raise RuntimeError(
+                "the trainer warm-up cannot run inside an open train step"
+            )
+
+        from megatron.core.distributed.finalize_model_grads import (
+            reset_model_temporary_tensors,
+        )
+        from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+        from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
+        from megatron.core.transformer.multi_token_prediction import (
+            MTPLossLoggingHelper,
+        )
+
+        # Wait for the cache copy __init__ started in the background.
+        compile_cache.seed("megatron")
+
+        t0 = time.perf_counter()
+        seqlens = seqlens or warmup_seqlens(self.cfg, os.environ.get(SEQLENS_ENV))
+        data = self._apply_packing_prep(
+            build_warmup_batch(
+                seqlens,
+                train_fields=train_fields,
+                pad_to_multiple=self.cfg["make_sequence_length_divisible_by"],
+            )
+        )
+        rng_tracker = get_cuda_rng_tracker()
+        # Graph-safe trackers hold generators that CUDA graphs may have registered;
+        # replacing them with copies would detach those graphs.
+        tracker_states = (
+            None
+            if getattr(rng_tracker, "use_cudagraphable_rng", False)
+            else {name: s.clone() for name, s in rng_tracker.get_states().items()}
+        )
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state()
+        grad_enabled = torch.is_grad_enabled()
+        step_timer, self.timer = self.timer, Timer()
+        summary: dict[str, Any] = {"seqlens": list(seqlens)}
+        try:
+            if run_logprobs:
+                t = time.perf_counter()
+                self.prepare_for_lp_inference()
+                logprobs = self.get_logprobs(data=data, require_router_replay=False)[
+                    "logprobs"
+                ]
+                # As in a real step: the ratio to these logprobs starts at one.
+                if logprobs.shape == data["input_ids"].shape:
+                    for name in (
+                        "prev_logprobs",
+                        "generation_logprobs",
+                        "reference_policy_logprobs",
+                    ):
+                        if name in data:
+                            data[name] = logprobs.clone()
+                summary["logprobs_s"] = time.perf_counter() - t
+            t = time.perf_counter()
+            self.prepare_for_training()
+            self.begin_train_step(loss_fn)
+            self.train_microbatch(data)
+            torch.cuda.synchronize()
+            summary["train_s"] = time.perf_counter() - t
+        finally:
+            torch.set_grad_enabled(grad_enabled)
+            self.abort_train_step()
+            reset_model_temporary_tensors(get_model_config(self.model), [self.model])
+            clear_aux_losses_tracker()
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
+            torch.set_rng_state(cpu_rng_state)
+            torch.cuda.set_rng_state(cuda_rng_state)
+            if tracker_states is not None:
+                rng_tracker.set_states(tracker_states)
+            self.timer = step_timer
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                torch.cuda.empty_cache()
+        summary["total_s"] = time.perf_counter() - t0
+        return summary
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(

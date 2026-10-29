@@ -22,9 +22,10 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 from __future__ import annotations
 
 import os
+import threading
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -109,6 +110,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
     build_nemo_gym_actors,
+    collect_dataset_agent_names,
     set_nemo_gym_log_dir,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
@@ -204,6 +206,7 @@ class SingleControllerActorArgs:
     # the MSE loss it trains under.
     value_handle: Optional[TQValue] = None
     value_loss_fn: Optional[LossFunction] = None
+    trainer_warmup_ran: bool = False
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -592,6 +595,17 @@ def _build_clusters(
     return train_cluster, inference_cluster, teacher_topology
 
 
+def _apply_vllm_generation_config(master_config: MasterConfig) -> None:
+    """Write the generation-config keys vLLM derives from the policy (idempotent)."""
+    generation_config = master_config.policy["generation"]
+    generation_config["model_name"] = master_config.policy["model_name"]
+    vllm_config = cast(VllmConfig, generation_config)
+    vllm_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
+        master_config.policy.get("hf_config_overrides", {})
+    )
+    configure_vllm_for_router_replay(master_config.policy)
+
+
 def _build_generation(
     inference_cluster: RayVirtualCluster,
     master_config: MasterConfig,
@@ -623,11 +637,8 @@ def _build_generation(
     backend = generation_config["backend"]
 
     if backend == "vllm":
+        _apply_vllm_generation_config(master_config)
         vllm_config = cast(VllmConfig, generation_config)
-        vllm_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            master_config.policy.get("hf_config_overrides", {})
-        )
-        configure_vllm_for_router_replay(master_config.policy)
         gen = VllmGeneration(
             cluster=inference_cluster,
             config=vllm_config,
@@ -1089,6 +1100,84 @@ def _load_opd_full_teacher_lm_heads(
             f"alias={teacher.alias!r}] from {results[0]}",
             flush=True,
         )
+
+
+class _EarlyTrainerWarmup:
+    """Starts NRL_TRAINER_WARMUP's pass as soon as the trainer is built.
+
+    If generation is already up by then, the controller runs the pass instead.
+    """
+
+    def __init__(
+        self,
+        loss_fn: LossFunction,
+        warmup_kwargs: dict[str, Any],
+        generation_future: Optional[Future],
+    ) -> None:
+        self._loss_fn = loss_fn
+        self._warmup_kwargs = warmup_kwargs
+        self._generation_future = generation_future
+        self._started = threading.Event()
+        self._futures: Optional[list[ray.ObjectRef]] = None
+        self._error: Optional[BaseException] = None
+
+    @classmethod
+    def maybe_create(
+        cls,
+        master_config: MasterConfig,
+        loss_fn: LossFunction,
+        *,
+        current_step: int,
+        generation_future: Optional[Future],
+    ) -> Optional[_EarlyTrainerWarmup]:
+        if os.environ.get("NRL_TRAINER_WARMUP") != "1":
+            return None
+        # Deferred: single_controller imports this module.
+        from nemo_rl.algorithms.single_controller import (
+            trainer_warmup_kwargs,
+            trainer_warmup_skip_reason,
+        )
+
+        stage_cfg = AdvantageStageConfig.from_master_config(master_config)
+        reason = trainer_warmup_skip_reason(
+            master_config,
+            is_ppo=stage_cfg.is_ppo,
+            opd=stage_cfg.teacher_logprobs_required,
+            steps_left=current_step < stage_cfg.algo.max_num_steps,
+        )
+        if reason is not None:
+            return None
+        return cls(loss_fn, trainer_warmup_kwargs(stage_cfg), generation_future)
+
+    def start(self, trainer_future: Future) -> None:
+        try:
+            if self._generation_future is None or not self._generation_future.done():
+                trainer = trainer_future.result()[0]
+                self._futures = trainer.start_warmup_first_pass(
+                    self._loss_fn, **self._warmup_kwargs
+                )
+        except BaseException as error:
+            # Exceptions in done-callbacks are only logged; finish() re-raises.
+            self._error = error
+        finally:
+            self._started.set()
+
+    def finish(self) -> bool:
+        """Wait for the pass start() began, if any; return whether one ran."""
+        # Future.result() can return before the done-callbacks have run.
+        self._started.wait()
+        if self._error is not None:
+            raise self._error
+        if self._futures is None:
+            return False
+        t0 = time.perf_counter()
+        summary = ray.get(self._futures)[0]
+        print(
+            f"  ✓ Trainer warm-up (rank 0): {summary}; setup waited "
+            f"{time.perf_counter() - t0:.1f}s for it",
+            flush=True,
+        )
+        return True
 
 
 def setup_single_controller(
@@ -1855,6 +1944,26 @@ def setup_single_controller(
             "NeMo-Gym. Set env.should_use_nemo_gym=true, or disable the router."
         )
 
+    # NRL_EARLY_TRAINER_SUBMIT=1 builds the trainer on its own thread during the vLLM
+    # reserve instead of after it. That thread reads the config while the reserve
+    # runs, so the reserve's config writes are applied before it starts.
+    early_trainer_submit = os.environ.get("NRL_EARLY_TRAINER_SUBMIT") == "1"
+    if early_trainer_submit and not (overlap_dataset_load and segment_size is not None):
+        print(
+            "  ⚠ NRL_EARLY_TRAINER_SUBMIT=1 ignored: it needs the overlapped dataset "
+            "load (NeMo-Gym, non-colocated vLLM, no resume) and cluster.segment_size.",
+            flush=True,
+        )
+        early_trainer_submit = False
+    early_trainer_executor: Optional[ThreadPoolExecutor] = None
+    early_trainer_future = None
+    if early_trainer_submit:
+        _apply_vllm_generation_config(master_config)
+        early_trainer_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="early-trainer"
+        )
+        early_trainer_future = early_trainer_executor.submit(_build_trainer_and_value)
+
     if use_nemo_gym:
         # Before the Gym build task below reads master_config.env.
         set_nemo_gym_log_dir(master_config.env, master_config.logger.log_dir)
@@ -1941,7 +2050,21 @@ def setup_single_controller(
                 tokenizer=tokenizer,
                 processor=processor,
             )
-        build_tasks["trainer"] = _build_trainer_and_value
+        if early_trainer_future is None:
+            build_tasks["trainer"] = _build_trainer_and_value
+
+    # NRL_OVERLAP_ROUTE_SCAN=1 scans the dataset's Gym routes while the setup tasks run.
+    overlap_route_scan = (
+        os.environ.get("NRL_OVERLAP_ROUTE_SCAN") == "1" and use_nemo_gym
+    )
+    dataset_agent_names = None
+    loss_fn = ClippedPGLossFn(
+        master_config.loss_fn,
+        opd_full=opd_module.get_opd_full_config(master_config),
+    )
+    _restore_adaptive_loss_state(loss_fn, save_state)
+    early_warmup: Optional[_EarlyTrainerWarmup] = None
+    trainer_warmup_ran = False
 
     # Submit build tasks and get results
     submitted: dict[str, Any] = {}
@@ -1949,6 +2072,8 @@ def setup_single_controller(
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
             submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
+            if early_trainer_future is not None:
+                submitted["trainer"] = early_trainer_future
             if preloaded_training_data is not None:
                 dataset, _val_dataset, env_handles, dataloader = preloaded_training_data
             else:
@@ -1979,7 +2104,24 @@ def setup_single_controller(
                         stale_value.shutdown()
                     stale_trainer.shutdown()
                     _maybe_inject_megatron_train_iters(master_config)
-                    submitted["trainer"] = executor.submit(_build_trainer_and_value)
+                    # The shared executor has no spare worker for an early trainer.
+                    submitted["trainer"] = (early_trainer_executor or executor).submit(
+                        _build_trainer_and_value
+                    )
+            if "trainer" in submitted:
+                # After the rebuild above, which replaces the trainer future.
+                early_warmup = _EarlyTrainerWarmup.maybe_create(
+                    master_config,
+                    loss_fn,
+                    current_step=save_state.current_step,
+                    generation_future=submitted.get("generation"),
+                )
+                if early_warmup is not None:
+                    submitted["trainer"].add_done_callback(early_warmup.start)
+            if overlap_route_scan:
+                dataset_agent_names = collect_dataset_agent_names(
+                    {"training": dataset, "validation": _val_dataset}
+                )
             if "generation_trainer" in submitted:
                 generation, trainer, value, time_metrics = submitted[
                     "generation_trainer"
@@ -1988,6 +2130,8 @@ def setup_single_controller(
             else:
                 generation, gen_load_time = submitted["generation"].result()
                 trainer, value, time_metrics = submitted["trainer"].result()
+                if early_warmup is not None:
+                    trainer_warmup_ran = early_warmup.finish()
             if megatron_reserved_urls:
                 # Gym initialization needs a live URL that will respond to health checks.
                 # Megatron generation can only respond to health checks once initialized.
@@ -2013,10 +2157,13 @@ def setup_single_controller(
                 setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
             if use_nemo_gym:
                 nemo_gym_shards, gym_time = submitted["nemo_gym"].result()
-                validate_dataset_agent_coverage(
-                    nemo_gym_shards,
-                    {"training": dataset, "validation": _val_dataset},
-                )
+                route_datasets = {"training": dataset, "validation": _val_dataset}
+                if dataset_agent_names is None:
+                    validate_dataset_agent_coverage(nemo_gym_shards, route_datasets)
+                else:
+                    validate_dataset_agent_coverage(
+                        nemo_gym_shards, route_datasets, agent_names=dataset_agent_names
+                    )
                 env_handles["nemo_gym"] = cast(EnvironmentInterface, nemo_gym_shards)
                 setup_timing_metrics.nemo_gym_init_time_s = gym_time
     except BaseException:
@@ -2034,6 +2181,8 @@ def setup_single_controller(
             # The frontend ranks adopted (or will never adopt) the held sockets;
             # drop the holders.
             ray.kill(megatron_port_holder)
+        if early_trainer_executor is not None:
+            early_trainer_executor.shutdown(wait=True)
 
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
 
@@ -2175,11 +2324,6 @@ def setup_single_controller(
     # Setup Algorithm + Rollout Wiring
     # ==========================
     advantage_estimator = _build_advantage_estimator(master_config)
-    loss_fn = ClippedPGLossFn(
-        master_config.loss_fn,
-        opd_full=opd_module.get_opd_full_config(master_config),
-    )
-    _restore_adaptive_loss_state(loss_fn, save_state)
     value_loss_fn: Optional[LossFunction] = (
         MseValueLossFn(master_config.value_loss_fn)  # type: ignore
         if is_ppo_run(master_config)
@@ -2308,6 +2452,7 @@ def setup_single_controller(
         generation_router=generation_router,
         teacher_worker_groups=teacher_worker_groups,
         alias_to_group_alias=alias_to_group_alias,
+        trainer_warmup_ran=trainer_warmup_ran,
         # PPO extras
         value_handle=value,
         value_loss_fn=value_loss_fn,
