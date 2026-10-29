@@ -117,7 +117,7 @@ def main() -> None:
         )
 
     dp_cfg = config.data_plane
-    if not dp_cfg.get("enabled", False):
+    if not dp_cfg["enabled"]:
         raise ValueError(
             "run_grpo_single_controller requires data_plane.enabled=true. "
             "Use examples/run_grpo.py for the legacy / sync paths."

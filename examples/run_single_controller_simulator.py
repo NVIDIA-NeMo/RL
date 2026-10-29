@@ -195,7 +195,7 @@ def main() -> None:
         )
 
     dp_cfg = config.data_plane
-    if not dp_cfg.get("enabled", False):
+    if not dp_cfg["enabled"]:
         raise ValueError(
             "run_single_controller_simulator requires data_plane.enabled=true: "
             "the simulator runs the SingleController loop, which is built on the "
