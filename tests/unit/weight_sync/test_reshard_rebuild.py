@@ -174,6 +174,30 @@ class TestPlanRegeneration:
         ):
             sync.init_communicator()
 
+    def test_a_fast_restart_rebuilds_even_when_no_shard_is_absent(self) -> None:
+        sync, _, workers, plan_calls, _ = _reshard()
+        sync.init_communicator()
+
+        workers[0] = _Worker(0)
+
+        assert sync.reconcile_communicator([]) is True
+        assert workers[0].calls, "the replacement needs both groups and the refit plan"
+        assert len(plan_calls) == 2
+        assert sync.reconcile_communicator([]) is False
+
+    def test_replacing_an_absent_worker_waits_until_it_rejoins(self) -> None:
+        sync, _, workers, _, kill = _reshard(dead_shards=(0,))
+        sync.init_communicator()
+        kill()
+        assert sync.reconcile_communicator([0]) is True
+
+        workers[0] = _Worker(0)
+
+        assert sync.reconcile_communicator([0]) is False
+        assert not workers[0].calls
+        assert sync.reconcile_communicator([]) is True
+        assert workers[0].calls
+
     def test_the_plan_is_rebuilt_for_the_smaller_fleet(self):
         """The whole reason reshard could not simply resize."""
         sync, _, _, plan_calls, kill = _reshard(dp_size=4, dead_shards=(2,))

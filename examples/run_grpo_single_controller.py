@@ -46,6 +46,7 @@ from nemo_rl.models.generation import (
     configure_generation_config,
     draft_full_refit_enabled,
     maybe_configure_engine_reaping_env,
+    maybe_configure_nccl_plugin_retention_env,
 )
 from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.models.policy.draft_config import draft_refit_enabled
@@ -156,6 +157,9 @@ def main() -> None:
             # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
             maybe_configure_data_plane_env(config.data_plane)
             maybe_configure_engine_reaping_env(
+                config.async_rl.generation_fleet_health.enabled
+            )
+            maybe_configure_nccl_plugin_retention_env(
                 config.async_rl.generation_fleet_health.enabled
             )
             # Opens rl.setup.ray_init itself, so no span here.

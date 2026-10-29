@@ -46,6 +46,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.distributed.refit_watchdog import is_refit_context_lost
 from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
@@ -143,6 +144,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         self._stale = True
         # What the communicators were last built over. None until init_communicator.
         self._built_membership: Optional[RefitMembership] = None
+        self._built_workers: Optional[tuple[object, ...]] = None
 
     def _train_parallelism(self) -> dict[str, int]:
         megatron_cfg = self._policy.cfg["megatron_cfg"]
@@ -215,7 +217,12 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
             try:
                 ray.get(futures_train)
-            except BaseException:
+            except BaseException as failure:
+                # A lost CUDA context cannot be recovered in this process. Waiting for
+                # stragglers would hide this diagnosis behind the controller's shorter
+                # timeout, which then attempts a rebuild on the unusable devices.
+                if is_refit_context_lost(failure):
+                    raise
                 # Every rank must be out of the old refit before the caller can rebuild
                 # over the survivors; see _settle_before_propagating. BOTH sides: the
                 # rebuild dispatches init_collective to the generation ranks too, and
@@ -270,6 +277,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         # distributes the regenerated plan through prepare_nccl_reshard_refit_info,
         # which consults it; setting it afterwards sends the new plan to the shard the
         # rebuild just excluded.
+        workers = membership.worker_handles(self._generation.worker_group.workers)
         self._generation.set_refit_membership(membership)
 
         train_parallelism = self._train_parallelism()
@@ -375,6 +383,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         )
         self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
         self._built_membership = membership
+        self._built_workers = workers
 
     def _settle_budget_s(self) -> float:
         """How long to let stragglers unwind: their own deadline, plus a little.
@@ -420,7 +429,10 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 total_gen_workers=len(self._generation.worker_group.workers),
                 train_world_size=membership.train_world_size,
             )
-        if not should_rebuild(
+        workers = membership.worker_handles(self._generation.worker_group.workers)
+        if self._built_workers is None:
+            self._built_workers = workers
+        if workers == self._built_workers and not should_rebuild(
             desired=membership,
             built=self._built_membership,
             absent_shards=absent_shards,

@@ -23,9 +23,11 @@ transports that own no NCCL world alone.
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -514,6 +516,33 @@ class TestAnUnchangedMembershipIsNotRebuiltAgain:
     expensive one, and three comments claimed the opposite.
     """
 
+    def test_a_fast_restart_rebuilds_even_when_no_shard_is_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, _ = _rebuildable()
+        assert sync.reconcile_communicator([]) is False
+
+        workers[0] = _FakeWorker(0)
+
+        assert sync.reconcile_communicator([]) is True
+        assert workers[0].calls, "the replacement must join the communicator"
+        assert sync.reconcile_communicator([]) is False
+
+    def test_replacing_an_absent_worker_waits_until_it_rejoins(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, _ = _rebuildable(dead_shards=(0,))
+        assert sync.reconcile_communicator([0]) is True
+
+        workers[0] = _FakeWorker(0)
+
+        assert sync.reconcile_communicator([0]) is False
+        assert not workers[0].calls
+        assert sync.reconcile_communicator([]) is True
+        assert workers[0].calls
+
     def test_the_second_call_with_the_same_absent_set_is_skipped(self, monkeypatch):
         monkeypatch.setattr("ray.get", lambda futures: futures)
         sync, workers, _ = _rebuildable(dead_shards=(2,))
@@ -611,6 +640,39 @@ class TestStragglersAreWaitedForBeforeARebuild:
         assert waited["futures"] == ["a", "b", "c"]
         assert waited["num_returns"] == 3, "all of them, not just the first"
         assert waited["timeout"] == 90.0
+
+    @pytest.mark.parametrize(
+        ("failure", "should_settle"),
+        [
+            (RefitAborted("[refit-context-lost] bulk transfer timed out"), False),
+            (RuntimeError("remote failure: [refit-context-lost]"), False),
+            (RefitAborted("a generation rank died"), True),
+        ],
+    )
+    def test_fatal_refit_errors_are_not_delayed_by_stragglers(
+        self, monkeypatch: pytest.MonkeyPatch, failure: Exception, should_settle: bool
+    ) -> None:
+        """A fatal worker diagnosis must reach the controller before its timeout."""
+        sync = _reshard()
+        sync._policy = SimpleNamespace(
+            nccl_reshard_refit=Mock(return_value=["train-0", "train-1"])
+        )
+        sync._generation.nccl_reshard_refit = Mock(return_value=["gen-0", "gen-1"])
+        monkeypatch.setattr("ray.get", Mock(side_effect=failure))
+        wait = Mock(return_value=([], ["pending"]))
+        monkeypatch.setattr("ray.wait", wait)
+
+        with pytest.raises(type(failure)) as caught:
+            sync.sync_weights()
+
+        assert caught.value is failure
+        if should_settle:
+            assert [call.args[0] for call in wait.call_args_list] == [
+                ["train-0", "train-1"],
+                ["gen-0", "gen-1"],
+            ]
+        else:
+            wait.assert_not_called()
 
     def test_it_is_bounded_rather_than_blocking_the_recovery(self, monkeypatch):
         """A caller stuck here is a worse wedge than the one being recovered from."""

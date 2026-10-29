@@ -125,6 +125,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._stale = True
         # What the communicator was last built over. None until init_communicator.
         self._built_membership: Optional[RefitMembership] = None
+        self._built_workers: Optional[tuple[object, ...]] = None
 
     def sync_weights(
         self,
@@ -247,6 +248,10 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         ray.get(futures_train + futures_inference)
         # Recorded so the first reconcile can tell "unchanged" from "never built".
         self._built_membership = self._desired_membership([], train_world_size)
+        if self._built_membership is not None:
+            self._built_workers = self._built_membership.worker_handles(
+                self._generation.worker_group.workers
+            )
 
     def _settle_budget_s(self) -> float:
         """How long to let stragglers unwind: their own deadline, plus a little.
@@ -305,7 +310,10 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                 self._desired_membership([], membership.train_world_size) or membership
             )
             self._built_membership = built
-        if not should_rebuild(
+        workers = membership.worker_handles(self._generation.worker_group.workers)
+        if self._built_workers is None:
+            self._built_workers = workers
+        if workers == self._built_workers and not should_rebuild(
             desired=membership,
             built=built,
             absent_shards=absent_shards,
@@ -357,6 +365,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)
         self._built_membership = membership
+        self._built_workers = workers
         return True
 
     def shutdown(self) -> None:

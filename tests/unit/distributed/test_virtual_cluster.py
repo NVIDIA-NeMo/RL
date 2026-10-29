@@ -328,6 +328,34 @@ def test_maybe_configure_data_plane_env_then_init_ray_threads_env_vars():
         assert env_vars["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
 
 
+@pytest.mark.parametrize(
+    ("enabled", "configured", "expected"),
+    [(False, None, None), (True, None, "1"), (True, "0", "0"), (True, "3", "3")],
+)
+def test_refit_plugin_retention_reaches_ray_workers(
+    enabled: bool, configured: str | None, expected: str | None
+) -> None:
+    """The setting must reach workers before their first NCCL communicator."""
+    # Load the generation module's heavy dependencies only for these tests.
+    from nemo_rl.models.generation import maybe_configure_nccl_plugin_retention_env
+
+    flag = "NCCL_NET_PLUGIN_REF_COUNT"
+    env = {"CUDA_VISIBLE_DEVICES": "0"}
+    if configured is not None:
+        env[flag] = configured
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources", return_value={"nrl_tag_0": 1}),
+        patch.dict(os.environ, env, clear=True),
+    ):
+        maybe_configure_nccl_plugin_retention_env(enabled)
+        virtual_cluster.init_ray()
+
+    assert mock_ray_init.call_count == 1
+    worker_env = mock_ray_init.call_args.kwargs["runtime_env"]["env_vars"]
+    assert worker_env.get(flag) == expected
+
+
 def test_init_ray_adds_hf_modules_cache_to_cluster_pythonpath():
     """Direct actors must import trust_remote_code classes while unpickling."""
     from nemo_rl.distributed.virtual_cluster import init_ray

@@ -47,6 +47,20 @@ class RefitMembership:
     def surviving_shards(self) -> list[int]:
         return list(self.shard_prefixes)
 
+    def worker_handles(self, workers: Sequence[object]) -> tuple[object, ...]:
+        """Snapshot the actors participating in this communicator.
+
+        A shard can die and restart between reconciliations. Its index is unchanged,
+        but the replacement actor has never joined the old communicator.
+        """
+        return tuple(
+            worker
+            for shard in self.surviving_shards
+            for worker in workers[
+                shard * self.workers_per_shard : (shard + 1) * self.workers_per_shard
+            ]
+        )
+
 
 class NoSurvivingShards(RuntimeError):
     """Every generation shard is gone, so there is nothing to rebuild onto."""

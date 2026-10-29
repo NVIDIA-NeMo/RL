@@ -32,6 +32,24 @@ from nemo_rl.models.generation.vllm.config import (
 TokenizerType = PreTrainedTokenizerBase
 
 
+def maybe_configure_nccl_plugin_retention_env(enabled: bool) -> None:
+    """Keep NCCL network plugins loaded across generation recovery.
+
+    Aborting a vLLM engine's last communicator can unload its network plugin,
+    while trainers retain theirs through the training process groups. With
+    Spectrum-X 1.3-0, reloading changes CollNet discovery from zero devices to the
+    available NICs; NCCL then rejects the rebuilt refit group because the
+    trainers and generation workers report different device counts.
+
+    NCCL's initial plugin reference count keeps the library and discovery state
+    alive without retaining old communicators or disabling the network plugin.
+    Call before init_ray() snapshots the worker environment, and before any
+    worker creates its first NCCL communicator. Explicit operator settings win.
+    """
+    if enabled:
+        os.environ.setdefault("NCCL_NET_PLUGIN_REF_COUNT", "1")
+
+
 def maybe_configure_engine_reaping_env(enabled: bool) -> None:
     """Let the raylet reap a dead generation worker's EngineCore, on runs the driver owns.
 
