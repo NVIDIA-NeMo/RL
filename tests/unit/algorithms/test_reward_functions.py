@@ -17,8 +17,12 @@ import torch
 
 from nemo_rl.algorithms.grpo import RewardScalingConfig, scale_rewards
 from nemo_rl.algorithms.reward_functions import (
+    GroupLengthPenaltyConfig,
     RewardShapingConfig,
+    apply_group_length_penalty,
+    apply_group_length_penalty_to_rows,
     apply_reward_shaping,
+    group_length_penalty_metrics,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import decompose_message_log
@@ -500,3 +504,183 @@ def test_stop_properly_penalty_error_cases():
     config.stop_properly_penalty_coef = 1.5
     with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
         apply_reward_shaping(batch, config)
+
+
+class TestGroupLengthPenalty:
+    """MiMo-V2.6 group-relative length penalty (grpo.group_relative_length_penalty)."""
+
+    @staticmethod
+    def _cfg(**overrides) -> GroupLengthPenaltyConfig:
+        return GroupLengthPenaltyConfig(enabled=True, **overrides)
+
+    def test_only_long_passing_rollouts_lose_up_to_max_penalty(self):
+        # Group of 4 with 3 passing (lengths 100, 100, 200) and a long failing rollout.
+        rewards = torch.tensor([1.0, 1.0, 1.0, 0.0])
+        lengths = torch.tensor([100.0, 100.0, 200.0, 1000.0])
+        penalized, metrics = apply_group_length_penalty(
+            rewards, lengths, torch.zeros(4, dtype=torch.long), self._cfg()
+        )
+
+        # l* = median(100, 100, 200) = 100; 200 is 2x l*, the full 0.3; failing rollout untouched.
+        assert penalized.tolist() == pytest.approx([1.0, 1.0, 0.7, 0.0])
+        assert metrics["length_penalty/groups_applied"] == 1.0
+        assert metrics["length_penalty/frac_passing_penalized"] == pytest.approx(1 / 3)
+
+    def test_ramp_between_tolerance_and_saturation(self):
+        # 160 is 1.6x l*: excess (0.6 - 0.2) / (1.0 - 0.2) = 0.5 -> 0.3 * 0.5**2.
+        penalized, _ = apply_group_length_penalty(
+            torch.tensor([1.0, 1.0, 1.0]),
+            torch.tensor([100.0, 100.0, 160.0]),
+            torch.zeros(3, dtype=torch.long),
+            self._cfg(),
+        )
+        assert penalized[2].item() == pytest.approx(1.0 - 0.3 * 0.25)
+
+    def test_groups_at_or_below_min_pass_rate_are_untouched(self):
+        rewards = torch.tensor([1.0] + [0.0] * 7)
+        penalized, metrics = apply_group_length_penalty(
+            rewards,
+            torch.arange(8, dtype=torch.float32) * 1000 + 10,
+            torch.zeros(8, dtype=torch.long),
+            self._cfg(),
+        )
+        assert torch.equal(penalized, rewards)
+        assert metrics["length_penalty/groups_applied"] == 0.0
+
+    def test_groups_above_max_pass_rate_are_untouched(self):
+        # Group 0: all 4 pass (rate 1.0 > 0.875), skipped. Group 1: 3 of 4 pass, penalized.
+        rewards = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0])
+        lengths = torch.tensor([100.0, 100.0, 100.0, 300.0, 100.0, 100.0, 200.0, 10.0])
+        group_ids = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+        penalized, metrics = apply_group_length_penalty(
+            rewards, lengths, group_ids, self._cfg(max_pass_rate=0.875)
+        )
+        assert penalized.tolist() == pytest.approx([1.0] * 6 + [0.7, 0.0])
+        assert metrics["length_penalty/groups_applied"] == 1.0
+        assert metrics["length_penalty/groups_skipped_above_max_pass_rate"] == 1.0
+
+    def test_groups_need_not_be_contiguous(self):
+        rewards = torch.tensor([1.0, 1.0, 1.0, 1.0])
+        lengths = torch.tensor([100.0, 100.0, 200.0, 400.0])
+        interleaved, _ = apply_group_length_penalty(
+            rewards, lengths, torch.tensor([0, 1, 0, 1]), self._cfg(max_pass_rate=1.0)
+        )
+        # Group 0: (100, 200) -> l* 150; group 1: (100, 400) -> l* 250.
+        contiguous, _ = apply_group_length_penalty(
+            rewards[[0, 2, 1, 3]],
+            lengths[[0, 2, 1, 3]],
+            torch.tensor([0, 0, 1, 1]),
+            self._cfg(max_pass_rate=1.0),
+        )
+        assert interleaved[[0, 2, 1, 3]].tolist() == pytest.approx(contiguous.tolist())
+
+    def test_mismatched_shapes_are_rejected(self):
+        with pytest.raises(ValueError, match="same shape"):
+            apply_group_length_penalty(
+                torch.ones(2),
+                torch.ones(3),
+                torch.zeros(2, dtype=torch.long),
+                self._cfg(),
+            )
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            ({"max_penalty": -0.1}, "max_penalty"),
+            ({"tolerance": 1.0, "saturation": 1.0}, "saturation > tolerance"),
+            ({"ramp_exponent": 0.5}, "ramp_exponent"),
+            (
+                {"min_pass_rate": 0.5, "max_pass_rate": 0.5},
+                "min_pass_rate < max_pass_rate",
+            ),
+            ({"reference_percentile": 100}, "reference_percentile"),
+        ],
+    )
+    def test_invalid_parameters_fail_at_config_load(self, overrides, match):
+        with pytest.raises(ValueError, match=match):
+            GroupLengthPenaltyConfig(**overrides)
+
+    def test_unknown_keys_are_rejected(self):
+        with pytest.raises(ValueError):
+            GroupLengthPenaltyConfig(max_penalyt=0.1)
+
+
+def test_rows_helper_counts_only_participating_rows():
+    """Non-participating rows (e.g. token-capture placeholders) keep their reward and no vote."""
+    # One group of 4: three passing rollouts of 2, 2 and 4 generated tokens, and a passing
+    # placeholder (no tokens, not participating).
+    rewards = torch.tensor([1.0, 1.0, 1.0, 1.0])
+    token_mask = torch.tensor(
+        [[0, 1, 1, 0, 0], [0, 1, 1, 0, 0], [0, 1, 1, 1, 1], [0, 0, 0, 0, 0]],
+        dtype=torch.float32,
+    )
+    participating = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    cfg = GroupLengthPenaltyConfig(
+        enabled=True, max_pass_rate=1.0, reference_percentile=25
+    )
+
+    penalized, partial = apply_group_length_penalty_to_rows(
+        rewards, token_mask, torch.zeros((4, 1), dtype=torch.long), participating, cfg
+    )
+    # l* = 25th percentile of (2, 2, 4) = 2, and 4 is 2x l* -> the full 0.3. Counting the
+    # placeholder as a length-0 pass would give 25th pct of (0, 2, 2, 4) = 1.5 and also
+    # penalize rows 0 and 1. The placeholder itself is untouched.
+    assert penalized.tolist() == pytest.approx([1.0, 1.0, 0.7, 1.0])
+    metrics = group_length_penalty_metrics([partial])
+    assert metrics["length_penalty/mean_reference_length"] == pytest.approx(2.0)
+    assert metrics["length_penalty/frac_passing_penalized"] == pytest.approx(1 / 3)
+    assert metrics["reward_with_length_penalty"] == pytest.approx((1.0 + 1.0 + 0.7) / 3)
+
+
+def test_metrics_add_up_across_calls():
+    """Per-call sums reduce to the metrics of one call over the whole batch."""
+    cfg = GroupLengthPenaltyConfig(enabled=True, max_pass_rate=1.0)
+    rewards = torch.tensor([1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0])
+    lengths = torch.tensor([2, 2, 4, 1, 3, 6, 2, 2])
+    token_mask = (torch.arange(8).unsqueeze(0) < lengths.unsqueeze(1)).float()
+    group_ids = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+    valid = torch.ones(8)
+
+    _, whole = apply_group_length_penalty_to_rows(
+        rewards, token_mask, group_ids, valid, cfg
+    )
+    _, first = apply_group_length_penalty_to_rows(
+        rewards[:4], token_mask[:4], group_ids[:4], valid[:4], cfg
+    )
+    _, second = apply_group_length_penalty_to_rows(
+        rewards[4:], token_mask[4:], group_ids[4:], valid[4:], cfg
+    )
+    assert group_length_penalty_metrics([first, second]) == pytest.approx(
+        group_length_penalty_metrics([whole])
+    )
+
+
+def test_legacy_trainers_apply_the_penalty_to_the_estimator_rewards():
+    """grpo_train, async_grpo_train and grpo_train_sync share this helper."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.grpo import _group_relative_length_penalty_rewards
+
+    rewards = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    token_mask = (
+        torch.arange(5).unsqueeze(0) < torch.tensor([[1], [1], [2], [4]])
+    ).float()
+    group_ids = torch.zeros((4, 1), dtype=torch.long)
+    valid = torch.ones(4)
+
+    off = SimpleNamespace(group_relative_length_penalty=GroupLengthPenaltyConfig())
+    out, metrics = _group_relative_length_penalty_rewards(
+        off, rewards, token_mask, group_ids, valid
+    )
+    assert out is rewards and metrics == {}
+
+    on = SimpleNamespace(
+        group_relative_length_penalty=GroupLengthPenaltyConfig(enabled=True)
+    )
+    out, metrics = _group_relative_length_penalty_rewards(
+        on, rewards, token_mask, group_ids, valid
+    )
+    # Passing lengths 1, 1, 2: l* = 1 and 2 is 2x l* -> the full 0.3.
+    assert out.tolist() == pytest.approx([1.0, 1.0, 0.7, 0.0])
+    assert torch.equal(rewards, torch.tensor([1.0, 1.0, 1.0, 0.0])), "input not mutated"
+    assert metrics["length_penalty/groups_applied"] == 1.0

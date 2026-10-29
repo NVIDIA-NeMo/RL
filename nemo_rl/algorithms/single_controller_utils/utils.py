@@ -24,6 +24,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.metric_utils import REWARD_KEY
+from nemo_rl.algorithms.reward_functions import group_length_penalty_metrics
 from nemo_rl.data_plane import KVBatchMeta
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
@@ -183,6 +184,7 @@ def reduce_advantage_pump_metrics(
     sequence_lengths: list[int],
     *,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
+    length_penalty_partials: list[dict[str, float]] | None = None,
     num_mask_sample_filtered: list[int] | None = None,
     num_invalid_tool_calls: list[int] | None = None,
     num_malformed_thinking: list[int] | None = None,
@@ -202,6 +204,8 @@ def reduce_advantage_pump_metrics(
         sequence_lengths: All input_lengths trained on this step.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
+        length_penalty_partials: grpo.group_relative_length_penalty sums, one
+            record per advantage_stage call (empty when the penalty is off).
         num_mask_sample_filtered: Environment-flagged sample counts, one per
             streaming chunk.
         num_invalid_tool_calls: Per-sample invalid tool-call counts.
@@ -240,6 +244,8 @@ def reduce_advantage_pump_metrics(
         out["num_mask_sample_filtered"] = float(sum(num_mask_sample_filtered))
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
+    if length_penalty_partials:
+        out.update(group_length_penalty_metrics(length_penalty_partials))
     n_asst = sum(num_assistant_messages or [])
     if n_asst:
         n_invalid = sum(num_invalid_tool_calls or [])

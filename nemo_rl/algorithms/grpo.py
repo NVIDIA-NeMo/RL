@@ -58,8 +58,11 @@ from nemo_rl.algorithms.metric_utils import (
 )
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
+    GroupLengthPenaltyConfig,
     RewardShapingConfig,
+    apply_group_length_penalty_to_rows,
     apply_reward_shaping,
+    group_length_penalty_metrics,
 )
 from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
@@ -433,6 +436,11 @@ class GRPOConfig(BaseModel, extra="allow"):
     # training rollout rewards (binary single-reward envs only); see
     # docs/guides/length-penalty.md. None/absent disables the feature.
     length_penalty: Optional[LengthPenaltyConfig] = None
+    # MiMo-V2.6 group-relative length penalty on passing rollouts (GroupLengthPenaltyConfig;
+    # docs/guides/length-penalty.md), applied to the rewards the advantages are computed from.
+    group_relative_length_penalty: GroupLengthPenaltyConfig = Field(
+        default_factory=GroupLengthPenaltyConfig
+    )
 
 
 @dataclass
@@ -2516,6 +2524,29 @@ def _raise_if_length_penalty_enabled_without_nemo_gym(
     )
 
 
+def _group_relative_length_penalty_rewards(
+    grpo_config: GRPOConfig,
+    rewards: torch.Tensor,
+    token_mask: torch.Tensor,
+    group_ids: torch.Tensor,
+    advantage_valid_mask: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Rewards for the advantage estimator under grpo.group_relative_length_penalty.
+
+    Returns ``rewards`` unchanged and no metrics when the penalty is off. Only the
+    estimator's input changes; the logged reward stays the environment's. The batch holds
+    whole prompt groups, and the penalty runs over the rows in the advantage statistics
+    (see ``apply_group_length_penalty_to_rows``).
+    """
+    cfg = grpo_config.group_relative_length_penalty
+    if not cfg.enabled:
+        return rewards, {}
+    penalized, partial = apply_group_length_penalty_to_rows(
+        rewards, token_mask, group_ids, advantage_valid_mask, cfg
+    )
+    return penalized, group_length_penalty_metrics([partial])
+
+
 def _apply_message_level_advantage_penalties(
     train_data: BatchedDataDict[ClippedPGLossDataDict],
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
@@ -4176,10 +4207,20 @@ def _grpo_train_impl(
                     advantage_valid_mask = _advantage_valid_mask(
                         sample_mask, master_config.grpo, dataset_loss_multiplier
                     )
+                    adv_rewards, length_penalty_metrics = (
+                        _group_relative_length_penalty_rewards(
+                            master_config.grpo,
+                            rewards,
+                            token_mask,
+                            prompt_ids_for_adv,
+                            advantage_valid_mask,
+                        )
+                    )
+                    metrics.update(length_penalty_metrics)
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
-                        rewards=rewards,
+                        rewards=adv_rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
@@ -6020,10 +6061,20 @@ def async_grpo_train(
                     advantage_valid_mask = _advantage_valid_mask(
                         sample_mask, master_config.grpo, dataset_loss_multiplier
                     )
+                    adv_rewards, length_penalty_metrics = (
+                        _group_relative_length_penalty_rewards(
+                            master_config.grpo,
+                            rewards,
+                            token_mask,
+                            prompt_ids_for_adv,
+                            advantage_valid_mask,
+                        )
+                    )
+                    rollout_metrics.update(length_penalty_metrics)
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
-                        rewards=rewards,
+                        rewards=adv_rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],

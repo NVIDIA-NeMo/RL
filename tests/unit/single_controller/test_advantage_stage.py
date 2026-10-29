@@ -33,6 +33,10 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
+from nemo_rl.algorithms.reward_functions import (
+    GroupLengthPenaltyConfig,
+    apply_group_length_penalty,
+)
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     SHARD_INVARIANT_ESTIMATORS,
@@ -503,6 +507,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "reward_partial",
         "advantage_partial",
         "seq_logprob_error_metrics",
+        # Length-penalty sums (a handful of floats) when the penalty is on.
+        "length_penalty_partial",
         # OPD's moments, as this call's contribution rather than a total.
         "opd_stat_sum",
         "opd_stat_sumsq",
@@ -621,6 +627,7 @@ def _controller(
     dump_dir: str | None = None,
     opd_full_enabled: bool = False,
     seq_logprob_error_threshold: float | None = None,
+    group_relative_length_penalty: GroupLengthPenaltyConfig | None = None,
 ):
     """Build the controller stub _advantage_stage needs, and nothing more.
 
@@ -632,6 +639,9 @@ def _controller(
         num_generations_per_prompt=GROUP_SIZE,
         adv_estimator=AdvEstimatorConfig(name=estimator_name),
         seq_logprob_error_threshold=seq_logprob_error_threshold,
+        group_relative_length_penalty=(
+            group_relative_length_penalty or GroupLengthPenaltyConfig()
+        ),
     )
     is_opd = estimator_name == "opd"
     estimator = (
@@ -690,6 +700,7 @@ def _controller(
         "advantage_partials": [],
         "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],
+        "length_penalty_partials": [],
     }
     return ctrl
 
@@ -841,3 +852,134 @@ def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
     assert ctrl._available_advantage_actors.qsize() == 0
     # The mutation cut is released even on failure.
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
+
+
+# ── grpo.group_relative_length_penalty ──────────────────────────────────────
+
+_LP_CFG = GroupLengthPenaltyConfig(
+    enabled=True,
+    max_penalty=0.2,
+    tolerance=0.0,
+    saturation=1.0,
+    ramp_exponent=1.5,
+    min_pass_rate=0.25,
+    max_pass_rate=0.75,
+    reference_percentile=30,
+    success_threshold=0.5,
+)
+LP_SEQ = 12
+# Passing rollouts per group of GROUP_SIZE: below, inside and above the pass-rate window.
+LP_PASSES = [0, 1, 2, 3, 4, 2]
+
+
+def _length_penalty_rows() -> tuple[
+    dict[str, dict[str, torch.Tensor]], torch.Tensor, torch.Tensor
+]:
+    """Rows whose generated tokens follow a zero prompt carry, as token capture stages them."""
+    gen = torch.Generator().manual_seed(1)
+    rewards, lengths, rows = [], [], {}
+    for group in range(NUM_GROUPS):
+        for member in range(GROUP_SIZE):
+            reward = float(member < LP_PASSES[group])
+            length = int(torch.randint(2, LP_SEQ - 2, (), generator=gen))
+            token_mask = torch.zeros(LP_SEQ)
+            token_mask[2 : 2 + length] = 1.0
+            rows[f"s{group * GROUP_SIZE + member}"] = {
+                "total_reward": torch.tensor(reward),
+                "token_mask": token_mask,
+                "sample_mask": torch.tensor(1.0),
+                "mask_sample": torch.tensor(False),
+                "truncated": torch.tensor(False),
+            }
+            rewards.append(reward)
+            lengths.append(length)
+    return rows, torch.tensor(rewards), torch.tensor(lengths, dtype=torch.float32)
+
+
+def _length_penalty_metrics(ctrl) -> dict[str, float]:
+    return reduce_advantage_pump_metrics(
+        reward_partials=ctrl._step_log_dict["reward_partials"],
+        advantage_partials=ctrl._step_log_dict["advantage_partials"],
+        sequence_lengths=[],
+        length_penalty_partials=ctrl._step_log_dict["length_penalty_partials"],
+    )
+
+
+@pytest.mark.parametrize("num_actors", [0, 3])
+def test_length_penalty_feeds_the_estimator_penalized_rewards(num_actors: int) -> None:
+    """Advantages are the GRPO estimator's over the penalized rewards, sharded or not."""
+    rows, rewards, lengths = _length_penalty_rows()
+    store = _RowStore(rows)
+    ctrl = _controller("grpo", num_actors, store, group_relative_length_penalty=_LP_CFG)
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    advantages = torch.stack(
+        [store.rows[f"s{i}"]["advantages"] for i in range(len(rows))]
+    )
+
+    group_ids = torch.arange(NUM_GROUPS).repeat_interleave(GROUP_SIZE)
+    penalized, expected_metrics = apply_group_length_penalty(
+        rewards, lengths, group_ids, _LP_CFG
+    )
+    assert (penalized < rewards).any(), "the fixture must exercise the penalty"
+    token_mask = torch.stack([rows[f"s{i}"]["token_mask"] for i in range(len(rows))])
+    valid = torch.ones(len(rows))
+    expected = ctrl._advantage_estimator.compute_advantage(
+        prompt_ids=group_ids.reshape(-1, 1),
+        rewards=penalized,
+        mask=token_mask,
+        repeated_batch={"total_reward": penalized},
+        valid_mask=valid,
+        normalization_mask=token_mask * valid.unsqueeze(-1),
+    )
+    torch.testing.assert_close(advantages, expected)
+
+    metrics = _length_penalty_metrics(ctrl)
+    for key, value in expected_metrics.items():
+        assert metrics[key] == pytest.approx(value), key
+    assert metrics["reward_with_length_penalty"] == pytest.approx(
+        penalized.mean().item()
+    )
+    # The logged reward stays the environment's.
+    assert metrics["reward"] == pytest.approx(rewards.mean().item())
+
+
+def test_length_penalty_ignores_rows_outside_the_advantage_statistics() -> None:
+    """A token-capture placeholder never counts as a length-0 passing rollout.
+
+    Placeholders keep the environment reward but carry no tokens and sample_mask 0. Counted,
+    a passing one would pull its group's reference length down and penalize the group's
+    real passing rollouts as if they were long.
+    """
+    rows, rewards, lengths = _length_penalty_rows()
+    placeholder = 3 * GROUP_SIZE  # group 3: 3 of 4 pass; member 0 passes
+    assert rewards[placeholder] == 1.0
+    rows[f"s{placeholder}"]["token_mask"] = torch.zeros(LP_SEQ)
+    rows[f"s{placeholder}"]["sample_mask"] = torch.tensor(0.0)
+    store = _RowStore(rows)
+    ctrl = _controller("grpo", 0, store, group_relative_length_penalty=_LP_CFG)
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+
+    keep = torch.ones(len(rows), dtype=torch.bool)
+    keep[placeholder] = False
+    group_ids = torch.arange(NUM_GROUPS).repeat_interleave(GROUP_SIZE)
+    penalized, expected_metrics = apply_group_length_penalty(
+        rewards[keep], lengths[keep], group_ids[keep], _LP_CFG
+    )
+    metrics = _length_penalty_metrics(ctrl)
+    assert metrics["length_penalty/mean_reference_length"] == pytest.approx(
+        expected_metrics["length_penalty/mean_reference_length"]
+    )
+    assert metrics["length_penalty/groups_applied"] == pytest.approx(
+        expected_metrics["length_penalty/groups_applied"]
+    )
+    assert metrics["reward_with_length_penalty"] == pytest.approx(
+        penalized.mean().item()
+    )
+
+
+def test_length_penalty_off_changes_nothing() -> None:
+    store = _RowStore(_length_penalty_rows()[0])
+    ctrl = _controller("grpo", 0, store)
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    assert ctrl._step_log_dict["length_penalty_partials"] == []
+    assert "reward_with_length_penalty" not in _length_penalty_metrics(ctrl)
