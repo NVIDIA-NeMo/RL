@@ -847,7 +847,7 @@ class VllmAsyncGenerationWorkerImpl(
                             raise MediaCaptureRejected("Cycle in retained media chain")
                         visited.add(parent)
                         call = source.fetch_for_finalization(
-                            [staging_key(admission.rollout_id, parent)],
+                            [staging_key(admission.capture_key, parent)],
                             include_route_fragments=False,
                         )[0]
                         calls.append(call)
@@ -861,7 +861,7 @@ class VllmAsyncGenerationWorkerImpl(
             for call in calls:
                 snapshot = call.snapshot
                 if (
-                    snapshot.rollout_id != admission.rollout_id
+                    snapshot.capture_key != admission.capture_key
                     or snapshot.parent_call_id != parent
                     or snapshot.prev_len != length
                     or snapshot.chain_hash

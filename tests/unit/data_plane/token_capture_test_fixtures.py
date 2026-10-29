@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from nemo_gym.token_id_capture.staging.digest import (
+    STAGING_SCHEMA_VERSION,
     compute_chain_hash,
     compute_extras_digest,
     compute_staging_digest,
@@ -47,7 +48,7 @@ def _record(
     cum_len = prev_len + delta_len
     extras_digest = compute_extras_digest(None)
     values = {
-        "rollout_id": rollout_id,
+        "capture_key": rollout_id,
         "model_call_id": model_call_id,
         "parent_call_id": parent_call_id,
         "mode": mode,
@@ -66,7 +67,7 @@ def _record(
     return StagedCallRecord(
         **values,
         digest=compute_staging_digest(
-            schema_version=2,
+            schema_version=STAGING_SCHEMA_VERSION,
             digest_version=2,
             extras_digest_version=1,
             **{key: value for key, value in values.items() if key != "extras"},
@@ -136,7 +137,7 @@ def build_fixture_artifacts(
             )
         )
     receipt = RolloutReceipt(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         terminal_model_call_id=records[-1].model_call_id,
         manifest=[_manifest(record) for record in records],
         terminal_selection="declared",

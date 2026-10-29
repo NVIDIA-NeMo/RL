@@ -14,9 +14,10 @@ policy:
     dynamo_cfg:
       # Bounds etcd/NATS/frontend start-up and every engine's registration.
       startup_timeout_s: 600
-      # Timeout for one rollout routed through the frontend (in place of
-      # NRL_VLLM_ASYNC_TIMEOUT_SECONDS). A timeout fails the attempt as a native
-      # timeout does, and the rollout retry policy applies.
+      # Timeout for one NeMo RL rollout routed through the frontend (in place
+      # of NRL_VLLM_ASYNC_TIMEOUT_SECONDS). A timeout fails the attempt as a
+      # native timeout does, and the rollout retry policy applies. NeMo-Gym's
+      # own calls keep Gym's timeouts.
       request_timeout_s: 900
       worker_args:
         # Dynamo's built-in parser names. null follows the native server's
@@ -39,7 +40,7 @@ policy:
         router_mode: kv
         # Keep a NeMo-Gym token-capture rollout on one engine while it idles up
         # to this many seconds (null disables it).
-        session_affinity_ttl_secs: 1800
+        session_affinity_ttl_secs: 300
         extra_cli_args: []
 
 logger:
