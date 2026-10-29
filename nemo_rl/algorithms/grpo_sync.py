@@ -56,6 +56,7 @@ from nemo_rl.algorithms.grpo import (
     _dynamic_sampling_valid_mask,
     _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
+    _next_step_runs_validation,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
     _resolve_logprob_skip_flags,
@@ -498,7 +499,6 @@ def grpo_train_sync(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
     )
-    timeout.start_iterations()
     memory_tracker = MemoryTracker()
 
     kv_scales_cache = None  # Cache reused for computed kv scales
@@ -639,6 +639,11 @@ def grpo_train_sync(
         )
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
+
+    # Time iterations from the first training step so that the optional
+    # val_at_start pass above does not become the slowest "iteration" that the
+    # checkpoint_must_save_by look-ahead budgets for.
+    timeout.start_iterations()
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
@@ -1332,7 +1337,28 @@ def grpo_train_sync(
                         and (total_steps + 1) % ft_save_period == 0
                     )
                 )
-                should_save_by_timeout = timeout.check_save()
+                # If the next step also runs validation (periodic schedule or
+                # val_at_end), budget one more step's worth of time for it to make
+                # starting a step that cannot finish less likely.
+                next_step_validates = _next_step_runs_validation(
+                    total_steps=total_steps,
+                    current_step=current_step,
+                    current_epoch=current_epoch,
+                    steps_per_epoch=None
+                    if master_config.data["use_multiple_dataloader"]
+                    else len(wrapped_dataloader),
+                    max_num_steps=max_num_steps,
+                    max_num_epochs=max_num_epochs,
+                    val_period=val_period,
+                    val_start_at=val_start_at,
+                    val_at_end=val_at_end,
+                    is_last_step=is_last_step,
+                )
+                should_save_by_timeout = timeout.check_save(
+                    extra_s=max(timeout.iteration_times)
+                    if next_step_validates and timeout.iteration_times
+                    else 0.0
+                )
 
                 memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
                 if master_config.checkpointing["enabled"] and (

@@ -7146,6 +7146,269 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys, tmp_path
             )
 
 
+def _enter_timeout_test_mocks(stack, train_func, mock_grpo_components):
+    """Enter the trainer mocks for a TimeoutChecker test of a sync trainer.
+
+    Returns ``(mock_validate, mock_timeout)``: the patched validation function
+    and the ``TimeoutChecker`` instance the trainer constructs. ``check_save``
+    returns False so the loop runs to its configured end.
+    """
+    master_config = mock_grpo_components["master_config"]
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    validate_target = _enter_stop_test_mocks(
+        stack,
+        train_func,
+        master_config,
+        mock_grpo_components,
+        mock_batch,
+        mock_rollout_metrics,
+    )
+    if train_func is grpo_train_sync:
+        # Not under test; a bare MagicMock result makes the data-plane
+        # observability wrapper log a (caught) ValueError on every step.
+        mock_grpo_components["policy"].get_data_plane_step_metrics = MagicMock(
+            return_value=None
+        )
+    module = validate_target.rsplit(".", 1)[0]
+    mock_validate = stack.enter_context(patch(validate_target, return_value=({}, {})))
+    mock_timeout_class = stack.enter_context(patch(f"{module}.TimeoutChecker"))
+    mock_timeout = MagicMock()
+    mock_timeout.iteration_times = []
+    mock_timeout.check_save.return_value = False
+    mock_timeout_class.return_value = mock_timeout
+    return mock_validate, mock_timeout
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, grpo_train_sync])
+@pytest.mark.parametrize(
+    (
+        "val_period",
+        "val_start_at",
+        "val_at_end",
+        "max_num_steps",
+        "max_num_epochs",
+        "validating_steps",
+    ),
+    [
+        pytest.param(3, -1, False, 6, 10, [3, 6], id="periodic"),
+        pytest.param(2, 3, False, 6, 10, [4, 6], id="periodic-from-val_start_at"),
+        pytest.param(7, -1, False, 6, 10, [], id="never-not-even-after-last-step"),
+        pytest.param(0, -1, True, 6, 10, [6], id="val_at_end-by-max_num_steps"),
+        pytest.param(0, -1, True, 100, 1, [10], id="val_at_end-by-max_num_epochs"),
+        pytest.param(4, -1, True, 6, 10, [4, 6], id="periodic-and-val_at_end"),
+    ],
+)
+def test_grpo_timeout_budgets_upcoming_validation(
+    mock_grpo_components,
+    train_func,
+    val_period,
+    val_start_at,
+    val_at_end,
+    max_num_steps,
+    max_num_epochs,
+    validating_steps,
+):
+    """Both sync trainers pass the slowest step time as extra_s exactly before a validating step."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = max_num_steps
+    master_config.grpo.max_num_epochs = max_num_epochs
+    master_config.grpo.val_period = val_period
+    master_config.grpo.val_start_at = val_start_at
+    master_config.grpo.val_at_end = val_at_end
+    master_config.checkpointing["enabled"] = False
+
+    with ExitStack() as stack:
+        mock_validate, mock_timeout = _enter_timeout_test_mocks(
+            stack, train_func, mock_grpo_components
+        )
+        mock_timeout.iteration_times = [10.0, 30.0, 20.0]
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    num_steps = min(
+        max_num_steps, max_num_epochs * len(mock_grpo_components["train_dataloader"])
+    )
+    # The check after step N budgets the slowest step iff step N + 1 validates ...
+    extra_s = [
+        call.kwargs["extra_s"] for call in mock_timeout.check_save.call_args_list
+    ]
+    assert extra_s == [
+        30.0 if step + 1 in validating_steps else 0.0
+        for step in range(1, num_steps + 1)
+    ]
+    # ... and validate() really ran on exactly those steps.
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == (
+        validating_steps
+    )
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, grpo_train_sync])
+def test_grpo_timeout_iterations_start_after_initial_validation(
+    mock_grpo_components, train_func
+):
+    """The val_at_start pass is not measured as an iteration.
+
+    With the max-based look-ahead, an initial validation folded into the first
+    iteration time would otherwise set the estimate for the whole run.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 2
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = True
+    master_config.checkpointing["enabled"] = False
+
+    events: list[object] = []
+
+    def record_validate(*args, **kwargs):
+        events.append(("validate", kwargs["step"]))
+        return {}, {}
+
+    with ExitStack() as stack:
+        mock_validate, mock_timeout = _enter_timeout_test_mocks(
+            stack, train_func, mock_grpo_components
+        )
+        mock_validate.side_effect = record_validate
+        mock_timeout.start_iterations.side_effect = lambda: events.append(
+            "start_iterations"
+        )
+        mock_timeout.mark_iteration.side_effect = lambda: events.append(
+            "mark_iteration"
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert events == [
+        ("validate", 0),
+        "start_iterations",
+        "mark_iteration",
+        "mark_iteration",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        # Periodic schedule for the next step (1-indexed total_steps + 2).
+        pytest.param(dict(total_steps=1, val_period=3), True, id="periodic-hit"),
+        pytest.param(dict(total_steps=2, val_period=3), False, id="periodic-miss"),
+        pytest.param(
+            dict(total_steps=1, val_period=3, val_start_at=4),
+            False,
+            id="before-val_start_at",
+        ),
+        # val_at_end: the next step is the last one by max_num_steps ...
+        pytest.param(
+            dict(total_steps=4, val_at_end=True, max_num_steps=6),
+            True,
+            id="val_at_end-max_num_steps",
+        ),
+        pytest.param(
+            dict(total_steps=3, val_at_end=True, max_num_steps=6),
+            False,
+            id="val_at_end-not-yet",
+        ),
+        # ... or by the epoch bound, including when it wraps into the final epoch.
+        pytest.param(
+            dict(
+                total_steps=8,
+                current_step=8,
+                steps_per_epoch=10,
+                max_num_epochs=1,
+                val_at_end=True,
+            ),
+            True,
+            id="val_at_end-last-epoch",
+        ),
+        pytest.param(
+            dict(
+                total_steps=1,
+                current_step=0,
+                current_epoch=1,
+                steps_per_epoch=1,
+                max_num_epochs=3,
+                val_at_end=True,
+            ),
+            True,
+            id="val_at_end-wraps-into-last-epoch",
+        ),
+        pytest.param(
+            dict(
+                total_steps=0,
+                current_step=0,
+                current_epoch=0,
+                steps_per_epoch=1,
+                max_num_epochs=3,
+                val_at_end=True,
+            ),
+            False,
+            id="val_at_end-wraps-into-middle-epoch",
+        ),
+        # Infinite dataloader: only max_num_steps bounds the run.
+        pytest.param(
+            dict(
+                total_steps=8,
+                current_step=8,
+                steps_per_epoch=None,
+                max_num_epochs=1,
+                val_at_end=True,
+            ),
+            False,
+            id="val_at_end-multiple-dataloader",
+        ),
+        # The last step has no successor to budget for.
+        pytest.param(
+            dict(total_steps=5, val_period=7, is_last_step=True),
+            False,
+            id="last-step",
+        ),
+    ],
+)
+def test_next_step_runs_validation_for_timeout_budget(overrides, expected):
+    kwargs = dict(
+        total_steps=0,
+        current_step=0,
+        current_epoch=0,
+        steps_per_epoch=10,
+        max_num_steps=1000,
+        max_num_epochs=100,
+        val_period=0,
+        val_start_at=-1,
+        val_at_end=False,
+        is_last_step=False,
+    )
+    kwargs.update(overrides)
+    assert grpo_mod._next_step_runs_validation(**kwargs) is expected
+
+
 # ============================================================================
 
 # Tests for GRPOAdvantageEstimator class
