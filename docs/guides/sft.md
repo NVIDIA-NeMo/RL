@@ -34,6 +34,94 @@ SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is e
   1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
   2. `task_name`: A string identifier that uniquely identifies the dataset.
 
+### Full-conversation text formatting
+
+Some chat templates rewrite earlier turns. For example, a template may group
+several tool responses into one turn, or drop reasoning from earlier assistant
+turns. For these templates, use full-conversation SFT, which renders and
+tokenizes each complete conversation once. Keep the model's stock chat template.
+You do not need template annotations or a model-family setting:
+
+```yaml
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: default
+data:
+  add_generation_prompt: false
+  default:
+    processor: sft_full_conversation_processor
+```
+
+If your training or validation dataset entries override `data.default.processor`,
+set the processor on those entries too. Other processors and existing recipes
+behave as before. When you select a different chat model, keep
+`policy.tokenizer.name` tied to `policy.model_name` so the tokenizer matches the
+model.
+
+The formatter renders the original template and records where each assistant
+message's loop iteration starts and ends. With `add_generation_prompt: false`,
+the loss covers the complete assistant turn, including its header and
+terminator. With `add_generation_prompt: true`, the formatter masks the part of
+an assistant turn that the template's own generation prompt supplies after a
+user or tool message, which is typically the assistant header. Either way, the
+targets match incremental SFT with the same setting. System, user and tool turns
+are context only. Whitespace after the last turn stays in the text and belongs
+to the final target.
+
+The formatter tokenizes the full rendered text once and assigns each token to
+the segment where the token starts. No decode/encode round trip is needed.
+Existing SFT masking, padding, next-token shifting and `sft.only_unmask_final`
+work unchanged. The formatter keeps configured template overrides and default
+tools. Row-level tools take precedence, including an explicit empty list.
+Assistant tool-call messages may have missing or null content. The formatter
+passes these values to the template unchanged instead of replacing them with
+empty strings, so a template that cannot handle that message shape still raises
+its own error. As in Transformers, the formatter passes absent tools and
+documents as `None`. Tools must be dictionary schemas, not Python callables, and
+tool arguments must use the format the model's template accepts.
+
+Full-conversation SFT requires a fast tokenizer, text-only messages and a final
+assistant message. The template must render each assistant message once, in
+order, in a streamed message loop, and the header, body and terminator must all
+come from that iteration. Loops that only scan messages are fine, including ones
+that use `break` or `continue`. The formatter rejects a template that copies,
+reorders or skips assistant messages, renders the message loop inside a macro,
+filter or `{% set %}` block, or renders messages without a loop. The error names
+the problem. Use `sft_processor` for those templates. The formatter never falls
+back to prefix matching. The template still decides how much earlier reasoning
+to keep. For Nemotron, check `truncate_history_thinking` before you switch an
+existing recipe.
+
+The formatter assigns loss by loop iteration, not by matching token text. An
+EOS-looking token in a user or tool turn stays masked whether or not BOS and EOS
+are equal. The formatter does not infer missing terminators.
+
+Switching an existing recipe can change token IDs as well as masks. The
+incremental formatter tokenizes each turn separately, and this formatter
+tokenizes the whole conversation at once. Tokens can therefore merge across a
+turn boundary that no special token marks.
+
+A row at or above `max_seq_length` keeps its original `length` for diagnostics,
+gets `loss_multiplier=0`, and becomes a short, masked batching placeholder. Like
+the incremental formatter, BOS/EOS insertion ignores only trailing newlines when
+it checks for an existing final EOS.
+
+The deterministic formatter tests use a synthetic tokenizer and need no model
+downloads. Run them separately from the stock tokenizer tests:
+
+```bash
+uv run --group test python -m pytest --noconftest -q -o addopts= \
+  tests/unit/data/test_full_conversation.py -k 'not stock'
+```
+
+Use `-k stock` instead to run the integration cases, which use pinned Hugging
+Face revisions. They need downloaded tokenizer files or network access. A
+failure caused by a missing cache says nothing about the formatter. The Mistral
+case is marked `hf_gated` and needs a Hugging Face token with access to the
+model. Neither selector starts Ray or runs end-to-end training.
+
 SFT datasets are expected to follow the HuggingFace chat format. Refer to the [chat dataset document](../design-docs/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [response_datasets/squad.py](../../nemo_rl/data/datasets/response_datasets/squad.py) has an example:
 
 **Note:** The `task_name` field is required in each formatted example.
