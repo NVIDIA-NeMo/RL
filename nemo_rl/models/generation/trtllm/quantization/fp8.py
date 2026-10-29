@@ -95,9 +95,7 @@ _SPLIT_LINEAR_ATTN_RE = re.compile(
 _EXPERT_PREFIX_LAYER_RE = re.compile(
     r"^(?:(?:model\.)?(?:language_model\.)?)layers\.(?P<layer>\d+)\.mlp\.experts$"
 )
-_MTP_EXPERT_PREFIX_LAYER_RE = re.compile(
-    r"^mtp\.layers\.(?P<layer>\d+)\.mlp\.experts$"
-)
+_MTP_EXPERT_PREFIX_LAYER_RE = re.compile(r"^mtp\.layers\.(?P<layer>\d+)\.mlp\.experts$")
 
 # Returns the expert ids this rank holds for a routed-expert checkpoint prefix,
 # or None when every expert must be converted.

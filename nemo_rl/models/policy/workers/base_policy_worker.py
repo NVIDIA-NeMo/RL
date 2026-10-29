@@ -31,6 +31,9 @@ class AbstractPolicyWorker:
     model_update_group: Optional[Any] = None
     # Same, for the per-PP-stage group the nccl_reshard transport builds.
     pp_comm_group: Optional[Any] = None
+    # The same group keyed by generation layout, for backends whose engines come
+    # in several layouts (disaggregated TRT-LLM); layout 0 is ``pp_comm_group``.
+    pp_comm_groups_by_layout: Optional[dict[int, Any]] = None
 
     def sync_params_before_refit(self) -> None:
         """Materialize optimizer updates before refit when the backend requires it."""
@@ -129,7 +132,7 @@ class AbstractPolicyWorker:
         # One bulk communicator per generation *layout* (e.g. disaggregated
         # TRT-LLM context vs generation engines); layout 0 stays on
         # ``pp_comm_group`` for the single-layout callers.
-        groups_by_layout = getattr(self, "pp_comm_groups_by_layout", None) or {}
+        groups_by_layout = dict(self.pp_comm_groups_by_layout or {})
         stale_group = groups_by_layout.pop(layout_index, None)
         if layout_index == 0:
             stale_group = stale_group or self.pp_comm_group

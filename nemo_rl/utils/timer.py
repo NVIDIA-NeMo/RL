@@ -423,6 +423,16 @@ class ThreadSafeTimer(Timer):
             super().reset(label)
 
 
+def refit_timing_log_enabled() -> bool:
+    """Whether refit paths print their per-phase timing lines.
+
+    The ``[refit-timing]`` breakdowns are a debugging aid
+    for the refit bubble, printed once per refit per process; they are off
+    unless ``NRL_REFIT_TIMING_LOG`` is set to a value other than ``0``.
+    """
+    return os.environ.get("NRL_REFIT_TIMING_LOG", "0") != "0"
+
+
 def convert_to_seconds(time_string: str) -> int:
     """Converts a time string in the format 'DD:HH:MM:SS' to total seconds.
 
