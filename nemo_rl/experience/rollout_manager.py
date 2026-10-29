@@ -1113,8 +1113,11 @@ class AsyncNemoGymRolloutImpl:
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
         # One fresh ID per run_rollout attempt, shared by all sibling rows.
-        # Dataset IDs may repeat; do not mutate the source sample. Row-level
-        # redispatch reuses these built rows and therefore keeps the same ID.
+        # Gym keys rollouts by task + rollout index (observability capture when
+        # no _ng_rollout_id is set, Harbor job folders), so a repeated dataset
+        # ID would reuse an earlier attempt's key. Unlike the async collector,
+        # this is NOT the prompt's dataloader position. Do not mutate the source
+        # sample. Row-level redispatch reuses these rows and keeps the same ID.
         template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
 
         # We do not translate max_seq_len into row-level max_tokens here because that would
