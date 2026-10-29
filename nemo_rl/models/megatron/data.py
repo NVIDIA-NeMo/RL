@@ -12,11 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from math import lcm
-from typing import Any, Iterator, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterator,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
 
+import numpy as np
 import torch
 from megatron.bridge.training.utils.packed_seq_utils import (
     get_packed_seq_cp_partition_indices,
@@ -36,6 +48,12 @@ from nemo_rl.data.megatron_sft_packed import (
     is_direct_packed_row,
 )
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
+from nemo_rl.data.packing.algorithms import get_packer
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_EXECUTION_SLOT,
+    SHARED_PREFIX_GROUP_ID,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
 from nemo_rl.data_plane.codec import pad_field
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS, OPD_FULL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -47,11 +65,50 @@ from nemo_rl.models.megatron.hybridep import (
     pad_packed_seq_for_hybridep,
     uses_hybridep_flex_dispatcher,
 )
+from nemo_rl.models.policy import (
+    MegatronConfig,
+    PolicyConfig,
+    get_shared_prefix_training_config,
+)
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
 )
 from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
+
+if TYPE_CHECKING:
+    # megatron.rl's shared-prefix modules exist only in Megatron-LM builds with
+    # shared-prefix support; the shared-prefix functions below import them
+    # lazily so dense runs work on any Megatron-LM.
+    from megatron.rl.shared_prefix_execution import SharedPrefixExecutionUnit
+    from megatron.rl.shared_prefix_packing import SharedPrefixRow
+    from megatron.rl.shared_prefix_tensors import SharedPrefixTensorBin
+
+SHARED_PREFIX_SOURCE_ROW_INDEX = "_shared_prefix_source_row_index"
+
+
+@dataclass(frozen=True, slots=True)
+class SharedPrefixForwardMetadata:
+    """Structured global star metadata retained until model-output fan-out.
+
+    For CP>1, the model input/output sequence is the standard two-chunk zigzag
+    shard for ``cp_rank``. ``padding_multiple`` is the resolved physical packing
+    contract ``M`` and is a multiple of the TP/CP topology quantum ``Q``.
+    ``padded_total_length`` is the minimally ``M``-padded global star length.
+    ``tensor_bin`` retains the global physical and logical correctness metadata
+    used to route scalar next-token log-probabilities.
+    ``exclude_sequence_padding_from_expert_bias`` states the dense path's MoE
+    expert-bias convention for per-branch padding rows: packed dense units
+    mask their padding exactly when this is true.
+    """
+
+    tensor_bin: "SharedPrefixTensorBin"
+    source_sequence_length: int
+    padding_multiple: int
+    cp_rank: int
+    cp_size: int
+    padded_total_length: int
+    exclude_sequence_padding_from_expert_bias: bool
 
 
 @dataclass
@@ -111,6 +168,7 @@ class ProcessedMicrobatch:
         media_token_validity_mask: Which media-token positions actually anchor a
             projected feature, in the model's own token layout. None when the
             batch needs no correction and the model should derive its own.
+        shared_prefix: Shared-prefix star metadata; None for conventional units.
     """
 
     data_dict: BatchedDataDict[Any]
@@ -128,6 +186,7 @@ class ProcessedMicrobatch:
     loss_mask_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
+    shared_prefix: Optional[SharedPrefixForwardMetadata] = None
 
 
 def _validate_direct_packed_microbatch(
@@ -215,7 +274,7 @@ def _validate_direct_packed_microbatch(
 
 def make_processed_microbatch_iterator(
     raw_iterator: Iterator[BatchedDataDict[Any]],
-    cfg: dict[str, Any],
+    cfg: PolicyConfig,
     seq_length_key: Optional[str],
     pad_individual_seqs_to_multiple_of: int,
     pad_packed_seq_to_multiple_of: int,
@@ -228,6 +287,11 @@ def make_processed_microbatch_iterator(
     prepad_packed_seq_for_hybridep: bool = False,
     mtp_enabled: bool = False,
     create_nonpacked_router_padding_mask: bool = False,
+    shared_prefix_bin_capacity: Optional[int] = None,
+    shared_prefix_execution_units: Optional[
+        tuple["SharedPrefixExecutionUnit", ...]
+    ] = None,
+    shared_prefix_stage: Literal["train", "logprobs"] = "train",
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -248,11 +312,18 @@ def make_processed_microbatch_iterator(
         mtp_enabled: Whether the model uses multi-token prediction layers.
         create_nonpacked_router_padding_mask: Use input lengths to exclude dense
             right padding from expert-bias statistics on supported MoE models.
+        shared_prefix_execution_units: The planned shared-prefix forwards for
+            the single raw batch this iterator wraps; required with sharing enabled.
+        shared_prefix_stage: Consumer stage; logprobs may use evaluation packing
+            and omit MTP training-head storage from the token budget.
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
     """
     pack_sequences = cfg["sequence_packing"]["enabled"]
+    shared_prefix_enabled = get_shared_prefix_training_config(cfg).enabled_for(
+        stage=shared_prefix_stage
+    )
 
     for data_dict in raw_iterator:
         for key, pad in MICROBATCH_PADDED_FIELDS.items():
@@ -270,6 +341,30 @@ def make_processed_microbatch_iterator(
 
         # Move to GPU
         data_dict = data_dict.to("cuda")
+
+        if shared_prefix_enabled:
+            if (
+                shared_prefix_bin_capacity is None
+                or shared_prefix_execution_units is None
+            ):
+                raise ValueError(
+                    "shared-prefix train mode requires an explicit per-stage "
+                    "token bin capacity and planned execution units"
+                )
+            yield from process_shared_prefix_microbatch(
+                data_dict=data_dict,
+                cfg=cfg,
+                bin_capacity=shared_prefix_bin_capacity,
+                execution_units=shared_prefix_execution_units,
+                seq_length_key=seq_length_key,
+                pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
+                pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                pad_full_seq_to=pad_full_seq_to,
+                straggler_timer=straggler_timer,
+                mask_sequence_padding=create_packed_seq_padding_mask,
+                mtp_enabled=mtp_enabled,
+            )
+            continue
 
         # Process the microbatch
         processed_inputs = process_microbatch(
@@ -353,9 +448,22 @@ def _pad_sequence_aligned_tensors(
         ).contiguous()
 
 
+def _masks_packed_sequence_padding(
+    megatron_cfg: Mapping[str, Any], *, create_router_padding_mask: bool
+) -> bool:
+    """Whether packed forwards mask per-sequence padding from MoE routing.
+
+    HybridEP always masks it. Any other dispatcher masks it while expert-bias
+    updates are live (``create_router_padding_mask``), so alignment padding
+    never reaches expert-bias load counts. Dense packed microbatches and
+    shared-prefix units (dense fallbacks and star forwards) share this rule.
+    """
+    return uses_hybridep_flex_dispatcher(megatron_cfg) or create_router_padding_mask
+
+
 def get_microbatch_iterator(
     data: BatchedDataDict[Any],
-    cfg: dict[str, Any],
+    cfg: PolicyConfig,
     mbs: int,
     straggler_timer: StragglerDetector,
     seq_length_key: Optional[str] = None,
@@ -365,6 +473,11 @@ def get_microbatch_iterator(
     mtp_enabled: bool = False,
     create_router_padding_mask: bool = False,
     allow_unmasked_chunkwise_cp: bool = False,
+    shared_prefix_bin_capacity: Optional[int] = None,
+    shared_prefix_execution_units: Optional[
+        tuple["SharedPrefixExecutionUnit", ...]
+    ] = None,
+    shared_prefix_stage: Literal["train", "logprobs"] = "train",
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -382,6 +495,12 @@ def get_microbatch_iterator(
             on supported MoE models, for packed and nonpacked inputs alike.
         allow_unmasked_chunkwise_cp: Suppress router masks for prepacked HybridEP
             inputs after setup warned about unsupported HybridBlock chunkwise CP.
+        shared_prefix_execution_units: The output of
+            :func:`plan_shared_prefix_execution_units` for ``data``; required in
+            shared-prefix mode. The worker plans once under its own timer and
+            reuses the units for the forward-count barrier and the iterator.
+        shared_prefix_stage: Consumer stage, independent of model.train()/eval().
+            Training APIs retain the train stage even during loss-only evaluation.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -416,6 +535,7 @@ def get_microbatch_iterator(
             )
     else:
         _, seq_dim_size = get_and_validate_seqlen(data)
+    max_execution_length = seq_dim_size
 
     # Auto-detect seq_length_key if not provided
     if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
@@ -435,7 +555,106 @@ def get_microbatch_iterator(
     if not cfg["sequence_packing"]["enabled"]:
         pad_factor = _get_non_packed_sequence_pad_factor(cfg)
 
-    if direct_packed_rows:
+    shared_prefix_enabled = get_shared_prefix_training_config(cfg).enabled_for(
+        stage=shared_prefix_stage
+    )
+    shared_prefix_padding_multiple: Optional[int] = None
+    if shared_prefix_execution_units is not None and not shared_prefix_enabled:
+        raise ValueError(
+            "shared_prefix_execution_units are only meaningful in shared-prefix "
+            "train mode"
+        )
+    if shared_prefix_enabled and (prepacked or direct_packed_rows):
+        raise ValueError(
+            "Shared prefix requires unpacked sibling rows, not prepacked inputs"
+        )
+    if shared_prefix_enabled:
+        if shared_prefix_bin_capacity is None or shared_prefix_execution_units is None:
+            raise ValueError(
+                "shared-prefix train mode requires shared_prefix_bin_capacity and "
+                "the shared_prefix_execution_units planned for this batch"
+            )
+        if cfg["dynamic_batching"]["enabled"]:
+            raise NotImplementedError(
+                "shared-prefix train mode does not support dynamic batching"
+            )
+        if not cfg["sequence_packing"]["enabled"]:
+            raise ValueError("shared-prefix train mode requires sequence packing")
+        model_owned_inputs = [
+            name
+            for name, enabled in (
+                ("delegate_pack_to_model", delegate_pack_to_model),
+                ("delegate_mtp_loss_mask_to_model", delegate_mtp_loss_mask_to_model),
+                (
+                    "model_slices_context_parallel_inputs",
+                    model_slices_context_parallel_inputs,
+                ),
+            )
+            if enabled
+        ]
+        if model_owned_inputs:
+            raise NotImplementedError(
+                "shared-prefix train mode packs and CP-shards every unit itself "
+                f"and does not support {', '.join(model_owned_inputs)}"
+            )
+        if uses_hybridep_flex_dispatcher(cfg["megatron_cfg"]) and cfg[
+            "megatron_cfg"
+        ].get("moe_hybridep_prepad_packed_inputs"):
+            # Star units are padded only to M, not to the expert-group maximum,
+            # and skip the prepad collective, so no shared-mode unit prepads.
+            raise NotImplementedError(
+                "shared-prefix train mode does not support "
+                "moe_hybridep_prepad_packed_inputs"
+            )
+        if SHARED_PREFIX_SOURCE_ROW_INDEX in data:
+            raise ValueError(
+                f"input batch contains reserved field {SHARED_PREFIX_SOURCE_ROW_INDEX!r}"
+            )
+        # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
+        from megatron.rl.shared_prefix_execution import (
+            SharedPrefixExecutionPlan,
+            validate_shared_prefix_execution_units,
+        )
+
+        # Units planned on ``data`` address its rows in order. Reject a plan for
+        # a different batch, and a star whose rows or length disagree with its
+        # layout: the logprob fan-out follows the layout's row order.
+        validate_shared_prefix_execution_units(
+            shared_prefix_execution_units,
+            batch_size=data.size,
+        )
+
+        # Retain an explicit source-row index so expanded shared/fallback
+        # forwards can be restored to the caller's conventional order. A
+        # shallow copy keeps the caller's batch untouched.
+        working_data = type(data)(dict(_normalize_shared_prefix_group_ids(data)))
+        working_data[SHARED_PREFIX_SOURCE_ROW_INDEX] = torch.arange(
+            data.size,
+            dtype=torch.long,
+        )
+        *_, shared_prefix_padding_multiple = _resolve_shared_prefix_execution_topology(
+            cfg
+        )
+        raw_iterator = iter((working_data,))
+        execution_plan = SharedPrefixExecutionPlan(units=shared_prefix_execution_units)
+        data_iterator_len = execution_plan.num_units
+        max_execution_length = execution_plan.max_physical_length
+        (
+            pad_factor,
+            pad_packed_seq_to_multiple_of,
+            pad_full_seq_to,
+        ) = _get_pack_sequence_parameters_for_megatron(
+            cast(MegatronConfig, cfg["megatron_cfg"]),
+            shared_prefix_padding_multiple,
+            max_execution_length,
+        )
+        # Dense fallbacks mask their padding, and star forwards state the same
+        # convention to the model, exactly as dense packed microbatches do.
+        create_packed_seq_padding_mask = _masks_packed_sequence_padding(
+            cfg["megatron_cfg"], create_router_padding_mask=create_router_padding_mask
+        )
+        micro_batch_size = 1
+    elif direct_packed_rows:
         raw_iterator = data.make_microbatch_iterator(1)
         data_iterator_len = data.size
         micro_batch_size = 1
@@ -453,7 +672,9 @@ def get_microbatch_iterator(
         uses_hybridep = uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
         # Alignment padding between packed sequences must not reach expert-bias
         # statistics with any dispatcher, not only HybridEP.
-        create_packed_seq_padding_mask = uses_hybridep or create_router_padding_mask
+        create_packed_seq_padding_mask = _masks_packed_sequence_padding(
+            cfg["megatron_cfg"], create_router_padding_mask=create_router_padding_mask
+        )
         prepad_packed_seq_for_hybridep = uses_hybridep and cfg["megatron_cfg"].get(
             "moe_hybridep_prepad_packed_inputs"
         )
@@ -466,7 +687,7 @@ def get_microbatch_iterator(
             pad_packed_seq_to_multiple_of,
             pad_full_seq_to,
         ) = _get_pack_sequence_parameters_for_megatron(
-            cfg["megatron_cfg"],
+            cast(MegatronConfig, cfg["megatron_cfg"]),
             cfg["make_sequence_length_divisible_by"],
             pack_seq_dim_size,
         )
@@ -501,14 +722,28 @@ def get_microbatch_iterator(
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
         mtp_enabled=mtp_enabled,
+        shared_prefix_bin_capacity=shared_prefix_bin_capacity,
+        shared_prefix_execution_units=shared_prefix_execution_units,
+        shared_prefix_stage=shared_prefix_stage,
     )
 
     # Compute padded sequence length for pipeline parallelism
-    padded_seq_length = (
-        pad_full_seq_to
-        if pad_full_seq_to is not None
-        else _round_up_to_multiple(seq_dim_size, pad_factor)
-    )
+    if shared_prefix_enabled:
+        assert shared_prefix_padding_multiple is not None
+        padded_seq_length = (
+            pad_full_seq_to
+            if pad_full_seq_to is not None
+            else _round_up_to_multiple(
+                max_execution_length,
+                shared_prefix_padding_multiple,
+            )
+        )
+    else:
+        padded_seq_length = (
+            pad_full_seq_to
+            if pad_full_seq_to is not None
+            else _round_up_to_multiple(seq_dim_size, pad_factor)
+        )
 
     return (
         processed_iterator,
@@ -750,6 +985,353 @@ def _prepare_prepacked(
         padding_mask,
         position_ids,
     )
+
+
+def _normalize_shared_prefix_group_ids(
+    data_dict: BatchedDataDict[Any],
+) -> BatchedDataDict[Any]:
+    """Return a list-backed group field suitable for BatchedDataDict slicing.
+
+    TransferQueue deliberately materializes non-tensor columns as one-dimensional
+    object arrays, while ``BatchedDataDict.select_indices`` only supports tensors,
+    packed tensors, and lists. Normalize only the opted-in group field and leave
+    the caller's batch untouched.
+    """
+    if SHARED_PREFIX_GROUP_ID not in data_dict:
+        raise ValueError(
+            f"shared-prefix train mode requires batch field {SHARED_PREFIX_GROUP_ID!r}"
+        )
+    group_ids = data_dict[SHARED_PREFIX_GROUP_ID]
+    if isinstance(group_ids, list):
+        return data_dict
+    if isinstance(group_ids, np.ndarray):
+        if group_ids.dtype != object or group_ids.ndim != 1:
+            raise TypeError(
+                "shared-prefix group IDs from TransferQueue must be a "
+                "one-dimensional numpy object array"
+            )
+        normalized_group_ids = group_ids.tolist()
+    elif isinstance(group_ids, tuple):
+        normalized_group_ids = list(group_ids)
+    else:
+        raise TypeError(
+            "shared-prefix group IDs must be a list, tuple, or one-dimensional "
+            f"numpy object array, got {type(group_ids).__name__}"
+        )
+    if len(normalized_group_ids) != data_dict.size:
+        raise ValueError("shared-prefix group IDs must have one entry per input row")
+    normalized = type(data_dict)(dict(data_dict.items()))
+    normalized[SHARED_PREFIX_GROUP_ID] = normalized_group_ids
+    return normalized
+
+
+def _build_shared_prefix_rows(
+    data_dict: BatchedDataDict[Any],
+) -> list["SharedPrefixRow"]:
+    """Build validated CPU planner rows from conventional batch metadata."""
+    # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
+    from megatron.rl.shared_prefix_tensors import build_shared_prefix_rows
+
+    required_fields = (
+        "input_ids",
+        "input_lengths",
+        SHARED_PREFIX_PROMPT_LENGTHS,
+        SHARED_PREFIX_GROUP_ID,
+    )
+    missing_fields = [field for field in required_fields if field not in data_dict]
+    if missing_fields:
+        raise ValueError(
+            "shared-prefix train mode requires batch fields "
+            f"{required_fields}; missing {tuple(missing_fields)}"
+        )
+
+    input_ids = data_dict["input_ids"]
+    input_lengths = data_dict["input_lengths"]
+    prompt_lengths = data_dict[SHARED_PREFIX_PROMPT_LENGTHS]
+    group_ids = data_dict[SHARED_PREFIX_GROUP_ID]
+    return build_shared_prefix_rows(
+        input_ids=input_ids,
+        input_lengths=input_lengths,
+        prompt_lengths=prompt_lengths,
+        group_ids=group_ids,
+    )
+
+
+def _resolve_shared_prefix_execution_topology(
+    cfg: PolicyConfig,
+) -> tuple[int, int, int]:
+    """Resolve the shared-prefix TP size, CP size and physical packing multiple.
+
+    The topology must obey the shared-prefix SP contract, and
+    ``make_sequence_length_divisible_by`` must be a multiple of its quantum;
+    :func:`validate_shared_prefix_training_config` already enforces both.
+    """
+    # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
+    from megatron.rl.shared_prefix_tensors import (
+        resolve_shared_prefix_parallel_topology,
+        resolve_shared_prefix_physical_padding_multiple,
+    )
+
+    megatron_cfg = cast(MegatronConfig, cfg["megatron_cfg"])
+    tp_size, cp_size, _ = resolve_shared_prefix_parallel_topology(
+        tp_size=megatron_cfg["tensor_model_parallel_size"],
+        cp_size=megatron_cfg["context_parallel_size"],
+        sequence_parallel=megatron_cfg["sequence_parallel"],
+    )
+    padding_multiple = resolve_shared_prefix_physical_padding_multiple(
+        tp_size=tp_size,
+        cp_size=cp_size,
+        padding_multiple=cfg["make_sequence_length_divisible_by"],
+    )
+    return tp_size, cp_size, padding_multiple
+
+
+def _get_prescribed_shared_prefix_slots(
+    data_dict: BatchedDataDict[Any],
+) -> tuple[tuple[int, ...], ...]:
+    """Return deterministic ``(group, slot)`` row sets and validate equal K."""
+    # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
+    from megatron.rl.shared_prefix_metadata import get_prescribed_shared_prefix_slots
+
+    if SHARED_PREFIX_EXECUTION_SLOT not in data_dict:
+        raise ValueError(
+            "shared-prefix train mode requires a driver-prescribed execution-slot field"
+        )
+    raw_slots = data_dict[SHARED_PREFIX_EXECUTION_SLOT]
+    if isinstance(raw_slots, torch.Tensor):
+        if raw_slots.ndim != 1:
+            raise ValueError("shared-prefix execution slots must have shape [batch]")
+        slots = [int(value) for value in raw_slots.detach().cpu().tolist()]
+    elif isinstance(raw_slots, np.ndarray):
+        if raw_slots.ndim != 1:
+            raise ValueError("shared-prefix execution slots must have shape [batch]")
+        slots = [int(value) for value in raw_slots.tolist()]
+    elif isinstance(raw_slots, (list, tuple)):
+        slots = [int(value) for value in raw_slots]
+    else:
+        raise TypeError(
+            "shared-prefix execution slots must be a tensor, ndarray, list, "
+            f"or tuple, got {type(raw_slots).__name__}"
+        )
+    return get_prescribed_shared_prefix_slots(
+        group_ids=data_dict[SHARED_PREFIX_GROUP_ID], slot_ids=slots
+    )
+
+
+def _make_shared_prefix_dense_packer(
+    packing_cfg: Mapping[str, Any], bin_capacity: int
+) -> Callable[[Sequence[int]], list[list[int]]]:
+    """Return the conventional length packer for shared-prefix dense units.
+
+    Dense units honor ``max_sequences_per_bin`` like ordinary sequence packing.
+    Star and forest units are not row-capped: one forward holds every sibling.
+    """
+    if packing_cfg.get("pair_grouping_key") is not None:
+        raise ValueError("shared-prefix train mode does not support pair_grouping_key")
+
+    def pack(lengths: Sequence[int]) -> list[list[int]]:
+        return get_packer(
+            packing_cfg["algorithm"],
+            bin_capacity=bin_capacity,
+            max_sequences_per_bin=packing_cfg.get("max_sequences_per_bin"),
+        ).pack(list(lengths))
+
+    return pack
+
+
+def plan_shared_prefix_execution_units(
+    data: BatchedDataDict[Any],
+    *,
+    cfg: PolicyConfig,
+    bin_capacity: int,
+    forward_only: bool = False,
+) -> tuple["SharedPrefixExecutionUnit", ...]:
+    """Plan a local batch's shared-prefix forwards once for reuse by the iterator.
+
+    Workers call this before :func:`get_microbatch_iterator` and pass the result
+    back through ``shared_prefix_execution_units``, so the CPU planning (one host
+    copy of ``input_ids`` plus the exact per-row prompt tuples) runs a single
+    time per call. Each driver-prescribed slot resolves to exactly one star,
+    forest or conventional unit. Row indices address ``data`` in its given
+    order, which :func:`get_microbatch_iterator` preserves. ``forward_only``
+    requires model evaluation mode, where shared-prefix MTP is skipped. It
+    relaxes only the expanded MTP budget for merging stars; physical capacity
+    and dense fallback validation remain unchanged.
+    """
+    # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
+    from megatron.rl.shared_prefix_execution import (
+        plan_shared_prefix_execution_units as plan_execution_units,
+    )
+
+    data = _normalize_shared_prefix_group_ids(data)
+    rows = _build_shared_prefix_rows(data)
+    *_, padding_multiple = _resolve_shared_prefix_execution_topology(cfg)
+    row_slots = _get_prescribed_shared_prefix_slots(data)
+    group_config = get_shared_prefix_training_config(cfg)
+    packing_cfg = cfg["sequence_packing"]
+    return plan_execution_units(
+        rows,
+        row_slots=row_slots,
+        bin_capacity=bin_capacity,
+        padding_multiple=padding_multiple,
+        pack_groups=group_config.pack_groups,
+        repack_groups=group_config.repack_groups,
+        pack_dense_fallbacks=group_config.pack_dense_fallbacks,
+        merge_dense_fallbacks=group_config.merge_dense_fallbacks,
+        forward_only=forward_only,
+        evaluation_packing=group_config.evaluation_packing,
+        dense_packer=_make_shared_prefix_dense_packer(packing_cfg, bin_capacity),
+        largest_first=packing_cfg.get("microbatch_order") == "largest_first",
+    )
+
+
+def process_shared_prefix_microbatch(
+    *,
+    data_dict: BatchedDataDict[Any],
+    cfg: PolicyConfig,
+    bin_capacity: int,
+    execution_units: tuple["SharedPrefixExecutionUnit", ...],
+    seq_length_key: Optional[str],
+    pad_individual_seqs_to_multiple_of: int,
+    pad_packed_seq_to_multiple_of: int,
+    pad_full_seq_to: Optional[int],
+    straggler_timer: Optional[StragglerDetector],
+    mask_sequence_padding: bool,
+    mtp_enabled: bool = False,
+) -> Iterator[ProcessedMicrobatch]:
+    """Expand one conventional local batch into star and fallback forwards.
+
+    ``execution_units`` is the plan :func:`plan_shared_prefix_execution_units`
+    produced for this exact batch. ``mask_sequence_padding`` is the dense packed
+    expert-bias padding rule that :func:`get_microbatch_iterator` resolved:
+    dense fallback units mask their padding from MoE routing, and star units
+    state the same convention to the model.
+    """
+    # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
+    from megatron.rl.shared_prefix_tensors import (
+        materialize_shared_prefix_layout,
+        materialize_shared_prefix_token_aligned_tensor,
+        shard_shared_prefix_tensor_bin_for_context_parallel,
+    )
+
+    data_dict = _normalize_shared_prefix_group_ids(data_dict)
+    if data_dict.get_multimodal_dict():
+        raise NotImplementedError(
+            "shared-prefix train mode does not support multimodal/VLM batches"
+        )
+    unsupported_fields = [field for field in ("routed_experts",) if field in data_dict]
+    if unsupported_fields:
+        raise NotImplementedError(
+            "shared-prefix train mode does not support batch fields "
+            f"{tuple(unsupported_fields)}"
+        )
+    if seq_length_key != "input_lengths":
+        raise ValueError(
+            "shared-prefix train mode requires seq_length_key='input_lengths'"
+        )
+
+    tp_size, cp_size, padding_multiple = _resolve_shared_prefix_execution_topology(cfg)
+    cp_rank = get_context_parallel_rank() if cp_size > 1 else 0
+    source_sequence_length = data_dict["input_ids"].shape[1]
+    for unit in execution_units:
+        unit_rows = list(unit.row_indices)
+        unit_data = data_dict.select_indices(unit_rows)
+        if unit.shared_layout is not None:
+            tensor_bin = materialize_shared_prefix_layout(
+                data_dict["input_ids"],
+                input_lengths=data_dict["input_lengths"],
+                layout=unit.shared_layout,
+            )
+            cp_shard = shard_shared_prefix_tensor_bin_for_context_parallel(
+                tensor_bin,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                tp_size=tp_size,
+                padding_multiple=padding_multiple,
+            )
+            if cp_shard.padded_total_length > bin_capacity:
+                raise RuntimeError(
+                    "context-parallel padding makes a shared-prefix star exceed "
+                    "its bin capacity: "
+                    f"physical_tokens={tensor_bin.layout.physical_total_length}, "
+                    f"padded_tokens={cp_shard.padded_total_length}, "
+                    f"capacity={bin_capacity}. Configure shared-prefix microbatch "
+                    "token capacities as multiples of resolved padding "
+                    f"M={padding_multiple}."
+                )
+            shared_prefix = SharedPrefixForwardMetadata(
+                tensor_bin=tensor_bin,
+                source_sequence_length=source_sequence_length,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                padded_total_length=cp_shard.padded_total_length,
+                padding_multiple=padding_multiple,
+                exclude_sequence_padding_from_expert_bias=mask_sequence_padding,
+            )
+            mtp_loss_mask = None
+            if "mtp_loss_mask" in data_dict:
+                global_mtp_loss_mask = materialize_shared_prefix_token_aligned_tensor(
+                    data_dict["mtp_loss_mask"],
+                    tensor_bin=tensor_bin,
+                    padding_value=0,
+                )
+                topology_pad = (
+                    cp_shard.padded_total_length - global_mtp_loss_mask.shape[0]
+                )
+                if topology_pad < 0:
+                    raise RuntimeError(
+                        "shared-prefix MTP mask is longer than the padded model input"
+                    )
+                if topology_pad:
+                    global_mtp_loss_mask = torch.nn.functional.pad(
+                        global_mtp_loss_mask,
+                        (0, topology_pad),
+                        value=0,
+                    )
+                mtp_loss_mask = global_mtp_loss_mask.index_select(
+                    0, cp_shard.global_token_indices
+                ).unsqueeze(0)
+            yield ProcessedMicrobatch(
+                data_dict=unit_data,
+                input_ids=unit_data["input_ids"],
+                input_ids_cp_sharded=cp_shard.packed_input_ids.unsqueeze(0),
+                attention_mask=None,
+                position_ids=cp_shard.position_ids.unsqueeze(0),
+                packed_seq_params=None,
+                cu_seqlens_padded=None,
+                mtp_loss_mask=mtp_loss_mask,
+                original_seq_length=source_sequence_length,
+                shared_prefix=shared_prefix,
+            )
+            continue
+
+        processed_inputs = process_microbatch(
+            data_dict=unit_data,
+            seq_length_key=seq_length_key,
+            pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
+            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+            pad_full_seq_to=pad_full_seq_to,
+            pack_sequences=True,
+            straggler_timer=straggler_timer,
+            create_packed_seq_padding_mask=mask_sequence_padding,
+            mtp_enabled=mtp_enabled,
+        )
+        yield ProcessedMicrobatch(
+            data_dict=unit_data,
+            input_ids=processed_inputs.input_ids,
+            input_ids_cp_sharded=processed_inputs.input_ids_cp_sharded,
+            attention_mask=processed_inputs.attention_mask,
+            position_ids=processed_inputs.position_ids,
+            packed_seq_params=processed_inputs.packed_seq_params,
+            cu_seqlens_padded=processed_inputs.cu_seqlens_padded,
+            mtp_loss_mask=processed_inputs.mtp_loss_mask,
+            routed_experts=processed_inputs.routed_experts,
+            routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
+            media_token_validity_mask=processed_inputs.media_token_validity_mask,
+            padding_mask=processed_inputs.padding_mask,
+            original_seq_length=processed_inputs.original_seq_length,
+            shared_prefix=None,
+        )
 
 
 def process_microbatch(
@@ -1984,7 +2566,7 @@ def _get_packed_sequence_alignment_factors(
 
 
 def _get_pack_sequence_parameters_for_megatron(
-    megatron_cfg: dict,
+    megatron_cfg: Mapping[str, Any],
     pad_individual_seqs_to_multiple_of: int,
     max_seq_len_in_batch: int,
 ):

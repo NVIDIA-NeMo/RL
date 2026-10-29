@@ -15,7 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Union
+from typing import Any, ClassVar, Iterable, Optional, Union
 
 import numpy as np
 import ray
@@ -46,6 +46,9 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.policy import (
     BLOCK_DRAFT_ALGOS,
     PolicyConfig,
+    SharedPrefixTrainingConfig,
+    validate_shared_prefix_data_parallel_size,
+    validate_shared_prefix_training_config,
 )
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import (
@@ -102,6 +105,15 @@ def _aggregate_megatron_flops_metrics(
 
 
 class Policy(ColocatablePolicyInterface, GenerationInterface):
+    # Disabled default for instances built without ``__init__`` (test stubs);
+    # ``__init__`` replaces it with the validated config.
+    shared_prefix_training_config: SharedPrefixTrainingConfig = (
+        SharedPrefixTrainingConfig()
+    )
+    # Shared-prefix forwards need per-row group IDs, prompt lengths and
+    # execution slots, which only the data-plane dispatch of TQPolicy carries.
+    _supports_shared_prefix_execution: ClassVar[bool] = False
+
     def __init__(
         self,
         cluster: RayVirtualCluster,
@@ -149,6 +161,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # Validate registration before allocating workers or placement groups.
             get_actor_python_env(extension_fqn)
 
+        self.shared_prefix_training_config = validate_shared_prefix_training_config(
+            config
+        )
+        # Fail before allocating workers rather than at the first get_logprobs
+        # or train call. An inference-only refit destination never plans
+        # shared-prefix forwards.
+        if (
+            self.shared_prefix_training_config.enabled_for(stage="logprobs")
+            and not is_refit_destination
+            and not self._supports_shared_prefix_execution
+        ):
+            raise NotImplementedError(
+                "shared-prefix execution requires the single-controller TQPolicy path"
+            )
         if weights_path:
             weights_path = checkpoint_abspath(weights_path)
         if optimizer_path:
@@ -402,6 +428,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) = {model_parallel_size}. "
                 f"This would result in DP = {actual_world_size}/{model_parallel_size} = {actual_world_size / model_parallel_size:.3f}, but DP must be ≥ 1. "
                 f"Please either increase the number of GPUs/nodes or reduce the parallelism parameters."
+            )
+        if not is_refit_destination:
+            # An inference-only refit destination never plans shared-prefix
+            # forwards, and its world size is not the trainer's.
+            validate_shared_prefix_data_parallel_size(
+                self.shared_prefix_training_config,
+                data_parallel_size=actual_world_size // model_parallel_size,
             )
 
         if actual_world_size % model_parallel_size != 0:
@@ -664,10 +697,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Shard inputs for ``get_logprobs`` / ``get_reference_policy_logprobs``.
 
         Mirrors the legacy shard block (lines 426-450 / 503-530). Returns
-        ``(sharded_data, unsorted_data_indices)`` where the second element
-        is the inverse permutation needed to undo seqpack/dynbatch reorder
-        (``None`` when neither is enabled).
+        ``(sharded_data, unsorted_data_indices)`` where the second element is
+        the original-row indices in DP-rank concatenation order, matching the
+        input contract of :meth:`BatchedDataDict.reorder_data` (``None`` when
+        neither sharding path reorders rows).
         """
+        if self.shared_prefix_training_config.enabled_for(stage="logprobs"):
+            raise NotImplementedError(
+                "shared-prefix execution requires the single-controller TQPolicy path"
+            )
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
@@ -711,6 +749,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         does not return ``unsorted_data_indices`` because train returns
         scalar metrics (no per-row outputs to reorder).
         """
+        if self.shared_prefix_training_config.enabled_for(stage="train"):
+            raise NotImplementedError(
+                "shared-prefix execution requires the single-controller TQPolicy path"
+            )
         dp_size = self.data_parallel_size
         if is_direct_packed_row(data):
             missing = _DIRECT_PACKED_SFT_REQUIRED_KEYS.difference(data)

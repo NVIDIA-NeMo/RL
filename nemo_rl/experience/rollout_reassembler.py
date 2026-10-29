@@ -43,6 +43,9 @@ import torch
 
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import (
@@ -260,6 +263,7 @@ class RolloutReassembler:
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
         media_columns: Optional[MediaColumnSpec] = None,
+        include_shared_prefix_metadata: bool = False,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
         self._effort_config = effort_config
@@ -275,6 +279,7 @@ class RolloutReassembler:
                 "size the serving workers pinned the staging column to)"
             )
         self._media_columns = media_columns
+        self._include_shared_prefix_metadata = include_shared_prefix_metadata
         self._pad_token_id = int(pad_token_id)
         self._max_seq_len = int(max_seq_len)
         self._router_replay_enabled = router_replay_enabled
@@ -852,6 +857,15 @@ class RolloutReassembler:
             assert self._media_columns is not None
             media_fields = _empty_trainer_media(self._media_columns, len(rows))
         train_batch.update(media_fields)
+        if self._include_shared_prefix_metadata:
+            # Keep verified capture boundaries. Invalid placeholders remain exactly
+            # as the baseline produced them and force conventional fallback packing.
+            # The tensor column is the only transport; the driver derives row
+            # tags from it only when work-weighted sharding needs them.
+            train_batch[SHARED_PREFIX_PROMPT_LENGTHS] = torch.tensor(
+                [int(row.prompt_len) if row.valid else 0 for row in rows],
+                dtype=torch.long,
+            )
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=group_min_wv,

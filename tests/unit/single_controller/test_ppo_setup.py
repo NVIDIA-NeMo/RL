@@ -747,7 +747,7 @@ def patched_ppo_factories():
                 MagicMock(name="inference"),
                 None,
             ),
-        ),
+        ) as mock_clusters,
         patch.object(
             sc_setup_mod, "_build_generation", return_value=(MagicMock(), 0.0)
         ),
@@ -769,6 +769,7 @@ def patched_ppo_factories():
         patch.object(sc_setup_mod, "_generation_max_seq_len", return_value=32),
     ):
         yield {
+            "_build_clusters": mock_clusters,
             "_build_trainer": mock_trainer,
             "_build_value": mock_value,
             "policy": fake_policy,
