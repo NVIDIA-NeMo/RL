@@ -61,7 +61,9 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    SPARSE_TEACHER_ROW_CHUNK_SIZE,
     distributed_vocab_topk,
+    distributed_vocab_topk_logz_force,
     get_cp_sharded_next_token_logprobs,
     get_logprobs_from_vocab_parallel_logits,
 )
@@ -461,13 +463,21 @@ def forward_with_post_processing_fn(
             vals, idx = result
             metrics = {"topk_logits": vals, "topk_indices": idx}
         else:
-            vals, idx, log_z, gt_in_topk = result
-            metrics = {
-                "topk_logits": vals,
-                "topk_indices": idx,
-                "log_z": log_z,
-                "gt_in_topk": gt_in_topk,
-            }
+            metrics = dict(
+                zip(
+                    (
+                        "topk_logits",
+                        "topk_indices",
+                        "log_z",
+                        "natural_tail_indices",
+                        "forced_logits",
+                        "forced_indices",
+                        "forced_in_topk",
+                    ),
+                    result,
+                    strict=True,
+                )
+            )
     elif isinstance(post_processing_fn, FullLogitsPostProcessor):
         result = post_processing_fn(
             logits=logits,
@@ -1228,7 +1238,18 @@ class TopkLogitsPostProcessor:
 
 
 class SparseLogitsPostProcessor:
-    """Compute sparse teacher payloads over TP and contiguous CP windows."""
+    """Compute sparse teacher rows over TP and contiguous CP windows.
+
+    Each teacher row carries what the Megatron sender exports through
+    :func:`distributed_vocab_topk_logz_force`: the natural top-k raw logits and
+    ids sorted by id, the exact log Z, the score-rank-k id, and the raw logits
+    and natural top-``membership_k`` membership of the row's forced labels. The
+    natural top-k is left unchanged, so the consumer builds an exact K-wide
+    support per loss request.
+
+    The teacher data must carry ``force_include_token_ids`` ``[B, T, F]``
+    (``-1`` for unused slots).
+    """
 
     def __init__(
         self,
@@ -1253,19 +1274,18 @@ class SparseLogitsPostProcessor:
     @staticmethod
     def _normalize_force_ids(
         logits: torch.Tensor,
-        force_ids: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        if force_ids is None:
-            return None
+        force_ids: torch.Tensor,
+    ) -> torch.Tensor:
         force_ids = force_ids.to(device=logits.device, dtype=torch.long)
         if force_ids.shape[:2] == logits.shape[:2]:
             return force_ids
         common_batch = min(int(force_ids.shape[0]), int(logits.shape[0]))
         common_seq = min(int(force_ids.shape[1]), int(logits.shape[1]))
-        if common_batch <= 0 or common_seq <= 0:
-            return None
         trimmed = torch.full(
-            logits.shape[:2], -1, device=logits.device, dtype=torch.long
+            (*logits.shape[:2], int(force_ids.shape[-1])),
+            -1,
+            device=logits.device,
+            dtype=torch.long,
         )
         trimmed[:common_batch, :common_seq] = force_ids[:common_batch, :common_seq]
         return trimmed
@@ -1280,11 +1300,17 @@ class SparseLogitsPostProcessor:
         *,
         cp_sharder: Optional[ContextParallelSharder],
         sequence_dim: int = 1,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, ...]:
+        """Return this CP rank's sparse teacher rows.
+
+        Returns:
+            ``(topk_logits [B, S, k], topk_indices [B, S, k] int32 sorted by id,
+            log_z [B, S], natural_tail_indices [B, S] int32, forced_logits
+            [B, S, F], forced_indices [B, S, F] int32, forced_in_topk
+            [B, S, F] bool)``.
+        """
         del processed_inputs, original_batch_size, original_seq_len
-        local_logits = (
-            logits.to_local() if isinstance(logits, DTensor) else logits
-        ).to(torch.float32)
+        local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
         tp_group = self.tp_mesh.get_group()
         tp_rank = torch.distributed.get_rank(tp_group)
         tp_size = torch.distributed.get_world_size(tp_group)
@@ -1306,134 +1332,63 @@ class SparseLogitsPostProcessor:
             if vocab_is_replicated
             else tp_rank * local_vocab_size
         )
-        valid_local_vocab = max(0, min(local_vocab_size, full_vocab_size - vocab_start))
-        if valid_local_vocab < local_vocab_size:
-            local_logits = local_logits.clone()
-            local_logits[..., valid_local_vocab:] = -torch.inf
-
-        actual_k = min(int(self.k), full_vocab_size)
-        real_logits: Optional[torch.Tensor] = None
-        if tp_size == 1:
-            # Match the reference TP1 producer exactly: slice padded lm-head
-            # columns before both reductions, then use native logsumexp/topk.
-            real_logits = local_logits[..., :full_vocab_size]
-            log_z = torch.logsumexp(real_logits / float(self.temperature), dim=-1)
-            top_vals, top_idx = torch.topk(real_logits, k=actual_k, dim=-1)
-        else:
-            scaled_logits = local_logits / float(self.temperature)
-            global_max = scaled_logits.amax(dim=-1)
-            torch.distributed.all_reduce(
-                global_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
+        if "force_include_token_ids" not in data_dict:
+            raise KeyError(
+                "Sparse teacher IPC requires force_include_token_ids in teacher data."
             )
-            exp_sum = torch.exp(scaled_logits - global_max.unsqueeze(-1)).sum(dim=-1)
-            torch.distributed.all_reduce(
-                exp_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group
-            )
-            log_z = global_max + torch.log(exp_sum)
-            top_vals, top_idx = distributed_vocab_topk(
-                local_logits,
-                k=actual_k,
-                tp_group=tp_group,
-                vocab_start_index=vocab_start,
-                vocab_end_index=vocab_start + local_vocab_size,
-            )
-
         force_ids = self._normalize_force_ids(
             local_logits,
             self._localize_force_ids(
-                data_dict.get("force_include_token_ids"),
+                data_dict["force_include_token_ids"],
                 local_logits.shape[1],
                 cp_sharder=cp_sharder,
             ),
         )
-        gt_in_topk: Optional[torch.Tensor] = None
-        if self.gt_filter_topk > 0:
-            if force_ids is None:
-                raise ValueError(
-                    "gt_filter_topk requires force_include_token_ids in teacher data"
-                )
-            filter_k = min(self.gt_filter_topk, full_vocab_size)
-            if tp_size == 1:
-                assert real_logits is not None
-                filter_idx = torch.topk(real_logits, k=filter_k, dim=-1).indices
-            else:
-                _, filter_idx = distributed_vocab_topk(
-                    local_logits,
-                    k=filter_k,
-                    tp_group=tp_group,
-                    vocab_start_index=vocab_start,
-                    vocab_end_index=vocab_start + local_vocab_size,
-                )
-            valid_force = (force_ids >= 0) & (force_ids < full_vocab_size)
-            gt_in_topk = valid_force & (
-                filter_idx.to(torch.long) == force_ids.unsqueeze(-1)
-            ).any(dim=-1)
-
-        if force_ids is not None and top_vals.shape[-1] > 0:
-            valid_force = (force_ids >= 0) & (force_ids < full_vocab_size)
-            already_present = (top_idx.to(torch.long) == force_ids.unsqueeze(-1)).any(
-                dim=-1
-            )
-            need_force = valid_force & ~already_present
-            if tp_size == 1:
-                assert real_logits is not None
-                forced_vals = real_logits.gather(
-                    dim=-1,
-                    index=force_ids.clamp(0, full_vocab_size - 1).unsqueeze(-1),
-                ).squeeze(-1)
-            else:
-                owned = (force_ids >= vocab_start) & (
-                    force_ids < vocab_start + valid_local_vocab
-                )
-                local_force_idx = (force_ids - vocab_start).clamp(
-                    min=0, max=max(local_vocab_size - 1, 0)
-                )
-                forced_vals = local_logits.gather(
-                    dim=-1, index=local_force_idx.unsqueeze(-1)
-                ).squeeze(-1)
-                forced_vals = torch.where(
-                    owned, forced_vals, torch.full_like(forced_vals, -torch.inf)
-                )
-                torch.distributed.all_reduce(
-                    forced_vals, op=torch.distributed.ReduceOp.MAX, group=tp_group
-                )
-            replace_slot = top_vals.argmin(dim=-1)
-            replacement_vals = torch.where(
-                need_force,
-                forced_vals,
-                top_vals.gather(-1, replace_slot.unsqueeze(-1)).squeeze(-1),
-            )
-            replacement_idx = torch.where(
-                need_force,
-                force_ids,
-                top_idx.to(torch.long)
-                .gather(-1, replace_slot.unsqueeze(-1))
-                .squeeze(-1),
-            )
-            top_vals = top_vals.clone()
-            top_idx = top_idx.clone()
-            top_vals.scatter_(
-                -1, replace_slot.unsqueeze(-1), replacement_vals.unsqueeze(-1)
-            )
-            top_idx.scatter_(
-                -1,
-                replace_slot.unsqueeze(-1),
-                replacement_idx.to(top_idx.dtype).unsqueeze(-1),
-            )
-
-        sorted_idx, sort_perm = torch.sort(top_idx.to(torch.int32), dim=-1)
-        sorted_vals = torch.gather(top_vals, dim=-1, index=sort_perm)
+        chunk_size = self.cfg.get("logprob_chunk_size")
+        if chunk_size is None:
+            chunk_size = SPARSE_TEACHER_ROW_CHUNK_SIZE
+        (
+            topk_logits,
+            topk_indices,
+            log_z,
+            natural_tail_indices,
+            forced_logits,
+            forced_indices,
+            forced_in_topk,
+        ) = distributed_vocab_topk_logz_force(
+            local_logits,
+            force_ids,
+            self.k,
+            tp_group if tp_size > 1 else None,
+            vocab_start_index=vocab_start,
+            vocab_end_index=vocab_start + local_vocab_size,
+            real_vocab_size=full_vocab_size,
+            temperature=self.temperature,
+            noise_filter_k=self.gt_filter_topk,
+            chunk_size=chunk_size,
+        )
+        natural_tail_indices = natural_tail_indices.squeeze(-1)
         if cp_sharder is not None:
-            sorted_vals = self._gather_and_slice_cp(
-                sorted_vals, cp_sharder, sequence_dim
+            topk_logits, topk_indices, log_z, natural_tail_indices = (
+                self._gather_and_slice_cp(tensor, cp_sharder, sequence_dim)
+                for tensor in (topk_logits, topk_indices, log_z, natural_tail_indices)
             )
-            sorted_idx = self._gather_and_slice_cp(sorted_idx, cp_sharder, sequence_dim)
-            log_z = self._gather_and_slice_cp(log_z, cp_sharder, sequence_dim)
-            if gt_in_topk is not None:
-                gt_in_topk = self._gather_and_slice_cp(
-                    gt_in_topk, cp_sharder, sequence_dim
-                )
-        return sorted_vals, sorted_idx, log_z, gt_in_topk
+            forced_logits, forced_indices = (
+                self._gather_and_slice_cp(tensor, cp_sharder, sequence_dim)
+                for tensor in (forced_logits, forced_indices)
+            )
+            forced_in_topk = self._gather_and_slice_cp(
+                forced_in_topk.to(torch.uint8), cp_sharder, sequence_dim
+            ).to(torch.bool)
+        return (
+            topk_logits,
+            topk_indices,
+            log_z,
+            natural_tail_indices,
+            forced_logits,
+            forced_indices,
+            forced_in_topk,
+        )
 
     def _gather_and_slice_cp(
         self,

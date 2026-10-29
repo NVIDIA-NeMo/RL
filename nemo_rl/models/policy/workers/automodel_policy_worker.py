@@ -1400,10 +1400,17 @@ class AutomodelPolicyWorkerImpl(
             gt_filter_topk=gt_filter_topk_value,
         )
 
-        output_logits: list[torch.Tensor] = []
-        output_indices: list[torch.Tensor] = []
-        output_log_z: list[torch.Tensor] = []
-        output_gt_in_topk: list[torch.Tensor] = []
+        # (field, padding value): the processor's fields in export order.
+        sparse_fields = (
+            ("topk_logits", 0.0),
+            ("topk_indices", 0),
+            ("log_z", 0.0),
+            ("natural_tail_indices", 0),
+            ("forced_logits", 0.0),
+            ("forced_indices", -1),
+            ("forced_in_topk", 0),
+        )
+        outputs: list[list[torch.Tensor]] = [[] for _ in sparse_fields]
         self.model.eval()
         with torch.no_grad():
             data.to("cuda")
@@ -1436,52 +1443,23 @@ class AutomodelPolicyWorkerImpl(
                     )
                 if batch_idx >= iterator_len:
                     continue
-                topk_logits, topk_indices, log_z, gt_in_topk = sparse_values
-                pad_needed = target_local_seq - topk_logits.shape[1]
-                if pad_needed > 0:
-                    topk_logits = torch.nn.functional.pad(
-                        topk_logits,
-                        (0, 0, 0, pad_needed, 0, 0),
-                        mode="constant",
-                        value=0.0,
-                    )
-                    topk_indices = torch.nn.functional.pad(
-                        topk_indices,
-                        (0, 0, 0, pad_needed, 0, 0),
-                        mode="constant",
-                        value=0,
-                    )
-                    log_z = torch.nn.functional.pad(
-                        log_z,
-                        (0, pad_needed, 0, 0),
-                        mode="constant",
-                        value=0.0,
-                    )
-                    if gt_in_topk is not None:
-                        gt_in_topk = torch.nn.functional.pad(
-                            gt_in_topk,
-                            (0, pad_needed, 0, 0),
-                            mode="constant",
-                            value=False,
+                pad_needed = target_local_seq - sparse_values[0].shape[1]
+                for output, value, (_, pad_value) in zip(
+                    outputs, sparse_values, sparse_fields, strict=True
+                ):
+                    if value.dtype == torch.bool:
+                        value = value.to(torch.int32)
+                    if pad_needed > 0:
+                        # Pad the sequence axis (dim 1) of [B, S] or [B, S, W].
+                        pad = (0, 0) * (value.dim() - 2) + (0, pad_needed)
+                        value = torch.nn.functional.pad(
+                            value, pad, mode="constant", value=pad_value
                         )
-                output_logits.append(topk_logits.contiguous())
-                output_indices.append(topk_indices.to(torch.int32).contiguous())
-                output_log_z.append(log_z.contiguous())
-                if gt_in_topk is not None:
-                    output_gt_in_topk.append(gt_in_topk.to(torch.int32).contiguous())
+                    output.append(value.contiguous())
 
-        if not output_logits:
+        if not outputs[0]:
             raise RuntimeError("No valid microbatches produced sparse teacher logits.")
-        final_logits = torch.cat(output_logits, dim=0)
-        final_indices = torch.cat(output_indices, dim=0)
-        final_log_z = torch.cat(output_log_z, dim=0)
-        final_gt_in_topk = (
-            torch.cat(output_gt_in_topk, dim=0) if output_gt_in_topk else None
-        )
-
-        sparse_sources = [final_logits, final_indices, final_log_z]
-        if final_gt_in_topk is not None:
-            sparse_sources.append(final_gt_in_topk)
+        sparse_sources = [torch.cat(output, dim=0) for output in outputs]
         existing_sparse_storage = self._teacher_sparse_ipc_buffer or []
         sparse_storage: list[torch.Tensor] = []
         sparse_views: list[torch.Tensor] = []
@@ -1507,19 +1485,10 @@ class AutomodelPolicyWorkerImpl(
             sparse_storage.append(storage)
             sparse_views.append(target)
         self._teacher_sparse_ipc_buffer = sparse_storage
-        final_logits = sparse_views[0]
-        final_indices = sparse_views[1]
-        final_log_z = sparse_views[2]
-        final_gt_in_topk = sparse_views[3] if len(sparse_views) == 4 else None
         torch.cuda.synchronize()
 
-        sparse_bytes = (
-            final_logits.numel() * final_logits.element_size()
-            + final_indices.numel() * final_indices.element_size()
-            + final_log_z.numel() * final_log_z.element_size()
-        )
-        if final_gt_in_topk is not None:
-            sparse_bytes += final_gt_in_topk.numel() * final_gt_in_topk.element_size()
+        final_logits, final_indices = sparse_views[0], sparse_views[1]
+        sparse_bytes = sum(view.numel() * view.element_size() for view in sparse_views)
         full_vocab = int(vocab_size or final_indices.max().item() + 1)
         full_bytes_estimate = (
             final_logits.shape[0]
@@ -1541,30 +1510,23 @@ class AutomodelPolicyWorkerImpl(
         global_seq_start = cp_rank * final_logits.shape[1]
         per_sample_handles: list[dict[str, Any]] = []
         for sample_idx in range(final_logits.shape[0]):
-            logits_sample = final_logits[sample_idx]
-            indices_sample = final_indices[sample_idx]
-            log_z_sample = final_log_z[sample_idx]
             handle: dict[str, Any] = {
-                "topk_logits_ipc": get_handle_from_tensor(logits_sample),
-                "topk_indices_ipc": get_handle_from_tensor(indices_sample),
-                "log_z_ipc": get_handle_from_tensor(log_z_sample),
-                "topk_shape": tuple(logits_sample.shape),
-                "topk_dtype": logits_sample.dtype,
-                "indices_dtype": indices_sample.dtype,
-                "log_z_dtype": log_z_sample.dtype,
-                "cp_rank": cp_rank,
-                "cp_size": self.cp_size,
-                "global_seq_start": global_seq_start,
-                "full_seq_len": final_logits.shape[1] * self.cp_size,
+                f"{field}_ipc": get_handle_from_tensor(view[sample_idx])
+                for (field, _), view in zip(sparse_fields, sparse_views, strict=True)
             }
-            if final_gt_in_topk is not None:
-                gt_sample = final_gt_in_topk[sample_idx]
-                handle.update(
-                    {
-                        "gt_in_topk_ipc": get_handle_from_tensor(gt_sample),
-                        "gt_in_topk_dtype": gt_sample.dtype,
-                    }
-                )
+            handle.update(
+                {
+                    "topk_shape": tuple(final_logits[sample_idx].shape),
+                    "topk_dtype": final_logits.dtype,
+                    "indices_dtype": final_indices.dtype,
+                    "log_z_dtype": sparse_views[2].dtype,
+                    "forced_in_topk_k": gt_filter_topk_value or k,
+                    "cp_rank": cp_rank,
+                    "cp_size": self.cp_size,
+                    "global_seq_start": global_seq_start,
+                    "full_seq_len": final_logits.shape[1] * self.cp_size,
+                }
+            )
             per_sample_handles.append(handle)
         return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
 

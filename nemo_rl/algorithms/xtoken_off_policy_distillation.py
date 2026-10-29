@@ -521,19 +521,6 @@ class TeacherAlignerConfig(BaseModel, extra="allow"):
     teacher_to_student_table_path: Optional[str] = None
 
 
-def _teacher_topk_ipc_keep_realized(
-    loss_config: CrossTokenizerDistillationLossConfig,
-) -> bool:
-    """Whether sparse teacher IPC must retain realized teacher labels."""
-    topk_k = int(loss_config["teacher_topk_ipc_k"])
-    return topk_k > 0 and (
-        bool(loss_config["csd_pure_alm"])
-        or bool(loss_config["csd_realized_only_mismatch"])
-        or topk_k == 1
-        or bool(loss_config["teacher_topk_ipc_keep_realized"])
-    )
-
-
 def _teacher_force_include_requests(
     batch: BatchedDataDict[Any],
     pair_valid: torch.Tensor,
@@ -582,60 +569,6 @@ def _teacher_force_include_requests(
         starts.repeat_interleave(lengths) + offsets,
         shift.repeat_interleave(lengths),
     )
-
-
-def _build_teacher_force_include_token_ids(
-    batch: BatchedDataDict[Any],
-    *,
-    teacher_idx: int,
-    loss_config: CrossTokenizerDistillationLossConfig,
-) -> Optional[torch.Tensor]:
-    """Build realized teacher labels that sparse IPC must retain per position.
-
-    When several chunks read the same predictor row, the row keeps the label
-    of the highest-indexed chunk.
-    """
-    needs_force_ids = _teacher_topk_ipc_keep_realized(loss_config) or (
-        int(loss_config["csd_noise_filter_topk"]) > 0
-    )
-    if not needs_force_ids:
-        return None
-
-    teacher_input_ids = batch[f"teacher_{teacher_idx}_input_ids"]
-    if not torch.is_tensor(teacher_input_ids):
-        return None
-
-    batch_idx, pair_idx, label_pos, shift = _teacher_force_include_requests(
-        batch,
-        batch[f"alignment_{teacher_idx}_pair_valid"].to(torch.bool),
-        teacher_idx=teacher_idx,
-        kl_chunk_shift=bool(loss_config["kl_chunk_shift"]),
-    )
-    batch_size, teacher_seq_len = teacher_input_ids.shape
-    # Spans come from the chunk ids; keep labels inside the token ids (their
-    # predictor rows then are too).
-    in_range = label_pos < teacher_seq_len
-    predictor_pos = (label_pos - shift)[in_range]
-    batch_idx, pair_idx, label_pos = (
-        batch_idx[in_range],
-        pair_idx[in_range],
-        label_pos[in_range],
-    )
-    # A chunk reads each predictor row at most once, so the highest chunk index
-    # per row picks exactly one read.
-    rows = batch_idx * teacher_seq_len + predictor_pos
-    last_pair = torch.full(
-        (batch_size * teacher_seq_len,),
-        -1,
-        dtype=pair_idx.dtype,
-        device=pair_idx.device,
-    ).scatter_reduce_(0, rows, pair_idx, reduce="amax")
-    wins = pair_idx == last_pair[rows]
-    force_ids = torch.full_like(teacher_input_ids, -1)
-    force_ids[batch_idx[wins], predictor_pos[wins]] = teacher_input_ids[
-        batch_idx[wins], label_pos[wins]
-    ]
-    return force_ids
 
 
 # A teacher row is only read for the realized label at its own position
@@ -2342,16 +2275,9 @@ def export_teacher_logits_and_pack(
             and isinstance(loss_fn, CSDLossFn)
             and loss_fn.cfg.teacher_topk_ipc_k > 0
         ):
-            if loss_fn.cfg.owner_local:
-                force_include_token_ids = _build_teacher_force_include_token_id_slots(
-                    batch, teacher_idx=i, kl_chunk_shift=loss_fn.cfg.kl_chunk_shift
-                )
-            else:
-                force_include_token_ids = _build_teacher_force_include_token_ids(
-                    batch,
-                    teacher_idx=i,
-                    loss_config=loss_fn.cfg.model_dump(),
-                )
+            force_include_token_ids = _build_teacher_force_include_token_id_slots(
+                batch, teacher_idx=i, kl_chunk_shift=loss_fn.cfg.kl_chunk_shift
+            )
         ipc_suffix, handles = _get_teacher_logits_ipc(
             teacher_policy,
             teacher_data,

@@ -2646,6 +2646,11 @@ def _canonical_topk_by_value_then_lowest_id(
     )
 
 
+# Teacher rows per sparse top-k/log Z tile when ``logprob_chunk_size`` is unset;
+# bounds the fp32 ``[B, rows, V/TP]`` working set at long context.
+SPARSE_TEACHER_ROW_CHUNK_SIZE = 128
+
+
 @torch.no_grad()
 def distributed_vocab_topk_logz_force(
     vocab_parallel_logits: torch.Tensor,

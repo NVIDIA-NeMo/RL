@@ -63,6 +63,7 @@ from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.data.megatron_sft_packed import is_direct_packed_row
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    SPARSE_TEACHER_ROW_CHUNK_SIZE,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     cp_load_balanced_to_contiguous,
@@ -94,10 +95,6 @@ PostProcessingFunction = Union[
     "SparseTeacherLogitsPostProcessor",
     "FullLogitsPostProcessor",
 ]
-
-# Teacher rows per sparse top-k/log Z tile when ``logprob_chunk_size`` is unset;
-# bounds the fp32 ``[B, rows, V/TP]`` working set at long context.
-SPARSE_TEACHER_ROW_CHUNK_SIZE = 128
 
 
 def _prepare_padding_mask_for_model(

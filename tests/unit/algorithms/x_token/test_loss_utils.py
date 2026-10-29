@@ -968,28 +968,42 @@ class TestZeroCopyTeacherLogits:
 
 
 class TestRebuildSparseTeacherLogits:
-    @staticmethod
-    def _shard(prefix: str, start: int, seq_len: int, full_seq_len: int) -> dict:
+    _FIELDS = (
+        "topk_logits",
+        "topk_indices",
+        "log_z",
+        "natural_tail_indices",
+        "forced_logits",
+        "forced_indices",
+        "forced_in_topk",
+    )
+
+    @classmethod
+    def _shard(cls, prefix: str, start: int, seq_len: int, full_seq_len: int) -> dict:
         return {
-            "topk_logits_ipc": f"{prefix}-logits",
-            "topk_indices_ipc": f"{prefix}-indices",
-            "log_z_ipc": f"{prefix}-logz",
-            "gt_in_topk_ipc": f"{prefix}-gt",
+            **{f"{field}_ipc": f"{prefix}-{field}" for field in cls._FIELDS},
             "topk_shape": (seq_len, 2),
+            "forced_in_topk_k": 2,
             "global_seq_start": start,
             "full_seq_len": full_seq_len,
         }
 
     def test_orders_cp_shards_and_preserves_dtypes(self, monkeypatch):
         tensors = {
-            "a-logits": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-            "a-indices": torch.tensor([[1, 3], [2, 4]], dtype=torch.int64),
-            "a-logz": torch.tensor([5.0, 6.0]),
-            "a-gt": torch.tensor([1, 0], dtype=torch.int32),
-            "b-logits": torch.tensor([[7.0, 8.0]]),
-            "b-indices": torch.tensor([[5, 6]], dtype=torch.int64),
-            "b-logz": torch.tensor([9.0]),
-            "b-gt": torch.tensor([0], dtype=torch.int32),
+            "a-topk_logits": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            "a-topk_indices": torch.tensor([[1, 3], [2, 4]], dtype=torch.int64),
+            "a-log_z": torch.tensor([5.0, 6.0]),
+            "a-natural_tail_indices": torch.tensor([3, 2], dtype=torch.int64),
+            "a-forced_logits": torch.tensor([[1.0, 0.0], [4.0, 0.0]]),
+            "a-forced_indices": torch.tensor([[1, -1], [4, -1]], dtype=torch.int64),
+            "a-forced_in_topk": torch.tensor([[1, 0], [1, 0]], dtype=torch.int32),
+            "b-topk_logits": torch.tensor([[7.0, 8.0]]),
+            "b-topk_indices": torch.tensor([[5, 6]], dtype=torch.int64),
+            "b-log_z": torch.tensor([9.0]),
+            "b-natural_tail_indices": torch.tensor([5], dtype=torch.int64),
+            "b-forced_logits": torch.tensor([[2.5, 8.0]]),
+            "b-forced_indices": torch.tensor([[9, 6]], dtype=torch.int64),
+            "b-forced_in_topk": torch.tensor([[0, 1]], dtype=torch.int32),
         }
         monkeypatch.setattr(
             "nemo_rl.models.policy.utils.rebuild_cuda_tensor_from_ipc",
@@ -1004,19 +1018,45 @@ class TestRebuildSparseTeacherLogits:
             }
         ]
 
-        logits, indices, log_z, gt_in_topk = rebuild_teacher_sparse_logits_from_ipc(
-            entries, device=0
-        )
+        payload = rebuild_teacher_sparse_logits_from_ipc(entries, device=0)
 
-        assert logits.shape == (1, 3, 2)
-        assert logits.dtype == torch.float32
-        assert torch.equal(logits[0, :, 0], torch.tensor([1.0, 3.0, 7.0]))
-        assert indices.dtype == torch.int32
-        assert torch.equal(indices[0], torch.tensor([[1, 3], [2, 4], [5, 6]]))
-        assert log_z.dtype == torch.float32
-        assert torch.equal(log_z, torch.tensor([[5.0, 6.0, 9.0]]))
-        assert gt_in_topk is not None and gt_in_topk.dtype == torch.bool
-        assert torch.equal(gt_in_topk, torch.tensor([[True, False, False]]))
+        assert payload.topk_logits.shape == (1, 3, 2)
+        assert payload.topk_logits.dtype == torch.float32
+        assert torch.equal(payload.topk_logits[0, :, 0], torch.tensor([1.0, 3.0, 7.0]))
+        assert payload.topk_indices.dtype == torch.int32
+        assert torch.equal(
+            payload.topk_indices[0], torch.tensor([[1, 3], [2, 4], [5, 6]])
+        )
+        assert payload.log_z.dtype == torch.float32
+        assert torch.equal(payload.log_z, torch.tensor([[5.0, 6.0, 9.0]]))
+        assert payload.natural_tail_indices.dtype == torch.int32
+        assert torch.equal(payload.natural_tail_indices, torch.tensor([[3, 2, 5]]))
+        assert payload.forced_indices.dtype == torch.int32
+        assert torch.equal(
+            payload.forced_indices[0], torch.tensor([[1, -1], [4, -1], [9, 6]])
+        )
+        assert payload.forced_in_topk.dtype == torch.bool
+        assert torch.equal(
+            payload.forced_in_topk[0],
+            torch.tensor([[True, False], [True, False], [False, True]]),
+        )
+        assert payload.membership_k == 2
+
+    def test_rejects_shards_with_different_membership_k(self, monkeypatch):
+        monkeypatch.setattr(
+            "nemo_rl.models.policy.utils.rebuild_cuda_tensor_from_ipc",
+            lambda _handle, _device: torch.zeros(1, 2),
+        )
+        entries = [
+            {
+                "teacher_shards": [
+                    self._shard("a", 0, 1, 2),
+                    {**self._shard("b", 1, 1, 2), "forced_in_topk_k": 3},
+                ]
+            }
+        ]
+        with pytest.raises(ValueError, match="disagree on forced_in_topk_k"):
+            rebuild_teacher_sparse_logits_from_ipc(entries, device=0)
 
     def test_rejects_noncontiguous_cp_coverage(self, monkeypatch):
         monkeypatch.setattr(

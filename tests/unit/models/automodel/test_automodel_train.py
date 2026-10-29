@@ -877,24 +877,18 @@ class TestTopkLogitsPostProcessor:
 @pytest.mark.automodel
 class TestSparseLogitsPostProcessor:
     def test_row_topk_logz_padding_and_forced_label(self, base_cfg, monkeypatch):
-        """Sparse export keeps exact logZ and ignores padded vocab columns."""
+        """Sparse export keeps exact logZ, ignores padded vocab columns, and
+        ships forced labels beside the unchanged natural top-k."""
+        from nemo_rl.algorithms.x_token.loss_utils import (
+            materialize_sparse_teacher_rows,
+        )
+
         group = object()
         mesh = MagicMock()
         mesh.get_group.return_value = group
 
         monkeypatch.setattr(torch.distributed, "get_rank", lambda _group: 0)
         monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group: 1)
-        monkeypatch.setattr(
-            torch.distributed,
-            "all_reduce",
-            lambda tensor, op=None, group=None: tensor,
-        )
-
-        def _all_gather(outputs, tensor, group=None):
-            assert len(outputs) == 1
-            outputs[0].copy_(tensor)
-
-        monkeypatch.setattr(torch.distributed, "all_gather", _all_gather)
 
         processor = SparseLogitsPostProcessor(
             cfg=base_cfg,
@@ -911,11 +905,25 @@ class TestSparseLogitsPostProcessor:
         logits = torch.tensor(
             [[[5.0, 4.0, 3.0, 2.0, -7.0, 1000.0], [0.0, 1.0, 2.0, 3.0, 4.0, 900.0]]]
         )
+        # Row 1 is read for two labels, as the last row of an unshifted first
+        # chunk is.
         data = BatchedDataDict(
-            {"force_include_token_ids": torch.tensor([[4, 4]], dtype=torch.long)}
+            {
+                "force_include_token_ids": torch.tensor(
+                    [[[4, -1], [4, 1]]], dtype=torch.long
+                )
+            }
         )
 
-        values, token_ids, log_z, gt_in_topk = processor(
+        (
+            values,
+            token_ids,
+            log_z,
+            natural_tail_indices,
+            forced_logits,
+            forced_indices,
+            forced_in_topk,
+        ) = processor(
             logits=logits,
             data_dict=data,
             processed_inputs=MagicMock(),
@@ -925,19 +933,70 @@ class TestSparseLogitsPostProcessor:
         )
 
         assert torch.equal(
-            token_ids,
-            torch.tensor([[[0, 1, 4], [2, 3, 4]]], dtype=torch.int32),
+            token_ids, torch.tensor([[[0, 1, 2], [2, 3, 4]]], dtype=torch.int32)
         )
         torch.testing.assert_close(
-            values,
-            torch.tensor([[[5.0, 4.0, -7.0], [2.0, 3.0, 4.0]]]),
+            values, torch.tensor([[[5.0, 4.0, 3.0], [2.0, 3.0, 4.0]]])
         )
         torch.testing.assert_close(
-            log_z,
-            torch.logsumexp(logits[..., :5] / 2.0, dim=-1),
+            log_z, torch.logsumexp(logits[..., :5] / 2.0, dim=-1)
         )
-        assert gt_in_topk is not None
-        assert torch.equal(gt_in_topk, torch.tensor([[False, True]]))
+        assert torch.equal(
+            natural_tail_indices, torch.tensor([[2, 2]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            forced_logits, torch.tensor([[[-7.0, 0.0], [4.0, 1.0]]])
+        )
+        assert torch.equal(forced_indices, data["force_include_token_ids"].int())
+        # Membership is against the natural top-gt_filter_topk (2) ids.
+        assert torch.equal(
+            forced_in_topk, torch.tensor([[[False, False], [True, False]]])
+        )
+
+        # Each request gets its own support: label 4 on row 0 evicts the tail
+        # (id 2); on row 1 label 4 is natural while label 1 evicts id 2.
+        rows = materialize_sparse_teacher_rows(
+            values[0, [0, 1, 1]],
+            token_ids[0, [0, 1, 1]],
+            natural_tail_indices[0, [0, 1, 1]],
+            forced_logits[0, [0, 1, 1]],
+            forced_indices[0, [0, 1, 1]],
+            forced_in_topk[0, [0, 1, 1]],
+            torch.tensor([4, 4, 1]),
+            real_vocab_size=5,
+        )
+        torch.testing.assert_close(
+            rows[0], torch.tensor([[5.0, 4.0, -7.0], [2.0, 3.0, 4.0], [1.0, 3.0, 4.0]])
+        )
+        assert torch.equal(
+            rows[1],
+            torch.tensor([[0, 1, 4], [2, 3, 4], [1, 3, 4]], dtype=torch.int32),
+        )
+        assert torch.equal(rows[2], torch.tensor([False, True, False]))
+
+    def test_requires_force_include_token_ids(self, base_cfg, monkeypatch):
+        mesh = MagicMock()
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda _group: 0)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group: 1)
+        processor = SparseLogitsPostProcessor(
+            cfg=base_cfg,
+            tp_mesh=mesh,
+            cp_mesh=mesh,
+            cp_size=1,
+            k=2,
+            temperature=1.0,
+            vocab_size=3,
+        )
+
+        with pytest.raises(KeyError, match="force_include_token_ids"):
+            processor(
+                logits=torch.zeros(1, 2, 3),
+                data_dict=BatchedDataDict({}),
+                processed_inputs=MagicMock(),
+                original_batch_size=1,
+                original_seq_len=2,
+                cp_sharder=None,
+            )
 
 
 # =====================
