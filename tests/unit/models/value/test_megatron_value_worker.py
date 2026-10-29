@@ -279,7 +279,9 @@ def test_get_values_passes_multimodal_batch_to_model_forward(
 
     assert model_forward.call_args.kwargs["data_dict"] is batch
     assert "pixel_values" in model_forward.call_args.kwargs["data_dict"]
-    assert "media_token_validity_mask" not in model_forward.call_args.kwargs["data_dict"]
+    assert (
+        "media_token_validity_mask" not in model_forward.call_args.kwargs["data_dict"]
+    )
     torch.testing.assert_close(result["values"], torch.tensor([[0.0, 1.0]]))
     assert (
         "MegatronValueWorker multimodal input fields: image_grid_thw,pixel_values"

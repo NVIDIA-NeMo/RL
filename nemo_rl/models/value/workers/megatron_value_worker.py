@@ -547,9 +547,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             self.model,
             self.optimizer,
         )
-        self.media_placeholder_token_id = _model_media_placeholder_token_id(
-            self.model
-        )
+        self.media_placeholder_token_id = _model_media_placeholder_token_id(self.model)
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
 

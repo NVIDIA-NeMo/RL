@@ -16,6 +16,7 @@ policy:
         gpus_per_node: 8
     vllm_cfg:
       async_engine: true
+      expert_parallel_size: 8
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async
   wandb:
