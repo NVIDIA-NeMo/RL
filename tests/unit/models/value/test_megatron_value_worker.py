@@ -354,34 +354,6 @@ def test_finish_training_updates_eval_cache_before_parameter_offload(
     )
 
 
-def test_finish_training_evals_before_model_offload(monkeypatch):
-    """Mamba decode caches must refresh before CUDA parameter storage is released."""
-    from nemo_rl.models.value.workers.megatron_value_worker import (
-        MegatronValueWorkerImpl,
-    )
-
-    events: list[str] = []
-    model = SimpleNamespace(eval=lambda: events.append("eval"))
-
-    def move_model(model, device, *, move_params, move_grads):
-        events.append(f"model:{device}")
-        return model
-
-    worker = SimpleNamespace(
-        _train_step_state=None,
-        model=model,
-        optimizer=object(),
-        optimizer_cpu_offload=False,
-        move_model=move_model,
-        move_optimizer=lambda device: events.append(f"optimizer:{device}"),
-    )
-
-    with patch("torch.cuda.empty_cache"):
-        MegatronValueWorkerImpl.finish_training(worker)
-
-    assert events == ["eval", "model:cpu", "optimizer:cpu"]
-
-
 def test_split_value_accepts_uneven_packed_dp_shard():
     from nemo_rl.models.value.workers.megatron_value_worker import (
         MegatronValueWorkerImpl,
