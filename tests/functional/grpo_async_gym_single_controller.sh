@@ -55,8 +55,8 @@ VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
 DATA_FILTER='.responses_create_params.tools |= (.[0:1])'
 CC_OVERRIDES=()
 if [[ "${SC_TEST_CONTEXT_COMPACTION:-0}" == "1" ]]; then
-    # Keep accepted history while dropping earlier reasoning from the next input.
-    DATA_FILTER='del(.task_source) | .agent_ref = {type: "responses_api_agents", name: "simple_agent_with_compaction"}'
+    # BrowseComp retains generated history while hiding older tool results.
+    DATA_FILTER='del(.task_source) | .agent_ref = {type: "responses_api_agents", name: "browsecomp_agent"}'
     CC_OVERRIDES=(
         ++token_capture.enabled=true
         ++token_capture.forest_training=true
@@ -71,17 +71,15 @@ if [[ "${SC_TEST_CONTEXT_COMPACTION:-0}" == "1" ]]; then
         ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser=deepseek_r1
         env.nemo_gym.policy_model.responses_api_models.vllm_model.uses_reasoning_parser=true
         env.nemo_gym.policy_model.responses_api_models.vllm_model.extra_body.chat_template_kwargs.enable_thinking=true
-        'env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/workplace_assistant/configs/workplace_assistant.yaml,responses_api_agents/simple_agent_with_compaction/configs/simple_agent_with_compaction.yaml]'
-        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.resources_server.name=workplace_assistant
-        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.max_steps=6
-        ++env.nemo_gym.simple_agent_with_compaction_environment_server.environment_servers.legacy_agent.entrypoint=app.py
-        ++env.nemo_gym.simple_agent_with_compaction_environment_server.environment_servers.legacy_agent.agent_server.type=responses_api_agents
-        ++env.nemo_gym.simple_agent_with_compaction_environment_server.environment_servers.legacy_agent.agent_server.name=simple_agent_with_compaction
-        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.context_history.policy.type=recency
-        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.context_history.policy.config.reasoning.enabled=true
-        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.context_history.policy.config.reasoning.keep_last_blocks=0
-        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.context_history.schedule.type=turn_chunked_recency
-        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.context_history.schedule.actions_per_chunk=1
+        'env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/workplace_assistant/configs/workplace_assistant.yaml,responses_api_agents/browsecomp_agent/configs/browsecomp_agent.yaml]'
+        ++env.nemo_gym.browsecomp_agent.responses_api_agents.browsecomp_agent.resources_server.name=workplace_assistant
+        ++env.nemo_gym.browsecomp_agent.responses_api_agents.browsecomp_agent.max_steps=6
+        ++env.nemo_gym.browsecomp_agent.responses_api_agents.browsecomp_agent.keep_rounds=1
+        ++env.nemo_gym.browsecomp_agent.responses_api_agents.browsecomp_agent.max_context_tokens=0
+        ++env.nemo_gym.browsecomp_agent.responses_api_agents.browsecomp_agent.nudge_steps=false
+        ++env.nemo_gym.browsecomp_agent_environment_server.environment_servers.legacy_agent.entrypoint=app.py
+        ++env.nemo_gym.browsecomp_agent_environment_server.environment_servers.legacy_agent.agent_server.type=responses_api_agents
+        ++env.nemo_gym.browsecomp_agent_environment_server.environment_servers.legacy_agent.agent_server.name=browsecomp_agent
     )
 fi
 jq -c "$DATA_FILTER" 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl > "$TRAIN_PATH"

@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 
@@ -31,7 +32,7 @@ from responses_api_agents.opencode_agent.app import (
     _parse_opencode_session,
     parse_opencode_session,
 )
-from responses_api_agents.opencode_agent.tests.test_app import _session_db
+from responses_api_agents.opencode_agent.tests.test_app import _config, _session_db
 from responses_api_agents.opencode_agent.tests.test_trajectory import _policy
 
 from nemo_rl.experience.rollout_reassembler import (
@@ -104,6 +105,7 @@ def terminus() -> SimpleNamespace:
             "TerminusObservations": observations.TerminusObservations,
             "asyncio": asyncio,
             "deepcopy": deepcopy,
+            "uuid4": uuid4,
             "time": time.time,
             "perf_counter": time.perf_counter,
         },
@@ -190,9 +192,11 @@ def test_terminus_real_transcript_and_existing_decision_references(
         assert any(
             item.get("id") == "native-2" for item in raw
         )  # rejected response was appended
+        summary_id = terminus.client.create_response.call_args.kwargs["input"][0]["id"]
+        assert summary_id
         assert any(
-            item.get("id") == "" and "summary" in str(item) for item in raw
-        )  # copied prompt
+            item.get("id") == summary_id and "summary" in str(item) for item in raw
+        )  # copied prompt retains the exporter's synthetic ID
         with pytest.raises(ValueError, match="No complete capture join"):
             selected_response_ids(records, {"output": raw})
         assert "model_response_rejected" in {gap.code for gap in trajectory.gaps}
@@ -256,9 +260,7 @@ def test_gym_opencode_real_sqlite_export_and_episode(
         items, usage = parse_opencode_session(db)
         return items, usage, "test", observations
 
-    shell = SimpleNamespace(
-        config=SimpleNamespace(system_prompt=None), _run_opencode=launch
-    )
+    shell = SimpleNamespace(config=_config(), _run_opencode=launch)
     episode = asyncio.run(
         OpenCodeAgent._create_episode(
             shell,

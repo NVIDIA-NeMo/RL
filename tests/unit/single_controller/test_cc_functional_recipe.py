@@ -96,17 +96,19 @@ def test_gym_functional_launch_config(functional_recipe) -> None:
             {"name": "second"},
         ]
         assert master.policy["max_total_sequence_length"] == 16384
-        assert transformed["agent_ref"]["name"] == "simple_agent_with_compaction"
+        assert transformed["agent_ref"]["name"] == "browsecomp_agent"
         assert "task_source" not in transformed
         assert master.token_capture.enabled
         assert master.loss_fn.token_level_loss
         assert not master.loss_fn.sequence_level_importance_ratios
         assert not master.grpo.calculate_advantages_on_gpu
-        history = master.env["nemo_gym"]["simple_agent_with_compaction"][
-            "responses_api_agents"
-        ]["simple_agent_with_compaction"]["context_history"]
-        assert history["schedule"]["actions_per_chunk"] == 1
-        assert history["policy"]["config"]["reasoning"]["keep_last_blocks"] == 0
+        agent = master.env["nemo_gym"]["browsecomp_agent"]["responses_api_agents"][
+            "browsecomp_agent"
+        ]
+        assert agent["keep_rounds"] == 1
+        assert agent["max_steps"] == 6
+        assert agent["max_context_tokens"] == 0
+        assert not agent["nudge_steps"]
         assert 'max(data["train/global_valid_seqs"]) > 8' in checks
         assert 'max(data["train/token_mult_prob_error"]) < 1.05' in checks
         assert 'len(data["train/token_mult_prob_error"]) == 10' in checks
@@ -117,7 +119,6 @@ def test_gym_functional_launch_config(functional_recipe) -> None:
 
 
 @pytest.mark.nemo_gym
-@pytest.mark.parametrize("functional_recipe", [False], indirect=True)
 def test_gym_functional_config_routes(functional_recipe) -> None:
     pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
     from nemo_gym.global_config import (
@@ -144,5 +145,39 @@ def test_gym_functional_config_routes(functional_recipe) -> None:
             offline=True,
         )
     )
-    agent = "simple_agent_with_compaction" if cc else "workplace_assistant_simple_agent"
+    agent = "browsecomp_agent" if cc else "workplace_assistant_simple_agent"
     assert _environment_server_for_agent(agent, _environment_servers_by_agent(resolved))
+
+
+def test_fast_suite_runs_capture_and_compaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = Path(__file__).resolve().parents[3]
+    scripts = tmp_path / "tests/functional"
+    scripts.mkdir(parents=True)
+    suite = scripts / "L1_Functional_Tests_SingleController_3.sh"
+    shutil.copy(source / "tests/functional" / suite.name, suite)
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    calls = tmp_path / "commands.jsonl"
+    executable = binaries / "uv"
+    executable.write_text(
+        f"#!{sys.executable}\nimport json, sys\n"
+        f"with open({str(calls)!r}, 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binaries}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAST", "1")
+    subprocess.run(["bash", str(suite)], check=True, capture_output=True, text=True)
+    commands = [json.loads(line) for line in calls.read_text().splitlines()]
+    for script, args in (
+        ("grpo_async_gym_single_controller.sh", ["++token_capture.enabled=true"]),
+        ("grpo_async_gym_single_controller_context_compaction.sh", []),
+    ):
+        assert [
+            "run",
+            "--no-sync",
+            "bash",
+            f"./tests/functional/{script}",
+            *args,
+        ] in commands
