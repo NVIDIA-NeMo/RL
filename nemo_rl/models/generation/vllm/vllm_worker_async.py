@@ -416,12 +416,19 @@ class VllmAsyncGenerationWorkerImpl(
                     stacklevel=1,
                 )
             llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
+        self.stat_loggers = (
+            [PrometheusStatLogger]
+            if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
+            else []
+        )
         if dynamo_enabled(self.cfg):
             from nemo_rl.models.generation.dynamo.native_engine import (
+                SnapshotStatLogger,
                 dynamo_kv_events_config,
             )
 
-            # Dynamo's KV-aware router indexes the engine's own KV-cache events.
+            # Dynamo's KV-aware router indexes the engine's own KV-cache events;
+            # the stat logger feeds its per-engine load signal.
             llm_kwargs.setdefault(
                 "kv_events_config",
                 dynamo_kv_events_config(
@@ -429,6 +436,7 @@ class VllmAsyncGenerationWorkerImpl(
                     prefix_caching=llm_kwargs["enable_prefix_caching"],
                 ),
             )
+            self.stat_loggers.append(SnapshotStatLogger)
         # AsyncEngineArgs leaves kv_events_config dicts unconverted.
         if isinstance(llm_kwargs.get("kv_events_config"), dict):
             from vllm.config import KVEventsConfig
@@ -438,18 +446,6 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-        self.stat_loggers = (
-            [PrometheusStatLogger]
-            if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
-            else []
-        )
-        if dynamo_enabled(self.cfg):
-            from nemo_rl.models.generation.dynamo.native_engine import (
-                SnapshotStatLogger,
-            )
-
-            # Feeds the router's per-engine load signal.
-            self.stat_loggers.append(SnapshotStatLogger)
         self.llm = AsyncLLM.from_engine_args(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )

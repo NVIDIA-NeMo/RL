@@ -399,7 +399,7 @@ def test_no_shipped_config_is_outdated(config_file):
 # per message with the 'string' content format, until Dynamo has a content-format
 # option.
 _KNOWN_DYNAMO_REFUSALS = (
-    "does not run data parallelism inside vLLM",
+    "does not serve data parallelism inside vLLM",
     "Native LoRA refit does not yet support vllm_cfg.async_engine=true",
     "allow at most one item of each modality",
 )

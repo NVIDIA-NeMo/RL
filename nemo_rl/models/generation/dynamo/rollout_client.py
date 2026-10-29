@@ -19,10 +19,9 @@ import json
 import logging
 from typing import Any, Optional
 
-from nemo_rl.models.generation.dynamo.http_client import (
-    async_http_post_json,
-    format_dynamo_error,
-)
+import aiohttp
+
+from nemo_rl.experience.failures import http_status_is_infra
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,7 +32,52 @@ ROLLOUT_ANNOTATION = "nemo_rl:rollout:"
 
 _HTTP_MAX_ATTEMPTS = 3
 _HTTP_RETRY_DELAY_S = 1.0
-_RETRYABLE_HTTP_STATUS_CODES = {408, 429}
+
+
+async def _post_json(
+    url: str, payload: dict[str, Any], timeout_s: float | None
+) -> dict[str, Any]:
+    """POST JSON; a failure comes back as a dict with ``"status": "error"``."""
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout_s)
+        ) as session:
+            async with session.post(url, json=payload) as response:
+                body = await response.read()
+                if response.status >= 400:
+                    return {
+                        "status": "error",
+                        "http_status": response.status,
+                        "raw": body.decode("utf-8", "replace"),
+                    }
+    except TimeoutError:
+        # Before ClientError: aiohttp's ServerTimeoutError is both.
+        return {"status": "error", "timeout_error": f"no response within {timeout_s}s"}
+    except aiohttp.ClientError as error:
+        return {
+            "status": "error",
+            "transport_error": f"{type(error).__name__}: {error}",
+        }
+    try:
+        decoded = json.loads(body)
+    except json.JSONDecodeError:
+        return {
+            "status": "error",
+            "json_decode_error": True,
+            "raw": body.decode("utf-8", "replace"),
+        }
+    if not isinstance(decoded, dict):
+        return {"status": "error", "raw": repr(decoded)}
+    return decoded
+
+
+def _format_error(response: dict[str, Any]) -> str:
+    if "http_status" in response:
+        return f"HTTP {response['http_status']}: {response.get('raw', '')}"
+    for key in ("transport_error", "timeout_error", "raw"):
+        if key in response:
+            return str(response[key])
+    return str(response)
 
 
 def _is_retryable(response: dict[str, Any]) -> bool:
@@ -42,9 +86,7 @@ def _is_retryable(response: dict[str, Any]) -> bool:
     if "transport_error" in response or response.get("json_decode_error") is True:
         return True
     status = response.get("http_status")
-    return isinstance(status, int) and (
-        status in _RETRYABLE_HTTP_STATUS_CODES or 500 <= status < 600
-    )
+    return isinstance(status, int) and http_status_is_infra(status)
 
 
 def rollout_payload(
@@ -83,7 +125,7 @@ def parse_rollout_response(response: dict[str, Any], *, url: str) -> dict[str, A
     """
     if response.get("status") == "error":
         raise RuntimeError(
-            f"Dynamo rollout request to {url} failed: {format_dynamo_error(response)}"
+            f"Dynamo rollout request to {url} failed: {_format_error(response)}"
         )
     engine_data = (response.get("nvext") or {}).get("engine_data")
     if not isinstance(engine_data, dict) or "rollout" not in engine_data:
@@ -95,12 +137,12 @@ def parse_rollout_response(response: dict[str, Any], *, url: str) -> dict[str, A
 
 
 async def post_rollout(
-    url: str, payload: dict[str, Any], timeout_s: float
+    url: str, payload: dict[str, Any], timeout_s: float | None
 ) -> dict[str, Any]:
     """POST one rollout, retrying transient errors; returns its ``engine_data``."""
     response: dict[str, Any] = {}
     for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
-        response = await async_http_post_json(url, payload, timeout_s)
+        response = await _post_json(url, payload, timeout_s)
         if not _is_retryable(response) or attempt == _HTTP_MAX_ATTEMPTS:
             break
         LOGGER.warning(
@@ -108,7 +150,7 @@ async def post_rollout(
             attempt,
             _HTTP_MAX_ATTEMPTS,
             _HTTP_RETRY_DELAY_S,
-            format_dynamo_error(response),
+            _format_error(response),
         )
         await asyncio.sleep(_HTTP_RETRY_DELAY_S)
     if "timeout_error" in response:
@@ -116,7 +158,6 @@ async def post_rollout(
         raise RuntimeError(
             f"Dynamo rollout request to {url} failed: {response['timeout_error']}. "
             "For longer sequences, increase "
-            "policy.generation.dynamo_cfg.request_timeout_s, e.g. to "
-            f"{int(timeout_s * 2)}."
+            "policy.generation.dynamo_cfg.request_timeout_s, or set it to null."
         )
     return parse_rollout_response(response, url=url)

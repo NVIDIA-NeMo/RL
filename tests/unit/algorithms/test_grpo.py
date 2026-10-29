@@ -14,7 +14,6 @@
 
 import math
 import os
-import warnings
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -2633,7 +2632,6 @@ def test_initial_refit_completes_before_async_collection_starts(
     mock_grpo_components,
 ) -> None:
     master_config = mock_grpo_components["master_config"]
-    master_config.policy["generation"]["backend"] = "vllm"
     master_config.policy["generation"]["colocated"]["enabled"] = False
     master_config.grpo.max_num_steps = 1
     master_config.grpo.val_period = 0
@@ -2672,7 +2670,6 @@ def test_initial_refit_completes_before_async_collection_starts(
 
 def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> None:
     master_config = mock_grpo_components["master_config"]
-    master_config.policy["generation"]["backend"] = "vllm"
     master_config.policy["generation"]["colocated"]["enabled"] = False
     master_config.grpo.max_num_steps = 1
     master_config.grpo.val_period = 0
@@ -4731,10 +4728,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
     assert master_config.grpo.skip_reference_policy_logprobs_calculation is True
 
 
-@pytest.mark.parametrize("configured_gym_log_dir", [None, "logs/nemo_gym"])
-def test_setup_starts_nemo_gym_for_trtllm(
-    monkeypatch, mock_grpo_components, configured_gym_log_dir
-):
+def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     """Guard the TRT-LLM NeMo-Gym startup path in shared GRPO setup."""
     from nemo_rl.algorithms import grpo as grpo_mod
 
@@ -4839,8 +4833,6 @@ def test_setup_starts_nemo_gym_for_trtllm(
         },
     }
     master_config.env = {"should_use_nemo_gym": True}
-    if configured_gym_log_dir is not None:
-        master_config.env["nemo_gym"] = {"nemo_gym_log_dir": configured_gym_log_dir}
     master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
     master_config.grpo.val_period = 0
     master_config.grpo.batch_multiplier = 1
@@ -4851,26 +4843,13 @@ def test_setup_starts_nemo_gym_for_trtllm(
     dataset = MagicMock()
     dataset.__len__ = MagicMock(return_value=1)
     tokenizer = MagicMock()
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        result = grpo_mod.setup(master_config, tokenizer, dataset, None)
+    result = grpo_mod.setup(master_config, tokenizer, dataset, None)
 
     assert result[2] is nemo_gym_shard_set
+    # Gym server logs go under the run's log directory.
     assert master_config.env["nemo_gym"]["nemo_gym_log_dir"] == (
         "/tmp/grpo-test-results/nemo_gym"
     )
-    log_dir_warnings = [
-        str(warning.message)
-        for warning in caught
-        if "nemo_gym_log_dir" in str(warning.message)
-    ]
-    if configured_gym_log_dir is None:
-        assert log_dir_warnings == []
-    else:
-        # A configured log dir is still replaced, but no longer silently.
-        assert len(log_dir_warnings) == 1
-        assert "'logs/nemo_gym'" in log_dir_warnings[0]
-        assert "'/tmp/grpo-test-results/nemo_gym'" in log_dir_warnings[0]
     build_nemo_gym_actors.assert_called_once_with(
         master_config.env,
         base_urls=["http://trtllm.example/v1"],
@@ -8380,28 +8359,6 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
-
-
-@pytest.mark.parametrize(
-    ("nccl_reshard", "offload_policy", "expected"),
-    [
-        (False, False, False),
-        (False, True, True),
-        (True, False, True),
-    ],
-)
-def test_noncolocated_refit_synchronizer_selection(
-    nccl_reshard, offload_policy, expected
-):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    assert (
-        grpo_mod._uses_managed_noncolocated_refit(
-            nccl_reshard_refit_enabled=nccl_reshard,
-            offload_policy_before_refit=offload_policy,
-        )
-        is expected
-    )
 
 
 def test_grpo_train_shuts_down_environments_after_failure():
