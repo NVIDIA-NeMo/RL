@@ -1744,9 +1744,8 @@ class RolloutManager:
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._rollout_recovery_config = rollout_recovery_config
-        # grpo.masked_reward_policy=exclude_infra only: token-capture
-        # finalization gives infrastructure-failed rows a sample_mask of 0, as
-        # the native payload path does (rollouts.infra_failure_flags).
+        # exclude_infra kinds for token-capture finalization (see
+        # rollouts.infra_failure_flags).
         self._policy_failure_kinds = policy_failure_kinds
         self._tq_buffer = tq_buffer
         self._recovery_ledger = RolloutRecoveryLedger()

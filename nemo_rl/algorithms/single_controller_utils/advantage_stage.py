@@ -423,16 +423,10 @@ class AdvantageComputer:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
-        # Statistics participation is binary and independent of the loss
-        # weights (grpo._binary_participation). ``include`` and
-        # ``exclude_infra`` let every row with a nonzero data-plane sample_mask
-        # vote, so token-capture placeholders, datums with a dataset-level
-        # loss_multiplier of 0 and (under ``exclude_infra``) rows the
-        # environment masked for an infrastructure failure, which the payload
-        # builders give a sample_mask of 0, never do; the legacy and
-        # TransferQueue loops read the same dataset weight
-        # (grpo._include_valid_mask), so every trainer normalizes over the same
-        # rows. ``exclude`` lets the rows with a nonzero final loss weight vote.
+        # Binary participation (grpo._binary_participation): include and
+        # exclude_infra vote by dataset weight, as the other trainers do
+        # (grpo._include_valid_mask); exclude by the final loss weight. See
+        # "Masked rewards in advantage statistics" in docs/guides/grpo.md.
         # PPO's GAE ignores valid_mask.
         participation = final_sample_mask
         if not cfg.is_ppo and _votes_by_dataset_weight(cast(GRPOConfig, cfg.algo)):

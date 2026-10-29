@@ -2185,9 +2185,7 @@ def setup_single_controller(
     )
 
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
-    # grpo.masked_reward_policy=exclude_infra: both payload paths (native
-    # commit and token-capture finalization) give infrastructure-failed rows a
-    # sample_mask of 0. PPO has no masked-reward policy.
+    # exclude_infra kinds for both payload paths; None for PPO.
     policy_failure_kinds = exclude_infra_policy_kinds(
         None if is_ppo_run(master_config) else cast(GRPOConfig, algo_cfg)
     )

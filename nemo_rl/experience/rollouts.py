@@ -3497,9 +3497,7 @@ def _postprocess_single_nemo_gym_group(
             result["full_result"] for result in results
         )
         if policy_failure_kinds is not None:
-            # grpo.masked_reward_policy=exclude_infra: an infrastructure
-            # failure's reward measured nothing, so it gets the dataset weight
-            # of an unusable row and never votes in the advantage statistics.
+            # exclude_infra: dataset weight 0 (see infra_failure_flags).
             infra_failure = infra_failure_flags(
                 (result["full_result"] for result in results), policy_failure_kinds
             )

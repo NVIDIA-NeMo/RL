@@ -1279,9 +1279,8 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     assert estimator.mask is not None
     assert estimator.mask[0].all()
     assert estimator.mask[1:].count_nonzero() == 0
-    # exclude_infra votes like include here: the payload builders already gave
-    # any infrastructure-failed row a sample_mask of 0, and this batch's
-    # environment-masked row kept its weight (a policy-caused mask).
+    # This env-masked row kept its weight (a policy-caused mask), so
+    # exclude_infra votes like include.
     expected_valid_mask = (
         torch.tensor([1.0, 0.0, 0.0, 0.0])
         if policy == "exclude"
@@ -4661,9 +4660,7 @@ def test_advantage_stage_infra_masked_reward_never_moves_valid_siblings(
         grpo=cfg, loss_fn=ClippedPGLossConfig(use_kl_in_reward=False)
     )
     env_extras = [{}, {}, {"mask_sample": True}]
-    # What the payload builders publish (record_to_train_batch and the
-    # token-capture finalizer): exclude_infra gives the infrastructure failure
-    # a data-plane sample_mask of 0.
+    # sample_mask as the payload builders publish it (0 for infra failures).
     sample_mask = torch.ones(3)
     policy_failure_kinds = exclude_infra_policy_kinds(cfg)
     if policy_failure_kinds is not None:
