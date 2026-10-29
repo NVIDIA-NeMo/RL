@@ -341,8 +341,8 @@ class RolloutReassembler:
         except (TypeError, ValueError) as error:
             return rejected(f"invalid_receipt:{error}", [])
         staging_keys = [record.staging_key for record in parsed.manifest]
-        if parsed.rollout_id != rollout_id:
-            return rejected(f"identity_mismatch:{parsed.rollout_id}", staging_keys)
+        if parsed.capture_key != rollout_id:
+            return rejected(f"identity_mismatch:{parsed.capture_key}", staging_keys)
         if parsed.failure_reason is not None:
             return rejected(f"rollout_failed:{parsed.failure_reason}", staging_keys)
         if parsed.capture_poisoned:

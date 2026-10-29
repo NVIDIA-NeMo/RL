@@ -577,61 +577,30 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
     assert should_use_nemo_gym(config) is True
 
 
-@pytest.mark.parametrize("dynamo", [False, True])
-def test_setup_nemo_gym_config_vllm_speaks_dynamo_dialect_only_with_dynamo(
-    dynamo: bool,
-) -> None:
-    """With Dynamo, Gym's policy model calls the frontend in Gym's Dynamo dialect."""
-    from nemo_rl.algorithms.grpo import MasterConfig
-    from nemo_rl.environments.nemo_gym import (
-        setup_nemo_gym_config,
-        should_use_nemo_gym,
-    )
-
-    config = MasterConfig.model_construct(
-        env={"should_use_nemo_gym": True},
-        data={},
-        policy={
-            "generation": {
-                "backend": "vllm",
-                "dynamo": dynamo,
-                "vllm_cfg": {"async_engine": False, "expose_http_server": False},
-            }
-        },
-    )
-
-    setup_nemo_gym_config(config, tokenizer=None)
-
-    vllm_cfg = config.policy["generation"]["vllm_cfg"]
-    assert vllm_cfg["async_engine"] is True
-    assert vllm_cfg["expose_http_server"] is True
-    assert should_use_nemo_gym(config) is True
-    if dynamo:
-        # A NeMo RL key each actor applies to its composed config, not a
-        # policy_model overlay a sharded plan would need an owner for.
-        assert config.env["nemo_gym"] == {
-            "dynamo_dialect": {"default_chat_template_kwargs": {}}
-        }
-    else:
-        assert "nemo_gym" not in config.env
-
-
 @pytest.mark.parametrize(
-    "vllm_model",
+    ("vllm_model", "refused"),
     [
-        {},
-        {"chat_template_kwargs": {"enable_thinking": False}},
-        {"extra_body": {"chat_template_kwargs": {"force_nonempty_content": True}}},
+        ({}, False),
+        ({"chat_template_kwargs": {"enable_thinking": False}}, False),
+        (
+            {"extra_body": {"chat_template_kwargs": {"force_nonempty_content": True}}},
+            False,
+        ),
+        # The frontend answers every request carrying bad_words with a 400.
+        ({"extra_body": {"bad_words": ["x"]}}, True),
     ],
 )
 def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
-    vllm_model: dict,
+    vllm_model: dict, refused: bool
 ) -> None:
     """The native server's default template kwargs go under every kwargs Gym has."""
+    from responses_api_models.vllm_model.app import VLLMModelConfig
+
     from nemo_rl.algorithms.grpo import MasterConfig
     from nemo_rl.environments.nemo_gym import (
         build_nemo_gym_config,
         setup_nemo_gym_config,
+        should_use_nemo_gym,
     )
 
     user_vllm_model = copy.deepcopy(vllm_model)
@@ -662,19 +631,40 @@ def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
     )
 
     setup_nemo_gym_config(config, tokenizer=None)
-    gym_config = build_nemo_gym_config(
-        config.env,
-        base_urls=["http://frontend"],
-        model_name="test-model",
-        enable_router_replay=False,
-        use_fastokens=False,
-    )["initial_global_config_dict"]
+    assert should_use_nemo_gym(config) is True
 
+    def build() -> dict:
+        return build_nemo_gym_config(
+            config.env,
+            base_urls=["http://frontend"],
+            model_name="test-model",
+            enable_router_replay=False,
+            use_fastokens=False,
+        )["initial_global_config_dict"]
+
+    if refused:
+        with pytest.raises(ValueError, match="bad_words"):
+            build()
+        return
+    gym_config = build()
     composed = gym_config["policy_model"]["responses_api_models"]["vllm_model"]
-    assert composed["dynamo_frontend"] is True
+    # Read back through Gym's own config, which ignores keys it does not know.
+    gym_model = VLLMModelConfig(
+        host="localhost",
+        port=8000,
+        name="policy_model",
+        entrypoint="app.py",
+        base_url="http://frontend",
+        api_key="dummy_key",
+        model="test-model",
+        return_token_id_information=True,
+        uses_reasoning_parser=True,
+        **composed,
+    )
+    assert gym_model.dynamo_frontend is True
     # The frontend refuses reasoning under both of Gym's keys.
-    assert composed["reasoning_field"] == "reasoning_content"
-    assert composed["default_chat_template_kwargs"] == {
+    assert gym_model.reasoning_field == "reasoning_content"
+    assert gym_model.default_chat_template_kwargs == {
         "enable_thinking": True,
         "truncate_history_thinking": False,
     }

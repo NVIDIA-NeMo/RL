@@ -228,7 +228,7 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     receipt, expected = _stage_fixture(
         tq_client, "worked_example", rollout_id=f"{group_id}_g0"
     )
-    receipt["rollout_id"] = f"{group_id}_g0"
+    receipt["capture_key"] = f"{group_id}_g0"
     # Mark this receipt's terminal as heuristically selected so the group
     # metric sees a mixed declared/heuristic population.
     receipt["terminal_selection"] = "heuristic"
@@ -297,7 +297,7 @@ def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
     receipt, expected = _stage_fixture(
         tq_client, "worked_example", rollout_id=f"{group_id}_g0"
     )
-    receipt["rollout_id"] = f"{group_id}_g0"
+    receipt["capture_key"] = f"{group_id}_g0"
     assert receipt["terminal_selection"] == "declared"
     # A manifest that never parsed ran no attribution stage, so the receipt
     # carries terminal_selection=None (Gym #2823, pinned 9fc05c0f) rather than a method.
@@ -355,7 +355,7 @@ def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(
         "worked_example",
         rollout_id=physical_id,
     )
-    receipt["rollout_id"] = physical_id
+    receipt["capture_key"] = physical_id
 
     finalized = _finalizer(tq_client).finalize_group(
         group_id,
@@ -479,7 +479,7 @@ def _record_with_routes(record: StagedCallRecord, routes: list) -> StagedCallRec
         schema_version=record.schema_version,
         digest_version=record.digest_version,
         extras_digest_version=record.extras_digest_version,
-        rollout_id=record.rollout_id,
+        capture_key=record.capture_key,
         model_call_id=record.model_call_id,
         parent_call_id=record.parent_call_id,
         mode=record.mode,

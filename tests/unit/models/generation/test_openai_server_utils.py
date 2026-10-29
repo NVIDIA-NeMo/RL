@@ -17,7 +17,6 @@ import pytest
 
 from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
-    derive_prefix_eos_count,
     replace_prefix_tokens,
     splice_prefix_tokens,
 )
@@ -161,37 +160,27 @@ def test_splice_prefix_tokens_without_tokenizer_honors_explicit_eos_ids(
     )
     assert result == expected
     assert result.token_ids[: len(model_prefix)] == model_prefix
-    # A host without the messages (managed Dynamo's engine) passes the EOS count
-    # derived from the prefix instead of the template prefix render.
+    # A host without the messages (the Dynamo engine) passes no template prefix.
     assert (
         splice_prefix_tokens(
             tokenizer=None,
             model_prefix_token_ids=model_prefix,
+            template_prefix_token_ids=None,
             template_token_ids=template,
             eos_token_id=eos_token_id,
-            template_prefix_eos_count=derive_prefix_eos_count(
-                model_prefix, eos_token_id=eos_token_id
-            ),
         )
         == expected
     )
-    with pytest.raises(ValueError, match="exactly one"):
-        splice_prefix_tokens(
-            tokenizer=None,
-            model_prefix_token_ids=model_prefix,
-            template_prefix_token_ids=template_prefix,
-            template_token_ids=template,
-            eos_token_id=eos_token_id,
-            template_prefix_eos_count=1,
-        )
 
 
 @pytest.mark.parametrize(
     "model_name", ["Qwen/Qwen3-0.6B", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"]
 )
-def test_derived_prefix_eos_count_matches_real_template_renders(model_name):
-    """Across tool-calling turns with reasoning, the EOS count derived from the
-    exact prefix equals the count in the template's render of the same history."""
+def test_splicing_without_the_template_prefix_matches_real_template_renders(
+    model_name,
+):
+    """Across tool-calling turns with reasoning, splicing without the template's
+    render of the history (as the Dynamo engine does) matches splicing with it."""
     transformers = pytest.importorskip("transformers")
     try:
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
@@ -242,16 +231,19 @@ def test_derived_prefix_eos_count_matches_real_template_renders(model_name):
         messages = [*messages, {"role": "assistant", "content": reply}, follow_up]
         template_prefix = render(messages[:-1], add_generation_prompt=False)
         template = render(messages, add_generation_prompt=True)
-        assert derive_prefix_eos_count(chain, eos_token_id=eos) == sum(
-            token == eos for token in template_prefix
-        )
         spliced = splice_prefix_tokens(
             tokenizer=tokenizer,
             model_prefix_token_ids=chain,
             template_prefix_token_ids=template_prefix,
             template_token_ids=template,
-        ).token_ids
-        chain = spliced + generate(next_reply)
+        )
+        assert spliced == splice_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=chain,
+            template_prefix_token_ids=None,
+            template_token_ids=template,
+        )
+        chain = spliced.token_ids + generate(next_reply)
 
 
 def test_replace_prefix_tokens_without_tokenizer_reports_missing_eos_without_decoding():
