@@ -111,7 +111,7 @@ sbatch ray.sub \
 * - `WANDB_API_KEY`
   - Setting this allows you to use the wandb logger without having to run `wandb login`.
 * - `HF_TOKEN`
-  - Setting the token used by huggingface-hub. Avoids having to run the `huggingface-cli login`
+  - Setting the token used by huggingface-hub. Avoids having to run the `hf auth login`
 * - `HF_DATASETS_CACHE`
   - Sets the cache dir for downloaded Huggingface datasets.
 ``````
@@ -276,7 +276,7 @@ SEGMENT_SIZE=2     # nodes per NVLink-domain segment; -> sbatch --segment
 
 ## Kubernetes
 
-This guide outlines the process of migrating NemoRL training jobs from a Slurm environment to a Kubernetes cluster utilizing Ray orchestration and NVIDIA GPUs.
+This guide outlines the process of migrating NeMo RL training jobs from a Slurm environment to a Kubernetes cluster utilizing Ray orchestration and NVIDIA GPUs.
 
 ---
 
@@ -313,11 +313,11 @@ docker login nvcr.io
 ```
 
 **Build and Push**
-Clone the NemoRL repository and build the container.
+Clone the NeMo RL repository and build the container.
 
 ```bash
 # Clone recursively
-git clone [https://github.com/NVIDIA-NeMo/RL](https://github.com/NVIDIA-NeMo/RL) --recursive
+git clone https://github.com/NVIDIA-NeMo/RL.git --recursive
 cd RL
 
 # If you already cloned without --recursive, update submodules:
@@ -382,7 +382,7 @@ We will create a Ray cluster with **1x Head node** and **1x Worker node** (with 
 * **Memory:** Disables Ray's OOM killer to prevent false positives.
 * **Caching:** Redirects HuggingFace cache to the shared PVC.
 * **Version Match:** The `rayVersion` spec must match the version in `RL/pyproject.toml`. Check this example [version snapshot](https://github.com/NVIDIA-NeMo/RL/blob/b2e4265d4f2424c0467691f2f0f864cdebe1ab0f/pyproject.toml#L25).
-* **Container image:** Replace the image name `nvcr.io/nvidian/nemo-rl:latest` with your actual image, e.g., `nvcr.io/YOUR_NGC_ORG/nemo-rl:latest`.
+* **Container image:** Replace `<NGC_ORG>` in `nvcr.io/<NGC_ORG>/nemo-rl:latest` with the NGC org you pushed to in the build step.
 
 > [!WARNING]
 > **Check Your Node Capacity & Resource Limits**
@@ -431,7 +431,7 @@ spec:
         
         containers:
         - name: ray-head
-          image: nvcr.io/nvidian/nemo-rl:latest
+          image: nvcr.io/<NGC_ORG>/nemo-rl:latest
           imagePullPolicy: Always
           resources:
             limits:
@@ -502,7 +502,7 @@ spec:
 
         containers:
         - name: ray-worker
-          image: nvcr.io/nvidian/nemo-rl:latest
+          image: nvcr.io/<NGC_ORG>/nemo-rl:latest
           imagePullPolicy: Always
           resources:
             limits:
@@ -553,7 +553,7 @@ spec:
 
 ---
 
-## Phase 3: Run Sample NemoRL Workloads
+## Phase 3: Run Sample NeMo RL Workloads
 
 Once the cluster is running, you can interact with the Ray head node to submit jobs.
 
@@ -567,7 +567,7 @@ Inside the pod, clone the code to the shared PVC (`/shared`). This ensures worke
 
 ```bash
 cd /shared
-git clone [https://github.com/NVIDIA-NeMo/RL](https://github.com/NVIDIA-NeMo/RL) --recursive
+git clone https://github.com/NVIDIA-NeMo/RL.git --recursive
 cd RL
 git submodule update --init --recursive
 ```
