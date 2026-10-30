@@ -1215,6 +1215,50 @@ class TestSetupModelAndOptimizer:
         call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
         assert "num_labels" not in call_kwargs
 
+    @pytest.mark.parametrize("fp32_lm_head", [None, False, True])
+    @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.setup.get_class")
+    def test_setup_model_requests_fp32_logits_only_with_fp32_lm_head(
+        self,
+        mock_get_class,
+        mock_get_rank,
+        mock_lambda_lr,
+        fp32_lm_head,
+        mock_config,
+        mock_runtime_config,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """automodel_cfg.fp32_lm_head=true asks Automodel for float32 logits."""
+        if fp32_lm_head is not None:
+            mock_config["automodel_cfg"]["fp32_lm_head"] = fp32_lm_head
+        mock_get_rank.return_value = 0
+        mock_lambda_lr.return_value = MagicMock()
+
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {}
+        mock_model.config = MagicMock()
+        mock_model.config.pad_token_id = 0
+        mock_runtime_config.model_class.from_pretrained.return_value = mock_model
+        mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
+        mock_get_class.return_value = MagicMock(return_value=MagicMock())
+
+        setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=mock_runtime_config,
+            distributed_context=mock_distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+        )
+
+        call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
+        if fp32_lm_head:
+            assert call_kwargs["logits_dtype"] is torch.float32
+        else:
+            assert "logits_dtype" not in call_kwargs
+
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")

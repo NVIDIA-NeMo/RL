@@ -915,6 +915,9 @@ def setup_model_and_optimizer(
     # Reward model num_labels override
     if is_reward_model and model_config.num_labels == 1:
         from_pretrained_kwargs["num_labels"] = 1
+    # Write fp32 logits from the bf16 LM-head GEMM, matching vLLM's fp32 head.
+    if config["automodel_cfg"].get("fp32_lm_head"):
+        from_pretrained_kwargs["logits_dtype"] = torch.float32
 
     # Auto-set force_hf if the custom model's adapter doesn't support per-tensor
     # HF conversion (required for weight syncing).

@@ -152,6 +152,28 @@ policy:
       logprobs_mode: raw_logprobs
 ```
 
+With an Automodel trainer, set `policy.automodel_cfg.fp32_lm_head` instead:
+
+```yaml
+policy:
+  automodel_cfg:
+    fp32_lm_head: true
+  generation:
+    backend: vllm
+    vllm_cfg:
+      fp32_lm_head: ${policy.automodel_cfg.fp32_lm_head}
+      logprobs_mode: raw_logprobs
+```
+
+This passes `logits_dtype=torch.float32` to Automodel, whose LM-head GEMM then
+writes FP32 logits from BF16 operands with the same
+`torch.mm(..., out_dtype=torch.float32)` call
+([Automodel #4574](https://github.com/NVIDIA-NeMo/Automodel/pull/4574)).
+Automodel validates support at setup: its Llama, Qwen2 and Qwen3
+implementations declare it, while Hugging Face classes selected with
+`force_hf`, pipeline parallelism, and LoRA- or quantization-wrapped heads are
+rejected. It requires an Automodel version that includes that change.
+
 The optional boolean defaults to `false` in the exemplar configurations. For
 standalone evaluation, set `generation.vllm_cfg.fp32_lm_head: true` without a
 trainer. Both synchronous and asynchronous workers pass the setting through
@@ -171,9 +193,9 @@ The LM head itself must be unquantized; quantized transformer layers with an
 unquantized head are supported by vLLM. Custom model implementations that bypass
 `LogitsProcessor` are outside this feature's scope. NeMo RL rejects conflicting
 `hf_overrides.head_dtype` settings and the obsolete `NRL_VLLM_FP32_LM_HEAD`
-environment switch. Training requires matching Megatron and vLLM flags; Automodel
-has no matching switch, and Megatron's fused linear/logprob path bypasses the
-output layer, so those combinations are rejected.
+environment switch. Training requires matching trainer (Megatron or Automodel)
+and vLLM flags, and Megatron's fused linear/logprob path bypasses the output
+layer, so a one-sided head and that combination are rejected.
 
 #### Validating precision and performance
 
