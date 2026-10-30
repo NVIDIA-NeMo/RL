@@ -19,6 +19,29 @@ quantization, PPO, distillation, colocation, and streaming dispatches are outsid
 the supported scope. Configuration validation rejects unsupported combinations before allocation;
 worker guards also protect direct lifecycle callers.
 
+## Configuration entrypoint
+
+Start from `examples/configs/grpo_math_1B_automodel_single_controller.yaml`:
+
+```bash
+uv run examples/run_grpo_single_controller.py \
+  --config examples/configs/grpo_math_1B_automodel_single_controller.yaml
+```
+
+This exemplar inherits `grpo_math_1B.yaml` and supplies the supported AutoModel
+SC settings: async vLLM on separate GPUs, TransferQueue, in-order sampling with
+zero lookahead, fixed microbatches, and full-batch admission. The default layout
+uses one training GPU and one rollout GPU. Global batch size, admission threshold,
+and buffer capacities follow the configured prompt/generation counts.
+Checkpointing is disabled in the base; enabling it retains optimizer and native
+TQ replay state. Configure the run length, model, workload, and resources for
+the intended experiment.
+
+The Qwen full-batch regression recipe inherits this exemplar and supplies its
+model/workload, checkpoint, and output settings. L1 and nightly continue to use
+that recipe with their existing step/checkpoint overrides. Extracting the base
+preserves the recipe's fully resolved configuration.
+
 ## Interfaces and ownership
 
 `setup_single_controller` already constructs `TQPolicy`. Its existing methods
@@ -116,7 +139,7 @@ wrapper tests remain backend independent.
 | --- | --- | --- |
 | Worker unit tests | `tests/unit/models/policy/test_automodel_split_state.py`: lifecycle, guards, failure cleanup, buffer and MoE hook behavior | Existing AutoModel L0 policy shards |
 | GPU numerical parity | `tests/unit/models/policy/test_automodel_split_parity.py`: tiny Llama, two FSDP ranks, two updates for each loss normalization, masks and gradient accumulation | Existing AutoModel L0 policy shards; HF-gated marker, like MCore's tiny-model fixture |
-| Configuration | `tests/unit/single_controller/test_automodel_config.py`: unsupported configurations and the regression recipe | Shared L0 controller suite |
+| Configuration | `tests/unit/single_controller/test_automodel_config.py`: base exemplar, prompt-count overrides, derived regression recipe, and unsupported configurations | Shared L0 controller suite |
 | Live integration | `tests/functional/automodel_sc_full_batch_smoke.sh`: Qwen2.5-1.5B, one training and one rollout GPU, timeout checkpoint at step 1, resume through step 4 | `L1_Functional_Tests_Automodel_SingleController.sh`, including FAST |
 | Longer regression | `grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch` recipe and matching driver: 100 updates, finite metrics, zero lag, logprob health and final checkpoint | `tests/test_suites/nightly.txt` |
 
