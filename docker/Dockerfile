@@ -152,7 +152,8 @@ ARG PYTHON_VERSION=3.13.14
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
         | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && \
-    uv python install ${PYTHON_VERSION}
+    uv python install ${PYTHON_VERSION} && \
+    find /opt/uv/python -path "*/pip/_vendor/distlib/*.exe" -delete
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
