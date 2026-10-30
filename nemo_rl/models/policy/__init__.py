@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from typing import Annotated, Any, Literal, NotRequired, TypedDict, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import (
@@ -198,13 +198,35 @@ class AutomodelCheckpointConfig(TypedDict, total=False):
     consolidation_timeout_minutes: int
 
 
+class AutomodelPipelineConfig(BaseModel, extra="forbid"):
+    """Pipeline schedule of the Automodel policy (``policy.automodel_cfg.pipeline``).
+
+    Read only when ``policy.automodel_cfg.pipeline_parallel_size > 1``. The
+    schedule is 1F1B, which places one stage on each pipeline rank. Each
+    schedule call runs ``microbatches_per_step`` microbatches of
+    ``policy.train_micro_batch_size`` samples through every pipeline stage.
+    """
+
+    # Microbatches per schedule call (M), at least pipeline_parallel_size. There
+    # is no default because M trades the pipeline bubble (~(pp_size - 1) /
+    # (M + pp_size - 1) of each call) against receive-buffer memory (one buffer
+    # per microbatch on every non-first stage) and padding (a call's M
+    # microbatches share one sequence length).
+    microbatches_per_step: Annotated[int, Field(gt=0)]
+
+
 class AutomodelConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
     # Distributed parallelism sizes
-    # data_parallel_size is derived from world_size / (tp * cp * ep)
+    # data_parallel_size is derived from world_size / (pp * tp * cp * ep)
     tensor_parallel_size: int
     context_parallel_size: int
+    # Pipeline parallel size; an absent key means 1 (no pipeline parallelism).
+    # Values > 1 require the `pipeline` block below and an explicit
+    # defer_fsdp_grad_sync. See docs/design-docs/automodel-pipeline-parallel.md.
+    pipeline_parallel_size: NotRequired[int]
+    pipeline: NotRequired[AutomodelPipelineConfig]
     expert_parallel_size: NotRequired[int]
     # Size of the HSDP replicate dimension within the data-parallel axis.
     dp_replicate_size: NotRequired[int]

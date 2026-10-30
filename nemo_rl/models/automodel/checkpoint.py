@@ -203,6 +203,7 @@ class AutomodelCheckpointManager:
         dp_mesh: DeviceMesh,
         tp_mesh: DeviceMesh,
         moe_mesh: Optional[DeviceMesh] = None,
+        pp_mesh: Optional[DeviceMesh] = None,
     ):
         """Initialize the AutomodelCheckpointManager.
 
@@ -210,11 +211,14 @@ class AutomodelCheckpointManager:
             dp_mesh: The data parallel device mesh.
             tp_mesh: The tensor parallel device mesh.
             moe_mesh: Optional MoE device mesh.
+            pp_mesh: Optional pipeline parallel device mesh; only consulted
+                when it spans more than one rank.
         """
         self.checkpointer: Optional[Checkpointer] = None
         self.dp_mesh = dp_mesh
         self.tp_mesh = tp_mesh
         self.moe_mesh = moe_mesh
+        self.pp_mesh = pp_mesh
 
     def _get_dp_rank(self) -> int:
         """Get the data parallel rank."""
@@ -264,11 +268,13 @@ class AutomodelCheckpointManager:
             checkpoint_dir="",
             **config_updates,
         )
+        pp_enabled = self.pp_mesh is not None and self.pp_mesh.size() > 1
         self.checkpointer = base_cfg.build(
             dp_rank=self._get_dp_rank(),
             tp_rank=self._get_tp_rank(),
-            pp_rank=0,
+            pp_rank=self.pp_mesh.get_local_rank() if pp_enabled else 0,
             moe_mesh=self.moe_mesh,
+            pp_group=self.pp_mesh.get_group() if pp_enabled else None,
         )
 
     def finalize_async_save(self) -> None:
@@ -335,6 +341,7 @@ class AutomodelCheckpointManager:
         *,
         is_final_checkpoint: bool,
         peft_config: Optional[PeftConfig] = None,
+        optimizer_part_ids: Optional[list[int]] = None,
     ) -> None:
         """Save a checkpoint of the model.
 
@@ -357,6 +364,8 @@ class AutomodelCheckpointManager:
                 consolidates these checkpoints. Timeout recovery checkpoints are
                 resumable and are not considered final.
             peft_config: Optional PEFT configuration.
+            optimizer_part_ids: Global pipeline stage index of the model under
+                pipeline parallelism; namespaces its optimizer state.
         """
         print(f"Saving checkpoint to {weights_path}")
         assert self.checkpointer is not None, (
@@ -382,6 +391,7 @@ class AutomodelCheckpointManager:
                 model=model,
                 weights_path=optimizer_path,
                 scheduler=scheduler,
+                optimizer_part_ids=optimizer_part_ids,
             )
 
         if tokenizer_path and tokenizer is not None:
@@ -429,6 +439,8 @@ class AutomodelCheckpointManager:
         optimizer: Optional[torch.optim.Optimizer] = None,
         optimizer_path: Optional[str] = None,
         scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+        *,
+        optimizer_part_ids: Optional[list[int]] = None,
     ) -> None:
         """Load a checkpoint into the model using Automodel Checkpointer.
 
@@ -438,6 +450,8 @@ class AutomodelCheckpointManager:
             optimizer: Optional optimizer to load state into.
             optimizer_path: Optional path to optimizer checkpoint.
             scheduler: Optional learning rate scheduler.
+            optimizer_part_ids: Global pipeline stage index of the model under
+                pipeline parallelism; namespaces its optimizer state.
         """
         print(f"Loading weights from {weights_path}")
         assert self.checkpointer is not None, (
@@ -460,6 +474,7 @@ class AutomodelCheckpointManager:
                 model=model,
                 weights_path=optimizer_path,
                 scheduler=scheduler,
+                optimizer_part_ids=optimizer_part_ids,
             )
 
     def check_master_weight_dtypes(

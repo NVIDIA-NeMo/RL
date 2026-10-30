@@ -50,7 +50,10 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    automodel_pipeline_parallel_size,
+    get_runtime_env_for_policy_worker,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
@@ -158,6 +161,12 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         )
 
         print("Initializing AutomodelValueWorker")
+
+        if automodel_pipeline_parallel_size(config["automodel_cfg"]) > 1:
+            raise NotImplementedError(
+                "The Automodel value worker does not support "
+                "automodel_cfg.pipeline_parallel_size > 1."
+            )
 
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None

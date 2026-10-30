@@ -247,6 +247,8 @@ tests/test_suites/llm/sft-llama3.2-1b-2n8g-hsdp.sh
 
 # Automodel (8B)
 tests/test_suites/llm/sft-llama3.1-8b-1n8g-automodel-tp2.sh
+# pipeline parallelism (1F1B)
+tests/test_suites/llm/sft-qwen2.5-7b-1n8g-automodel-pp2.sh
 # dynamic batching
 tests/test_suites/llm/sft-llama3.1-8b-1n8g-automodel-tp4-dynamicbatch.sh
 # lora

@@ -343,6 +343,7 @@ def test_offload_releases_moe_dispatcher_state_before_empty_cache(monkeypatch, e
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = nn.Sequential(experts)
     worker.optimizer = None
+    worker.pipeline = None
     worker.move_to_cpu = lambda model: model
     token_probs_at_empty_cache = []
 
@@ -1038,6 +1039,7 @@ class TestAutomodelLoraParamsGenerator:
 
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = model
+        worker.pipeline = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1074,6 +1076,7 @@ class TestAutomodelLoraParamsGenerator:
     def test_prepare_refit_info_contains_only_factor_metadata(self):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
+        worker.pipeline = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1090,6 +1093,7 @@ class TestAutomodelLoraParamsGenerator:
     def test_ipc_producer_uses_worker_refit_generator(self, monkeypatch):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
+        worker.pipeline = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1118,6 +1122,7 @@ class TestAutomodelLoraParamsGenerator:
     def test_collective_producer_uses_worker_refit_generator(self, monkeypatch):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
+        worker.pipeline = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1142,6 +1147,7 @@ class TestAutomodelLoraParamsGenerator:
     def test_refit_params_generator_selects_by_mode(self, monkeypatch, mode, expected):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
+        worker.pipeline = None
         worker.draft_model = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
@@ -1177,6 +1183,7 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
 
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = RouterModel()
+    worker.pipeline = None
     worker.dtype = torch.bfloat16
     worker.draft_model = None
     worker.lora_enabled = False

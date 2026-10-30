@@ -179,28 +179,68 @@ def prepare_model_forward(
             model_context_factory=nullcontext,
         )
 
-    # Automodel's generic CP prep reads ``batch["labels"]`` unconditionally and
-    # shards it alongside input_ids/position_ids (see ``shard_batch_load_balanced``).
-    # NeMo-RL computes its own masked losses from the returned logits, so pass an
-    # all-ignore placeholder purely to satisfy that contract and drop it again
-    # before the forward. ``pop`` tolerates a strategy that consumed it itself.
-    model_batch["labels"] = torch.full_like(processed_inputs.input_ids, -100)
-
-    cp_sharder = ContextParallelSharder(
+    cp_sharder, model_context_factory, model_batch = shard_model_batch_for_cp(
         model,
-        device_mesh,
         model_batch,
+        device_mesh=device_mesh,
         padding_token_id=padding_token_id,
         num_chunks=1,
     )
-    model_context_factory, model_batch = cp_sharder.shard(model_batch)
-    model_batch.pop("labels", None)
     return PreparedModelForward(
         model_batch=model_batch,
         cp_size=cp_size,
         cp_sharder=cp_sharder,
         model_context_factory=model_context_factory,
     )
+
+
+def shard_model_batch_for_cp(
+    model: nn.Module,
+    model_batch: dict[str, Any],
+    *,
+    device_mesh: Optional[DeviceMesh],
+    padding_token_id: int,
+    num_chunks: int,
+) -> tuple[
+    ContextParallelSharder, Callable[[], AbstractContextManager[Any]], dict[str, Any]
+]:
+    """Resolve Automodel's context-parallel sharder for a model batch and shard it.
+
+    Automodel pads and shards the batch's tensors in place, some strategies
+    only once the returned context is entered, so ``model_batch`` must not
+    share storage with the canonical loss-side data.
+
+    Args:
+        model: The model, or under pipeline parallelism a local model part,
+            whose attention backend and CP hook select the strategy.
+        model_batch: Model-facing inputs with full-length sequences.
+        device_mesh: Device mesh with the ``cp`` axis.
+        padding_token_id: Token used to pad ``input_ids`` to the CP granularity.
+        num_chunks: Number of microbatches the batch is split into after
+            sharding (1 outside pipeline parallelism).
+
+    Returns:
+        The sharder, which maps token tensors between the canonical and local
+        sequence layouts; the context factory the forward and backward passes
+        must run in; and the sharded batch.
+    """
+    # Automodel's generic CP prep reads ``batch["labels"]`` unconditionally and
+    # shards it alongside input_ids/position_ids (see ``shard_batch_load_balanced``).
+    # NeMo-RL computes its own masked losses from the returned logits, so pass an
+    # all-ignore placeholder purely to satisfy that contract and drop it again
+    # before the forward. ``pop`` tolerates a strategy that consumed it itself.
+    model_batch["labels"] = torch.full_like(model_batch["input_ids"], -100)
+
+    cp_sharder = ContextParallelSharder(
+        model,
+        device_mesh,
+        model_batch,
+        padding_token_id=padding_token_id,
+        num_chunks=num_chunks,
+    )
+    model_context_factory, model_batch = cp_sharder.shard(model_batch)
+    model_batch.pop("labels", None)
+    return cp_sharder, model_context_factory, model_batch
 
 
 def model_forward(
@@ -343,9 +383,6 @@ def forward_with_post_processing_fn(
             - metrics: Dictionary of metrics from post-processing
             - processed_microbatch: The ProcessedMicrobatch that was processed
     """
-    # Extract the processed components
-    data_dict = processed_mb.data_dict
-    processed_inputs = processed_mb.processed_inputs
     cp_sharder = prepared.cp_sharder
     if prepared.cp_size > 1 and cp_sharder is None:
         raise RuntimeError(
@@ -363,6 +400,55 @@ def forward_with_post_processing_fn(
     # Extract logits from model outputs
     logits = extract_logits(model, outputs)
     del outputs
+
+    result, metrics = post_process_logits(
+        logits,
+        post_processing_fn,
+        processed_mb,
+        cp_sharder=cp_sharder,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+        sampling_params=sampling_params,
+        sequence_dim=sequence_dim,
+    )
+
+    del logits
+    return result, metrics, processed_mb
+
+
+def post_process_logits(
+    logits: torch.Tensor,
+    post_processing_fn: PostProcessingFunction,
+    processed_mb: ProcessedMicrobatch,
+    *,
+    cp_sharder: Optional[ContextParallelSharder],
+    global_valid_seqs: Optional[torch.Tensor],
+    global_valid_toks: Optional[torch.Tensor],
+    sampling_params: Optional[TrainingSamplingParams],
+    sequence_dim: int,
+) -> Tuple[Any, dict[str, Any]]:
+    """Apply sampling-parameter scaling and a post-processor to model logits.
+
+    Shared by the per-microbatch forward above and the pipeline-parallel loss
+    adapter, which receives the last stage's logits from the schedule.
+
+    Args:
+        logits: Model output logits for one microbatch; scaled in place by the
+            sampling temperature.
+        post_processing_fn: Post-processing function to apply to the logits
+        processed_mb: The microbatch the logits belong to
+        cp_sharder: Per-microbatch Automodel sequence-layout owner, or None
+            when context parallelism is inactive.
+        global_valid_seqs: Global valid sequence count for loss normalization
+        global_valid_toks: Global valid token count for loss normalization
+        sampling_params: Sampling parameters (top-k, top-p, temperature)
+        sequence_dim: Sequence dimension
+
+    Returns:
+        tuple: (result, metrics) as returned by forward_with_post_processing_fn.
+    """
+    data_dict = processed_mb.data_dict
+    processed_inputs = processed_mb.processed_inputs
 
     # Draft co-training distills against the policy's raw logits; stash them
     # before the (in-place) temperature scaling below mutates the tensor.
@@ -438,8 +524,22 @@ def forward_with_post_processing_fn(
             f"Unknown post-processing function type: {type(post_processing_fn)}"
         )
 
-    del logits
-    return result, metrics, processed_mb
+    return result, metrics
+
+
+def scale_metrics_for_global_batches(
+    metrics: dict[str, Any], num_global_batches: int
+) -> None:
+    """Scale a microbatch's loss metrics in place by ``1 / num_global_batches``.
+
+    Summing the scaled metrics over every microbatch of a ``train()`` call then
+    gives the per-global-batch value. Min/max metrics are left unscaled.
+    """
+    for k in metrics.keys():
+        if "_min" in k or "_max" in k:
+            continue
+
+        metrics[k] /= num_global_batches
 
 
 def automodel_forward_backward(
@@ -567,13 +667,7 @@ def automodel_forward_backward(
                 if isinstance(post_processing_fn, LossPostProcessor):
                     # skip the update for dummy batches
                     if not is_dummy:
-                        ## scale by the number of global batches so we get the correct
-                        ## value when summing metrics across all microbatches
-                        for k in metrics.keys():
-                            if "_min" in k or "_max" in k:
-                                continue
-
-                            metrics[k] /= num_global_batches
+                        scale_metrics_for_global_batches(metrics, num_global_batches)
                     else:
                         # Zero out loss for dummy batches
                         result = result * 0
