@@ -55,6 +55,8 @@ DOCKER_CLI_VERSION=29.3.0
 DOCKER_VERSION=27.5.1
 GO_CONTAINERREGISTRY_VERSION=0.20.3
 CONTAINERS_IMAGE_VERSION=5.33.1
+GO_JOSE_VERSION=4.1.6
+KLAUSPOST_COMPRESS_VERSION=1.18.7
 DEB_ARCH="$(dpkg --print-architecture)"
 export DEBIAN_FRONTEND=noninteractive
 
@@ -268,6 +270,8 @@ install_from_source() {
     go get "github.com/sigstore/rekor@v${REKOR_VERSION}"
     go get "github.com/containers/image/v5@v${CONTAINERS_IMAGE_VERSION}"
     go get "github.com/docker/cli@v${DOCKER_CLI_VERSION}+incompatible"
+    go get "github.com/go-jose/go-jose/v4@v${GO_JOSE_VERSION}"
+    go get "github.com/klauspost/compress@v${KLAUSPOST_COMPRESS_VERSION}"
     go mod tidy
     go mod vendor
 
@@ -348,7 +352,9 @@ EOF
         "google.golang.org/grpc	v${GRPC_VERSION}" \
         "github.com/sigstore/fulcio	v${FULCIO_VERSION}" \
         "github.com/sigstore/rekor	v${REKOR_VERSION}" \
-        "github.com/docker/cli	v${DOCKER_CLI_VERSION}+incompatible"
+        "github.com/docker/cli	v${DOCKER_CLI_VERSION}+incompatible" \
+        "github.com/go-jose/go-jose/v4	v${GO_JOSE_VERSION}" \
+        "github.com/klauspost/compress	v${KLAUSPOST_COMPRESS_VERSION}"
     assert_go_binary /usr/local/libexec/apptainer/bin/starter \
         "golang.org/x/crypto	v${GO_CRYPTO_VERSION}"
     assert_go_binary /usr/local/libexec/apptainer/bin/gocryptfs \
