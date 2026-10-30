@@ -1,11 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Small v2 Gym staging fixtures shared by the RL data-plane tests."""
+"""Small Gym staging fixtures shared by the RL data-plane tests."""
 
 from __future__ import annotations
 
 from nemo_gym.token_id_capture.staging.digest import (
+    EXTRAS_DIGEST_VERSION,
+    STAGING_DIGEST_VERSION,
     STAGING_SCHEMA_VERSION,
     compute_chain_hash,
     compute_extras_digest,
@@ -68,8 +70,8 @@ def _record(
         **values,
         digest=compute_staging_digest(
             schema_version=STAGING_SCHEMA_VERSION,
-            digest_version=2,
-            extras_digest_version=1,
+            digest_version=STAGING_DIGEST_VERSION,
+            extras_digest_version=EXTRAS_DIGEST_VERSION,
             **{key: value for key, value in values.items() if key != "extras"},
         ),
     )
