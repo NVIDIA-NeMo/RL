@@ -1087,6 +1087,15 @@ class VllmAsyncGenerationWorkerImpl(
         if engine_client is None:
             raise RuntimeError("The HTTP engine client is not initialized.")
         model_config = self.llm_async_engine_args.create_model_config()
+        # vLLM adds the generation config's EOS to every request's stop set
+        # regardless of the configured stops, so a turn can end on either.
+        model_stop_token_ids = set(self.cfg.get("stop_token_ids") or ())
+        generation_eos_token_ids = model_config.try_get_generation_config().get(
+            "eos_token_id"
+        )
+        if isinstance(generation_eos_token_ids, int):
+            generation_eos_token_ids = [generation_eos_token_ids]
+        model_stop_token_ids |= set(generation_eos_token_ids or ())
         base_model_paths = [
             BaseModelPath(
                 name=model_config.served_model_name, model_path=model_config.model
@@ -1329,6 +1338,10 @@ class VllmAsyncGenerationWorkerImpl(
                     model_prefix_token_ids=model_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
+                    # The template's own EOS must stay countable even when the
+                    # configured stops don't include it.
+                    eos_token_id=model_stop_token_ids
+                    | {self.renderer.tokenizer.eos_token_id},
                 )
                 final_prompt_token_ids = splice.token_ids
                 # Reject overflows before media validation can mask the length error.
@@ -1846,6 +1859,10 @@ class VllmAsyncGenerationWorkerImpl(
         # We initialize the FastAPI app here in case we want to do some generic configuration before the subsequent server inits
         # e.g. last-run middleware.
         app = FastAPI()
+
+        @app.get("/health")
+        async def health() -> dict[str, str]:
+            return {"status": "ok"}
 
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:

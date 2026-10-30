@@ -34,6 +34,7 @@ import random
 import threading
 import time
 import uuid
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -116,8 +117,12 @@ async def build_spliced_prompt_ids(
     tokenizer: Any,
     model_config: Any,
     template_kwargs: dict[str, Any],
+    eos_token_ids: Collection[int] | None = None,
 ) -> list[int]:
     """Render the chat template and splice in the on-policy prefix.
+
+    ``eos_token_ids`` is every token that can end a turn (see
+    :func:`resolve_eos_token_ids`); ``None`` means only ``tokenizer.eos_token_id``.
 
     The single source of truth for turning a conversation into engine prompt
     ids -- shared by the engine adapter's route and the disagg frontend's
@@ -160,6 +165,7 @@ async def build_spliced_prompt_ids(
             model_prefix_token_ids=required_prefix_ids,
             template_prefix_token_ids=template_prefix_ids,
             template_token_ids=prompt_token_ids,
+            eos_token_id=eos_token_ids or None,
         )
 
     return await asyncio.to_thread(_sync)
@@ -262,18 +268,53 @@ def _context_leg_response(
     return JSONResponse(content=response)
 
 
-def _build_reasoning_parser(name: str, chat_template_kwargs: dict[str, Any]) -> Any:
-    from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+def resolve_eos_token_ids(
+    tokenizer: Any,
+    stop_token_ids: Collection[int] | None = None,
+    generation_eos_token_ids: Any = None,
+) -> set[int]:
+    """Every token that ends a turn: configured stops, tokenizer EOS and generation-config EOS."""
+    eos_token_ids: set[int] = set(stop_token_ids or ())
+    for token_ids in (tokenizer.eos_token_id, generation_eos_token_ids):
+        if isinstance(token_ids, int):
+            eos_token_ids.add(token_ids)
+        elif token_ids is not None:
+            eos_token_ids.update(t for t in token_ids if isinstance(t, int))
+    return eos_token_ids
 
-    if name == "deepseek-r1" and "enable_thinking" in chat_template_kwargs:
-        from tensorrt_llm.llmapi.reasoning_parser import DeepSeekR1Parser
 
-        return DeepSeekR1Parser(
-            reasoning_at_start=bool(chat_template_kwargs["enable_thinking"]),
-            chat_template_kwargs=chat_template_kwargs,
-        )
+def _tokens_for_response_text(
+    token_ids: list[int], stop_token_ids: Collection[int]
+) -> list[int]:
+    """``token_ids`` without trailing stop tokens, as a new list."""
+    text_token_end = len(token_ids)
+    while text_token_end and token_ids[text_token_end - 1] in stop_token_ids:
+        text_token_end -= 1
+    return token_ids[:text_token_end]
 
-    return ReasoningParserFactory.create_reasoning_parser(name, chat_template_kwargs)
+
+def _prompt_opens_reasoning(tokenizer: Any, token_ids: list[int]) -> bool:
+    """Whether the prompt ends inside an open ``<think>`` block."""
+    tail = tokenizer.decode(token_ids[-16:], skip_special_tokens=False)
+    return tail.rstrip().endswith("<think>")
+
+
+def _build_reasoning_parser(
+    name: str,
+    chat_template_kwargs: dict[str, Any],
+    *,
+    reasoning_at_start: bool = False,
+) -> Any:
+    from tensorrt_llm.llmapi.reasoning_parser import (
+        DeepSeekR1Parser,
+        ReasoningParserFactory,
+    )
+
+    parser = ReasoningParserFactory.create_reasoning_parser(name, chat_template_kwargs)
+    if isinstance(parser, DeepSeekR1Parser):
+        parser.reasoning_at_start = reasoning_at_start
+        parser.in_reasoning = reasoning_at_start
+    return parser
 
 
 def _build_sampling_params(
@@ -308,7 +349,7 @@ def _build_sampling_params(
         top_k=int(top_k_cfg) if top_k_cfg is not None else 0,
         max_tokens=int(max_tokens),
         stop_token_ids=stop_ids or None,
-        # Include generated stop tokens so the adapter can trim tokens and logprobs together.
+        # Include generated stop tokens so generation_token_ids stays contiguous with the next turn's prompt.
         include_stop_str_in_output=True,
         logprobs=True,
         logprobs_simple_format=True,
@@ -349,26 +390,16 @@ def create_app(
     if reasoning_parser is not None:
         _build_reasoning_parser(reasoning_parser, _server_template_kwargs)
 
-    # Match TRT-LLM's effective EOS set so this adapter can trim every returned
-    # stop token and its logprob together, preserving multi-turn continuity.
-    _eos_token_ids: set[int] = set(stop_token_ids or [])
-
-    def _add_eos_token_ids(token_ids: Any) -> None:
-        if isinstance(token_ids, int):
-            _eos_token_ids.add(token_ids)
-        elif token_ids is not None:
-            _eos_token_ids.update(
-                token_id for token_id in token_ids if isinstance(token_id, int)
-            )
-
-    _add_eos_token_ids(tokenizer.eos_token_id)
+    # Match TRT-LLM's effective EOS set. Stops are kept in the returned token
+    # metadata but excluded from the parsed response text.
     generation_config = getattr(llm, "_generation_config", None)
-    generation_eos_token_ids = (
+    _eos_token_ids = resolve_eos_token_ids(
+        tokenizer,
+        stop_token_ids,
         generation_config.get("eos_token_id")
         if isinstance(generation_config, dict)
-        else getattr(generation_config, "eos_token_id", None)
+        else getattr(generation_config, "eos_token_id", None),
     )
-    _add_eos_token_ids(generation_eos_token_ids)
 
     app = FastAPI()
 
@@ -413,12 +444,6 @@ def create_app(
         per_request_kwargs: dict[str, Any] = body.get("chat_template_kwargs") or {}
         effective_template_kwargs = {**_server_template_kwargs, **per_request_kwargs}
 
-        _active_reasoning_parser = (
-            _build_reasoning_parser(reasoning_parser, effective_template_kwargs)
-            if reasoning_parser is not None
-            else None
-        )
-
         # b64 when gen_tokids_ctxbytes is set, an int array otherwise.
         supplied = body.get("prompt_token_ids") or body.get("prompt_token_ids_b64")
         if isinstance(supplied, str):
@@ -448,6 +473,7 @@ def create_app(
                         tokenizer,
                         model_config,
                         effective_template_kwargs,
+                        _eos_token_ids,
                     )
                     if recomputed != adj_prompt:
                         diff = next(
@@ -486,9 +512,21 @@ def create_app(
                     tokenizer,
                     model_config,
                     effective_template_kwargs,
+                    _eos_token_ids,
                 )
             except ValueError as e:
                 return JSONResponse(status_code=400, content={"error": str(e)})
+
+        # Infer parser state from the exact engine prompt.
+        _active_reasoning_parser = (
+            _build_reasoning_parser(
+                reasoning_parser,
+                effective_template_kwargs,
+                reasoning_at_start=_prompt_opens_reasoning(tokenizer, adj_prompt),
+            )
+            if reasoning_parser is not None
+            else None
+        )
 
         max_tokens_requested = (
             body.get("max_tokens") or body.get("max_completion_tokens") or max_seq_len
@@ -561,14 +599,9 @@ def create_app(
                 else:
                     raise TypeError(f"Unsupported TRT-LLM logprob type: {type(lp)}")
 
-        # Strip trailing stop tokens TRT-LLM appends — apply_chat_template doesn't reproduce
-        # <|endoftext|>, so they'd break seen_token_ids contiguity. Trim logprobs in lockstep.
-        while gen_token_ids and gen_token_ids[-1] in _eos_token_ids:
-            gen_token_ids.pop()
-            if gen_logprobs:
-                gen_logprobs.pop()
-
-        gen_text = tokenizer.decode(gen_token_ids, skip_special_tokens=False)
+        # Parse without trailing stops; the returned token ids and logprobs keep them.
+        text_token_ids = _tokens_for_response_text(gen_token_ids, _eos_token_ids)
+        gen_text = tokenizer.decode(text_token_ids, skip_special_tokens=False)
 
         finish_reason = "stop"
         if gen.finish_reason is not None:
