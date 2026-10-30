@@ -118,6 +118,12 @@ def main() -> None:
             "ppo.async_ppo: null is only supported by run_grpo_single_controller.py; "
             "the legacy PPO entrypoint requires the block."
         )
+    if config.ppo.value_training_mode != "whole_batch":
+        raise ValueError(
+            "ppo.value_training_mode=split is only supported by the "
+            "SingleController PPO entrypoint (run_grpo_single_controller.py); "
+            "the legacy PPO entrypoint requires whole_batch."
+        )
 
     # Print config
     print("Final config:")

@@ -318,6 +318,7 @@ value_loss_fn:
 **PPO-specific parameters:**
 - **`ppo.ppo_epochs`**: Number of actor training updates per rollout batch
 - **`ppo.critic_ppo_epochs`**: Number of critic training updates per rollout batch. It can differ from `ppo_epochs`; the exemplar defaults it to `${ppo.ppo_epochs}`.
+- **`ppo.value_training_mode`**: SingleController critic execution: `whole_batch` (default) trains each epoch on the assembled batch; `split` replays its chunks and performs one optimizer update per epoch. Split mode does not currently overlap critic training with policy work.
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
 - **`ppo.warm_start_value_checkpoint`**: Checkpoint step directory whose `value/` seeds the critic on a fresh run. See [Warm-Starting the Critic](#warm-starting-the-critic)
 - **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.
