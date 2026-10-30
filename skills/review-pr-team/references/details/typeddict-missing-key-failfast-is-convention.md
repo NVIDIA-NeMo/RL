@@ -34,6 +34,9 @@ genuinely optional there, `.get()` is fine. Also run the baseline check from
 patterns, so failing loudly is a strict improvement. At most, ask for a clearer error message —
 never for a default that hides the broken invariant.
 
+In review, never suggest `.get(key, default)` for a required key or invariant; a KeyError there is
+the feature, at most ask for a clearer message (#3308, #3652).
+
 **How to apply:** (1) Before flagging "new required key breaks existing configs", trace every
 in-repo recipe's `defaults:` inheritance chain (nemo_rl/utils/config.py
 `load_config_with_inheritance` deep-merges parents) — recipes rooting at the updated exemplar

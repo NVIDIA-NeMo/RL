@@ -13,6 +13,7 @@ The rules live in `references/`, one file per theme. Before writing or changing 
 | File | Covers |
 |------|--------|
 | [comments-docstrings-and-docs](references/comments-docstrings-and-docs.md) | comments, docstrings and docs a change adds, edits or moves |
+| [config](references/config.md) | config a change adds, reads or overrides, and config models built in tests |
 | [dead-code](references/dead-code.md) | names a change adds, removes or stops using |
 
 ## PR Title Format
