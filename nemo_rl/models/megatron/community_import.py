@@ -23,6 +23,7 @@ from typing import Any, Callable, Optional
 import torch
 from megatron.bridge import AutoBridge
 from megatron.core.transformer import ModuleSpec
+from megatron.core.transformer.enums import AttnBackend
 
 from nemo_rl.models.policy import MegatronConfig, provider_override_allowed
 
@@ -247,6 +248,13 @@ def import_model_from_hf_name(
         model_provider.gradient_accumulation_fusion = megatron_config[
             "gradient_accumulation_fusion"
         ]
+        # PTQ runs in the post-wrap hook, before training setup applies this
+        # override. Honor it while constructing the import model as well.
+        attention_backend = megatron_config.get("attention_backend")
+        if attention_backend is not None:
+            for name in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
+                os.environ.pop(name, None)
+            model_provider.attention_backend = AttnBackend[attention_backend]
     if transformer_layer_spec is not None:
         model_provider.transformer_layer_spec = transformer_layer_spec
     if mamba_stack_spec is not None:

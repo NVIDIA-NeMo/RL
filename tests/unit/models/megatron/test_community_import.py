@@ -19,6 +19,7 @@ import os
 import pickle
 import sys
 import time
+from enum import Enum
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -64,6 +65,9 @@ def _load_community_import_module(monkeypatch):
     megatron_transformer = ModuleType("megatron.core.transformer")
     megatron_transformer.ModuleSpec = type("ModuleSpec", (), {})
     monkeypatch.setitem(sys.modules, "megatron.core.transformer", megatron_transformer)
+    megatron_enums = ModuleType("megatron.core.transformer.enums")
+    megatron_enums.AttnBackend = Enum("AttnBackend", "flash fused")
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer.enums", megatron_enums)
 
     # Stub the config type while retaining the real override policy.
     nemo_policy = ModuleType("nemo_rl.models.policy")
@@ -144,7 +148,10 @@ def _stage_conversion(path) -> None:
         pickle.dump(metadata, f)
 
 
-def test_import_model_from_hf_name_calls_bridge_save(monkeypatch, tmp_path):
+@pytest.mark.parametrize("attention_backend", [None, "fused"])
+def test_import_model_from_hf_name_calls_bridge_save(
+    monkeypatch, tmp_path, attention_backend
+):
     module = _load_community_import_module(monkeypatch)
     _install_runtime_stubs_for_hf_import(monkeypatch)
     # Force this import path to stay unavailable even if real megatron modules
@@ -163,6 +170,7 @@ def test_import_model_from_hf_name_calls_bridge_save(monkeypatch, tmp_path):
             self.num_layers_in_first_pipeline_stage = None
             self.num_layers_in_last_pipeline_stage = None
             self.pipeline_dtype = "fp32"
+            self.attention_backend = module.AttnBackend.flash
 
         def finalize(self):
             pass
@@ -171,6 +179,10 @@ def test_import_model_from_hf_name_calls_bridge_save(monkeypatch, tmp_path):
             self.seed = seed
 
         def provide_distributed_model(self, wrap_with_ddp, post_wrap_hook):
+            assert (
+                self.attention_backend
+                == module.AttnBackend[attention_backend or "flash"]
+            )
             config = SimpleNamespace()
             return [SimpleNamespace(config=config)]
 
@@ -203,7 +215,24 @@ def test_import_model_from_hf_name_calls_bridge_save(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "AutoBridge", FakeAutoBridge)
 
     output_path = tmp_path / "out"
-    module.import_model_from_hf_name("fake/hf-model", str(output_path))
+    megatron_config = None
+    if attention_backend is not None:
+        megatron_config = {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+            "num_layers_in_first_pipeline_stage": None,
+            "num_layers_in_last_pipeline_stage": None,
+            "pipeline_dtype": "fp32",
+            "sequence_parallel": False,
+            "gradient_accumulation_fusion": False,
+            "attention_backend": attention_backend,
+        }
+    module.import_model_from_hf_name(
+        "fake/hf-model", str(output_path), megatron_config=megatron_config
+    )
 
     assert fake_bridge.saved_model is not None
     # The save lands in a hidden staging sibling, then is renamed into place.
