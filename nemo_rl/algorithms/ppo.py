@@ -1438,6 +1438,7 @@ def ppo_train(
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
         for batch in dataloader:
+            checkpointer.raise_if_finalization_failed()
             metrics_logging_data = dict()
             metrics = dict()
 
@@ -2597,6 +2598,7 @@ def async_ppo_train(
     try:
         while step < max_training_steps:
             ray.get(trajectory_collector.check_health.remote())
+            checkpointer.raise_if_finalization_failed()
             print(f"\n{'=' * 25} Step {step + 1}/{max_training_steps} {'=' * 25}")
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
