@@ -766,6 +766,8 @@ Set explicit bounds (for example, `-5.0` and `5.0`) when small reward variance p
 
 The implementation aligns with vLLM’s top-p and top-k filtering by applying an equivalent process to the logits.
 
+Because the trainer replays the filters, the logprobs vLLM reports must also be the filtered ones: training with top-p or top-k requires `policy.generation.vllm_cfg.logprobs_mode: processed_logprobs` (setup raises otherwise; `vllm_cfg` takes precedence over `vllm_kwargs`). Requests served through the vLLM HTTP server (NeMo-Gym rollouts) are pinned to the configured `top_k`, to `min_p=0` and to `repetition_penalty=1`, which the trainer does not replay; otherwise vLLM would fill unset values from the model's `generation_config.json`.
+
 When top-p or top-k filtering is enabled, the following conventions apply:
 
 - **`curr_logprobs` and `prev_logprobs`** are computed *with* filtering applied, for compatibility with the actor loss.
