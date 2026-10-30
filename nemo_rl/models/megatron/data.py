@@ -2120,6 +2120,17 @@ def get_and_validate_seqlen(data: BatchedDataDict[Any]):
         if k in PACKED_MULTIMODAL_FIELDS or k in OPD_FULL_FIELDS:
             continue
         if torch.is_tensor(v) and not v.is_nested and len(v.shape) > 1:
+            if k in MICROBATCH_PADDED_FIELDS and v.shape[sequence_dim] != seq_dim_size:
+                # These fields are widened in process_microbatches. A dense
+                # single-row fetch can still have its unpadded sequence width.
+                lengths = data.get("input_lengths")
+                assert lengths is not None and (
+                    lengths.numel() == v.shape[0] == data["input_ids"].shape[0]
+                ), f"{k} requires input_lengths aligned with its rows"
+                assert int(lengths.max()) <= v.shape[sequence_dim] <= seq_dim_size, (
+                    f"{k} must cover every real token without exceeding the input width"
+                )
+                continue
             assert v.shape[sequence_dim] == seq_dim_size, (
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape} for key {k}"
             )
