@@ -17,9 +17,9 @@ set -euo pipefail
 
 APPTAINER_VERSION=1.4.5
 APPTAINER_SOURCE_SHA256=d323a8b9a0a9e5e131b396d0049fdaa99beceb83a3d7ffb80dd91d15331e3b9a
-GO_VERSION=1.26.6
-GO_AMD64_SHA256=708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89
-GO_ARM64_SHA256=d0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e
+GO_VERSION=1.26.9
+GO_AMD64_SHA256=42d158b4d8f7b61ac0a830567c940a86098fb7aac52e467a5ebec03ef5cc2f8d
+GO_ARM64_SHA256=4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052
 # Bumping APPTAINER_VERSION itself is not an option here (functionality
 # regressions on a newer release), so instead this script builds the SAME
 # 1.4.5 release from source on both architectures and patches only the
