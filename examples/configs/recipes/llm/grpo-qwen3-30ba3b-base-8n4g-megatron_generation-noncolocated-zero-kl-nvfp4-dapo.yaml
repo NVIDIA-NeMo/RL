@@ -38,6 +38,13 @@ policy:
   train_micro_batch_size: 1
   max_total_sequence_length: 22528
   logprob_chunk_size: 2048
+  # grpo_math_qwen30ba3b_megatron turns packing off; without it every microbatch is one
+  # response padded to the batch's longest. logprob_mb_tokens is set explicitly because the
+  # default scales with logprob_batch_size (4) to ~90K tokens.
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${policy.max_total_sequence_length}
+    logprob_mb_tokens: ${policy.max_total_sequence_length}
   megatron_cfg:
     optimizer:
       lr: 1.0e-06
