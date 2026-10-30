@@ -863,6 +863,22 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                     f"target_weight_versions={len(target_weight_versions)}"
                 )
 
+            # Checkpoints written before taskset attribution hold only flat rows,
+            # whose attribution is the agent name. Restore the column so these
+            # batches merge with newly collected ones in from_batches.
+            for trajectory in trajectories:
+                batch = (
+                    trajectory.get("batch") if isinstance(trajectory, dict) else None
+                )
+                if (
+                    batch is not None
+                    and "agent_ref" in batch
+                    and "attribution_key" not in batch
+                ):
+                    batch["attribution_key"] = [
+                        ref["name"] for ref in batch["agent_ref"]
+                    ]
+
             if "max_size" in state and state["max_size"] != self.max_size:
                 print(
                     "ReplayBuffer max_size changed: "

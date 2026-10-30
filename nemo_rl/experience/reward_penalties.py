@@ -26,6 +26,7 @@ from collections.abc import Callable, Container, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
+from nemo_rl.environments.nemo_gym_task import get_nemo_gym_task_input
 from nemo_rl.experience.metric_utils import calculate_single_metric
 
 if TYPE_CHECKING:
@@ -82,10 +83,11 @@ def effort_shaping_enabled(config: EffortLevelsConfig | None) -> bool:
 
 def is_low_effort(row: dict[str, Any], config: EffortLevelsConfig) -> bool:
     """Classify the original rollout input using the standard last-user rule."""
+    task_input = get_nemo_gym_task_input(row)
     prompt = next(
         (
             msg["content"]
-            for msg in reversed(row["responses_create_params"]["input"])
+            for msg in reversed(task_input["responses_create_params"]["input"])
             if msg.get("role") == "user" and "content" in msg
         ),
         "",
@@ -279,7 +281,11 @@ class CaptureRewardSettings:
 
 @dataclass(frozen=True)
 class RewardLogContext:
-    """Agent identity and optional full-result table data, without raw reward."""
+    """Attribution and optional full-result table data, without raw reward.
+
+    ``agent_name`` retains its checkpoint field name and holds the taskset for
+    materialized tasks or the resolved agent name for flat rows.
+    """
 
     agent_name: str
     full_result_json: str | None

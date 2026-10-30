@@ -63,8 +63,12 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     NemoGymShardSet,
     as_nemo_gym_shard_set,
-    get_nemo_gym_route_name,
     get_pad_dynamic_image_shapes,
+)
+from nemo_rl.environments.nemo_gym_task import (
+    get_nemo_gym_attribution_key,
+    get_nemo_gym_task_input,
+    is_nemo_gym_task,
 )
 from nemo_rl.environments.nemotron_utils import (
     verify_static_video_media_alignment,
@@ -170,8 +174,10 @@ def attach_initial_nemo_gym_image_payloads(
     ):
         if extra_env_info is None or not isinstance(extra_env_info, dict):
             continue
-        initial_messages = extra_env_info.get("responses_create_params", {}).get(
-            "input", []
+        initial_messages = (
+            get_nemo_gym_task_input(extra_env_info)
+            .get("responses_create_params", {})
+            .get("input", [])
         )
         # Load images from Responses-API input messages in encounter order.
         images = [
@@ -1934,7 +1940,7 @@ class _NemoGymStreamAccumulator:
         self,
         row_index: int,
         result: dict,
-        resolved_agent_ref: dict,
+        resolved_agent_ref: dict | None,
     ) -> _CompletedNemoGymGroup | None:
         """Add one streamed row and return its group when that group is complete."""
         if not isinstance(row_index, int):
@@ -1949,7 +1955,8 @@ class _NemoGymStreamAccumulator:
         if row_index in self._received_row_indices:
             raise ValueError(f"NeMo-Gym returned duplicate row index {row_index}")
 
-        self._rows[row_index]["agent_ref"] = resolved_agent_ref
+        row = self._rows[row_index]
+        row["agent_ref"] = None if is_nemo_gym_task(row) else resolved_agent_ref
         self._received_row_indices.add(row_index)
         group_index = row_index // self._num_generations
         group_results = self._pending_results[group_index]
@@ -1971,10 +1978,11 @@ class _NemoGymStreamAccumulator:
 
         rows = self._rows[start:end]
         if not self._allow_mixed_agents:
-            agent_names = [row["agent_ref"]["name"] for row in rows]
-            if len(set(agent_names)) != 1:
+            attribution_keys = [get_nemo_gym_attribution_key(row) for row in rows]
+            if None in attribution_keys or len(set(attribution_keys)) != 1:
                 raise ValueError(
-                    f"Expected one NeMo-Gym agent per prompt group, got {agent_names}"
+                    "Expected one NeMo-Gym attribution key per prompt group, "
+                    f"got {attribution_keys}"
                 )
 
         ordered_results = [group_results[index] for index in expected_row_indices]
@@ -2441,10 +2449,12 @@ def _prepare_nemo_gym_rows(
     for row_index, row in enumerate(rows):
         group_index = row_index // num_generations
         rollout_index = row_index % num_generations
-        responses_create_params = row.get("responses_create_params")
+        responses_create_params = get_nemo_gym_task_input(row).get(
+            "responses_create_params"
+        )
         if not isinstance(responses_create_params, dict):
             raise TypeError(
-                "Each NeMo-Gym row must contain a responses_create_params dict"
+                "Each NeMo-Gym task input must contain a responses_create_params dict"
             )
 
         responses_create_params["temperature"] = sampling_params.temperature
@@ -2485,16 +2495,12 @@ def _bucket_nemo_gym_rows_by_instance(
         first-use order. Actors with no rows are omitted rather than sent an
         empty batch.
     """
+    if not rows:
+        return []
     buckets: dict[int, tuple[str, Any, list[dict]]] = {}
     for start in range(0, len(rows), num_generations):
         group = rows[start : start + num_generations]
-        route_names = {get_nemo_gym_route_name(row) for row in group}
-        if len(route_names) != 1:
-            raise ValueError(
-                f"NeMo-Gym prompt group at row {start} mixes routes "
-                f"{sorted(route_names)}. A group must reference exactly one route."
-            )
-        handle = shard_set.pick_handle(next(iter(route_names)))
+        handle = shard_set.pick_handle_for_group(group)
         if id(handle) not in buckets:
             buckets[id(handle)] = (shard_set.instance_label(handle), handle, [])
         buckets[id(handle)][2].extend(group)
@@ -2510,7 +2516,7 @@ async def _merge_nemo_gym_instance_streams(
     timer_prefix: str,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
-) -> AsyncGenerator[tuple[int, dict, dict, dict | None, str], None]:
+) -> AsyncGenerator[tuple[int, dict | None, dict, dict | None, str], None]:
     """Interleave K actor streams into one, yielding rows as they complete.
 
     ``run_rollouts`` is a streaming generator, so there is nothing to gather:
@@ -3221,6 +3227,13 @@ def _postprocess_single_nemo_gym_group(
     (``identity_num_generations``); the synchronous path hands the whole batch
     in as one call, so it may hold several prompt groups. Defaults to the batch.
     """
+    for row, result in zip(nemo_gym_rows, results):
+        attribution_key = get_nemo_gym_attribution_key(row)
+        if attribution_key is None:
+            raise ValueError("NeMo-Gym rollout has no attribution key")
+        result["attribution_key"] = attribution_key
+        result["agent_ref"] = None if is_nemo_gym_task(row) else row["agent_ref"]
+
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
 
@@ -3237,12 +3250,16 @@ def _postprocess_single_nemo_gym_group(
     if length_penalty_config is not None:
         # Copy the per-row fields the length adjustments consume.
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
-            result["agent_ref"] = nemo_gym_row["agent_ref"]
-            result["profiled_rewards"] = nemo_gym_row.get("profiled_rewards")
-            result["profiled_output_lengths"] = nemo_gym_row.get(
+            task_input = get_nemo_gym_task_input(nemo_gym_row)
+            if is_nemo_gym_task(nemo_gym_row):
+                task_data = task_input.get("task_data")
+                if isinstance(task_data, dict):
+                    task_input = {**task_data, **task_input}
+            result["profiled_rewards"] = task_input.get("profiled_rewards")
+            result["profiled_output_lengths"] = task_input.get(
                 "profiled_output_lengths"
             )
-            result["profile_band"] = nemo_gym_row.get("profile_band")
+            result["profile_band"] = task_input.get("profile_band")
         env_rewards = torch.tensor([r["full_result"]["reward"] for r in results])
         length_penalty_metrics = apply_group_length_penalties(
             results,
@@ -3349,18 +3366,14 @@ def _postprocess_single_nemo_gym_group(
             # )
             # / batch_size,
         }
-    # Per-agent misc metrics
+    # Namespace metrics by taskset for materialized rows or agent for flat rows.
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
         agent_to_sample_metrics: dict[str, list[dict]] = defaultdict(list)
-        for nemo_gym_row, result, sample_metrics in zip(
-            nemo_gym_rows, results, all_sample_metrics
-        ):
-            agent_ref = nemo_gym_row["agent_ref"]
-            agent_name = agent_ref["name"]
+        for result, sample_metrics in zip(results, all_sample_metrics):
+            agent_name = result["attribution_key"]
             agent_to_results[agent_name].append(result["full_result"])
             agent_to_sample_metrics[agent_name].append(sample_metrics)
-            result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
@@ -3433,6 +3446,7 @@ def _postprocess_single_nemo_gym_group(
     final_batch = BatchedDataDict[DatumSpec](
         {
             "agent_ref": [r["agent_ref"] for r in results],
+            "attribution_key": [r["attribution_key"] for r in results],
             "message_log": [r["message_log"] for r in results],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(

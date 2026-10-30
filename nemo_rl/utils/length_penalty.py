@@ -38,6 +38,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from nemo_rl.environments.nemo_gym_task import get_nemo_gym_attribution_key
+
 logger = logging.getLogger(__name__)
 
 # MAD/median floor for zMAD (fixed; matches ``flag_reasoning_length_outliers`` default).
@@ -379,7 +381,12 @@ def apply_group_length_penalties(
 
     n = len(results)
     original_rewards = [r["full_result"]["reward"] for r in results]
-    agent_names = [r["agent_ref"]["name"] for r in results]
+    agent_names: list[str] = []
+    for result in results:
+        attribution_key = get_nemo_gym_attribution_key(result)
+        if attribution_key is None:
+            raise ValueError("Length penalties require a NeMo-Gym attribution key")
+        agent_names.append(attribution_key)
 
     # Extract text once; lengths computed per-group based on resolved length_type
     texts: list[tuple[str, str]] = []

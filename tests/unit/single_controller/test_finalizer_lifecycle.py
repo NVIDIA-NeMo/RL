@@ -77,7 +77,9 @@ class _DataPlaneClient:
         )
 
 
-def _request(resolved_agent_name: str | None = None) -> ReassemblyRequest:
+def _request(
+    resolved_agent_name: str | None = None, *, attribution_key: str | None = None
+) -> ReassemblyRequest:
     return ReassemblyRequest(
         group_id="group",
         prompt_idx=17,
@@ -95,6 +97,7 @@ def _request(resolved_agent_name: str | None = None) -> ReassemblyRequest:
         mask_sample=(False,),
         fallback_weight_version=3,
         resolved_agent_name=resolved_agent_name,
+        attribution_key=attribution_key,
     )
 
 
@@ -126,7 +129,24 @@ def _controller(actor: object) -> Any:
     return ctrl
 
 
-def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -> None:
+@pytest.mark.parametrize(
+    ("resolved_agent_name", "attribution_key", "expected_extra_env_info"),
+    [
+        (None, None, None),
+        ("flat-agent", None, {"agent_ref": {"name": "flat-agent"}}),
+        (
+            "flat-agent",
+            "flat-agent",
+            {"agent_ref": {"name": "flat-agent"}, "attribution_key": "flat-agent"},
+        ),
+        (None, "usersim:train", {"attribution_key": "usersim:train"}),
+    ],
+)
+def test_successful_actor_finalization_returns_actor_and_transfers_ownership(
+    resolved_agent_name: str | None,
+    attribution_key: str | None,
+    expected_extra_env_info: dict[str, Any] | None,
+) -> None:
     meta = KVBatchMeta(
         partition_id="canonical",
         task_name="train",
@@ -145,7 +165,7 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
     finalize = _RemoteFinalize(result=result)
     actor = SimpleNamespace(finalize=finalize)
     ctrl = _controller(actor)
-    request = _request()
+    request = _request(resolved_agent_name, attribution_key=attribution_key)
 
     committed = asyncio.run(ctrl._finalize_with_actor(request))
 
@@ -161,7 +181,7 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         3,
         3,
         staging_keys=["group_g0/call"],
-        extra_env_info=None,
+        extra_env_info=expected_extra_env_info,
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
 
