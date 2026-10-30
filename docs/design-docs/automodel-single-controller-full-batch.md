@@ -1,9 +1,9 @@
-# AutoModel single-controller: PR1 implementation design
+# AutoModel single-controller: full-batch implementation design
 
 ## Baseline and scope
 
 Base: upstream `main` at `0e36f2e6a944a2e617fbc1941d57041715a4ac3f`.
-PR1 adds full-batch single-controller (SC) execution to AutoModel. The existing
+This design adds full-batch single-controller (SC) execution to AutoModel. The existing
 synchronous `AutomodelPolicyWorkerImpl.train()` remains byte-for-byte unchanged.
 The previous experimental branch is preserved separately; its validation results
 are not evidence for this revised implementation.
@@ -16,7 +16,7 @@ Model-specific numerical/refit support remains subject to the existing backend.
 
 Packing, dynamic batching, HSDP, CPU offload, LoRA, draft training, VLM,
 quantization, PPO, distillation, colocation, and streaming dispatches are outside
-PR1. Configuration validation rejects unsupported combinations before allocation;
+the supported scope. Configuration validation rejects unsupported combinations before allocation;
 worker guards also protect direct lifecycle callers.
 
 ## Interfaces and ownership
@@ -31,7 +31,7 @@ and the separation of backward from optimizer commit match the MCore path.
 An internal `_TrainStepState` holds the loss function, GBS/MBS, dispatch status,
 completed metrics, and snapshots of mutable model state needed for cancellation.
 It is initialized in the worker constructor. It represents a logical optimizer
-step; the one-dispatch restriction is an explicit PR1 execution constraint.
+step; the one-dispatch restriction is an explicit full-batch execution constraint.
 
 | Operation | Preconditions | Work and ownership |
 | --- | --- | --- |

@@ -402,6 +402,6 @@ if __name__ == "__main__":
     parser.add_argument("--rtol", type=float, default=1e-5)
     parser.add_argument("--atol", type=float, default=1e-6)
     parser.add_argument("--wandb-project")
-    parser.add_argument("--name", default="gemma4-e2b-automodel-sc-stage1-parity")
+    parser.add_argument("--name", default="gemma4-e2b-automodel-sc-full-batch-parity")
     parser.add_argument("--source-sha", required=True)
     run(parser.parse_args())

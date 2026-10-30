@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Early guards for the supported AutoModel SC Stage 1 surface."""
+"""Early guards for supported AutoModel single-controller configurations."""
 
 import pytest
 from omegaconf import OmegaConf
@@ -68,7 +68,7 @@ def test_supported(config):
 def test_unsupported(config, path, value):
     raw = OmegaConf.create(config)
     OmegaConf.update(raw, path, value, merge=False)
-    with pytest.raises(ValueError, match="Stage 1"):
+    with pytest.raises(ValueError, match="AutoModel SC"):
         _validate_automodel_single_controller_config(
             MasterConfig(**OmegaConf.to_container(raw, resolve=True))
         )
