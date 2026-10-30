@@ -342,24 +342,29 @@ class _FullVocabLogprob:
     The distributed log-softmax sums per-rank partial normalizers, which rounds
     differently from Megatron Inference's single full-row reduction, so the
     forward all-gathers the vocab-parallel logits first. Gradients come from
-    the replaced function (see ``_GenAlignedLogprob``).
+    the replaced function (see ``_GenAlignedLogprob``). Each subclass's
+    ``apply`` mirrors its replaced function's ``forward`` so arguments bind by
+    name.
     """
 
-    def __init__(self, original: Any, *, chunked: bool) -> None:
+    def __init__(self, original: Any) -> None:
         self._original = original
-        self._chunked = chunked
 
-    def apply(self, *args: Any) -> Any:
-        # (logits, target, vocab_start, vocab_end, [chunk_size,] group, inference_only,
-        # *trailing); trailing is the chunked function's reuse_logits_storage.
-        inference_only_index = 6 if self._chunked else 5
-        logits, target, *original_args = args[:inference_only_index]
-        inference_only = args[inference_only_index]
-        trailing_args = tuple(args[inference_only_index + 1 :])
-        group = original_args[-1]
-        chunk_size = original_args[2] if self._chunked else None
+    def _apply(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        chunk_size: int | None,
+        group: torch.distributed.ProcessGroup | None,
+        inference_only: bool,
+        original_args: tuple[Any, ...],
+        trailing_args: tuple[Any, ...],
+    ) -> torch.Tensor:
         if group is None:
-            return self._original.apply(*args)
+            return self._original.apply(
+                logits, target, *original_args, inference_only, *trailing_args
+            )
         return _GenAlignedLogprob.apply(
             logits,
             target,
@@ -367,22 +372,70 @@ class _FullVocabLogprob:
             group,
             inference_only,
             self._original,
-            tuple(original_args),
+            original_args,
             trailing_args,
         ).contiguous()
+
+
+class _DistributedFullVocabLogprob(_FullVocabLogprob):
+    """Replaces ``DistributedLogprob``."""
+
+    def apply(
+        self,
+        vocab_parallel_logits: torch.Tensor,
+        target: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        group: torch.distributed.ProcessGroup | None,
+        inference_only: bool = False,
+    ) -> torch.Tensor:
+        return self._apply(
+            vocab_parallel_logits,
+            target,
+            chunk_size=None,
+            group=group,
+            inference_only=inference_only,
+            original_args=(vocab_start_index, vocab_end_index, group),
+            trailing_args=(),
+        )
+
+
+class _ChunkedFullVocabLogprob(_FullVocabLogprob):
+    """Replaces ``ChunkedDistributedLogprob``."""
+
+    def apply(
+        self,
+        vocab_parallel_logits: torch.Tensor,
+        target: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup | None,
+        inference_only: bool = False,
+        reuse_logits_storage: bool = False,
+    ) -> torch.Tensor:
+        return self._apply(
+            vocab_parallel_logits,
+            target,
+            chunk_size=chunk_size,
+            group=tp_group,
+            inference_only=inference_only,
+            original_args=(vocab_start_index, vocab_end_index, chunk_size, tp_group),
+            trailing_args=(reuse_logits_storage,),
+        )
 
 
 def _use_full_vocab_log_softmax() -> None:
     # Deferred: model_utils is heavy and only needed once the shim is installed.
     from nemo_rl.distributed import model_utils
 
-    for name, chunked in (
-        ("DistributedLogprob", False),
-        ("ChunkedDistributedLogprob", True),
+    for name, shim_cls in (
+        ("DistributedLogprob", _DistributedFullVocabLogprob),
+        ("ChunkedDistributedLogprob", _ChunkedFullVocabLogprob),
     ):
         current = getattr(model_utils, name)
         if not isinstance(current, _FullVocabLogprob):
-            setattr(model_utils, name, _FullVocabLogprob(current, chunked=chunked))
+            setattr(model_utils, name, shim_cls(current))
 
 
 def _enable_mcore_deterministic_tuning() -> None:
