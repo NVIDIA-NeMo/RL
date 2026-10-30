@@ -68,6 +68,7 @@ from nemo_rl.algorithms.grpo import (
     _validate_multimodal_dedup_capability,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
+    _validate_val_sampling,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -7879,6 +7880,35 @@ class TestValidateFunction:
 
         with pytest.raises(AssertionError, match="only supported for vLLM NeMo-Gym"):
             setup(master_config, MagicMock(), MagicMock(), None)
+
+    @pytest.mark.parametrize(
+        "val_temperature,val_top_k,rejected",
+        [
+            (0.1, 50, False),  # val_top_k inherits top_k (${.top_k})
+            (0.1, None, False),  # the server tells validation apart by temperature
+            (1.0, None, True),  # same temperature and top_p: val_top_k is ignored
+        ],
+    )
+    def test_val_top_k_on_the_gym_path(
+        self, mock_grpo_components, val_temperature, val_top_k, rejected
+    ):
+        """The vLLM server pins top_k per sampling profile, told apart by temperature/top_p."""
+        config = mock_grpo_components["master_config"]
+        config.policy["generation"].update(
+            backend="vllm",
+            temperature=1.0,
+            top_p=1.0,
+            top_k=50,
+            val_temperature=val_temperature,
+            val_top_p=1.0,
+            val_top_k=val_top_k,
+        )
+        with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+            if rejected:
+                with pytest.raises(AssertionError, match="val_top_k"):
+                    _validate_val_sampling(config)
+            else:
+                _validate_val_sampling(config)
 
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""

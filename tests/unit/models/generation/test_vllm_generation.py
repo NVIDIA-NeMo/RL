@@ -1126,8 +1126,10 @@ def _setup_fake_vllm_chat_handler(
     worker.cfg = {
         "temperature": 1.0,
         "top_p": 1.0,
+        "top_k": None,
         "val_temperature": 0.0,
         "val_top_p": 1.0,
+        "val_top_k": None,
         "vllm_cfg": {},
     }
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
@@ -1151,6 +1153,8 @@ def _setup_fake_vllm_chat_handler(
 def _fake_chat_request():
     return types.SimpleNamespace(
         top_k=-1,
+        min_p=None,
+        repetition_penalty=None,
         top_p=1.0,
         temperature=1.0,
         max_tokens=1,
@@ -1161,6 +1165,52 @@ def _fake_chat_request():
         logprobs=False,
         top_logprobs=None,
     )
+
+
+class _StopAfterValidation(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    "temperature,expected_top_k",
+    [(1.0, 20), (0.0, -1)],  # train profile, validation profile (val_top_k=None)
+)
+def test_chat_request_pins_top_k_and_disables_min_p(
+    monkeypatch: pytest.MonkeyPatch, temperature: float, expected_top_k: int
+) -> None:
+    """Unset top_k/min_p/repetition_penalty would fall back to generation_config.json."""
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    worker.cfg.update(top_k=20)
+    serving_chat.create_chat_completion = AsyncMock(side_effect=_StopAfterValidation)
+    request = _fake_chat_request()
+    request.temperature = temperature
+    request.top_k = None
+
+    with pytest.raises(_StopAfterValidation):
+        asyncio.run(chat_handler(request, MagicMock()))
+
+    assert (request.top_k, request.min_p, request.repetition_penalty) == (
+        expected_top_k,
+        0.0,
+        1.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value", [("top_k", 50), ("min_p", 0.1), ("repetition_penalty", 1.05)]
+)
+def test_chat_request_rejects_mismatched_top_k_and_min_p(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: float
+) -> None:
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    worker.cfg.update(top_k=20)
+    serving_chat.create_chat_completion = AsyncMock(side_effect=_StopAfterValidation)
+    request = _fake_chat_request()
+    request.top_k = None
+    setattr(request, field, value)
+
+    with pytest.raises(AssertionError, match=field):
+        asyncio.run(chat_handler(request, MagicMock()))
 
 
 def _track_request_capture(worker, request):
@@ -1615,6 +1665,28 @@ def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
         "reasoning",
         "final",
     )
+
+
+@pytest.mark.parametrize("filters", [{"top_p": 0.9, "top_k": 20}, {"top_k": 20}])
+def test_configure_generation_config_requires_processed_logprobs_for_filtering(
+    filters: dict,
+) -> None:
+    """The trainer replays the filters, so vLLM must report filtered logprobs."""
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config.update(filters)
+
+    with pytest.raises(ValueError, match="logprobs_mode=processed_logprobs"):
+        configure_generation_config(deepcopy(vllm_config), tokenizer)
+    # Evaluation has no trainer to match.
+    configure_generation_config(deepcopy(vllm_config), tokenizer, is_eval=True)
+
+    vllm_config["vllm_kwargs"]["logprobs_mode"] = "processed_logprobs"
+    configure_generation_config(deepcopy(vllm_config), tokenizer)
+    # vllm_cfg overrides vllm_kwargs when building the engine.
+    vllm_config["vllm_cfg"]["logprobs_mode"] = "raw_logprobs"
+    with pytest.raises(ValueError, match="logprobs_mode=processed_logprobs"):
+        configure_generation_config(deepcopy(vllm_config), tokenizer)
 
 
 def test_configure_generation_config_uses_real_startup_weights_without_draft_refit():

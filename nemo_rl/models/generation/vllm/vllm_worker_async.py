@@ -1617,13 +1617,6 @@ class VllmAsyncGenerationWorkerImpl(
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
-            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            # Right now we explicitly assert set this to -1.
-            assert request.top_k in (None, -1), (
-                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
-            )
-            request.top_k = -1
-
             # The request sampling params need to exactly match those as are set in NeMo RL.
             # If they do not match, the inference will be off policy and destroy training
             # stability. Validation rollouts are the one exception: they are stamped with
@@ -1657,6 +1650,28 @@ class VllmAsyncGenerationWorkerImpl(
                 f"params (val_temperature={generation_config['val_temperature']}, "
                 f"val_top_p={generation_config['val_top_p']})"
             )
+            # vLLM fills an unset top_k/min_p/repetition_penalty from
+            # generation_config.json (e.g. Qwen2.5-Instruct's repetition_penalty=1.05).
+            # Pin top_k to what the trainer replays (as in
+            # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params) and
+            # disable min_p and the repetition penalty, which the trainer does not
+            # replay.
+            top_k = generation_config["top_k" if is_train_sampling else "val_top_k"]
+            top_k = top_k if top_k is not None else -1
+            assert request.top_k in (None, top_k), (
+                f"request top_k={request.top_k} must be unset or match the configured "
+                f"top_k ({top_k})"
+            )
+            assert request.min_p in (None, 0.0), (
+                f"request min_p={request.min_p} is not supported; leave it unset"
+            )
+            assert request.repetition_penalty in (None, 1.0), (
+                f"request repetition_penalty={request.repetition_penalty} is not "
+                "supported; leave it unset"
+            )
+            request.top_k = top_k
+            request.min_p = 0.0
+            request.repetition_penalty = 1.0
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(

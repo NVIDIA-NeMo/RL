@@ -2774,9 +2774,10 @@ async def run_async_nemo_gym_rollout(
         sampling_params = GenerationSamplingParams.from_generation_config(
             generation_config
         )
-    # Top k is not OpenAI compatible, so NeMo-Gym does not guarantee support over it.
-    assert not sampling_params.top_k, (
-        "Top k is not supported in the sampling params in NeMo-Gym path!"
+    # Top k is not OpenAI compatible, so NeMo-Gym requests leave it unset; only
+    # NeMo-RL's vLLM server pins it to the configured profile.
+    assert not sampling_params.top_k or generation_config["backend"] == "vllm", (
+        "Top k in the sampling params in NeMo-Gym path needs the vLLM backend!"
     )
     if num_generations <= 0:
         raise ValueError("num_generations must be greater than zero")
