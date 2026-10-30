@@ -16,7 +16,7 @@
 
 One schedule call (an execution batch) runs ``microbatches_per_step`` (M)
 microbatches of ``micro_batch_size`` samples. The planning unit is whatever data
-one call hands over -- a training chunk or a logprob request -- so nothing here
+one call hands over -- a global batch or a logprob request -- so nothing here
 assumes it equals ``gbs / dp`` or that DP ranks hold the same amount.
 """
 

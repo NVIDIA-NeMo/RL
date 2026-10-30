@@ -16,8 +16,7 @@ import gc
 import warnings
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass
-from typing import Any, Callable, Generator, Iterable, Optional, cast
+from typing import Any, Generator, Iterable, Optional, cast
 
 import ray
 import torch
@@ -26,10 +25,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
-from nemo_automodel.components.training.utils import (
-    prepare_for_grad_accumulation,
-    scale_grads_and_clip_grad_norm,
-)
+from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from torch import nn
 from torch.distributed.tensor import DTensor
@@ -382,44 +378,6 @@ def _maybe_adapt_tensor_to_hf(
     return [(fqn, tensor)]
 
 
-@dataclass
-class GlobalCounts:
-    """Loss normalization of one optimizer update, summed over the DP group."""
-
-    global_valid_seqs: torch.Tensor
-    global_valid_toks: torch.Tensor
-
-
-@dataclass
-class _OpenUpdate:
-    """An optimizer update between ``_open_update`` and ``_close_update``."""
-
-    post_processing_fn: LossPostProcessor
-    mbs: int
-    global_counts: GlobalCounts
-    eval_mode: bool
-    num_global_batches: int
-    sequence_dim: int
-    on_microbatch_start: Callable[[int], None]
-    # Per-microbatch loss values and metrics of valid microbatches, accumulated
-    # over the update's chunks. Under pipeline parallelism only the last stage
-    # records them; _close_update broadcasts them to the other stages.
-    mb_losses: list[Any]
-    mb_metrics: list[dict[str, Any]]
-
-
-@dataclass
-class _ClosedUpdate:
-    """Result of one optimizer update, identical on every rank of a PP group."""
-
-    loss: float
-    mb_metrics: list[dict[str, Any]]
-    # None in eval mode.
-    grad_norm: Optional[torch.Tensor]
-    # Set only when draft co-training ran.
-    draft_grad_norm: Optional[float]
-
-
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class AutomodelPolicyWorkerImpl(
@@ -642,8 +600,6 @@ class AutomodelPolicyWorkerImpl(
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
 
-        # The optimizer update between _open_update and _close_update.
-        self._update: Optional[_OpenUpdate] = None
         # Built on first refit under pipeline parallelism.
         self._weight_exporter: Optional[PipelineWeightExporter] = None
 
@@ -701,12 +657,7 @@ class AutomodelPolicyWorkerImpl(
         mbs: Optional[int] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
-        """Train the policy on a batch of data with a given loss function.
-
-        Each global batch is one optimizer update, run as the three update
-        phases with a single chunk: ``_open_update``, ``_run_update_chunk``,
-        ``_close_update``.
-        """
+        """Train the policy on a batch of data with a given loss function."""
         self.timer.start("train")
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
@@ -769,8 +720,6 @@ class AutomodelPolicyWorkerImpl(
 
             losses = []
             all_mb_metrics = []
-            grad_norm: Optional[torch.Tensor] = None
-            draft_grad_norm: Optional[float] = None
             for gb_idx in range(num_global_batches):
                 # Process global batch and compute normalization factors
                 gb_result = process_global_batch(
@@ -780,319 +729,182 @@ class AutomodelPolicyWorkerImpl(
                     batch_idx=gb_idx,
                     batch_size=local_gbs,
                 )
+                batch = gb_result["batch"]
+                global_valid_seqs = gb_result["global_valid_seqs"]
+                global_valid_toks = gb_result["global_valid_toks"]
 
-                self._open_update(
-                    loss_post_processor,
-                    mbs,
-                    global_counts=GlobalCounts(
-                        global_valid_seqs=gb_result["global_valid_seqs"],
-                        global_valid_toks=gb_result["global_valid_toks"],
-                    ),
-                    eval_mode=eval_mode,
-                    num_global_batches=num_global_batches,
-                    sequence_dim=sequence_dim,
-                    on_microbatch_start=on_microbatch_start,
+                self.optimizer.zero_grad()
+
+                if self.pipeline is not None:
+                    execution_batches = self._plan_execution_batches(batch, mbs)
+                    mb_results = pipeline_forward_backward(
+                        self.pipeline,
+                        execution_batches,
+                        loss_post_processor,
+                        autocast_context_factory=self._autocast_context,
+                        forward_only=eval_mode,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                        dp_size=self.dp_size,
+                        cp_size=self.cp_size,
+                        num_global_batches=num_global_batches,
+                    )
+                    # Only the last stage has results; real samples come
+                    # first, so the valid microbatches are a prefix.
+                    iterator_len = sum(
+                        execution_batch.num_real_microbatches
+                        for execution_batch in execution_batches
+                    )
+                else:
+                    # Get microbatch iterator based on batching strategy
+                    processed_iterator, iterator_len = get_microbatch_iterator(
+                        batch,
+                        self.cfg,
+                        mbs,
+                        self.dp_mesh,
+                        tokenizer=self.tokenizer,
+                    )
+
+                    # Use automodel_forward_backward for the training loop
+                    mb_results = automodel_forward_backward(
+                        model=self.model,
+                        data_iterator=processed_iterator,
+                        post_processing_fn=loss_post_processor,
+                        device_mesh=self.device_mesh,
+                        padding_token_id=self.tokenizer.pad_token_id or 0,
+                        autocast_context_factory=self._autocast_context,
+                        forward_only=eval_mode,
+                        is_reward_model=self._is_reward_model,
+                        allow_flash_attn_args=self.allow_flash_attn_args,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                        dp_size=self.dp_size,
+                        cp_size=self.cp_size,
+                        num_global_batches=num_global_batches,
+                        num_valid_microbatches=iterator_len,
+                        on_microbatch_start=on_microbatch_start,
+                        router_replay_gates=self._router_replay_gates,
+                    )
+
+                # Extract losses and metrics from results
+                mb_losses = []
+                for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
+                    # Only process valid (non-dummy) batches for metrics
+                    if mb_idx < iterator_len:
+                        num_valid_samples = loss_metrics["num_valid_samples"]
+                        loss_metrics[LEARNING_RATE_KEY] = self.optimizer.param_groups[
+                            0
+                        ]["lr"]
+                        if self.draft_model is not None:
+                            # param_groups[0] is "policy" (see
+                            # DSPARK_OPTIMIZER_GROUP_NAMES); the draft's own
+                            # lr is otherwise never logged anywhere, so its
+                            # schedule can't be verified from wandb/TB.
+                            loss_metrics["draft_lr"] = self.optimizer.param_groups[1][
+                                "lr"
+                            ]
+                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
+
+                        if num_valid_samples > 0:
+                            # Metrics were materialized together by the loss;
+                            # undo this worker's per-global-batch scaling without
+                            # synchronizing the loss tensor again.
+                            mb_losses.append(loss_metrics["loss"] * num_global_batches)
+                            all_mb_metrics.append(loss_metrics)
+
+                grad_norm: Optional[float | torch.Tensor] = None
+                if not eval_mode:
+                    # The policy is clipped on its own (Megatron-path parity):
+                    # a shared global clip let the draft's larger gradients
+                    # scale down the policy's updates on every step. The draft
+                    # is clipped separately below. num_label_tokens=None keeps
+                    # the helper from rescaling gradients under pipeline
+                    # parallelism: the loss already carries the global
+                    # normalization.
+                    grad_norm = scale_grads_and_clip_grad_norm(
+                        self.max_grad_norm,
+                        [self.model],
+                        norm_type=2.0,
+                        pp_enabled=self.pipeline is not None,
+                        device_mesh=self.device_mesh,
+                        moe_mesh=self.moe_mesh,
+                        ep_axis_name="ep"
+                        if self.moe_mesh is not None
+                        and "ep" in self.moe_mesh.mesh_dim_names
+                        else None,
+                        pp_axis_name="pp" if self.pipeline is not None else None,
+                        foreach=True,
+                        num_label_tokens=None,
+                        dp_group_size=self.dp_size * self.cp_size,
+                    )
+                    grad_norm = torch.tensor(
+                        grad_norm, device="cpu", dtype=torch.float32
+                    )
+                    warn_if_inf_grad_norm(grad_norm)
+
+                    # Independent draft clip with the same max norm; the
+                    # returned pre-clip norm doubles as the reported metric.
+                    if draft_runtime is not None:
+                        draft_grad_norm = float(
+                            scale_grads_and_clip_grad_norm(
+                                self.max_grad_norm,
+                                [self.draft_model],
+                                norm_type=2.0,
+                                pp_enabled=False,
+                                device_mesh=self.device_mesh,
+                                moe_mesh=None,
+                                ep_axis_name=None,
+                                pp_axis_name=None,
+                                foreach=True,
+                                num_label_tokens=1,
+                                dp_group_size=self.dp_size * self.cp_size,
+                            )
+                        )
+
+                    # Update parameters and the non-gradient MoE routing bias.
+                    self.optimizer.step()
+                    self._update_moe_gate_bias_if_supported()
+
+                losses.append(torch.tensor(mb_losses).sum().item())
+
+            if self.pipeline is not None:
+                # The loss runs on the last stage only.
+                losses, all_mb_metrics = broadcast_object_from_last_stage(
+                    self.pipeline, (losses, all_mb_metrics)
                 )
-                self._run_update_chunk(gb_result["batch"], sync_expert_grads=True)
-                update = self._close_update()
 
-                grad_norm = update.grad_norm
-                draft_grad_norm = update.draft_grad_norm
-                all_mb_metrics.extend(update.mb_metrics)
-                losses.append(update.loss)
+            # release gradient memory before rollouts
+            self.optimizer.zero_grad()
+            # increment scheduler after all batches in rollout are processed
+            if not eval_mode:
+                self.scheduler.step()
+            # dynamic batch and sequence dims causes alot of fragmentation, so clear
+            # the memory allocator before moving on
+            torch.cuda.empty_cache()
 
-            metrics = self._finish_train_call(
+            # Aggregate training statistics across microbatches and ranks
+            metrics = aggregate_training_statistics(
                 losses=losses,
                 all_mb_metrics=all_mb_metrics,
                 grad_norm=grad_norm,
-                draft_grad_norm=draft_grad_norm,
-                eval_mode=eval_mode,
+                dp_group=self.dp_mesh.get_group(),
+                dtype=self.dtype,
             )
+            if draft_runtime is not None:
+                # Like grad_norm, this reflects the last global batch. Returned
+                # as a CPU tensor to match the Megatron worker's return type
+                # (the trainer calls .numpy() on it).
+                metrics["draft_grad_norm"] = torch.tensor(
+                    draft_grad_norm, device="cpu", dtype=torch.float32
+                )
+
             self.timer.stop("train")
             return metrics
-
-    def _open_update(
-        self,
-        post_processing_fn: LossPostProcessor,
-        mbs: int,
-        *,
-        global_counts: Optional[GlobalCounts],
-        eval_mode: bool,
-        num_global_batches: int,
-        sequence_dim: int,
-        on_microbatch_start: Callable[[int], None],
-    ) -> None:
-        """Start an optimizer update: zero gradients and record its normalization.
-
-        Args:
-            post_processing_fn: Loss post-processor for every chunk of the update.
-            mbs: Microbatch size.
-            global_counts: The update's valid sequence and token counts summed
-                over the DP group, known before any chunk runs. ``None`` (counts
-                known only when the update closes) is reserved for streaming
-                updates and not implemented.
-            eval_mode: Compute losses and metrics without gradients.
-            num_global_batches: Global batches in the enclosing ``train()`` call,
-                used to scale metrics.
-            sequence_dim: Sequence dimension of the data.
-            on_microbatch_start: Called with each microbatch index of the
-                non-pipelined path.
-        """
-        if global_counts is None:
-            raise NotImplementedError(
-                "Optimizer updates whose global valid counts are known only at "
-                "close time are not supported by the Automodel policy worker yet."
-            )
-        if self._update is not None:
-            raise RuntimeError(
-                "An optimizer update is already open; close or abort it first."
-            )
-        self.optimizer.zero_grad()
-        if self.pipeline is not None and not eval_mode:
-            # Lets Automodel defer MoE expert-gradient sync to the update's
-            # final backward; the non-pipelined path syncs on every backward.
-            prepare_for_grad_accumulation([self.model], pp_enabled=True)
-        self._update = _OpenUpdate(
-            post_processing_fn=post_processing_fn,
-            mbs=mbs,
-            global_counts=global_counts,
-            eval_mode=eval_mode,
-            num_global_batches=num_global_batches,
-            sequence_dim=sequence_dim,
-            on_microbatch_start=on_microbatch_start,
-            mb_losses=[],
-            mb_metrics=[],
-        )
-
-    def _run_update_chunk(
-        self, data: BatchedDataDict[Any], *, sync_expert_grads: bool
-    ) -> None:
-        """Run forward and backward on one chunk of the open update.
-
-        Gradients and metrics accumulate into the open update; no optimizer step
-        happens here.
-
-        Args:
-            data: This rank's rows of the chunk, on the training device.
-            sync_expert_grads: Synchronize MoE expert gradients at the end of
-                this chunk. Required for the chunk whose gradients reach the
-                optimizer step without another backward pass; only the
-                pipelined path defers that sync.
-        """
-        update = self._update
-        if update is None:
-            raise RuntimeError("_run_update_chunk requires an open update.")
-
-        if self.pipeline is not None:
-            if update.mbs != self.pipeline.pp_microbatch_size:
-                raise ValueError(
-                    f"Pipeline parallelism runs microbatches of "
-                    f"{self.pipeline.pp_microbatch_size} samples "
-                    "(policy.train_micro_batch_size), but this call requested "
-                    f"mbs={update.mbs}."
-                )
-            execution_batches = self._plan_execution_batches(data, update.mbs)
-            mb_results = pipeline_forward_backward(
-                self.pipeline,
-                execution_batches,
-                update.post_processing_fn,
-                autocast_context_factory=self._autocast_context,
-                forward_only=update.eval_mode,
-                global_valid_seqs=update.global_counts.global_valid_seqs,
-                global_valid_toks=update.global_counts.global_valid_toks,
-                sampling_params=self.sampling_params,
-                sequence_dim=update.sequence_dim,
-                dp_size=self.dp_size,
-                cp_size=self.cp_size,
-                num_global_batches=update.num_global_batches,
-                sync_expert_grads=sync_expert_grads,
-            )
-            # Real samples come first, so the valid microbatches are a prefix.
-            num_valid_microbatches = sum(
-                batch.num_real_microbatches for batch in execution_batches
-            )
-        else:
-            # Get microbatch iterator based on batching strategy
-            processed_iterator, num_valid_microbatches = get_microbatch_iterator(
-                data,
-                self.cfg,
-                update.mbs,
-                self.dp_mesh,
-                tokenizer=self.tokenizer,
-            )
-
-            # Use automodel_forward_backward for the training loop
-            mb_results = automodel_forward_backward(
-                model=self.model,
-                data_iterator=processed_iterator,
-                post_processing_fn=update.post_processing_fn,
-                device_mesh=self.device_mesh,
-                padding_token_id=self.tokenizer.pad_token_id or 0,
-                autocast_context_factory=self._autocast_context,
-                forward_only=update.eval_mode,
-                is_reward_model=self._is_reward_model,
-                allow_flash_attn_args=self.allow_flash_attn_args,
-                global_valid_seqs=update.global_counts.global_valid_seqs,
-                global_valid_toks=update.global_counts.global_valid_toks,
-                sampling_params=self.sampling_params,
-                sequence_dim=update.sequence_dim,
-                dp_size=self.dp_size,
-                cp_size=self.cp_size,
-                num_global_batches=update.num_global_batches,
-                num_valid_microbatches=num_valid_microbatches,
-                on_microbatch_start=update.on_microbatch_start,
-                router_replay_gates=self._router_replay_gates,
-            )
-
-        # Extract losses and metrics from results. Under pipeline parallelism
-        # only the last stage has results.
-        for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
-            # Only process valid (non-dummy) batches for metrics
-            if mb_idx < num_valid_microbatches:
-                num_valid_samples = loss_metrics["num_valid_samples"]
-                loss_metrics[LEARNING_RATE_KEY] = self.optimizer.param_groups[0]["lr"]
-                if self.draft_model is not None:
-                    # param_groups[0] is "policy" (see
-                    # DSPARK_OPTIMIZER_GROUP_NAMES); the draft's own
-                    # lr is otherwise never logged anywhere, so its
-                    # schedule can't be verified from wandb/TB.
-                    loss_metrics["draft_lr"] = self.optimizer.param_groups[1]["lr"]
-                loss_metrics["global_valid_seqs"] = (
-                    update.global_counts.global_valid_seqs.item()
-                )
-                loss_metrics["global_valid_toks"] = (
-                    update.global_counts.global_valid_toks.item()
-                )
-
-                if num_valid_samples > 0:
-                    # Metrics were materialized together by the loss;
-                    # undo this worker's per-global-batch scaling without
-                    # synchronizing the loss tensor again.
-                    update.mb_losses.append(
-                        loss_metrics["loss"] * update.num_global_batches
-                    )
-                    update.mb_metrics.append(loss_metrics)
-
-    def _close_update(self) -> _ClosedUpdate:
-        """Finish the open update: clip, step, and share its metrics.
-
-        The once-per-call epilogue (final ``zero_grad``, LR scheduler step,
-        cache release, metric aggregation) is ``_finish_train_call``, which
-        ``train()`` runs once after all of its updates.
-
-        Returns:
-            The update's loss, metrics, and gradient norms, identical on every
-            rank of a pipeline group.
-        """
-        update = self._update
-        if update is None:
-            raise RuntimeError("_close_update requires an open update.")
-        pp_enabled = self.pipeline is not None
-
-        grad_norm: Optional[torch.Tensor] = None
-        draft_grad_norm: Optional[float] = None
-        if not update.eval_mode:
-            # The policy is clipped on its own (Megatron-path parity):
-            # a shared global clip let the draft's larger gradients
-            # scale down the policy's updates on every step. The draft
-            # is clipped separately below. num_label_tokens=None keeps the
-            # helper from rescaling gradients under pipeline parallelism: the
-            # loss already carries the global normalization.
-            grad_norm = scale_grads_and_clip_grad_norm(
-                self.max_grad_norm,
-                [self.model],
-                norm_type=2.0,
-                pp_enabled=pp_enabled,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                ep_axis_name="ep"
-                if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names
-                else None,
-                pp_axis_name="pp" if pp_enabled else None,
-                foreach=True,
-                num_label_tokens=None,
-                dp_group_size=self.dp_size * self.cp_size,
-            )
-            grad_norm = torch.tensor(grad_norm, device="cpu", dtype=torch.float32)
-            warn_if_inf_grad_norm(grad_norm)
-
-            # Independent draft clip with the same max norm; the
-            # returned pre-clip norm doubles as the reported metric.
-            if update.post_processing_fn.draft_runtime is not None:
-                draft_grad_norm = float(
-                    scale_grads_and_clip_grad_norm(
-                        self.max_grad_norm,
-                        [self.draft_model],
-                        norm_type=2.0,
-                        pp_enabled=False,
-                        device_mesh=self.device_mesh,
-                        moe_mesh=None,
-                        ep_axis_name=None,
-                        pp_axis_name=None,
-                        foreach=True,
-                        num_label_tokens=1,
-                        dp_group_size=self.dp_size * self.cp_size,
-                    )
-                )
-
-            # Update parameters and the non-gradient MoE routing bias.
-            self.optimizer.step()
-            self._update_moe_gate_bias_if_supported()
-
-        mb_losses, mb_metrics = update.mb_losses, update.mb_metrics
-        if self.pipeline is not None:
-            # The loss runs on the last stage only.
-            mb_losses, mb_metrics = broadcast_object_from_last_stage(
-                self.pipeline, (mb_losses, mb_metrics)
-            )
-        self._update = None
-        return _ClosedUpdate(
-            loss=torch.tensor(mb_losses).sum().item(),
-            mb_metrics=mb_metrics,
-            grad_norm=grad_norm,
-            draft_grad_norm=draft_grad_norm,
-        )
-
-    def _abort_update(self) -> None:
-        """Discard the open update's gradients and metrics. Idempotent."""
-        self.optimizer.zero_grad()
-        self._update = None
-
-    def _finish_train_call(
-        self,
-        *,
-        losses: list[float],
-        all_mb_metrics: list[dict[str, Any]],
-        grad_norm: Optional[torch.Tensor],
-        draft_grad_norm: Optional[float],
-        eval_mode: bool,
-    ) -> dict[str, Any]:
-        """Run the once-per-call epilogue of ``train()`` and aggregate metrics."""
-        # release gradient memory before rollouts
-        self.optimizer.zero_grad()
-        # increment scheduler after all batches in rollout are processed
-        if not eval_mode:
-            self.scheduler.step()
-        # dynamic batch and sequence dims causes alot of fragmentation, so clear
-        # the memory allocator before moving on
-        torch.cuda.empty_cache()
-
-        # Aggregate training statistics across microbatches and ranks
-        metrics = aggregate_training_statistics(
-            losses=losses,
-            all_mb_metrics=all_mb_metrics,
-            grad_norm=grad_norm,
-            dp_group=self.dp_mesh.get_group(),
-            dtype=self.dtype,
-        )
-        if draft_grad_norm is not None:
-            # Like grad_norm, this reflects the last global batch. Returned
-            # as a CPU tensor to match the Megatron worker's return type
-            # (the trainer calls .numpy() on it).
-            metrics["draft_grad_norm"] = torch.tensor(
-                draft_grad_norm, device="cpu", dtype=torch.float32
-            )
-        return metrics
 
     @wrap_with_nvtx_name("automodel_policy_worker/get_logprobs")
     def get_logprobs(
@@ -1210,6 +1022,13 @@ class AutomodelPolicyWorkerImpl(
     ) -> list[ExecutionBatch]:
         """Split this rank's ``data`` into the pipeline's schedule calls."""
         pipeline = self.pipeline
+        if micro_batch_size != pipeline.pp_microbatch_size:
+            raise ValueError(
+                "Pipeline parallelism runs microbatches of "
+                f"{pipeline.pp_microbatch_size} samples "
+                "(policy.train_micro_batch_size), but this call requested "
+                f"micro_batch_size={micro_batch_size}."
+            )
         return plan_execution_batches(
             data,
             model=self.model,
@@ -1240,13 +1059,6 @@ class AutomodelPolicyWorkerImpl(
         pipeline group, so every rank returns the same tensor.
         """
         pipeline = self.pipeline
-        if micro_batch_size != pipeline.pp_microbatch_size:
-            raise ValueError(
-                "Pipeline parallelism runs microbatches of "
-                f"{pipeline.pp_microbatch_size} samples "
-                "(policy.train_micro_batch_size), but logprobs were requested with "
-                f"micro_batch_size={micro_batch_size}."
-            )
         data.to("cuda")
         execution_batches = self._plan_execution_batches(data, micro_batch_size)
         token_logprobs = pipeline_forward_logprobs(

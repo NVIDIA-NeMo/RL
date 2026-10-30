@@ -89,31 +89,31 @@ checkpoint's optimizer namespace (Section 5) branch on `worker.pipeline`. Worker
 features with no PP implementation either raise in the worker or are rejected by
 validation (Section 1.1), so no non-PP code path runs on a single stage.
 
-## 3. Training Update Lifecycle
+## 3. Training Loop
 
-`train()` runs each global batch as one optimizer update in three phases:
+`train()` keeps the non-PP loop: each global batch is one optimizer update, and only
+the forward and backward pass branches on `worker.pipeline`:
 
 ```text
 process_global_batch          global valid sequence/token counts, summed over DP
-_open_update                  zero_grad; record loss post-processor and counts
-_run_update_chunk(batch)      PP=1: automodel_forward_backward; PP>1: pipeline schedule
-_close_update                 clip (PP-aware) -> optimizer.step -> broadcast metrics
+optimizer.zero_grad
+PP=1: automodel_forward_backward
+PP>1: plan_execution_batches -> pipeline_forward_backward (schedule calls)
+clip (PP-aware) -> optimizer.step
 ...                           (next global batch)
-_finish_train_call            zero_grad, scheduler.step, empty_cache, aggregate metrics
+PP>1: broadcast losses and metrics from the last stage
+zero_grad, scheduler.step, empty_cache, aggregate metrics
 ```
 
-The normalization counts are always known before the first chunk (`GlobalCounts`);
-`_open_update(global_counts=None)` is reserved for streaming updates whose counts are
-known only at close and raises `NotImplementedError`. `_abort_update` drops an open
-update's gradients and metrics. `_run_update_chunk` does not assume one chunk is the
-whole update, and nothing in it changes when an update runs several chunks.
+The normalization counts are known before any schedule call runs, so the loss is
+normalized exactly as without PP.
 
 ## 4. Pipeline Execution
 
 ### 4.1 Batch Planning
 
 `plan_execution_batches` (`nemo_rl/models/automodel/pipeline_batch.py`) turns the data
-of one chunk (or one logprob request) into execution batches of `mbs * M` samples. The
+of one global batch (or one logprob request) into execution batches of `mbs * M` samples. The
 tail is padded with copies of the first sample whose `sample_mask` and `token_mask` are
 zero, and the number of execution batches is all-reduced (max) over the DP group, so
 every DP rank issues the same number of schedule calls and FSDP collectives. Every
@@ -208,8 +208,10 @@ recommended.
 
 ## 8. Limitations and Follow-ups
 
-- Streaming (SingleController) updates need unknown-N normalization and an upstream
-  fix that preserves gradients across stage re-initialization.
+- Streaming (SingleController) updates are not supported. They would implement the
+  worker's `begin_train_step` / `train_microbatch` / `finish_train_step` contract, which
+  normalizes at finish, and need an upstream fix that preserves gradients across stage
+  re-initialization.
 - Inputs whose batch dimension is not dim 0, as reported by a model's
   `get_pipeline_kwargs_chunk_dims` hook (for example multimodal M-RoPE position IDs),
   are rejected when a batch is planned. Text-only inputs of such models run.

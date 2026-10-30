@@ -37,6 +37,7 @@ from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtens
 from nemo_automodel.components.training.utils import (
     prepare_after_first_microbatch,
     prepare_for_final_backward,
+    prepare_for_grad_accumulation,
 )
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
@@ -222,16 +223,15 @@ def pipeline_forward_backward(
     dp_size: int,
     cp_size: int,
     num_global_batches: int,
-    sync_expert_grads: bool,
 ) -> list[tuple[torch.Tensor, dict[str, Any]]]:
     """Pipeline-parallel counterpart of ``automodel_forward_backward``.
 
-    Runs every execution batch through the schedule; gradients accumulate across
-    calls and no optimizer step happens here.
+    Runs every execution batch of one optimizer update through the schedule;
+    gradients accumulate across calls and no optimizer step happens here.
 
     Args:
         pipeline: The AutoPipeline that drives this rank's stage.
-        execution_batches: The chunk's planned schedule calls.
+        execution_batches: The update's planned schedule calls.
         post_processing_fn: The loss post-processor.
         autocast_context_factory: Worker-owned precision context factory.
         forward_only: Compute losses and metrics without a backward pass.
@@ -242,9 +242,6 @@ def pipeline_forward_backward(
         dp_size: Data parallel size.
         cp_size: Context parallel size.
         num_global_batches: Number of global batches (for metric scaling).
-        sync_expert_grads: Synchronize MoE expert gradients in the chunk's last
-            schedule call. Automodel only syncs them when told the optimizer
-            step follows.
 
     Returns:
         ``(loss, metrics)`` per microbatch in order, including padding
@@ -252,10 +249,13 @@ def pipeline_forward_backward(
         last stage; an empty list on other ranks.
     """
     loss_scale = dp_size * cp_size / post_processing_fn.cp_gradient_fanout
+    if not forward_only:
+        # Automodel defers MoE expert-gradient sync to the final backward of
+        # the update, as its own pipeline trainer does.
+        prepare_for_grad_accumulation(pipeline.parts, pp_enabled=True)
     results: list[tuple[torch.Tensor, dict[str, Any]]] = []
     for call_idx, execution_batch in enumerate(execution_batches):
-        is_last_call = call_idx == len(execution_batches) - 1
-        if not forward_only and sync_expert_grads and is_last_call:
+        if not forward_only and call_idx == len(execution_batches) - 1:
             prepare_for_final_backward(pipeline.parts, pp_enabled=True)
         context = PipelineCallContext(
             execution_batch=execution_batch,
