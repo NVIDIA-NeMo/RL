@@ -201,6 +201,9 @@ def _install_value_head_load_skip(
     chunk.hide_loss_modules = hide_loss_modules
 
 
+# Megatron-Bridge's public create_value_head_hook currently hard-codes a
+# top-level "output_layer". Keep this local equivalent until that API accepts
+# an output_layer_path for VLM wrappers with nested language-model heads.
 def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
     """Build a pre-wrap scalar-head hook for both GPT and VLM model layouts."""
 
