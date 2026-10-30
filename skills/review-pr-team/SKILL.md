@@ -374,12 +374,6 @@ Instructions:
   source code (via WebFetch on the raw GitHub URL or `curl`) and provide a permalink to
   the exact line that proves the claim. Use a pinned commit SHA, not `main`. Never claim
   "verl does X" or "TRL does Y" based on memory alone — verify and link.
-- **Compare new components to their nearest existing analog.** When the PR adds a component that
-  parallels an existing one (a new worker group ↔ `lm_policy.py`, a new advantage estimator ↔ the
-  existing estimators, a new config block ↔ `MasterConfig`), diff the new one against the established
-  pattern and flag missing affordances: backend dispatch, override hooks (e.g. `resolve_policy_worker_cls`),
-  guards/validation, type annotations, and return-shape consistency. "It works for the shipped recipe" is
-  not enough if the new component silently diverges from its sibling's contract.
 - **Copied-constant check.** Any value the PR copies from code it doesn't own (a string key, a field
   name, a protocol name, a look-alike type) — usually flagged by a comment like "must match X" or
   "mirrors Y" — has to be justified, in this order: (1) import it where it is read, even with a
@@ -1130,9 +1124,6 @@ Judge on three axes, each tied to an OBSERVABLE (no abstract hand-waving):
      for one logical change.
 
 Rules:
-- Compare the new component to its nearest existing analog (a new worker group ↔ lm_policy,
-  a new estimator ↔ the existing estimators): does it match that pattern's extension points
-  (backend dispatch, override hooks, guards), or diverge without reason?
 - Bias to code the PR INTRODUCES — reshaping a seam while it is being written costs nothing.
   For pre-existing shape the PR merely touches, suggest a tracking issue; do NOT block.
 - Low-severity SUGGESTIONS by default (these are not blockers) unless the shape will actively
