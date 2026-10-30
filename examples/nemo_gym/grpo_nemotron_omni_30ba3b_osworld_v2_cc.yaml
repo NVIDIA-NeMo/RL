@@ -161,7 +161,7 @@ env:
     is_trajectory_collection: false
     skip_venv_if_present: true
     config_paths:
-      - ${oc.env:OSWORLD_SANDBOX_CONFIG,benchmarks/osworld/configs/osworld_nemo_rl_opensandbox.yaml}
+      - benchmarks/osworld/configs/osworld_nemo_rl_opensandbox.yaml
     policy_model:
       responses_api_models:
         vllm_model:

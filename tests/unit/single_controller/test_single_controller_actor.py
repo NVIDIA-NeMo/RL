@@ -249,14 +249,6 @@ def _stamp_advantage_stage_config(ctrl, *, shardable: bool = True) -> None:
         teacher_logprobs_required=ctrl._teacher_logprobs_required,
         message_level_advantage_penalties_enabled=penalties_enabled,
         shardable=shardable,
-        prompt_mean_token_mean=(
-            getattr(
-                getattr(getattr(ctrl, "_master_config", None), "loss_fn", None),
-                "loss_agg_mode",
-                None,
-            )
-            == "prompt-mean-token-mean"
-        ),
         train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
     )
     ctrl._advantage_computer = AdvantageComputer(

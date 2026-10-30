@@ -24,7 +24,6 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
-    DrGRPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     ReinforceBaselineAdvantageEstimator,
 )
@@ -135,10 +134,11 @@ def _controller(meta, data, *, grpo=None, loss=None):
     ctrl._dp_client = _DataPlane(meta, data)
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._advantage_cfg = AdvantageConfig()
-    estimator_type = {
-        "reinforce_baseline": ReinforceBaselineAdvantageEstimator,
-        "dr_grpo": DrGRPOAdvantageEstimator,
-    }.get(config.adv_estimator.name, GRPOAdvantageEstimator)
+    estimator_type = (
+        ReinforceBaselineAdvantageEstimator
+        if config.adv_estimator.name == "reinforce_baseline"
+        else GRPOAdvantageEstimator
+    )
     ctrl._advantage_estimator = estimator_type(
         config.adv_estimator, ClippedPGLossConfig(**(loss or {}))
     )
@@ -162,9 +162,6 @@ def _controller(meta, data, *, grpo=None, loss=None):
         teacher_logprobs_required=False,
         message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
         shardable=True,
-        prompt_mean_token_mean=(
-            ctrl._master_config.loss_fn.loss_agg_mode == "prompt-mean-token-mean"
-        ),
         train_data_dump_dir=None,
     )
     ctrl._advantage_computer = AdvantageComputer(
@@ -470,37 +467,6 @@ def test_molt_owner_scalar_is_invariant_to_physical_segment_splitting():
     torch.testing.assert_close(
         split_data["advantages"][[0, 2], 1],
         unsplit_data["advantages"][:, 1],
-    )
-
-
-def test_flash_prompt_weights_pool_all_segments_and_rollouts_per_dispatch_group():
-    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)]), ("b", [(0.0, 3), (1.0, 1)])])
-    ctrl = _controller(
-        meta,
-        data,
-        grpo={
-            "baseline_population": "all_owners",
-            "adv_estimator": {"name": "dr_grpo"},
-        },
-        loss={
-            "use_importance_sampling_correction": True,
-            "truncated_importance_sampling_type": "seq-mask-tis",
-            "is_correction_gating": "binary_kl",
-            "truncated_importance_sampling_ratio_min": 0.0,
-            "truncated_importance_sampling_ratio": 0.01,
-            "force_on_policy_ratio": True,
-            "loss_agg_mode": "prompt-mean-token-mean",
-        },
-    )
-
-    result, valid = asyncio.run(ctrl._advantage_stage(meta))
-
-    assert valid and "prompt_loss_weight" in result.fields
-    # Every row has two action tokens. Prompt a has 3 rows (6 tokens), prompt b
-    # has 4 rows (8 tokens), T=14 and P=2.
-    torch.testing.assert_close(
-        data["prompt_loss_weight"],
-        torch.tensor([14 / 12] * 3 + [14 / 16] * 4),
     )
 
 

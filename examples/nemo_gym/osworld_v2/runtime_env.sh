@@ -7,43 +7,14 @@ set -euo pipefail
 : "${OSWORLD_CHECKPOINT_DIR:?}"
 : "${NANO_OMNI_MODEL_NAME:?}"
 : "${NANO_OMNI_CHAT_TEMPLATE:?}"
-export OSWORLD_SANDBOX_PROVIDER="${OSWORLD_SANDBOX_PROVIDER:-opensandbox}"
-case "$OSWORLD_SANDBOX_PROVIDER" in
-  opensandbox)
-    if [[ -z "${OPENSANDBOX_BASE_URL:-}" && -n "${OPENSANDBOX_DOMAIN:-}" ]]; then
-      export OPENSANDBOX_BASE_URL="$OPENSANDBOX_DOMAIN"
-    fi
-    : "${OPENSANDBOX_BASE_URL:?}"
-    export OSWORLD_SANDBOX_CONFIG=benchmarks/osworld/configs/osworld_nemo_rl_opensandbox.yaml
-    ;;
-  agentenv)
-    if [[ -z "${AGENTENV_URL:-}" && -n "${AGENTENV_ENDPOINT:-}" ]]; then
-      export AGENTENV_URL="$AGENTENV_ENDPOINT"
-    fi
-    : "${AGENTENV_URL:?}"
-    : "${AGENTENV_API_KEY:?}"
-    export AGENTENV_TEMPLATE="${AGENTENV_TEMPLATE:-osworld-slim-pixel-parity-20261001}"
-    export OSWORLD_SANDBOX_CONFIG=benchmarks/osworld/configs/osworld_nemo_rl_agentenv.yaml
-    if [[ -n "${AGENTENV_TLS_CA:-}" ]]; then
-      test -r "$AGENTENV_TLS_CA"
-      export SSL_CERT_FILE="$AGENTENV_TLS_CA"
-      export NEMO_GYM_PROXY_CA_BUNDLE="$AGENTENV_TLS_CA"
-    fi
-    ;;
-  *)
-    echo "OSWORLD_SANDBOX_PROVIDER must be opensandbox or agentenv" >&2
-    exit 2
-    ;;
-esac
+if [[ -z "${OPENSANDBOX_BASE_URL:-}" && -n "${OPENSANDBOX_DOMAIN:-}" ]]; then
+  export OPENSANDBOX_BASE_URL="$OPENSANDBOX_DOMAIN"
+fi
+: "${OPENSANDBOX_BASE_URL:?}"
 if [[ -n "${OSWORLD_EVAL_MODE:-}" ]]; then
   : "${OSWORLD_GRPO_VAL_DATA:?}"
 else
   : "${OSWORLD_GRPO_TRAIN_DATA:?}"
-fi
-if [[ -n "${OSWORLD_RLVR_SNAPSHOT:-}" ]]; then
-  test -d "$OSWORLD_RLVR_SNAPSHOT/tmp_funcs"
-  test -s "$OSWORLD_RLVR_SNAPSHOT/SNAPSHOT.json"
-  export OSWORLD_RLVR_SNAPSHOT
 fi
 
 export OSWORLD_RL_ROOT=/opt/nemo-rl
@@ -108,11 +79,7 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 export HF_HUB_OFFLINE="${OSWORLD_HF_HUB_OFFLINE:-0}"
 
 export OSWORLD_POOL_REF="${OSWORLD_POOL_REF:-osworld-kvm}"
-case "${OSWORLD_RECIPE:-flash-b8n8-dr-grpo}" in
-  flash-*) default_osworld_max_steps=200 ;;
-  *) default_osworld_max_steps=150 ;;
-esac
-export OSWORLD_MAX_STEPS="${OSWORLD_MAX_STEPS:-$default_osworld_max_steps}"
+export OSWORLD_MAX_STEPS="${OSWORLD_MAX_STEPS:-150}"
 export OSWORLD_MAX_PARALLEL_ROLLOUTS="${OSWORLD_MAX_PARALLEL_ROLLOUTS:-8}"
 export OPENSANDBOX_API_KEY="${OPENSANDBOX_API_KEY:-}"
 

@@ -66,7 +66,6 @@ def _config(**overrides) -> AdvantageStageConfig:
         teacher_logprobs_required=False,
         message_level_advantage_penalties_enabled=False,
         shardable=True,
-        prompt_mean_token_mean=False,
         train_data_dump_dir=None,
     )
     base.update(overrides)
@@ -448,7 +447,7 @@ class TestShardInvariantEstimators:
         that reads no other row. Everything else has to be checked before it is
         added here.
         """
-        assert SHARD_INVARIANT_ESTIMATORS == {"grpo", "dr_grpo", "opd"}
+        assert SHARD_INVARIANT_ESTIMATORS == {"grpo", "opd"}
 
 
 def test_rpc_dataclass_fields_are_classified() -> None:
@@ -619,7 +618,6 @@ def _controller(
         teacher_logprobs_required=is_opd,
         message_level_advantage_penalties_enabled=False,
         shardable=estimator_name in SHARD_INVARIANT_ESTIMATORS,
-        prompt_mean_token_mean=False,
         train_data_dump_dir=dump_dir,
     )
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)

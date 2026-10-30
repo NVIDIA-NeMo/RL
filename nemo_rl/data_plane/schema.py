@@ -52,7 +52,6 @@ SAMPLE_MASK = "sample_mask"
 MASK_SAMPLE = "mask_sample"
 TRUNCATED = "truncated"
 META_IDX = "meta_idx"
-PROMPT_LOSS_WEIGHT = "prompt_loss_weight"
 
 # Token-aligned message-violation fields consumed by SingleController advantages.
 INVALID_TOOL_CALL_MASK = "invalid_tool_call_mask"
@@ -101,7 +100,6 @@ SC_ROLLOUT_SCHEMA_FIELDS = (
     "values",
     "returns",
     "teacher_reference_logprobs",
-    PROMPT_LOSS_WEIGHT,
     *OPD_FULL_FIELDS,
     OPD_FULL_TEACHER_INDEX_FIELD,
     INVALID_TOOL_CALL_MASK,

@@ -18,7 +18,6 @@ from pydantic import ValidationError
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
-    DrGRPOAdvantageEstimator,
     OPDAdvantageEstimator,
     ReinforceBaselineAdvantageEstimator,
 )
@@ -39,21 +38,6 @@ def _make_estimator(alpha=1.0, subtract_global_baseline=False):
 def _make_reinforce_baseline_estimator():
     return ReinforceBaselineAdvantageEstimator(
         AdvEstimatorConfig(name="reinforce_baseline"), ClippedPGLossConfig()
-    )
-
-
-def test_dr_grpo_is_group_mean_without_std_or_whitening():
-    estimator = DrGRPOAdvantageEstimator(
-        AdvEstimatorConfig(name="dr_grpo"), ClippedPGLossConfig()
-    )
-    advantages = estimator.compute_advantage(
-        prompt_ids=torch.tensor([[1], [1], [2], [2]]),
-        rewards=torch.tensor([0.0, 2.0, 10.0, 14.0]),
-        mask=torch.ones(4, 2),
-    )
-    torch.testing.assert_close(
-        advantages,
-        torch.tensor([[-1.0, -1.0], [1.0, 1.0], [-2.0, -2.0], [2.0, 2.0]]),
     )
 
 

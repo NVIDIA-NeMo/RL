@@ -26,16 +26,12 @@ resolved_uv_python="$(uv python find 3.13.14)"
   'import sys; assert sys.version_info[:3] == (3, 13, 14), sys.version'
 
 "$OSWORLD_DRIVER_PYTHON" - <<'PY'
-import os
-import ssl
-import urllib.request
 from pathlib import Path
 
 import nemo_gym
 import nemo_rl
 import ray
 import transfer_queue
-from nemo_gym.sandbox import get_provider_class
 
 expected = (
     (nemo_rl, Path("/opt/nemo-rl")),
@@ -49,19 +45,6 @@ for module, root in expected:
 ray_version = tuple(int(part) for part in ray.__version__.split(".")[:2])
 if ray_version < (2, 58):
     raise RuntimeError(f"Expected Ray >=2.58, found {ray.__version__}")
-
-if os.environ.get("OSWORLD_SANDBOX_PROVIDER") == "agentenv":
-    assert get_provider_class("e2b").name == "e2b"
-    context = ssl.create_default_context()
-    if os.environ.get("AGENTENV_TLS_CA"):
-        context.load_verify_locations(cafile=os.environ["AGENTENV_TLS_CA"])
-    request = urllib.request.Request(
-        os.environ["AGENTENV_URL"].rstrip("/") + "/health",
-        headers={"X-API-Key": os.environ["AGENTENV_API_KEY"]},
-    )
-    with urllib.request.urlopen(request, timeout=30, context=context) as response:
-        if response.status != 204:
-            raise RuntimeError(f"AgentEnv health returned HTTP {response.status}")
 
 print(
     "osworld-v2-node-preflight-ok",
@@ -117,7 +100,7 @@ PY
 else
   "$OSWORLD_DRIVER_PYTHON" \
     examples/nemo_gym/launch_osworld_v2_cc.py \
-    --recipe "${OSWORLD_RECIPE:-flash-b8n8-dr-grpo}" \
+    --molt-b8k8-checkpoint \
     --validate-only \
     "grpo.max_num_steps=${OSWORLD_GRPO_MAX_STEPS:-300}"
 fi

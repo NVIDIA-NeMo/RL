@@ -21,7 +21,6 @@ from omegaconf import OmegaConf
 from examples.nemo_gym.launch_osworld_v2_cc import (
     MOLT_CHECKPOINT_CONFIG_PATH,
     MOLT_CONFIG_PATH,
-    RECIPE_CONFIG_PATHS,
     compose_and_validate_config,
     parse_args,
 )
@@ -187,33 +186,6 @@ def test_osworld_v2_recipe_resolves_paired_gym_configs(monkeypatch):
     )
 
 
-def test_osworld_v2_recipe_selects_agentenv_profile(monkeypatch):
-    monkeypatch.setenv("NANO_OMNI_MODEL_NAME", "/models/nemotron-omni")
-    monkeypatch.setenv(
-        "NANO_OMNI_CHAT_TEMPLATE",
-        "/models/nemotron-omni/chat_template.jinja",
-    )
-    monkeypatch.setenv("OSWORLD_GRPO_TRAIN_DATA", "/data/osworld-train.jsonl")
-    monkeypatch.setenv(
-        "OSWORLD_SANDBOX_CONFIG",
-        "benchmarks/osworld/configs/osworld_nemo_rl_agentenv.yaml",
-    )
-    monkeypatch.setenv("AGENTENV_URL", "http://agentenv.example")
-    monkeypatch.setenv("AGENTENV_API_KEY", "test-key")
-    monkeypatch.setenv("AGENTENV_TEMPLATE", "osworld-slim-pixel-parity-20261001")
-
-    config = compose_and_validate_config([])
-    gym_config = _resolve_gym_config(config)
-
-    assert config.env["nemo_gym"]["config_paths"][-1].endswith("agentenv.yaml")
-    agent = gym_config.osworld_nano_omni_agent.responses_api_agents.osworld_agent
-    assert agent.sandbox_provider == "osworld_agentenv"
-    assert agent.sandbox_spec.image == "osworld-slim-pixel-parity-20261001"
-    assert gym_config.osworld_agentenv.e2b.connection.api_url == (
-        "http://agentenv.example"
-    )
-
-
 def test_osworld_v2_molt_b8k8_recipe_composes_and_validates(monkeypatch):
     monkeypatch.setenv("NANO_OMNI_MODEL_NAME", "/models/nemotron-omni")
     monkeypatch.setenv(
@@ -371,65 +343,3 @@ def test_launcher_selects_molt_checkpoint_recipe(monkeypatch):
     assert args.molt_b8k8_checkpoint is True
     assert args.validate_only is True
     assert overrides == []
-
-
-@pytest.mark.parametrize(
-    ("recipe", "prompts", "generations", "advantage"),
-    [
-        ("flash-b8n8-reinforce", 8, 8, "reinforce_baseline"),
-        ("flash-b8n8-dr-grpo", 8, 8, "dr_grpo"),
-        ("flash-b17n16-dr-grpo", 17, 16, "dr_grpo"),
-        ("flash-b17n16-reinforce", 17, 16, "reinforce_baseline"),
-    ],
-)
-def test_flash_recipes_compose_and_validate(
-    monkeypatch, recipe, prompts, generations, advantage
-):
-    monkeypatch.setenv("NANO_OMNI_MODEL_NAME", "/models/nemotron-omni")
-    monkeypatch.setenv(
-        "NANO_OMNI_CHAT_TEMPLATE",
-        "/models/nemotron-omni/chat_template.jinja",
-    )
-    monkeypatch.setenv("OSWORLD_GRPO_TRAIN_DATA", "/data/rlvr-band/train.jsonl")
-    monkeypatch.setenv("OSWORLD_CHECKPOINT_DIR", "/checkpoints/osworld-v2")
-
-    config = compose_and_validate_config([], config_path=RECIPE_CONFIG_PATHS[recipe])
-
-    assert config.grpo.num_prompts_per_step == prompts
-    assert config.grpo.num_generations_per_prompt == generations
-    assert config.grpo.adv_estimator.name == advantage
-    assert config.policy["train_global_batch_size"] == prompts * generations
-    assert config.policy["router_replay"]["enabled"] is True
-    assert config.policy["megatron_cfg"]["optimizer"]["lr"] == 5e-6
-    assert config.async_rl.stage_full_advantage_window is True
-    assert config.loss_fn.force_on_policy_ratio is True
-    assert config.loss_fn.use_importance_sampling_correction is True
-    assert config.loss_fn.truncated_importance_sampling_type == "seq-mask-tis"
-    assert config.loss_fn.is_correction_gating == "binary_kl"
-    assert config.loss_fn.truncated_importance_sampling_ratio_min == 0.0
-    assert config.loss_fn.truncated_importance_sampling_ratio == 0.01
-    assert config.loss_fn.loss_agg_mode == "prompt-mean-token-mean"
-    if prompts == 17:
-        assert config.policy["train_global_batch_size"] > 16 * 16
-        assert config.async_rl.min_groups_for_streaming_train == 17
-        assert config.async_rl.max_buffered_rollouts == 17
-
-
-def test_launcher_selects_explicit_flash_recipe(monkeypatch):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "launch_osworld_v2_cc.py",
-            "--recipe",
-            "flash-b8n8-dr-grpo",
-            "--validate-only",
-            "logger.log_dir=/logs/flash",
-        ],
-    )
-
-    args, overrides = parse_args()
-
-    assert args.recipe == "flash-b8n8-dr-grpo"
-    assert args.validate_only is True
-    assert overrides == ["logger.log_dir=/logs/flash"]

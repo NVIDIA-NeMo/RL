@@ -48,7 +48,6 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import GenerationUnavailable
 from nemo_rl.experience.interfaces import (
-    NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY,
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
@@ -1330,18 +1329,7 @@ def test_nemo_gym_build_inputs_stamps_logical_group_coordinates():
     assert len({row[NEMO_GYM_GROUP_ID_KEY] for row in rows}) == 1
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
-    assert [row[NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY] for row in rows] == [
-        [0, 1, 2],
-        [0, 1, 2],
-        [0, 1, 2],
-    ]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2]
-
-    recovery_rows = impl._build_inputs(input_sample, generation_indices=[0, 2])
-    assert [row[NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY] for row in recovery_rows] == [
-        [0, 2],
-        [0, 2],
-    ]
 
 
 def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
