@@ -1,0 +1,506 @@
+# =============================================================================
+# Agentic GenRM -- GRPO on the SingleController. The task and reward are the
+# GenRM's (Gym generative_reward_model: per-rubric + overall scores and a 1-6
+# ranking as one JSON verdict, reward = -weighted L1 against human labels, 0 is
+# perfect, -100 when no single valid verdict parses). The policy judges from
+# inside OpenCode in an OpenSandbox sandbox (Gym agentic_genrm): it can read and
+# run the responses' code and search the web (Exa through genrm_search over Gym
+# MCP) before it writes the verdict.
+#
+# Infrastructure (policy / vLLM / Megatron, async sampler, data plane, token
+# capture) is copied from the SWE sandbox-capture PPO recipe
+# (examples/swe_ppo_hsg/ppo_nano_v3_5_swe_sandbox_capture_priv.yaml). Changes:
+#   - GRPO, no critic: group-normalized leave-one-out advantages, 8 generations
+#     per prompt (the single-turn GenRM recipe's group size).
+#   - One chain per rollout: OpenCode subagents are denied (Gym config), so
+#     segment rows are off and every rollout is one GRPO row.
+#   - reward_penalties off: they set the reward to 0, the BEST GenRM reward.
+#   - Masking: agent timeout and OOM only (infrastructure). A run that ends
+#     without a verdict or out of context is a parse failure (-100), as a
+#     truncated single-turn verdict is.
+# Cluster values (model, data, sandbox and Exa credentials, OpenCode install
+# paths, the search opt-out list) come from the launcher as overrides.
+# =============================================================================
+cluster:
+  gpus_per_node: 4
+  num_nodes: 128
+  segment_size: 16
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/agentic_genrm
+  metric_name: null
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 3
+  ft_keep_latest_k: 1
+  ft_save_period: 1
+  save_optimizer: true
+  checkpoint_must_save_by: 00:03:30:00
+  save_data_plane: false
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 8
+  max_rollout_turns: 1
+  # SC clamps max_num_steps to max_num_epochs x batches.
+  max_num_epochs: 100000
+  max_num_steps: 1000000
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  max_val_samples: 256
+  val_batch_size: 256
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: 2
+  # Infrastructure-masked rollouts (env.mask_sample_rules) stay out of their group's baseline.
+  masked_sample_rewards_in_baseline: false
+  adv_estimator:
+    name: grpo
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  async_grpo: null
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 3
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+policy:
+  model_name: ???
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 131072
+  precision: bfloat16
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 8
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.001
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    gradient_accumulation_fusion: false
+    defer_fp32_logits: true
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    mtp_num_layers: 5
+    mtp_detach_heads: true
+    optimizer:
+      optimizer: adam
+      lr: 3.0e-06
+      min_lr: 3.0e-06
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      adam_eps: 1e-10
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3e-7
+      override_opt_param_scheduler: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: false
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+    env_vars:
+      NCCL_NVLS_ENABLE: '0'
+      # The step-2 policy backward allocates a 12 GiB fp32 logits grad; with the
+      # default allocator ~14 GiB sat reserved-but-unused.
+      # Refit is an NCCL collective, so the expandable-segment IPC caveat is moot.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    fp32_lm_head: tf32
+    clear_memory_caches_before_refit: true
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+    fuse_loss: true
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}},
+    2}
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    backend: vllm
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: auto
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      skip_tokenizer_init: false
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+      fp32_lm_head: tf32
+    vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      moe_backend: triton
+      mamba_ssm_cache_dtype: float32
+      disable_custom_all_reduce: true
+      # Chunked-prefill budget per engine step. Unset, NeMo RL's engine context falls back to 2048, and
+      # this hybrid model's 1056-token attention block (Mamba "align" prefix caching ends prefill chunks
+      # on block boundaries) then admits one block of prefill per step. With the post-refit KV reset
+      # every in-flight context re-prefills, which made agent turns 20-30% slower at 2048; at 32768 the
+      # reset run matches the no-reset controls. Scheduler-only: sampling and semantics are unchanged.
+      max_num_batched_tokens: 32768
+      compilation_config:
+        cudagraph_mode: PIECEWISE
+        cudagraph_capture_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
+        pass_config:
+          fuse_allreduce_rms: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 64
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: null
+  validation:
+    data_path: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    skip_venv_if_present: true
+    num_gpu_nodes: 0
+    port_range_low: 15001
+    port_range_high: 20000
+    # A cold start builds the Gym server venvs (~6-8 min of installs each onto Lustre), past
+    # Gym's 600 s default. Stay under NeMo-RL's 1800 s shard spinup so Gym's error surfaces first.
+    server_spinup_timeout_seconds: 1500
+    invalid_tool_call_patterns:
+    - <tool_call>
+    - </tool_call>
+    - <function_call>
+    - </function_call>
+    thinking_tags:
+    - <think>
+    - </think>
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/agentic_genrm/configs/agentic_genrm_opencode.yaml
+    # Gym's config (agentic_genrm_opencode.yaml) holds the harness: image, judge prompt, permissions,
+    # 40 OpenCode steps, network restricted to the policy model and genrm_search. Training knobs here.
+    agentic_genrm_opencode_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent:
+          token_id_capture: true
+          concurrency: ${mul:2, ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}}
+          opencode_max_context_window: ${policy.generation.vllm_cfg.max_model_len}
+          opencode_model_call_timeout: null
+          sandbox_timeout: 1800
+          # The sandbox reaches only the model and genrm_search: OpenCode and ripgrep cannot be
+          # downloaded inside it. The launcher points these at staged copies.
+          remote_opencode_install_script_path: null
+          remote_opencode_binary_path: null
+          remote_opencode_musl_binary_path: null
+          local_ripgrep_binary_path: null
+          # Rows come from data.train; no Gym-side dataset.
+          datasets: []
+    use_absolute_ip: true
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+          # Retry 429/502/503/504/520 for up to ~1 h (7200 x 0.5 s) instead of failing the rollout.
+          max_rate_limit_attempts: 7200
+          # Force the trainer's sampling on every OpenCode session (NeMo-RL's on-policy check).
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
+    train_on_all_session_traces: false
+    # A trace with NaN policy logprobs is kept and masked from the loss.
+    nan_generation_logprobs: mask
+  # Infrastructure failures only. A session that ran out of steps or context is scored
+  # (no final verdict -> parse failure), not masked.
+  mask_sample_rules:
+  - name: agent_timeout
+    field: opencode_error_type
+    equals: timeout
+  - name: agent_timeout_exception
+    field: opencode_error_type
+    equals: TimeoutError
+  - name: agent_oom
+    field: opencode_exit_code
+    equals: 137
+logger:
+  log_dir: logs
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: agentic-genrm
+    name: agentic-genrm
+    # W&B "Step" = trainer step, so SC runs line up with legacy runs in shared panels.
+    trainer_step_as_wandb_step: true
+    # Off: per-step transcript tables were ~1.7 GB/step (5-20 MB strings) and stalled the W&B
+    # row; legacy never uploaded them (no such option in legacy NeMo-RL).
+    log_nemo_gym_full_result_tables: false
+  tensorboard: {}
+  mlflow:
+    experiment_name: agentic-genrm
+    run_name: agentic-genrm
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+effort_levels:
+  low_string: '{reasoning effort: efficient}'
+  low_weight: 0.1
+  low_penalty: 1
+  low_ub: 15000
+# All off: each one sets the rollout's reward to 0, which is a PERFECT GenRM score.
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_unwanted_tokens: false
+  penalize_malformed_think_tag: false
+  rollout_scoped_penalties_on_all_segments: false
+  token_ids:
+    unwanted:
+    - 2
+    think_open: 12
+    think_close: 13
+async_rl:
+  sampler:
+    name: ready_first
+    max_staleness_versions: 1
+  recompute_kv_cache_after_weight_updates: false
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${mul:2, ${grpo.num_prompts_per_step}}
+  max_buffered_rollouts: ${mul:2, ${grpo.num_prompts_per_step}}
+  diagnostics: false
+  rollout_failure:
+    max_infra_attempts_per_prompt: 5
+    max_data_attempts_per_prompt: 2
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    max_skipped_prompts: 0
+    max_consecutive_dropped_prompts: 0
+    min_step_batch_fraction: 0.9
+    on_dropped_prompt: shrink
+    max_replacement_attempts: 1
+    replacement_reserve_prompts: 1
+    native:
+      generation_timeout_s: null
+      env_timeout_s: null
+    nemo_gym:
+      rollout_timeout_s: null
+      max_row_attempts: 3
+  stall_watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 3600.0
+    stall_action: warn
+    gym_subprocess_check: true
+  generation_fleet_health:
+    enabled: false
+    probe_interval_s: 5.0
+    probe_timeout_s: 2.0
+    unhealthy_threshold: 3
+    healthy_threshold: 2
+    selection: least_outstanding
+    max_restart_attempts_per_shard: 5
+    restart_dead_shards: false
+    restart_timeout_s: 1800.0
+    restart_backoff_s: 60.0
+    min_healthy_shards: 1
+    refit_timeout_s: 300.0
+  generation_router:
+    enabled: false
+    port_range_low: 1202
+    port_range_high: 1300
+    backend_timeout_s: 600.0
+    connect_timeout_s: 5.0
+    no_healthy_backend_status: 409
+  checkpoint_replay_buffer: false
+rollout_checkpointing:
+  snapshot_attempt_interval_s: null
+  telemetry_interval_s: null
+  max_consecutive_failures: 3
+  keep_latest_k: 2
+  restore_mode: latest
+  extra_fingerprint_excluded_paths: []
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+  mooncake_cpu:
+    global_segment_size: 68719476736
+    local_buffer_size: 4294967296
+    reuse_registered_buffers: true
+    staging_buffer_size: 268435456
+token_capture:
+  enabled: true
+  staging_partition: rollout_staging
+  # OpenCode subagents are denied, so each rollout is one chain: one GRPO row.
+  segment_rows:
+    enabled: false
+    max_per_rollout: 1
+rollout_recovery:
+  default_granularity: sibling
+  task_source_granularity_overrides: {}
+  agent_granularity_overrides: {}
