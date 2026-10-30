@@ -45,7 +45,7 @@ from nemo_rl.environments.nemo_gym import (
 )
 
 
-@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron", "trtllm"])
+@pytest.mark.parametrize("backend", ["vllm", "megatron", "trtllm"])
 def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
     generation = {
         "backend": backend,
@@ -59,10 +59,9 @@ def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
 
     setup_nemo_gym_config(config, tokenizer=None)
 
-    is_vllm_like = backend in ("vllm", "dynamo")
     assert generation["vllm_cfg"] == {
-        "async_engine": is_vllm_like,
-        "expose_http_server": is_vllm_like,
+        "async_engine": backend == "vllm",
+        "expose_http_server": backend == "vllm",
     }
     assert generation["mcore_generation_config"] == {
         "expose_http_server": backend == "megatron"
@@ -1055,6 +1054,68 @@ def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
 
     assert cluster.actor_configs
     assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
+
+
+def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
+    detected_uv_dirs,
+):
+    """With Dynamo, each actor's composed config speaks Gym's Dynamo dialect.
+
+    The dialect is not a policy_model overlay, which a sharded plan would reject
+    as unowned. A shard's own template kwargs still win over the native defaults.
+    """
+    from nemo_rl.algorithms.grpo import MasterConfig
+
+    env = _shard_env_configs()
+    env["nemo_gym"]["shards"][1]["overrides"] = {
+        "policy_model": {
+            "responses_api_models": {
+                "vllm_model": {"chat_template_kwargs": {"enable_thinking": False}}
+            }
+        }
+    }
+    config = MasterConfig.model_construct(
+        env=env,
+        data={},
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "dynamo": True,
+                "vllm_cfg": {
+                    "http_server_serving_chat_kwargs": {
+                        "default_chat_template_kwargs": {"enable_thinking": True}
+                    }
+                },
+            }
+        },
+    )
+    setup_nemo_gym_config(config, tokenizer=None)
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            config.env,
+            base_urls=["http://frontend"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+
+    thinking = [
+        cfg["initial_global_config_dict"]["policy_model"]["responses_api_models"][
+            "vllm_model"
+        ]["chat_template_kwargs"]["enable_thinking"]
+        for cfg in cluster.actor_configs
+    ]
+    # judged, then the tools shard's two replicas with their own override.
+    assert thinking == [True, False, False]
+    for cfg in cluster.actor_configs:
+        gym_config = cfg["initial_global_config_dict"]
+        vllm_model = gym_config["policy_model"]["responses_api_models"]["vllm_model"]
+        assert vllm_model["dynamo_frontend"] is True
+        assert vllm_model["reasoning_field"] == "reasoning_content"
+        assert "dynamo_dialect" not in gym_config
 
 
 def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(

@@ -29,7 +29,7 @@ depend on torch.
 """
 
 import base64
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import torch
 
@@ -67,11 +67,13 @@ def encode_routed_experts(routed_experts: torch.Tensor) -> str:
     return f"{_MAGIC}:{dtype_name}:{tokens}x{num_layers}x{topk}:{data}"
 
 
-def decode_routed_experts(payload: Union[str, Any], dtype: torch.dtype) -> torch.Tensor:
+def decode_routed_experts(
+    payload: Union[str, Any], dtype: Optional[torch.dtype]
+) -> torch.Tensor:
     """Decode routed experts into a tensor of the requested dtype.
 
     Accepts the base64 envelope produced by ``encode_routed_experts`` or the
-    legacy nested-list format.
+    legacy nested-list format. ``dtype=None`` keeps the envelope's own dtype.
     """
     if not isinstance(payload, str):
         return torch.as_tensor(payload, dtype=dtype)
@@ -100,6 +102,8 @@ def decode_routed_experts(payload: Union[str, Any], dtype: torch.dtype) -> torch
             f"routed_experts envelope has {len(raw) // wire_dtype.itemsize} "
             f"elements, expected {expected} for shape {shape}."
         )
+    if dtype is None:
+        dtype = wire_dtype
     if expected == 0:
         return torch.empty(shape, dtype=dtype)
     tensor = torch.frombuffer(raw, dtype=wire_dtype).reshape(shape)

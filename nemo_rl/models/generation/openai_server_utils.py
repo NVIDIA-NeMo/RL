@@ -62,7 +62,7 @@ def splice_prefix_tokens(
     *,
     tokenizer: Any,
     model_prefix_token_ids: list[int],
-    template_prefix_token_ids: list[int],
+    template_prefix_token_ids: list[int] | None,
     template_token_ids: list[int],
     eos_token_id: int | Collection[int] | None = None,
 ) -> PrefixSplice:
@@ -132,6 +132,14 @@ def splice_prefix_tokens(
     toward the boundary, and when the model's prefix ends on one of them that
     exact id is kept in place of the template's, so the spliced prompt still
     starts with the model's tokens verbatim.
+
+    A host that sees only the rendered prompt, not the messages (the Dynamo
+    engine), passes ``template_prefix_token_ids=None``. The prefix render is only
+    used for its EOS count, and every EOS in the model's prefix closed one
+    message, plus the one the template adds to a final assistant turn the model
+    did not close. The counts agree when the history up to that turn is the one
+    the prefix was generated from and the model emitted no EOS text as ordinary
+    tokens.
     """
     if not model_prefix_token_ids:
         return PrefixSplice(template_token_ids, 0, 0)
@@ -152,6 +160,12 @@ def splice_prefix_tokens(
     model_ended_on_eos = model_prefix_token_ids[-1] in eos_token_ids
     if model_ended_on_eos:
         model_cut_end -= 1
+    if template_prefix_token_ids is None:
+        template_prefix_token_ids = (
+            model_prefix_token_ids
+            if model_ended_on_eos
+            else [*model_prefix_token_ids, next(iter(eos_token_ids))]
+        )
 
     # Locate the turn boundary by EOS count rather than token position. Qwen3
     # templates may strip prior reasoning blocks when re-rendering history;

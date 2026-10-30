@@ -173,13 +173,6 @@ def _make_master_config(
             "kv_cache_management_mode": "recompute",
         }
         policy_config["model_name"] = "test-model"
-    if backend == "dynamo":
-        # The fields DynamoGeneration.validate_settings reads, at accepted values.
-        generation_config["dynamo_cfg"] = {
-            "request_timeout_s": 900.0,
-            "control_timeout_s": 900.0,
-        }
-        generation_config["vllm_cfg"] = {"enable_vllm_metrics_logger": False}
     master_config = MasterConfig.model_construct(
         data_plane={
             "enabled": dp_enabled,
@@ -226,8 +219,6 @@ def _make_master_config(
             **({} if sampler_cfg is None else {"sampler": sampler_cfg}),
         ),
     )
-    if backend == "dynamo":
-        master_config.async_rl.generation_fleet_health.refit_timeout_s = None
     return master_config
 
 
@@ -494,51 +485,6 @@ def test_forest_retains_shared_checkpoint_requirements(
     patched_factories["_build_trainer"].assert_not_called()
 
 
-def test_build_generation_constructs_dynamo_from_normalized_config():
-    """DynamoGeneration receives the generation config setup already validated."""
-    master_config = _make_master_config(backend="dynamo")
-    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
-    inference_cluster = MagicMock(name="inference_cluster")
-
-    with patch.object(sc_setup_mod, "DynamoGeneration") as mock_dynamo:
-        generation, _ = sc_setup_mod._build_generation(
-            inference_cluster,
-            master_config,
-        )
-
-    mock_dynamo.assert_called_once_with(
-        cluster=inference_cluster,
-        config=master_config.policy["generation"],
-    )
-    assert master_config.policy["generation"]["model_name"] == "Qwen/Qwen3-0.6B"
-    generation.finish_generation.assert_called_once_with()
-
-
-def test_build_generation_rejects_deferred_dynamo_load():
-    master_config = _make_master_config(backend="dynamo")
-    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
-
-    with (
-        patch.object(sc_setup_mod, "DynamoGeneration") as mock_dynamo,
-        pytest.raises(AssertionError, match="defer_model_load"),
-    ):
-        sc_setup_mod._build_generation(
-            MagicMock(name="inference_cluster"),
-            master_config,
-            defer_model_load=True,
-        )
-    mock_dynamo.assert_not_called()
-
-
-def test_generation_max_seq_len_reads_dynamo_vllm_cfg():
-    assert (
-        sc_setup_mod._generation_max_seq_len(
-            {"backend": "dynamo", "vllm_cfg": {"max_model_len": 1024}}
-        )
-        == 1024
-    )
-
-
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")
@@ -562,7 +508,7 @@ def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
 
     with pytest.raises(
         ValueError,
-        match="only supports vllm, sglang, megatron, or dynamo generation; got 'trtllm'",
+        match="only supports vllm, sglang, or megatron generation; got 'trtllm'",
     ):
         sc_setup_mod._build_clusters(master_config)
 
@@ -1897,104 +1843,6 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
-    def test_invalid_dynamo_config_fails_before_clusters(self, patched_factories):
-        mc = _make_master_config(backend="dynamo")
-
-        with (
-            patch.object(
-                sc_setup_mod.DynamoConfig,
-                "model_validate",
-                side_effect=ValueError("bad dynamo config"),
-            ),
-            pytest.raises(ValueError, match="bad dynamo config"),
-        ):
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
-
-        patched_factories["_build_clusters"].assert_not_called()
-        patched_factories["_build_generation"].assert_not_called()
-
-    @pytest.mark.parametrize(
-        ("misconfigure", "match"),
-        [
-            pytest.param(
-                lambda mc: mc.policy.update(router_replay={"enabled": True}),
-                "does not return routed experts",
-                id="router_replay",
-            ),
-            pytest.param(
-                lambda mc: mc.policy.update(is_vlm=True),
-                "serves text prompts only",
-                id="vlm",
-            ),
-            pytest.param(
-                lambda mc: setattr(
-                    mc.async_rl.generation_fleet_health, "enabled", True
-                ),
-                "Dynamo frontend owns request routing",
-                id="fleet_health",
-            ),
-            # 300.0 is the FleetHealthConfig default, so a Dynamo config that does
-            # not opt out would otherwise only fail at its first weight sync.
-            pytest.param(
-                lambda mc: setattr(
-                    mc.async_rl.generation_fleet_health, "refit_timeout_s", 300.0
-                ),
-                "refit_timeout_s must be null",
-                id="refit_deadline",
-            ),
-            pytest.param(
-                lambda mc: mc.policy["generation"]["dynamo_cfg"].update(
-                    control_timeout_s=600.0
-                ),
-                "must be >= request_timeout_s",
-                id="drain_timeout",
-            ),
-            pytest.param(
-                lambda mc: mc.policy["generation"]["vllm_cfg"].update(
-                    enable_vllm_metrics_logger=True
-                ),
-                "requires rollout_checkpointing.telemetry_interval_s",
-                id="unread_metrics_logger",
-            ),
-        ],
-    )
-    def test_unsupported_dynamo_settings_fail_before_clusters(
-        self, patched_factories, misconfigure, match
-    ):
-        mc = _make_master_config(backend="dynamo")
-        misconfigure(mc)
-
-        with (
-            patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate,
-            pytest.raises(ValueError, match=match),
-        ):
-            validate.return_value.model_dump.return_value = mc.policy["generation"]
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
-
-        patched_factories["setup_response_data"].assert_not_called()
-        patched_factories["_build_clusters"].assert_not_called()
-        patched_factories["_build_generation"].assert_not_called()
-
-    def test_dynamo_generation_config_is_normalized(self, patched_factories):
-        mc = _make_master_config(backend="dynamo")
-        mc.policy["hf_config_overrides"] = {"rope_theta": 1.0}
-        normalized = {
-            **mc.policy["generation"],
-            "vllm_kwargs": {"hf_overrides": {"rope_theta": 1.0}},
-        }
-
-        with patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate:
-            validate.return_value.model_dump.return_value = normalized
-            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
-
-        (raw_config,), _ = validate.call_args
-        assert raw_config["vllm_kwargs"]["hf_overrides"] == {"rope_theta": 1.0}
-        assert mc.policy["generation"] is normalized
-        assert actor_args.gen_handle is patched_factories["fake_gen"]
-        _, sync_kwargs = patched_factories["create_weight_synchronizer"].call_args
-        assert sync_kwargs["generation_backend"] == "dynamo"
-        assert sync_kwargs["colocated"] is False
-
     def test_returns_actor_args(self, patched_factories):
         mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=0)
@@ -2504,7 +2352,7 @@ class TestSetup:
         assert data_kwargs["is_vlm"] is True
         mock_spinup.assert_called_once_with(
             mc.env,
-            base_urls=patched_factories["fake_gen"].dp_openai_server_base_urls,
+            base_urls=patched_factories["fake_gen"].client_base_urls,
             model_name="test-model",
             # Reaches the actor once, at spinup, rather than riding along with every
             # run_rollouts call.
@@ -2656,6 +2504,39 @@ class TestSetup:
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args
         assert setup_kwargs["capture_media"] is with_processor
+
+    def test_dynamo_token_capture_tells_gym_to_speak_dynamo(self, patched_factories):
+        """The same vLLM workers stage the calls; Gym reaches them through the frontend."""
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "dynamo": True,
+                "vllm_cfg": {"async_engine": True, "expose_http_server": True},
+            }
+        )
+        mc.token_capture.enabled = True
+        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {}}
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[MagicMock()],
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        assert mc.token_capture.generation_backend == "dynamo"
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
         mc = _make_master_config(colocated=False, backend="vllm")
