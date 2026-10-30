@@ -53,7 +53,7 @@ value-worker path. See the
 [Qwen2.5-VL-3B Geometry3K recipe](../../examples/configs/recipes/vlm/vlm_ppo-qwen2.5-vl-3b-geometry3k-1n8g-megatron-single-controller.v1.yaml)
 for a complete configuration.
 
-![MMPR-Tiny PPO and GRPO 300-step fixed-set accuracy](../assets/vlm-ppo-vs-grpo-fixed-accuracy.png)
+![CLEVR-CoGenT 100-step and MMPR-Tiny 300-step PPO versus GRPO fixed-set accuracy](../assets/vlm-ppo-vs-grpo-fixed-accuracy.png)
 
 ### Deployment Architectures
 
