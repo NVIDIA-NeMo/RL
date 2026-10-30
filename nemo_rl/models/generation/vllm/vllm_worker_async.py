@@ -179,14 +179,8 @@ class _AsyncLLMHTTPClient:
         request_id: str,
         **kwargs: Any,
     ) -> AsyncGenerator[Any, None]:
-        # vllm_cfg.flat_logprobs: store this request's logprobs flat. output_handler
-        # would otherwise build a dict plus a Logprob object per generated token on the
-        # engine loop; under a large backlog the cyclic GC's full collections over those
-        # objects hold the GIL for tens of seconds. The values are the same, and
-        # attach_token_information_to_chat_response_choices reads them the same way.
-        # flat_logprobs also flattens prompt logprobs, and vLLM's clamp_prompt_logprobs
-        # edits per-position copies of FlatLogprobs, so -inf prompt logprobs would reach
-        # JSON serialization; leave requests that ask for prompt logprobs unchanged.
+        # Flat logprobs avoid per-token Logprob objects that cause long GC pauses.
+        # Not for prompt logprobs: vLLM's -inf clamp edits copies of flat storage.
         if (
             self._flat_logprobs
             and sampling_params.logprobs is not None
@@ -442,12 +436,12 @@ class VllmAsyncGenerationWorkerImpl(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
         # Keep vLLM's output loops from monopolizing this actor's event loop under a
-        # generation backlog (see output_loop_yield.py).
+        # generation backlog (see install_output_loop_yield).
         output_loop_yield_budget_ms = self.cfg["vllm_cfg"].get(
             "output_loop_yield_budget_ms"
         )
         if output_loop_yield_budget_ms is not None:
-            from nemo_rl.models.generation.vllm.output_loop_yield import (
+            from nemo_rl.models.generation.vllm.patches import (
                 install_output_loop_yield,
             )
 
