@@ -611,7 +611,7 @@ def value_setup(request, tiny_qwen2_model_path):
         _apply_config_updates(config, config_updates)
         tokenizer = get_tokenizer(config["tokenizer"])
 
-        value = Value(cluster=cluster, config=config, tokenizer=tokenizer)
+        value = Value(cluster=cluster, config=config, tokenizer=tokenizer, seed=42)
 
         # Build a tiny test batch.
         torch.manual_seed(42)
@@ -825,7 +825,7 @@ def test_value_worker_parallelism_equivalence(
         # Reference worker: feature OFF.
         ref_config = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
         tokenizer = get_tokenizer(ref_config["tokenizer"])
-        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer)
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer, seed=42)
         values_ref = ref.get_values(data)["values"].detach().cpu()
 
         # Save weights, then reload into a feature-ON worker (same weights).
@@ -841,6 +841,7 @@ def test_value_worker_parallelism_equivalence(
             cluster=cluster,
             config=feat_config,
             tokenizer=tokenizer,
+            seed=42,
             weights_path=Path(weights_path),
             name_prefix="lm_value_feat",
         )
@@ -901,7 +902,7 @@ def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_pa
         )
         _apply_config_updates(ref_config, {"sequence_packing": True})
         tokenizer = get_tokenizer(ref_config["tokenizer"])
-        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer)
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer, seed=42)
         values_ref = ref.get_values(data)["values"].detach().cpu()
 
         # Save weights, then reload into the CP=2 worker (same weights).
@@ -922,6 +923,7 @@ def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_pa
             cluster=cluster,
             config=feat_config,
             tokenizer=tokenizer,
+            seed=42,
             weights_path=Path(weights_path),
             name_prefix="lm_value_feat",
         )
@@ -1184,6 +1186,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         cluster=cluster,
         config=config,
         tokenizer=tokenizer,
+        seed=42,
         weights_path=resume_weights_path,
         optimizer_path=resume_optimizer_path,
         name_prefix="lm_value_resumed",

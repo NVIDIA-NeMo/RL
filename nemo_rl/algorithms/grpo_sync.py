@@ -640,7 +640,9 @@ def grpo_train_sync(
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
 
-    while current_epoch < max_num_epochs and total_steps < max_num_steps:
+    while (
+        max_num_epochs is None or current_epoch < max_num_epochs
+    ) and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
         # 1-hop cross-iteration cache for dynamic_sampling: across

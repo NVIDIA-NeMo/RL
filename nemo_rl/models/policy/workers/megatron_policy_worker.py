@@ -100,6 +100,7 @@ from nemo_rl.models.megatron.draft.step_state import (
     DraftStepState,
 )
 from nemo_rl.models.megatron.hybridep import uses_hybridep_flex_dispatcher
+from nemo_rl.models.megatron.manual_gc import ManualGCMixin
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -686,6 +687,7 @@ def _reserved_http_server_port_for_rank(
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
+    ManualGCMixin,
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
     TQWorkerMixin,
@@ -886,6 +888,9 @@ class MegatronPolicyWorkerImpl(
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
+        # Fail on a bad manual_gc config before the expensive setup below; GC itself
+        # is disabled at the end of __init__ (_maybe_enable_manual_gc).
+        self._manual_gc_interval_from_cfg()
 
         # Store the reserved HTTP server port for inference server initialization.
         # Megatron-LLM's hosts an inference server on every MP coordinator rank,
@@ -1155,6 +1160,7 @@ class MegatronPolicyWorkerImpl(
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
         )
+        self._maybe_enable_manual_gc()
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -1562,6 +1568,9 @@ class MegatronPolicyWorkerImpl(
                     # policy so their large early gradients don't shrink the
                     # policy update. None when no draft model is attached.
                     draft_grad_norm = self.optimizer.grad_norms_by_group.get("draft")
+                    # Once per optimizer step, so manual_gc_interval means the same
+                    # here as on the split-step path (finish_train_step).
+                    self._maybe_run_manual_gc()
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
                     mtp_grad_norm = None
@@ -2243,7 +2252,7 @@ class MegatronPolicyWorkerImpl(
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
-            return self._finish_train_step_body(state)
+            result = self._finish_train_step_body(state)
         except Exception:
             # Mid-finish failure: state machine is in a partial state and the
             # mcore hooks may still be nulled (or restored, depending on how far
@@ -2263,6 +2272,8 @@ class MegatronPolicyWorkerImpl(
                     "failed to restore mcore hooks after finish_train_step error"
                 )
             raise
+        self._maybe_run_manual_gc()
+        return result
 
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
