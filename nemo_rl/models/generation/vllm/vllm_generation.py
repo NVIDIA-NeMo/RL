@@ -737,11 +737,13 @@ class VllmGeneration(GenerationInterface):
 
     def _get_raw_spec_counters(self) -> dict[str | tuple[str, int], float]:
         """Collect raw spec decode counters from workers."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "_get_raw_spec_counters",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        worker_metrics = ray.get(futures)
+        futures = [
+            worker._get_raw_spec_counters.remote()
+            for worker in self._refit_leader_workers()
+        ]
+        # A frozen actor may not have been quarantined yet. Optional telemetry
+        # must not block training while the health monitor detects that failure.
+        worker_metrics = ray.get(futures, timeout=5.0)
 
         # Aggregate across workers
         return aggregate_spec_decode_counters(worker_metrics)

@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -42,6 +43,7 @@ from nemo_rl.models.generation.vllm.utils import (
     remap_multimodal_placeholders,
 )
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+from nemo_rl.weight_sync.membership import plan_refit_membership
 
 
 def _decoded_routes(payload: str) -> list:
@@ -1155,6 +1157,58 @@ def _generation_stub(counters):
         _step_metrics_snapshot=counters,
         _get_raw_spec_counters=lambda: counters,
     )
+
+
+@pytest.mark.parametrize("surviving_shards", [[0, 1], [1]])
+def test_spec_counters_only_query_refit_participants(
+    monkeypatch: pytest.MonkeyPatch, surviving_shards: list[int]
+) -> None:
+    # Import the heavy generation implementation only for these tests.
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    workers = [MagicMock(), MagicMock()]
+    stub = SimpleNamespace(
+        worker_group=SimpleNamespace(workers=workers),
+        _refit_membership=plan_refit_membership(
+            surviving_shards=surviving_shards,
+            dp_size=2,
+            total_gen_workers=2,
+            train_world_size=1,
+        ),
+    )
+    stub._refit_leaders_by_shard = lambda: VllmGeneration._refit_leaders_by_shard(stub)
+    stub._refit_leader_workers = lambda: VllmGeneration._refit_leader_workers(stub)
+    get = MagicMock(return_value=[{"vllm:spec_decode_num_drafts": 10.0}])
+    monkeypatch.setattr(ray, "get", get)
+
+    counters = VllmGeneration._get_raw_spec_counters(stub)
+
+    assert counters["vllm:spec_decode_num_drafts"] == 10.0
+    for idx, worker in enumerate(workers):
+        assert worker._get_raw_spec_counters.remote.call_count == int(
+            idx in surviving_shards
+        )
+    assert 0 < get.call_args.kwargs["timeout"] <= 30
+
+
+def test_frozen_metrics_worker_does_not_block_the_training_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Import the heavy generation implementation only for these tests.
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = SimpleNamespace(
+        _step_metrics_snapshot=None,
+        _refit_leader_workers=lambda: [MagicMock()],
+    )
+    stub._get_raw_spec_counters = lambda: VllmGeneration._get_raw_spec_counters(stub)
+    get = MagicMock(side_effect=ray.exceptions.GetTimeoutError("frozen worker"))
+    monkeypatch.setattr(ray, "get", get)
+
+    VllmGeneration.snapshot_step_metrics(stub)
+
+    assert stub._step_metrics_snapshot is None
+    assert 0 < get.call_args.kwargs["timeout"] <= 30
 
 
 def test_step_metrics_survive_an_unreadable_engine_snapshot():
