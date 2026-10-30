@@ -2,7 +2,7 @@
 
 How to add, read and override config, and how tests build config models.
 
-- **Follow the `config-conventions` skill (`skills/config-conventions/SKILL.md`) for new and changed config.** It covers where defaults live, BaseModel vs TypedDict vs dataclass, exemplar YAML updates and the forbidden default patterns.
+- **Follow the config conventions for new and changed config.** They cover where defaults live, BaseModel vs TypedDict vs dataclass, exemplar YAML updates and the forbidden default patterns. Contributing Details: [config-conventions](details/config-conventions.md).
 - **In unit tests, build BaseModel configs with keyword arguments (`Foo(k=v)`, or `Foo.model_construct(k=v)` when required fields are missing), not `model_validate({...})` or `**{...}`, unless validating a loaded recipe YAML.** The point is to unify how tests build configs (#4278). Review Details: [unify-test-configs-to-keyword-arguments](../../review-pr-team/references/details/unify-test-configs-to-keyword-arguments.md).
 - **When you add a key to an exemplar YAML, also update its `tests/unit/reference_configs/` twin; one exemplar is enough.** (#3798)
 - **Do not use `.get(key, default)` for a required key or invariant unless there is a strong reason; a KeyError there is the feature.** (#3308, #3652) Review Details: [typeddict-missing-key-failfast-is-convention](../../review-pr-team/references/details/typeddict-missing-key-failfast-is-convention.md).

@@ -6,7 +6,7 @@ When a NeMo-RL PR adds a new key to a v1 TypedDict config (e.g. `VllmConfig`) an
 without a fallback (bare subscript, or `.get()` + isinstance/None check that raises), that
 fail-loud-on-missing behavior IS the repo convention — the default lives ONLY in the exemplar
 YAML (`examples/configs/*.yaml`), and `cfg.get("key", default)` at the call site is an
-explicitly FORBIDDEN pattern per the config-conventions skill and
+explicitly FORBIDDEN pattern per `skills/contributing/references/details/config-conventions.md` and
 docs/design-docs/design-and-philosophy.md.
 
 **Why:** In PR #3308 review, design-reviewer flagged the hard-require of
@@ -44,5 +44,5 @@ inherit the key and are safe; the only break is out-of-tree standalone YAMLs, wh
 severity and by design. (2) Never propose `.get(key, non-None-default)` as a fix in this repo;
 the correct asks are exemplar+reference-YAML defaults (both files, kept in sync for
 tests/unit/test_config_v2.py) and, at most, a clearer error message. (3) Verify against the
-config-conventions skill before letting any agent's "sibling uses .get()" argument stand —
+config conventions (`skills/contributing/references/details/config-conventions.md`) before letting any agent's "sibling uses .get()" argument stand —
 the sibling may be the legacy anti-pattern. Related: [stacked-pr-check-threads-before-flagging](stacked-pr-check-threads-before-flagging.md).

@@ -1930,7 +1930,7 @@ carry, copy it into `references/details/` and end the rule with `Details: [name]
 Set `scope:` deliberately — it routes the lesson when it is upstreamed:
 - `general` → a review-process rule: a `references/` file, or this skill's text once it is stable.
 - `repo-specific` → a NeMo-RL convention: `references/repo-conventions-*.md`, or later the repo's
-  contributor skills (`config-conventions`, `testing`, `cicd`, …).
+  contributor skills (`contributing` references, `testing`, `cicd`, …).
 
 Before writing, glob the folder and **UPDATE** an existing file if one already covers the topic rather than
 duplicating; delete a lesson that turns out wrong. (Materialize is human-triggered: the user asks you to
