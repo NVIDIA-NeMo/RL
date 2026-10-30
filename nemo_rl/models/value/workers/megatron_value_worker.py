@@ -975,6 +975,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
                 torch.cuda.empty_cache()
             self._train_step_state = None
+            self._maybe_run_manual_gc()
             return result
         except Exception:
             state.failed = True

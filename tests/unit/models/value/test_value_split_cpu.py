@@ -213,6 +213,7 @@ def make_worker(cls):
     w._policy_like_cfg = {}
     w.mcore_state = SimpleNamespace(straggler_timer=None)
     w.defer_fp32_logits = False
+    w._maybe_run_manual_gc = MagicMock()
     return w
 
 
@@ -273,6 +274,7 @@ def test_split_matches_full_batch_gradients_and_updates(worker_type, cliprange, 
                 expected_metrics[key], rel=1e-6
             )
     assert worker.optimizer.steps == 2
+    assert worker._maybe_run_manual_gc.call_count == 2
     assert worker.model.finalize.call_count == 2
     assert worker.model.start_grad_sync.call_count == 2
     assert worker.scheduler.step.call_count == 2
@@ -290,6 +292,7 @@ def test_abort_and_invalid_transitions(worker_type):
         worker.begin_train_step(loss_fn)
     with pytest.raises(RuntimeError, match="empty"):
         worker.finish_train_step()
+    worker._maybe_run_manual_gc.assert_not_called()
     with pytest.raises(RuntimeError, match="failed"):
         worker.train_microbatch(batch())
     worker.abort_train_step()
@@ -304,6 +307,7 @@ def test_abort_and_invalid_transitions(worker_type):
     worker.train_microbatch(batch())
     worker.finish_train_step()
     assert worker.optimizer.steps == 1
+    worker._maybe_run_manual_gc.assert_called_once_with()
 
 
 def test_incomplete_batch_cannot_commit(worker_type):
