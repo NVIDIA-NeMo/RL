@@ -2,13 +2,12 @@ defaults: ./grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated.yaml
 # Shard-to-shard (nccl_reshard) refit sibling of the base recipe: the routed
 # experts go trainer EP4 -> TRT-LLM EP4 slots directly and are MXFP8-quantized
 # on the receiving rank; everything else rides the misc packed broadcast.
-# nccl_reshard needs Megatron training with ETP=1 and TRT-LLM pure expert
-# parallelism (moe_expert_parallel_size == tensor_parallel_size, both 4 here).
+# Tested only with Megatron ETP=1 (the inherited default). nccl_reshard needs
+# TRT-LLM pure expert parallelism (moe_expert_parallel_size ==
+# tensor_parallel_size, both 4 here).
 checkpointing:
   checkpoint_dir: results/grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated-reshard
 policy:
-  megatron_cfg:
-    expert_tensor_parallel_size: 1
   generation:
     refit_transport: nccl_reshard
 logger:

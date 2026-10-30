@@ -260,6 +260,29 @@ async def test_async_refit_surfaces_worker_exception():
         await worker.update_weights_from_collective_async(
             drain=True, recompute_kv=False
         )
+    with pytest.raises(RuntimeError, match="worker is poisoned") as excinfo:
+        await worker.nccl_reshard_refit_async(drain=True, recompute_kv=False)
+    assert str(excinfo.value.__cause__) == "worker is poisoned"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [[True], [], [False], [True, False], [True, True]],
+)
+async def test_async_nccl_reshard_refit_checks_every_worker_result(result):
+    worker = _worker()
+    worker.llm.collective_rpc.return_value = result
+
+    succeeded = await worker.nccl_reshard_refit_async(
+        refit_timeout_s=None, drain=False, recompute_kv=True
+    )
+
+    assert succeeded is (bool(result) and all(result))
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "nccl_reshard_refit",
+        kwargs={"refit_timeout_s": None, "drain": False, "recompute_kv": True},
+    )
 
 
 class _RecordedConfig:

@@ -81,7 +81,6 @@ class NcclExtension(WorkerExtension):
     # Routed-expert prefix -> expert ids this rank stores (see
     # fp8_quantization.build_local_expert_lookup); None converts every expert.
     _local_expert_lookup: Optional[fp8_quantization.LocalExpertLookup] = None
-    # Per-refit timing counters, reset at the start of each refit.
     # nccl_reshard: per-PP-stage bulk communicators, the transfer plan, the misc
     # broadcast's (shape, dtype) map, and the bulk param -> local slot specs.
     pp_comm_groups: Optional[dict[int, Any]] = None
@@ -92,6 +91,13 @@ class NcclExtension(WorkerExtension):
     # the expert prefix -> MoE weight-owner module map (built once).
     _pending_bulk_reload: Optional[dict[str, Any]] = None
     _moe_weight_owner_map: Optional[dict[str, Any]] = None
+    # nccl_reshard env knobs, parsed in prepare_nccl_reshard_refit_info.
+    # Converted bytes to accumulate before one ``model_loader.reload`` call:
+    # every reload walks the whole module tree, so batching keeps that host cost
+    # off the transfer's critical path; 0 means one reload per received stack.
+    _reload_batch_bytes: int = 2 << 30
+    # Receive streams across PP stages.
+    _refit_num_streams: int = 2
 
     # ------------------------------------------------------------------ #
     #  Collective initialisation (called once during setup)
@@ -424,6 +430,12 @@ class NcclExtension(WorkerExtension):
             restore_refit_info_placements,
         )
 
+        # Parsed here, before any refit: a bad value raised mid-receive would
+        # leave the trainers blocked on sends that are never received.
+        self._reload_batch_bytes = int(
+            os.environ.get("NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES", str(2 << 30))
+        )
+        self._refit_num_streams = int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2"))
         self.nccl_reshard_refit_info = restore_refit_info_placements(refit_info)
         model = self.engine.model_engine.model
         quant_config = model.model_config.quant_config
@@ -437,49 +449,15 @@ class NcclExtension(WorkerExtension):
             )
         if fp8_quantization.is_quantized_expert_refit(quant_config):
             _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
-        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {}) or {}
-        misc_state_dict_info = {}
-        for name, meta in misc_meta.items():
-            if isinstance(meta, dict):
-                shape, dtype = meta["shape"], meta["dtype"]
-            else:
-                shape, dtype = meta[0], meta[1]
-            dtype = (
-                _STR_TO_DTYPE[str(dtype)]
-                if not isinstance(dtype, torch.dtype)
-                else dtype
-            )
-            misc_state_dict_info[name] = (torch.Size(shape), dtype)
-        self.misc_state_dict_info = misc_state_dict_info
-        # The misc consumer reuses the collective path's per-bucket reload.
-        self.state_dict_info = misc_state_dict_info
+        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
+        self.misc_state_dict_info = {
+            name: (torch.Size(meta["shape"]), _STR_TO_DTYPE[meta["dtype"]])
+            for name, meta in misc_meta.items()
+        }
         if self.pp_comm_groups:
             self.hf_to_local_param_map = self._build_expert_local_param_map(
                 self.nccl_reshard_refit_info
             )
-
-    @staticmethod
-    def _local_shard_slices(param_info: dict, rank: int) -> tuple:
-        """This rank's slices of the HF-global tensor under the dst placements."""
-        from nemo_rl.weight_sync.xferdtensor_python import _compute_shard_slices
-
-        dst_mesh = param_info["dst_mesh_info"]
-        mesh_tensor = getattr(dst_mesh, "mesh", None)
-        if mesh_tensor is None:
-            mesh_tensor = getattr(dst_mesh, "_mesh", None)
-        if mesh_tensor is None:
-            raise ValueError("Destination mesh does not expose its ranks")
-        coordinates = (mesh_tensor == rank).nonzero(as_tuple=False)
-        if coordinates.numel() == 0:
-            raise ValueError(f"Rank {rank} is absent from the destination mesh")
-        return tuple(
-            _compute_shard_slices(
-                param_info["global_shape"],
-                list(mesh_tensor.shape),
-                coordinates[0].tolist(),
-                param_info["dst_placements"],
-            )
-        )
 
     def _build_expert_local_param_map(self, refit_info: dict):
         """One LocalParamSpec per grouped routed-expert projection.
@@ -499,6 +477,7 @@ class NcclExtension(WorkerExtension):
             LocalParamSpec,
             RefitCtx,
         )
+        from nemo_rl.weight_sync.xferdtensor_python import local_shard_slices
 
         pp_comm_groups = self.pp_comm_groups
         if not pp_comm_groups:
@@ -532,7 +511,7 @@ class NcclExtension(WorkerExtension):
                 if stage not in pp_comm_groups:
                     raise RuntimeError(f"no reshard communicator for PP stage {stage}")
                 rank = pp_comm_groups[stage].rank
-                slices = self._local_shard_slices(param_info, rank)
+                slices = local_shard_slices(param_info, rank)
                 global_shape = tuple(param_info["global_shape"])
                 local_shape = []
                 for size, sl in zip(global_shape, slices):
@@ -578,18 +557,6 @@ class NcclExtension(WorkerExtension):
                 specs[name] = LocalParamSpec(base=None, pre=pre, post=post)
         return HFToLocalParamMap(specs=specs)
 
-    @staticmethod
-    def _bulk_reload_batch_bytes() -> int:
-        """Converted bytes to accumulate before one ``model_loader.reload`` call.
-
-        Every reload walks the whole module tree, so loading each received
-        ``[E_local, out, in]`` projection stack on its own costs one full scan per
-        stack. Batching keeps that host cost off the transfer's critical path;
-        the budget bounds how many converted stacks wait on the GPU. 0 disables
-        batching (one reload per stack, the pre-batching behaviour).
-        """
-        return int(os.environ.get("NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES", str(2 << 30)))
-
     def _convert_received_experts(
         self, prefix: str, projection: str, expert_ids: list[int], stack: torch.Tensor
     ) -> dict:
@@ -624,7 +591,7 @@ class NcclExtension(WorkerExtension):
             pending = self._pending_bulk_reload = {"weights": {}, "bytes": 0}
         pending["weights"].update(weights)
         pending["bytes"] += sum(t.numel() * t.element_size() for t in weights.values())
-        if pending["bytes"] >= self._bulk_reload_batch_bytes():
+        if pending["bytes"] >= self._reload_batch_bytes:
             self._flush_received_experts()
 
     @staticmethod
@@ -645,21 +612,12 @@ class NcclExtension(WorkerExtension):
         owners = self._moe_weight_owner_map
         if owners is not None:
             return owners
-        try:
-            from tensorrt_llm._torch.moe.fused_moe.weight_owner import (
-                is_moe_weight_owner,
-            )
-        except ImportError:
-            # Older module layout: the fused MoE backend is the module that
-            # carries the EP slot assignment and loads its own weights.
-            def is_moe_weight_owner(module) -> bool:
-                return hasattr(module, "initial_local_expert_ids") and hasattr(
-                    module, "load_weights"
-                )
+        from tensorrt_llm._torch.moe.fused_moe.weight_owner import (
+            is_moe_weight_owner,
+        )
 
         owners = {}
-        model = self.engine.model_engine.model
-        for name, module in getattr(model, "named_modules", lambda: ())():
+        for name, module in self.engine.model_engine.model.named_modules():
             if not is_moe_weight_owner(module):
                 continue
             # The loader addresses ConfigurableMoE's weight-owning backend by
@@ -670,25 +628,58 @@ class NcclExtension(WorkerExtension):
         self._moe_weight_owner_map = owners
         return owners
 
+    def _moe_weight_owner(self, prefix: str) -> Any:
+        """The MoE weight owner of an expert prefix, matched as a dotted suffix.
+
+        Owners are named from the engine's root module, while weight prefixes
+        are named from the module the mapper loads into: a VLM wrapper
+        (Qwen3.5) nests its decoder under ``llm.``, and the mapper is bound to
+        that decoder only once ``load_weights`` has run.
+        """
+        owners = self._moe_weight_owners()
+        module = owners.get(prefix)
+        if module is not None:
+            return module
+        matches = [
+            owner for name, owner in owners.items() if name.endswith("." + prefix)
+        ]
+        if len(matches) != 1:
+            # Every queued weight is a routed expert: no single match means the
+            # owner names no longer line up with the weight names.
+            raise RuntimeError(
+                f"expected one TRT-LLM MoE weight owner for expert prefix "
+                f"{prefix!r}, found {len(matches)} (known owners: "
+                f"{sorted(owners)[:4]}...)"
+            )
+        owners[prefix] = matches[0]
+        return matches[0]
+
     def _load_expert_weights_direct(self, weights: dict) -> dict:
         """Replay the loader's per-module MoE branch for the queued stacks.
 
-        Returns the weights that no known MoE module claimed (loaded by the
-        generic loader afterwards).
+        This copies upstream TRT-LLM code at the pinned ``[tool.trtllm].ref``:
+        the per-module branch of ``_load_weights_impl_v2``
+        (tensorrt_llm/_torch/models/modeling_utils.py) and the
+        ``preprocess_weights`` call of the model's ``load_weights``. It skips the
+        ``params_map`` rename, ``should_skip_module``,
+        ``does_require_special_handling`` and ``mark_consumed`` steps, which do
+        not apply to routed-expert stacks; re-check this copy on every TRT-LLM
+        bump.
+
+        Returns the weights that no MoE module claimed: only entries the mapper
+        filtered out of every owner's prefix (loaded by the generic loader
+        afterwards).
         """
         model_loader = self.engine.model_engine.model_loader
         mapper = model_loader.weight_mapper
         if mapper is None:
             return weights
-        owners = self._moe_weight_owners()
         weights = mapper.preprocess_weights(weights, allow_partial_loading=True)
         # "<prefix>.<expert>.<projection>.<leaf>" -> "<prefix>"
         prefixes = {name.rsplit(".", 3)[0] for name in weights if name.count(".") >= 3}
         leftover = dict(weights)
         for prefix in sorted(prefixes):
-            module = owners.get(prefix)
-            if module is None:
-                continue
+            module = self._moe_weight_owner(prefix)
             module_weights = mapper.filter_weights(prefix, weights)
             if not module_weights:
                 continue
@@ -735,9 +726,7 @@ class NcclExtension(WorkerExtension):
                 stage_params.setdefault(param_info.get("pp_stage", 0), []).append(
                     param_info
                 )
-        num_streams = max(
-            1, min(int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params))
-        )
+        num_streams = max(1, min(self._refit_num_streams, len(stage_params)))
         streams = [torch.cuda.Stream() for _ in range(num_streams)]
         events = {}
         for idx, (stage, params) in enumerate(stage_params.items()):
@@ -819,6 +808,8 @@ class NcclExtension(WorkerExtension):
                 self._receive_and_load_misc_params()
                 self._finish_refit(recompute_kv)
             except Exception:
+                # Drop converted stacks of the failed refit; never reload them later.
+                self._pending_bulk_reload = None
                 self.engine.model_engine.model_loader.abort_update_weights()
                 raise
         return True
