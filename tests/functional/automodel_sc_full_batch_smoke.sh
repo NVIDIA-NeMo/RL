@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Stage 1 integration smoke: run in the NeMo RL driver environment on 8 GPUs.
+# Full-batch SC integration smoke: run in the NeMo RL driver environment on 8 GPUs.
 # Model paths, W&B run names, and output directories can be overridden via "$@".
 set -euo pipefail
 uv run examples/run_grpo_single_controller.py \
@@ -43,6 +43,6 @@ uv run examples/run_grpo_single_controller.py \
   checkpointing.enabled=false \
   logger.wandb_enabled=true \
   logger.wandb.project=nemorl-gemma4 \
-  logger.wandb.name=grpo-gemma4-e2b-it-1n8g-automodel-sc-stage1 \
-  logger.log_dir=logs/grpo-gemma4-e2b-it-1n8g-automodel-sc-stage1 \
+  logger.wandb.name=grpo-gemma4-e2b-it-1n8g-automodel-sc-full-batch \
+  logger.log_dir=logs/grpo-gemma4-e2b-it-1n8g-automodel-sc-full-batch \
   "$@"

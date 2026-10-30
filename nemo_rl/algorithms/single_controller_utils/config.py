@@ -1358,7 +1358,7 @@ def _validate_automodel_single_controller_config(master_config: MasterConfig) ->
     if automodel is None or not automodel["enabled"]:
         return
     automodel = cast(AutomodelConfig, automodel)
-    prefix = "AutoModel SC Stage 1 "
+    prefix = "AutoModel SC "
     if is_ppo_run(master_config) or master_config.on_policy_distillation is not None:
         raise ValueError(prefix + "supports text GRPO only")
     async_cfg = master_config.async_rl

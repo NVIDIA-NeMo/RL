@@ -880,7 +880,7 @@ class AutomodelPolicyWorkerImpl(
             or self.cfg["automodel_cfg"].get("dp_replicate_size") not in (None, 1)
         ):
             raise ValueError(
-                "AutoModel SC Stage 1 requires text full-parameter training, "
+                "AutoModel SC requires text full-parameter training, "
                 "TP=CP=EP=1, fixed microbatches, no CPU offload or draft model"
             )
         if self.optimizer is None or self.scheduler is None:
@@ -920,14 +920,14 @@ class AutomodelPolicyWorkerImpl(
         """Compute a full dispatch's gradients using existing numerical primitives.
 
         One dispatch may contain many backend forward/backward microbatches.
-        PR1 requires exactly one complete batch; streaming is a later extension.
+        Requires exactly one complete batch; streaming is not supported.
         """
         state = self._train_step_state
         if state is None:
             raise RuntimeError("begin_train_step must precede train_microbatch")
         if state.dispatched:
             raise RuntimeError(
-                "Stage 1 accepts exactly one full-batch dispatch per step"
+                "AutoModel SC accepts exactly one full-batch dispatch per step"
             )
         state.dispatched = True
         sizes = torch.tensor([data.size, -data.size], device="cuda")
@@ -938,7 +938,7 @@ class AutomodelPolicyWorkerImpl(
         local_gbs = state.gbs // self.dp_size
         if minimum != local_gbs or -negative_maximum != local_gbs:
             raise ValueError(
-                f"Stage 1 requires {local_gbs} rows on every DP rank; "
+                f"AutoModel SC requires {local_gbs} rows on every DP rank; "
                 f"received between {minimum} and {-negative_maximum}. Abort this step."
             )
         with self.timer.time("train"):

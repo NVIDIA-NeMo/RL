@@ -16,7 +16,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 `run_grpo_single_controller.py` mirrors `run_grpo.py` for config loading — the same YAML files apply — but requires a few settings the legacy path does not. The default exemplar lives at [examples/configs/grpo_math_1B_megatron_single_controller.yaml](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml); the PPO one at [examples/configs/ppo_math_1B_megatron_single_controller.yaml](../../examples/configs/ppo_math_1B_megatron_single_controller.yaml).
 
-### AutoModel full-batch baseline (Stage 1)
+### AutoModel full-batch baseline
 
 AutoModel supports the initial text GRPO baseline: dense and MoE full-parameter FSDP2,
 TP=CP=EP=1, fixed microbatches, disaggregated async vLLM, `in_order` with
@@ -34,7 +34,7 @@ path retains its broader configuration support.
 Run the five-step Gemma4 E2B integration smoke on one eight-GPU node:
 
 ```bash
-bash tests/functional/automodel_sc_stage1_smoke.sh
+bash tests/functional/automodel_sc_full_batch_smoke.sh
 ```
 
 The script uses the existing Gemma recipe with SC-specific overrides, splits four
@@ -46,12 +46,12 @@ For numerical parity, run the fixed-data test in the AutoModel environment:
 
 ```bash
 uv run --extra automodel python -m torch.distributed.run --standalone --nproc-per-node=4 \
-  tests/functional/automodel_sc_stage1_parity.py \
+  tests/functional/automodel_sc_full_batch_parity.py \
   --model /path/to/gemma-4-E2B-it --output /path/to/parity-results \
   --source-sha "$(git rev-parse HEAD)" --wandb-project nemorl-gemma4
 ```
 
-See the [low-level design and validation record](../design-docs/automodel-single-controller-stage1.md)
+See the [low-level design and validation record](../design-docs/automodel-single-controller-full-batch.md)
 for the lifecycle, reused numerical primitives, and limitations of each test.
 
 ### Mandatory settings
@@ -580,7 +580,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: Megatron supports the configurations described in this guide.
-  AutoModel is limited to the [Stage 1 full-batch baseline](#automodel-full-batch-baseline-stage-1);
+  AutoModel is limited to the [full-batch baseline](#automodel-full-batch-baseline);
   the streaming and broader sampler options elsewhere in this guide do not
   apply to AutoModel yet.
 - Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). Managed Dynamo (`backend: dynamo`) is supported on the native rollout path; see [Managed Dynamo generation](dynamo-generation.md#run-under-the-singlecontroller). SGLang and TRT-LLM have not been tested on SC.

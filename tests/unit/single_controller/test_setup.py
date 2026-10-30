@@ -821,7 +821,7 @@ class TestSetup:
 
         # Test shared LoRA setup ordering independently of backend execution
         # capabilities. AutoModel SC currently rejects LoRA before allocation;
-        # that restriction is covered by test_automodel_stage_one_config.
+        # that restriction is covered by test_automodel_config.
         with patch(
             "nemo_rl.algorithms.single_controller_utils.config."
             "_validate_automodel_single_controller_config"

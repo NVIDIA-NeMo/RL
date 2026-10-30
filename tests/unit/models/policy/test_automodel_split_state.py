@@ -228,7 +228,7 @@ def test_invalid_sizes(worker, gbs, mbs):
 )
 def test_unsupported_worker_modes(worker, flag):
     setattr(worker, flag, True)
-    with pytest.raises(ValueError, match="Stage 1"):
+    with pytest.raises(ValueError, match="AutoModel SC"):
         worker.begin_train_step(Mock())
 
 
