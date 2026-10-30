@@ -8,7 +8,7 @@ when_to_use: Writing or changing code; removing, renaming or reshaping a config 
 
 ## Rules for Every Code Change
 
-The rules live in `references/`, one file per theme. Before writing or changing code, read all of them. Reviews check against the same files. A rule that ends with `Details:` has step-by-step instructions in `references/details/`; read them when the rule applies. A `Source:` link is the review lesson a rule came from and is not needed to write code.
+The rules live in `references/`, one file per theme. Before writing or changing code, read all of them. Reviews check against the same files. A rule that ends with `Contributing Details:` has step-by-step instructions in `references/details/`; read them when the rule applies. A `Review Details:` link is the review lesson a rule came from and is not needed to write code.
 
 | File | Covers |
 |------|--------|
