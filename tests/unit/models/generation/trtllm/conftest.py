@@ -13,9 +13,9 @@
 # limitations under the License.
 """No-op Ray fixture overrides for the TRT-LLM direct-server tests.
 
-Tests here use tensorrt_llm.LLM directly, not via Ray actors, so they must not
-auto-connect to a running cluster via the session-scoped autouse fixtures in
-tests/unit/conftest.py.
+Tests here that use tensorrt_llm.LLM directly must not auto-connect to a running
+cluster via the session-scoped autouse fixtures in tests/unit/conftest.py; tests
+that drive Ray actors start the cluster themselves.
 """
 
 import pytest
