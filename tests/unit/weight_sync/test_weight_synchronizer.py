@@ -19,7 +19,6 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from nemo_rl.models.generation.constants import (
-    DYNAMO_BACKEND,
     MEGATRON_BACKEND,
     SGLANG_BACKEND,
     VLLM_BACKEND,
@@ -1555,17 +1554,6 @@ class TestFactory:
         assert isinstance(sync, NcclReshardWeightSynchronizer)
         sync.sync_weights()
         policy.offload_before_refit.assert_called_once_with()
-
-    def test_non_colocated_dynamo_returns_collective(self):
-        sync = create_weight_synchronizer(
-            policy=_mock_policy(),
-            generation=_mock_generation(),
-            generation_backend=DYNAMO_BACKEND,
-            colocated=False,
-            train_cluster=_mock_cluster(),
-            inference_cluster=_mock_cluster(),
-        )
-        assert isinstance(sync, CollectiveWeightSynchronizer)
 
     def test_non_colocated_sglang_returns_sglang_disaggregated(self):
         """SGLang owns its own weight-update group, so no clusters are needed."""

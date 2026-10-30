@@ -17,6 +17,7 @@ from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
@@ -106,10 +107,6 @@ def resolve_generation_class(
         from nemo_rl.models.generation.trtllm import TrtllmGeneration
 
         return TrtllmGeneration
-    if backend == "dynamo":
-        from nemo_rl.models.generation.dynamo import DynamoGeneration
-
-        return DynamoGeneration
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
@@ -153,6 +150,19 @@ def configure_generation_config(
             "extend the training worker instead."
         )
 
+    if dynamo_enabled(config) and config["backend"] != "vllm":
+        raise ValueError(
+            "policy.generation.dynamo=true serves NeMo RL's vLLM workers through "
+            f"Dynamo and does not apply to backend={config['backend']!r}. Set "
+            "policy.generation.backend=vllm, or remove policy.generation.dynamo."
+        )
+    if config.get("dynamo_cfg") is not None and not dynamo_enabled(config):
+        raise ValueError(
+            "policy.generation.dynamo_cfg is set but policy.generation.dynamo is not "
+            "true, so it would be ignored. Set policy.generation.dynamo=true to "
+            "serve generation through Dynamo, or remove dynamo_cfg."
+        )
+
     # tokenizer setting
     if "_pad_token_id" in config:
         warnings.warn(
@@ -164,18 +174,49 @@ def configure_generation_config(
     if config["stop_token_ids"] is None:
         config["stop_token_ids"] = [tokenizer.eos_token_id]
 
-    # vLLM setting shared by the standard and managed Dynamo backends.
-    if config["backend"] in ("vllm", "dynamo"):
-        vllm_backed_config = cast(VllmConfig, config)
+    if config["backend"] == "vllm":
+        config = cast(VllmConfig, config)
         # Respect explicit checkpoint-loading overrides. Dummy loading relies
         # on startup refit to initialize all generator weights, including frozen
         # vision parameters; freezing alone does not exclude them from refit.
-        vllm_backed_config["vllm_cfg"].setdefault(
-            "load_format", "auto" if is_eval else "dummy"
-        )
-
-    if config["backend"] == "vllm":
-        config = cast(VllmConfig, config)
+        config["vllm_cfg"].setdefault("load_format", "auto" if is_eval else "dummy")
+        if dynamo_enabled(config):
+            # Validate before any Ray allocation.
+            dynamo_cfg(config)
+            if config["vllm_cfg"].get("http_server_api_key_required"):
+                raise ValueError(
+                    "policy.generation.vllm_cfg.http_server_api_key_required is not "
+                    "supported with policy.generation.dynamo=true: the Dynamo "
+                    "frontend serves the same engines on 0.0.0.0 and checks no "
+                    "bearer token."
+                )
+            colocated = config.get("colocated")
+            if colocated is not None and colocated["enabled"]:
+                raise ValueError(
+                    "policy.generation.dynamo=true requires non-colocated generation "
+                    "(policy.generation.colocated.enabled=false): a colocated engine "
+                    "sleeps while the policy trains, and the Dynamo frontend would "
+                    "keep routing requests to it."
+                )
+            vllm_cfg = config["vllm_cfg"]
+            if vllm_cfg["expert_parallel_size"] > vllm_cfg["tensor_parallel_size"]:
+                # Data parallelism inside vLLM: above DP rank 0, vLLM rejects the
+                # per-engine ipc:// KV-event endpoint (dynamo_kv_events_config).
+                raise ValueError(
+                    "policy.generation.dynamo=true does not serve data parallelism "
+                    "inside vLLM yet (vllm_cfg.expert_parallel_size > "
+                    "tensor_parallel_size). Set expert_parallel_size <= "
+                    "tensor_parallel_size, or remove policy.generation.dynamo."
+                )
+            if not config["vllm_cfg"]["async_engine"]:
+                # Dynamo serves the engine's AsyncLLM, so turning the async engine
+                # on is the switch; settings Dynamo cannot serve are rejected above.
+                print(
+                    "  [Dynamo] policy.generation.dynamo=true: using the async "
+                    "vLLM engine (vllm_cfg.async_engine=true)",
+                    flush=True,
+                )
+                config["vllm_cfg"]["async_engine"] = True
         validate_vllm_quantization_config(config)
         validate_nvfp4_pertoken_generation(config, is_eval=is_eval)
         if config.get("real_quant"):

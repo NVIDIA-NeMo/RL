@@ -54,7 +54,6 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
         "nemo_gym",
     ],
     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": ["sglang"],
-    "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": None,
     "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": [
         "automodel"
     ],

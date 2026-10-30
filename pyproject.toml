@@ -177,6 +177,11 @@ vllm = [
   "flashinfer-cubin==0.6.18",
   "flashinfer-jit-cache==0.6.18",
   "nvidia-cutlass-dsl[cu13]==4.6.2",
+  # Dynamo serving (policy.generation.dynamo=true) hosts these vLLM workers behind
+  # dynamo.frontend through Dynamo's engine-agnostic backend SDK. Only the base
+  # package: its [vllm] extra pins Dynamo's own vLLM, which NeMo RL never runs.
+  "ai-dynamo==1.5.1",
+  "ai-dynamo-runtime==1.5.1",
 ]
 sglang = [
   # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
@@ -453,10 +458,14 @@ override-dependencies = [
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
-  # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
   "nvidia-nccl-cu13==2.30.7",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
+  # ai-dynamo (vllm extra) requires these for its planner and simulators only
+  # (aisimulate brings jax, flax and tfp-nightly). The backend SDK and frontend
+  # that Dynamo serving uses import neither.
+  "aisimulate; sys_platform == 'never'",
+  "kubernetes; sys_platform == 'never'",
   "timm<=1.0.22",
   "fastapi[standard]>=0.133.0,<0.137.0",
   "nvidia-modelopt[torch]>=0.44.0a0",
@@ -699,7 +708,9 @@ exclude = '''
 '''
 
 [tool.pytest.ini_options]
-addopts = "--durations=100 -s -rA -x"
+# ai-dynamo (vllm extra) registers pytest plugins that skip test_sglang_*,
+# test_trtllm_* and test_triton_* files when those frameworks are absent.
+addopts = "--durations=100 -s -rA -x -p no:vllm_tests -p no:sglang_tests -p no:trtllm_tests -p no:triton_tests"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
