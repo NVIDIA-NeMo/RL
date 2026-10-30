@@ -185,11 +185,9 @@ loss_fn:
 async_rl:
   rollout_failure:
     min_step_batch_fraction: 1  # Optional floor; drop budgets must also permit losses.
-checkpointing:
-  enabled: false
-rollout_checkpointing:
-  snapshot_attempt_interval_s: null
 ```
+
+Checkpointing and rollout snapshots work as for any [Single-Controller run](./single-controller.md#checkpointing-and-replay-recovery). Forest recovery requires schema 5 with saved forest-mode and execution-padding metadata. Schema 4 contains the renamed capture receipts but no forest selection. Checkpoints from earlier experimental context-compaction builds without the current schema and metadata cannot be resumed; there is no migration. Resume rejects changes to forest mode or the execution row multiple used to pad saved groups.
 
 The learner must use non-interleaved Megatron with fixed batches or ordinary sequence packing (`policy.sequence_packing.enabled: true`). Fixed-batch train and logprob microbatch sizes must be positive integers; packed execution uses the existing token-budget bin planner. Dynamic batching remains unsupported. Setup checks the actual loaded model before any rollout runs: dense models pass; MoE models must use supported dropless per-token routing without auxiliary losses or capacity limits. Router-bias updates are allowed, but execution-padding and borrowed inputs can still contribute to expert-load counts and affect subsequent bias updates. Artificial-input exclusion is tracked separately in [#4519](https://github.com/NVIDIA-NeMo/RL/pull/4519); it is not included here. Model-specific router-mask restrictions still apply.
 
@@ -236,15 +234,13 @@ as generated output. Environment masking does not erase verified generations;
 unverifiable owners contribute zero. These are generation statistics before
 learner-side filtering, not counts of tokens ultimately used in the loss.
 
-Checkpoint/resume is separate work in [#4200](https://github.com/NVIDIA-NeMo/RL/pull/4200), tracked by [#4558](https://github.com/NVIDIA-NeMo/RL/issues/4558). The current path rejects trainer checkpoints and rollout snapshots rather than resuming without the accepted-call selection metadata.
+The implementation supports concurrent capture through Responses and Chat, bounded resampling of definite responses, ordinary text/images supported by the foundation processor path, token-level GRPO, and direct route assembly. It retains existing forest-training guards on deferred route assembly, incompatible objectives, message-level advantage overrides and non-unit dataset loss multipliers. Buffered Responses SSE is supported through a non-streaming upstream call. Incremental engine streaming, provider-managed conversation state, assistant prefill, and engine prompt truncation are rejected. Ordinary capture keeps its existing path with the option disabled.
 
-The implementation supports concurrent capture through Responses and Chat, bounded resampling of definite responses, ordinary text/images supported by the foundation processor path, token-level GRPO, and direct route assembly. It retains existing forest-training guards on checkpoint/resume, rollout snapshots, deferred route assembly, incompatible objectives, message-level advantage overrides and non-unit dataset loss multipliers. Buffered Responses SSE is supported through a non-streaming upstream call. Incremental engine streaming, provider-managed conversation state, assistant prefill, and engine prompt truncation are rejected. Ordinary capture keeps its existing path with the option disabled.
-
-Both repositories must use the paired capture schema v3 revision, including the `ReplaySummary` representation on this route. Earlier experimental v3 ledgers that persisted `ReplayContext.items` are rejected, as are prior v2 staged checkpoints; there is no automatic migration or forest-training resume. Source normalization and token/media digest versions are unchanged by the summary representation.
+Both repositories must use the paired capture schema v3 revision, including the `ReplaySummary` representation on this route. Earlier experimental v3 ledgers that persisted `ReplayContext.items` are rejected, as are prior v2 staged checkpoints; there is no automatic migration of those older capture formats. Source normalization and token/media digest versions are unchanged by the summary representation.
 
 ## Validation
 
-CPU tests cover scripted context rewrites, captured-call selection, forest reconstruction, exact-once loss ownership, media commitments, invalid owners, padding, and sharded logical advantages. They use synthetic generations and in-memory storage. An order-sensitive recurrent-model oracle checks loss and gradients against independently recorded per-call inputs. These tests do not establish distributed model or processor numerical agreement.
+CPU tests cover checkpoint/retry selection persistence, staged-write custody, replay restoration, scripted context rewrites, captured-call selection, forest reconstruction, exact-once loss ownership, media commitments, invalid owners, padding, and sharded logical advantages. They use synthetic generations and in-memory storage. An order-sensitive recurrent-model oracle checks loss and gradients against independently recorded per-call inputs. These tests do not establish distributed model or processor numerical agreement.
 
 The functional test is `tests/functional/grpo_async_gym_single_controller_context_compaction.sh`. It reuses the ordinary SingleController/Gym launcher with Qwen3-0.6B and the existing BrowseComp agent connected to the workplace tools. `keep_rounds=1` hides older tool results from subsequent model calls while the returned history retains all accepted generations. Token-budget resets and the progress board are disabled. The test retains the full tool set within a 16,384-token context and enables reasoning. Its checks require ten optimizer-step metric records, more valid physical rows than the eight logical rollouts in at least one step, positive reward, finalizer activity, maximum generation KL error below 0.05, and maximum token multiplicative probability error below 1.05. A run that never creates a context boundary fails the row-count check. Aggregate logprob agreement is a numerical regression signal, not proof that every tensor is identical.
 

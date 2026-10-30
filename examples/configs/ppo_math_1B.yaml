@@ -332,6 +332,8 @@ policy:
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
+      flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
+      output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
     vllm_kwargs: {}
     colocated:
       enabled: true
