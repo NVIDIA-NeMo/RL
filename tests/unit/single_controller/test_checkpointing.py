@@ -963,7 +963,7 @@ def _sealed_recovery_ledger(staging_key: str) -> RolloutRecoveryLedger:
                 generation_index=0,
                 gate_rollout_id=gate_id,
                 receipt={
-                    "rollout_id": gate_id,
+                    "capture_key": gate_id,
                     "manifest": [{"staging_key": staging_key}],
                 },
                 reward=1.0,
