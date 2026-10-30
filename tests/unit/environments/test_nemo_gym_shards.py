@@ -602,30 +602,36 @@ def test_task_sources_are_never_allowlisted_for_duplication():
         )
 
 
-def test_build_route_shard_map_rejects_an_unlisted_duplicate_entry():
+@pytest.mark.parametrize("server_type", ["responses_api_models", "environment_servers"])
+def test_build_route_shard_map_rejects_an_unlisted_duplicate_entry(
+    server_type: str,
+) -> None:
     with pytest.raises(ShardSetupError, match="allowed_duplicate_entries"):
         build_route_shard_map(
             {
-                "judged": {"shared_judge": ["responses_api_models"]},
-                "tools": {"shared_judge": ["responses_api_models"]},
+                "judged": {"shared_judge": [server_type]},
+                "tools": {"shared_judge": [server_type]},
             }
         )
 
 
-def test_build_route_shard_map_allows_a_listed_duplicate_entry():
-    """Policy proxies are copied into every shard on purpose."""
+@pytest.mark.parametrize("server_type", ["responses_api_models", "environment_servers"])
+def test_build_route_shard_map_allows_a_listed_duplicate_entry(
+    server_type: str,
+) -> None:
+    """Allowlisted support entries can be shared without becoming routes."""
     route_to_shard = build_route_shard_map(
         {
             "judged": {
                 "math_agent": ["responses_api_agents"],
-                "policy_model": ["responses_api_models"],
+                "support_entry": [server_type],
             },
             "tools": {
                 "bash_agent": ["responses_api_agents"],
-                "policy_model": ["responses_api_models"],
+                "support_entry": [server_type],
             },
         },
-        allowed_duplicate_entries={"policy_model"},
+        allowed_duplicate_entries={"support_entry"},
     )
 
     assert route_to_shard == {"math_agent": "judged", "bash_agent": "tools"}

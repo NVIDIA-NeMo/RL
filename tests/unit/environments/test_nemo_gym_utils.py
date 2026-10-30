@@ -694,10 +694,16 @@ def _stub_gym_resolved_config(resolved):
     package = types.ModuleType("nemo_gym")
     module = types.ModuleType("nemo_gym.global_config")
     module.get_global_config_dict = lambda: resolved
+    module.SERVER_TYPE_KEYS = (
+        "resources_servers",
+        "responses_api_agents",
+        "responses_api_models",
+        "environment_servers",
+    )
     with patch.dict(
         sys.modules, {"nemo_gym": package, "nemo_gym.global_config": module}
     ):
-        yield
+        yield module
 
 
 def _spun_up_actor():
@@ -715,6 +721,9 @@ def test_list_entries_reports_entry_names_and_server_types():
                 "responses_api_agents": {"simple_agent": {"entrypoint": "app.py"}}
             },
             "math_env": {"resources_servers": {"math": {"entrypoint": "app.py"}}},
+            "environment": {
+                "environment_servers": {"legacy_agent": {"entrypoint": "app.py"}}
+            },
             # An entry can carry more than one server type.
             "judge": {
                 "responses_api_models": {"local_vllm_model": {"entrypoint": "app.py"}},
@@ -733,8 +742,42 @@ def test_list_entries_reports_entry_names_and_server_types():
     assert entries == {
         "math_agent": ["responses_api_agents"],
         "math_env": ["resources_servers"],
-        "judge": ["responses_api_models", "resources_servers"],
+        "environment": ["environment_servers"],
+        "judge": ["resources_servers", "responses_api_models"],
     }
+
+
+def test_list_entries_uses_gym_server_type_keys() -> None:
+    resolved = DictConfig(
+        {
+            "mixed": {
+                "resources_servers": {"tools": {"entrypoint": "app.py"}},
+                "future_servers": {"future": {"entrypoint": "app.py"}},
+            },
+            "excluded": {"responses_api_agents": {"agent": {"entrypoint": "app.py"}}},
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved) as gym_config:
+        gym_config.SERVER_TYPE_KEYS = ("future_servers", "resources_servers")
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {"mixed": ["future_servers", "resources_servers"]}
+
+
+@pytest.mark.nemo_gym
+def test_list_entries_uses_installed_gym_server_type_keys() -> None:
+    # Gym is an optional dependency available in the Gym test shard.
+    from nemo_gym.global_config import SERVER_TYPE_KEYS
+
+    resolved = DictConfig(
+        {key: {key: {"server": {"entrypoint": "app.py"}}} for key in SERVER_TYPE_KEYS}
+    )
+
+    with patch("nemo_gym.global_config.get_global_config_dict", return_value=resolved):
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {key: [key] for key in SERVER_TYPE_KEYS}
 
 
 def test_list_entries_skips_dicts_that_hold_no_server_type():
@@ -1469,12 +1512,15 @@ def test_an_unsharded_job_is_checked_against_the_actors_entries():
     assert "math_agent" in str(excinfo.value)
 
 
-def test_an_unsharded_job_counts_only_routable_entries_as_hosted():
-    """A model-only entry is not a route on one actor any more than on many.
+@pytest.mark.parametrize("server_type", ["responses_api_models", "environment_servers"])
+def test_an_unsharded_job_counts_only_routable_entries_as_hosted(
+    server_type: str,
+) -> None:
+    """A support entry is not a route on one actor any more than on many.
 
     ``build_route_shard_map`` maps agents and resources servers only, so on a
-    sharded job a row naming a ``responses_api_models`` entry is rejected at
-    setup. The unsharded check must agree, and must not list the model among
+    sharded job a row naming a model or environment server is rejected at
+    setup. The unsharded check must agree, and must not list the entry among
     the hosted routes in its error message.
     """
     handle = MagicMock()
@@ -1485,17 +1531,17 @@ def test_an_unsharded_job_counts_only_routable_entries_as_hosted():
         ray_get.return_value = {
             "math_agent": ["responses_api_agents"],
             "math_tools": ["resources_servers"],
-            "policy_model": ["responses_api_models"],
+            "support_entry": [server_type],
         }
         nemo_gym_mod.validate_dataset_agent_coverage(
             shard_set, {"train": [*_gym_dataset("math_agent"), tool_row]}
         )
         with pytest.raises(nemo_gym_mod.ShardSetupError) as excinfo:
             nemo_gym_mod.validate_dataset_agent_coverage(
-                shard_set, {"train": _gym_dataset("policy_model")}
+                shard_set, {"train": _gym_dataset("support_entry")}
             )
 
-    assert "['policy_model']" in str(excinfo.value)
+    assert "['support_entry']" in str(excinfo.value)
     assert "Hosted routes: ['math_agent', 'math_tools']." in str(excinfo.value)
 
 
