@@ -11,9 +11,11 @@ from nemo_rl.telemetry.setup import _ENV_FIELD_MAP, _config_to_env
 
 def test_defaults():
     cfg = TelemetryConfig()
-    assert cfg.enabled is False
+    # On by default; the driver's OTLP endpoint check is what keeps a run with
+    # no collector from exporting (see test_setup.py).
+    assert cfg.enabled is True
     assert cfg.service_name == "nemo-rl"
-    assert cfg.span_groups == "default"
+    assert cfg.span_groups == "per_step"
     # Must match the nemo-lens defaults, since propagating them is unconditional.
     assert cfg.traces_enabled is True
     assert cfg.metrics_enabled is True

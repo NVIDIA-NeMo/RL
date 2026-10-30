@@ -18,6 +18,7 @@ from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.setup import (
     _build_resource_attributes,
     _dig,
+    _otlp_endpoint_configured,
     _process_attributes,
     _training_config_attributes,
     _worker_resource_attributes,
@@ -254,6 +255,81 @@ def test_init_driver_returns_none_when_disabled():
 def test_init_driver_returns_none_when_no_telemetry_block():
     handle = init_telemetry_driver(_FakeMasterConfig(telemetry=None), "grpo")
     assert handle is None
+
+
+def _no_otlp_endpoint(monkeypatch):
+    # Not cleared by the autouse fixture, and a developer with a collector in
+    # their shell would otherwise skip the branch under test.
+    for name in (
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_otlp_endpoint_counts_the_signal_specific_vars(monkeypatch):
+    """The SDK prefers the signal-specific vars, so either one counts as wired."""
+    _no_otlp_endpoint(monkeypatch)
+    assert _otlp_endpoint_configured() is False
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://collector:4318")
+    assert _otlp_endpoint_configured() is True
+    # Whitespace is not an endpoint.
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "   ")
+    assert _otlp_endpoint_configured() is False
+
+
+def test_init_driver_stays_off_when_nothing_configured_an_endpoint(monkeypatch, caplog):
+    """``enabled`` defaults true, so this is what a run that never asked gets.
+
+    Without the check the SDK would fall back to ``http://localhost:4317`` and
+    every such run would pay a retry per batch plus a blocked shutdown flush.
+    """
+    _no_otlp_endpoint(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="nemo_rl.telemetry.setup"):
+        handle = init_telemetry_driver(_FakeMasterConfig(TelemetryConfig()), "grpo")
+    assert handle is None
+    assert get_telemetry_handle() is None
+    assert "no OTLP endpoint configured" in caplog.text
+    # Workers rebuild from the environment and cannot repeat the check, so the
+    # verdict has to travel with them.
+    assert os.environ["NEMO_RL_OTEL_ENABLED"] == "0"
+    assert telemetry_enabled_in_env() is False
+
+
+def test_init_driver_honours_an_explicit_opt_in_without_an_endpoint(
+    monkeypatch, caplog
+):
+    """Dropping a request the user actually made is the worse failure mode."""
+    _no_otlp_endpoint(monkeypatch)
+    cfg = TelemetryConfig(enabled=True, exporter="console")
+    with caplog.at_level(logging.WARNING, logger="nemo_rl.telemetry.setup"):
+        handle = init_telemetry_driver(_FakeMasterConfig(cfg), "grpo")
+    assert handle is not None
+    # console needs no endpoint, so there is nothing to warn about either.
+    assert "no OTLP endpoint" not in caplog.text
+
+
+def test_init_driver_warns_when_an_explicit_otlp_opt_in_has_no_endpoint(
+    monkeypatch, caplog
+):
+    _no_otlp_endpoint(monkeypatch)
+    cfg = TelemetryConfig(enabled=True)
+    with caplog.at_level(logging.WARNING, logger="nemo_rl.telemetry.setup"):
+        handle = init_telemetry_driver(_FakeMasterConfig(cfg), "grpo")
+    assert handle is not None, "an explicit opt-in is honoured, not overridden"
+    assert "no OTLP endpoint is set" in caplog.text
+
+
+def test_init_driver_exports_by_default_once_an_endpoint_exists(monkeypatch):
+    """The point of the default: a configured cluster needs no telemetry YAML."""
+    _no_otlp_endpoint(monkeypatch)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+    handle = init_telemetry_driver(_FakeMasterConfig(TelemetryConfig()), "grpo")
+    assert handle is not None
+    assert os.environ["NEMO_RL_OTEL_ENABLED"] == "1"
+    assert os.environ["NEMO_RL_OTEL_SPAN_GROUPS"] == "per_step"
 
 
 def test_init_worker_returns_none_when_disabled():

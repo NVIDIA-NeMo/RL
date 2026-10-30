@@ -700,9 +700,9 @@ Stable-for-the-run values, set once at init and attached to every span/metric: `
 
 | Span groups | Relative cost | Recommendation |
 |---|---|---|
-| Disabled (`telemetry.enabled: false`) | None | The default |
-| `default` | Lowest | Safe for all production runs |
-| `per_step` | Moderate | Per-step profiling; one trace for the whole run |
+| Disabled (`telemetry.enabled: false`) | None | Also what a run with no OTLP endpoint falls back to |
+| `default` | Lowest | Run-level spans only; no per-step breakdown |
+| `per_step` | Moderate | The default. Per-step profiling; one trace for the whole run |
 | `all` | Highest | Development / deep debugging |
 
 A process with telemetry disabled has an empty span-group set — `is_span_group_enabled()` returns `False` everywhere, so no span objects are created at all. The disabled path is a `frozenset` lookup and an immediate return. See [lens: architecture](https://github.com/NVIDIA-NeMo/Lens).

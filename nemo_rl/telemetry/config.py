@@ -43,16 +43,31 @@ class TelemetryConfig(BaseModel, extra="allow"):
     driver returns before it validates anything.
     """
 
-    enabled: bool = False
-    """Master switch. When false, all instrumentation is a ~0-cost no-op."""
+    enabled: bool = True
+    """Master switch. When false, all instrumentation is a ~0-cost no-op.
+
+    On by default, but the driver turns it back off when no OTLP endpoint is
+    configured -- see ``_otlp_endpoint_configured`` in ``setup.py``. So a run on
+    a cluster whose ``OTEL_EXPORTER_OTLP_*`` environment is already set gets
+    telemetry with no YAML at all, while a laptop or CI run that would otherwise
+    export into a refused connection stays a no-op. Setting this false here (or
+    via ``NEMO_RL_OTEL_ENABLED``) still wins over both."""
 
     service_name: str = "nemo-rl"
     """``service.name`` reported to the OTLP backend."""
 
-    span_groups: str = "default"
+    span_groups: str = "per_step"
     """Span-group spec: a preset (``default`` | ``per_step`` | ``all``) or a
     comma-separated list of individual group names (e.g.
-    ``"default,generation,reward"``). See ``RLSpanGroup``."""
+    ``"default,generation,reward"``). See ``RLSpanGroup``.
+
+    ``per_step`` is the default because the ``step`` group is what makes a run
+    legible: without it the phases inside a step are the only thing exported and
+    nothing covers the step itself, so a per-step goodput breakdown has no
+    denominator. Every group in the preset emits a bounded number of spans per
+    step, so the volume scales with step count rather than dataset size. Drop to
+    ``default`` for run-level spans only; ``all`` adds ``per_prompt``, which
+    scales with the dataset."""
 
     # NOTE: there is deliberately no rank-filtering field here. nemo-lens has no
     # notion of rank -- it dropped its export-strategy registry and rank-aware
