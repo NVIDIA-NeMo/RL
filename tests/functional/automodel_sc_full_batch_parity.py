@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fixed-data Gemma parity through AutoModel's SC metadata lifecycle.
+"""Fixed-data parity through AutoModel's full-batch SC metadata lifecycle.
 
-Run inside the AutoModel environment with torchrun --nproc-per-node=4 (80 GB GPUs).
+Run inside the AutoModel environment with torchrun and enough GPUs for the model.
+The L0 wrapper uses a tiny Llama on two GPUs; larger models use this same harness.
 The local data plane exercises real metadata sharding/fetch/materialization;
 network TransferQueue and live vLLM are covered by the separate SC smoke run.
 """
@@ -182,6 +183,10 @@ def run(args):
     # numerical test; production initialization is otherwise unchanged.
     with patch.object(ray, "get_gpu_ids", return_value=[local_rank]):
         worker = AutomodelPolicyWorkerImpl(policy_cfg, init_reference_model=False)
+    if args.strict_determinism:
+        # Worker initialization selects warn-only determinism. Numerical
+        # regression tests require deterministic kernels or an explicit failure.
+        torch.use_deterministic_algorithms(True, warn_only=False)
     worker.setup_data_plane(LocalDataPlaneConfig(max_partitions=2))
     client = worker._require_dp_client()
     output = Path(args.output)
@@ -392,6 +397,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--force-hf", action="store_true")
+    parser.add_argument("--strict-determinism", action="store_true")
     parser.add_argument(
         "--recipe",
         default="examples/configs/recipes/llm/dapo-gemma4-e2b-it-1n8g-automodel.yaml",
