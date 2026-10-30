@@ -48,6 +48,8 @@ grpo:
   num_prompts_per_step: 64
   val_period: 0
 logger:
+  # The test script turns TensorBoard on; its metrics feed tests/check_metrics.py.
+  tensorboard: {}
   wandb:
     name: grpo-nemotron3.5-super-120BA12B-56n4g-megatron-rlvr-single-controller-gym-quick
     project: nemo-rl
