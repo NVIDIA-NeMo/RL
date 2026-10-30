@@ -1972,6 +1972,13 @@ def resolve_reward_penalty_config(
         if value is not None:
             resolved[flag] = value
 
+    # apply_reward_penalties only sees this resolved dict, so penalty_reward has to be carried over.
+    penalty_reward = _get_reward_penalty_config_value(
+        reward_penalty_config, "penalty_reward"
+    )
+    if penalty_reward is not None:
+        resolved["penalty_reward"] = penalty_reward
+
     token_ids: dict[str, Any] = {}
     unwanted_token_ids = _get_reward_penalty_token_ids(
         reward_penalty_config, "unwanted"
@@ -2025,9 +2032,10 @@ def resolve_reward_penalty_config(
 def apply_reward_penalties(
     results: list[dict], reward_penalty_config: dict[str, Any] | BaseModel | None
 ) -> dict[str, int]:
-    """Apply reward penalties to results, setting reward to 0.0 when triggered.
+    """Apply reward penalties to results, setting reward to `penalty_reward` when triggered.
 
-    All penalties are gated by reward_penalty_config flags. Returns a dict of penalty
+    All penalties are gated by reward_penalty_config flags. `penalty_reward` is read from
+    reward_penalty_config and defaults to 0.0 when it is not set. Returns a dict of penalty
     counts keyed by penalty name.
 
     NOTE: These penalties assume Gym-path message_log structure where roles
@@ -2085,6 +2093,10 @@ def apply_reward_penalties(
     if not reward_penalty_config or not results:
         return counts
 
+    penalty_reward = float(
+        _get_reward_penalty_config_value(reward_penalty_config, "penalty_reward") or 0.0
+    )
+
     # Guard: penalties rely on Gym-path message_log (strictly alternating user/assistant roles).
     # Non-Gym paths may have "environment", "tool", or "system" roles which these checks don't handle.
     any_penalty_enabled = any(
@@ -2129,7 +2141,7 @@ def apply_reward_penalties(
                     is_duplicated = True
                     break
             if is_duplicated:
-                result["full_result"]["reward"] = 0.0
+                result["full_result"]["reward"] = penalty_reward
 
                 counts["duplicated_reasoning"] += 1
 
@@ -2156,7 +2168,7 @@ def apply_reward_penalties(
                     final_answer_text = content.strip()
                     break
             if final_answer_text is None or final_answer_text == "":
-                result["full_result"]["reward"] = 0.0
+                result["full_result"]["reward"] = penalty_reward
 
                 counts["empty_final_answer"] += 1
 
@@ -2178,7 +2190,7 @@ def apply_reward_penalties(
                     has_unwanted_token = True
                     break
             if has_unwanted_token:
-                result["full_result"]["reward"] = 0.0
+                result["full_result"]["reward"] = penalty_reward
 
                 counts["unwanted_token"] += 1
 
@@ -2264,7 +2276,7 @@ def apply_reward_penalties(
                         has_violation = True
                         break
             if has_violation:
-                result["full_result"]["reward"] = 0.0
+                result["full_result"]["reward"] = penalty_reward
 
                 counts["malformed_think_tag"] += 1
 

@@ -273,12 +273,17 @@ class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
 
 
 class RewardPenaltyConfig(BaseModel, extra="allow"):
-    """Reward-zeroing penalties applied to NeMo-Gym rollout results."""
+    """Reward penalties applied to NeMo-Gym rollout results.
+
+    A rollout that triggers an enabled penalty has its reward replaced by `penalty_reward`.
+    """
 
     penalize_duplicated_reasoning: bool = False
     penalize_empty_final_answer: bool = False
     penalize_unwanted_tokens: bool = False
     penalize_malformed_think_tag: bool = False
+    # Reward given to a rollout that triggers a penalty. Default 0.0 (the original zeroing behavior).
+    penalty_reward: float = 0.0
     # Optional token IDs. token_ids.unwanted is required when
     # penalize_unwanted_tokens is true;
     # think-tag IDs are inferred from configured tag strings when possible.

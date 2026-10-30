@@ -505,10 +505,11 @@ data_plane:
 on_policy_distillation: null
 
 reward_penalties:
+  penalty_reward: -10.0
   penalize_duplicated_reasoning: true   # reasoning content == final answer
   penalize_empty_final_answer: true     # last message output has empty content
   penalize_unwanted_tokens: true        # eos token appears in generation
-  penalize_malformed_think_tag: true    # <think>/<\/think> count != 1 per turn
+  penalize_malformed_think_tag: false   # <think>/<\/think> count != 1 per turn
   token_ids:
     unwanted: [2]      # </s>
     think_open: 12     # <think>
