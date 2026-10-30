@@ -520,6 +520,47 @@ def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs
     assert "port_range_high" not in cfg["initial_global_config_dict"]
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({}, True),
+        ({"decode_prompt_strs": None}, True),
+        ({"decode_prompt_strs": True}, True),
+        ({"decode_prompt_strs": False}, False),
+    ],
+    ids=["omitted", "null", "true", "false"],
+)
+def test_build_nemo_gym_config_moves_decode_prompt_strs_to_actor_field(
+    detected_uv_dirs, extra, expected
+):
+    """Omitted and YAML null both mean the default; explicit bools pass through."""
+    cfg = build_nemo_gym_config(
+        _env_configs(**extra),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+
+    assert cfg["decode_prompt_strs"] is expected
+    assert "decode_prompt_strs" not in cfg["initial_global_config_dict"]
+
+
+@pytest.mark.parametrize("configured", ["false", "no", 0], ids=repr)
+def test_build_nemo_gym_config_rejects_non_bool_decode_prompt_strs(
+    detected_uv_dirs, configured
+):
+    """A quoted string or int would silently coerce the wrong way; fail at setup."""
+    with pytest.raises(ValueError, match="decode_prompt_strs must be a boolean"):
+        build_nemo_gym_config(
+            _env_configs(decode_prompt_strs=configured),
+            base_urls=[],
+            model_name="test-model",
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+
+
 def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_dirs):
     cfg = build_nemo_gym_config(
         _env_configs(),
