@@ -118,7 +118,6 @@ def _policy_config(
     model_path: str,
     *,
     pp_size: int,
-    pp_schedule: str = "1f1b",
     microbatches_per_step: int = 2,
     train_global_batch_size: int = 8,
     precision: str = "float32",
@@ -150,11 +149,7 @@ def _policy_config(
         "lora_cfg": {"enabled": False},
     }
     if pp_size > 1:
-        automodel_cfg["pipeline"] = {
-            "pp_schedule": pp_schedule,
-            "microbatches_per_step": microbatches_per_step,
-            "layers_per_stage": None,
-        }
+        automodel_cfg["pipeline"] = {"microbatches_per_step": microbatches_per_step}
     return {
         "model_name": model_path,
         "tokenizer": {"name": model_path},
@@ -315,34 +310,28 @@ def reference_runs(tiny_untied_llama_path):
 
 
 @pytest.mark.timeout(900)
-@pytest.mark.parametrize(
-    ("pp_schedule", "microbatches_per_step"),
-    [("1f1b", 2), ("1f1b", 8), ("interleaved_1f1b", 2), ("interleaved_1f1b", 4)],
-)
+@pytest.mark.parametrize("microbatches_per_step", [2, 8])
 @pytest.mark.parametrize("loss_name", ["nll", "clipped_pg"])
 def test_pipeline_matches_non_pipelined(
     tiny_untied_llama_path,
     reference_runs,
-    pp_schedule,
     microbatches_per_step,
     loss_name,
 ):
     """PP=2 reproduces the non-pipelined logprobs, losses, and updates.
 
     microbatches_per_step=8 on a local batch of 8 is one schedule call per
-    update; 2 is four calls whose gradients accumulate; 4 with interleaved
-    stages also pads nothing but rounds the schedule differently.
+    update; 2 is four calls whose gradients accumulate.
     """
     loss_fn = NLLLossFn() if loss_name == "nll" else _clipped_pg_loss_fn()
     actual = _run_steps(
         _policy_config(
             tiny_untied_llama_path,
             pp_size=2,
-            pp_schedule=pp_schedule,
             microbatches_per_step=microbatches_per_step,
         ),
         2,
-        f"pp_{pp_schedule}_{microbatches_per_step}_{loss_name}",
+        f"pp_{microbatches_per_step}_{loss_name}",
         loss_fn,
     )
     _assert_runs_close(reference_runs[loss_name], actual)
@@ -496,10 +485,8 @@ def test_pipeline_logprobs_with_uneven_dp_shards(
 
 @pytest.mark.timeout(900)
 def test_pipeline_reference_logprobs_and_checkpoint_resume(tiny_untied_llama_path):
-    """Reference swap, then save, resume, and keep training under interleaved PP."""
-    config = _policy_config(
-        tiny_untied_llama_path, pp_size=2, pp_schedule="interleaved_1f1b"
-    )
+    """Reference swap, then save, resume, and keep training under PP."""
+    config = _policy_config(tiny_untied_llama_path, pp_size=2)
     data = _batch(config["train_global_batch_size"])
     loss_fn = NLLLossFn()
     cluster = _cluster(2, "pp_ckpt")

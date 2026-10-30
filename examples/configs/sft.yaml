@@ -65,10 +65,8 @@ policy:
     # sequence packing, dynamic batching, LoRA, or non-colocated generation.
     # See docs/design-docs/automodel-pipeline-parallel.md.
     pipeline_parallel_size: 1
-    # pipeline:
-    #   pp_schedule: "1f1b"  # "1f1b" or "interleaved_1f1b"
-    #   microbatches_per_step: 8  # Required. Microbatches per schedule call; >= pipeline_parallel_size for 1f1b
-    #   layers_per_stage: null  # interleaved_1f1b only; null keeps two virtual stages per PP rank
+    # pipeline:  # 1F1B schedule, one stage per pipeline rank
+    #   microbatches_per_step: 8  # Required. Microbatches per schedule call; >= pipeline_parallel_size
     # HSDP replicate dimension size for Automodel.
     # Typically set to the number of nodes; set to 1 to disable HSDP.
     dp_replicate_size: 1

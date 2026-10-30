@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from typing import Annotated, Any, Literal, NotRequired, TypedDict, Union
 
 from pydantic import BaseModel, Field
 
@@ -201,24 +201,18 @@ class AutomodelCheckpointConfig(TypedDict, total=False):
 class AutomodelPipelineConfig(BaseModel, extra="forbid"):
     """Pipeline schedule of the Automodel policy (``policy.automodel_cfg.pipeline``).
 
-    Read only when ``policy.automodel_cfg.pipeline_parallel_size > 1``. Each
+    Read only when ``policy.automodel_cfg.pipeline_parallel_size > 1``. The
+    schedule is 1F1B, which places one stage on each pipeline rank. Each
     schedule call runs ``microbatches_per_step`` microbatches of
     ``policy.train_micro_batch_size`` samples through every pipeline stage.
     """
 
-    # "1f1b" places one stage per PP rank. "interleaved_1f1b" places several
-    # virtual stages per PP rank in loop order (stage i on PP rank i % pp_size).
-    pp_schedule: Literal["1f1b", "interleaved_1f1b"] = "1f1b"
-    # Microbatches per schedule call (M). There is no default because M trades
-    # the pipeline bubble (~(pp_size - 1) / (M + pp_size - 1) of each call)
-    # against receive-buffer memory (one buffer per microbatch on every
-    # non-first stage) and padding (a call's M microbatches share one sequence
-    # length). "1f1b" needs M >= pipeline_parallel_size; "interleaved_1f1b" needs
-    # M to be a multiple of max(1, M // pipeline_parallel_size).
-    microbatches_per_step: int = Field(gt=0)
-    # Decoder layers per virtual stage, "interleaved_1f1b" only. None keeps
-    # Automodel's default of two virtual stages per PP rank.
-    layers_per_stage: int | None = Field(default=None, gt=0)
+    # Microbatches per schedule call (M), at least pipeline_parallel_size. There
+    # is no default because M trades the pipeline bubble (~(pp_size - 1) /
+    # (M + pp_size - 1) of each call) against receive-buffer memory (one buffer
+    # per microbatch on every non-first stage) and padding (a call's M
+    # microbatches share one sequence length).
+    microbatches_per_step: Annotated[int, Field(gt=0)]
 
 
 class AutomodelConfig(TypedDict):

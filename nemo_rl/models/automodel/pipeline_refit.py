@@ -14,17 +14,16 @@
 
 """Full-model weight stream for a pipeline-parallel Automodel policy."""
 
-import itertools
 from dataclasses import dataclass
-from typing import Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import torch
-from torch import nn
+from nemo_automodel.components.distributed.pipelining.autopipeline import (
+    AutoPipeline,
+)
 
-from nemo_rl.models.automodel.model_handle import ModelRuntime
-
-# Maps a local model part to its (Hugging Face name, full tensor) stream.
-LocalParamsFn = Callable[[nn.Module], Iterator[tuple[str, torch.Tensor]]]
+# Yields this rank's pipeline stage as its (Hugging Face name, full tensor) stream.
+LocalParamsFn = Callable[[], Iterator[tuple[str, torch.Tensor]]]
 
 
 @dataclass(frozen=True)
@@ -42,79 +41,48 @@ class PipelineWeightExporter:
     """Produce the whole model's ``(name, tensor)`` stream on every PP rank.
 
     Refit consumers expect every training rank to stream the complete model, as
-    without pipeline parallelism, but a pipeline rank holds only its stages.
+    without pipeline parallelism, but a pipeline rank holds only its stage.
     Each tensor is produced by the ranks of the stage that owns it (the same
     per-module stream the non-pipelined refit uses: full tensors, Hugging Face
-    names, refit dtypes) and broadcast within the pipeline group, in one global
-    order every rank agrees on. The stream does not assume its consumer, so
-    colocated CUDA IPC and NCCL broadcast refits both iterate it.
+    names, refit dtypes) and broadcast within the pipeline group. Under 1F1B
+    PP rank ``i`` owns stage ``i``, so the stream visits the stages in PP rank
+    order, an order every rank agrees on. The stream does not assume its
+    consumer, so colocated CUDA IPC and NCCL broadcast refits both iterate it.
     """
 
-    def __init__(self, runtime: ModelRuntime, *, local_params: LocalParamsFn):
+    def __init__(self, pipeline: AutoPipeline, *, local_params: LocalParamsFn):
         """Initialize the exporter.
 
         Args:
-            runtime: The worker's pipeline model parts.
-            local_params: Yields the refit stream of one local model part.
+            pipeline: The AutoPipeline that drives this rank's stage.
+            local_params: Yields the refit stream of this rank's stage.
         """
-        self._runtime = runtime
         self._local_params = local_params
-        self._pp_group = runtime.pipeline.pp_mesh.get_group()
+        self._pp_group = pipeline.pp_mesh.get_group()
         self._manifest: Optional[list[_ManifestEntry]] = None
 
-    def _local_parts_in_stage_order(self) -> list[nn.Module]:
-        return [
-            part
-            for _, part in sorted(
-                zip(self._runtime.stage_ids, self._runtime.parts),
-                key=lambda stage_and_part: stage_and_part[0],
-            )
-        ]
-
     def _build_manifest(self) -> list[_ManifestEntry]:
-        """List every stage's tensors, merged in global stage order."""
-        pp_rank = torch.distributed.get_rank(self._pp_group)
-        local_stages = {
-            stage_id: [
-                (name, tuple(tensor.shape), tensor.dtype)
-                for name, tensor in self._local_params(part)
-            ]
-            for stage_id, part in zip(self._runtime.stage_ids, self._runtime.parts)
-        }
-        gathered: list[Optional[tuple[int, dict]]] = [None] * (
-            torch.distributed.get_world_size(self._pp_group)
-        )
+        """List every stage's tensors, in PP rank order."""
+        local_entries = [
+            (name, tuple(tensor.shape), tensor.dtype)
+            for name, tensor in self._local_params()
+        ]
+        # all_gather_object fills every slot with one PP rank's entries.
+        gathered: list[Any] = [None] * torch.distributed.get_world_size(self._pp_group)
         torch.distributed.all_gather_object(
-            gathered, (pp_rank, local_stages), group=self._pp_group
+            gathered, local_entries, group=self._pp_group
         )
-
-        stages: dict[int, tuple[int, list]] = {}
-        for owner_pp_rank, rank_stages in gathered:
-            for stage_id, entries in rank_stages.items():
-                if stage_id in stages:
-                    raise RuntimeError(
-                        f"Pipeline stage {stage_id} is owned by PP ranks "
-                        f"{stages[stage_id][0]} and {owner_pp_rank}."
-                    )
-                stages[stage_id] = (owner_pp_rank, entries)
-        num_stages = self._runtime.pipeline.info.stages[0].num_stages
-        if sorted(stages) != list(range(num_stages)):
-            raise RuntimeError(
-                f"Pipeline weight manifest covers stages {sorted(stages)}, "
-                f"expected 0..{num_stages - 1}."
-            )
 
         manifest = []
-        producing_stage: dict[str, int] = {}
-        for stage_id in range(num_stages):
-            owner_pp_rank, entries = stages[stage_id]
+        producing_rank: dict[str, int] = {}
+        for owner_pp_rank, entries in enumerate(gathered):
             for name, shape, dtype in entries:
-                if name in producing_stage:
+                if name in producing_rank:
                     raise RuntimeError(
-                        f"Weight {name!r} is produced by pipeline stages "
-                        f"{producing_stage[name]} and {stage_id}."
+                        f"Weight {name!r} is produced by the pipeline stages of "
+                        f"PP ranks {producing_rank[name]} and {owner_pp_rank}."
                     )
-                producing_stage[name] = stage_id
+                producing_rank[name] = owner_pp_rank
                 manifest.append(_ManifestEntry(name, shape, dtype, owner_pp_rank))
         return manifest
 
@@ -140,9 +108,7 @@ class PipelineWeightExporter:
         """
         manifest = self.manifest()
         pp_rank = torch.distributed.get_rank(self._pp_group)
-        local_stream = itertools.chain.from_iterable(
-            self._local_params(part) for part in self._local_parts_in_stage_order()
-        )
+        local_stream = self._local_params()
         for entry in manifest:
             if entry.owner_pp_rank == pp_rank:
                 name, tensor = next(local_stream)

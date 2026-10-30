@@ -95,7 +95,7 @@ def _generation_config(model_path: str) -> dict:
     }
 
 
-def _policy_config(model_path: str, generation_config: dict, pp_schedule: str):
+def _policy_config(model_path: str, generation_config: dict):
     return {
         "model_name": model_path,
         "tokenizer": {"name": model_path},
@@ -125,7 +125,7 @@ def _policy_config(model_path: str, generation_config: dict, pp_schedule: str):
             "defer_fsdp_grad_sync": False,
             "custom_parallel_plan": None,
             "automodel_kwargs": {"force_hf": True},
-            "pipeline": {"pp_schedule": pp_schedule, "microbatches_per_step": 2},
+            "pipeline": {"microbatches_per_step": 2},
         },
         "dynamic_batching": {"enabled": False},
         "sequence_packing": {"enabled": False},
@@ -135,10 +135,7 @@ def _policy_config(model_path: str, generation_config: dict, pp_schedule: str):
 
 
 @pytest.mark.timeout(900)
-@pytest.mark.parametrize("pp_schedule", ["1f1b", "interleaved_1f1b"])
-def test_colocated_refit_from_pipeline_parallel_policy(
-    tiny_untied_llama_path, pp_schedule
-):
+def test_colocated_refit_from_pipeline_parallel_policy(tiny_untied_llama_path):
     """After training and refit, vLLM scores its own tokens like the PP policy.
 
     vLLM starts from dummy weights, so matching logprobs show that every layer of
@@ -149,7 +146,7 @@ def test_colocated_refit_from_pipeline_parallel_policy(
         _generation_config(tiny_untied_llama_path), tokenizer
     )
     cluster = RayVirtualCluster(
-        name=f"pp_refit_{pp_schedule}",
+        name="pp_refit",
         bundle_ct_per_node_list=[2],
         use_gpus=True,
         num_gpus_per_node=2,
@@ -162,9 +159,7 @@ def test_colocated_refit_from_pipeline_parallel_policy(
         vllm_generation.finish_generation()
         policy = Policy(
             cluster=cluster,
-            config=_policy_config(
-                tiny_untied_llama_path, generation_config, pp_schedule
-            ),
+            config=_policy_config(tiny_untied_llama_path, generation_config),
             tokenizer=tokenizer,
             init_reference_model=False,
         )

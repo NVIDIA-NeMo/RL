@@ -33,7 +33,7 @@ def _config(**automodel_overrides: Any) -> dict[str, Any]:
         "tensor_parallel_size": 1,
         "context_parallel_size": 1,
         "pipeline_parallel_size": 2,
-        "pipeline": {"pp_schedule": "1f1b", "microbatches_per_step": 4},
+        "pipeline": {"microbatches_per_step": 4},
         "defer_fsdp_grad_sync": False,
         "sequence_parallel": False,
         "cpu_offload": False,
@@ -72,9 +72,7 @@ def test_valid_config_returns_parsed_pipeline_block():
     pipeline_cfg = _validate(
         _config(), model_config=SimpleNamespace(tie_word_embeddings=False)
     )
-    assert pipeline_cfg == AutomodelPipelineConfig(
-        pp_schedule="1f1b", microbatches_per_step=4, layers_per_stage=None
-    )
+    assert pipeline_cfg == AutomodelPipelineConfig(microbatches_per_step=4)
 
 
 @pytest.mark.parametrize(
@@ -83,28 +81,8 @@ def test_valid_config_returns_parsed_pipeline_block():
         ({"pipeline_parallel_size": 0}, "must be >= 1"),
         ({"pipeline": None}, "valid dictionary"),
         (
-            {"pipeline": {"pp_schedule": "1f1b", "microbatches_per_step": 1}},
+            {"pipeline": {"microbatches_per_step": 1}},
             "at least one microbatch per pipeline stage",
-        ),
-        (
-            {
-                "pipeline": {
-                    "pp_schedule": "1f1b",
-                    "microbatches_per_step": 4,
-                    "layers_per_stage": 2,
-                }
-            },
-            "applies only to pp_schedule=interleaved_1f1b",
-        ),
-        (
-            {
-                "pipeline_parallel_size": 3,
-                "pipeline": {
-                    "pp_schedule": "interleaved_1f1b",
-                    "microbatches_per_step": 10,
-                },
-            },
-            "multiple of max",
         ),
     ],
 )
@@ -123,24 +101,17 @@ def test_pipeline_block_is_required():
 def test_pipeline_block_rejects_unknown_keys():
     with pytest.raises(pydantic.ValidationError):
         _validate(
-            _config(
-                pipeline={
-                    "pp_schedule": "1f1b",
-                    "microbatches_per_step": 4,
-                    "pp_microbatch_size": 1,
-                }
-            )
+            _config(pipeline={"microbatches_per_step": 4, "pp_microbatch_size": 1})
         )
 
 
-def test_interleaved_accepts_rounded_microbatches():
-    pipeline_cfg = _validate(
-        _config(
-            pipeline_parallel_size=4,
-            pipeline={"pp_schedule": "interleaved_1f1b", "microbatches_per_step": 12},
-        )
-    )
-    assert pipeline_cfg.pp_schedule == "interleaved_1f1b"
+@pytest.mark.parametrize(
+    "schedule_key", [{"pp_schedule": "interleaved_1f1b"}, {"layers_per_stage": 2}]
+)
+def test_pipeline_block_rejects_schedule_choices(schedule_key):
+    """The schedule is always 1F1B, so schedule settings fail at startup."""
+    with pytest.raises(pydantic.ValidationError, match="Extra inputs"):
+        _validate(_config(pipeline={"microbatches_per_step": 4, **schedule_key}))
 
 
 @pytest.mark.parametrize(

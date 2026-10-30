@@ -70,8 +70,10 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
-from nemo_rl.models.automodel.model_handle import ModelRuntime
-from nemo_rl.models.automodel.pipeline_parallel import PipelineOutputAdapter
+from nemo_rl.models.automodel.pipeline_parallel import (
+    PipelineOutputAdapter,
+    pipeline_optimizer_part_ids,
+)
 from nemo_rl.models.automodel.router_replay import (
     enable_routing_replay_in_automodel_kwargs,
     require_automodel_moe_model,
@@ -966,26 +968,28 @@ def setup_model_and_optimizer(
         **automodel_kwargs,
     )
 
+    pipeline = None
     if pp_enabled:
-        return _setup_pipeline_parts(
-            config,
-            pipeline=model,
-            tokenizer=tokenizer,
-            model_config=model_config,
-            is_reward_model=is_reward_model,
-            peft_config=peft_config,
-            checkpoint_manager=checkpoint_manager,
-            optimizer_cls=optimizer_cls if init_optimizer else None,
-            optimizer_kwargs=optimizer_kwargs if init_optimizer else None,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-        )
+        # 1F1B places one stage per pipeline rank; the rest of setup and the
+        # worker treat this rank's stage as the model.
+        pipeline = model
+        (model,) = pipeline.parts
 
     print(model)
 
     # Compute model metadata after from_pretrained
     model_state_dict_keys = list(model.state_dict().keys())
     is_moe_model = any(["expert" in key for key in model_state_dict_keys])
+    if pipeline is not None:
+        # A stage may hold only dense layers of an MoE model, so decide over the
+        # whole pipeline group: every stage must agree on autocast.
+        has_experts = torch.tensor([is_moe_model], device="cuda")
+        torch.distributed.all_reduce(
+            has_experts,
+            op=torch.distributed.ReduceOp.MAX,
+            group=pipeline.pp_mesh.get_group(),
+        )
+        is_moe_model = bool(has_experts.item())
     is_hf_model = (
         model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
     )
@@ -1115,9 +1119,35 @@ def setup_model_and_optimizer(
             )
 
     # Initialize scheduler
-    scheduler = (
-        _build_lr_scheduler(config, optimizer) if optimizer is not None else None
-    )
+    scheduler = None
+    if "scheduler" in config and optimizer is not None:
+        if isinstance(config["scheduler"], dict):
+            scheduler_cls = get_class(config["scheduler"]["name"])
+            scheduler = scheduler_cls(optimizer, **config["scheduler"]["kwargs"])
+        else:
+            schedulers = []
+            for scheduler_cfg in config["scheduler"]:
+                if "name" in scheduler_cfg:
+                    schedulers.append(
+                        get_class(scheduler_cfg["name"])(
+                            optimizer, **scheduler_cfg["kwargs"]
+                        )
+                    )
+                else:
+                    assert "milestones" in scheduler_cfg, (
+                        "unknown scheduler config: ",
+                        scheduler_cfg,
+                    )
+                    milestones: list[int] = scheduler_cfg["milestones"]
+
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer, schedulers, milestones
+            )
+    elif optimizer is not None:
+        # Default to passthrough LR schedule
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda epoch: 1
+        )
 
     # Load NeMo RL checkpoint if provided
     if weights_path:
@@ -1144,6 +1174,7 @@ def setup_model_and_optimizer(
                 optimizer=optimizer,
                 optimizer_path=optimizer_path,
                 scheduler=scheduler,
+                optimizer_part_ids=pipeline_optimizer_part_ids(pipeline),
             )
     elif lora_enabled and lora_cfg.get("restore_from") is not None:
         # Warm start: base weights were already loaded by from_pretrained above;
@@ -1175,49 +1206,11 @@ def setup_model_and_optimizer(
         model_config=model.config,
         peft_config=peft_config,
         autocast_enabled=autocast_enabled,
-        model_runtime=ModelRuntime(
-            parts=[model],
-            stage_ids=[0],
-            optimizers=[optimizer] if optimizer is not None else [],
-            schedulers=[scheduler] if scheduler is not None else [],
-            pipeline=None,
-        ),
         draft_model=draft_model,
         composite_model=composite_model,
         draft_runtime=draft_runtime,
+        pipeline=pipeline,
     )
-
-
-def _build_lr_scheduler(config: PolicyConfig, optimizer: torch.optim.Optimizer) -> Any:
-    """Build the LR scheduler ``policy.scheduler`` describes for one optimizer."""
-    if "scheduler" in config:
-        if isinstance(config["scheduler"], dict):
-            scheduler_cls = get_class(config["scheduler"]["name"])
-            return scheduler_cls(optimizer, **config["scheduler"]["kwargs"])
-
-        schedulers = []
-        for scheduler_cfg in config["scheduler"]:
-            if "name" in scheduler_cfg:
-                schedulers.append(
-                    get_class(scheduler_cfg["name"])(
-                        optimizer, **scheduler_cfg["kwargs"]
-                    )
-                )
-            else:
-                assert "milestones" in scheduler_cfg, (
-                    "unknown scheduler config: ",
-                    scheduler_cfg,
-                )
-                milestones: list[int] = scheduler_cfg["milestones"]
-
-        return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers, milestones)
-
-    # Default to passthrough LR schedule
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1)
-
-
-# policy.automodel_cfg.pipeline.pp_schedule -> torch.distributed.pipelining name.
-_PP_SCHEDULE_NAMES = {"1f1b": "1F1B", "interleaved_1f1b": "Interleaved1F1B"}
 
 
 def build_pipeline_config(
@@ -1227,6 +1220,7 @@ def build_pipeline_config(
 
     NeMo RL owns the runtime values:
 
+    - The schedule is 1F1B, which places one stage on each pipeline rank.
     - Each schedule call runs ``microbatches_per_step`` microbatches of
       ``train_micro_batch_size`` samples.
     - The schedule does not scale gradients: the loss adapter already returns
@@ -1241,121 +1235,11 @@ def build_pipeline_config(
     )
     micro_batch_size = config["train_micro_batch_size"]
     return PipelineConfig(
-        pp_schedule=_PP_SCHEDULE_NAMES[pipeline_cfg.pp_schedule],
+        pp_schedule="1F1B",
         pp_microbatch_size=micro_batch_size,
         pp_batch_size=micro_batch_size * pipeline_cfg.microbatches_per_step,
-        layers_per_stage=pipeline_cfg.layers_per_stage,
         dtype=fsdp2_config.mp_policy.output_dtype,
         scale_grads_in_schedule=False,
         loss_fn=PipelineOutputAdapter(),
         pp_seq_len=config["max_total_sequence_length"],
-    )
-
-
-def _setup_pipeline_parts(
-    config: PolicyConfig,
-    *,
-    pipeline: Any,
-    tokenizer: AutoTokenizer,
-    model_config: Any,
-    is_reward_model: bool,
-    peft_config: Optional[PeftConfig],
-    checkpoint_manager: Any,
-    optimizer_cls: Optional[type[torch.optim.Optimizer]],
-    optimizer_kwargs: Optional[dict[str, Any]],
-    weights_path: Optional[str],
-    optimizer_path: Optional[str],
-) -> ModelAndOptimizerState:
-    """Finish setup for the pipeline stages ``from_pretrained`` built.
-
-    Every local stage (model part) gets its own optimizer and LR scheduler, and
-    checkpoints namespace optimizer state by global stage index.
-
-    Args:
-        config: Policy configuration.
-        pipeline: The ``AutoPipeline`` returned by ``from_pretrained``.
-        tokenizer: Tokenizer for the model.
-        model_config: The Hugging Face model config.
-        is_reward_model: Whether this is a reward model.
-        peft_config: PEFT configuration, if any.
-        checkpoint_manager: Checkpoint manager for loading weights.
-        optimizer_cls: Optimizer class, or None to build no optimizer.
-        optimizer_kwargs: Optimizer keyword arguments.
-        weights_path: Optional path to checkpoint weights to load.
-        optimizer_path: Optional path to optimizer state to load.
-
-    Returns:
-        ModelAndOptimizerState whose ``model_runtime`` holds the local stages.
-    """
-    parts = pipeline.parts
-    stage_ids = [stage.stage_index for stage in pipeline.info.stages]
-    for stage_id, part in zip(stage_ids, parts):
-        print(f"Pipeline stage {stage_id}:\n{part}")
-
-    # A stage may hold only dense layers of an MoE model, so decide over the
-    # whole pipeline group: every stage must agree on autocast.
-    has_experts = torch.tensor(
-        [any("expert" in key for part in parts for key in part.state_dict())],
-        device="cuda",
-    )
-    torch.distributed.all_reduce(
-        has_experts,
-        op=torch.distributed.ReduceOp.MAX,
-        group=pipeline.pp_mesh.get_group(),
-    )
-    is_moe_model = bool(has_experts.item())
-    is_hf_model = (
-        model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
-    )
-    # Autocast is disabled for custom MoE models (non-HF) to avoid numerical issues
-    autocast_enabled = not (is_moe_model and not is_hf_model)
-
-    for part in parts:
-        if getattr(part.config, "pad_token_id", None) is None:
-            part.config.pad_token_id = tokenizer.pad_token_id
-
-    optimizers: list[torch.optim.Optimizer] = []
-    if optimizer_cls is not None:
-        # Only pass trainable params to the optimizer; see setup_model_and_optimizer.
-        optimizers = [
-            optimizer_cls(
-                (p for p in part.parameters() if p.requires_grad),
-                **optimizer_kwargs,
-            )
-            for part in parts
-        ]
-    schedulers = [_build_lr_scheduler(config, optimizer) for optimizer in optimizers]
-
-    if weights_path:
-        checkpoint_manager.load_checkpoint(
-            model=parts,
-            weights_path=weights_path,
-            optimizer=optimizers or None,
-            optimizer_path=optimizer_path,
-            scheduler=schedulers or None,
-            optimizer_part_ids=stage_ids,
-        )
-    else:
-        print(
-            "No weights path provided. Loaded base HF weights via from_pretrained (default policy init)"
-        )
-
-    return ModelAndOptimizerState(
-        model=None,
-        optimizer=None,
-        scheduler=None,
-        is_hf_model=is_hf_model,
-        is_moe_model=is_moe_model,
-        is_reward_model=is_reward_model,
-        model_class=type(parts[0]),
-        model_config=parts[0].config,
-        peft_config=peft_config,
-        autocast_enabled=autocast_enabled,
-        model_runtime=ModelRuntime(
-            parts=parts,
-            stage_ids=stage_ids,
-            optimizers=optimizers,
-            schedulers=schedulers,
-            pipeline=pipeline,
-        ),
     )

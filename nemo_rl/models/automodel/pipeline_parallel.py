@@ -27,6 +27,9 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional
 
 import torch
+from nemo_automodel.components.distributed.pipelining.autopipeline import (
+    AutoPipeline,
+)
 from nemo_automodel.components.distributed.pipelining.functional import (
     reset_pp_stage_shapes,
 )
@@ -37,7 +40,6 @@ from nemo_automodel.components.training.utils import (
 )
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
-from nemo_rl.models.automodel.model_handle import ModelRuntime
 from nemo_rl.models.automodel.pipeline_batch import ExecutionBatch
 from nemo_rl.models.automodel.train import (
     LogprobsPostProcessor,
@@ -168,7 +170,7 @@ class PipelineOutputAdapter:
 
 
 def _run_schedule_call(
-    runtime: ModelRuntime,
+    pipeline: AutoPipeline,
     execution_batch: ExecutionBatch,
     context: PipelineCallContext,
     *,
@@ -180,7 +182,6 @@ def _run_schedule_call(
     ``return_outputs`` and ``loss_kwargs`` reach the schedule rather than the
     model inputs, and so that forward-only calls can use ``schedule.eval``.
     """
-    pipeline = runtime.pipeline
     info = pipeline.info
     model_inputs = dict(execution_batch.model_inputs)
     input_ids = model_inputs.pop("input_ids")
@@ -208,7 +209,7 @@ def _run_schedule_call(
 
 
 def pipeline_forward_backward(
-    runtime: ModelRuntime,
+    pipeline: AutoPipeline,
     execution_batches: list[ExecutionBatch],
     post_processing_fn: LossPostProcessor,
     *,
@@ -229,7 +230,7 @@ def pipeline_forward_backward(
     calls and no optimizer step happens here.
 
     Args:
-        runtime: The worker's pipeline model parts.
+        pipeline: The AutoPipeline that drives this rank's stage.
         execution_batches: The chunk's planned schedule calls.
         post_processing_fn: The loss post-processor.
         autocast_context_factory: Worker-owned precision context factory.
@@ -255,7 +256,7 @@ def pipeline_forward_backward(
     for call_idx, execution_batch in enumerate(execution_batches):
         is_last_call = call_idx == len(execution_batches) - 1
         if not forward_only and sync_expert_grads and is_last_call:
-            prepare_for_final_backward(runtime.parts, pp_enabled=True)
+            prepare_for_final_backward(pipeline.parts, pp_enabled=True)
         context = PipelineCallContext(
             execution_batch=execution_batch,
             mode="eval" if forward_only else "train",
@@ -269,12 +270,12 @@ def pipeline_forward_backward(
         )
         with autocast_context_factory():
             _run_schedule_call(
-                runtime, execution_batch, context, forward_only=forward_only
+                pipeline, execution_batch, context, forward_only=forward_only
             )
         if not forward_only and call_idx == 0:
             prepare_after_first_microbatch()
 
-        if not runtime.has_last_stage:
+        if not pipeline.info.has_last_stage:
             continue
         for mb_index in range(len(execution_batch.microbatches)):
             loss, metrics = context.results[mb_index]
@@ -285,7 +286,7 @@ def pipeline_forward_backward(
 
 
 def pipeline_forward_logprobs(
-    runtime: ModelRuntime,
+    pipeline: AutoPipeline,
     execution_batches: list[ExecutionBatch],
     post_processing_fn: LogprobsPostProcessor,
     *,
@@ -313,8 +314,8 @@ def pipeline_forward_logprobs(
             results={},
         )
         with autocast_context_factory():
-            _run_schedule_call(runtime, execution_batch, context, forward_only=True)
-        if runtime.has_last_stage:
+            _run_schedule_call(pipeline, execution_batch, context, forward_only=True)
+        if pipeline.info.has_last_stage:
             results.extend(
                 context.results[mb_index]
                 for mb_index in range(execution_batch.num_real_microbatches)
@@ -322,9 +323,22 @@ def pipeline_forward_logprobs(
     return results
 
 
-def _last_stage_global_rank(runtime: ModelRuntime) -> int:
+def pipeline_optimizer_part_ids(
+    pipeline: Optional[AutoPipeline],
+) -> Optional[list[int]]:
+    """Global stage index of this rank's pipeline stage, or None without PP.
+
+    Optimizer checkpoints namespace their state by it, as Automodel's own
+    pipeline trainer does, so stages cannot write overlapping keys.
+    """
+    if pipeline is None:
+        return None
+    return [stage.stage_index for stage in pipeline.info.stages]
+
+
+def _last_stage_global_rank(pipeline: AutoPipeline) -> int:
     """Global rank of the PP rank that owns the last pipeline stage."""
-    pp_group = runtime.pipeline.pp_mesh.get_group()
+    pp_group = pipeline.pp_mesh.get_group()
     return torch.distributed.get_global_rank(
         pp_group, torch.distributed.get_world_size(pp_group) - 1
     )
@@ -341,32 +355,32 @@ def _materialize_for_object_broadcast(value: Any) -> Any:
     return value
 
 
-def broadcast_object_from_last_stage(runtime: ModelRuntime, obj: Any) -> Any:
+def broadcast_object_from_last_stage(pipeline: AutoPipeline, obj: Any) -> Any:
     """Broadcast a picklable payload from the last pipeline stage to the PP group.
 
     Tensors are converted to host values first, on every rank, so all PP ranks
     return identical payloads.
 
     Args:
-        runtime: The worker's pipeline model parts.
+        pipeline: The AutoPipeline that drives this rank's stage.
         obj: The payload on the last stage; ignored on other ranks.
 
     Returns:
         The last stage's payload with tensors materialized on the host.
     """
     payload = [
-        _materialize_for_object_broadcast(obj) if runtime.has_last_stage else None
+        _materialize_for_object_broadcast(obj) if pipeline.info.has_last_stage else None
     ]
     torch.distributed.broadcast_object_list(
         payload,
-        src=_last_stage_global_rank(runtime),
-        group=runtime.pipeline.pp_mesh.get_group(),
+        src=_last_stage_global_rank(pipeline),
+        group=pipeline.pp_mesh.get_group(),
     )
     return payload[0]
 
 
 def broadcast_tensor_from_last_stage(
-    runtime: ModelRuntime,
+    pipeline: AutoPipeline,
     tensor: Optional[torch.Tensor],
     *,
     shape: tuple[int, ...],
@@ -375,7 +389,7 @@ def broadcast_tensor_from_last_stage(
     """Broadcast a CUDA tensor of known shape from the last stage to the PP group.
 
     Args:
-        runtime: The worker's pipeline model parts.
+        pipeline: The AutoPipeline that drives this rank's stage.
         tensor: The tensor on the last stage; ignored on other ranks.
         shape: The tensor's shape, known on every rank.
         dtype: The tensor's dtype.
@@ -383,7 +397,7 @@ def broadcast_tensor_from_last_stage(
     Returns:
         The last stage's tensor on every PP rank.
     """
-    if runtime.has_last_stage:
+    if pipeline.info.has_last_stage:
         buffer = tensor.to(dtype).contiguous()
         if tuple(buffer.shape) != shape:
             raise RuntimeError(
@@ -393,13 +407,13 @@ def broadcast_tensor_from_last_stage(
         buffer = torch.empty(shape, dtype=dtype, device="cuda")
     torch.distributed.broadcast(
         buffer,
-        src=_last_stage_global_rank(runtime),
-        group=runtime.pipeline.pp_mesh.get_group(),
+        src=_last_stage_global_rank(pipeline),
+        group=pipeline.pp_mesh.get_group(),
     )
     return buffer
 
 
-def release_pipeline_runtime_state(runtime: ModelRuntime) -> None:
+def release_pipeline_runtime_state(pipeline: AutoPipeline) -> None:
     """Free pipeline buffers before the GPU is handed to the rollout engine.
 
     Drops each stage's forward cache and its per-microbatch activation and
@@ -407,14 +421,13 @@ def release_pipeline_runtime_state(runtime: ModelRuntime) -> None:
     schedule call reallocates them. Gradients must already be zero: the
     re-initialization clears them.
     """
-    pipeline = runtime.pipeline
     info = pipeline.info
     for stage in info.stages:
         stage.clear_runtime_states()
     reset_pp_stage_shapes(
         info.schedule,
         info.stages,
-        runtime.parts[0].config,
+        pipeline.parts[0].config,
         pipeline.pp_microbatch_size,
         pipeline.pp_seq_len,
         tensor_dtype=pipeline.dtype,

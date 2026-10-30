@@ -13,7 +13,6 @@ policy:
     pipeline_parallel_size: 2
     defer_fsdp_grad_sync: false
     pipeline:
-      pp_schedule: 1f1b
       microbatches_per_step: 4
 logger:
   log_dir: logs/sft-qwen2.5-7b-1n8g-automodel-pp2

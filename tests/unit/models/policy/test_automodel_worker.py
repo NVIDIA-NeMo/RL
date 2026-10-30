@@ -46,7 +46,6 @@ try:
         ModelAndOptimizerState,
         RuntimeConfig,
     )
-    from nemo_rl.models.automodel.model_handle import ModelRuntime
     from nemo_rl.models.policy.workers.automodel_policy_worker import (
         AutomodelPolicyWorkerImpl,
         _maybe_adapt_tensor_to_hf,
@@ -252,17 +251,6 @@ def calculate_token_logprobs(model_name: str, data: BatchedDataDict):
     return token_logprobs
 
 
-def _single_model_runtime(model, optimizer=None) -> "ModelRuntime":
-    """The ModelRuntime a non-pipelined worker builds around one model."""
-    return ModelRuntime(
-        parts=[model],
-        stage_ids=[0],
-        optimizers=[optimizer] if optimizer is not None else [],
-        schedulers=[],
-        pipeline=None,
-    )
-
-
 class _FakeTrainableModel:
     def __init__(self):
         self.train_called = False
@@ -284,7 +272,6 @@ def test_prepare_for_training_restores_optimizer(monkeypatch):
 
     worker.model = model
     worker.optimizer = object()
-    worker.model_runtime = _single_model_runtime(model, worker.optimizer)
     worker.cpu_offload = False
     worker.move_to_cuda = lambda model: model
     worker.move_optimizer_to_device = lambda device: restored_devices.append(device)
@@ -317,7 +304,6 @@ def test_prepare_for_lp_inference_keep_train_buffers(monkeypatch, keep_train_buf
 
     worker.model = model
     worker.optimizer = object()
-    worker.model_runtime = _single_model_runtime(model, worker.optimizer)
     worker.cpu_offload = False
     worker.offload_optimizer_for_logprob = True
     worker.move_to_cuda = lambda model: model
@@ -357,7 +343,7 @@ def test_offload_releases_moe_dispatcher_state_before_empty_cache(monkeypatch, e
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = nn.Sequential(experts)
     worker.optimizer = None
-    worker.model_runtime = _single_model_runtime(worker.model)
+    worker.pipeline = None
     worker.move_to_cpu = lambda model: model
     token_probs_at_empty_cache = []
 
@@ -385,7 +371,6 @@ def test_update_moe_gate_bias_called_when_supported():
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = MagicMock()
     worker.model.update_moe_gate_bias = MagicMock()
-    worker.model_runtime = _single_model_runtime(worker.model)
 
     AutomodelPolicyWorkerImpl._update_moe_gate_bias_if_supported(worker)
 
@@ -399,7 +384,6 @@ def test_update_moe_gate_bias_noop_when_unsupported():
     # A real module without the hook: getattr(..., None) must short-circuit so
     # models that do not expose update_moe_gate_bias are unaffected.
     worker.model = nn.Linear(1, 1)
-    worker.model_runtime = _single_model_runtime(worker.model)
 
     # Should be a no-op and must not raise.
     AutomodelPolicyWorkerImpl._update_moe_gate_bias_if_supported(worker)
@@ -1055,7 +1039,7 @@ class TestAutomodelLoraParamsGenerator:
 
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = model
-        worker.model_runtime = _single_model_runtime(worker.model)
+        worker.pipeline = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1092,7 +1076,7 @@ class TestAutomodelLoraParamsGenerator:
     def test_prepare_refit_info_contains_only_factor_metadata(self):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
-        worker.model_runtime = _single_model_runtime(worker.model)
+        worker.pipeline = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1109,7 +1093,7 @@ class TestAutomodelLoraParamsGenerator:
     def test_ipc_producer_uses_worker_refit_generator(self, monkeypatch):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
-        worker.model_runtime = _single_model_runtime(worker.model)
+        worker.pipeline = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1138,7 +1122,7 @@ class TestAutomodelLoraParamsGenerator:
     def test_collective_producer_uses_worker_refit_generator(self, monkeypatch):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
-        worker.model_runtime = _single_model_runtime(worker.model)
+        worker.pipeline = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1163,7 +1147,7 @@ class TestAutomodelLoraParamsGenerator:
     def test_refit_params_generator_selects_by_mode(self, monkeypatch, mode, expected):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
-        worker.model_runtime = _single_model_runtime(worker.model)
+        worker.pipeline = None
         worker.draft_model = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
@@ -1199,7 +1183,7 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
 
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = RouterModel()
-    worker.model_runtime = _single_model_runtime(worker.model)
+    worker.pipeline = None
     worker.dtype = torch.bfloat16
     worker.draft_model = None
     worker.lora_enabled = False
@@ -1301,11 +1285,9 @@ def _init_v2_worker_mocked(
     )
 
     # Unpacked as model_and_optimizer_state.
-    model = MagicMock(name="model")
-    optimizer = MagicMock(name="optimizer")
     model_and_optimizer_state = ModelAndOptimizerState(
-        model=model,
-        optimizer=optimizer,
+        model=MagicMock(name="model"),
+        optimizer=MagicMock(name="optimizer"),
         scheduler=MagicMock(name="scheduler"),
         is_hf_model=False,
         is_moe_model=False,
@@ -1314,7 +1296,6 @@ def _init_v2_worker_mocked(
         model_config="model_config",
         peft_config=None,
         autocast_enabled=False,
-        model_runtime=_single_model_runtime(model, optimizer),
     )
     setup_mock = MagicMock(
         side_effect=lambda **kw: (
@@ -1394,7 +1375,7 @@ def test_resume_with_reference_model_defers_checkpoint_load(monkeypatch):
         "setup_reference_model_state",
         "load_checkpoint",
     ]
-    assert worker.reference_model_state_dicts == [{"ref": "state"}]
+    assert worker.reference_model_state_dict == {"ref": "state"}
     # (c) checkpoint still loaded, with the original paths.
     assert load_mock.call_args.kwargs["weights_path"] == "/ckpt/weights"
     assert load_mock.call_args.kwargs["optimizer_path"] == "/ckpt/optim"
@@ -1414,7 +1395,7 @@ def test_resume_without_reference_model_passes_paths_through(monkeypatch):
     assert setup_mock.call_args.kwargs["weights_path"] == "/ckpt/weights"
     assert setup_mock.call_args.kwargs["optimizer_path"] == "/ckpt/optim"
     load_mock.assert_not_called()
-    assert worker.reference_model_state_dicts is None
+    assert worker.reference_model_state_dict is None
 
 
 @pytest.mark.automodel
@@ -1428,7 +1409,7 @@ def test_fresh_run_with_reference_model_does_not_defer(monkeypatch):
     )
     assert setup_mock.call_args.kwargs["weights_path"] is None
     load_mock.assert_not_called()
-    assert worker.reference_model_state_dicts == [{"ref": "state"}]
+    assert worker.reference_model_state_dict == {"ref": "state"}
 
 
 def _base_setup_impl(request, cluster):

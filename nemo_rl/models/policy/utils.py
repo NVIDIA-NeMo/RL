@@ -37,7 +37,11 @@ from nemo_rl.models.generation.vllm.patches import (
 from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
 if TYPE_CHECKING:
-    from nemo_rl.models.policy import AutomodelPipelineConfig, PolicyConfig
+    from nemo_rl.models.policy import (
+        AutomodelConfig,
+        AutomodelPipelineConfig,
+        PolicyConfig,
+    )
 
 # Environment for bitwise-reproducible policy workers. These are read when the
 # worker creates its cuBLAS handles and selects Transformer Engine kernels, so
@@ -204,7 +208,7 @@ def validate_automodel_pipeline_config(
     from nemo_rl.models.policy import AutomodelPipelineConfig
     from nemo_rl.models.policy.draft_config import draft_refit_enabled
 
-    automodel_cfg = config["automodel_cfg"]
+    automodel_cfg = cast("AutomodelConfig", config["automodel_cfg"])
     pp_size = automodel_pipeline_parallel_size(automodel_cfg)
     if pp_size < 1:
         raise ValueError(
@@ -220,30 +224,12 @@ def validate_automodel_pipeline_config(
             "microbatches_per_step."
         )
     pipeline_cfg = AutomodelPipelineConfig.model_validate(automodel_cfg["pipeline"])
-    num_microbatches = pipeline_cfg.microbatches_per_step
-    if pipeline_cfg.pp_schedule == "1f1b":
-        if pipeline_cfg.layers_per_stage is not None:
-            raise ValueError(
-                "policy.automodel_cfg.pipeline.layers_per_stage applies only to "
-                "pp_schedule=interleaved_1f1b; set it to null for 1f1b, which "
-                "places one stage per pipeline rank."
-            )
-        if num_microbatches < pp_size:
-            raise ValueError(
-                "pp_schedule=1f1b needs at least one microbatch per pipeline "
-                "stage: policy.automodel_cfg.pipeline.microbatches_per_step="
-                f"{num_microbatches} < pipeline_parallel_size={pp_size}."
-            )
-    else:
-        num_rounds = max(1, num_microbatches // pp_size)
-        if num_microbatches % num_rounds != 0:
-            raise ValueError(
-                "pp_schedule=interleaved_1f1b runs microbatches in rounds of "
-                "pipeline_parallel_size, so microbatches_per_step must be a "
-                f"multiple of max(1, microbatches_per_step // pipeline_parallel_size)"
-                f"={num_rounds}; got microbatches_per_step={num_microbatches} "
-                f"with pipeline_parallel_size={pp_size}."
-            )
+    if pipeline_cfg.microbatches_per_step < pp_size:
+        raise ValueError(
+            "The 1F1B pipeline schedule needs at least one microbatch per "
+            "pipeline stage: policy.automodel_cfg.pipeline.microbatches_per_step="
+            f"{pipeline_cfg.microbatches_per_step} < pipeline_parallel_size={pp_size}."
+        )
 
     if "defer_fsdp_grad_sync" not in automodel_cfg:
         raise ValueError(

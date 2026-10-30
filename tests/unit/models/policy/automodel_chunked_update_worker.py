@@ -62,8 +62,7 @@ class ChunkedUpdateAutomodelPolicyWorkerImpl(AutomodelPolicyWorkerImpl):
         counts = process_global_batch(
             data, loss_fn, self.dp_mesh.get_group(), batch_idx=0, batch_size=data.size
         )
-        for part in self.model_runtime.parts:
-            part.train()
+        self.model.train()
         self._open_update(
             LossPostProcessor(
                 loss_fn=loss_fn,
@@ -90,8 +89,7 @@ class ChunkedUpdateAutomodelPolicyWorkerImpl(AutomodelPolicyWorkerImpl):
             )
             if logprobs_after_first_chunk and chunk_idx == 0:
                 self.get_logprobs(data=data.slice(start, start + size))
-                for part in self.model_runtime.parts:
-                    part.train()
+                self.model.train()
             start += size
         closed = self._close_update()
         return self._finish_train_call(

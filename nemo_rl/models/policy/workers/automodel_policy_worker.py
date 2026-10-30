@@ -50,7 +50,6 @@ from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
-from nemo_rl.models.automodel.model_handle import ModelRuntime
 from nemo_rl.models.automodel.pipeline_batch import (
     ExecutionBatch,
     plan_execution_batches,
@@ -60,6 +59,7 @@ from nemo_rl.models.automodel.pipeline_parallel import (
     broadcast_tensor_from_last_stage,
     pipeline_forward_backward,
     pipeline_forward_logprobs,
+    pipeline_optimizer_part_ids,
     release_pipeline_runtime_state,
 )
 from nemo_rl.models.automodel.pipeline_refit import PipelineWeightExporter
@@ -596,10 +596,11 @@ class AutomodelPolicyWorkerImpl(
         # Set instance attributes from model and optimizer state. Access by
         # field name (not positional unpacking) so optional fields appended to
         # ModelAndOptimizerState stay backward compatible across workers.
-        # model_runtime holds the local model parts; model, optimizer, and
-        # scheduler are the single-module handles, None under pipeline
-        # parallelism.
-        self.model_runtime: ModelRuntime = model_and_optimizer_state.model_runtime
+        # Under pipeline parallelism, model, optimizer, and scheduler are this
+        # rank's pipeline stage and its optimizer state, and pipeline is
+        # Automodel's AutoPipeline that drives the stages; pipeline is None
+        # otherwise.
+        self.pipeline = model_and_optimizer_state.pipeline
         self.model = model_and_optimizer_state.model
         self.optimizer = model_and_optimizer_state.optimizer
         self.scheduler = model_and_optimizer_state.scheduler
@@ -636,13 +637,10 @@ class AutomodelPolicyWorkerImpl(
 
         # Initialize reference model if requested. With deferred loading the
         # model still holds the base (model_name) weights here, so the KL
-        # reference stays anchored to the same policy across resumes. One state
-        # dict per local model part.
-        self.reference_model_state_dicts: Optional[list[dict[str, torch.Tensor]]] = None
+        # reference stays anchored to the same policy across resumes.
+        self.reference_model_state_dict = None
         if init_reference_model:
-            self.reference_model_state_dicts = [
-                setup_reference_model_state(part) for part in self.model_runtime.parts
-            ]
+            self.reference_model_state_dict = setup_reference_model_state(self.model)
 
         # The optimizer update between _open_update and _close_update.
         self._update: Optional[_OpenUpdate] = None
@@ -671,14 +669,13 @@ class AutomodelPolicyWorkerImpl(
 
     def _update_moe_gate_bias_if_supported(self) -> None:
         """Update the non-gradient MoE routing bias after the optimizer step."""
-        for part in self.model_runtime.parts:
-            update_moe_gate_bias = getattr(part, "update_moe_gate_bias", None)
-            if update_moe_gate_bias is not None:
-                update_moe_gate_bias()
+        update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
+        if update_moe_gate_bias is not None:
+            update_moe_gate_bias()
 
     def _raise_if_pipeline_parallel(self, feature: str) -> None:
         """Reject a worker feature that has no pipeline-parallel implementation."""
-        if self.model_runtime.pp_enabled:
+        if self.pipeline is not None:
             raise NotImplementedError(
                 f"{feature} is not supported with "
                 "policy.automodel_cfg.pipeline_parallel_size > 1."
@@ -733,13 +730,11 @@ class AutomodelPolicyWorkerImpl(
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
-            for part in self.model_runtime.parts:
-                part.eval()
+            self.model.eval()
         else:
             ctx = nullcontext()
             # Ensure model is in training mode
-            for part in self.model_runtime.parts:
-                part.train()
+            self.model.train()
             if draft_runtime is not None:
                 self.draft_model.train()
 
@@ -852,12 +847,11 @@ class AutomodelPolicyWorkerImpl(
             raise RuntimeError(
                 "An optimizer update is already open; close or abort it first."
             )
-        for optimizer in self.model_runtime.optimizers:
-            optimizer.zero_grad()
-        if self.model_runtime.pp_enabled and not eval_mode:
+        self.optimizer.zero_grad()
+        if self.pipeline is not None and not eval_mode:
             # Lets Automodel defer MoE expert-gradient sync to the update's
             # final backward; the non-pipelined path syncs on every backward.
-            prepare_for_grad_accumulation(self.model_runtime.parts, pp_enabled=True)
+            prepare_for_grad_accumulation([self.model], pp_enabled=True)
         self._update = _OpenUpdate(
             post_processing_fn=post_processing_fn,
             mbs=mbs,
@@ -889,18 +883,17 @@ class AutomodelPolicyWorkerImpl(
         if update is None:
             raise RuntimeError("_run_update_chunk requires an open update.")
 
-        if self.model_runtime.pp_enabled:
-            pipeline = self.model_runtime.pipeline
-            if update.mbs != pipeline.pp_microbatch_size:
+        if self.pipeline is not None:
+            if update.mbs != self.pipeline.pp_microbatch_size:
                 raise ValueError(
                     f"Pipeline parallelism runs microbatches of "
-                    f"{pipeline.pp_microbatch_size} samples "
+                    f"{self.pipeline.pp_microbatch_size} samples "
                     "(policy.train_micro_batch_size), but this call requested "
                     f"mbs={update.mbs}."
                 )
             execution_batches = self._plan_execution_batches(data, update.mbs)
             mb_results = pipeline_forward_backward(
-                self.model_runtime,
+                self.pipeline,
                 execution_batches,
                 update.post_processing_fn,
                 autocast_context_factory=self._autocast_context,
@@ -957,9 +950,7 @@ class AutomodelPolicyWorkerImpl(
             # Only process valid (non-dummy) batches for metrics
             if mb_idx < num_valid_microbatches:
                 num_valid_samples = loss_metrics["num_valid_samples"]
-                loss_metrics[LEARNING_RATE_KEY] = self.model_runtime.optimizers[
-                    0
-                ].param_groups[0]["lr"]
+                loss_metrics[LEARNING_RATE_KEY] = self.optimizer.param_groups[0]["lr"]
                 if self.draft_model is not None:
                     # param_groups[0] is "policy" (see
                     # DSPARK_OPTIMIZER_GROUP_NAMES); the draft's own
@@ -996,7 +987,7 @@ class AutomodelPolicyWorkerImpl(
         update = self._update
         if update is None:
             raise RuntimeError("_close_update requires an open update.")
-        runtime = self.model_runtime
+        pp_enabled = self.pipeline is not None
 
         grad_norm: Optional[torch.Tensor] = None
         draft_grad_norm: Optional[float] = None
@@ -1009,15 +1000,15 @@ class AutomodelPolicyWorkerImpl(
             # loss already carries the global normalization.
             grad_norm = scale_grads_and_clip_grad_norm(
                 self.max_grad_norm,
-                runtime.parts,
+                [self.model],
                 norm_type=2.0,
-                pp_enabled=runtime.pp_enabled,
+                pp_enabled=pp_enabled,
                 device_mesh=self.device_mesh,
                 moe_mesh=self.moe_mesh,
                 ep_axis_name="ep"
                 if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names
                 else None,
-                pp_axis_name="pp" if runtime.pp_enabled else None,
+                pp_axis_name="pp" if pp_enabled else None,
                 foreach=True,
                 num_label_tokens=None,
                 dp_group_size=self.dp_size * self.cp_size,
@@ -1045,15 +1036,14 @@ class AutomodelPolicyWorkerImpl(
                 )
 
             # Update parameters and the non-gradient MoE routing bias.
-            for optimizer in runtime.optimizers:
-                optimizer.step()
+            self.optimizer.step()
             self._update_moe_gate_bias_if_supported()
 
         mb_losses, mb_metrics = update.mb_losses, update.mb_metrics
-        if runtime.pp_enabled:
+        if self.pipeline is not None:
             # The loss runs on the last stage only.
             mb_losses, mb_metrics = broadcast_object_from_last_stage(
-                runtime, (mb_losses, mb_metrics)
+                self.pipeline, (mb_losses, mb_metrics)
             )
         self._update = None
         return _ClosedUpdate(
@@ -1065,8 +1055,7 @@ class AutomodelPolicyWorkerImpl(
 
     def _abort_update(self) -> None:
         """Discard the open update's gradients and metrics. Idempotent."""
-        for optimizer in self.model_runtime.optimizers:
-            optimizer.zero_grad()
+        self.optimizer.zero_grad()
         self._update = None
 
     def _finish_train_call(
@@ -1080,12 +1069,10 @@ class AutomodelPolicyWorkerImpl(
     ) -> dict[str, Any]:
         """Run the once-per-call epilogue of ``train()`` and aggregate metrics."""
         # release gradient memory before rollouts
-        for optimizer in self.model_runtime.optimizers:
-            optimizer.zero_grad()
+        self.optimizer.zero_grad()
         # increment scheduler after all batches in rollout are processed
         if not eval_mode:
-            for scheduler in self.model_runtime.schedulers:
-                scheduler.step()
+            self.scheduler.step()
         # dynamic batch and sequence dims causes alot of fragmentation, so clear
         # the memory allocator before moving on
         torch.cuda.empty_cache()
@@ -1139,8 +1126,7 @@ class AutomodelPolicyWorkerImpl(
         sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         all_log_probs = []
-        for part in self.model_runtime.parts:
-            part.eval()
+        self.model.eval()
 
         # Create logprobs post-processor
         logprobs_post_processor = LogprobsPostProcessor(
@@ -1149,7 +1135,7 @@ class AutomodelPolicyWorkerImpl(
             sampling_params=self.sampling_params,
         )
 
-        if self.model_runtime.pp_enabled:
+        if self.pipeline is not None:
             return_data = BatchedDataDict[LogprobOutputSpec]()
             return_data["logprobs"] = self._get_pipeline_logprobs(
                 data,
@@ -1223,10 +1209,10 @@ class AutomodelPolicyWorkerImpl(
         self, data: BatchedDataDict[Any], micro_batch_size: int
     ) -> list[ExecutionBatch]:
         """Split this rank's ``data`` into the pipeline's schedule calls."""
-        pipeline = self.model_runtime.pipeline
+        pipeline = self.pipeline
         return plan_execution_batches(
             data,
-            model=self.model_runtime.parts[0],
+            model=self.model,
             micro_batch_size=micro_batch_size,
             microbatches_per_step=pipeline.pp_batch_size // pipeline.pp_microbatch_size,
             dp_group=self.dp_mesh.get_group(),
@@ -1253,8 +1239,7 @@ class AutomodelPolicyWorkerImpl(
         The last stage computes them and broadcasts them to the rest of the
         pipeline group, so every rank returns the same tensor.
         """
-        runtime = self.model_runtime
-        pipeline = runtime.pipeline
+        pipeline = self.pipeline
         if micro_batch_size != pipeline.pp_microbatch_size:
             raise ValueError(
                 "Pipeline parallelism runs microbatches of "
@@ -1265,7 +1250,7 @@ class AutomodelPolicyWorkerImpl(
         data.to("cuda")
         execution_batches = self._plan_execution_batches(data, micro_batch_size)
         token_logprobs = pipeline_forward_logprobs(
-            runtime,
+            pipeline,
             execution_batches,
             post_processing_fn,
             autocast_context_factory=self._autocast_context,
@@ -1273,13 +1258,13 @@ class AutomodelPolicyWorkerImpl(
             sequence_dim=sequence_dim,
         )
         local_logprobs = None
-        if runtime.has_last_stage:
+        if pipeline.info.has_last_stage:
             # Microbatches hold real samples first; drop the padding rows.
             local_logprobs = pad_and_concat(token_logprobs, target_len=seq_dim_size)[
                 : data.size
             ]
         return broadcast_tensor_from_last_stage(
-            runtime,
+            pipeline,
             local_logprobs,
             shape=(data.size, seq_dim_size),
             dtype=torch.float32,
@@ -1593,21 +1578,16 @@ class AutomodelPolicyWorkerImpl(
                   is different from the current policy, making filtered logprobs incompatible.
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
-        parts = self.model_runtime.parts
         with torch.no_grad():
             # Save train model state_dict
-            curr_state_dicts = [
-                get_cpu_state_dict(part.state_dict().items(), pin_memory=True)
-                for part in parts
-            ]
+            curr_state_dict = get_cpu_state_dict(
+                self.model.state_dict().items(), pin_memory=True
+            )
 
-            # Swap reference model state_dict into every local model part
-            for part, reference_state_dict in zip(
-                parts, self.reference_model_state_dicts, strict=True
-            ):
-                for k, v in part.state_dict().items():
-                    val = to_local_if_dtensor(v)
-                    val.copy_(reference_state_dict[k])
+            # Swap reference model state_dict to self.model
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(self.reference_model_state_dict[k])
 
             # Temporarily disable top-k/top-p filtering for reference policy logprobs.
             # The reference policy has different weights, so its top-k/top-p set is
@@ -1632,27 +1612,21 @@ class AutomodelPolicyWorkerImpl(
             self.sampling_params = saved_sampling_params
 
             # Restore train model state_dict
-            for part, curr_state_dict in zip(parts, curr_state_dicts, strict=True):
-                for k, v in part.state_dict().items():
-                    val = to_local_if_dtensor(v)
-                    val.copy_(curr_state_dict[k])
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(curr_state_dict[k])
 
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
         noise_std = 0.01  # Standard deviation for the noise
-        for part in self.model_runtime.parts:
-            for p in part.parameters():
-                if p.requires_grad:
-                    noise = torch.randn_like(p.data) * noise_std
-                    p.data.add_(noise)  # Add noise in-place
+        for p in self.model.parameters():
+            if p.requires_grad:
+                noise = torch.randn_like(p.data) * noise_std
+                p.data.add_(noise)  # Add noise in-place
         torch.cuda.synchronize()
 
     def return_state_dict(self):
-        """Return the state dict of this rank's model parts (testing only)."""
-        state_dict = {}
-        for part in self.model_runtime.parts:
-            state_dict.update(part.state_dict())
-        return state_dict
+        return self.model.state_dict()
 
     def return_model_config(self) -> dict[str, Any]:
         """Return the model configuration as a dictionary.
@@ -1660,12 +1634,12 @@ class AutomodelPolicyWorkerImpl(
         Returns:
             dict: Model configuration dictionary
         """
-        return self.model_runtime.parts[0].config
+        return self.model.config
 
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
-        if self.model_runtime.pp_enabled:
+        if self.pipeline is not None:
             return self._pipeline_weight_exporter().refit_info()
         if self.lora_enabled and self.lora_refit_mode == "native":
             return {
@@ -1706,8 +1680,8 @@ class AutomodelPolicyWorkerImpl(
         """The full-model weight stream of a pipeline-parallel policy."""
         if self._weight_exporter is None:
             self._weight_exporter = PipelineWeightExporter(
-                self.model_runtime,
-                local_params=lambda part: _module_params_generator(part, self.dtype),
+                self.pipeline,
+                local_params=lambda: _module_params_generator(self.model, self.dtype),
             )
         return self._weight_exporter
 
@@ -1715,7 +1689,7 @@ class AutomodelPolicyWorkerImpl(
         self,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Yield native A/B tensors or the unchanged merged full state."""
-        if self.model_runtime.pp_enabled:
+        if self.pipeline is not None:
             yield from self._pipeline_weight_exporter().iter_params()
             return
         if self.lora_enabled and self.lora_refit_mode == "native":
@@ -1803,7 +1777,7 @@ class AutomodelPolicyWorkerImpl(
 
         params = (
             self._pipeline_weight_exporter().iter_params()
-            if self.model_runtime.pp_enabled
+            if self.pipeline is not None
             else automodel_params_generator(self.model, self.dtype)
         )
         bucket_iter = iter_named_tensor_buckets(
@@ -1910,19 +1884,18 @@ class AutomodelPolicyWorkerImpl(
                 only suppresses the per-chunk optimizer round trip.
         """
         # onload model to cuda
-        for part in self.model_runtime.parts:
-            if not self.cpu_offload:
-                self.move_to_cuda(part)
-            else:
-                self.move_buffer_to_device(part, "cuda")
+        if not self.cpu_offload:
+            self.move_to_cuda(self.model)
+        else:
+            self.model = self.move_buffer_to_device(self.model, "cuda")
 
-            part.eval()
+        self.model.eval()
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
         if (
             not keep_train_buffers
-            and self.model_runtime.optimizers
+            and self.optimizer is not None
             and self.offload_optimizer_for_logprob
         ):
             self.move_optimizer_to_device("cpu")
@@ -1933,28 +1906,26 @@ class AutomodelPolicyWorkerImpl(
     @wrap_with_nvtx_name("automodel_policy_worker/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
         # onload models and optimizer state to cuda
-        for part in self.model_runtime.parts:
-            if not self.cpu_offload:
-                self.move_to_cuda(part)
-            else:
-                # when cpu offload is enabled, the buffers do not get moved
-                # to cuda automatically, so we need to do that manually
-                self.move_buffer_to_device(part, "cuda")
+        if not self.cpu_offload:
+            self.move_to_cuda(self.model)
+        else:
+            # when cpu offload is enabled, the buffers do not get moved
+            # to cuda automatically, so we need to do that manually
+            self.model = self.move_buffer_to_device(self.model, "cuda")
 
-            part.train()
+        self.model.train()
         # Training expects optimizer state on CUDA. Restore unconditionally rather
         # than tracking which path offloaded it; move_optimizer_to_device is a no-op
         # when the state is already resident.
-        if self.model_runtime.optimizers and not self.cpu_offload:
+        if self.optimizer is not None and not self.cpu_offload:
             self.move_optimizer_to_device("cuda")
 
         torch.cuda.empty_cache()
 
     def finish_inference(self) -> None:
         """Offload model params to CPU after inference. Only used in PPO."""
-        for part in self.model_runtime.parts:
-            self.move_to_cpu(part)
-            part.eval()
+        self.model = self.move_to_cpu(self.model)
+        self.model.eval()
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1964,17 +1935,16 @@ class AutomodelPolicyWorkerImpl(
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
         torch.randn(1).cuda()  # wake up torch allocator
-        if self.model_runtime.optimizers:
+        if self.optimizer is not None:
             self.move_optimizer_to_device("cpu")
 
-        if self.model_runtime.pp_enabled:
+        if self.pipeline is not None:
             # Pipeline receive buffers outlive the schedule call; free them
             # before the rollout engine needs the memory.
-            release_pipeline_runtime_state(self.model_runtime)
+            release_pipeline_runtime_state(self.pipeline)
         # Release recompute activations that MoE dispatch state keeps alive;
         # otherwise they pin cached segments and empty_cache() cannot free them.
-        for part in self.model_runtime.parts:
-            release_moe_dispatcher_state(part)
+        release_moe_dispatcher_state(self.model)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1982,9 +1952,8 @@ class AutomodelPolicyWorkerImpl(
     @wrap_with_nvtx_name("automodel_policy_worker/offload_after_refit")
     def offload_after_refit(self) -> None:
         """Offload as much as possible on the CPU."""
-        for part in self.model_runtime.parts:
-            self.move_to_cpu(part)
-            part.eval()
+        self.model = self.move_to_cpu(self.model)
+        self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 
@@ -1996,11 +1965,10 @@ class AutomodelPolicyWorkerImpl(
         )
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
-        for optimizer in self.model_runtime.optimizers:
-            for state in optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, (DTensor, torch.Tensor)):
-                        state[k] = v.to(device)
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, (DTensor, torch.Tensor)):
+                    state[k] = v.to(device)
 
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)
@@ -2039,23 +2007,7 @@ class AutomodelPolicyWorkerImpl(
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
-        runtime = self.model_runtime
-        if runtime.pp_enabled:
-            # Every stage saves its own parts; optimizer state is namespaced by
-            # global stage index so stages cannot produce overlapping keys.
-            self.checkpoint_manager.save_checkpoint(
-                model=runtime.parts,
-                weights_path=weights_path,
-                optimizer=runtime.optimizers or None,
-                optimizer_path=optimizer_path,
-                scheduler=runtime.schedulers or None,
-                tokenizer=self.tokenizer if tokenizer_path else None,
-                tokenizer_path=tokenizer_path,
-                is_final_checkpoint=is_final_checkpoint,
-                peft_config=self.peft_config,
-                optimizer_part_ids=runtime.stage_ids,
-            )
-        elif self.draft_model is not None:
+        if self.draft_model is not None:
             from nemo_rl.models.automodel.draft.checkpoint import (
                 save_checkpoint_with_draft,
             )
@@ -2086,6 +2038,7 @@ class AutomodelPolicyWorkerImpl(
                 tokenizer_path=tokenizer_path,
                 is_final_checkpoint=is_final_checkpoint,
                 peft_config=self.peft_config,
+                optimizer_part_ids=pipeline_optimizer_part_ids(self.pipeline),
             )
 
     def finalize_async_save(self) -> None:
@@ -2105,17 +2058,7 @@ class AutomodelPolicyWorkerImpl(
         optimizer_path: Optional[str] = None,
     ) -> None:
         """Load a checkpoint into the model using Automodel Checkpointer."""
-        runtime = self.model_runtime
-        if runtime.pp_enabled:
-            self.checkpoint_manager.load_checkpoint(
-                model=runtime.parts,
-                weights_path=weights_path,
-                optimizer=runtime.optimizers or None,
-                optimizer_path=optimizer_path,
-                scheduler=runtime.schedulers or None,
-                optimizer_part_ids=runtime.stage_ids,
-            )
-        elif self.draft_model is not None:
+        if self.draft_model is not None:
             from nemo_rl.models.automodel.draft.checkpoint import (
                 load_checkpoint_with_draft,
             )
@@ -2138,6 +2081,7 @@ class AutomodelPolicyWorkerImpl(
                 optimizer=self.optimizer,
                 optimizer_path=optimizer_path,
                 scheduler=self.scheduler,
+                optimizer_part_ids=pipeline_optimizer_part_ids(self.pipeline),
             )
 
     def _init_checkpoint_manager(

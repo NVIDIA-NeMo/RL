@@ -211,21 +211,15 @@ def test_build_pipeline_config_sets_nemo_rl_runtime_fields():
     config = {
         "train_micro_batch_size": 2,
         "max_total_sequence_length": 128,
-        "automodel_cfg": {
-            "pipeline": {
-                "pp_schedule": "interleaved_1f1b",
-                "microbatches_per_step": 4,
-                "layers_per_stage": 2,
-            }
-        },
+        "automodel_cfg": {"pipeline": {"microbatches_per_step": 4}},
     }
 
     pipeline_config = build_pipeline_config(config, fsdp2_config)
 
-    assert pipeline_config.pp_schedule == "Interleaved1F1B"
+    assert pipeline_config.pp_schedule == "1F1B"
     assert pipeline_config.pp_microbatch_size == 2
     assert pipeline_config.pp_batch_size == 8
-    assert pipeline_config.layers_per_stage == 2
+    assert pipeline_config.layers_per_stage is None
     assert pipeline_config.dtype == torch.float32
     assert pipeline_config.scale_grads_in_schedule is False
     assert pipeline_config.pp_seq_len == 128

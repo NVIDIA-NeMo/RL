@@ -1443,7 +1443,7 @@ def test_init_checkpointer_passes_pipeline_rank_and_group(monkeypatch, pp_size):
 
 
 @pytest.mark.automodel
-def test_pipeline_checkpoint_forwards_parts_and_part_ids(tmp_path):
+def test_pipeline_checkpoint_forwards_stage_part_ids(tmp_path):
     from nemo_rl.models.automodel import checkpoint as ckpt_mod
 
     manager = ckpt_mod.AutomodelCheckpointManager.__new__(
@@ -1451,35 +1451,33 @@ def test_pipeline_checkpoint_forwards_parts_and_part_ids(tmp_path):
     )
     manager.checkpointer = MagicMock()
     manager.moe_mesh = None
-    parts = [torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)]
-    optimizers = [torch.optim.SGD(part.parameters(), lr=0.1) for part in parts]
-    schedulers = [
-        torch.optim.lr_scheduler.LambdaLR(opt, lambda epoch: 1) for opt in optimizers
-    ]
+    stage = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(stage.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 1)
 
     manager.save_checkpoint(
-        model=parts,
+        model=stage,
         weights_path=str(tmp_path / "weights"),
-        optimizer=optimizers,
+        optimizer=optimizer,
         optimizer_path=str(tmp_path / "optim"),
-        scheduler=schedulers,
+        scheduler=scheduler,
         is_final_checkpoint=False,
-        optimizer_part_ids=[0, 2],
+        optimizer_part_ids=[1],
     )
     save_kwargs = manager.checkpointer.save_optimizer.call_args.kwargs
-    assert save_kwargs["model"] is parts
-    assert save_kwargs["optimizer"] is optimizers
-    assert save_kwargs["scheduler"] is schedulers
-    assert save_kwargs["optimizer_part_ids"] == [0, 2]
+    assert save_kwargs["model"] is stage
+    assert save_kwargs["optimizer"] is optimizer
+    assert save_kwargs["scheduler"] is scheduler
+    assert save_kwargs["optimizer_part_ids"] == [1]
 
     manager.load_checkpoint(
-        model=parts,
+        model=stage,
         weights_path=str(tmp_path / "weights"),
-        optimizer=optimizers,
+        optimizer=optimizer,
         optimizer_path=str(tmp_path / "optim"),
-        scheduler=schedulers,
-        optimizer_part_ids=[0, 2],
+        scheduler=scheduler,
+        optimizer_part_ids=[1],
     )
-    assert manager.checkpointer.load_model.call_args.kwargs["model"] is parts
+    assert manager.checkpointer.load_model.call_args.kwargs["model"] is stage
     load_kwargs = manager.checkpointer.load_optimizer.call_args.kwargs
-    assert load_kwargs["optimizer_part_ids"] == [0, 2]
+    assert load_kwargs["optimizer_part_ids"] == [1]

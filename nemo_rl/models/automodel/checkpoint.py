@@ -331,11 +331,11 @@ class AutomodelCheckpointManager:
 
     def save_checkpoint(
         self,
-        model: nn.Module | list[nn.Module],
+        model: nn.Module,
         weights_path: str,
-        optimizer: Optional[torch.optim.Optimizer | list[torch.optim.Optimizer]] = None,
+        optimizer: Optional[torch.optim.Optimizer] = None,
         optimizer_path: Optional[str] = None,
-        scheduler: Optional[Any] = None,
+        scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
         tokenizer: Optional[AutoTokenizer] = None,
         tokenizer_path: Optional[str] = None,
         *,
@@ -351,11 +351,11 @@ class AutomodelCheckpointManager:
         staging is complete; upload and consolidation may continue in the background.
 
         Args:
-            model: The model to save, or this rank's pipeline model parts.
+            model: The model to save.
             weights_path: Path to save model weights.
-            optimizer: Optional optimizer to save, or one per model part.
+            optimizer: Optional optimizer to save.
             optimizer_path: Optional path to save optimizer state.
-            scheduler: Optional learning rate scheduler, or one per model part.
+            scheduler: Optional learning rate scheduler.
             tokenizer: Optional tokenizer to save with the checkpoint.
             tokenizer_path: Optional path to save tokenizer separately.
             is_final_checkpoint: Whether this checkpoint completes the training
@@ -364,8 +364,8 @@ class AutomodelCheckpointManager:
                 consolidates these checkpoints. Timeout recovery checkpoints are
                 resumable and are not considered final.
             peft_config: Optional PEFT configuration.
-            optimizer_part_ids: Global pipeline stage index of each model part
-                when saving pipeline parts.
+            optimizer_part_ids: Global pipeline stage index of the model under
+                pipeline parallelism; namespaces its optimizer state.
         """
         print(f"Saving checkpoint to {weights_path}")
         assert self.checkpointer is not None, (
@@ -434,26 +434,24 @@ class AutomodelCheckpointManager:
 
     def load_checkpoint(
         self,
-        model: nn.Module | list[nn.Module],
+        model: nn.Module,
         weights_path: str,
-        optimizer: Optional[torch.optim.Optimizer | list[torch.optim.Optimizer]] = None,
+        optimizer: Optional[torch.optim.Optimizer] = None,
         optimizer_path: Optional[str] = None,
-        scheduler: Optional[Any] = None,
+        scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
         *,
         optimizer_part_ids: Optional[list[int]] = None,
     ) -> None:
         """Load a checkpoint into the model using Automodel Checkpointer.
 
         Args:
-            model: The model to load weights into, or this rank's pipeline
-                model parts.
+            model: The model to load weights into.
             weights_path: Path to the checkpoint weights.
-            optimizer: Optional optimizer to load state into, or one per model
-                part.
+            optimizer: Optional optimizer to load state into.
             optimizer_path: Optional path to optimizer checkpoint.
-            scheduler: Optional learning rate scheduler, or one per model part.
-            optimizer_part_ids: Global pipeline stage index of each model part
-                when loading pipeline parts.
+            scheduler: Optional learning rate scheduler.
+            optimizer_part_ids: Global pipeline stage index of the model under
+                pipeline parallelism; namespaces its optimizer state.
         """
         print(f"Loading weights from {weights_path}")
         assert self.checkpointer is not None, (
@@ -481,8 +479,8 @@ class AutomodelCheckpointManager:
 
     def check_master_weight_dtypes(
         self,
-        model: nn.Module | list[nn.Module],
-        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
         optimizer_path: str,
     ) -> None:
         """Hard-error if a resumed optimizer's on-disk master dtype has drifted.
@@ -492,8 +490,7 @@ class AutomodelCheckpointManager:
         just because ``store_param_remainders``/``master_weight_dtype``
         changed between save and resume.
         """
-        optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
-        if not any(getattr(opt, "master_weights", False) for opt in optimizers):
+        if not getattr(optimizer, "master_weights", False):
             return
         assert self.checkpointer is not None, (
             "Checkpointer must be initialized before loading checkpoint. "
