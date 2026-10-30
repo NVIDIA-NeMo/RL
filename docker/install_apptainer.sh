@@ -17,9 +17,9 @@ set -euo pipefail
 
 APPTAINER_VERSION=1.4.5
 APPTAINER_SOURCE_SHA256=d323a8b9a0a9e5e131b396d0049fdaa99beceb83a3d7ffb80dd91d15331e3b9a
-GO_VERSION=1.26.6
-GO_AMD64_SHA256=708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89
-GO_ARM64_SHA256=d0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e
+GO_VERSION=1.26.10
+GO_AMD64_SHA256=ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5
+GO_ARM64_SHA256=3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797
 # Bumping APPTAINER_VERSION itself is not an option here (functionality
 # regressions on a newer release), so instead this script builds the SAME
 # 1.4.5 release from source on both architectures and patches only the
@@ -27,13 +27,14 @@ GO_ARM64_SHA256=d0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e
 # before compiling -- same technique Megatron-Bridge uses to patch
 # wandb-core's vendored deps
 # (see 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/docker/Dockerfile.fw_final).
-GO_CRYPTO_VERSION=0.55.0
-# x/crypto 0.55.0 requires x/text >= 0.41.0; pinning x/text lower makes the
+GO_CRYPTO_VERSION=0.57.0
+# x/crypto 0.57.0 and x/net 0.60.0 require x/text >= 0.42.0; pinning x/text lower makes the
 # later `go get` silently downgrade x/crypto (and x/net) to match.
-GO_TEXT_VERSION=0.41.0
+GO_TEXT_VERSION=0.42.0
+GO_NET_VERSION=0.60.0
 # Only used for the bundled gocryptfs helper (see patch_gocryptfs).
 GO_SYS_VERSION=0.49.0
-GO_TERM_VERSION=0.45.0
+GO_TERM_VERSION=0.46.0
 GRPC_VERSION=1.83.2
 FULCIO_VERSION=1.8.6
 REKOR_VERSION=1.5.2
@@ -55,6 +56,8 @@ DOCKER_CLI_VERSION=29.3.0
 DOCKER_VERSION=27.5.1
 GO_CONTAINERREGISTRY_VERSION=0.20.3
 CONTAINERS_IMAGE_VERSION=5.33.1
+GO_JOSE_VERSION=4.1.6
+KLAUSPOST_COMPRESS_VERSION=1.18.7
 DEB_ARCH="$(dpkg --print-architecture)"
 export DEBIAN_FRONTEND=noninteractive
 
@@ -263,11 +266,14 @@ install_from_source() {
         -replace "github.com/google/go-containerregistry=github.com/google/go-containerregistry@v${GO_CONTAINERREGISTRY_VERSION}"
     go get "golang.org/x/crypto@v${GO_CRYPTO_VERSION}"
     go get "golang.org/x/text@v${GO_TEXT_VERSION}"
+    go get "golang.org/x/net@v${GO_NET_VERSION}"
     go get "google.golang.org/grpc@v${GRPC_VERSION}"
     go get "github.com/sigstore/fulcio@v${FULCIO_VERSION}"
     go get "github.com/sigstore/rekor@v${REKOR_VERSION}"
     go get "github.com/containers/image/v5@v${CONTAINERS_IMAGE_VERSION}"
     go get "github.com/docker/cli@v${DOCKER_CLI_VERSION}+incompatible"
+    go get "github.com/go-jose/go-jose/v4@v${GO_JOSE_VERSION}"
+    go get "github.com/klauspost/compress@v${KLAUSPOST_COMPRESS_VERSION}"
     go mod tidy
     go mod vendor
 
@@ -345,10 +351,13 @@ EOF
     assert_go_binary /usr/local/bin/apptainer \
         "golang.org/x/crypto	v${GO_CRYPTO_VERSION}" \
         "golang.org/x/text	v${GO_TEXT_VERSION}" \
+        "golang.org/x/net	v${GO_NET_VERSION}" \
         "google.golang.org/grpc	v${GRPC_VERSION}" \
         "github.com/sigstore/fulcio	v${FULCIO_VERSION}" \
         "github.com/sigstore/rekor	v${REKOR_VERSION}" \
-        "github.com/docker/cli	v${DOCKER_CLI_VERSION}+incompatible"
+        "github.com/docker/cli	v${DOCKER_CLI_VERSION}+incompatible" \
+        "github.com/go-jose/go-jose/v4	v${GO_JOSE_VERSION}" \
+        "github.com/klauspost/compress	v${KLAUSPOST_COMPRESS_VERSION}"
     assert_go_binary /usr/local/libexec/apptainer/bin/starter \
         "golang.org/x/crypto	v${GO_CRYPTO_VERSION}"
     assert_go_binary /usr/local/libexec/apptainer/bin/gocryptfs \

@@ -106,6 +106,9 @@ apt install -y --only-upgrade gnupg
 # Upgrade rsync to address security vulnerabilities
 apt-get install -y --only-upgrade rsync
 
+# Upgrade libbrotli1 to address security vulnerabilities
+apt-get install -y --only-upgrade libbrotli1
+
 # Upgrade openssl and libssl3t64 to address security vulnerabilities. --only-upgrade never
 # installs a package that is not already present, but a newer version can still declare new
 # dependencies, so simulate first and fail the build if apt would install or remove anything
