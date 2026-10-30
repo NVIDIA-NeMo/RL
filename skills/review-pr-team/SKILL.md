@@ -148,8 +148,9 @@ just saying "this is wrong."
   applies to what it is checking.
 - Read every `skills/contributing/references/*.md` and treat each rule as a finding checklist,
   the same as this skill's own references. A rule that ends with `Source: [name](...)` has a
-  review lesson behind it; tell every agent to read that file whenever the rule applies, as
-  with `Details:` links.
+  review lesson behind it, and one that ends with `Details:` has an author how-to under
+  `skills/contributing/references/details/`; tell every agent to read the linked file whenever
+  the rule applies.
 - Then glob `~/.claude/review-memory/RL/*.md` and read EVERY match. This is the optional, machine-local
   store of lessons that are not in `references/` yet. It may be empty or absent; an empty glob is fine.
   New lessons are written here in Phase 6. A memory's `count` is how many times its pattern has shown

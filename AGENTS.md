@@ -13,7 +13,7 @@ Coding guidelines and operational procedures are organized as agent skills in `s
 
 Never skip or reorder these steps. Do not wait for the user to name the right skill keyword — infer it from the artifact you read.
 
-Any task that writes or changes code also loads the `contributing` skill and reads every `skills/contributing/references/*.md` file. A rule's `Source:` link points to the review lesson it came from; reading it is not needed to write code.
+Any task that writes or changes code also loads the `contributing` skill and reads every `skills/contributing/references/*.md` file. A rule's `Details:` link has step-by-step instructions; read it when the rule applies. A rule's `Source:` link points to the review lesson it came from; reading it is not needed to write code.
 
 ## Code Review
 
