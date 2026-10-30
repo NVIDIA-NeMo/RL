@@ -1099,6 +1099,7 @@ def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
         "sampler_dispatch_index": None,
         # None unless adaptive-ppo-clip is on.
         "cur_adaptive_ppo_clip_k": None,
+        "next_nemo_gym_task_index": 0,
     }
     assert "total_valid_tokens" not in loaded_state
     assert not hasattr(save_state, "val:accuracy")
@@ -1109,6 +1110,7 @@ def test_grpo_save_state_checkpoint_round_trip():
     save_state.current_step = 4
     save_state.total_steps = 4
     save_state.total_valid_tokens = 128
+    save_state.next_nemo_gym_task_index = 123
     save_state.val_reward = 0.8
     setattr(save_state, "val:accuracy", 0.8)
 
@@ -1117,6 +1119,7 @@ def test_grpo_save_state_checkpoint_round_trip():
     assert restored_state.current_step == 4
     assert restored_state.total_steps == 4
     assert restored_state.total_valid_tokens == 128
+    assert restored_state.next_nemo_gym_task_index == 123
     assert restored_state.val_reward == 0.8
     assert not hasattr(restored_state, "val:accuracy")
 
@@ -7962,6 +7965,59 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         ]
         if masked_position:
             assert math.isfinite(result["max_seq_mult_prob_error"])
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+    @pytest.mark.parametrize("field", ["prev_logprobs", "generation_logprobs"])
+    @pytest.mark.parametrize("threshold", [None, 1.1])
+    def test_pooled_nonfinite_error_is_owner_local(
+        self, bad: float, field: str, threshold: float | None
+    ) -> None:
+        train_data = self._create_train_data(
+            4,
+            3,
+            torch.zeros(4, 3),
+            torch.zeros(4, 3),
+            sample_mask=torch.tensor([1.0, 1.0, 1.0, 0.0]),
+        )
+        train_data[field][0, 1] = bad
+        train_data[field][3] = torch.nan
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data,
+            torch.ones(4),
+            threshold,
+            row_owner=torch.tensor([7, 7, 12, -1]),
+        )
+        keep = float(threshold is None)
+        assert train_data["sample_mask"].tolist() == [keep, keep, 1.0, 0.0]
+        assert result["num_masked_seqs"] == (0 if threshold is None else 2)
+        if threshold is not None:
+            assert result["max_seq_mult_prob_error_after_mask"] == 1.0
+
+    @pytest.mark.parametrize("filtering_on", [False, True])
+    def test_pooled_filtering_uses_only_supported_token_counts(
+        self, filtering_on: bool
+    ) -> None:
+        train_data = self._create_train_data(
+            3,
+            4,
+            torch.zeros(3, 4),
+            torch.zeros(3, 4),
+            token_mask=torch.tensor([[0, 1, 1, 1], [0, 1, 0, 0], [0, 1, 1, 1]]),
+        )
+        train_data["generation_logprobs"][0, 1:] = -torch.inf
+        train_data["generation_logprobs"][1, 1] = -math.log(1.2)
+        original_token_mask = train_data["token_mask"].clone()
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data,
+            torch.ones(3),
+            1.1,
+            filtering_on=filtering_on,
+            row_owner=torch.tensor([0, 0, 1]),
+        )
+        # Unsupported tokens cannot dilute the remaining token's error to 0.3.
+        assert train_data["sample_mask"].tolist() == [0.0, 0.0, 1.0]
+        assert result["num_masked_seqs"] == 2
+        torch.testing.assert_close(train_data["token_mask"], original_token_mask)
 
     @pytest.mark.parametrize("threshold", [None, 2.0])
     def test_support_filtered_tokenless_rows_are_excluded(self, threshold):

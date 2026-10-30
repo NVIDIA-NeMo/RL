@@ -28,7 +28,7 @@ uv run examples/run_dpo.py \
     logger.wandb.name="dpo-dev-8-gpu"
 ```
 
-**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `hf auth login` as well for Llama models.
 
 ## Datasets
 

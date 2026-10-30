@@ -42,8 +42,8 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
-SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, ROLLOUT_RECOVERY_SCHEMA_VERSION}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, 3, ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -320,6 +320,11 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
     """Validate a terminal Gate receipt and return its ordered staging keys."""
     if receipt is None:
         return []
+    pending = set(receipt.get("pending_call_ids", []))
+    if pending and not receipt.get("capture_poisoned"):
+        raise ValueError(
+            "Capture acknowledgement is unresolved; preserve staging until reconciliation"
+        )
     manifest = receipt.get("manifest")
     if not isinstance(manifest, list):
         raise ValueError("sealed rollout receipt must contain a manifest list")
@@ -331,7 +336,23 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
                 "staging_key values"
             )
         staging_keys.append(entry["staging_key"])
-    return staging_keys
+    owner = receipt.get("capture_key")
+    if not pending.issubset(receipt.get("attempted_call_ids", [])) or any(
+        entry.get("model_call_id") in pending for entry in manifest
+    ):
+        raise ValueError("Pending calls must be attempted and uncommitted")
+    for call_id in receipt.get("attempted_call_ids", []):
+        if not isinstance(call_id, str) or not call_id or "/" in call_id:
+            raise ValueError("Invalid attempted capture call identity")
+        # Abandoned calls remain isolated by the attempt UUID. A worker may
+        # still write them; leave those rows for staging-partition teardown,
+        # as on the existing abandoned-dispatch path.
+        if call_id not in pending:
+            # Gym is optional for legacy receipts without attempted call IDs.
+            from nemo_gym.token_id_capture.staging.records import staging_key
+
+            staging_keys.append(staging_key(owner, call_id))
+    return list(dict.fromkeys(staging_keys))
 
 
 class RolloutRecoveryLedger:
@@ -627,10 +648,10 @@ class RolloutRecoveryLedger:
                 "streamed rollout identity mismatch: "
                 f"result={gate_rollout_id!r}, expected={expected_gate_rollout_id!r}"
             )
-        if receipt is not None and receipt.get("rollout_id") != gate_rollout_id:
+        if receipt is not None and receipt.get("capture_key") != gate_rollout_id:
             raise ValueError(
                 "receipt rollout identity mismatch: "
-                f"receipt={receipt.get('rollout_id')!r}, expected={gate_rollout_id!r}"
+                f"receipt={receipt.get('capture_key')!r}, expected={gate_rollout_id!r}"
             )
         if attempt.status == RolloutAttemptStatus.SEALED:
             if (
@@ -717,11 +738,11 @@ class RolloutRecoveryLedger:
                 )
             if (
                 result.receipt is not None
-                and result.receipt.get("rollout_id") != expected_gate_rollout_id
+                and result.receipt.get("capture_key") != expected_gate_rollout_id
             ):
                 raise ValueError(
                     "receipt rollout identity mismatch: "
-                    f"receipt={result.receipt.get('rollout_id')!r}, "
+                    f"receipt={result.receipt.get('capture_key')!r}, "
                     f"expected={expected_gate_rollout_id!r}"
                 )
             if not isinstance(result.mask_sample, bool):
@@ -991,6 +1012,7 @@ class RolloutRecoveryLedger:
             record = cls._group_from_state(
                 raw_group,
                 seen_attempt_uuids=seen_attempt_uuids,
+                schema_version=schema_version,
             )
             if record.group_id in ledger._groups:
                 raise ValueError(f"duplicate recovery group_id={record.group_id!r}")
@@ -1027,6 +1049,7 @@ class RolloutRecoveryLedger:
         raw_group: Any,
         *,
         seen_attempt_uuids: set[uuid.UUID],
+        schema_version: int,
     ) -> PromptGroupRecoveryRecord:
         if not isinstance(raw_group, dict):
             raise ValueError("rollout-recovery group must be a mapping")
@@ -1135,6 +1158,11 @@ class RolloutRecoveryLedger:
                         f"invalid rollout attempt status={raw_attempt_status!r}"
                     ) from error
                 receipt = attempt_state.get("receipt")
+                if schema_version < 4 and receipt is not None:
+                    raise ValueError(
+                        "Token-capture rollout checkpoints from before schema v4 cannot be resumed "
+                        f"(schema={schema_version}). Restart the rollouts."
+                    )
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
                 raw_checks = attempt_state.get("reward_checks")
@@ -1166,7 +1194,7 @@ class RolloutRecoveryLedger:
                                 "sealed missing-receipt attempt cannot own staging keys"
                             )
                     elif isinstance(receipt, dict):
-                        if receipt.get("rollout_id") != gate_id:
+                        if receipt.get("capture_key") != gate_id:
                             raise ValueError("sealed receipt identity mismatch")
                         if _receipt_staging_keys(receipt) != staging_keys:
                             raise ValueError("sealed receipt staging manifest mismatch")
@@ -1444,15 +1472,19 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
         "finalizer_metrics_by_group",
         "finalizer_rewards_by_group",
     ):
-        if key not in state:
+        if schema_version >= 3 and key not in state:
             raise ValueError(f"rollout recovery sidecar is missing {key!r}")
     reward_settings = (
         CaptureRewardSettings.from_state(state["reward_settings"])
-        if state["reward_settings"] is not None
+        if state.get("reward_settings") is not None
         else None
     )
-    finalizer_metrics = _validate_finalizer_metrics(state["finalizer_metrics_by_group"])
-    finalizer_rewards = _validate_finalizer_rewards(state["finalizer_rewards_by_group"])
+    finalizer_metrics = _validate_finalizer_metrics(
+        state.get("finalizer_metrics_by_group", {})
+    )
+    finalizer_rewards = _validate_finalizer_rewards(
+        state.get("finalizer_rewards_by_group", {})
+    )
     if set(finalizer_rewards) - set(finalizer_metrics):
         raise ValueError("finalized reward observations require matching group metrics")
     return ParsedRolloutRecoveryState(

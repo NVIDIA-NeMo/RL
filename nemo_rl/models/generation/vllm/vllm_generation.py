@@ -51,6 +51,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
+    validate_vllm_async_actor_settings,
     validate_vllm_quantization_config,
 )
 from nemo_rl.models.generation.vllm.draft_utils import (
@@ -230,6 +231,7 @@ class VllmGeneration(GenerationInterface):
             defer_model_load: If True, defer model loading for overlapped init
         """
         validate_vllm_quantization_config(config)
+        validate_vllm_async_actor_settings(config)
 
         # Store config
         self.cfg = config
