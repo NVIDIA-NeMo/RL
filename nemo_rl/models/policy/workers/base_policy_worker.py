@@ -129,9 +129,7 @@ class AbstractPolicyWorker:
         # _build re-runs both communicator families on every reconcile, so without this
         # each recovery strands a NCCL communicator and a bound TCPStore per PP stage for
         # the life of the worker. Deferred past the rendezvous and bounded, same as there.
-        # One bulk communicator per generation *layout* (e.g. disaggregated
-        # TRT-LLM context vs generation engines); layout 0 stays on
-        # ``pp_comm_group`` for the single-layout callers.
+        # Replace only this layout's group; layout 0 also backs pp_comm_group.
         groups_by_layout = dict(self.pp_comm_groups_by_layout or {})
         stale_group = groups_by_layout.pop(layout_index, None)
         if layout_index == 0:
@@ -179,6 +177,7 @@ class AbstractPolicyWorker:
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
+        layout_index: int = 0,
     ) -> dict[str, Any]:
         """Prepare parameter metadata for NCCL reshard refit."""
         # This is a placeholder implementation.

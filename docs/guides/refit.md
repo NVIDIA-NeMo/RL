@@ -55,7 +55,7 @@ for those cases.
 | NCCL + reload API | vLLM | Automodel or Megatron | Default non-colocated NCCL only. Rejects colocated refit, `nccl_reshard`, sparse delta, NIXL/checkpoint-engine transports, ModelOpt quantization (`real_quant` or `quant_cfg`), and Eagle/MTP trainer-refit draft weights. |
 | MCore native refit | Megatron | Megatron | Supports MCore's configured copy-service backend. |
 | SGLang NCCL weight-update group | SGLang | Megatron | Trainer rank 0 broadcasts finalized HF tensors to the engine leaders. |
-| NCCL reshard | vLLM or Megatron | Megatron | Supports BF16 and the documented FP8/MXFP8 combinations; see the [NCCL Reshard Refit design](../design-docs/nccl-reshard-refit.md). |
+| NCCL reshard | vLLM, Megatron or TensorRT-LLM | Megatron | Supports BF16 and the documented FP8/MXFP8 combinations; see the [NCCL Reshard Refit design](../design-docs/nccl-reshard-refit.md). TensorRT-LLM moves only routed MoE experts shard-to-shard and needs pure expert parallelism (`moe_expert_parallel_size == tensor_parallel_size`, generation PP 1) on every engine role, with no expert load balancer; models with dense MLP layers or expert TP use the default NCCL transport. Example: [`grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated-reshard.yaml`](../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated-reshard.yaml). |
 | Sparse delta | vLLM | Megatron | BF16/FP16, unquantized rollout only. |
 | NIXL, full weights | vLLM | Automodel or Megatron | Supports the standard full-weight FP8 loader. Automodel FP8 KV-cache scale transfer is not yet supported. |
 | NIXL, sharded experts | vLLM | Automodel or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
@@ -210,9 +210,27 @@ policy:
     refit_transport: nccl_reshard
 ```
 
-`offload_policy_before_refit` also works with this transport. The reshard moves
-only parameters, so releasing gradient buffers, optimizer state, and caches
-before transfer is safe.
+For NCCL reshard with Megatron policy training and TensorRT-LLM generation (routed
+MoE experts only; every engine role must be pure expert parallel):
+
+```yaml
+policy:
+  megatron_cfg:
+    expert_tensor_parallel_size: 1
+  generation:
+    backend: trtllm
+    refit_transport: nccl_reshard
+    colocated:
+      enabled: false
+    trtllm_cfg:
+      tensor_parallel_size: 4
+      moe_expert_parallel_size: 4   # must equal tensor_parallel_size
+```
+
+With vLLM or Megatron generation, `offload_policy_before_refit` also works with
+this transport. The reshard moves only parameters, so releasing gradient
+buffers, optimizer state, and caches before transfer is safe. It is not
+supported with TensorRT-LLM generation and `nccl_reshard`.
 
 For sparse delta, select one data plane and configure its scope:
 

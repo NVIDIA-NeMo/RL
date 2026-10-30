@@ -1008,9 +1008,12 @@ class TestNcclReshardWeightSynchronizer:
             {"tp_size": 4, "ep_size": 1, "etp_size": 4, "pp_size": 1},
             2,
             4,
+            layout_index=0,
         )
         gen.prepare_nccl_reshard_refit_info.assert_called_once()
-        (shipped,), _ = gen.prepare_nccl_reshard_refit_info.call_args
+        (shipped_plans,), _ = gen.prepare_nccl_reshard_refit_info.call_args
+        assert len(shipped_plans) == 1
+        shipped = shipped_plans[0]
         for params in shipped["per_layer_params"].values():
             for p in params:
                 assert isinstance(p["src_mesh_info"], dict)
@@ -1449,12 +1452,15 @@ class TestFactory:
 
         assert isinstance(sync, MegatronWeightSynchronizer)
         assert isinstance(sync._transport, NcclReshardWeightSynchronizer)
-        assert sync._transport._gen_parallelism() == {
-            "tp_size": 8,
-            "ep_size": 2,
-            "etp_size": 8,
-            "pp_size": 1,
-        }
+        assert sync._transport._gen_layouts() == [
+            {
+                "tp_size": 8,
+                "ep_size": 2,
+                "etp_size": 8,
+                "pp_size": 1,
+                "world_size": None,
+            }
+        ]
 
     @pytest.mark.parametrize(("configured", "expected_calls"), [(False, 0), (True, 1)])
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
