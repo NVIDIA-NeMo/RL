@@ -298,7 +298,6 @@ def _parse_with_vllm(
     tool_parser: str | None,
     tools: list[dict[str, Any]] | None,
     enable_thinking: bool,
-    reasoning_at_start: bool = False,
 ) -> dict[str, Any]:
     # Keep optional vLLM imports out of module collection. The base unit-test
     # phase imports this file before its vllm marker can be deselected.
@@ -318,9 +317,9 @@ def _parse_with_vllm(
     content: str | None = raw_output
 
     if reasoning_parser is not None:
-        # vLLM has no reasoning_at_start flag: its parser infers the shape from
-        # the text, so output without an opening <think> is passed through
-        # untouched. TRT-LLM is told explicitly via the flag instead.
+        # vLLM has no reasoning_at_start flag: its parser infers it by splitting
+        # on </think>, so output without an opening <think> is still treated as
+        # reasoning. TRT-LLM is told explicitly via the flag instead.
         parser_input = raw_output
         parser_type = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
         parser = parser_type(tokenizer)
@@ -364,7 +363,6 @@ def test_reasoning_parser_contracts(tokenizer, reasoning_parser: str) -> None:
             tool_parser="hermes",
             tools=[TOOL_DEF],
             enable_thinking=case["enable_thinking"],
-            reasoning_at_start=case["reasoning_at_start"],
         )
         assert actual == case["expected"], "vLLM %s reasoning contract %r failed" % (
             reasoning_parser,
