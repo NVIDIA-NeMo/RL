@@ -21,7 +21,7 @@
 - **Muon Optimizer** - Muon optimizer support for SFT/RL. See the [Muon guide](../guides/muon-optimizer.md).
 - **SGLang Inference** - SGLang rollout backend. See the [Generation design doc](../design-docs/generation.md).
 - **Speculative Decoding** - Eagle3 draft models for rollout acceleration. See the [Eagle3 guide](../guides/eagle3-speculative-decoding.md).
-- **GDPO** - See `examples/configs/gdpo_math_1B.yaml`.
+- **GDPO** - See [Multi-reward support (GDPO)](../guides/environments.md#multi-reward-support-gdpo) and `examples/configs/gdpo_math_1B.yaml`.
 - **Nemotron-Super** - See the [Nemotron 3 Super guide](../guides/models/nemotron/nemotron-3-super.md).
 
 ## Planned / In Progress
