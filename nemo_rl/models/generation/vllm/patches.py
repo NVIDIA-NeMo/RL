@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.util import find_spec
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import torch
@@ -1374,6 +1376,77 @@ def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
     finally:
         for module, alias in reversed(aliased):
             delattr(module, alias)
+
+
+def install_output_loop_yield(llm: Any, *, reader_budget_s: float) -> None:
+    """Make ``llm``'s output loops yield to other tasks on the event loop.
+
+    AsyncLLM runs two loops on the generation actor's event loop: the socket
+    reader (``AsyncMPClient``) that receives EngineCore outputs, and
+    ``output_handler`` (``AsyncLLM``) that does the per-token work. Under a
+    generation backlog each finds its next message already waiting, and awaiting
+    a done future does not yield, so either can hold the loop for minutes and
+    starve refit and other Ray calls to the actor.
+
+    ``output_handler`` now yields once per engine step, and the reader once it
+    has run for ``reader_budget_s`` without waiting. Yielding the reader on every
+    message instead starves it against ``output_handler`` and moves the backlog
+    into the socket. This bounds how long control calls wait behind generation;
+    it does not make the per-token work cheaper.
+
+    Args:
+        llm: The ``vllm.v1.engine.async_llm.AsyncLLM`` whose output loops to patch.
+        reader_budget_s: How long the socket reader may run without yielding.
+
+    Raises:
+        ValueError: If ``reader_budget_s`` is not positive.
+        RuntimeError: If the installed vLLM does not have the internals this patches.
+    """
+    if reader_budget_s <= 0:
+        raise ValueError(f"reader_budget_s must be positive, got {reader_budget_s}")
+    try:
+        from vllm.v1.engine.core_client import AsyncMPClient
+
+        original_get = AsyncMPClient.get_output_async
+        socket = llm.engine_core.resources.output_socket
+        original_recv = socket.recv_multipart
+    except (ImportError, AttributeError) as e:
+        raise RuntimeError(
+            "output-loop yielding is enabled (vllm_cfg.output_loop_yield_budget_ms) but "
+            "the installed vLLM does not have the AsyncMPClient output-loop internals it "
+            "patches; disable it or update install_output_loop_yield in "
+            "nemo_rl/models/generation/vllm/patches.py for this vLLM version"
+        ) from e
+
+    # output_handler: yield once per engine step. Patched on the class once per process.
+    if not getattr(AsyncMPClient, "_nrl_output_loop_yield", False):
+
+        async def get_output_async(self):
+            outputs = await original_get(self)
+            await asyncio.sleep(0)
+            return outputs
+
+        AsyncMPClient.get_output_async = get_output_async
+        AsyncMPClient._nrl_output_loop_yield = True
+
+    # Reader: yield after reader_budget_s of work; patch this socket instance only.
+    state = {"since": time.monotonic()}
+
+    async def recv_multipart(*args, **kwargs):
+        # A done future means a message was waiting; awaiting it does not yield.
+        future = original_recv(*args, **kwargs)
+        if not future.done():
+            # This receive waits, so the loop gets its turn; restart the budget.
+            frames = await future
+            state["since"] = time.monotonic()
+            return frames
+        frames = await future
+        if time.monotonic() - state["since"] >= reader_budget_s:
+            await asyncio.sleep(0)
+            state["since"] = time.monotonic()
+        return frames
+
+    socket.recv_multipart = recv_multipart
 
 
 def ensure_vllm_source_compat() -> None:
