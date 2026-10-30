@@ -50,4 +50,4 @@ def test_value_rejects_policy_only_deterministic_option():
         ValueError,
         match=r"value\.automodel_cfg\.deterministic is not supported",
     ):
-        Value(cluster=MagicMock(), config=config, tokenizer=MagicMock())
+        Value(cluster=MagicMock(), config=config, tokenizer=MagicMock(), seed=42)

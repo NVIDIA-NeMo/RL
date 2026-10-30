@@ -26,7 +26,7 @@ uv run examples/run_sft.py \
     logger.wandb.name="sft-dev-1-gpu"
 ```
 
-**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `hf auth login` as well for Llama models.
 
 ## Datasets
 
@@ -560,6 +560,24 @@ uv run examples/run_sft.py policy.automodel_cfg.lora_cfg.enabled=true
 For the full reference — backend support, the Automodel vs Megatron schema comparison, config examples, parameter details, example recipes, and Hugging Face export — see the dedicated [LoRA guide](lora.md).
 
 ## Optimizations
+
+### Overlap Async Checkpoint Writes with Training (SFT v2)
+
+With `policy.megatron_cfg.checkpoint.async_save: true`, a save returns once the weights are staged in host memory and the disk write continues in a background process. By default the next training step still waits for that write: the finalize is queued on the policy workers right after the save. SFT v2 can instead finalize the save at a later step boundary, once every rank's write is done, so the write overlaps training:
+
+```yaml
+sft:
+  defer_async_checkpoint_finalize: true
+policy:
+  megatron_cfg:
+    checkpoint:
+      async_save: true
+```
+
+**Notes:**
+
+- SFT v2 only (`examples/run_sft_v2.py`); SFT v1 rejects the key, and SFT v2 rejects it without `async_save`.
+- `tmp_step_N` is renamed to `step_N` only after the finalize, and resume reads only `step_N`. A crash in that window — typically one step — resumes from the previous checkpoint. The next save, training exit, and teardown after a failure still finalize blocking, so the save is published whenever the policy workers are still alive.
 
 ### Chunked Linear Cross-Entropy Fusion Loss
 
