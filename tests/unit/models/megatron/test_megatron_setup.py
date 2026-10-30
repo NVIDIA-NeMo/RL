@@ -994,6 +994,8 @@ class TestApplyMoeConfig:
 
         assert not hasattr(model_cfg, "moe_grouped_gemm")
         assert not hasattr(model_cfg, "inference_flashinfer_mxfp8_token_capacity")
+        assert not hasattr(model_cfg, "inference_moe_nvfp4_recipe")
+        assert not hasattr(model_cfg, "moe_match_generation_forward")
 
     def test_flashinfer_mxfp8_token_capacity_forwarded(self):
         """Without this key MCore runs FlashInfer MXFP8 MoE over the full dispatcher buffer."""
@@ -1039,6 +1041,34 @@ class TestApplyMoeConfig:
         else:
             _apply_moe_config(model_cfg, config)
             assert model_cfg.moe_router_dtype == moe_router_dtype
+
+    def test_match_generation_forward_forwarded(self):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["inference_moe_nvfp4_recipe"] = "per_token"
+        megatron_cfg["moe_match_generation_forward"] = True
+        config = {"megatron_cfg": megatron_cfg}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.inference_moe_nvfp4_recipe == "per_token"
+        assert model_cfg.moe_match_generation_forward is True
+
+    def test_match_generation_forward_false_resets_a_copied_provider(self):
+        """Generation can start from the training provider and must clear the flag."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        model_cfg.moe_match_generation_forward = True
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["moe_match_generation_forward"] = False
+        config = {"megatron_cfg": megatron_cfg}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_match_generation_forward is False
 
     def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
         from nemo_rl.models.megatron import setup

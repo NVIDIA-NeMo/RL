@@ -236,9 +236,22 @@ mcore = [
   "mamba-ssm",
   "causal-conv1d",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  "flashinfer-python==0.6.18.post1",
-  "flashinfer-cubin==0.6.18.post1",
-  "flashinfer-jit-cache==0.6.18.post1",
+  "flashinfer-python==0.7.2.post1",
+  "flashinfer-cubin==0.7.2.post1",
+  # Megatron's FlashInfer MoE backend refuses to start without it (it ships the prebuilt
+  # TRT-LLM fused-MoE, routing and MXFP8/FP4 quantization modules).
+  "flashinfer-jit-cache==0.7.2.post1",
+  # Its per-arch wheels, listed directly: [tool.uv.sources] index pins only attach to direct
+  # requirements, so without these uv looks for them on PyPI.
+  "flashinfer-jit-cache-sm80==0.7.2.post1",
+  "flashinfer-jit-cache-sm89==0.7.2.post1",
+  "flashinfer-jit-cache-sm90a==0.7.2.post1",
+  "flashinfer-jit-cache-sm100a==0.7.2.post1",
+  "flashinfer-jit-cache-sm103a==0.7.2.post1",
+  "flashinfer-jit-cache-sm120f==0.7.2.post1",
+  # Required by the aarch64 meta wheel only; neither has an x86_64 build.
+  "flashinfer-jit-cache-sm110a==0.7.2.post1 ; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm121a==0.7.2.post1 ; platform_machine == 'aarch64'",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "nvidia-cutlass-dsl[cu13]==4.6.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "torch-memory-saver>=0.0.9.post1",
@@ -376,6 +389,16 @@ nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "43
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.7.0" }
 flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
+# Since 0.7.0 flashinfer-jit-cache is a meta-package over these per-arch wheels; each is also a
+# direct requirement of the mcore extra so that these entries apply.
+flashinfer-jit-cache-sm80 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm89 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm90a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm100a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm103a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm120f = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm110a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
 members = [
@@ -618,6 +641,22 @@ flash-attn = { MAX_JOBS = "4" }
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
+
+# uv reads one wheel's metadata per version, and the aarch64 meta wheel also requires
+# sm110a/sm121a, which have no x86_64 build. Declare the union with their real markers.
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache"
+version = "0.7.2.post1+cu130"
+requires-dist = [
+  "flashinfer-jit-cache-sm80==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm89==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm90a==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm100a==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm103a==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm120f==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm110a==0.7.2.post1+cu130 ; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm121a==0.7.2.post1+cu130 ; platform_machine == 'aarch64'",
+]
 
 [[tool.uv.dependency-metadata]]
 name = "flash-mla"

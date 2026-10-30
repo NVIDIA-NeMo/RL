@@ -587,6 +587,11 @@ def megatron_forward_backward(
         finally:
             if use_router_replay:
                 clear_router_replay(model)
+            # The next call rebuilds the moe_match_generation_forward kernel weights
+            # on its first microbatch, so keeping them between calls only holds memory.
+            for model_chunk in model if isinstance(model, list) else [model]:
+                if hasattr(model_chunk, "release_match_generation_weights"):
+                    model_chunk.release_match_generation_weights()
 
 
 class LossPostProcessor:

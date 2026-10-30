@@ -1,0 +1,27 @@
+# Nemotron Nano v3 zero train/generation KL with MXFP8 routed experts on generation's
+# FlashInfer routed MXFP8 kernel. The FlashInfer kernel does not match TE training, so
+# each training MoE forward runs that kernel (moe_match_generation_forward) and the
+# TE recompute pass of the MoE layer supplies the backward.
+#
+# Needs Megatron-LM PR #7798 on top of the zero-kl-mxfp8 parent's requirements.
+defaults: grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8-flashinfer
+policy:
+  megatron_cfg:
+    transformer_impl: inference_optimized
+    inference_grouped_gemm_backend: flashinfer
+    inference_moe_token_dispatcher_type: nvls
+    moe_match_generation_forward: true
+    te_precision_config_file: examples/te_precision/nanov3_experts_mxfp8.yaml
+    activation_checkpointing: true
+    recompute_granularity: selective
+    recompute_modules:
+      - moe
+  generation:
+    mcore_generation_config:
+      inference_grouped_gemm_backend: flashinfer
+logger:
+  log_dir: logs/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8-flashinfer
+  wandb:
+    name: grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8-flashinfer

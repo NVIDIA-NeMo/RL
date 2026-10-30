@@ -1179,6 +1179,39 @@ class TestMegatronForwardBackward:
         assert call_kwargs["micro_batch_size"] == 2
 
     @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_megatron_forward_backward_releases_match_generation_weights(
+        self, mock_get_fb
+    ):
+        """Every model chunk drops its value-pass weights once the call returns."""
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        chunks = [MagicMock(), MagicMock()]
+        mock_fb_func = MagicMock(
+            side_effect=lambda **_: [
+                c.release_match_generation_weights.assert_not_called() for c in chunks
+            ]
+        )
+        mock_get_fb.return_value = mock_fb_func
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        megatron_forward_backward(
+            model=chunks,
+            data_iterator=iter([]),
+            num_microbatches=1,
+            seq_length=64,
+            mbs=1,
+            post_processing_fn=post_processor,
+        )
+
+        for chunk in chunks:
+            chunk.release_match_generation_weights.assert_called_once_with()
+
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
     def test_megatron_forward_backward_forward_only(self, mock_get_fb):
         """Test megatron_forward_backward with forward_only=True."""
         from nemo_rl.models.megatron.train import (
