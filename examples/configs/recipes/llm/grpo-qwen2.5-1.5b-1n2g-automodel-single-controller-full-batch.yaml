@@ -1,0 +1,30 @@
+# Small full-batch SC regression recipe: one training GPU and one rollout GPU.
+defaults: ../../grpo_math_1B_automodel_single_controller.yaml
+
+grpo:
+  max_num_steps: 100
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
+  seq_logprob_error_threshold: 1000
+
+policy:
+  model_name: Qwen/Qwen2.5-1.5B
+  train_micro_batch_size: 1
+  max_total_sequence_length: 1024
+  generation:
+    max_new_tokens: 512
+    vllm_cfg:
+      enforce_eager: true
+
+data:
+  max_input_seq_length: 512
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch
+  save_period: 10
+
+logger:
+  log_dir: logs/grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch
+  wandb:
+    name: grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch

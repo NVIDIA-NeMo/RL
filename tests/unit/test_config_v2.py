@@ -78,6 +78,7 @@ def test_async_kv_recompute_defaults_on_with_explicit_opt_out(config_class):
         ("grpo_math_1B.yaml", True),
         ("ppo_math_1B.yaml", True),
         ("grpo_math_1B_megatron_single_controller.yaml", True),
+        ("grpo_math_1B_automodel_single_controller.yaml", True),
         ("ppo_math_1B_megatron_single_controller.yaml", True),
         ("grpo_math_1B_megatron_generation_colocated_single_controller.yaml", True),
         (
