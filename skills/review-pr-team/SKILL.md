@@ -147,8 +147,8 @@ just saying "this is wrong."
   links when you pass the lessons on, and tell every agent to read the detail file whenever its rule
   applies to what it is checking.
 - Read every `skills/contributing/references/*.md` and treat each rule as a finding checklist,
-  the same as this skill's own references. A rule that ends with `Source: [name](...)` has a
-  review lesson behind it, and one that ends with `Details:` has an author how-to under
+  the same as this skill's own references. A rule that ends with `Review Details: [name](...)` has a
+  review lesson behind it, and one that ends with `Contributing Details:` has an author how-to under
   `skills/contributing/references/details/`; tell every agent to read the linked file whenever
   the rule applies.
 - Then glob `~/.claude/review-memory/RL/*.md` and read EVERY match. This is the optional, machine-local
