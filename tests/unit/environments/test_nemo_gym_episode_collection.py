@@ -28,6 +28,11 @@ from aiohttp.test_utils import TestServer
 from omegaconf import OmegaConf
 
 from nemo_rl.environments.nemo_gym import NemoGym
+from nemo_rl.experience.failures import (
+    GymAdmissionClosed,
+    GymRowFailure,
+    GymTransportError,
+)
 from nemo_rl.experience.rollouts import _prepare_nemo_gym_rows
 
 gym_episode = pytest.importorskip("nemo_gym.episode_types")
@@ -37,6 +42,7 @@ gym_rollouts = pytest.importorskip("nemo_gym.rollout_collection")
 gym_server = pytest.importorskip("nemo_gym.server_utils")
 gym_openai = pytest.importorskip("nemo_gym.openai_utils")
 gym_protocol = pytest.importorskip("nemo_gym.single_agent_turn_types")
+gym_completion = pytest.importorskip("nemo_gym.token_id_capture.completion")
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -72,14 +78,26 @@ def _model_response(*, episode_protocol: bool) -> gym_openai.NeMoGymResponse:
 
 
 @pytest.mark.parametrize(
-    ("token_capture", "group_attempt", "compatibility_response", "multi_agent"),
+    (
+        "token_capture",
+        "group_attempt",
+        "compatibility_response",
+        "multi_agent",
+        "forest_training",
+        "failure_kind",
+    ),
     [
-        (False, 0, False, False),
-        (False, 2, False, False),
-        (True, 3, False, False),
-        (False, 0, True, False),
-        (True, 3, True, False),
-        (True, 0, False, True),
+        (False, 0, False, False, False, None),
+        (False, 2, False, False, False, None),
+        (True, 3, False, False, False, None),
+        (False, 0, True, False, False, None),
+        (True, 3, True, False, False, None),
+        (True, 0, False, True, False, None),
+        (True, 0, False, False, True, None),
+        (False, 0, False, False, False, "retryable_episode"),
+        (True, 0, False, False, False, "retryable_episode"),
+        (True, 0, False, False, True, "retryable_episode"),
+        (True, 0, False, False, False, "admission_closed"),
     ],
 )
 def test_real_collector_streams_episode_and_flat_http_results(
@@ -88,6 +106,8 @@ def test_real_collector_streams_episode_and_flat_http_results(
     group_attempt: int,
     compatibility_response: bool,
     multi_agent: bool,
+    forest_training: bool,
+    failure_kind: str | None,
 ) -> None:
     async def run() -> None:
         received_episode = []
@@ -96,6 +116,28 @@ def test_real_collector_streams_episode_and_flat_http_results(
         async def episode_run(request: web.Request) -> web.Response:
             body = await request.json()
             received_episode.append(body)
+            if (
+                failure_kind is not None
+                and body["episode_id"] == expected_episode_ids[0]
+            ):
+                if failure_kind == "admission_closed":
+                    return web.json_response(
+                        {"error": {"code": "checkpoint_admission_closed"}},
+                        status=409,
+                    )
+                failed_episode = gym_episode.BaseEpisodeRequest[dict].model_validate(
+                    body
+                )
+                failure_reply = gym_episode.BaseEpisodeResponse[dict](
+                    episode_id=failed_episode.episode_id,
+                    task_id=failed_episode.task.task_id,
+                    failure=gym_episode.EpisodeFailure(
+                        failure_reason="temporary verifier failure",
+                        terminal=False,
+                        stage="verification",
+                    ),
+                )
+                return web.json_response(failure_reply.model_dump(mode="json"))
             if multi_agent:
                 # Isolate adaptation to a generic response-free result from
                 # harness behavior; the collector only requires the base contract.
@@ -268,7 +310,15 @@ def test_real_collector_streams_episode_and_flat_http_results(
                     for index, row in enumerate(rows[:2])
                 ]
 
-            actor = NemoGym.__ray_metadata__.modified_class({})
+            actor = NemoGym.__ray_metadata__.modified_class(
+                {
+                    "token_capture": {
+                        "enabled": token_capture,
+                        "forest_training": forest_training,
+                        "selection_policy": "returned_history",
+                    }
+                }
+            )
             actor.rh = object()
             actor.rch = gym_rollouts.RolloutCollectionHelper()
             actor.head_server_config = gym_server.BaseServerConfig(
@@ -284,8 +334,13 @@ def test_real_collector_streams_episode_and_flat_http_results(
                     if capture_key == "capture-flat"
                     else "response-episode"
                 )
+                output_item = (
+                    _model_response(episode_protocol=capture_key != "capture-flat")
+                    .output[0]
+                    .model_dump(mode="json")
+                )
                 return {
-                    "rollout_id": capture_key,
+                    "capture_key": capture_key,
                     "records": [
                         {
                             "model_call_id": "call-1",
@@ -301,6 +356,18 @@ def test_real_collector_streams_episode_and_flat_http_results(
                             "response_id": response_id,
                             "chain_hash": "c" * 64,
                             "cumulative_hash": "d" * 64,
+                            "output_items": [
+                                {
+                                    "id": output_item["id"],
+                                    "fingerprint": gym_completion.output_item_fingerprint(
+                                        output_item
+                                    ),
+                                }
+                            ],
+                            "response_status": "completed",
+                            "last_output_item": gym_completion.output_validation_item(
+                                output_item
+                            ),
                         }
                     ],
                     "failures": [],
@@ -324,15 +391,42 @@ def test_real_collector_streams_episode_and_flat_http_results(
             assert "episode_id" not in body
             assert body["agent_ref"]["name"] == "legacy_agent"
 
+        failures = [
+            item
+            for item in streamed
+            if isinstance(item, (GymRowFailure, GymAdmissionClosed))
+        ]
+        if failure_kind is None:
+            assert failures == []
+        else:
+            assert len(failures) == 1
+            failure = failures[0]
+            assert failure.rowidx == 0
+            if failure_kind == "admission_closed":
+                assert isinstance(failure, GymAdmissionClosed)
+            else:
+                assert isinstance(failure, GymRowFailure)
+                assert isinstance(failure.error, GymTransportError)
+                assert "temporary verifier failure" in str(failure.error)
+        successes = [item for item in streamed if isinstance(item, tuple)]
         by_index = {
             row_index: (agent_ref, result)
-            for row_index, agent_ref, result, _ in streamed
+            for row_index, agent_ref, result, _ in successes
         }
-        assert set(by_index) == set(range(len(rows)))
-        assert sum(timing is not None for _, _, _, timing in streamed) == 1
-        for index in (0, 1):
+        expected_indices = set(range(len(rows)))
+        if failure_kind is not None:
+            expected_indices.remove(0)
+        assert set(by_index) == expected_indices
+        assert len(streamed) == len(rows)
+        assert (
+            sum(timing is not None for _, _, _, timing in successes)
+            + sum(failure.timing_metrics is not None for failure in failures)
+            == 1
+        )
+        for index in sorted({0, 1} & expected_indices):
             agent_ref, result = by_index[index]
             assert agent_ref is None
+            assert "agent_ref" not in result
             assert result["attribution_key"] == "weather:train"
             assert result["full_result"]["reward"] == 0.75
             if not compatibility_response:
@@ -365,33 +459,47 @@ def test_real_collector_streams_episode_and_flat_http_results(
                     "generation_logprobs"
                 ].tolist() == pytest.approx([-0.4])
         if token_capture:
-            expected_captures = [
-                ("capture-episode-0", 0.75),
-                ("capture-episode-1-a2", 0.75),
-                ("capture-flat", 0.25),
-            ]
+            expected_captures = {
+                index: capture
+                for index, capture in enumerate(
+                    [
+                        ("capture-episode-0", 0.75),
+                        ("capture-episode-1-a2", 0.75),
+                        ("capture-flat", 0.25),
+                    ]
+                )
+                if index in expected_indices
+            }
             actor._control.assert_has_awaits(
                 [
                     call(
-                        "GET",
-                        f"/training-token-capture/control/rollouts/{capture_key}/manifest",
+                        "POST" if forest_training else "GET",
+                        f"/training-token-capture/control/rollouts/{capture_key}/"
+                        + ("close-admission" if forest_training else "manifest"),
                     )
-                    for capture_key, _ in expected_captures
+                    for capture_key, _ in expected_captures.values()
                 ],
                 any_order=True,
             )
-            assert actor._control.await_count == 3
-            for index, (capture_key, reward) in enumerate(expected_captures):
+            assert actor._control.await_count == len(expected_captures)
+            for index, (capture_key, reward) in expected_captures.items():
                 result = by_index[index][1]
                 assert result["message_log"] == []
                 assert result["rollout_id"] == capture_key
-                assert result["receipt"]["rollout_id"] == capture_key
+                assert result["receipt"]["capture_key"] == capture_key
                 assert result["receipt"]["reward"] == reward
                 assert result["receipt"]["terminal_model_call_id"] == "call-1"
                 assert result["receipt"]["terminal_selection"] == (
-                    "declared" if multi_agent and index < 2 else "response_id"
+                    "declared"
+                    if forest_training or (multi_agent and index < 2)
+                    else "response_id"
                 )
                 assert result["receipt"]["capture_poisoned"] is False
+                if forest_training:
+                    assert result["logical_selection"].response_ids == (
+                        "response-episode" if index < 2 else "response-flat",
+                    )
+                    assert result["truncated"] is False
         else:
             actor._control.assert_not_awaited()
 
