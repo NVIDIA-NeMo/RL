@@ -63,6 +63,10 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
     enabled: true
+    # Collective timeout (minutes) for the default process group and the FSDP2 /
+    # expert-parallel groups derived from it. null = torch default (10 for NCCL).
+    # Raise it when the first step JIT-compiles kernels (MoE dispatchers, TileLang) or I/O is slow.
+    distributed_timeout_minutes: null
     checkpoint:
       model_save_format: "safetensors"
       # Canonical Automodel modes: "false", "final", or "every".
