@@ -1349,35 +1349,6 @@ def _apply_multimodal_config(model_cfg: Any, config: PolicyConfig) -> None:
         setattr(model_cfg, provider_attr, megatron_cfg[config_key])
 
 
-def moe_inference_training_max_tokens_per_rank(config: PolicyConfig) -> int:
-    """Tokens one rank feeds the largest moe_inference_training_forward pass.
-
-    The NVLS symmetric heap is allocated once and cannot grow, so it is sized for
-    the largest train or log-prob microbatch at the padded maximum sequence length.
-    """
-    configured = config["megatron_cfg"].get(
-        "moe_inference_training_max_tokens_per_rank"
-    )
-    if configured is not None:
-        return configured
-    divisor = config["make_sequence_length_divisible_by"]
-    padded_seq_len = -(-config["max_total_sequence_length"] // divisor) * divisor
-    micro_batch = max(
-        config["train_micro_batch_size"],
-        config.get("logprob_batch_size", config["train_micro_batch_size"]),
-    )
-    tokens = micro_batch * padded_seq_len
-    for batching_key in ("sequence_packing", "dynamic_batching"):
-        batching = config.get(batching_key) or {}
-        if batching.get("enabled"):
-            tokens = max(
-                tokens,
-                batching["train_mb_tokens"],
-                batching.get("logprob_mb_tokens", batching["train_mb_tokens"]),
-            )
-    return tokens
-
-
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Mixture of Experts configuration."""
     model_cfg.expert_tensor_parallel_size = config["megatron_cfg"][
@@ -1426,14 +1397,10 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.inference_moe_nvfp4_recipe = config["megatron_cfg"][
             "inference_moe_nvfp4_recipe"
         ]
-    if "moe_inference_training_forward" in config["megatron_cfg"]:
-        model_cfg.moe_inference_training_forward = config["megatron_cfg"][
-            "moe_inference_training_forward"
+    if "moe_match_generation_forward" in config["megatron_cfg"]:
+        model_cfg.moe_match_generation_forward = config["megatron_cfg"][
+            "moe_match_generation_forward"
         ]
-        if model_cfg.moe_inference_training_forward:
-            model_cfg.moe_inference_training_max_tokens_per_rank = (
-                moe_inference_training_max_tokens_per_rank(config)
-            )
     if "moe_router_num_groups" in config["megatron_cfg"]:
         model_cfg.moe_router_num_groups = config["megatron_cfg"][
             "moe_router_num_groups"

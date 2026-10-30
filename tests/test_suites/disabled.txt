@@ -102,9 +102,3 @@ research/template_project/tests/test_suites/llm/single_update_1n8g.sh
 
 # Full Flow-GRPO recipe requires an externally served GenRM OCR judge.
 research/flow_grpo/tests/test_suites/flow_grpo_qwen_image_ocr.sh
-
-# FlashInfer MXFP8 / per-token NVFP4 zero-KL via moe_inference_training_forward: needs
-# Megatron-LM PR #7798 in the submodule pin (NVFP4 also flashinfer-python>=0.7.0) and
-# has not run end to end yet.
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8-flashinfer.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer.sh

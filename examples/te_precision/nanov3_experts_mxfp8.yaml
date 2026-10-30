@@ -1,0 +1,51 @@
+# MXFP8 on the routed experts (GroupedLinear linear_fc1 / linear_fc2) of Nemotron Nano v3
+# only; every other linear stays BF16, including linear_qkv and linear_proj. For
+# transformer_impl='inference_optimized' on the training side (moe_match_generation_forward):
+# its log-prob forward runs under eval(), where the inference linears skip TE, so a TE MXFP8
+# qkv/proj weight would run a BF16 GEMM while generation runs MXFP8.
+#
+# Use the same file on train and generation (generation inherits megatron_cfg).
+configs:
+  bf16:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe: {}
+  mxfp8:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe:
+      fp8_quantization_recipe: "mxfp8"
+      fp8_format: "hybrid"
+      fp8_param: true
+      override_quantized_autocast: true
+      override_nonquantized_autocast: true
+    # Grad-disabled model construction (the generation model) reads evaluation_recipe, so it
+    # repeats the training precision; an empty block would mean BF16.
+    evaluation_recipe:
+      fp8_quantization_recipe: "mxfp8"
+      fp8_format: "hybrid"
+      fp8_param: true
+      override_quantized_autocast: true
+      override_nonquantized_autocast: true
+
+matchers:
+  # First match wins.
+  # Before the routed experts so that no broader experts pattern can pull them into MXFP8.
+  shared_experts_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.mlp.shared_experts.*"
+    enabled: true
+  experts_fc1_mxfp8:
+    config: "mxfp8"
+    type: "glob"
+    pattern: "*.mlp.experts.linear_fc1"
+    enabled: true
+  experts_fc2_mxfp8:
+    config: "mxfp8"
+    type: "glob"
+    pattern: "*.mlp.experts.linear_fc2"
+    enabled: true
+  fallthrough_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*"
+    enabled: true

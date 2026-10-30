@@ -502,11 +502,7 @@ class MegatronConfig(TypedDict):
     # inference_grouped_gemm_backend='flashinfer', batch_invariant_mode, and
     # activation_checkpointing with recompute_granularity='selective' and 'moe' in
     # recompute_modules. Generation never sets it.
-    moe_inference_training_forward: NotRequired[bool]
-    # Token bound per rank for the NVLS symmetric heap of that training forward.
-    # Unset: max(train_micro_batch_size, logprob_batch_size) * padded
-    # max_total_sequence_length, or the packing / dynamic batching mb_tokens if larger.
-    moe_inference_training_max_tokens_per_rank: NotRequired[int | None]
+    moe_match_generation_forward: NotRequired[bool]
     # InferenceTopKRouter requires moe_router_num_groups=None
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]

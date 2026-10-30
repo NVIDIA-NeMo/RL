@@ -1,7 +1,7 @@
 #!/bin/bash
 # Five-step GB200 test for zero train/generation KL on Nemotron Nano v3 30B-A3B with
 # per-token NVFP4 routed experts on FlashInfer. Training and refit stay BF16; each
-# training MoE forward runs generation's NVFP4 kernel (moe_inference_training_forward)
+# training MoE forward runs generation's NVFP4 kernel (moe_match_generation_forward)
 # and the TE recompute pass supplies the backward.
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env

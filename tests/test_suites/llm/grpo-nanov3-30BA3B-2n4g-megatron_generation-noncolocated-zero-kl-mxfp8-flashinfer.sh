@@ -1,7 +1,7 @@
 #!/bin/bash
 # Five-step GB200 test for zero train/generation KL on Nemotron Nano v3 30B-A3B with MXFP8
 # routed experts on generation's FlashInfer routed MXFP8 kernel. Each training MoE forward
-# runs that kernel (moe_inference_training_forward); the TE recompute pass supplies the
+# runs that kernel (moe_match_generation_forward); the TE recompute pass supplies the
 # backward.
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env

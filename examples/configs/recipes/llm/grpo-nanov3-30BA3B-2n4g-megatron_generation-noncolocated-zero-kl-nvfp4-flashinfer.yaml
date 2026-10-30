@@ -1,7 +1,7 @@
 # Nemotron Nano v3 zero train/generation KL with per-token NVFP4 routed experts on
 # FlashInfer. Training and refit stay BF16; generation quantizes the experts to NVFP4,
 # and each training MoE forward runs the same kernel on the same quantization
-# (moe_inference_training_forward) with the backward from the TE recompute pass.
+# (moe_match_generation_forward) with the backward from the TE recompute pass.
 #
 # Needs Megatron-LM PR #7798 and flashinfer-python>=0.7.0 (the per-token NVFP4 Relu2
 # MoE kernels).
@@ -52,7 +52,7 @@ policy:
     inference_grouped_gemm_backend: flashinfer
     inference_moe_token_dispatcher_type: nvls
     inference_moe_nvfp4_recipe: per_token
-    moe_inference_training_forward: true
+    moe_match_generation_forward: true
     activation_checkpointing: true
     recompute_granularity: selective
     recompute_modules:

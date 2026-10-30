@@ -149,6 +149,11 @@ name = "flash-mla"
 version = "1.0.0+b7643bd"
 
 [[manifest.dependency-metadata]]
+name = "flashinfer-jit-cache"
+version = "0.7.2.post1+cu130"
+requires-dist = ["flashinfer-jit-cache-sm80==0.7.2.post1+cu130", "flashinfer-jit-cache-sm89==0.7.2.post1+cu130", "flashinfer-jit-cache-sm90a==0.7.2.post1+cu130", "flashinfer-jit-cache-sm100a==0.7.2.post1+cu130", "flashinfer-jit-cache-sm103a==0.7.2.post1+cu130", "flashinfer-jit-cache-sm120f==0.7.2.post1+cu130", "flashinfer-jit-cache-sm110a==0.7.2.post1+cu130 ; platform_machine == 'aarch64'", "flashinfer-jit-cache-sm121a==0.7.2.post1+cu130 ; platform_machine == 'aarch64'"]
+
+[[manifest.dependency-metadata]]
 name = "logsage"
 version = "0.1.7"
 requires-dist = ["drain3>=0.9.11,<0.10.0", "langchain>=1.2.0,<2.0.0", "langchain-core>=1.2.22,<2.0.0", "langchain-nvidia-ai-endpoints>=1.0.0,<2.0.0", "nh3>=0.3.1,<0.4.0", "numpy", "pandas", "pydantic-settings>=2.11.0,<3.0.0", "requests>=2.32.5,<3.0.0"]
@@ -1775,14 +1780,14 @@ wheels = [
 
 [[package]]
 name = "flashinfer-cubin"
-version = "0.7.0.post1"
+version = "0.7.2.post1"
 source = { registry = "https://flashinfer.ai/whl/" }
 resolution-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
     "platform_machine == 'aarch64' and sys_platform == 'linux'",
 ]
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.0.post1/flashinfer_cubin-0.7.0.post1-py3-none-any.whl", hash = "sha256:f5b5fbf6e914b358219b845ed3ee586ffc1ae3c9768c8b135115ac14afbceed3" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_cubin-0.7.2.post1-py3-none-any.whl", hash = "sha256:1998c7006bcc06ee5dd3208a682af247382c6710d6b370a961381262c04c11f0" },
 ]
 
 [[package]]
@@ -1809,6 +1814,99 @@ resolution-markers = [
 wheels = [
     { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.18/flashinfer_jit_cache-0.6.18+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:c97664eab2f21a01f6b8d24d10ba33631a1a64b981f788c3f61d81ebbf905970" },
     { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.18/flashinfer_jit_cache-0.6.18+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:428a47a554ade93c30a818e142b781df58582bf056bab94611fb4c906cc366bf" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+resolution-markers = [
+    "platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "platform_machine == 'aarch64' and sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "flashinfer-jit-cache-sm100a" },
+    { name = "flashinfer-jit-cache-sm103a" },
+    { name = "flashinfer-jit-cache-sm110a", marker = "platform_machine != 'x86_64'" },
+    { name = "flashinfer-jit-cache-sm120f" },
+    { name = "flashinfer-jit-cache-sm121a", marker = "platform_machine != 'x86_64'" },
+    { name = "flashinfer-jit-cache-sm80" },
+    { name = "flashinfer-jit-cache-sm89" },
+    { name = "flashinfer-jit-cache-sm90a" },
+]
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:8449156043036d240f3581c25e6883810f7ea6d656f56e78183b39eee9066877" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:5a0a92ce56e11c19cec31948a4828b245314377eb587fe17307730b096225500" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache-sm100a"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm100a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:ed6c128c4033de6fb6edbd1743a008ee70d9a3d4c8d1b60b45d821bd7e4143a2" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm100a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:2d118fdb9a4a403ae22c08192830885eb27aba6d363ffa9c88758c7a51d1c126" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache-sm103a"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm103a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:8883759aaf289b8d494f714bb28766c9bef2e84fe6115d439d10e2417a8c7ae3" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm103a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:c9c8430cd8c49d80edc44af820d4817c1c1b99cbe738c40034b41a44403ec5c7" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache-sm110a"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm110a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:ff08fecf03bec168d37c8518c679e2332ba77d79824e806cc3cdd67c4f6b7a75" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache-sm120f"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm120f-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:1d3582708053a70b383c6d4df842a18c86f19518e230eaff6c1f689ce279dda5" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm120f-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:ab05a6e987bf79e18594d43ccc89ccdc8dbeacb3241c031ede8bc054a2baa9a7" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache-sm121a"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm121a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:bcbd9b7d51cefcaaac9629cec260d37e253f6a8493876d045b6869ddf42b49c7" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache-sm80"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm80-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:f84fd89aac415b9cf79494e5606a307ecff2e421bcff132b62c6dba88f447a3b" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm80-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:b5076a39be7b63d15df44ecdfb9ce5be7206d39629b6d317b06d6e314f0b4cd6" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache-sm89"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm89-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:18fa31a010e3942a00ed4b6ffb4def344b5e10fc1ff9f56a538ce646bc316a7c" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm89-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:61ae80c3a78f20ebd8ef350bfe16bde947242bb9ac93f1cafb63e26c04c009dc" },
+]
+
+[[package]]
+name = "flashinfer-jit-cache-sm90a"
+version = "0.7.2.post1+cu130"
+source = { registry = "https://flashinfer.ai/whl/cu130" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm90a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:3bd375e978255d3215ee69da3434ca4b9dcce7a2d655c5d3445cd048fcc62096" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_jit_cache_sm90a-0.7.2.post1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:52e5cc064b52290dad2f8889ee0eb5cd59621dfac8351841e4b3987d42d034a3" },
 ]
 
 [[package]]
@@ -1878,7 +1976,7 @@ wheels = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.7.0.post1"
+version = "0.7.2.post1"
 source = { registry = "https://flashinfer.ai/whl/" }
 resolution-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
@@ -1904,7 +2002,7 @@ dependencies = [
     { name = "tqdm" },
 ]
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.0.post1/flashinfer_python-0.7.0.post1-py3-none-any.whl", hash = "sha256:c7adf826568d61fc1b7d3aadd4cae387a35a138bfc08e2deca2f34ecfa280716" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_python-0.7.2.post1-py3-none-any.whl", hash = "sha256:bfdc18b9e1e4d8d0730fe4343dc0e284cd0c160086de80f99888bc4867922d49" },
 ]
 
 [[package]]
@@ -3181,8 +3279,8 @@ dependencies = [
     { name = "einops" },
     { name = "fast-hadamard-transform" },
     { name = "flash-linear-attention" },
-    { name = "flashinfer-cubin", version = "0.7.0.post1", source = { registry = "https://flashinfer.ai/whl/" } },
-    { name = "flashinfer-python", version = "0.7.0.post1", source = { registry = "https://flashinfer.ai/whl/" } },
+    { name = "flashinfer-cubin", version = "0.7.2.post1", source = { registry = "https://flashinfer.ai/whl/" } },
+    { name = "flashinfer-python", version = "0.7.2.post1", source = { registry = "https://flashinfer.ai/whl/" } },
     { name = "hydra-core" },
     { name = "megatron-core", extra = ["dev", "inference", "mlm", "te"], marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "mistral-common" },
@@ -3225,8 +3323,8 @@ requires-dist = [
     { name = "einops" },
     { name = "fast-hadamard-transform", specifier = ">=1.1.0" },
     { name = "flash-linear-attention" },
-    { name = "flashinfer-cubin", specifier = "==0.7.0.post1", index = "https://flashinfer.ai/whl/" },
-    { name = "flashinfer-python", specifier = "==0.7.0.post1", index = "https://flashinfer.ai/whl/" },
+    { name = "flashinfer-cubin", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/" },
+    { name = "flashinfer-python", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/" },
     { name = "hydra-core", specifier = ">=1.3.4,<1.4" },
     { name = "librosa", marker = "extra == 'audio'" },
     { name = "mamba-ssm", marker = "extra == 'ssm'", specifier = "==2.3.1" },
@@ -3319,7 +3417,7 @@ dev = [
     { name = "emerging-optimizers" },
     { name = "fast-hadamard-transform" },
     { name = "fastapi", extra = ["standard"], marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "flashinfer-python", version = "0.7.0.post1", source = { registry = "https://flashinfer.ai/whl/" } },
+    { name = "flashinfer-python", version = "0.7.2.post1", source = { registry = "https://flashinfer.ai/whl/" } },
     { name = "hypercorn" },
     { name = "megatron-energon", marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "multi-storage-client" },
@@ -3367,7 +3465,7 @@ requires-dist = [
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "flash-linear-attention", marker = "extra == 'ssm'", specifier = "==0.5.1" },
-    { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.5.0,<0.8.0" },
+    { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.7.2,<0.8.0" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
     { name = "flask-restful", marker = "extra == 'training'" },
     { name = "gigatoken", marker = "extra == 'mlm'" },
@@ -3379,7 +3477,7 @@ requires-dist = [
     { name = "nemo-lens", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'otel'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "numpy" },
-    { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.29.1" },
+    { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.32.0" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.47" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.7.0" },
     { name = "omegaconf", marker = "extra == 'mlm'" },
@@ -4262,8 +4360,17 @@ mcore = [
     { name = "flash-attn" },
     { name = "flash-attn-4" },
     { name = "flash-mla" },
-    { name = "flashinfer-cubin", version = "0.7.0.post1", source = { registry = "https://flashinfer.ai/whl/" } },
-    { name = "flashinfer-python", version = "0.7.0.post1", source = { registry = "https://flashinfer.ai/whl/" } },
+    { name = "flashinfer-cubin", version = "0.7.2.post1", source = { registry = "https://flashinfer.ai/whl/" } },
+    { name = "flashinfer-jit-cache", version = "0.7.2.post1+cu130", source = { registry = "https://flashinfer.ai/whl/cu130" } },
+    { name = "flashinfer-jit-cache-sm100a" },
+    { name = "flashinfer-jit-cache-sm103a" },
+    { name = "flashinfer-jit-cache-sm110a", marker = "platform_machine != 'x86_64'" },
+    { name = "flashinfer-jit-cache-sm120f" },
+    { name = "flashinfer-jit-cache-sm121a", marker = "platform_machine != 'x86_64'" },
+    { name = "flashinfer-jit-cache-sm80" },
+    { name = "flashinfer-jit-cache-sm89" },
+    { name = "flashinfer-jit-cache-sm90a" },
+    { name = "flashinfer-python", version = "0.7.2.post1", source = { registry = "https://flashinfer.ai/whl/" } },
     { name = "mamba-ssm" },
     { name = "megatron-bridge", extra = ["ssm", "te"], marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "megatron-energon", marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -4387,12 +4494,21 @@ requires-dist = [
     { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.8.1" },
     { name = "flash-attn-4", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", specifier = "==4.0.0b19" },
     { name = "flash-mla", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", git = "https://github.com/deepseek-ai/FlashMLA?rev=b7643bd54521f563b839b98289b5cd048c062ba2" },
-    { name = "flashinfer-cubin", marker = "extra == 'mcore'", specifier = "==0.7.0.post1", index = "https://flashinfer.ai/whl/" },
+    { name = "flashinfer-cubin", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/" },
     { name = "flashinfer-cubin", marker = "extra == 'sglang'", specifier = "==0.6.14", index = "https://flashinfer.ai/whl/" },
     { name = "flashinfer-cubin", marker = "extra == 'vllm'", specifier = "==0.6.18", index = "https://flashinfer.ai/whl/" },
+    { name = "flashinfer-jit-cache", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache", marker = "extra == 'sglang'", specifier = "==0.6.14", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache", marker = "extra == 'vllm'", specifier = "==0.6.18", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-python", marker = "extra == 'mcore'", specifier = "==0.7.0.post1" },
+    { name = "flashinfer-jit-cache-sm100a", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm103a", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm110a", marker = "platform_machine == 'aarch64' and extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm120f", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm121a", marker = "platform_machine == 'aarch64' and extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm80", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm89", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm90a", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-python", marker = "extra == 'mcore'", specifier = "==0.7.2.post1" },
     { name = "flashinfer-python", marker = "extra == 'sglang'", specifier = "==0.6.14" },
     { name = "flashinfer-python", marker = "extra == 'vllm'", specifier = "==0.6.18" },
     { name = "hydra-core" },
