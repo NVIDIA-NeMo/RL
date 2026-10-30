@@ -1002,41 +1002,10 @@ class TestSetup:
         with pytest.raises(NotImplementedError, match="backend='future_backend'"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    @pytest.mark.parametrize("token_capture_enabled", [False, True])
-    @pytest.mark.parametrize("snapshot_interval", [None, 1.0])
-    @pytest.mark.parametrize("fleet_health_enabled", [False, True])
-    def test_mooncake_checkpointing_rejects_generation_shard_restarts(
-        self,
-        patched_factories: dict[str, MagicMock],
-        token_capture_enabled: bool,
-        snapshot_interval: float | None,
-        fleet_health_enabled: bool,
-    ) -> None:
-        mc = _make_master_config()
-        mc.data_plane["backend"] = "mooncake_cpu"
-        mc.checkpointing.update(enabled=True, save_data_plane=True)
-        mc.async_rl.generation_fleet_health.enabled = fleet_health_enabled
-        mc.async_rl.generation_fleet_health.restart_dead_shards = True
-        mc.token_capture = TokenCaptureConfig(enabled=token_capture_enabled)
-        mc.rollout_checkpointing = RolloutCheckpointConfig(
-            snapshot_attempt_interval_s=snapshot_interval
-        )
-
-        with pytest.raises(ValueError, match="restart_dead_shards=false"):
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
-
-        for factory in (
-            "setup_response_data",
-            "_build_clusters",
-            "_build_generation",
-            "_build_trainer",
-            "build_data_plane_client",
-        ):
-            patched_factories[factory].assert_not_called()
-
     @pytest.mark.parametrize(
         "backend,checkpointing_enabled,save_data_plane,restart_dead_shards",
         [
+            ("mooncake_cpu", True, True, True),
             ("mooncake_cpu", True, True, False),
             ("simple", True, True, True),
             ("mooncake_cpu", False, True, True),
@@ -1044,7 +1013,7 @@ class TestSetup:
             ("mooncake_cpu", True, False, True),
         ],
     )
-    def test_generation_shard_restart_guard_leaves_other_configs_unchanged(
+    def test_generation_shard_restarts_are_accepted_with_any_checkpointing(
         self,
         patched_factories: dict[str, MagicMock],
         backend: str,

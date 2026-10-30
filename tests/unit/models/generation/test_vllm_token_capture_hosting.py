@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -195,18 +196,115 @@ def test_generation_setup_token_capture_requires_async_engine():
         gen.setup_token_capture({}, "rollout_staging")
 
 
-def test_generation_set_rollout_weight_version_fans_out(monkeypatch):
+def test_generation_setup_token_capture_keeps_its_arguments_for_restarts(
+    monkeypatch,
+):
     gen = _generation_with_mock_group()
+    gen.worker_group.run_all_workers_single_data.return_value = [None, None]
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
         lambda futures: futures,
     )
-    gen.set_rollout_weight_version(7)
+    gen.setup_token_capture({"backend": "simple"}, "rollout_staging")
+    assert asdict(gen._token_capture_setup) == {
+        "dp_cfg": {"backend": "simple"},
+        "staging_partition": "rollout_staging",
+        "capture_media": False,
+    }
+    assert gen._token_capture_media is None
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
-        "set_rollout_weight_version",
-        version=7,
+        "setup_token_capture",
+        **asdict(gen._token_capture_setup),
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
+
+
+def _generation_with_leaders(
+    num_shards: int, *, membership=None, fleet_monitor=None
+) -> tuple[VllmGeneration, list[MagicMock]]:
+    """One worker per shard, so each worker is its shard's DP leader."""
+    gen = object.__new__(VllmGeneration)
+    gen.cfg = {"vllm_cfg": {"async_engine": True}}
+    leaders = [MagicMock(name=f"leader{i}") for i in range(num_shards)]
+    for i, leader in enumerate(leaders):
+        leader.set_rollout_weight_version.remote.return_value = f"ref{i}"
+    gen.worker_group = SimpleNamespace(workers=list(leaders))
+    gen.dp_size = num_shards
+    gen._refit_membership = membership
+    gen.fleet_monitor = fleet_monitor
+    gen._rollout_weight_version = None
+    return gen, leaders
+
+
+def test_generation_set_rollout_weight_version_fans_out(monkeypatch):
+    gen, leaders = _generation_with_leaders(2)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get", lambda ref: ref
+    )
+    gen.set_rollout_weight_version(7)
+    for leader in leaders:
+        leader.set_rollout_weight_version.remote.assert_called_once_with(version=7)
+    assert gen._rollout_weight_version == 7
+
+
+def test_set_rollout_weight_version_skips_shards_outside_the_refit(monkeypatch):
+    # Shard 1 is dead or still restarting: the rebuilt refit left it out.
+    membership = SimpleNamespace(workers_per_shard=1, shard_prefixes={0: 0})
+    gen, leaders = _generation_with_leaders(2, membership=membership)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get", lambda ref: ref
+    )
+    gen.set_rollout_weight_version(7)
+    leaders[0].set_rollout_weight_version.remote.assert_called_once_with(version=7)
+    leaders[1].set_rollout_weight_version.remote.assert_not_called()
+
+
+def test_set_rollout_weight_version_skips_a_shard_condemned_since_the_refit(
+    monkeypatch,
+):
+    # Shard 1 was a refit member, then died and is restarting: its handle may already be
+    # a replacement that is still loading, and must not be waited on.
+    monitor = MagicMock()
+    monitor.absent_shards.return_value = [1]
+    gen, leaders = _generation_with_leaders(2, fleet_monitor=monitor)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get", lambda ref: ref
+    )
+    gen.set_rollout_weight_version(7)
+    leaders[0].set_rollout_weight_version.remote.assert_called_once_with(version=7)
+    leaders[1].set_rollout_weight_version.remote.assert_not_called()
+    assert gen._rollout_weight_version == 7
+
+
+def test_set_rollout_weight_version_records_a_death_since_the_refit(monkeypatch):
+    import ray
+
+    def get(ref):
+        if ref == "ref1":
+            raise ray.exceptions.ActorDiedError()
+        return ref
+
+    monitor = MagicMock()
+    gen, leaders = _generation_with_leaders(2, fleet_monitor=monitor)
+    monkeypatch.setattr("nemo_rl.models.generation.vllm.vllm_generation.ray.get", get)
+    gen.set_rollout_weight_version(7)
+    leaders[0].set_rollout_weight_version.remote.assert_called_once_with(version=7)
+    monitor.record_actor_death.assert_called_once()
+    assert monitor.record_actor_death.call_args.args == (1,)
+
+
+def test_set_rollout_weight_version_raises_a_death_without_fleet_health(
+    monkeypatch,
+):
+    import ray
+
+    def get(ref):
+        raise ray.exceptions.ActorDiedError()
+
+    gen, _ = _generation_with_leaders(1)
+    monkeypatch.setattr("nemo_rl.models.generation.vllm.vllm_generation.ray.get", get)
+    with pytest.raises(ray.exceptions.ActorDiedError):
+        gen.set_rollout_weight_version(7)
 
 
 # ---------------------------------------------------------------------------

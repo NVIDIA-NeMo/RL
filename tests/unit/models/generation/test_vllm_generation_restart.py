@@ -54,6 +54,9 @@ class TestRestartShardLoadPath:
         gen.cfg = {"vllm_cfg": {"async_engine": True}}
         gen.dp_openai_server_base_urls = ["http://old:8000/v1"]
         gen._defer_model_load = defer
+        gen._token_capture_setup = None
+        gen._token_capture_media = None
+        gen._rollout_weight_version = None
         return gen, leader
 
     def test_the_eager_path_does_not_reload(self, monkeypatch):
@@ -76,3 +79,95 @@ class TestRestartShardLoadPath:
 
         leader.load_model.remote.assert_called_once()
         leader.post_init_async.remote.assert_called_once()
+
+
+class TestRestartShardTokenCapture:
+    """restart_shard must give a replacement leader the token capture the fleet has.
+
+    setup_token_capture runs once, at setup. A recreated leader starts with capture
+    dormant, so without a re-install it serves calls without staging them, and the
+    rollouts it serves are never captured.
+    """
+
+    SETUP = {
+        "dp_cfg": {"backend": "simple"},
+        "staging_partition": "rollout_staging",
+        "capture_media": False,
+    }
+
+    @staticmethod
+    def _generation(*, media_reported=None):
+        from nemo_rl.models.generation.vllm import vllm_generation
+
+        gen = vllm_generation.VllmGeneration.__new__(vllm_generation.VllmGeneration)
+        calls = MagicMock()
+        leader = SimpleNamespace(
+            post_init_async=SimpleNamespace(remote=calls.post_init_async),
+            setup_token_capture=SimpleNamespace(remote=calls.setup_token_capture),
+            set_rollout_weight_version=SimpleNamespace(
+                remote=calls.set_rollout_weight_version
+            ),
+            report_dp_openai_server_base_url=SimpleNamespace(
+                remote=calls.report_dp_openai_server_base_url
+            ),
+        )
+        calls.setup_token_capture.return_value = media_reported
+        calls.report_dp_openai_server_base_url.return_value = "http://new:9000/v1"
+        gen.worker_group = SimpleNamespace(
+            workers=[leader],
+            get_dp_leader_worker_idx=lambda shard: 0,
+            recreate_worker=MagicMock(),
+        )
+        gen.model_parallel_size = 1
+        gen.cfg = {"vllm_cfg": {"async_engine": True}}
+        gen.dp_openai_server_base_urls = ["http://old:8000/v1"]
+        gen._defer_model_load = False
+        gen._token_capture_setup = None
+        gen._token_capture_media = None
+        gen._rollout_weight_version = None
+        return gen, calls
+
+    def test_capture_and_weight_version_are_reinstalled_before_the_url(
+        self, monkeypatch
+    ):
+        from nemo_rl.models.generation.vllm import vllm_generation
+
+        gen, calls = self._generation()
+        gen._token_capture_setup = vllm_generation._TokenCaptureSetup(**self.SETUP)
+        gen._rollout_weight_version = 3
+        monkeypatch.setattr(vllm_generation.ray, "get", lambda ref: ref)
+
+        assert gen.restart_shard(0) == "http://new:9000/v1"
+
+        calls.setup_token_capture.assert_called_once_with(**self.SETUP)
+        calls.set_rollout_weight_version.assert_called_once_with(version=3)
+        assert [name for name, _, _ in calls.mock_calls] == [
+            "post_init_async",
+            "setup_token_capture",
+            "set_rollout_weight_version",
+            "report_dp_openai_server_base_url",
+        ]
+
+    def test_nothing_is_installed_when_capture_was_never_set_up(self, monkeypatch):
+        from nemo_rl.models.generation.vllm import vllm_generation
+
+        gen, calls = self._generation()
+        monkeypatch.setattr(vllm_generation.ray, "get", lambda ref: ref)
+
+        gen.restart_shard(0)
+
+        calls.setup_token_capture.assert_not_called()
+        calls.set_rollout_weight_version.assert_not_called()
+
+    def test_a_replacement_that_pins_a_different_media_spec_is_refused(
+        self, monkeypatch
+    ):
+        from nemo_rl.models.generation.vllm import vllm_generation
+
+        gen, calls = self._generation(media_reported="other-spec")
+        gen._token_capture_setup = vllm_generation._TokenCaptureSetup(**self.SETUP)
+        monkeypatch.setattr(vllm_generation.ray, "get", lambda ref: ref)
+
+        with pytest.raises(RuntimeError, match="pinned media column spec"):
+            gen.restart_shard(0)
+        calls.report_dp_openai_server_base_url.assert_not_called()

@@ -19,6 +19,7 @@ import secrets
 import time
 import warnings
 from collections import defaultdict
+from dataclasses import asdict, dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -169,6 +170,15 @@ def _record_vllm_generation_metrics(
             record_rl_metrics({BATCH_DURATION_KEY: batch_duration_s})
     except Exception:
         warn_once("vllm_inference_metrics", "nemo-lens: failed to record vLLM metrics")
+
+
+@dataclass(frozen=True)
+class _TokenCaptureSetup:
+    """The arguments setup_token_capture fanned out, kept for restart_shard."""
+
+    dp_cfg: "DataPlaneConfig"
+    staging_partition: str
+    capture_media: bool
 
 
 class VllmGeneration(GenerationInterface):
@@ -424,6 +434,12 @@ class VllmGeneration(GenerationInterface):
         # any run that never loses one -- so absence is a real value, not a missing one,
         # and it should not be discovered with getattr at the read site.
         self._refit_membership: Optional["RefitMembership"] = None
+        # What setup_token_capture installed and the weight version last stamped, kept so
+        # restart_shard can give a replacement leader the same capture as the fleet. None
+        # means token capture was never set up.
+        self._token_capture_setup: Optional[_TokenCaptureSetup] = None
+        self._token_capture_media: Optional["MediaColumnSpec"] = None
+        self._rollout_weight_version: Optional[int] = None
 
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
@@ -707,29 +723,55 @@ class VllmGeneration(GenerationInterface):
         Called once at setup when ``token_capture.enabled``; each async worker
         builds its in-worker data-plane client + TQTokenSink and makes the
         single Gym ``install_capture`` call. Returns the media column spec the
-        leaders pinned (``None`` for text-only capture).
+        leaders pinned (``None`` for text-only capture). The arguments are kept
+        so ``restart_shard`` can install the same capture in a replacement.
         """
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "
             "is the worker's in-process HTTP server)"
         )
+        setup = _TokenCaptureSetup(dp_cfg, staging_partition, capture_media)
         futures = self.worker_group.run_all_workers_single_data(
             "setup_token_capture",
-            dp_cfg=dp_cfg,
-            staging_partition=staging_partition,
-            capture_media=capture_media,
+            **asdict(setup),
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        return agreed_media_columns(ray.get(futures))
+        self._token_capture_media = agreed_media_columns(ray.get(futures))
+        self._token_capture_setup = setup
+        return self._token_capture_media
 
     def set_rollout_weight_version(self, version: int) -> None:
-        """Rotate the weight version workers stamp on captured model calls."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "set_rollout_weight_version",
-            version=version,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        ray.get(futures)
+        """Rotate the weight version refit members stamp on captured model calls.
+
+        Addresses the refit members, not the whole worker group. A dead shard's actor
+        cannot answer, and a replacement that is still restarting is not built yet;
+        walking every worker would raise on the first and wait on the second. A
+        replacement gets the current version from restart_shard and every later one
+        here, once it rejoins the refit.
+        """
+        self._rollout_weight_version = version
+        leaders = self._refit_leaders_by_shard()
+        if self.fleet_monitor is not None:
+            # The membership is the last reconcile's, but the handles are live: a shard
+            # condemned since then may already hold a replacement that is still loading.
+            # A shard is absent before its handle is swapped and until restart_shard
+            # returns, and restart_shard stamps the replacement itself, so reading the
+            # absent set after the snapshot never addresses a replacement mid-build.
+            absent = set(self.fleet_monitor.absent_shards())
+            leaders = [leader for leader in leaders if leader[0] not in absent]
+        futures = [
+            worker.set_rollout_weight_version.remote(version=version)
+            for _, _, worker in leaders
+        ]
+        for (shard_idx, leader_idx, worker), future in zip(leaders, futures):
+            try:
+                ray.get(future)
+            except ray.exceptions.ActorDiedError as exc:
+                if self.fleet_monitor is None:
+                    raise
+                # A late error from an old actor must not condemn its replacement.
+                if self.worker_group.workers[leader_idx] is worker:
+                    self.fleet_monitor.record_actor_death(shard_idx, error=str(exc))
 
     def _get_raw_spec_counters(self) -> dict[str | tuple[str, int], float]:
         """Collect raw spec decode counters from workers."""
@@ -883,7 +925,10 @@ class VllmGeneration(GenerationInterface):
 
         Mirrors the startup sequence (`create workers -> load_model -> post_init ->
         report URL`) rather than inventing a shorter one, because anything the deferred-
-        load path does at startup is equally required for a replacement.
+        load path does at startup is equally required for a replacement. It also
+        installs the token capture that setup adds after startup (setup_token_capture
+        and the current weight version), before the URL is returned, so a replacement
+        is never published without it.
 
         Returns:
             The replacement's OpenAI base URL, or None for a sync engine that exposes no
@@ -928,6 +973,31 @@ class VllmGeneration(GenerationInterface):
             "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
         )
         ray.get(getattr(leader, method_name).remote())
+
+        # setup_token_capture runs once, at setup, so a recreated leader starts with
+        # capture dormant: it would serve calls without staging them. Install the same
+        # capture the fleet has, and its current weight version, before the URL is
+        # published.
+        if self._token_capture_setup is not None:
+            media = ray.get(
+                leader.setup_token_capture.remote(**asdict(self._token_capture_setup))
+            )
+            if media != self._token_capture_media:
+                raise RuntimeError(
+                    f"restarted shard {shard_idx} pinned media column spec {media}, "
+                    f"but the fleet pinned {self._token_capture_media}"
+                )
+            if self._rollout_weight_version is not None:
+                ray.get(
+                    leader.set_rollout_weight_version.remote(
+                        version=self._rollout_weight_version
+                    )
+                )
+            print(
+                f"  restart_shard: shard {shard_idx} token capture reinstalled "
+                f"(weight version {self._rollout_weight_version})",
+                flush=True,
+            )
 
         if not self.cfg["vllm_cfg"]["async_engine"]:
             return None
