@@ -16,15 +16,20 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import ray
 import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.metric_utils import REWARD_KEY
 from nemo_rl.data_plane import KVBatchMeta
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import WatchdogConfig
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -442,3 +447,50 @@ def fields_for_put(meta: KVBatchMeta, fields: dict[str, torch.Tensor]) -> Tensor
             packed[field_name] = value.detach().contiguous()
     # pyrefly: ignore[bad-argument-type]
     return TensorDict(packed, batch_size=[meta.size])
+
+
+def run_with_controller_liveness_watch(
+    sc: ray.actor.ActorHandle, watchdog_config: WatchdogConfig
+) -> dict[str, Any]:
+    """Await the SC run, polling ping() so a frozen event loop cannot hide.
+
+    The in-actor watchdog is an asyncio task on the SC's own event loop, so it cannot
+    observe that loop being blocked -- by a synchronous Ray call into a wedged worker,
+    say. The driver is a separate process that already holds the handle, which makes it
+    the cheapest possible external observer; no supervisor actor required.
+
+    ping() returning is the liveness signal. A slow reply is not a freeze, so the check
+    only escalates once the loop has been unresponsive for the same budget the in-actor
+    watchdog uses to call a stall.
+
+    Shared by every SingleController entrypoint (training and simulator) so the
+    liveness semantics cannot drift between them.
+    """
+    run_ref = sc.run.remote()
+    last_pong_at = time.monotonic()
+
+    ready: list[Any] = []
+    while not ready:
+        ready, _ = ray.wait([run_ref], timeout=watchdog_config.interval_s)
+        if ready:
+            break
+
+        try:
+            ray.get(sc.ping.remote(), timeout=watchdog_config.interval_s)
+        except Exception as error:
+            unresponsive_s = time.monotonic() - last_pong_at
+            print(
+                f"SingleController ping failed after {unresponsive_s:.0f}s "
+                f"unresponsive: {type(error).__name__}: {error}",
+                flush=True,
+            )
+            if unresponsive_s > watchdog_config.stall_timeout_s:
+                raise RuntimeError(
+                    "SingleController event loop has been unresponsive for "
+                    f"{unresponsive_s:.0f}s (stall_timeout_s="
+                    f"{watchdog_config.stall_timeout_s}); its in-actor watchdog runs "
+                    "on that loop and cannot report this."
+                ) from error
+        else:
+            last_pong_at = time.monotonic()
+    return ray.get(run_ref)

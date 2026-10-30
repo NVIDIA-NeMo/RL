@@ -152,6 +152,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     _maybe_restore_native_data_plane_checkpoint,
     _register_single_controller_partitions,
 )
+from nemo_rl.algorithms.single_controller_utils.simulator import SimulatorSettings
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     reduce_advantage_pump_metrics,
@@ -390,6 +391,11 @@ class SingleControllerActor:
     # rather than raising out of the training loop.
     _tracer: Any = None
 
+    # Same again: the train pump asks for the simulated train step on every
+    # step, and ``None`` is the training-run answer, so a controller built
+    # without __init__ (the test stubs) trains rather than raises.
+    _simulator: Optional[SimulatorSettings] = None
+
     def __init__(
         self,
         master_config: MasterConfig,
@@ -522,6 +528,12 @@ class SingleControllerActor:
         self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
         self._dataloader = actor_args.dataloader
         self._weight_synchronizer = actor_args.weight_synchronizer
+        # None on a training run. Like the fleet monitor and router below, None is
+        # the documented "feature off" value, so absence degrades to a training
+        # run rather than to a broken one.
+        self._simulator: Optional[SimulatorSettings] = getattr(
+            actor_args, "simulator", None
+        )
         self._advantage_estimator = actor_args.advantage_estimator
         # Built driver-side so the actors attach their TQ clients before this
         # process configures checkpoint participants. Empty means the stage runs
@@ -825,6 +837,14 @@ class SingleControllerActor:
             f"weight_sync={type(self._weight_synchronizer).__name__}",
             flush=True,
         )
+        if self._simulator is not None:
+            print(
+                f"SingleControllerActor: simulator mode={self._simulator.mode} "
+                f"train_backend={self._simulator.train_backend} "
+                f"train_time_s={self._simulator.train_time_s} "
+                f"refit_time_s={self._simulator.refit_time_s}",
+                flush=True,
+            )
 
     # ── public API ─────────────────────────────────────────────────────────
 
@@ -2962,6 +2982,44 @@ class SingleControllerActor:
             // 2,
         }
 
+    # Poll interval of the simulated train step's idle check. Class attribute so
+    # a test can shorten it on a bare controller.
+    _SIMULATED_TRAIN_POLL_S: float = 1.0
+
+    def _rollouts_idle(self) -> bool:
+        """Whether nothing is generating: no dispatch task exists and none is in flight.
+
+        ``_dispatched_rollouts`` holds tasks from creation, so a prompt whose task
+        has not started yet still counts as busy.
+        """
+        return self._inflight_rollouts == 0 and not self._dispatched_rollouts
+
+    async def _simulate_training(self) -> tuple[float, float]:
+        """Stand in for the GPU train step on a simulator run.
+
+        Holds ``simulator.train_time_s`` where ``policy.train()`` would run, so
+        generation is paced as it is beside a non-colocated trainer. The hold
+        ends early once no rollout is in flight: dispatch is gated on the
+        trainer version, which only advances after this returns, so the rest of
+        the wait is idle on both sides and a rollout-only run continues
+        identically after it. The skipped seconds are reported so the e2e step
+        time is still recoverable as held + skipped.
+
+        Returns:
+            ``(held_s, idle_skipped_s)``; both zero outside a simulator run.
+        """
+        settings = self._simulator
+        if settings is None or settings.train_time_s <= 0:
+            return 0.0, 0.0
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + settings.train_time_s
+        while (remaining := deadline - loop.time()) > 0:
+            if self._rollouts_idle():
+                return loop.time() - started, remaining
+            await asyncio.sleep(min(remaining, self._SIMULATED_TRAIN_POLL_S))
+        return loop.time() - started, 0.0
+
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
 
@@ -3036,6 +3094,9 @@ class SingleControllerActor:
             step_has_valid_training_tokens = False
             early_refit_done = False
             aborted_stale_inflight_groups = 0
+            # Simulator runs only: the held train step and its idle-skipped part.
+            simulated_train_s = 0.0
+            simulated_idle_skipped_s = 0.0
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
             consumed_metas: list[KVBatchMeta] = []
@@ -3699,6 +3760,12 @@ class SingleControllerActor:
                             tracer=self._tracer,
                         ),
                     ):
+                        # A no-op outside a simulator run. Inside the timer, so the
+                        # held seconds land where policy_training would.
+                        (
+                            simulated_train_s,
+                            simulated_idle_skipped_s,
+                        ) = await self._simulate_training()
                         policy_result = await asyncio.to_thread(
                             self._trainer.finish_train_step
                         )
@@ -3908,6 +3975,15 @@ class SingleControllerActor:
                         "promoted_prompt_groups": promoted_prompt_groups,
                     }
                 )
+                if self._simulator is not None:
+                    # Where policy.train() would have run, and how much of that
+                    # hold was skipped because no rollout was left to overlap with.
+                    step_metrics.update(
+                        {
+                            "simulated_train_time_s": simulated_train_s,
+                            "simulated_train_idle_skipped_s": simulated_idle_skipped_s,
+                        }
+                    )
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 if will_save_checkpoint:
