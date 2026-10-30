@@ -428,36 +428,24 @@ class TrtllmAsyncGenerationWorkerImpl:
         if self._http_base_url is not None:
             return self._http_base_url
 
-        from nemo_rl.utils.fastokens import maybe_patch_fastokens
+        from nemo_rl.utils.fastokens import (
+            check_fastokens_applied,
+            maybe_patch_fastokens,
+        )
 
         # Apply fastokens inside this Ray actor before constructing the tokenizer.
         maybe_patch_fastokens(False)
 
         from transformers import AutoTokenizer
 
-        from nemo_rl.models.generation.trtllm.trtllm_http_server import (
-            _tokenizer_backend_name,
-            start_server,
-        )
+        from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
 
         tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
             trust_remote_code=True,
         )
-        tokenizer_backend = _tokenizer_backend_name(tokenizer)
+        tokenizer_backend = check_fastokens_applied(tokenizer)
         print(f"[TrtllmAsyncWorker] HTTP tokenizer backend: {tokenizer_backend}")
-        # Assert the patch landed, not which private class implements it:
-        # fastokens renamed the shim (0.2.x `_compat._TokenizerShim` ->
-        # 0.3.x `_ConfiguredTokenizerShim`), and pinning the exact name makes
-        # this fail on every release that touches internals.
-        if os.environ.get(
-            "NRL_USE_FASTOKENS"
-        ) == "1" and not tokenizer_backend.startswith("fastokens."):
-            raise RuntimeError(
-                "NRL_USE_FASTOKENS=1, but the TRT-LLM HTTP tokenizer backend "
-                f"is {tokenizer_backend!r}; expected a fastokens shim "
-                "(fastokens.patch_transformers() did not take effect)"
-            )
         self._http_thread, self._http_base_url, self._http_server = start_server(
             llm=self.llm,
             tokenizer=tokenizer,
@@ -472,10 +460,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "top_p": self.cfg["top_p"],
                 "top_k": self.cfg["top_k"],
             },
-            # Validation rollouts are stamped with this second profile by
-            # grpo.validate(); without it the server would reject them as
-            # off-policy, which is why validation previously had to be pinned to
-            # the train sampling params on this backend.
+            # grpo.validate() stamps validation rollouts with this profile.
             val_sampling_config={
                 "temperature": self.cfg["val_temperature"],
                 "top_p": self.cfg["val_top_p"],

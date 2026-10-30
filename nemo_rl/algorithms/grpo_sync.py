@@ -307,12 +307,17 @@ def validate_sync(
 
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
-        max_batches = (
-            master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
-        )
+        max_val_samples = master_config.grpo.max_val_samples
+        val_batch_size = master_config.grpo.val_batch_size
+        # Round up so a partial last batch is still scored, and trim the last
+        # batch so no more than max_val_samples prompts are scored.
+        max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
+            num_left = max_val_samples - batch_idx * val_batch_size
+            if val_batch.size > num_left:
+                val_batch = val_batch.slice(0, num_left)
             n_prompts = int(val_batch.size)
             policy.prepare_val_partition(n_prompts, partition_id=partition_id)
             meta, driver_carry, rollout_metrics, _ = ray.get(
