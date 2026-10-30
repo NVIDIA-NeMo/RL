@@ -1515,8 +1515,8 @@ class TestFactory:
                 None,
                 "requires non-colocated vLLM or Megatron",
             ),
-            # TensorRT-LLM has no shard-to-shard refit transport.
-            ("trtllm", False, "nccl_reshard", "TensorRT-LLM generation"),
+            # mcore refit is Megatron-generation only.
+            ("trtllm", False, "mcore", "TensorRT-LLM generation"),
         ],
     )
     def test_refit_memory_release_rejects_unsupported_transport(
@@ -1539,8 +1539,9 @@ class TestFactory:
             )
 
     @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
-    def test_non_colocated_vllm_nccl_reshard_propagates_refit_memory_release(
-        self, mock_ray
+    @pytest.mark.parametrize("backend", [VLLM_BACKEND, "trtllm"])
+    def test_non_colocated_nccl_reshard_propagates_refit_memory_release(
+        self, mock_ray, backend
     ):
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
@@ -1552,7 +1553,7 @@ class TestFactory:
         sync = create_weight_synchronizer(
             policy=policy,
             generation=generation,
-            generation_backend=VLLM_BACKEND,
+            generation_backend=backend,
             colocated=False,
             train_cluster=_mock_cluster(),
             inference_cluster=_mock_cluster(),
