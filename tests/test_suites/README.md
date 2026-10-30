@@ -93,6 +93,29 @@ GB200 YAML configs should inherit from their 8g counterparts and override:
 - Any parallelism settings that need to change (e.g., halving `tensor_parallel_size`)
 - Directory/name references updated to reflect the 4g naming
 
+## External vLLM pools
+
+A test that needs fixed models served beside training (for example judge models) can run them as
+external vLLM pools in a second Slurm hetgroup. Add `NUM_EXTERNAL_SERVICE_NODES` to the CONFIG
+section, and register the pools in a `.pools` file next to the script with the same base name:
+
+```sh
+# ===== BEGIN CONFIG =====
+NUM_NODES=48                     # NeMo RL nodes (hetgroup 0)
+NUM_EXTERNAL_SERVICE_NODES=8     # pool nodes (hetgroup 1); must match the registered pools
+EXTERNAL_VLLM_SEGMENT_SIZE=2     # optional --segment for hetgroup 1
+...
+# ===== END CONFIG =====
+```
+
+`tools/launch` sources `tools/external_gym_vllm/pool_config.sh` and then the `.pools` file, and
+submits the job through `tools/external_gym_vllm/run_in_allocation.sh`. The `.pools` file calls
+`register_external_vllm_pool` once per pool (see `tools/external_gym_vllm/README.md`) and puts the
+Hydra overrides that carry each pool's URL placeholder in `EXTERNAL_VLLM_SCRIPT_ARGS`. The wrapper
+replaces the placeholders with the load balancers' addresses. Model paths must be under
+`EXTERNAL_VLLM_SHARED_ROOT` (default `/lustre`). Example:
+`llm/grpo-nemotron3.5-super-120BA12B-56n4g-megatron-rlvr-single-controller-gym-quick.pools`.
+
 ## Launching with code snapshots
 
 We provide a convenience script that will create a code snapshot and launch `NUM_RUNS` number of slurm jobs (`NUM_RUNS` is defined in the script itself). We create a code snapshot to

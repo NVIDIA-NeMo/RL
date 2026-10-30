@@ -124,6 +124,8 @@ for SCRIPT in $SCRIPTS; do
     # the loop does not leak into a script that omits it.
     SEGMENT_SIZE=""
     JOB_REAPER_COMMENT=""
+    NUM_EXTERNAL_SERVICE_NODES=0
+    EXTERNAL_VLLM_SEGMENT_SIZE=""
     eval "$config"
 
     # Default GPUS_PER_NODE to 8 if not specified in config (H100 default)
@@ -143,8 +145,31 @@ for SCRIPT in $SCRIPTS; do
         SEGMENT_ARG="--segment=$SEGMENT_SIZE "
     fi
 
-    # NUM_RUNS * NUM_NODES * NUM_GPUS * (NUM_MINUTES / 60)
-    gpu_hours=$((NUM_RUNS * NUM_NODES * GPUS_PER_NODE * NUM_MINUTES / 60))
+    # Optional external vLLM pools (e.g. judge models): NUM_EXTERNAL_SERVICE_NODES > 0
+    # submits a two-component heterogeneous job through
+    # tools/external_gym_vllm/run_in_allocation.sh. Hetgroup 0 runs ray.sub on
+    # NUM_NODES nodes; hetgroup 1 runs the pools that <script>.pools registers with
+    # tools/external_gym_vllm/pool_config.sh (see its README). EXTERNAL_VLLM_SEGMENT_SIZE
+    # optionally sets --segment for hetgroup 1 and must evenly divide its nodes.
+    POOLS_FILE=""
+    EXTERNAL_SEGMENT_ARG=""
+    if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+        POOLS_FILE="${SCRIPT%.sh}.pools"
+        if [[ ! -f "$POOLS_FILE" ]]; then
+            echo "[ERROR]: NUM_EXTERNAL_SERVICE_NODES=$NUM_EXTERNAL_SERVICE_NODES needs pool definitions in $POOLS_FILE" >&2
+            exit 1
+        fi
+        if [[ -n "${EXTERNAL_VLLM_SEGMENT_SIZE:-}" ]]; then
+            if (( NUM_EXTERNAL_SERVICE_NODES % EXTERNAL_VLLM_SEGMENT_SIZE != 0 )); then
+                echo "[ERROR]: EXTERNAL_VLLM_SEGMENT_SIZE=$EXTERNAL_VLLM_SEGMENT_SIZE must evenly divide NUM_EXTERNAL_SERVICE_NODES=$NUM_EXTERNAL_SERVICE_NODES (in $SCRIPT)" >&2
+                exit 1
+            fi
+            EXTERNAL_SEGMENT_ARG="--segment=$EXTERNAL_VLLM_SEGMENT_SIZE "
+        fi
+    fi
+
+    # NUM_RUNS * (NUM_NODES + NUM_EXTERNAL_SERVICE_NODES) * NUM_GPUS * (NUM_MINUTES / 60)
+    gpu_hours=$((NUM_RUNS * (NUM_NODES + NUM_EXTERNAL_SERVICE_NODES) * GPUS_PER_NODE * NUM_MINUTES / 60))
     total_gpu_hours=$((total_gpu_hours + gpu_hours))
     echo "[INFO]: $gpu_hours GPUhrs to run $SCRIPT"
     if [[ "${DRYRUN}" -eq 1 ]]; then
@@ -153,6 +178,10 @@ for SCRIPT in $SCRIPTS; do
     fi
 
     rel_script=$(check_file_in_version_control_and_get_relpath_from_git_root $SCRIPT)
+    rel_pools=""
+    if [[ -n "$POOLS_FILE" ]]; then
+        rel_pools=$(check_file_in_version_control_and_get_relpath_from_git_root $POOLS_FILE)
+    fi
 
     EXP_NAME=$(basename $SCRIPT .sh)
     SNAPSHOT_DIR=$(bash $PROJECT_ROOT/tools/code_snapshot.sh $EXP_NAME)
@@ -188,20 +217,56 @@ for SCRIPT in $SCRIPTS; do
             COMMENT_ARG="--comment='${JOB_REAPER_COMMENT}' "
         fi
 
+        # The sandbox also sees the snapshot, so a test can share a directory under
+        # its EXP_DIR between the training and sandbox containers.
+        SANDBOX_MOUNTS_ARG=""
+        if [[ -n "${SANDBOX_CONTAINER:-}" ]]; then
+            SANDBOX_MOUNTS_ARG="$SNAPSHOT_DIR:$SNAPSHOT_DIR${SANDBOX_EXTRA_MOUNTS:+,${SANDBOX_EXTRA_MOUNTS}}"
+        fi
+
+        COMMAND_ARG="uv run $rel_script ${script_args[@]}"
+        POOL_SETUP=""
+        HET_ARGS=""
+        BATCH_SCRIPT=ray.sub
+        if [[ -n "$rel_pools" ]]; then
+            # The pools file registers each pool and may append Hydra overrides that
+            # carry the pools' URL placeholders to EXTERNAL_VLLM_SCRIPT_ARGS.
+            # run_in_allocation.sh replaces the placeholders in COMMAND once the load
+            # balancers have addresses.
+            COMMAND_ARG="\$COMMAND"
+            POOL_SETUP="set -euo pipefail
+source tools/external_gym_vllm/pool_config.sh
+EXTERNAL_VLLM_POOLS=\"\"
+EXTERNAL_VLLM_SCRIPT_ARGS=\"\"
+export GPUS_PER_NODE=$GPUS_PER_NODE
+export HF_HOME=$HF_HOME
+export BASE_LOG_DIR=\$SCRIPT_DIR
+export EXTERNAL_VLLM_TOOLS_DIR_HOST=\$SCRIPT_DIR/tools/external_gym_vllm
+export EXTERNAL_VLLM_SHARED_ROOT=${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}
+source $rel_pools
+export EXTERNAL_VLLM_POOLS
+COMMAND=\"uv run $rel_script ${script_args[@]} \$EXTERNAL_VLLM_SCRIPT_ARGS \$EXTERNAL_SERVICE_READINESS_PLACEHOLDER\"
+validate_external_vllm_submission \"\$COMMAND\" $NUM_EXTERNAL_SERVICE_NODES
+"
+            HET_ARGS=": --nodes=$NUM_EXTERNAL_SERVICE_NODES ${EXTERNAL_SEGMENT_ARG}--account=$ACCOUNT --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} --partition=$PARTITION --time=0:${NUM_MINUTES}:0 ${GRES_ARG}${COMMENT_ARG}"
+            BATCH_SCRIPT=tools/external_gym_vllm/run_in_allocation.sh
+        fi
+
         cat <<EOF >$SNAPSHOT_DIR/continue.sh
 #!/bin/bash
 SCRIPT_DIR=\$( cd -- "\$( dirname -- "\${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 cd \$SCRIPT_DIR
-
+${POOL_SETUP}
 ${EXTRA_ENV:-} \\
 HF_HOME=$HF_HOME \\
 HF_DATASETS_CACHE=$HF_DATASETS_CACHE \\
-COMMAND="uv run $rel_script ${script_args[@]}" \\
+COMMAND="${COMMAND_ARG}" \\
 CONTAINER=$CONTAINER \\
 MOUNTS="$SNAPSHOT_DIR:$SNAPSHOT_DIR${MOUNTS}" \\
 SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-}" \\
 SANDBOX_COMMAND="${SANDBOX_COMMAND:-}" \\
 SANDBOX_ENV_VARS="${SANDBOX_ENV_VARS:-}" \\
+SANDBOX_EXTRA_MOUNTS="${SANDBOX_MOUNTS_ARG}" \\
 sbatch \\
     --nodes=$NUM_NODES ${SEGMENT_ARG}\\
     --account=$ACCOUNT \\
@@ -209,7 +274,7 @@ sbatch \\
     --partition=$PARTITION \\
     --time=0:${NUM_MINUTES}:0 ${GRES_ARG}${COMMENT_ARG}\\
     --output=slurm-${NOW}-%j-${JOB_NAME}-${i}.${NUM_RUNS}.out \\
-    ray.sub
+    ${HET_ARGS}${BATCH_SCRIPT}
 EOF
         if [[ "${DRYRUN}" -eq 2 ]]; then
             echo "[DRY_RUN]: Skipping submission of $SCRIPT. Find the snapshot at $SNAPSHOT_DIR and manually launch with 'bash continue.sh'"

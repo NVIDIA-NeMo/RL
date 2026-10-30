@@ -1,0 +1,79 @@
+defaults: ../../../nemo_gym/nemotron-3.5-super/rlvr_v43.yaml
+# Gym-bump lane smoke of the Nemotron 3.5 Super text RLVR v43 recipe on the SingleController: 64 prompts x 16
+# generations, 16 training + 32 generation nodes, 3 steps. The GenRM, NL2Bash and safety judges run as external
+# vLLM pools in a second hetgroup (see the .pools file next to the test script).
+# Assets are under ${HF_HOME}/nemotron3.5-super-rlvr/.
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron3.5-super-120BA12B-56n4g-megatron-rlvr-single-controller-gym-quick
+  checkpoint_must_save_by: null
+  metric_name: null
+  save_data_plane: true
+cluster:
+  num_nodes: 48
+data:
+  train:
+    data_path: ${oc.env:HF_HOME}/nemotron3.5-super-rlvr/data/rl-v43-train.len64k.jsonl
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+env:
+  nemo_gym:
+    finance_sec_search_resources_server:
+      resources_servers:
+        finance_sec_search:
+          cache_dir: ${oc.env:HF_HOME}/nemotron3.5-super-rlvr/finance/sec-cache/finance_sec_search
+          sec_dump_path: ${oc.env:HF_HOME}/nemotron3.5-super-rlvr/finance/sec-cache/data
+    scicode:
+      resources_servers:
+        scicode:
+          test_data_fpath: ${oc.env:HF_HOME}/nemotron3.5-super-rlvr/scicode/combined_test_data.h5
+    scicode_agent:
+      responses_api_agents:
+        scicode_agent:
+          datasets:
+          - jsonl_fpath: ${oc.env:HF_HOME}/nemotron3.5-super-rlvr/scicode/combined_stock_gold_transitions.jsonl
+            license: Apache 2.0
+            name: scicode_ds0_ds1_stock_gym_v1
+            num_repeats: 1
+            prompt_config: null
+            type: train
+grpo:
+  # The SingleController is always async and has no validation loop.
+  async_grpo: null
+  max_num_steps: 3
+  num_prompts_per_step: 64
+  val_period: 0
+logger:
+  wandb:
+    name: grpo-nemotron3.5-super-120BA12B-56n4g-megatron-rlvr-single-controller-gym-quick
+    project: nemo-rl
+policy:
+  generation:
+    colocated:
+      resources:
+        num_nodes: 32
+  model_name: ${oc.env:HF_HOME}/nemotron3.5-super-rlvr/models/super35-sft
+  train_global_batch_size: 1024
+async_rl:
+  # in_order trains each step on the batch dispatched for it, like v1 with max_trajectory_age_steps: 1, and keeps
+  # loss_fn.force_on_policy_ratio: true.
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  recompute_kv_cache_after_weight_updates: false
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: 128
+  max_buffered_rollouts: 128
+  num_advantage_workers: 8
+  generation_fleet_health:
+    # The 300 s default can abort a slow Super refit.
+    refit_timeout_s: null
+  rollout_failure:
+    nemo_gym:
+      rollout_timeout_s: 9000.0
+  stall_watchdog:
+    stall_timeout_s: 10800.0
