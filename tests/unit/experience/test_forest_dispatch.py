@@ -386,6 +386,7 @@ def test_forest_retry_and_restart_reuse_durable_selection(
                     reward=float(index),
                     truncated=False,
                     env_extras={
+                        "agent_ref": {"name": "test-agent"},
                         "ng_receipt": receipt,
                         "ng_rollout_id": owner,
                         "ng_logical_selection": selection,
@@ -441,6 +442,7 @@ def test_forest_retry_and_restart_reuse_durable_selection(
     assert request.receipts == tuple(
         observed[owner][0] for owner in request.rollout_ids
     )
+    assert request.resolved_agent_name == "test-agent"
     expected_keys = {
         entry["staging_key"]
         for receipt in request.receipts
@@ -490,6 +492,7 @@ def test_forest_unsafe_custody_never_reaches_cleanup(
                     reward=1.0,
                     truncated=False,
                     env_extras={
+                        "agent_ref": {"name": "test-agent"},
                         "ng_receipt": receipt,
                         "ng_rollout_id": owner,
                         "ng_logical_selection": selection,
