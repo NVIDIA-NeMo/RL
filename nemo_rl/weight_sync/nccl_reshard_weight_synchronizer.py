@@ -46,6 +46,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.distributed.refit_watchdog import is_refit_context_lost
 from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
@@ -215,7 +216,12 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
             try:
                 ray.get(futures_train)
-            except BaseException:
+            except BaseException as failure:
+                # A lost CUDA context cannot be recovered in this process. Waiting for
+                # stragglers would hide this diagnosis behind the controller's shorter
+                # timeout, which then attempts a rebuild on the unusable devices.
+                if is_refit_context_lost(failure):
+                    raise
                 # Every rank must be out of the old refit before the caller can rebuild
                 # over the survivors; see _settle_before_propagating. BOTH sides: the
                 # rebuild dispatches init_collective to the generation ranks too, and
