@@ -107,6 +107,44 @@ capability-specific tests rather than dense-versus-MoE implementations.
    parity or learning-quality equivalence. Disclose transport differences if the
    synchronous baseline requires a workaround.
 
+## Automated regression coverage
+
+AutoModel follows the same test layers as MCore; shared controller and TQ
+wrapper tests remain backend independent.
+
+| Layer | AutoModel coverage | Discovery |
+| --- | --- | --- |
+| Worker unit tests | `tests/unit/models/policy/test_automodel_split_state.py`: lifecycle, guards, failure cleanup, buffer and MoE hook behavior | Existing AutoModel L0 policy shards |
+| GPU numerical parity | `tests/unit/models/policy/test_automodel_split_parity.py`: tiny Llama, two FSDP ranks, two updates for each loss normalization, masks and gradient accumulation | Existing AutoModel L0 policy shards; HF-gated marker, like MCore's tiny-model fixture |
+| Configuration | `tests/unit/single_controller/test_automodel_config.py`: unsupported configurations and the regression recipe | Shared L0 controller suite |
+| Live integration | `tests/functional/automodel_sc_full_batch_smoke.sh`: Qwen2.5-1.5B, one training and one rollout GPU, timeout checkpoint at step 1, resume through step 4 | `L1_Functional_Tests_Automodel_SingleController.sh`, including FAST |
+| Longer regression | `grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch` recipe and matching driver: 100 updates, finite metrics, zero lag, logprob health and final checkpoint | `tests/test_suites/nightly.txt` |
+
+The L0 test reuses `tests/functional/automodel_sc_full_batch_parity.py`
+with strict deterministic kernels and zero tolerances. It compares pre-clip
+gradients, returned metrics, model parameters/buffers, optimizer and scheduler
+state. It also checks retained gradients across logprob inference and rollback
+after an aborted backward. Its local metadata transport isolates worker
+numerics; L1 exercises Ray dispatch, network TransferQueue, async vLLM and refit.
+The tiny model uses the Hugging Face implementation inside AutoModel. Native
+dense/MoE architecture qualification remains separate from this small CI test.
+
+L1 checks checkpoint artifacts and restore messages, and requires exactly step 1
+before restart and steps 2–4 afterward. It tests save/resume mechanics, not
+equivalence to uninterrupted training: the controller may drop in-flight
+prompts on restart. W&B is optional for L1; the nightly uses the original NeMo RL
+metric names in the `nemo-rl-automodel-sc` project.
+
+Validation on 2026-10-30 passed 20 AutoModel worker tests (including the exact
+two-GPU parity test), then 37 configuration/shared-wrapper tests. The first job
+(`21044661`) passed the worker tests but exposed a config-access error in the
+new recipe test assertion; that assertion was corrected. Job `21044947`
+passed the 37 tests and the live four-step save/resume smoke, exiting 0.
+The smoke had zero policy lag and zero logprob-error-masked sequences;
+maximum generation KL was 0.000553 and maximum sequence probability error
+was 1.04654. The 100-step nightly was registered and dry-run checked, but was
+not executed in this validation pass.
+
 ## Validation status
 
 The validation checkout is frozen at `56b4fc2d582c06204fa5f8effceaecb21dd5419c`.

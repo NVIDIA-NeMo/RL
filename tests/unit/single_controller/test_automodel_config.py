@@ -45,6 +45,19 @@ def test_supported(config):
     _validate_automodel_single_controller_config(MasterConfig(**config))
 
 
+def test_full_batch_regression_recipe():
+    register_omegaconf_resolvers()
+    raw = load_config(
+        "examples/configs/recipes/llm/"
+        "grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch.yaml"
+    )
+    config = MasterConfig(**OmegaConf.to_container(raw, resolve=True))
+    _validate_automodel_single_controller_config(config)
+    assert config.policy["train_global_batch_size"] == (
+        config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
+    )
+
+
 @pytest.mark.parametrize(
     "path,value",
     [
