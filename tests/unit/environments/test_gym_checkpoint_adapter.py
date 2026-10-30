@@ -93,8 +93,12 @@ def _participants(client: object, label: str) -> SimpleNamespace:
     return SimpleNamespace(
         client=client,
         members=(
-            SimpleNamespace(server_name=f"{label}-agent", kind="agent"),
-            SimpleNamespace(server_name=f"{label}-model", kind="model"),
+            SimpleNamespace(
+                server_name=f"{label}-agent", kind="agent", mode="exported"
+            ),
+            SimpleNamespace(
+                server_name=f"{label}-model", kind="model", mode="exported"
+            ),
         ),
     )
 
@@ -337,7 +341,7 @@ def test_adapter_drives_gyms_real_participants_through_save_and_restore(
         await restored.resume("restore-1", deadline_ts=time.time() + 5)
 
         replacement = EpisodeId(rollout_id="rollout-1", attempt=1)
-        assert await restored_agent.restored_pending() == [replacement]
+        assert await restored_agent.unclaimed() == [replacement]
         assert [(s.session_key, s.episode_id, s.session) for s in hooks.restored] == [
             ("run:rollout-1", replacement, {"turns": 1})
         ]
@@ -468,8 +472,8 @@ def _commit_model_reply(monkeypatch, model_reply: dict[str, object]):
     participants = SimpleNamespace(
         client=client,
         members=(
-            SimpleNamespace(server_name="agent", kind="agent"),
-            SimpleNamespace(server_name="model", kind="model"),
+            SimpleNamespace(server_name="agent", kind="agent", mode="exported"),
+            SimpleNamespace(server_name="model", kind="model", mode="exported"),
         ),
     )
     episodes = ["rollout-1", "rollout-2-a1"]
@@ -565,8 +569,8 @@ def _commit_with_agent_session(monkeypatch, *, own_run_episode_ids: list[str]):
     participants = SimpleNamespace(
         client=client,
         members=(
-            SimpleNamespace(server_name="model", kind="model"),
-            SimpleNamespace(server_name="agent", kind="agent"),
+            SimpleNamespace(server_name="model", kind="model", mode="exported"),
+            SimpleNamespace(server_name="agent", kind="agent", mode="exported"),
         ),
     )
     monkeypatch.setattr(coordination, "discover", AsyncMock(return_value=participants))
@@ -640,7 +644,8 @@ def _commit_replies(monkeypatch, members: list[tuple[str, str]], replies: dict):
     participants = SimpleNamespace(
         client=client,
         members=tuple(
-            SimpleNamespace(server_name=name, kind=kind) for name, kind in members
+            SimpleNamespace(server_name=name, kind=kind, mode="exported")
+            for name, kind in members
         ),
     )
     monkeypatch.setattr(coordination, "discover", AsyncMock(return_value=participants))
@@ -717,8 +722,10 @@ def test_adapter_refuses_environment_server_participants(monkeypatch) -> None:
     participants = SimpleNamespace(
         client=client,
         members=(
-            SimpleNamespace(server_name="episodes", kind="environment"),
-            SimpleNamespace(server_name="model", kind="model"),
+            SimpleNamespace(
+                server_name="episodes", kind="environment", mode="exported"
+            ),
+            SimpleNamespace(server_name="model", kind="model", mode="exported"),
         ),
     )
     monkeypatch.setattr(coordination, "discover", AsyncMock(return_value=participants))
@@ -837,20 +844,14 @@ def test_a_failed_checkpoint_control_call_crosses_ray_typed(
 
 
 def test_adapter_names_the_restart_only_servers_gym_reports(tmp_path: Path) -> None:
-    """Read the field each participant kind reports, through Gym's own status route."""
+    """Name the participants whose discovered checkpoint mode is restart_only."""
     from nemo_gym._checkpoint.agent import RestartOnlyAgentParticipant
     from nemo_gym._checkpoint.resources import ResourcesParticipant
 
-    restart_only_agent = RestartOnlyAgentParticipant()
-    if "restart_only" not in restart_only_agent.status_extra():
-        # Gyms before NVIDIA-NeMo/Gym#4957 do not report it; the adapter then
-        # cannot tell, which is checked below.
-        restart_only_agent.status_extra = lambda: {"restart_only": True}
-
-    async def exercise() -> tuple[list[str], list[str]]:
+    async def exercise() -> list[str]:
         adapter, _, _ = _in_process_gym(
             tmp_path / "ledger",
-            restart_only_agent=restart_only_agent,
+            restart_only_agent=RestartOnlyAgentParticipant(),
             resources={
                 "restarting_tools": ResourcesParticipant(
                     _NoResourceSessions(), "restart_only"
@@ -864,18 +865,7 @@ def test_adapter_names_the_restart_only_servers_gym_reports(tmp_path: Path) -> N
             },
         )
         await adapter.discover()
-        named = await adapter.restart_only_servers()
-
-        older_agent = RestartOnlyAgentParticipant()
-        older_agent.status_extra = lambda: {}
-        older, _, _ = _in_process_gym(
-            tmp_path / "ledger-older", restart_only_agent=older_agent
-        )
-        await older.discover()
-        return named, await older.restart_only_servers()
-
-    named, older = asyncio.run(exercise())
+        return await adapter.restart_only_servers()
 
     # The session-capable agent and the policy model are not restart-only.
-    assert named == ["restart_only", "restarting_tools"]
-    assert older == []
+    assert asyncio.run(exercise()) == ["restart_only", "restarting_tools"]

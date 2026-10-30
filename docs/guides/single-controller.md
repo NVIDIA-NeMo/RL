@@ -340,15 +340,12 @@ their tasks. If any other candidate is neither exported by Gym nor drained befor
 the deadline, the checkpoint aborts and every deployment is resumed.
 
 Because a restart-only server would make turn-level recovery quietly restart its
-rollouts, SC checks every Gym participant's checkpoint status before the first
-rollout. A resources server reports its checkpoint `mode`, and an agent reports
-`restart_only` (Gym versions that predate that field leave such agents
-unchecked). If any server is restart-only, setup fails and names it, unless
+rollouts, SC reads every Gym participant's checkpoint `mode` from discovery
+before the first rollout. If any server's mode is `restart_only` (the default for
+agents and resources servers), setup fails and names it, unless
 `rollout_recovery.allow_restart_only_gym_servers` is true, which accepts it with
 a warning. Each saved snapshot logs `gym_restarted_episodes`, the episodes that
-would start over after a crash. Gym also requires `num_workers: 1` on every
-checkpointing agent and resources server, because their sessions live in one
-process; it refuses to start a server that sets more.
+would start over after a crash.
 
 Gym leases are renewed throughout. Gym resumes as soon as the cut is captured,
 before SC writes its sidecars and publishes the snapshot, so new rollouts wait
