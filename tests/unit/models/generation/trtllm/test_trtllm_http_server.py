@@ -434,3 +434,62 @@ def test_the_chat_route_renders_gym_tools_in_normalized_order(monkeypatch):
 
     assert response.status_code == 400
     assert [list(tool) for tool in rendered["tools"]] == [["type", "function"]]
+
+
+_TRAIN = {"temperature": 1.0, "top_p": 1.0, "top_k": None}
+_VAL = {"temperature": 0.6, "top_p": 0.95, "top_k": None}
+
+
+@pytest.mark.parametrize(
+    ("request_sampling", "val_sampling_config", "served"),
+    [
+        ({"temperature": 1.0, "top_p": 1.0}, _VAL, _TRAIN),
+        ({"temperature": 0.6, "top_p": 0.95}, _VAL, _VAL),
+        # Unpinned params take the train profile.
+        ({}, _VAL, _TRAIN),
+        ({"temperature": 0.6, "top_p": 0.95}, None, None),
+        ({"temperature": 0.6, "top_p": 1.0}, _VAL, None),
+    ],
+)
+def test_the_chat_route_serves_the_profile_the_request_pins(
+    monkeypatch, request_sampling, val_sampling_config, served
+):
+    pytest.importorskip("tensorrt_llm.serve.openai_protocol")
+    from fastapi.testclient import TestClient
+
+    from nemo_rl.models.generation.trtllm import trtllm_http_server
+
+    class _Stop(Exception):
+        pass
+
+    served_with = {}
+
+    def fake_build_sampling_params(_cls, *, sampling_config, **_kwargs):
+        served_with["config"] = sampling_config
+        # Stop before generation.
+        raise _Stop
+
+    monkeypatch.setattr(
+        trtllm_http_server, "_build_sampling_params", fake_build_sampling_params
+    )
+    app = trtllm_http_server.create_app(
+        llm=SimpleNamespace(_hf_model_config=object(), _generation_config=None),
+        tokenizer=SimpleNamespace(eos_token_id=0),
+        model_name="m",
+        max_seq_len=16,
+        sampling_config=_TRAIN,
+        val_sampling_config=val_sampling_config,
+        tool_parser="qwen3",
+    )
+    body = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        # Supplied ids skip prompt rendering.
+        "prompt_token_ids": [1, 2],
+        **request_sampling,
+    }
+
+    expected = _Stop if served is not None else AssertionError
+    with pytest.raises(expected):
+        TestClient(app).post("/v1/chat/completions", json=body)
+    assert served_with.get("config") is served

@@ -770,19 +770,22 @@ def setup(
     _validate_seq_logprob_error_in_loss(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
 
-    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
-    # path; everywhere else validation must sample exactly like training.
+    # Validation-only sampling is honored on the NeMo-Gym rollout path for the
+    # backends whose HTTP server accepts a second sampling profile; everywhere
+    # else validation must sample exactly like training.
     val_sampling_overridden = (
         generation_config["val_temperature"] != generation_config["temperature"]
         or generation_config["val_top_p"] != generation_config["top_p"]
         or generation_config["val_top_k"] != generation_config["top_k"]
     )
     if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
-            master_config
-        ), (
+        assert generation_config["backend"] in (
+            "vllm",
+            "trtllm",
+        ) and should_use_nemo_gym(master_config), (
             "generation.val_temperature/val_top_p/val_top_k differing from the "
-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
+            "train sampling params is only supported for vLLM and TRT-LLM "
+            "NeMo-Gym rollouts."
         )
         # The NeMo-Gym path only stamps temperature/top_p onto requests and
         # rejects any top_k at rollout time, so a val_top_k override can never
@@ -4817,12 +4820,18 @@ def validate(
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
-        )
+        max_val_samples = master_config.grpo.max_val_samples
+        val_batch_size = master_config.grpo.val_batch_size
+        # Round up so a partial last batch is still scored (251 prompts in
+        # batches of 126 -> 126 + 125), and trim the last batch so no more than
+        # max_val_samples prompts are scored when the dataset is larger.
+        max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
+            num_left = max_val_samples - batch_idx * val_batch_size
+            if val_batch.size > num_left:
+                val_batch = val_batch.slice(0, num_left)
 
             if val_num_generations_per_prompt > 1:
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
