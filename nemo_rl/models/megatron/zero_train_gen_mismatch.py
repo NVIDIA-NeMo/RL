@@ -287,6 +287,7 @@ class _GenAlignedLogprob(torch.autograd.Function):
         inference_only: bool,
         original: Any,
         original_args: tuple[Any, ...],
+        trailing_args: tuple[Any, ...],
     ) -> torch.Tensor:
         # Deferred: Megatron-Core exists only in worker venvs; model_utils is heavy.
         from megatron.core.tensor_parallel.mappings import (
@@ -319,16 +320,20 @@ class _GenAlignedLogprob(torch.autograd.Function):
             ctx.save_for_backward(vocab_parallel_logits, target)
             ctx.original = original
             ctx.original_args = original_args
+            ctx.trailing_args = trailing_args
         return torch.cat(out_chunks, dim=1)
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple[Any, ...]:
         vocab_parallel_logits, target = ctx.saved_tensors
         with torch.enable_grad():
+            # A leaf, so the replaced function never reuses its storage for the grad.
             logits = vocab_parallel_logits.detach().requires_grad_()
-            logprobs = ctx.original.apply(logits, target, *ctx.original_args, False)
+            logprobs = ctx.original.apply(
+                logits, target, *ctx.original_args, False, *ctx.trailing_args
+            )
             (grad_input,) = torch.autograd.grad(logprobs, logits, grad_outputs[0])
-        return grad_input, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None
 
 
 class _FullVocabLogprob:
@@ -345,7 +350,12 @@ class _FullVocabLogprob:
         self._chunked = chunked
 
     def apply(self, *args: Any) -> Any:
-        logits, target, *original_args, inference_only = args
+        # (logits, target, vocab_start, vocab_end, [chunk_size,] group, inference_only,
+        # *trailing); trailing is the chunked function's reuse_logits_storage.
+        inference_only_index = 6 if self._chunked else 5
+        logits, target, *original_args = args[:inference_only_index]
+        inference_only = args[inference_only_index]
+        trailing_args = tuple(args[inference_only_index + 1 :])
         group = original_args[-1]
         chunk_size = original_args[2] if self._chunked else None
         if group is None:
@@ -358,6 +368,7 @@ class _FullVocabLogprob:
             inference_only,
             self._original,
             tuple(original_args),
+            trailing_args,
         ).contiguous()
 
 

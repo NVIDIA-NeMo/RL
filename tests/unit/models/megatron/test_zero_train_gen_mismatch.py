@@ -1063,8 +1063,14 @@ def test_logprob_shim_uses_full_vocab_log_softmax_at_any_tp(monkeypatch):
     assert shim.apply(logits, target, 0, 16, None, True) == "orig"
 
 
-@pytest.mark.parametrize("chunked", [False, True])
-def test_logprob_shim_backward_is_the_replaced_functions_backward(monkeypatch, chunked):
+# The chunked function takes a trailing reuse_logits_storage after inference_only.
+@pytest.mark.parametrize(
+    "chunked,trailing_args",
+    [(False, ()), (True, ()), (True, (False,)), (True, (True,))],
+)
+def test_logprob_shim_backward_is_the_replaced_functions_backward(
+    monkeypatch, chunked, trailing_args
+):
     import torch
 
     def full_row(shard):
@@ -1096,17 +1102,17 @@ def test_logprob_shim_backward_is_the_replaced_functions_backward(monkeypatch, c
     grad_output = torch.randn(2, 5)
 
     reference_logits = shard.clone().requires_grad_()
-    Original.apply(reference_logits, target, *original_args, False).backward(
-        grad_output
-    )
+    Original.apply(
+        reference_logits, target, *original_args, False, *trailing_args
+    ).backward(grad_output)
 
     calls.clear()
     logits = shard.clone().requires_grad_()
     shim = zgm._FullVocabLogprob(Original, chunked=chunked)
-    out = shim.apply(logits, target, *original_args, False)
+    out = shim.apply(logits, target, *original_args, False, *trailing_args)
     assert calls == []  # the forward does not call the replaced function
     out.backward(grad_output)
 
-    assert calls == [(*original_args, False)]
+    assert calls == [(*original_args, False, *trailing_args)]
     assert logits.grad.dtype == torch.bfloat16
     assert torch.equal(logits.grad, reference_logits.grad)
