@@ -161,10 +161,18 @@ class TeacherWorkerGroup:
         cfg["megatron_cfg"]["expert_model_parallel_size"] = (
             teacher_cfg.expert_model_parallel_size
         )
+        # The student's manual_gc is for its training steps; a teacher never trains.
+        cfg["megatron_cfg"]["manual_gc"] = False
 
         # Apply any additional megatron config overrides from teacher config.
         for key, value in teacher_cfg.megatron_cfg_overrides.items():
             cfg["megatron_cfg"][key] = value
+        if cfg["megatron_cfg"]["manual_gc"]:
+            raise ValueError(
+                f"Teacher '{self.alias}': manual_gc is not supported on teachers. "
+                "They never run a training step, so GC would be disabled with "
+                "nothing ever collecting."
+            )
 
         # Teacher architecture comes from its checkpoint, not the student's
         # cloned config. Only explicit teacher overrides reach the provider,

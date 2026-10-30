@@ -134,6 +134,55 @@ state remains GPU resident; choose a fraction that leaves enough GPU memory for
 the colocated generation backend. Optimizer CPU offload is independent of
 activation CPU offload.
 
+#### Manual garbage collection
+
+Python's automatic garbage collector runs a full (generation-2) collection on
+whichever process crosses its allocation threshold first. In a multi-rank Megatron
+job that rank stops for the length of the collection, and every other rank waits
+for it at the next collective. With many ranks, these unaligned pauses add up: on
+a 32-node SFT run, collections of about 1 s landed on up to 90 of 128 ranks at
+different points of one step, stretching 66 s steps to 75-85 s.
+
+`manual_gc` mirrors Megatron-LM's option of the same name. The Megatron policy
+workers turn automatic garbage collection off at the end of worker setup and run
+a full collection on every rank together, once every `manual_gc_interval`
+optimizer steps:
+
+```yaml
+policy:
+  megatron_cfg:
+    manual_gc: true
+    manual_gc_interval: 10  # optimizer steps between collections
+```
+
+- `manual_gc_interval` must be a positive integer when `manual_gc` is `true`;
+  anything else is rejected at worker setup. NeMo RL has no counterpart to
+  Megatron-LM's collections around evaluation, so without an interval nothing
+  would ever collect.
+- The interval counts optimizer steps on both training paths: the monolithic
+  `train()` used by SFT, DPO and RM (one optimizer step per global batch), and the
+  split-step API used by the single controller (`finish_train_step`).
+- Model, optimizer and checkpoint setup run with automatic collection on; the
+  first manual collection, at the end of setup, frees their garbage.
+- Processes forked from the worker, such as data loader workers, get automatic
+  collection back.
+- For PPO, the Megatron value workers have the same stall and take the same keys
+  under `value.megatron_cfg`; set them there separately.
+- Distillation teachers never run a training step, so they do not inherit the
+  student's `manual_gc`, and setting it in a teacher's `megatron_cfg_overrides`
+  is rejected.
+
+Choosing the interval is a trade between step-time consistency and host memory.
+Reference counting still frees most objects immediately; only garbage held in
+reference cycles waits for the next collection, so host memory grows between
+collections by however much cyclic garbage a step creates. Each manual
+collection also costs about as much as one automatic full collection did, just
+on every rank at the same point. Start with `10`, then compare runs with
+`manual_gc` off and on: mean and p99 step time, and the peak host RSS of the
+policy workers. Raise the interval if the collection time is visible in every
+tenth step; lower it if host memory keeps climbing. The option only changes the
+Megatron workers that train; vLLM and other actors keep the default collector.
+
 ### Automodel Backend
 To enable Automodel training:
 
