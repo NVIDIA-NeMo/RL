@@ -315,11 +315,21 @@ def composed_radio_modules(tmp_path, monkeypatch):
     not torch.cuda.is_available(), reason="Requires the vLLM GPU runner"
 )
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-@pytest.mark.parametrize("reload_api", [False, True])
+@pytest.mark.parametrize(
+    ("reload_api", "real_quant"),
+    [(False, True), (True, True), (True, False)],
+    ids=["modelopt-chunked", "modelopt-native", "bf16-native"],
+)
 @pytest.mark.parametrize("scale_source", ["explicit", "folded", "unverified"])
 @torch.inference_mode()
 def test_composed_native_vision_refit(
-    composed_radio_modules, tmp_path, monkeypatch, device, reload_api, scale_source
+    composed_radio_modules,
+    tmp_path,
+    monkeypatch,
+    device,
+    reload_api,
+    scale_source,
+    real_quant: bool,
 ):
     """Real loaders/lifecycle: late scales, folded defaults, frozen omission and graphs."""
     from vllm.config import MultiModalConfig, VllmConfig, set_current_vllm_config
@@ -340,7 +350,7 @@ def test_composed_native_vision_refit(
         model=str(checkpoint),
         revision=None,
         dtype=torch.bfloat16,
-        quantization="modelopt",
+        quantization="modelopt" if real_quant else None,
         architectures=["NemotronH_Nano_VL_V2"],
         hf_config=SimpleNamespace(
             vision_config=SimpleNamespace(model_type="radio", layerscale_value=1.0)
@@ -392,7 +402,12 @@ def test_composed_native_vision_refit(
         runner.encoder_cache = {}
         runner.late_interaction_runner = {}
         runner.drafter = None
-        ext = VllmQuantInternalWorkerExtension.__new__(VllmQuantInternalWorkerExtension)
+        worker_cls = (
+            VllmQuantInternalWorkerExtension
+            if real_quant
+            else vllm_backend.VllmInternalWorkerExtension
+        )
+        ext = worker_cls.__new__(worker_cls)
         ext.model_runner, ext.model_config = runner, config
         ext.device = torch.device(device)
         ext.model_update_group = object()
@@ -490,8 +505,11 @@ def test_composed_native_vision_refit(
             runner.late_interaction_runner["stale"] = inputs
             with set_current_vllm_config(runner.vllm_config):
                 if scale_source == "unverified":
-                    with pytest.raises(ValueError, match="LayerScale"):
-                        ext._update_weights_from_collective(reload_api)
+                    if real_quant:
+                        with pytest.raises(ValueError, match="LayerScale"):
+                            ext._update_weights_from_collective(reload_api)
+                    else:
+                        assert not ext._update_weights_from_collective(reload_api)
                     assert "load_weights" not in vars(model)
                     return
                 assert ext._update_weights_from_collective(reload_api)
