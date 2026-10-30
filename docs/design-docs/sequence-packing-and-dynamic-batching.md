@@ -94,6 +94,17 @@ all six through the same interface, and its recipes use Balanced Greedy
 Knapsack because it matched MFFD bin utilization in validation while spreading
 sequences evenly across physical packs.
 
+All packers share `SequencePacker.pack()`, which places a sequence longer than
+`bin_capacity` alone in a bin of its own and packs the remaining sequences as
+usual. Such a bin counts toward `min_bin_count` / `bin_count_multiple` like any
+other, and `micro_batch_lengths` reports its own padded length (rounded up to
+`make_sequence_length_divisible_by`, like every bin) rather than the bin
+capacity, so `train_mb_tokens` can be set below
+`policy.max_total_sequence_length`: a rare sequence longer than the bin capacity
+trains alone instead of forcing every bin up to the model maximum. Note that
+the bin capacity is then a typical size, not a cap on peak memory, which is set
+by the longest single sequence.
+
 ##### Concatenative Packer 
 - Sequential concatenation until bin capacity is reached
 - O(n)
@@ -234,6 +245,7 @@ Internally, Automodel and Megatron-Core are made aware of sequence packing with 
 
 ### Nuances
 - With using Sequence Packing with Megatron + Pipeline Parallelism (PP), note that all packed sequences will be padded up to the maximum packed sequence length because PP requires maintaining a fixed-size batch x seqlen buffer for PP communications. In practice, however, we find that packing is _so efficient_ that this hardly makes a difference.
+- A sequence longer than `train_mb_tokens` is packed alone (see Packing Algorithms above). On the DTensor path, any packed row longer than `train_mb_tokens` (such an oversized bin, or a logprob bin when `logprob_mb_tokens > train_mb_tokens`) is padded to a multiple of `policy.make_sequence_length_divisible_by` instead of to `train_mb_tokens`; with Megatron PP an oversized bin raises the padded length of that global batch only. Two consumers keep a hard capacity: Energon-owned SFT packs reject a sample longer than the pack capacity, and DPO `pair_grouping_key` packing rejects a preference pair longer than `train_mb_tokens`.
 
 All together, we see **speedups in the ~2-3x range** when enabling sequence packing.
 
