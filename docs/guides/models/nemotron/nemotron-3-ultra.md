@@ -116,7 +116,7 @@ one JSONL per stage: `rlvr1`, `rlvr2`, `ifbench`, `rlhf`, `reasoning`, `swe`, an
 export DATA_DIR=/path/to/ultra/data
 
 # 1. Download the blends + fill_placeholders.py
-huggingface-cli download nvidia/Nemotron-RL-Ultra-Training-Blends \
+hf download nvidia/Nemotron-RL-Ultra-Training-Blends \
   --repo-type dataset --local-dir ultra-blends
 
 # 2. Restore the DAPO / Skywork placeholders into $DATA_DIR

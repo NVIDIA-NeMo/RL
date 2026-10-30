@@ -67,6 +67,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
     resolve_ppo_chunk_alignment,
+    TokenCaptureConfig,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -128,8 +129,12 @@ class _InitRolloutManager:
 
     def __init__(self, tq_buffer: _InitBuffer) -> None:
         self._tq_buffer = tq_buffer
+        self.next_nemo_gym_task_index = 0
         self.recovery_ledger = RolloutRecoveryLedger()
         self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        self.next_nemo_gym_task_index = value
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -2338,6 +2343,7 @@ def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._master_config = SimpleNamespace(
+        token_capture=TokenCaptureConfig(),
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=2,
             max_num_steps=1,
