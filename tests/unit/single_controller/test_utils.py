@@ -215,6 +215,33 @@ class TestReduceAdvantagePumpMetrics:
     def test_all_empty_inputs_returns_empty_dict(self) -> None:
         assert reduce_advantage_pump_metrics([], [], []) == {}
 
+    def test_sample_mask_metrics_are_summed_across_streaming_chunks(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            reward_partials=[],
+            advantage_partials=[],
+            sequence_lengths=[],
+            sample_mask_metrics=[
+                {
+                    "num_masked_seqs_by_loss_multiplier": 1,
+                    "num_masked_seqs_by_overlong_filtering": 0,
+                    "num_masked_seqs_by_rollout": 2,
+                    "num_masked_seqs_total": 4,
+                },
+                {
+                    "num_masked_seqs_by_loss_multiplier": 0,
+                    "num_masked_seqs_by_overlong_filtering": 3,
+                    "num_masked_seqs_by_rollout": 1,
+                    "num_masked_seqs_total": 4,
+                },
+            ],
+        )
+        assert out == {
+            "num_masked_seqs_by_loss_multiplier": 1.0,
+            "num_masked_seqs_by_overlong_filtering": 3.0,
+            "num_masked_seqs_by_rollout": 3.0,
+            "num_masked_seqs_total": 8.0,
+        }
+
     def test_seq_logprob_error_metrics_are_reduced_across_streaming_chunks(
         self,
     ) -> None:

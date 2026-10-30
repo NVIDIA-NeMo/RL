@@ -788,6 +788,7 @@ class SingleControllerActor:
             "num_mask_sample_filtered": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
+            "sample_mask_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
         self._opd_gap_sum = 0.0
@@ -5886,6 +5887,10 @@ class SingleControllerActor:
         if outcome.seq_logprob_error_metrics is not None:
             self._step_log_dict["seq_logprob_error_metrics"].append(
                 outcome.seq_logprob_error_metrics
+            )
+        if outcome.sample_mask_metrics is not None:
+            self._step_log_dict.setdefault("sample_mask_metrics", []).append(
+                outcome.sample_mask_metrics
             )
         self._opd_stat_sum += outcome.opd_stat_sum
         self._opd_stat_sumsq += outcome.opd_stat_sumsq

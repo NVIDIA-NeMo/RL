@@ -1291,6 +1291,14 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 1
+    assert ctrl._step_log_dict["sample_mask_metrics"] == [
+        {
+            "num_masked_seqs_by_loss_multiplier": 0,
+            "num_masked_seqs_by_overlong_filtering": 1,
+            "num_masked_seqs_by_rollout": 1,
+            "num_masked_seqs_total": 3,
+        }
+    ]
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
     assert "advantages" in (result_meta.fields or [])
