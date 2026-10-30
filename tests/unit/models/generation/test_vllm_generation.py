@@ -474,6 +474,138 @@ async def test_async_vllm_worker_gpu_profiling_awaits_collective_rpc(
     worker.llm.collective_rpc.assert_awaited_once_with("stop_gpu_profiling", args=())
 
 
+class _ScriptedAsyncLLM:
+    """Yields one scripted final RequestOutput and records what it was asked to generate."""
+
+    def __init__(self, generated: list[int], finish_reason: str = "stop") -> None:
+        self.generated = generated
+        self.finish_reason = finish_reason
+        self.calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+    async def generate(self, prompt, sampling_params, request_id):
+        self.calls.append((prompt, sampling_params))
+        yield types.SimpleNamespace(
+            prompt_token_ids=prompt["prompt_token_ids"],
+            prompt_routed_experts=None,
+            num_cached_tokens=0,
+            outputs=[
+                types.SimpleNamespace(
+                    token_ids=self.generated,
+                    # The second token has no reported logprob.
+                    logprobs=[
+                        {} if i == 1 else {t: types.SimpleNamespace(logprob=-0.5)}
+                        for i, t in enumerate(self.generated)
+                    ],
+                    finish_reason=self.finish_reason,
+                    routed_experts=None,
+                )
+            ],
+        )
+
+
+def _rollout_worker(llm: _ScriptedAsyncLLM, **cfg) -> VllmAsyncGenerationWorkerImpl:
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "max_new_tokens": 8,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": None,
+        "stop_token_ids": [2],
+        "stop_strings": ["</done>"],
+        "_pad_token_id": 0,
+        "vllm_cfg": {"async_engine": True, "max_model_len": 16},
+        **cfg,
+    }
+    # Records the sampling kwargs instead of building vLLM's SamplingParams.
+    worker.SamplingParams = dict
+    worker.routed_experts_dtype = torch.int16
+    worker.llm = llm
+    return worker
+
+
+async def _generate_one(
+    worker: VllmAsyncGenerationWorkerImpl,
+    prompt: list[int],
+    stop_strings: list[str] | None = None,
+) -> BatchedDataDict:
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([prompt]),
+            "input_lengths": torch.tensor([len(prompt)]),
+            "stop_strings": [stop_strings],
+        }
+    )
+    ((sample_idx, output),) = [item async for item in worker.generate_async(data)]
+    assert sample_idx == 0
+    return output
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_generate_async_samples_and_returns_the_rollout() -> None:
+    llm = _ScriptedAsyncLLM([10, 11, 2], finish_reason="stop")
+    worker = _rollout_worker(llm)
+
+    output = await _generate_one(worker, [1, 2, 3, 4, 5], stop_strings=["</x>"])
+
+    ((prompt, sampling),) = llm.calls
+    assert prompt == {"prompt_token_ids": [1, 2, 3, 4, 5]}
+    assert sampling["max_tokens"] == 8
+    assert sampling["temperature"] == 0.7
+    assert sampling["top_k"] == -1
+    assert sorted(sampling["stop"]) == ["</done>", "</x>"]
+    assert output["output_ids"].tolist() == [[1, 2, 3, 4, 5, 10, 11, 2]]
+    # A position without a reported logprob stays 0.0, aligned with its token.
+    assert output["logprobs"].tolist() == [[0.0] * 5 + [-0.5, 0.0, -0.5]]
+    assert output["generation_lengths"].tolist() == [3]
+    assert output["unpadded_sequence_lengths"].tolist() == [8]
+    assert output["truncated"].tolist() == [False]
+    # No router replay keys when R3 is off.
+    assert set(output) == {
+        "output_ids",
+        "logprobs",
+        "generation_lengths",
+        "unpadded_sequence_lengths",
+        "truncated",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt_length", "speculative_config", "expected_max_tokens"),
+    [
+        # min(max_new_tokens=8, max_model_len 16 - prompt 12)
+        (12, None, 4),
+        # The drafter reads 2 tokens ahead: 16 - 12 - (2 + 1)
+        (12, {"num_speculative_tokens": 2}, 1),
+        # Nothing fits: the prompt comes back without calling vLLM.
+        (16, None, 0),
+        # The spec-decode clamp floors at 1 token; a full context must not reach it.
+        (16, {"num_speculative_tokens": 2}, 0),
+    ],
+)
+async def test_async_vllm_generate_async_budget(
+    prompt_length, speculative_config, expected_max_tokens
+) -> None:
+    llm = _ScriptedAsyncLLM([10], finish_reason="length")
+    worker = _rollout_worker(
+        llm, vllm_kwargs={"speculative_config": speculative_config}
+    )
+    prompt = list(range(1, prompt_length + 1))
+
+    output = await _generate_one(worker, prompt)
+
+    if expected_max_tokens == 0:
+        assert llm.calls == []
+        assert output["output_ids"].tolist() == [prompt]
+        assert output["logprobs"].tolist() == [[0.0] * prompt_length]
+        assert output["generation_lengths"].tolist() == [0]
+        assert output["truncated"].tolist() == [False]
+    else:
+        ((_, sampling),) = llm.calls
+        assert sampling["max_tokens"] == expected_max_tokens
+        assert output["truncated"].tolist() == [True]
+
+
 @pytest.mark.asyncio
 async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
     engine_loop = asyncio.get_running_loop()
@@ -1362,6 +1494,25 @@ async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
     error = json.loads(response.body)["error"]
     assert error["code"] == "retained_media_changed"
     assert error["param"] == "messages"
+
+
+@pytest.mark.asyncio
+async def test_chat_handler_rejects_off_policy_sampling_and_pins_top_k(monkeypatch):
+    """The route asserts on-policy sampling, then hands vLLM top_k=-1."""
+    _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    serving_chat.create_chat_completion = AsyncMock(return_value=iter(()))
+
+    off_policy = _fake_chat_request()
+    off_policy.temperature = 0.5
+    with pytest.raises(AssertionError, match="matches neither"):
+        await chat_handler(off_policy, MagicMock())
+    serving_chat.create_chat_completion.assert_not_awaited()
+
+    request = _fake_chat_request()
+    request.top_k = None
+    await chat_handler(request, MagicMock())
+    serving_chat.create_chat_completion.assert_awaited_once()
+    assert request.top_k == -1
 
 
 @pytest.mark.asyncio
