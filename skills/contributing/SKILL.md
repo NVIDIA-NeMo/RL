@@ -16,6 +16,7 @@ The rules live in `references/`, one file per theme. Before writing or changing 
 | [config](references/config.md) | config a change adds, reads or overrides, and config models built in tests |
 | [dead-code](references/dead-code.md) | names a change adds, removes or stops using |
 | [error-handling](references/error-handling.md) | exceptions a change catches, and misconfigurations it must reject |
+| [linting-and-formatting](references/linting-and-formatting.md) | style of the Python and shell a change writes: naming, signatures, types, imports |
 
 ## PR Title Format
 
