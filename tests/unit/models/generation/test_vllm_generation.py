@@ -647,7 +647,7 @@ async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
         async def abort(self, _request_id: str) -> None:
             calls.append(("abort", asyncio.get_running_loop(), threading.get_ident()))
 
-    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop, flat_logprobs=False)
     assert (
         await client._run_on_engine_loop(
             lambda: asyncio.sleep(0, result="same-loop-result")
@@ -727,7 +727,7 @@ async def test_async_vllm_http_client_aborts_cancelled_generation(
             if abort_error is not None:
                 raise abort_error
 
-    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop, flat_logprobs=False)
 
     def cancel_from_http_thread():
         async def cancel():
@@ -5114,7 +5114,9 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
             if n > 2:
                 raise Overflow("queue full")
 
-    client = _AsyncLLMHTTPClient(FakeEngine(), asyncio.new_event_loop())
+    client = _AsyncLLMHTTPClient(
+        FakeEngine(), asyncio.new_event_loop(), flat_logprobs=False
+    )
 
     client.check_admission(1)
     client.check_admission(2, request_id="req-2")

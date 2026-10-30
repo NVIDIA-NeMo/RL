@@ -228,7 +228,7 @@ def _controller(
     controller._master_config = SimpleNamespace(
         grpo=controller._algo_cfg,
         checkpointing={"load_replay_buffer": True},
-        token_capture=SimpleNamespace(enabled=False),
+        token_capture=SimpleNamespace(enabled=False, forest_training=False),
     )
     controller._dataloader = loader
     controller._rollout_permitted = asyncio.Event()
