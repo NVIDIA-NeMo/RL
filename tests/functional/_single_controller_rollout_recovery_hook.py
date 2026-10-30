@@ -106,6 +106,7 @@ class _InstrumentedRolloutManager:
             target_step=target_step,
             inflight_registry=inflight_registry,
             lineage_group_id=lineage_group_id,
+            replacement_index=replacement_index,
         )
         if outcome is RolloutOutcome.COMMITTED:
             self._append_event("canonical_tq_commit", **fields)

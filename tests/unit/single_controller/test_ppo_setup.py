@@ -600,8 +600,8 @@ def _dynamic_sampling_config(
     sampler: str = "in_order",
     num_generations_per_prompt: int = _NUM_GENERATIONS_PER_PROMPT,
     max_replacements_per_slot: int = 32,
-    # A full batch, the size setup stops warning at: the pool is a low-water mark and
-    # one refill diverts exactly one batch, so anything smaller reaches 0 in between.
+    # A full batch, the size setup stops warning at: the pool is a low-water mark
+    # checked once per dataloader batch, so anything smaller can empty in between.
     replacement_reserve_prompts: int = _NUM_PROMPTS_PER_STEP,
 ) -> MasterConfig:
     """A GRPO SC config with dynamic sampling on and the knobs it validates."""
