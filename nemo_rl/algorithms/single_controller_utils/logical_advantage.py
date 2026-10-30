@@ -1,0 +1,178 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Validate logical owners for replay restore and the existing GRPO estimator."""
+
+from dataclasses import dataclass, fields
+
+import torch
+
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import LogicalRowTag, forest_segment_id
+
+_OWNER_TAGS = frozenset(field.name for field in fields(LogicalRowTag))
+
+
+def has_logical_owners(meta: KVBatchMeta) -> bool:
+    """Detect even partially tagged Forest batches so they cannot take ordinary GRPO."""
+    return any(_OWNER_TAGS.intersection(tag) for tag in meta.tags or [])
+
+
+@dataclass(frozen=True)
+class LogicalOwnerBatch:
+    """Indices into physical rows; padding has row_owner=-1 and no reward vote."""
+
+    representative_rows: torch.Tensor
+    group_ids: torch.Tensor
+    row_owner: torch.Tensor
+    valid_mask: torch.Tensor
+
+    def fanout(self, values: torch.Tensor) -> torch.Tensor:
+        """Broadcast one scalar per owner, with zero for ownerless padding."""
+        return values[self.row_owner.clamp_min(0)] * (self.row_owner >= 0)
+
+
+def validate_logical_owner_metadata(
+    meta: KVBatchMeta, *, expected_group_size: int
+) -> dict[str, dict[int, list[int]]]:
+    """Return physical rows by dispatch group and slot after structural checks.
+
+    Ownerless execution padding is validated but not returned as an owner.
+    Reward, prompt and mask checks require tensors and remain in the advantage
+    stage; replay metadata alone cannot establish those invariants.
+    """
+    if (
+        meta.tags is None
+        or len(meta.tags) != meta.size
+        or len(set(meta.sample_ids)) != meta.size
+    ):
+        raise ValueError(
+            "Forest owner metadata must be row-aligned with unique sample IDs"
+        )
+
+    assert meta.tags is not None
+    tags = meta.tags
+    groups: dict[str, dict[int, list[int]]] = {}
+    for row, tag in enumerate(tags):
+        if not _OWNER_TAGS.issubset(tag):
+            raise ValueError("Forest batches require complete owner tags on every row")
+        group = tag["dispatch_group_id"]
+        size = tag["logical_group_size"]
+        if (
+            not isinstance(group, str)
+            or not group
+            or type(size) is not int
+            or size != expected_group_size
+            or type(tag["is_execution_padding"]) is not bool
+        ):
+            raise ValueError("Forest dispatch group identity or cardinality is invalid")
+        slots = groups.setdefault(group, {})
+        if tag["is_execution_padding"]:
+            if (
+                tag["logical_rollout_id"] is not None
+                or tag["logical_slot"] is not None
+                or tag["segment_index"] is not None
+                or type(tag["segment_count"]) is not int
+                or tag["segment_count"] != 0
+            ):
+                raise ValueError("Forest execution padding must be ownerless")
+            continue
+        slot, segment, count = (
+            tag["logical_slot"],
+            tag["segment_index"],
+            tag["segment_count"],
+        )
+        if (
+            type(slot) is not int
+            or not 0 <= slot < size
+            or type(segment) is not int
+            or type(count) is not int
+            or not 0 <= segment < count
+            or tag["logical_rollout_id"] != f"{group}_g{slot}"
+            or meta.sample_ids[row] != forest_segment_id(f"{group}_g{slot}", segment)
+        ):
+            raise ValueError("Forest owner/segment identity is invalid")
+        slots.setdefault(slot, []).append(row)
+
+    for slots in groups.values():
+        if set(slots) != set(range(expected_group_size)):
+            raise ValueError(
+                "Forest estimator requires every logical slot in each group"
+            )
+        for rows in slots.values():
+            counts = {tags[row]["segment_count"] for row in rows}
+            indices = {tags[row]["segment_index"] for row in rows}
+            if counts != {len(rows)} or indices != set(range(len(rows))):
+                raise ValueError("Forest estimator requires every segment exactly once")
+    if not groups:
+        raise ValueError("Forest metadata requires logical owners")
+    return groups
+
+
+def build_logical_owner_batch(
+    meta: KVBatchMeta,
+    *,
+    prompt_ids: torch.Tensor,
+    rewards: torch.Tensor,
+    sample_mask: torch.Tensor,
+    expected_group_size: int,
+) -> LogicalOwnerBatch:
+    """Check complete groups, deduplicate owner rows, and combine their validity.
+
+    Dispatch IDs determine the estimator's grouping, independently of prompt
+    tokens. Each logical owner contributes once, regardless of segment count.
+    """
+    if (
+        prompt_ids.ndim != 2
+        or prompt_ids.shape[0] != meta.size
+        or prompt_ids.dtype not in (torch.int32, torch.int64)
+        or rewards.shape != (meta.size,)
+        or sample_mask.shape != (meta.size,)
+        or not torch.isfinite(rewards).all()
+        or not ((sample_mask == 0) | (sample_mask == 1)).all()
+    ):
+        raise ValueError(
+            "Forest advantage inputs must be finite, binary-masked, row-aligned"
+        )
+    groups = validate_logical_owner_metadata(
+        meta, expected_group_size=expected_group_size
+    )
+    representatives, validity, group_ids = [], [], []
+    row_owner = torch.full((meta.size,), -1, dtype=torch.long, device=rewards.device)
+    for group_index, slots in enumerate(groups.values()):
+        for rows in slots.values():
+            first = rows[0]
+            if any(
+                rewards[row] != rewards[first]
+                or not torch.equal(prompt_ids[row], prompt_ids[first])
+                for row in rows[1:]
+            ):
+                raise ValueError(
+                    "Forest owner rows disagree on reward or original prompt"
+                )
+            row_owner[rows] = len(representatives)
+            representatives.append(first)
+            group_ids.append(group_index)
+            validity.append(sample_mask[rows].amin())
+    if (sample_mask[row_owner < 0] != 0).any():
+        raise ValueError("Forest execution padding must be masked")
+    return LogicalOwnerBatch(
+        representative_rows=torch.tensor(
+            representatives, dtype=torch.long, device=rewards.device
+        ),
+        group_ids=torch.tensor(group_ids, dtype=torch.long, device=rewards.device)[
+            :, None
+        ],
+        row_owner=row_owner,
+        valid_mask=torch.stack(validity),
+    )
