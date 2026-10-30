@@ -197,7 +197,7 @@ def parse_args():
     required.add_argument('-d', '--dataset',
                         required=True,
                         type=str,
-                        choices=["rewardbench2", "judgebench", "rmbench", "hs3local"],
+                        choices=["rewardbench2", "judgebench", "rmbench", "hs3local", "hs4local"],
                         help='which benchmark to run')
     required.add_argument('-s', '--server',
                         required=True,
@@ -235,7 +235,7 @@ def parse_args():
                         default=8000,
                         help="Port for the server where the model is hosted",
                         required=False)
-    optional.add_argument('--hs3_file',
+    optional.add_argument('--hs_eval_file',
                         type=str,
                         default=None,
                         help="Location of HS3 eval file to use",
@@ -278,8 +278,8 @@ if __name__ == "__main__":
         dataset_loader = RMBenchDataset()
     elif args.dataset == "rewardbench2":
         dataset_loader = RewardBench2Dataset()
-    elif args.dataset == "hs3local":
-        dataset_loader = HelpSteer3LocalDataset(args.hs3_file, media_path=args.media_path, split='validation', max_number=10000, double_swap=False)
+    elif args.dataset in ["hs3local", "hs4local"]:
+        dataset_loader = HelpSteer3LocalDataset(args.hs_eval_file, media_path=args.media_path, split='validation', max_number=10000, double_swap=False)
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
     
