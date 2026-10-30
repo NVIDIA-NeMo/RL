@@ -977,19 +977,26 @@ class TrtllmGeneration(GenerationInterface):
         )
 
     def invalidate_kv_cache(self) -> bool:
-        """No-op for TRT-LLM: KV-cache invalidation happens inside the refit path.
+        """Reset the reusable prefix cache on every engine.
 
-        For async RL correctness, KV/prefix-cache invalidation must happen in
-        the same engine step boundary as the weight update — otherwise
-        in-flight requests forward several decode steps with new weights ×
-        old KV, opening a race window.
-
-        TRT-LLM avoids this by performing the invalidation inside the refit
-        function itself, under the same ``control_action`` context:
+        A refit does not need this: TRT-LLM resets the prefix cache inside the
+        refit itself, under the same ``control_action`` as the weight swap, so
+        no in-flight request forwards new weights over old KV:
           * ``NcclExtension.update_weights_from_collective`` (NCCL path)
           * ``NcclExtension.update_weights_via_ipc_zmq`` (IPC-ZMQ path)
+
+        This is the explicit reset for callers with no weight update, e.g. a
+        generation-only run between rollout steps or standing in for a refit.
+        It does not drain: in-flight requests keep their KV and the reuse state
+        is cleared at the next scheduler step boundary
+        (``NcclExtension.reset_prefix_cache``).
         """
-        return True
+        try:
+            results = ray.get(self._run_on_engines("reset_prefix_cache_async"))
+            return all(r for r in results if r is not None)
+        except Exception as e:
+            print(f"Error in invalidate_kv_cache: {e}")
+            return False
 
     def clear_logger_metrics(self) -> None:
         """No-op: TRT-LLM rollout telemetry is not yet wired up.
