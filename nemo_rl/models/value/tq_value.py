@@ -115,9 +115,9 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(VALUE_SEED_FIELDS),
             task_name="value_fwd",
-            # A VLM critic consumes the same media payload as the policy.
-            # The union is empty for text-only batches.
-            include_multimodal=True,
+            # Only the Megatron critic supports VLM inputs. AutoModel critics
+            # must not receive media because their packing path is text-only.
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("get_values/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
@@ -172,7 +172,7 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
-            include_multimodal=True,
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(

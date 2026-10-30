@@ -75,6 +75,18 @@ def test_value_media_mask_only_for_explicit_model_forward() -> None:
     assert _model_media_placeholder_token_id(_WithoutMask()) is None
 
 
+def test_value_model_cp_slicing_capability_is_detected() -> None:
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _model_slices_context_parallel_inputs,
+    )
+
+    class _SlicesContextParallelInputs:
+        model_slices_context_parallel_inputs = True
+
+    assert _model_slices_context_parallel_inputs(_SlicesContextParallelInputs())
+    assert not _model_slices_context_parallel_inputs(object())
+
+
 def test_value_head_hook_replaces_nested_vlm_language_head() -> None:
     """VLM critics must replace the head used by the nested language model."""
     from megatron.bridge.training.utils.train_utils import LinearForLastLayer
@@ -166,6 +178,7 @@ def test_get_values_suspends_activation_offload() -> None:
         model=model,
         _policy_like_cfg={},
         mcore_state=SimpleNamespace(straggler_timer=None),
+        model_slices_context_parallel_inputs=False,
     )
     observed_states: list[tuple[bool, bool]] = []
 
@@ -230,6 +243,7 @@ def test_get_values_passes_multimodal_batch_to_model_forward(
         position_ids=None,
         packed_seq_params=None,
         cu_seqlens_padded=None,
+        media_token_validity_mask=batch["media_token_validity_mask"],
     )
     model = SimpleNamespace(
         config=SimpleNamespace(fine_grained_activation_offloading=False),
@@ -242,6 +256,7 @@ def test_get_values_passes_multimodal_batch_to_model_forward(
         mcore_state=SimpleNamespace(straggler_timer=None),
         defer_fp32_logits=False,
         media_placeholder_token_id=None,
+        model_slices_context_parallel_inputs=True,
     )
 
     def run_forward_only(**kwargs: Any) -> list[dict[str, torch.Tensor]]:
@@ -253,7 +268,7 @@ def test_get_values_passes_multimodal_batch_to_model_forward(
         patch(
             "nemo_rl.models.value.workers.megatron_value_worker.get_microbatch_iterator",
             return_value=(iter([]), 1, 1, 2, 2),
-        ),
+        ) as get_microbatch_iterator,
         patch(
             "nemo_rl.models.value.workers.megatron_value_worker.get_forward_backward_func",
             return_value=run_forward_only,
@@ -281,6 +296,17 @@ def test_get_values_passes_multimodal_batch_to_model_forward(
     assert "pixel_values" in model_forward.call_args.kwargs["data_dict"]
     assert (
         "media_token_validity_mask" not in model_forward.call_args.kwargs["data_dict"]
+    )
+    assert (
+        model_forward.call_args.kwargs["media_token_validity_mask"]
+        is batch["media_token_validity_mask"]
+    )
+    assert (
+        model_forward.call_args.kwargs["model_slices_context_parallel_inputs"] is True
+    )
+    assert (
+        get_microbatch_iterator.call_args.kwargs["model_slices_context_parallel_inputs"]
+        is True
     )
     torch.testing.assert_close(result["values"], torch.tensor([[0.0, 1.0]]))
     assert (

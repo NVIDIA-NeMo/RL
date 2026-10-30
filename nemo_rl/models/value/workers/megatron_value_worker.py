@@ -131,6 +131,18 @@ def _model_media_placeholder_token_id(model: Any) -> Optional[int]:
     return media_placeholder_token_id_from_chunks(chunks)
 
 
+def _model_slices_context_parallel_inputs(model: Any) -> bool:
+    """Whether the model consumes full THD input and slices CP after embedding."""
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(
+        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
+        for chunk in chunks
+    )
+
+
 def _value_head_parent(chunk: MegatronModule) -> tuple[Any, str]:
     """Return the module and state-dict path that own a chunk's language head.
 
@@ -548,6 +560,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             self.optimizer,
         )
         self.media_placeholder_token_id = _model_media_placeholder_token_id(self.model)
+        self.model_slices_context_parallel_inputs = (
+            _model_slices_context_parallel_inputs(self.model)
+        )
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
 
@@ -637,6 +652,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                     self._policy_like_cfg,
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
+                    model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                 )
                 total_num_microbatches += int(num_microbatches)
 
@@ -665,6 +681,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
+                        model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                     )
 
                 # Empty unused memory
@@ -828,6 +845,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             self._policy_like_cfg,
             value_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
 
         def forward_step_fn(
@@ -849,6 +867,8 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 packed_seq_params=packed_seq_params,
                 defer_fp32_logits=getattr(self, "defer_fp32_logits", False),
                 straggler_timer=self.mcore_state.straggler_timer,
+                media_token_validity_mask=processed_mb.media_token_validity_mask,
+                model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             )
 
             def collection_fn(output_tensor):
