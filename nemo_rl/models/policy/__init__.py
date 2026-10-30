@@ -219,6 +219,12 @@ class AutomodelConfig(TypedDict):
     # Model config
     lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
     automodel_kwargs: NotRequired[AutomodelKwargs]
+    # Emit fp32 logits from the bf16 LM-head GEMM (Automodel logits_dtype=float32).
+    # Set the matching generation.vllm_cfg.fp32_lm_head flag for vLLM generation:
+    # applying this to only one engine makes the generation/training logprob
+    # mismatch worse. Automodel validates support per model at setup (its Llama,
+    # Qwen2 and Qwen3 implementations).
+    fp32_lm_head: NotRequired[bool]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
     checkpoint: NotRequired[AutomodelCheckpointConfig]

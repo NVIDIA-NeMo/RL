@@ -328,13 +328,55 @@ def test_policy_rejects_mismatched_vllm_and_megatron_fp32_lm_head(
     worker_group.assert_not_called()
 
 
-def test_policy_rejects_vllm_fp32_lm_head_with_automodel_trainer():
+def test_policy_accepts_matched_vllm_and_automodel_fp32_lm_head():
     config = create_automodel_config("test-model", tp=1)
+    config["automodel_cfg"]["fp32_lm_head"] = True
+    set_vllm_generation(config, {"fp32_lm_head": True})
+
+    policy = construct_policy_with_mocks(config)
+
+    assert policy.worker_group is not None
+
+
+@pytest.mark.parametrize(
+    ("trainer_fp32", "vllm_fp32"),
+    [
+        (True, False),
+        (False, True),
+        (None, True),
+    ],
+)
+def test_policy_rejects_mismatched_vllm_and_automodel_fp32_lm_head(
+    trainer_fp32, vllm_fp32
+):
+    config = create_automodel_config("test-model", tp=1)
+    if trainer_fp32 is not None:
+        config["automodel_cfg"]["fp32_lm_head"] = trainer_fp32
+    set_vllm_generation(config, {"fp32_lm_head": vllm_fp32})
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="both Automodel training and vLLM generation"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    worker_group.assert_not_called()
+
+
+def test_policy_rejects_non_bool_automodel_fp32_lm_head():
+    config = create_automodel_config("test-model", tp=1)
+    config["automodel_cfg"]["fp32_lm_head"] = "tf32"
     set_vllm_generation(config, {"fp32_lm_head": True})
 
     with (
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
-        pytest.raises(ValueError, match="Automodel has no matching"),
+        pytest.raises(
+            ValueError, match="policy.automodel_cfg.fp32_lm_head must be true or false"
+        ),
     ):
         Policy(
             cluster=create_mock_cluster(world_size=1),
