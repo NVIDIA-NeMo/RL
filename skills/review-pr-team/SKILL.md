@@ -380,9 +380,6 @@ Instructions:
   pattern and flag missing affordances: backend dispatch, override hooks (e.g. `resolve_policy_worker_cls`),
   guards/validation, type annotations, and return-shape consistency. "It works for the shipped recipe" is
   not enough if the new component silently diverges from its sibling's contract.
-- **Fail-loud check.** For each new config option / branch, ask: what does the worst plausible misconfiguration
-  do? If it silently produces wrong results (zeroed logprobs, an unrouted alias, an ignored backend, a config
-  combination no warning covers), flag it and suggest a setup-time assert/raise.
 - **Copied-constant check.** Any value the PR copies from code it doesn't own (a string key, a field
   name, a protocol name, a look-alike type) — usually flagged by a comment like "must match X" or
   "mirrors Y" — has to be justified, in this order: (1) import it where it is read, even with a

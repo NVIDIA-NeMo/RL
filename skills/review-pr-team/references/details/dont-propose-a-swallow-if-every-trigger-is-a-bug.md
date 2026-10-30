@@ -49,7 +49,8 @@ against before citing it, and check whether it swallows or falls back — those 
 different designs.
 
 Corollary on this repo specifically: NeMo-RL's own guidance leans **fail-loud** (see the
-"Fail-loud check" in the review skill, and `typeddict-missing-key-failfast-is-convention.md`).
+"Fail loud, not silent" rule in `skills/contributing/references/error-handling.md`, and
+`typeddict-missing-key-failfast-is-convention.md`).
 A suggestion that converts a hard failure into a printed warning is swimming against the
 repo's convention and needs a much stronger justification than "logging shouldn't crash."
 
