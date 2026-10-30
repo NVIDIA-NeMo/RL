@@ -7958,6 +7958,23 @@ class TestValidateFunction:
         ):
             setup(master_config, MagicMock(), MagicMock(), None)
 
+    @pytest.mark.parametrize("backend", ["vllm", "trtllm"])
+    def test_setup_accepts_val_sampling_on_gym_path(
+        self, mock_grpo_components, backend
+    ):
+        master_config = mock_grpo_components["master_config"]
+        # val_top_k trips the check right after the backend/Gym one, so
+        # reaching it proves this backend was accepted.
+        master_config.policy["generation"].update(
+            {"backend": backend, "val_temperature": 0.1, "val_top_k": 5}
+        )
+
+        with (
+            patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True),
+            pytest.raises(AssertionError, match="val_top_k is not supported"),
+        ):
+            setup(master_config, MagicMock(), MagicMock(), None)
+
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""
         mock_policy_gen = MagicMock()

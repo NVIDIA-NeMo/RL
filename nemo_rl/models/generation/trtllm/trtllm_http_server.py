@@ -201,14 +201,6 @@ def _parse_disaggregated_params(raw: Optional[dict[str, Any]]) -> tuple[Any, boo
     return to_llm_disaggregated_params(wire), return_b64
 
 
-def _tokenizer_backend_name(tokenizer: Any) -> str:
-    """Return the concrete backend that performs encode/decode operations."""
-    backend = getattr(tokenizer, "_tokenizer", None)
-    implementation = backend if backend is not None else tokenizer
-    implementation_type = type(implementation)
-    return f"{implementation_type.__module__}.{implementation_type.__name__}"
-
-
 def _context_leg_response(
     model_name: str,
     prompt_token_ids: list[int],
@@ -452,14 +444,8 @@ def create_app(
         )
         is_context_leg = getattr(disagg_params, "request_type", None) == "context_only"
 
-        # The NeMo-RL generation config, not the request, is the source of truth
-        # for sampling params: anything else would sample off-policy and destroy
-        # training stability. Validation rollouts are the one exception -- they
-        # are stamped with generation.val_temperature / val_top_p, which is
-        # metric-only and safe to serve. Accept either profile and serve the one
-        # the request pins, mirroring the vLLM server's is_train_sampling /
-        # is_val_sampling check. Multi-turn agents issue their own requests, so
-        # this handler is the single chokepoint they all pass.
+        # The NeMo-RL generation config, not the request, sets sampling. Serve the
+        # train profile, or the validation profile grpo.validate() stamps.
         if _request_matches_profile(body, sampling_config):
             active_sampling_config = sampling_config
         elif val_sampling_config is not None and _request_matches_profile(

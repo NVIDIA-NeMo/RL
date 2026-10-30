@@ -26,6 +26,7 @@ from nemo_rl.models.generation.trtllm import trtllm_generation
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmDisaggServerConfig,
     replica_width,
+    role_engine_config,
     resolve_disagg_layout,
     resolve_disagg_server_config,
     resolve_role_overrides,
@@ -673,3 +674,17 @@ def test_configure_generation_config_forces_dummy_for_fp8() -> None:
             _config(precision="fp8"), _LoadFormatTokenizer(), is_eval=is_eval
         )
         assert configured["trtllm_cfg"]["load_format"] == "dummy"
+
+
+@pytest.mark.parametrize("precision", ["bf16", "fp8"])
+def test_configure_generation_config_load_format_reaches_both_disagg_engines(
+    precision,
+) -> None:
+    """Both role blocks are copied from the shared block, so they must inherit it."""
+    from nemo_rl.models.generation import configure_generation_config
+
+    configured = configure_generation_config(
+        _disagg_config(precision=precision), _LoadFormatTokenizer()
+    )
+    for role in ("prefill", "decode"):
+        assert role_engine_config(configured, role)["load_format"] == "dummy"
