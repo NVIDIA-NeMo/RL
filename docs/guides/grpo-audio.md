@@ -15,7 +15,7 @@ NeMo RL ships three recipes out of the box, but the pieces are independent and c
 
 | Recipe | Model | Default dataset | Config |
 | --- | --- | --- | --- |
-| 3B (R1-AQA reproduction) | Qwen2.5-Omni-3B | [AVQA](https://mn.cs.tsinghua.edu.cn/avqa) | `examples/configs/audio_grpo_3B_megatron.yaml` |
+| 3B (R1-AQA reproduction) | Qwen2.5-Omni-3B | [AVQA](https://huggingface.co/datasets/gijs/avqa-processed) | `examples/configs/audio_grpo_3B_megatron.yaml` |
 | 7B (StrongAC + Gemini CoT) | Qwen2.5-Omni-7B | [Harland/AudioMCQ-StrongAC-GeminiCoT](https://huggingface.co/datasets/Harland/AudioMCQ-StrongAC-GeminiCoT) | `examples/configs/recipes/vlm/vlm_grpo-qwen2.5-omni-7b-audiomcq-1n8g-megatron.v1.yaml` |
 | 30B MoE (Qwen3-Omni) | Qwen3-Omni-30B-A3B-Instruct | Harland/AudioMCQ-StrongAC-GeminiCoT | `examples/configs/recipes/vlm/vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron.v1.yaml` |
 
@@ -25,7 +25,7 @@ The 3B recipe accepts the AudioMCQ dataset via a CLI override (no new YAML neede
 
 ### AVQA
 
-The [Audio-Visual Question Answering (AVQA)](https://mn.cs.tsinghua.edu.cn/avqa) dataset is the original training corpus from the [R1-AQA paper](https://arxiv.org/abs/2503.11197). NeMo RL exposes it under the registry key `audiomcq`'s sibling, `dataset_name: avqa`, and pulls the pre-processed split from [`gijs/avqa-processed`](https://huggingface.co/datasets/gijs/avqa-processed) on the Hub. AVQA has native `train` and `validation` splits, so the 3B recipe references both directly.
+The Audio-Visual Question Answering (AVQA) dataset is the original training corpus from the [R1-AQA paper](https://arxiv.org/abs/2503.11197). NeMo RL exposes it under the registry key `audiomcq`'s sibling, `dataset_name: avqa`, and pulls the pre-processed split from [`gijs/avqa-processed`](https://huggingface.co/datasets/gijs/avqa-processed) on the Hub. AVQA has native `train` and `validation` splits, so the 3B recipe references both directly.
 
 ### AudioMCQ-StrongAC-GeminiCoT
 
