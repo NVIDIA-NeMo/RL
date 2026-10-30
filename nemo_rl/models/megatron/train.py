@@ -23,6 +23,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
+    get_context_parallel_rank,
     get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -54,6 +55,7 @@ from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
+from nemo_rl.algorithms.w2s_opd import w2s_packed_proxy_support
 from nemo_rl.data.megatron_sft_packed import is_direct_packed_row
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -1001,6 +1003,11 @@ class TeacherFullPayloadPostProcessor:
         self._logprobs_post_processor = LogprobsPostProcessor(
             cfg=cfg, sampling_params=sampling_params
         )
+        # Every rank joins the TP/CP collectives that rebuild the payload, but
+        # only the data-plane writer (TP0/CP0) copies it to host and keeps it.
+        self.emit_payload = (
+            get_tensor_model_parallel_rank() == 0 and get_context_parallel_rank() == 0
+        )
 
     def __call__(
         self,
@@ -1115,6 +1122,12 @@ class TeacherFullPayloadPostProcessor:
             else:
                 payload_full = payload_local
 
+            if not self.emit_payload:
+                return output_tensor.new_zeros(()), {
+                    "logprobs": logprob_outputs["logprobs"],
+                    "teacher_full_payload": None,
+                }
+
             if pack:
                 assert cu_seqlens_padded_cpu is not None
                 assert seq_lengths_cpu is not None
@@ -1142,6 +1155,137 @@ class TeacherFullPayloadPostProcessor:
                 "teacher_full_payload": payload_full.to(
                     device="cpu", dtype=self.payload_dtype
                 ),
+            }
+
+        return processor_fn_inner
+
+
+# Supplies one packed microbatch's anchor and positive hidden states. Called with
+# the microbatch data dict on every rank of the TP x CP replica group, in
+# microbatch order; returns ``(anchor, positive)`` as ``[sum(input_lengths), H]``
+# device tensors holding each row's true-length positions back to back.
+W2SArmSource = Callable[[BatchedDataDict[Any]], Tuple[torch.Tensor, torch.Tensor]]
+
+
+class W2SProxyPostProcessor(TeacherFullPayloadPostProcessor):
+    """Negative-teacher forward that publishes the exact W2S-OPD proxy support.
+
+    The anchor and positive arms arrive through ``arm_source`` as hidden states
+    and are projected with their LM heads; the negative arm is this forward's
+    own logits. Every rank folds its context-parallel tokens on its vocabulary
+    shard, the global top-K is exchanged over TP, and only TP0/CP0 keeps the
+    gathered ``[B, S, K]`` result (see
+    :func:`nemo_rl.algorithms.w2s_opd.w2s_packed_proxy_support`).
+    """
+
+    def __init__(
+        self,
+        cfg: PolicyConfig,
+        *,
+        heads: tuple[torch.Tensor, torch.Tensor],
+        alpha: float,
+        top_k: int,
+        vocab_size: int,
+        chunk_size: int,
+        payload_dtype: torch.dtype,
+        arm_source: W2SArmSource,
+        sampling_params: Optional[TrainingSamplingParams] = None,
+    ):
+        super().__init__(
+            cfg=cfg,
+            payload="logits",
+            payload_dtype=payload_dtype,
+            sampling_params=sampling_params,
+        )
+        if not cfg["sequence_packing"]["enabled"]:
+            raise ValueError("The W2S proxy teacher pass requires sequence packing.")
+        # The forward tempers its logits in place before post-processing (see
+        # apply_temperature_scaling), and the negative arm is those logits.
+        if sampling_params is not None and sampling_params.temperature != 1.0:
+            raise ValueError(
+                "The W2S proxy teacher pass requires untempered logits, got "
+                f"temperature={sampling_params.temperature}."
+            )
+        self.heads = heads
+        self.alpha = alpha
+        self.top_k = top_k
+        self.vocab_size = vocab_size
+        self.chunk_size = chunk_size
+        self.arm_source = arm_source
+
+    def __call__(
+        self,
+        data_dict: BatchedDataDict[Any],
+        input_ids: torch.Tensor,
+        cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
+        original_seq_length: int,
+        hidden_states: Optional[torch.Tensor] = None,
+    ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
+        """Create the post-processing function for one packed microbatch.
+
+        Args:
+            data_dict: Batched data dictionary containing input sequences.
+            input_ids: Processed input token IDs.
+            cu_seqlens_padded: Cumulative padded sequence lengths of the pack.
+            original_seq_length: Sequence width before dense padding was applied.
+            hidden_states: Unused: the negative arm is this forward's logits.
+
+        Returns:
+            Callable mapping the model output to ``(dummy_loss, {"logprobs":
+            [B, S], "w2s_proxy": (support [B, S, K] int32, target_logprobs
+            [B, S, K] float32) on TP0/CP0, else None})``.
+        """
+        del hidden_states
+        assert cu_seqlens_padded is not None  # packing is required, see __init__
+        boundaries = to_cpu_int_tuple(cu_seqlens_padded)
+        lengths = list(to_cpu_int_tuple(data_dict["input_lengths"]))
+        spans = [(boundaries[i], boundaries[i + 1]) for i in range(len(lengths))]
+        logprobs_fn = self._logprobs_post_processor(
+            data_dict=data_dict,
+            input_ids=input_ids,
+            cu_seqlens_padded=boundaries,
+            original_seq_length=original_seq_length,
+        )
+        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
+
+        def processor_fn_inner(output_tensor):
+            # Fold before scoring: the negative arm must be the logits exactly as
+            # the output layer produced them.
+            rows = w2s_packed_proxy_support(
+                self.arm_source(data_dict),
+                output_tensor,
+                self.heads,
+                lengths=lengths,
+                spans=spans,
+                alpha=self.alpha,
+                top_k=self.top_k,
+                vocab_size=self.vocab_size,
+                chunk_size=self.chunk_size,
+                payload_dtype=self.payload_dtype,
+                vocab_parallel_group=get_tensor_model_parallel_group(),
+                context_parallel_group=(
+                    get_context_parallel_group() if cp_size > 1 else None
+                ),
+            )
+            _, logprob_outputs = logprobs_fn(output_tensor)
+            if not self.emit_payload:
+                return output_tensor.new_zeros(()), {
+                    "logprobs": logprob_outputs["logprobs"],
+                    "w2s_proxy": None,
+                }
+            out_support = torch.zeros(
+                (len(rows), original_seq_length, self.top_k), dtype=torch.int32
+            )
+            out_target = torch.zeros(
+                (len(rows), original_seq_length, self.top_k), dtype=torch.float32
+            )
+            for i, (support, target) in enumerate(rows):
+                length = min(support.shape[0], original_seq_length)
+                out_support[i, :length] = support[:length].to("cpu", torch.int32)
+                out_target[i, :length] = target[:length].to("cpu")
+            return output_tensor.new_zeros(()), {
+                "logprobs": logprob_outputs["logprobs"],
+                "w2s_proxy": (out_support, out_target),
             }
 
         return processor_fn_inner

@@ -55,6 +55,7 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
+    W2S_PROXY_FIELDS,
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
@@ -1114,6 +1115,7 @@ class TQWorkerMixin:
         opd_full_payload_field: Optional[str] = None,
         opd_full_teacher_index: Optional[int] = None,
         opd_full_teacher_index_field: Optional[str] = None,
+        w2s_proxy: Optional[dict[str, Any]] = None,
     ) -> None:
         """Per-rank frozen-teacher logprob entrypoint for SingleController MOPD.
 
@@ -1130,6 +1132,10 @@ class TQWorkerMixin:
             opd_full_teacher_index_field: Data-plane column the index is
                 written to; ``None`` when the run doesn't need per-sample
                 teacher routing (logits payload, or opd_full off).
+            w2s_proxy: W2S-OPD negative-arm pass. ``arm_sample_ids`` maps each
+                row to the temporary row holding its anchor/positive hidden
+                states, in the ``arm_fields`` columns. Writes the proxy support
+                (``W2S_PROXY_FIELDS``) instead of a dense payload.
 
         Raises:
             ValueError: If a payload is requested without a target column, or
@@ -1152,8 +1158,30 @@ class TQWorkerMixin:
                 "can desynchronize data-parallel collectives."
             )
         data = self._attach_or_repack_pack_metadata(data, meta)
+        if w2s_proxy is not None:
+            arm_request: dict[str, Any] = w2s_proxy
+            result: BatchedDataDict[Any] = self.get_w2s_proxy_logprobs(  # type: ignore[attr-defined]
+                data=data,
+                fetch_arm_rows=lambda: self._fetch_w2s_arm_rows(meta, arm_request),
+                micro_batch_size=micro_batch_size,
+            )
+            # Only TP0/CP0 holds the proxy support (see W2SProxyPostProcessor);
+            # every other rank holds None, which keeps this to a single writer.
+            proxy_fields = {
+                field: result[field] for field in W2S_PROXY_FIELDS if field in result
+            }
+            if proxy_fields:
+                self._write_back_stage_local(meta, proxy_fields)
+            self._write_back_result_field(
+                meta,
+                result,
+                result_key="logprobs",
+                tq_field="teacher_reference_logprobs",
+            )
+            del result
+            return
         if opd_full_payload is None:
-            result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
+            result = self.get_logprobs(  # type: ignore[attr-defined]
                 data=data,
                 micro_batch_size=micro_batch_size,
             )
@@ -1213,6 +1241,48 @@ class TQWorkerMixin:
             tq_field="teacher_reference_logprobs",
         )
         del result
+
+    def _fetch_w2s_arm_rows(
+        self,
+        meta: "KVBatchMeta",
+        w2s_proxy: dict[str, Any],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Fetch each row's anchor/positive hidden states as true-length CPU tensors.
+
+        Args:
+            meta: This DP shard's canonical rows, in scoring order.
+            w2s_proxy: ``arm_sample_ids`` (canonical -> temporary row id) and
+                the two ``arm_fields`` to read.
+
+        Returns:
+            Per row of ``meta``, the ``(anchor, positive)`` hidden states, each
+            ``[length, H]``.
+
+        Raises:
+            ValueError: If the arm columns are not exactly two, or the fetched
+                rows do not match ``meta``.
+        """
+        arm_ids = w2s_proxy["arm_sample_ids"]
+        fields = list(w2s_proxy["arm_fields"])
+        if len(fields) != 2:
+            raise ValueError("The W2S proxy pass reads exactly two arm columns.")
+        sample_ids = [arm_ids[sample_id] for sample_id in meta.sample_ids]
+        td = self._require_dp_client().get_samples(
+            sample_ids=sample_ids,
+            partition_id=meta.partition_id,
+            select_fields=fields,  # type: ignore[no-matching-overload]
+        )
+        data = _materialize_fetched(
+            td,
+            local_batch=False,
+            layout="jagged",
+            pad_value_dict=None,
+            pad_to_seqlen=0,
+        )
+        columns = [data[field].unbind(0) for field in fields]
+        if any(len(column) != len(sample_ids) for column in columns):
+            raise ValueError("W2S arm rows do not match the scored sample ids.")
+        return list(zip(*columns, strict=True))
 
     @accepts_trace_context
     @wrap_with_nvtx_name("value_worker/get_values_presharded")

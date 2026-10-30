@@ -40,6 +40,7 @@ from nemo_rl.data_plane.schema import (
     OPD_FULL_LOGITS_FIELD,
     OPD_FULL_TEACHER_INDEX_FIELD,
     ROUTED_EXPERTS_FIELD,
+    W2S_PROXY_FIELDS,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -417,3 +418,32 @@ class TestTQPolicyOPDFullColumn:
 
         fields = p.dp_client.register_partition.call_args.kwargs["fields"]
         assert fields == list(DP_TRAIN_FIELDS)
+
+    def test_train_microbatches_request_every_w2s_column(self):
+        """W2S-OPD reads its proxy-support columns and no teacher-index column."""
+        p, _ = _make_tq_policy()
+        p._opd_full_field = W2S_PROXY_FIELDS
+        meta = _meta()
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            p.train_microbatches_from_meta(meta)
+
+        train_meta = mock_shard.call_args.args[0]
+        assert train_meta.fields == [*DP_TRAIN_FIELDS, *W2S_PROXY_FIELDS]
+
+    def test_prepare_step_registers_every_w2s_column(self):
+        p, _ = _make_tq_policy()
+        p._opd_full_field = W2S_PROXY_FIELDS
+        p.tq_partition_id = "train"
+        p.dp_client = MagicMock()
+
+        p.prepare_step(num_samples=4, group_size=2)
+
+        fields = p.dp_client.register_partition.call_args.kwargs["fields"]
+        assert fields == [*DP_TRAIN_FIELDS, *W2S_PROXY_FIELDS]

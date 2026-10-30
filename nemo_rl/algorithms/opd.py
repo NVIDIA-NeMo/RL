@@ -26,12 +26,13 @@ import time
 import uuid
 from collections.abc import Iterable
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional
 
 import ray
 import torch
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PositiveInt, model_validator
 from tensordict import TensorDict
+from transformers import AutoTokenizer
 
 from nemo_rl.data.multimodal_utils import teacher_multimodal_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
@@ -40,6 +41,9 @@ from nemo_rl.data_plane.schema import (
     OPD_FULL_LOGITS_FIELD,
     OPD_FULL_TEACHER_INDEX_FIELD,
     TEACHER_LP_FIELDS,
+    W2S_ARM_FIELDS,
+    W2S_ARM_ROW_SUFFIX,
+    W2S_PROXY_FIELDS,
 )
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
@@ -154,16 +158,88 @@ class OnPolicyDistillationFullConfig(BaseModel, extra="allow"):
         return self
 
 
+class W2SOPDConfig(OnPolicyDistillationFullConfig):
+    """Weak-to-strong OPD (``on_policy_distillation.w2s``, arXiv:2607.26246).
+
+    Three frozen models score every student prefix: the anchor (an immutable
+    copy of the student's initialization, ``policy.model_name``), the positive
+    teacher (post-RL), and
+    the negative teacher (its pre-RL checkpoint). The student minimizes the
+    reverse KL to the proxy ``softmax(z_anchor + alpha * (z_positive -
+    z_negative))``, with student and proxy both renormalized on the proxy's
+    exact top-K support. Version 1 supports one positive/negative pair, mapped
+    through ``teacher_model_by_agent_name`` and
+    ``reference_model_by_agent_name``.
+
+    Reuses the hidden-state teacher payload for the anchor and positive arms, but
+    not its objective: no teacher logits are reconstructed on the student, so
+    ``validate_decomposition`` has no code path here.
+    """
+
+    method: Literal["w2s_opd"] = "w2s_opd"
+    # Contrast strength: finite and >= 0. 0 distills toward the anchor alone.
+    alpha: Annotated[float, Field(ge=0.0, allow_inf_nan=False)] = 0.75
+    # Proxy support size K after the logit arithmetic; >= 2.
+    top_k: Annotated[int, Field(ge=2)] = 32
+    # The negative teacher folds the proxy on every scoring pass and never
+    # trains, so it keeps the anchor and positive LM heads resident: only
+    # "none" is accepted (checked below).
+    teacher_lm_head_lifecycle: Literal["none", "offload", "evict"] = "none"
+    # Set from the verified shared tokenizer during setup, not by callers.
+    vocab_size: Optional[PositiveInt] = None
+    # Sequence chunk bounding the fp32 proxy and student-logit working set;
+    # required here (null is rejected below).
+    chunk_size: Optional[int] = 128
+
+    @model_validator(mode="after")
+    def validate_w2s_settings(self) -> "W2SOPDConfig":
+        """Reject inherited ``full`` settings that W2S-OPD has no code path for."""
+        if self.teacher_payload != "hidden_states":
+            raise ValueError(
+                "on_policy_distillation.w2s ships hidden states: teacher_payload "
+                f"must be 'hidden_states', got {self.teacher_payload!r}."
+            )
+        if self.teacher_lm_head_lifecycle != "none":
+            raise ValueError(
+                "on_policy_distillation.w2s keeps the anchor and positive LM heads "
+                "resident on the negative teacher: teacher_lm_head_lifecycle must "
+                f"be 'none', got {self.teacher_lm_head_lifecycle!r}."
+            )
+        if self.validate_decomposition:
+            raise ValueError(
+                "on_policy_distillation.w2s reconstructs no teacher logits, so "
+                "validate_decomposition must be false."
+            )
+        if self.chunk_size is None:
+            raise ValueError("on_policy_distillation.w2s requires a chunk_size.")
+        # extra="allow" would otherwise drop these silently, e.g. anchoring to
+        # policy.model_name while the config names another checkpoint.
+        stale = sorted({"anchor_model", "transport"} & set(self.model_extra or {}))
+        if stale:
+            raise ValueError(
+                f"on_policy_distillation.w2s does not take {stale}: the anchor is "
+                "always policy.model_name, and the frozen side always ships the "
+                "proxy support."
+            )
+        return self
+
+
 class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     """User-facing config for the top-level ``on_policy_distillation`` block."""
 
     enabled: bool = False
     teacher_model_by_agent_name: dict[str, str] = Field(default_factory=dict)
+    # Frozen reference checkpoint per teacher alias, served as a separate
+    # ``ref:<alias>`` teacher (deduplicated by checkpoint like the teachers).
+    # W2S-OPD uses it as the negative (pre-RL) arm; nothing else reads it.
+    reference_model_by_agent_name: dict[str, str] = Field(default_factory=dict)
     default_teacher_alias: Optional[str] = None
     strict_agent_name_match: bool = False
     deduplicate_shared_teacher_checkpoints: bool = True
     non_colocated_teachers: Optional[NonColocatedTeachersConfig] = None
     full: Optional[OnPolicyDistillationFullConfig] = None
+    # Weak-to-strong OPD; mutually exclusive with ``full``. null = disabled.
+    w2s: Optional[W2SOPDConfig] = None
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +263,23 @@ def _opd_cfg(master_config: Any) -> dict[str, Any]:
     if isinstance(cfg, BaseModel):
         return cfg.model_dump(exclude_none=True)
     return cfg
+
+
+def w2s_anchor_model(master_config: Any) -> Optional[str]:
+    """The W2S-OPD anchor checkpoint, or None when W2S-OPD is off.
+
+    The anchor is the student's initialization, ``policy.model_name``: a resumed
+    student keeps anchoring to it, never to its updated weights.
+    """
+    w2s_cfg = _opd_cfg(master_config).get("w2s")
+    if not (w2s_cfg and w2s_cfg.get("enabled")):
+        return None
+    policy = (
+        master_config["policy"]
+        if isinstance(master_config, dict)
+        else master_config.policy
+    )
+    return policy["model_name"]
 
 
 def is_opd_enabled(master_config: Any) -> bool:
@@ -224,6 +317,45 @@ def get_opd_full_config(master_config: Any) -> Optional[OnPolicyDistillationFull
     return full_cfg if full_cfg.enabled else None
 
 
+def get_opd_distribution_config(
+    master_config: Any,
+) -> Optional[OnPolicyDistillationFullConfig]:
+    """Return the enabled direct-distribution loss config: W2S-OPD or ``full``.
+
+    Both replace the sampled-token objective with a divergence computed in the
+    loss; sampled-token OPD is unaffected and resolves to ``None``.
+
+    Args:
+        master_config: Full training configuration, a plain dict, or any object
+            without the field (non-OPD recipes).
+
+    Returns:
+        The ``W2SOPDConfig`` when ``w2s.enabled``, else the result of
+        :func:`get_opd_full_config`.
+
+    Raises:
+        ValueError: If W2S-OPD is enabled without OPD or together with
+            ``full``.
+    """
+    w2s_cfg = _opd_cfg(master_config).get("w2s")
+    if w2s_cfg is not None:
+        if not isinstance(w2s_cfg, W2SOPDConfig):
+            w2s_cfg = W2SOPDConfig(**w2s_cfg)
+        if w2s_cfg.enabled:
+            if not is_opd_enabled(master_config):
+                raise ValueError(
+                    "on_policy_distillation.w2s requires "
+                    "on_policy_distillation.enabled=true."
+                )
+            if get_opd_full_config(master_config) is not None:
+                raise ValueError(
+                    "on_policy_distillation.w2s and on_policy_distillation.full "
+                    "are mutually exclusive."
+                )
+            return w2s_cfg
+    return get_opd_full_config(master_config)
+
+
 def opd_full_payload_field(full_cfg: OnPolicyDistillationFullConfig) -> str:
     """Return the data-plane column name carrying this run's teacher payload."""
     if full_cfg.teacher_payload == "hidden_states":
@@ -239,8 +371,12 @@ def opd_full_teacher_index_field(
     Only the ``hidden_states`` payload needs it: the student loads a teacher
     LM-head shard per unique checkpoint and must know which one projects each
     row. The ``logits`` payload ships an already-projected distribution, so no
-    per-sample routing is needed at training time.
+    per-sample routing is needed at training time. Neither does W2S-OPD: all
+    three frozen models score every row, and only the proxy support reaches
+    the student.
     """
+    if isinstance(full_cfg, W2SOPDConfig):
+        return None
     if full_cfg.teacher_payload == "hidden_states":
         return OPD_FULL_TEACHER_INDEX_FIELD
     return None
@@ -310,20 +446,20 @@ def assert_prev_logprobs_available(master_config: Any) -> None:
 def assert_trust_region_supported(master_config: Any) -> None:
     """Raise if TROPD knobs are set on a path that never reads the advantage.
 
-    Full-vocabulary MOPD replaces the policy-gradient objective with an exact
-    reverse KL and ignores ``advantages``, so a proximal teacher or a global
+    Full-vocabulary MOPD and W2S-OPD replace the policy-gradient objective with
+    a reverse KL and ignore ``advantages``, so a proximal teacher or a global
     baseline would be silently dropped there.
     """
     adv_cfg = master_config.grpo.adv_estimator
     if adv_cfg.proximal_teacher_alpha == 1.0 and not adv_cfg.subtract_global_baseline:
         return
-    if get_opd_full_config(master_config) is not None:
+    if get_opd_distribution_config(master_config) is not None:
         raise ValueError(
             "grpo.adv_estimator.proximal_teacher_alpha < 1 and "
             "grpo.adv_estimator.subtract_global_baseline have no effect with "
-            "on_policy_distillation.full.enabled=true: the full-vocabulary loss "
-            "ignores advantages. Set proximal_teacher_alpha=1.0 and "
-            "subtract_global_baseline=false."
+            "on_policy_distillation.full or on_policy_distillation.w2s enabled: "
+            "the distribution loss ignores advantages. Set "
+            "proximal_teacher_alpha=1.0 and subtract_global_baseline=false."
         )
 
 
@@ -421,13 +557,21 @@ class TQTeacherLogprobCoordinator:
         self._teacher_worker_groups = dict(teacher_worker_groups)
         self._alias_to_group_alias = dict(alias_to_group_alias)
         self._opd_cfg = dict(on_policy_distillation_cfg)
-        # Set when full-vocabulary MOPD is on: the teacher then writes a second,
-        # per-token payload column the training fetch must also see.
+        # Set when full-vocabulary MOPD or W2S-OPD is on: the teacher then
+        # writes per-token payload columns the training fetch must also see.
         full_cfg = self._opd_cfg.get("full")
+        w2s_cfg = self._opd_cfg.get("w2s")
+        resolved_full_cfg: Optional[OnPolicyDistillationFullConfig] = None
+        if w2s_cfg and w2s_cfg.get("enabled"):
+            resolved_full_cfg = W2SOPDConfig(**w2s_cfg)
+        elif full_cfg and full_cfg.get("enabled"):
+            resolved_full_cfg = OnPolicyDistillationFullConfig(**full_cfg)
+        self._w2s: Optional[W2SOPDConfig] = (
+            resolved_full_cfg if isinstance(resolved_full_cfg, W2SOPDConfig) else None
+        )
         self._opd_full_field: Optional[str] = None
         self._opd_full_teacher_index_field: Optional[str] = None
-        if full_cfg and full_cfg.get("enabled"):
-            resolved_full_cfg = OnPolicyDistillationFullConfig(**full_cfg)
+        if resolved_full_cfg is not None:
             self._opd_full_field = opd_full_payload_field(resolved_full_cfg)
             self._opd_full_teacher_index_field = opd_full_teacher_index_field(
                 resolved_full_cfg
@@ -485,8 +629,24 @@ class TQTeacherLogprobCoordinator:
         self,
         meta: KVBatchMeta,
         group_alias: str,
+        *,
+        payload_field: Optional[str] = None,
+        w2s_arm_sample_ids: Optional[dict[str, str]] = None,
     ) -> float:
-        """Run the blocking TQ-read, teacher inference, and TQ-write sequence."""
+        """Run the blocking TQ-read, teacher inference, and TQ-write sequence.
+
+        Args:
+            meta: Rows to score.
+            group_alias: Physical teacher group that scores them.
+            payload_field: W2S-OPD arm column the teacher writes its hidden
+                states to, instead of the run's default payload column.
+            w2s_arm_sample_ids: W2S-OPD negative pass: maps each row of
+                ``meta`` to the temporary row holding its anchor and positive
+                hidden states. The teacher then writes the proxy support.
+
+        Returns:
+            Seconds spent in teacher inference.
+        """
         if not meta.sequence_lengths:
             raise ValueError("MOPD teacher enrichment requires sequence_lengths")
 
@@ -554,7 +714,20 @@ class TQTeacherLogprobCoordinator:
                 padded_meta = meta.concat(pad_meta)
 
             inference_started_at = time.perf_counter()
-            teacher.get_logprobs_from_meta(padded_meta)
+            if w2s_arm_sample_ids is not None:
+                # DP padding rows copy the last row, so they reuse its arms.
+                arm_sample_ids = dict(w2s_arm_sample_ids)
+                for sample_id in temporary_sample_ids:
+                    arm_sample_ids[sample_id] = w2s_arm_sample_ids[meta.sample_ids[-1]]
+                teacher.get_w2s_proxy_from_meta(
+                    padded_meta,
+                    arm_sample_ids=arm_sample_ids,
+                    arm_fields=W2S_ARM_FIELDS,
+                )
+            elif payload_field is not None:
+                teacher.get_logprobs_from_meta(padded_meta, payload_field=payload_field)
+            else:
+                teacher.get_logprobs_from_meta(padded_meta)
             inference_finished_at = time.perf_counter()
         except BaseException as enrichment_error:
             if temporary_sample_ids:
@@ -584,6 +757,125 @@ class TQTeacherLogprobCoordinator:
     ) -> KVBatchMeta:
         """Write teacher logprobs before the replay-buffer slot becomes ready."""
         alias, group_alias = self._resolve_teacher(extra_env_info)
+        if self._w2s is None:
+            return await self._enrich_route(meta, alias, group_alias)
+        return await self._enrich_w2s_proxy(meta, alias)
+
+    def _create_w2s_arm_rows(self, meta: KVBatchMeta) -> KVBatchMeta:
+        """Clone the scoring inputs to temporary rows that receive the arm payloads.
+
+        Canonical rows never hold hidden states, so neither replay snapshots nor
+        training fetches can retain them.
+        """
+        teacher_fields = [*TEACHER_LP_FIELDS, *teacher_multimodal_fields(meta)]
+        # Clone the wire rows directly, as the DP padding in _enrich_sync does:
+        # decoding/re-encoding packed media would omit empty columns of
+        # text-only rows. The tags travel too, since the teachers' media field
+        # selection reads the row geometry they carry.
+        source = self._dp_client.get_samples(
+            sample_ids=meta.sample_ids,
+            partition_id=meta.partition_id,
+            select_fields=teacher_fields,
+        )
+        arm_meta = KVBatchMeta(
+            partition_id=meta.partition_id,
+            task_name=meta.task_name,
+            sample_ids=[
+                f"{sample_id}{W2S_ARM_ROW_SUFFIX}" for sample_id in meta.sample_ids
+            ],
+            fields=teacher_fields,
+            sequence_lengths=list(meta.sequence_lengths or []),
+            tags=deepcopy(meta.tags) if meta.tags is not None else None,
+        )
+        arm_fields: dict[str, torch.Tensor] = {}
+        for field in teacher_fields:
+            value = source[field]
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"W2S arm-row field {field!r} must be a tensor")
+            arm_fields[field] = value
+        try:
+            self._dp_client.put_samples(
+                sample_ids=arm_meta.sample_ids,
+                partition_id=arm_meta.partition_id,
+                fields=TensorDict(arm_fields, batch_size=[meta.size]),
+                tags=arm_meta.tags,
+            )
+        except BaseException as write_error:
+            # A backend may write only some rows before reporting failure.
+            try:
+                self._dp_client.clear_samples(
+                    sample_ids=arm_meta.sample_ids, partition_id=arm_meta.partition_id
+                )
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "W2S arm-row creation and cleanup both failed",
+                    [write_error, cleanup_error],
+                )
+            raise
+        return arm_meta
+
+    async def _enrich_w2s_proxy(self, meta: KVBatchMeta, alias: str) -> KVBatchMeta:
+        """Score anchor and positive onto temporary rows, then fold on the negative."""
+        if not meta.sequence_lengths:
+            raise ValueError("W2S teacher enrichment requires sequence_lengths")
+        arm_meta = await asyncio.to_thread(self._create_w2s_arm_rows, meta)
+        try:
+            for route, field in zip(("anchor:", alias), W2S_ARM_FIELDS, strict=True):
+                await self._enrich_route(
+                    arm_meta,
+                    alias,
+                    self._alias_to_group_alias[route],
+                    payload_field=field,
+                )
+            await self._enrich_route(
+                meta,
+                alias,
+                self._alias_to_group_alias[f"ref:{alias}"],
+                w2s_arm_sample_ids=dict(
+                    zip(meta.sample_ids, arm_meta.sample_ids, strict=True)
+                ),
+            )
+        except BaseException as enrichment_error:
+            try:
+                await asyncio.to_thread(
+                    self._dp_client.clear_samples,
+                    sample_ids=arm_meta.sample_ids,
+                    partition_id=arm_meta.partition_id,
+                )
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "W2S enrichment and arm-row cleanup both failed",
+                    [enrichment_error, cleanup_error],
+                )
+            raise
+        await asyncio.to_thread(
+            self._dp_client.clear_samples,
+            sample_ids=arm_meta.sample_ids,
+            partition_id=arm_meta.partition_id,
+        )
+        return meta.with_fields([self.teacher_logprobs_field, *W2S_PROXY_FIELDS])
+
+    async def _enrich_route(
+        self,
+        meta: KVBatchMeta,
+        alias: str,
+        group_alias: str,
+        *,
+        payload_field: Optional[str] = None,
+        w2s_arm_sample_ids: Optional[dict[str, str]] = None,
+    ) -> KVBatchMeta:
+        """Score ``meta`` on one physical teacher group under its collective lock.
+
+        Args:
+            meta: Rows to score.
+            alias: The routed teacher alias, reported in the routing metrics.
+            group_alias: The physical teacher group that scores the rows.
+            payload_field: See :meth:`_enrich_sync`.
+            w2s_arm_sample_ids: See :meth:`_enrich_sync`.
+
+        Returns:
+            ``meta`` declaring the columns the teacher wrote.
+        """
         started_at = time.perf_counter()
         lock_started_at = time.perf_counter()
         # Wait for a physical teacher without occupying a default-executor
@@ -594,7 +886,13 @@ class TQTeacherLogprobCoordinator:
             # drain it so replay-buffer rollback never clears rows while teacher
             # workers are still fetching from or writing to those rows.
             enrichment_task = asyncio.create_task(
-                asyncio.to_thread(self._enrich_sync, meta, group_alias)
+                asyncio.to_thread(
+                    self._enrich_sync,
+                    meta,
+                    group_alias,
+                    payload_field=payload_field,
+                    w2s_arm_sample_ids=w2s_arm_sample_ids,
+                )
             )
             try:
                 inference_time_s = await asyncio.shield(enrichment_task)
@@ -762,7 +1060,9 @@ def reserve_teacher_clusters(
 
     opd_cfg = _opd_cfg(master_config)
     _validate_default_teacher_alias(opd_cfg)
-    teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
+    teacher_configs = create_teacher_configs_from_opd_config(
+        opd_cfg, anchor_model=w2s_anchor_model(master_config)
+    )
 
     # Running topology of still-free nodes; each teacher consumes a segment and
     # passes the remainder to the next so teachers don't collide.
@@ -862,8 +1162,12 @@ def create_teacher_worker_groups(
     opd_cfg = _opd_cfg(master_config)
     teacher_model_by_agent_name = dict(opd_cfg.get("teacher_model_by_agent_name", {}))
     _validate_default_teacher_alias(opd_cfg)
+    anchor_model = w2s_anchor_model(master_config)
+    w2s_enabled = anchor_model is not None
 
-    teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
+    teacher_configs = create_teacher_configs_from_opd_config(
+        opd_cfg, anchor_model=anchor_model
+    )
     expected_aliases = {teacher_config.alias for teacher_config in teacher_configs}
     if set(teacher_clusters) != expected_aliases:
         raise ValueError(
@@ -871,6 +1175,23 @@ def create_teacher_worker_groups(
             f"configs: expected {sorted(expected_aliases)}, "
             f"got {sorted(teacher_clusters)}."
         )
+
+    if w2s_enabled:
+        # The W2S-OPD proxy adds the frozen models' logits token id by token
+        # id, which is meaningful only in one shared token-ID mapping.
+        student_vocab = tokenizer.get_vocab()
+        for teacher_config in teacher_configs:
+            teacher_tokenizer = AutoTokenizer.from_pretrained(
+                teacher_config.model_name,
+                trust_remote_code=True,
+            )
+            if teacher_tokenizer.get_vocab() != student_vocab:
+                raise ValueError(
+                    "on_policy_distillation.w2s requires every frozen model to "
+                    "share the student's token-ID mapping, but teacher "
+                    f"{teacher_config.alias!r} ({teacher_config.model_name}) "
+                    "differs."
+                )
 
     # Stable, config-derived index for each physical (deduplicated) teacher.
     # This is the single source of truth for "which teacher wrote this row":
@@ -893,25 +1214,18 @@ def create_teacher_worker_groups(
             teacher_index=alias_to_teacher_index[alias],
         )
         teacher_worker_groups[alias] = twg
+        if w2s_enabled:
+            # First-time HF-to-Megatron conversions of the frozen checkpoints
+            # are large; bring W2S-OPD's frozen models up one at a time.
+            _wait_for_teacher_workers(alias, twg)
         print(
             f"  ✓ Initialized teacher '{alias}' workers",
             flush=True,
         )
 
-    # Verify all teacher workers are alive (actor __init__ runs async and
-    # failures are otherwise silent until the first remote call).
     print("  Verifying teacher workers are healthy...", flush=True)
     for alias, twg in teacher_worker_groups.items():
-        try:
-            refs = [w.__ray_ready__.remote() for w in twg.worker_group.workers]
-            ray.get(refs, timeout=1800)
-        except Exception as e:
-            raise RuntimeError(
-                f"Teacher '{alias}' worker(s) failed during initialization. "
-                f"This often means a stale cached mcore checkpoint — try deleting "
-                f"the cached checkpoint under $HF_HOME/nemo_rl/ and rerunning.\n"
-                f"Original error: {e}"
-            ) from e
+        _wait_for_teacher_workers(alias, twg)
     print("  ✓ All teacher workers healthy", flush=True)
 
     # Reject a mixed/incompatible teacher packing config (raises).
@@ -926,5 +1240,32 @@ def create_teacher_worker_groups(
         model_to_primary[teacher_config.model_name] = teacher_config.alias
     for alias, model_name in teacher_model_by_agent_name.items():
         alias_to_group_alias[alias] = model_to_primary.get(model_name, alias)
+    # Frozen reference and anchor models route through reserved aliases (see
+    # create_teacher_configs_from_opd_config).
+    for alias, model_name in opd_cfg.get("reference_model_by_agent_name", {}).items():
+        alias_to_group_alias[f"ref:{alias}"] = model_to_primary[model_name]
+    if anchor_model is not None:
+        alias_to_group_alias["anchor:"] = model_to_primary[anchor_model]
 
     return teacher_worker_groups, alias_to_group_alias
+
+
+def _wait_for_teacher_workers(alias: str, twg: Any) -> None:
+    """Block until every worker of one teacher group has finished ``__init__``.
+
+    Actor ``__init__`` runs asynchronously, and its failures are otherwise
+    silent until the first remote call.
+
+    Raises:
+        RuntimeError: If a worker failed or did not come up within 30 minutes.
+    """
+    try:
+        refs = [w.__ray_ready__.remote() for w in twg.worker_group.workers]
+        ray.get(refs, timeout=1800)
+    except Exception as e:
+        raise RuntimeError(
+            f"Teacher '{alias}' worker(s) failed during initialization. "
+            f"This often means a stale cached mcore checkpoint — try deleting "
+            f"the cached checkpoint under $HF_HOME/nemo_rl/ and rerunning.\n"
+            f"Original error: {e}"
+        ) from e

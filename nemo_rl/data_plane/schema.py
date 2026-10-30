@@ -77,7 +77,24 @@ DP_TRAIN_FIELDS = (
 # packed per-token ``[N, S, D]``, with ``D`` the hidden size or vocabulary size.
 OPD_FULL_HIDDEN_STATES_FIELD = "teacher_full_hidden_states"
 OPD_FULL_LOGITS_FIELD = "teacher_full_logits"
-OPD_FULL_FIELDS = (OPD_FULL_HIDDEN_STATES_FIELD, OPD_FULL_LOGITS_FIELD)
+# W2S-OPD (``on_policy_distillation.w2s``): the negative teacher combines all
+# three arms on its GPUs and publishes only the proxy's exact top-K support
+# ``[N, S, K]`` (int32 token ids) and the proxy log-probabilities renormalized
+# on it ``[N, S, K]`` (float32). The anchor and positive teachers write their
+# pre-LM-head hidden states to their own columns (their hidden sizes may
+# differ) on temporary rows whose sample ids carry W2S_ARM_ROW_SUFFIX, cleared
+# within the same enrichment.
+W2S_ARM_FIELDS = ("w2s_anchor_hidden_states", "w2s_positive_hidden_states")
+W2S_PROXY_SUPPORT_IDS_FIELD = "w2s_proxy_support_ids"
+W2S_PROXY_TARGET_LOGPROBS_FIELD = "w2s_proxy_target_logprobs"
+W2S_PROXY_FIELDS = (W2S_PROXY_SUPPORT_IDS_FIELD, W2S_PROXY_TARGET_LOGPROBS_FIELD)
+W2S_ARM_ROW_SUFFIX = "__w2s_arms"
+OPD_FULL_FIELDS = (
+    OPD_FULL_HIDDEN_STATES_FIELD,
+    OPD_FULL_LOGITS_FIELD,
+    *W2S_ARM_FIELDS,
+    *W2S_PROXY_FIELDS,
+)
 
 # Per-sample (not per-token) teacher identity for multi-teacher full-vocabulary
 # MOPD's hidden-state path: which loaded teacher LM head projects this row's
@@ -180,7 +197,7 @@ def fields_with_optional_routed_experts(
 def fields_with_optional_opd_full(
     fields: Sequence[str],
     *,
-    field: Optional[str],
+    field: Optional[str | Sequence[str]],
     teacher_index_field: Optional[str] = None,
 ) -> list[str]:
     """Return `fields` plus the full-vocabulary MOPD teacher payload column(s).
@@ -190,7 +207,8 @@ def fields_with_optional_opd_full(
 
     Args:
         fields: Base field list.
-        field: Payload column name, or ``None`` when opd_full is off.
+        field: Payload column name, several of them (W2S-OPD reads
+            ``W2S_PROXY_FIELDS``), or ``None`` when opd_full is off.
         teacher_index_field: Per-sample teacher-identity column name (hidden-
             state path only, see ``OPD_FULL_TEACHER_INDEX_FIELD``), or
             ``None`` when opd_full is off or using the logits payload.
@@ -199,8 +217,10 @@ def fields_with_optional_opd_full(
         The field list, with the payload/index columns appended when applicable.
     """
     out = list(fields)
-    if field is not None and field not in out:
-        out.append(field)
+    payload_fields = (field,) if isinstance(field, str) else (field or ())
+    for payload_field in payload_fields:
+        if payload_field not in out:
+            out.append(payload_field)
     if teacher_index_field is not None and teacher_index_field not in out:
         out.append(teacher_index_field)
     return out

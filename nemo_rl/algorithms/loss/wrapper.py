@@ -34,13 +34,19 @@ Tensor = TypeVar("Tensor", bound=torch.Tensor)
 # of reducing them, reporting a "min" larger than any individual value. Hoist
 # into a single shared definition in loss/interfaces.py.
 _SEQ_METRIC_MIN: frozenset[str] = frozenset(
-    {"probs_ratio_min", "probs_ratio_clamped_min", "opd_full_reverse_kl_min"}
+    {
+        "probs_ratio_min",
+        "probs_ratio_clamped_min",
+        "opd_full_reverse_kl_min",
+        "w2s_opd_reverse_kl_min",
+    }
 )
 _SEQ_METRIC_MAX: frozenset[str] = frozenset(
     {
         "probs_ratio_max",
         "probs_ratio_clamped_max",
         "opd_full_reverse_kl_max",
+        "w2s_opd_reverse_kl_max",
         "opd_full_decomposition_error",
     }
 )

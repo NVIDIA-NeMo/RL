@@ -25,6 +25,10 @@ from nemo_rl.data_plane.schema import (
     OPD_FULL_HIDDEN_STATES_FIELD,
     OPD_FULL_TEACHER_INDEX_FIELD,
     TEACHER_LP_FIELDS,
+    W2S_ARM_FIELDS,
+    W2S_PROXY_FIELDS,
+    W2S_PROXY_SUPPORT_IDS_FIELD,
+    W2S_PROXY_TARGET_LOGPROBS_FIELD,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -963,3 +967,170 @@ def test_provider_override_allowlist_is_explicit_keys_only():
     # student configs carry no allowlist: every key applies as before
     student_megatron_cfg = {"radio_force_cpe_eval_mode": True}
     assert provider_override_allowed(student_megatron_cfg, "radio_force_cpe_eval_mode")
+
+
+# ── W2S-OPD ────────────────────────────────────────────────────────────────
+
+
+def _w2s_dispatch_teacher():
+    from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
+
+    class Sharding:
+        def get_axis_size(self, axis):
+            assert axis == "data_parallel"
+            return 1
+
+    teacher = object.__new__(TeacherWorkerGroup)
+    _disable_opd_full(teacher)
+    teacher._opd_full_payload = "hidden_states"
+    teacher._opd_full_payload_field = OPD_FULL_HIDDEN_STATES_FIELD
+    teacher.alias = "teacher"
+    teacher.use_sequence_packing = False
+    teacher.use_dynamic_batches = False
+    teacher.sequence_length_pad_multiple = 1
+    teacher.sharding_annotations = Sharding()
+    teacher.worker_group = MagicMock()
+    teacher._micro_batch_size = 1
+    return teacher
+
+
+def _w2s_meta():
+    return KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["a"],
+        fields=["input_ids", "input_lengths"],
+        sequence_lengths=[3],
+    )
+
+
+def test_w2s_arm_pass_writes_its_hidden_states_to_the_arm_column():
+    teacher = _w2s_dispatch_teacher()
+
+    teacher.get_logprobs_from_meta(_w2s_meta(), payload_field="arm_column")
+
+    kwargs = teacher.worker_group.run_all_workers_sharded_data.call_args.kwargs
+    assert kwargs["common_kwargs"]["opd_full_payload_field"] == "arm_column"
+    assert "w2s_proxy" not in kwargs["common_kwargs"]
+
+
+def test_w2s_proxy_pass_forwards_the_arm_rows_to_every_worker():
+    teacher = _w2s_dispatch_teacher()
+    arm_fields = W2S_ARM_FIELDS
+
+    teacher.get_w2s_proxy_from_meta(
+        _w2s_meta(), arm_sample_ids={"a": "a__arms"}, arm_fields=arm_fields
+    )
+
+    kwargs = teacher.worker_group.run_all_workers_sharded_data.call_args.kwargs
+    assert kwargs["common_kwargs"]["w2s_proxy"] == {
+        "arm_sample_ids": {"a": "a__arms"},
+        "arm_fields": arm_fields,
+    }
+    # The default payload column is untouched: the proxy pass writes the support.
+    assert kwargs["common_kwargs"]["opd_full_payload_field"] == (
+        OPD_FULL_HIDDEN_STATES_FIELD
+    )
+    with pytest.raises(ValueError, match="lack arm rows"):
+        teacher.get_w2s_proxy_from_meta(
+            _w2s_meta(), arm_sample_ids={}, arm_fields=arm_fields
+        )
+
+
+@pytest.mark.parametrize("writer", [True, False])
+def test_teacher_worker_presharded_entrypoint_writes_the_w2s_proxy_support(writer):
+    """Only the rank holding the proxy support writes it; logprobs keep their path."""
+    support = torch.zeros(1, 3, 4, dtype=torch.int32)
+    target = torch.full((1, 3, 4), -1.0)
+    proxy_calls = []
+
+    class Worker(_full_payload_worker_class()):
+        def get_w2s_proxy_logprobs(self, *, data, fetch_arm_rows, micro_batch_size):
+            del data
+            proxy_calls.append((fetch_arm_rows, micro_batch_size))
+            result = {"logprobs": torch.full((1, 3), 0.75)}
+            if writer:
+                result[W2S_PROXY_SUPPORT_IDS_FIELD] = support
+                result[W2S_PROXY_TARGET_LOGPROBS_FIELD] = target
+            return BatchedDataDict(result)
+
+    worker = Worker(None)
+    worker.get_teacher_logprobs_presharded(
+        _presharded_meta(),
+        micro_batch_size=1,
+        opd_full_payload="hidden_states",
+        opd_full_payload_dtype="bfloat16",
+        opd_full_payload_field=OPD_FULL_HIDDEN_STATES_FIELD,
+        w2s_proxy={"arm_sample_ids": {"a": "a__arms"}, "arm_fields": ("x", "y")},
+    )
+
+    assert len(proxy_calls) == 1 and callable(proxy_calls[0][0])
+    assert worker.full_payload_call is None and worker.logprob_call is None
+    assert worker.written[2] == "teacher_reference_logprobs"
+    assert torch.allclose(worker.written[1], torch.full((1, 3), 0.75))
+    if writer:
+        assert len(worker.stage_local_writes) == 1
+        _, fields = worker.stage_local_writes[0]
+        assert list(fields) == list(W2S_PROXY_FIELDS)
+    else:
+        assert worker.stage_local_writes == []
+
+
+def test_fetch_w2s_arm_rows_reads_each_rows_temporary_arm_row(monkeypatch):
+    import nemo_rl.data_plane.worker_mixin as worker_mixin_module
+    from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+
+    requested = {}
+
+    class Client:
+        def get_samples(self, *, sample_ids, partition_id, select_fields):
+            requested.update(
+                sample_ids=sample_ids,
+                partition_id=partition_id,
+                select_fields=select_fields,
+            )
+            return "td"
+
+    anchor = [torch.ones(3, 2), torch.ones(2, 2)]
+    positive = [torch.ones(3, 5), torch.ones(2, 5)]
+
+    def materialize(td, **kwargs):
+        assert td == "td" and kwargs["layout"] == "jagged"
+        return {
+            "anchor": torch.nested.nested_tensor(anchor, layout=torch.jagged),
+            "positive": torch.nested.nested_tensor(positive, layout=torch.jagged),
+        }
+
+    monkeypatch.setattr(worker_mixin_module, "_materialize_fetched", materialize)
+    worker = object.__new__(TQWorkerMixin)
+    worker._dp_client = Client()
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="teacher_lp:negative",
+        sample_ids=["b", "a"],
+        fields=["input_ids", "input_lengths"],
+        sequence_lengths=[3, 2],
+    )
+
+    rows = worker._fetch_w2s_arm_rows(
+        meta,
+        {
+            "arm_sample_ids": {"a": "a__arms", "b": "b__arms"},
+            "arm_fields": ("anchor", "positive"),
+        },
+    )
+
+    # Arm rows come back in the canonical rows' order, one (anchor, positive) each.
+    assert requested == {
+        "sample_ids": ["b__arms", "a__arms"],
+        "partition_id": "rollout_data",
+        "select_fields": ["anchor", "positive"],
+    }
+    assert [tuple(t.shape for t in row) for row in rows] == [
+        ((3, 2), (3, 5)),
+        ((2, 2), (2, 5)),
+    ]
+    with pytest.raises(ValueError, match="exactly two arm columns"):
+        worker._fetch_w2s_arm_rows(
+            meta, {"arm_sample_ids": {}, "arm_fields": ("anchor",)}
+        )

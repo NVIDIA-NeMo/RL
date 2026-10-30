@@ -445,7 +445,9 @@ class AdvantageComputer:
         # masking; leaving it unset keeps this metrics-only.
         if cfg.policy_logprobs_required:
             # Full KL compares unfiltered policy with possibly filtered rollout
-            # logprobs. Their normalization gap remains diagnostic.
+            # logprobs. Their normalization gap remains diagnostic. W2S-OPD is
+            # not opd_full here: it samples unfiltered, so its gap is real
+            # drift, and the threshold still masks it.
             seq_logprob_error_threshold = (
                 None if cfg.opd_full_enabled else cfg.algo.seq_logprob_error_threshold
             )

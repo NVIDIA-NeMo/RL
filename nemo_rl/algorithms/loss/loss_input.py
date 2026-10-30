@@ -28,6 +28,9 @@ from nemo_rl.algorithms.loss.utils import (
     map_teacher_logits_to_draft_vocab,
     reconstruct_opd_full_teacher_logits,
 )
+from nemo_rl.algorithms.w2s_opd import (
+    w2s_reverse_kl_from_support,
+)
 from nemo_rl.algorithms.x_token.loss_utils import (
     prepare_xtoken_cross_tokenizer_loss_input,
 )
@@ -48,6 +51,8 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
         ContextParallelSharder,
     )
+
+    from nemo_rl.algorithms.opd import W2SOPDConfig
 
 
 def _prepare_opd_full_loss_input(
@@ -90,6 +95,7 @@ def _prepare_opd_full_loss_input(
     # Deferred: nemo_rl.algorithms.opd imports the data plane (tensordict), which
     # should not be pulled into every loss-function consumer.
     from nemo_rl.algorithms.opd import (
+        W2SOPDConfig,
         opd_full_payload_field,
         opd_full_teacher_index_field,
     )
@@ -99,6 +105,15 @@ def _prepare_opd_full_loss_input(
         raise NotImplementedError(
             "opd_full currently requires the Megatron vocabulary-parallel path; "
             "the Automodel-only logit path is not supported."
+        )
+
+    if isinstance(full_cfg, W2SOPDConfig):
+        return _prepare_w2s_opd_loss_input(
+            logits,
+            data,
+            full_cfg,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
         )
 
     payload_field = opd_full_payload_field(full_cfg)
@@ -193,6 +208,62 @@ def _prepare_opd_full_loss_input(
             sampling_params=None,
             chunk_size=chunk_size,
         )
+    return loss_input
+
+
+def _prepare_w2s_opd_loss_input(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    w2s_cfg: "W2SOPDConfig",
+    *,
+    vocab_parallel_group: torch.distributed.ProcessGroup,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+) -> dict[str, Any]:
+    """Build the W2S-OPD loss input: the reverse KL to the frozen proxy.
+
+    Args:
+        logits: Student vocabulary-parallel logits ``[B, S_local, V_local]``.
+        data: Microbatch carrying the proxy-support columns.
+        w2s_cfg: The resolved W2S-OPD config.
+        vocab_parallel_group: Vocabulary-parallel process group.
+        context_parallel_group: Context-parallel process group.
+
+    Returns:
+        Loss input dict with the per-token divergence ``[B, S - 1]``.
+
+    Raises:
+        ValueError: If a proxy column is missing.
+    """
+    # Deferred: the data-plane package imports tensordict, which should not be
+    # pulled into every loss-function consumer.
+    from nemo_rl.data_plane.schema import (
+        W2S_PROXY_FIELDS,
+        W2S_PROXY_SUPPORT_IDS_FIELD,
+        W2S_PROXY_TARGET_LOGPROBS_FIELD,
+    )
+
+    chunk_size = w2s_cfg.chunk_size
+    assert chunk_size is not None  # W2SOPDConfig rejects a null chunk_size
+    missing = [field for field in W2S_PROXY_FIELDS if field not in data]
+    if missing:
+        raise ValueError(
+            f"W2S-OPD requires the proxy columns {missing!r} in the training "
+            "microbatch."
+        )
+    divergence = w2s_reverse_kl_from_support(
+        logits,
+        data[W2S_PROXY_SUPPORT_IDS_FIELD],
+        data[W2S_PROXY_TARGET_LOGPROBS_FIELD],
+        chunk_size=chunk_size,
+        vocab_parallel_group=vocab_parallel_group,
+        context_parallel_group=context_parallel_group,
+    )
+    # Position t predicts token t+1, the LOGPROB convention that pairs with
+    # token_mask[:, 1:].
+    next_token_width = int(data["input_ids"].shape[1]) - 1
+    loss_input: dict[str, Any] = {
+        "opd_full_divergence": divergence[:, :next_token_width]
+    }
     return loss_input
 
 
