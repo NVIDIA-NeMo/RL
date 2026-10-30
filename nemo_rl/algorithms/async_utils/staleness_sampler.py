@@ -110,11 +110,15 @@ class PromptGroupSampler(Protocol):
             current_train_weight: Trainer version used by the staleness policy.
             min_prompt_groups: Minimum groups needed to return a selection.
             max_prompt_groups: Maximum selection size. For chunked training,
-                this is the number of groups remaining in the current batch.
+                this is the groups remaining in the current batch, or
+                ``async_rl.max_groups_for_streaming_train`` when that is lower.
             group_multiple: Align the capped selection to this many complete
                 groups, leaving any unaligned ready groups unclaimed.
             min_remaining_groups: Defer a nonfinal selection if it would leave
-                fewer than this many groups in the current batch. A complete
+                fewer than this many groups in ``max_prompt_groups``. Under a
+                chunk cap that window is the capped chunk rather than the step,
+                so a floor close to the cap defers until the chunk can fill. A
+                complete
                 aligned remainder may be selected even when below this floor,
                 provided it meets ``min_prompt_groups``. Zero preserves greedy
                 selection. Custom streaming PPO samplers must honor this bound.

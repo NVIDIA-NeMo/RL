@@ -2802,6 +2802,11 @@ class SingleControllerActor:
                         max_prompt_groups = target_groups - groups_dispatched
                         if max_prompt_groups <= 0:
                             break
+                        # Bound what one dispatch materializes; the floor below
+                        # still clamps to this maximum.
+                        chunk_cap = self._async_cfg.max_groups_for_streaming_train
+                        if chunk_cap is not None:
+                            max_prompt_groups = min(max_prompt_groups, chunk_cap)
                         # For a colocated engine this is max_prompt_groups, pinned inside setup.
                         min_prompt_groups = min(
                             self._async_cfg.min_groups_for_streaming_train,
