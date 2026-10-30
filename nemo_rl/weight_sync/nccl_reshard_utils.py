@@ -31,7 +31,7 @@ live in ``nemo_rl/weight_sync/xferdtensor.py`` — import both from there.
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Optional, Protocol, cast, runtime_checkable
 
 import torch
 from torch.distributed._tensor import Shard
@@ -580,6 +580,34 @@ def is_blockwise_fp8_param_storage(fp8_cfg: Optional[dict[str, Any]]) -> bool:
     )
 
 
+def check_trtllm_nccl_reshard_bulk_params(refit_info: dict[str, Any]) -> None:
+    """Reject a refit plan whose bulk params TRT-LLM cannot receive.
+
+    The TRT-LLM destination writes grouped routed-expert stacks
+    (``grouped_expert_proj``) into its EP slots and nothing else: a dense MLP
+    projection also takes the bulk path (see ``is_nccl_reshard_param``) but
+    would need the engine's TP layout. Which params a model has is only known
+    once the trainer has built the plan, so this runs on the controller right
+    after that, before the plan reaches the engines.
+
+    Raises:
+        ValueError: if any bulk param is not a grouped routed-expert stack.
+    """
+    unsupported = [
+        param_info["name"]
+        for layer_name in refit_info["layer_names"]
+        for param_info in refit_info["per_layer_params"][layer_name]
+        if not param_info.get("grouped_expert_proj")
+    ]
+    if unsupported:
+        raise ValueError(
+            "refit_transport='nccl_reshard' with the TRT-LLM backend moves grouped "
+            f"routed experts only, but this model has {len(unsupported)} other bulk "
+            f"param(s), e.g. {unsupported[:3]} (dense MLP layers). Use "
+            "refit_transport=null (the collective refit) for this model."
+        )
+
+
 def check_nccl_reshard_refit_support(master_config: Any) -> None:
     """Validate ``master_config`` against every precondition of nccl_reshard_refit.
 
@@ -629,9 +657,9 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
 
     # Generation backends with a destination-side HFToLocalParamMap adapter.
     backend = generation.get("backend")
-    if backend not in ("vllm", "megatron"):
+    if backend not in ("vllm", "megatron", "trtllm"):
         violations.append(
-            f"policy.generation.backend must be 'vllm' or 'megatron' (got {backend!r})."
+            f"policy.generation.backend must be 'vllm', 'megatron' or 'trtllm' (got {backend!r})."
         )
 
     if backend == "vllm" and vllm_kwargs.get("enable_eplb"):
@@ -677,11 +705,12 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
     if megatron_enabled:
         etp = megatron_cfg.get("expert_tensor_parallel_size", 1)
 
-        # ETP with vLLM generation has not been fully tested yet.
-        if backend == "vllm" and etp not in (1, None):
+        # ETP with vLLM or TRT-LLM generation has not been fully tested yet.
+        if backend in ("vllm", "trtllm") and etp not in (1, None):
+            backend_name = "vLLM" if backend == "vllm" else "TRT-LLM"
             violations.append(
                 "policy.megatron_cfg.expert_tensor_parallel_size must be 1 "
-                f"for vLLM generation until ETP is fully tested (got {etp})."
+                f"for {backend_name} generation until ETP is fully tested (got {etp})."
             )
 
         # PP-layout knobs that _build_layer_to_pp_stage doesn't yet handle.
@@ -810,6 +839,40 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                     "policy.megatron_cfg.model_overrides, so copy those keys into it."
                 )
 
+    if backend == "trtllm":
+        # TRT-LLM's loader needs full EP-local experts; validate every engine role.
+        # Dense MLP layers are rejected later (check_trtllm_nccl_reshard_bulk_params).
+        from nemo_rl.models.generation.trtllm.config import (
+            TrtllmConfig,
+            resolve_disagg_layout,
+            resolve_role_overrides,
+            role_engine_config,
+        )
+
+        trtllm_generation = cast(TrtllmConfig, generation)
+        if resolve_disagg_layout(trtllm_generation).enabled:
+            # Idempotent, so an already-resolved config passes through as is.
+            resolved = resolve_role_overrides(trtllm_generation)
+            roles = {
+                f"trtllm_cfg.{role}_engine": role_engine_config(resolved, role)
+                for role in ("prefill", "decode")
+            }
+        else:
+            roles = {"trtllm_cfg": generation.get("trtllm_cfg", {}) or {}}
+        for label, kwargs in roles.items():
+            tp = int(kwargs.get("tensor_parallel_size", 1) or 1)
+            ep = int(kwargs.get("moe_expert_parallel_size", 1) or 1)
+            if ep != tp:
+                violations.append(
+                    f"policy.generation.{label}: "
+                    f"moe_expert_parallel_size ({ep}) must equal tensor_parallel_size "
+                    f"({tp}) for nccl_reshard_refit (pure expert parallelism)."
+                )
+            if int(kwargs.get("pipeline_parallel_size", 1) or 1) != 1:
+                violations.append(
+                    f"policy.generation.{label}: pipeline_parallel_size must be 1 "
+                    "for nccl_reshard_refit (this initial version)."
+                )
     # Gen-backend restrictions. The reshard supports gen-side TP, DP, EP, and
     # Megatron ETP. The vLLM backend shards experts by index across
     # its TP ranks, so its EP is either 1 (TP-sharded experts) or equal to TP

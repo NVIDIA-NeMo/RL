@@ -1578,8 +1578,10 @@ class VllmGeneration(GenerationInterface):
         # co-works with lm_policy; wait for all futures to complete outside
         return futures
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+    def prepare_nccl_reshard_refit_info(self, refit_infos: list[dict]) -> None:
         """Forward per-layer param metadata to vLLM workers for nccl_reshard refit."""
+        assert len(refit_infos) == 1, "vLLM generation has a single reshard layout"
+        refit_info = refit_infos[0]
         method_name = (
             "prepare_nccl_reshard_refit_info_async"
             if self.cfg["vllm_cfg"]["async_engine"]
@@ -1603,6 +1605,7 @@ class VllmGeneration(GenerationInterface):
         pp_size: int,
         train_ranks_per_stage: int,
         sub_world_size: int,
+        layout_index: int = 0,
     ) -> list[ray.ObjectRef]:
         """Re-init the bulk-path comm groups over the surviving shards only.
 
@@ -1611,6 +1614,7 @@ class VllmGeneration(GenerationInterface):
         ``model_update_group``'s -- both families have to be rebuilt together or the two
         disagree about who is present.
         """
+        assert layout_index == 0, "vLLM generation has a single reshard layout"
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 

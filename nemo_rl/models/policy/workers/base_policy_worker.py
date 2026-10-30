@@ -31,6 +31,9 @@ class AbstractPolicyWorker:
     model_update_group: Optional[Any] = None
     # Same, for the per-PP-stage group the nccl_reshard transport builds.
     pp_comm_group: Optional[Any] = None
+    # The same group keyed by generation layout, for backends whose engines come
+    # in several layouts (disaggregated TRT-LLM); layout 0 is ``pp_comm_group``.
+    pp_comm_groups_by_layout: Optional[dict[int, Any]] = None
 
     def sync_params_before_refit(self) -> None:
         """Materialize optimizer updates before refit when the backend requires it."""
@@ -111,6 +114,7 @@ class AbstractPolicyWorker:
         my_pp_stage: int,
         sub_world_size: int,
         my_rank_in_group: int,
+        layout_index: int = 0,
     ) -> None:
         """Bootstrap this train worker's nccl_reshard comm group.
 
@@ -125,7 +129,13 @@ class AbstractPolicyWorker:
         # _build re-runs both communicator families on every reconcile, so without this
         # each recovery strands a NCCL communicator and a bound TCPStore per PP stage for
         # the life of the worker. Deferred past the rendezvous and bounded, same as there.
-        stale_group, self.pp_comm_group = self.pp_comm_group, None
+        # Replace only this layout's group; layout 0 also backs pp_comm_group.
+        groups_by_layout = dict(self.pp_comm_groups_by_layout or {})
+        stale_group = groups_by_layout.pop(layout_index, None)
+        if layout_index == 0:
+            stale_group = stale_group or self.pp_comm_group
+            self.pp_comm_group = None
+        self.pp_comm_groups_by_layout = groups_by_layout
 
         # Printed on both sides of this rendezvous, because a mismatch here is invisible
         # otherwise: the party that got it wrong just waits, and the other reports a 300s
@@ -139,7 +149,7 @@ class AbstractPolicyWorker:
             f"rank={my_rank_in_group} world_size={sub_world_size}",
             flush=True,
         )
-        self.pp_comm_group = StatelessProcessGroup(
+        group = StatelessProcessGroup(
             master_address=pp_ips[my_pp_stage],
             port=pp_ports[my_pp_stage],
             rank=my_rank_in_group,
@@ -148,7 +158,10 @@ class AbstractPolicyWorker:
         device = torch.cuda.current_device()
         # Free cached blocks so NCCL P2P buffers have headroom (see init_collective).
         torch.cuda.empty_cache()
-        self.pp_comm_group.init_nccl_communicator(device=device)
+        group.init_nccl_communicator(device=device)
+        self.pp_comm_groups_by_layout[layout_index] = group
+        if layout_index == 0:
+            self.pp_comm_group = group
         self.my_pp_stage = my_pp_stage
 
         if stale_group is not None:
@@ -164,6 +177,7 @@ class AbstractPolicyWorker:
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
+        layout_index: int = 0,
     ) -> dict[str, Any]:
         """Prepare parameter metadata for NCCL reshard refit."""
         # This is a placeholder implementation.

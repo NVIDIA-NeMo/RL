@@ -701,6 +701,9 @@ class MegatronPolicyWorkerImpl(
     # Tests and extension classes that bypass __init__ retain the historical
     # training/source behavior unless they explicitly select destination.
     is_refit_destination: bool = False
+    # nccl_reshard source plans keyed by generation layout (one for vLLM and
+    # Megatron generation, one per engine role for disaggregated TRT-LLM).
+    nccl_reshard_refit_infos: Optional[dict[int, dict[str, Any]]] = None
     # Holds the split-API train-step state between begin/finish or
     # begin/abort; None when no step is open. Declared at class level so
     # ``self._train_step_state = None`` after finish/abort type-checks.
@@ -4260,8 +4263,15 @@ class MegatronPolicyWorkerImpl(
         gen_world_size: Optional[int] = None,
         *,
         refit_info: Optional[dict[str, Any]] = None,
+        layout_index: int = 0,
     ) -> Optional[dict[str, Any]]:
-        """Prepare NCCL-reshard state for the worker's explicit refit role."""
+        """Prepare NCCL-reshard state for the worker's explicit refit role.
+
+        ``layout_index`` selects the generation layout the plan is built for;
+        a backend whose engines come in several layouts (disaggregated TRT-LLM)
+        prepares one plan per layout and the refit sends the bulk params once
+        per plan.
+        """
         if self.is_refit_destination:
             if refit_info is None:
                 raise ValueError("Destination NCCL refit requires refit_info.")
@@ -4291,12 +4301,16 @@ class MegatronPolicyWorkerImpl(
             raise ValueError(
                 "Source NCCL refit requires train/gen parallelism and world sizes."
             )
-        return self._prepare_source_nccl_reshard_refit_info(
+        refit_info = self._prepare_source_nccl_reshard_refit_info(
             train_parallelism,
             gen_parallelism,
             train_world_size,
             gen_world_size,
         )
+        plans = dict(self.nccl_reshard_refit_infos or {})
+        plans[layout_index] = refit_info
+        self.nccl_reshard_refit_infos = plans
+        return refit_info
 
     def _build_expert_groups(self, param_map):
         """Group this rank's live source specs in numeric expert order.
@@ -4470,7 +4484,11 @@ class MegatronPolicyWorkerImpl(
             )
             groups = [*generation_groups.values(), self.model_update_group]
         else:
-            groups = [self.pp_comm_group, self.model_update_group]
+            layout_groups = self.pp_comm_groups_by_layout or {}
+            groups = [
+                *(layout_groups.values() or [self.pp_comm_group]),
+                self.model_update_group,
+            ]
 
         with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
             if self.is_refit_destination:
@@ -4495,53 +4513,24 @@ class MegatronPolicyWorkerImpl(
         # refits.
         from nemo_rl.distributed.refit_watchdog import sync_stream_within
 
-        # Keep this local because xferdtensor probes optional NCCL M-to-N bindings.
-        from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
-
-        # Source pre hooks and spec.post enqueue on this worker's current stream;
-        # xferdtensor uses the same stream.
-        nccl_reshard_stream = torch.cuda.current_stream()
-        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
-            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
-                layer_name
-            ]:
-                # Each train worker handles only its own PP stage's params
-                # (non-PP = every param is in pp_stage 0).
-                if param_info.get("pp_stage", 0) != self.my_pp_stage:
-                    continue
-                group = self.pp_comm_group
-
-                spec = self.hf_to_local_param_map.get(param_info["name"])
-                assert spec is not None, (
-                    f"no spec for {param_info['name']!r} in hf_to_local_param_map"
-                )
-                ctx = spec.materialize()
-                assert ctx.buf is not None, (
-                    f"no local tensor for {param_info['name']!r}"
-                )
-                src_tensor = DTensorRef(
-                    local_tensor=ctx.buf, global_shape=param_info["global_shape"]
-                )
-                xferdtensor(
-                    src_tensor,
-                    param_info["src_mesh_info"],
-                    param_info["src_placements"],
-                    None,
-                    param_info["dst_mesh_info"],
-                    param_info["dst_placements"],
-                    group,
-                    nccl_reshard_stream,
-                )
-                if spec.post is not None:
-                    spec.post(ctx)
-                # Drop refs to per-param views and grouped tensors promptly.
-                del ctx, src_tensor
-
-        sync_stream_within(
-            nccl_reshard_stream, refit_timeout_s, "the bulk parameter transfer"
-        )
-        torch.cuda.empty_cache()
-
+        # Materialization runs on the current stream; one layout sends there too,
+        # several get a stream each so prefill and decode transfers overlap.
+        materialize_stream = torch.cuda.current_stream()
+        layout_indices = self._nccl_reshard_layout_indices()
+        if len(layout_indices) == 1:
+            streams = {layout_indices[0]: materialize_stream}
+        else:
+            streams = {idx: torch.cuda.Stream() for idx in layout_indices}
+        self._send_bulk_params(layout_indices, streams, materialize_stream)
+        for idx in layout_indices:
+            sync_stream_within(
+                streams[idx],
+                refit_timeout_s,
+                f"the bulk parameter transfer (generation layout {idx})",
+            )
+        # TRT-LLM reuses cached allocations for the following misc broadcast.
+        if not self._refit_is_trtllm_nccl_reshard():
+            torch.cuda.empty_cache()
         misc_t0 = time.perf_counter()
         self._broadcast_misc_params_packed(kv_scales=kv_scales)
         sync_stream_within(
@@ -4553,6 +4542,107 @@ class MegatronPolicyWorkerImpl(
                 f"{time.perf_counter() - misc_t0:.2f}s",
                 flush=True,
             )
+
+    def _nccl_reshard_layout_indices(self) -> list[int]:
+        """Generation layouts this worker sends bulk params to, in order."""
+        plans = self.nccl_reshard_refit_infos or {}
+        if not plans:
+            return [0]
+        return sorted(plans)
+
+    def _send_bulk_params(
+        self,
+        layout_indices: list[int],
+        streams: dict[int, torch.cuda.Stream],
+        materialize_stream: torch.cuda.Stream,
+    ) -> None:
+        """Send every bulk param of every generation layout via xferdtensor, by layer.
+
+        Each layer's local sources are materialized once (on ``materialize_stream``)
+        and enqueued to every layout on that layout's stream, so the layouts'
+        transfers overlap instead of running back to back. With a single layout
+        each source is post-processed and freed right after its send, so peak
+        memory stays at one materialized buffer.
+        """
+        from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
+
+        plans = self.nccl_reshard_refit_infos or {}
+        groups = self.pp_comm_groups_by_layout or {}
+        layouts = []
+        for layout_index in layout_indices:
+            refit_info = plans.get(layout_index, self.nccl_reshard_refit_info)
+            group = groups.get(layout_index, self.pp_comm_group)
+            if group is None:
+                raise RuntimeError(
+                    f"no reshard bulk communicator for generation layout {layout_index}"
+                )
+            layouts.append((layout_index, refit_info, group, streams[layout_index]))
+        layer_names = list(layouts[0][1]["layer_names"])
+        for layout_index, refit_info, _, _ in layouts[1:]:
+            if list(refit_info["layer_names"]) != layer_names:
+                raise RuntimeError(
+                    f"generation layout {layout_index} orders the bulk layers differently "
+                    "from layout 0; the layer-interleaved send needs one order"
+                )
+        # Share each materialization across layouts, retaining at most one layer;
+        # a single layout frees each source right after its send.
+        cache_layer = len(layouts) > 1
+        for layer_name in layer_names:
+            layer_ctxs: dict[int, tuple[LocalParamSpec, RefitCtx]] = {}
+            try:
+                for layout_index, refit_info, group, stream in layouts:
+                    for param_info in refit_info["per_layer_params"][layer_name]:
+                        # Each train worker handles only its own PP stage's params
+                        # (non-PP = every param is in pp_stage 0).
+                        if param_info.get("pp_stage", 0) != self.my_pp_stage:
+                            continue
+
+                        spec = self.hf_to_local_param_map.get(param_info["name"])
+                        assert spec is not None, (
+                            f"no spec for {param_info['name']!r} in hf_to_local_param_map"
+                        )
+                        cached = layer_ctxs.get(id(spec))
+                        if cached is None:
+                            ctx = spec.materialize()
+                            assert ctx.buf is not None, (
+                                f"no local tensor for {param_info['name']!r}"
+                            )
+                            if cache_layer:
+                                layer_ctxs[id(spec)] = (spec, ctx)
+                        else:
+                            ctx = cached[1]
+                        if stream is not materialize_stream:
+                            # Wait for materialization before sending this buffer.
+                            stream.wait_stream(materialize_stream)
+                        src_tensor = DTensorRef(
+                            local_tensor=ctx.buf,
+                            global_shape=param_info["global_shape"],
+                        )
+                        xferdtensor(
+                            src_tensor,
+                            param_info["src_mesh_info"],
+                            param_info["src_placements"],
+                            None,
+                            param_info["dst_mesh_info"],
+                            param_info["dst_placements"],
+                            group,
+                            stream,
+                        )
+                        if stream is not materialize_stream:
+                            # Keep source storage alive until this stream finishes sending it.
+                            ctx.buf.record_stream(stream)
+                        del src_tensor
+                        if not cache_layer:
+                            if spec.post is not None:
+                                spec.post(ctx)
+                            del ctx
+                for spec, ctx in layer_ctxs.values():
+                    if spec.post is not None:
+                        spec.post(ctx)
+            finally:
+                # Never retain stale BF16 materializations across layers or
+                # optimizer steps.
+                layer_ctxs.clear()
 
     def _broadcast_misc_params_packed(self, kv_scales=None) -> None:
         """Broadcast misc params via the existing packed_broadcast machinery."""
@@ -4826,6 +4916,14 @@ class MegatronPolicyWorkerImpl(
         self.model.start_param_sync(force_sync=True)
         # Ensure exporters cannot observe a partially gathered buffer.
         torch.cuda.synchronize()
+
+    def _refit_is_trtllm_nccl_reshard(self) -> bool:
+        """Whether this policy refits TRT-LLM engines shard-to-shard."""
+        generation_cfg = self.cfg.get("generation") or {}
+        return (
+            generation_cfg.get("backend") == "trtllm"
+            and generation_cfg.get("refit_transport") == "nccl_reshard"
+        )
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):

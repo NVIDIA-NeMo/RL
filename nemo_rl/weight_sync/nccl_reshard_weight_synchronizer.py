@@ -55,6 +55,7 @@ from nemo_rl.weight_sync.membership import (
     should_rebuild,
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import (
+    check_trtllm_nccl_reshard_bulk_params,
     make_nccl_reshard_refit_info_wire_safe,
 )
 
@@ -157,35 +158,71 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             "pp_size": megatron_cfg.get("pipeline_model_parallel_size", 1),
         }
 
-    def _gen_parallelism(self) -> dict[str, int]:
+    def _gen_layouts(self) -> list[dict[str, Any]]:
+        """Destination layouts, each ``{tp_size, ep_size, etp_size, pp_size, world_size}``.
+
+        vLLM and Megatron generation are one layout spanning every inference
+        rank. TRT-LLM reports one per engine role: under prefill/decode
+        disaggregation the context and generation engines have different
+        TP/EP, and xferdtensor needs one destination mesh per transfer, so the
+        bulk path runs once per layout (its own communicators and plan).
+        """
         generation_cfg = self._policy.cfg["generation"]
-        if generation_cfg["backend"] == "vllm":
+        backend = generation_cfg["backend"]
+        if backend == "vllm":
             vllm_cfg = generation_cfg.get("vllm_cfg", {})
             tp_size = vllm_cfg.get("tensor_parallel_size", 1)
             ep_size = vllm_cfg.get("expert_parallel_size", 1)
-            return {
-                "tp_size": tp_size,
-                "ep_size": ep_size,
-                "etp_size": tp_size if ep_size == 1 else 1,
-                "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
-            }
-        if generation_cfg["backend"] == "megatron":
+            return [
+                {
+                    "tp_size": tp_size,
+                    "ep_size": ep_size,
+                    "etp_size": tp_size if ep_size == 1 else 1,
+                    "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
+                    "world_size": None,
+                }
+            ]
+        if backend == "megatron":
             # Resolve through the same merge the generation model is built from,
             # so the reshard mesh cannot drift from the layout MCore actually
             # instantiates (e.g. the inference_optimized ETP pin).
             megatron_cfg = merged_inference_megatron_cfg(self._policy.cfg)
             tp_size = megatron_cfg["tensor_model_parallel_size"]
             etp_size = megatron_cfg.get("expert_tensor_parallel_size")
-            return {
-                "tp_size": tp_size,
-                "ep_size": megatron_cfg["expert_model_parallel_size"],
-                # Match MCore's effective default: an omitted/None ETP uses TP.
-                "etp_size": tp_size if etp_size is None else etp_size,
-                "pp_size": megatron_cfg["pipeline_model_parallel_size"],
-            }
+            return [
+                {
+                    "tp_size": tp_size,
+                    "ep_size": megatron_cfg["expert_model_parallel_size"],
+                    # Match MCore's effective default: an omitted/None ETP uses TP.
+                    "etp_size": tp_size if etp_size is None else etp_size,
+                    "pp_size": megatron_cfg["pipeline_model_parallel_size"],
+                    "world_size": None,
+                }
+            ]
+        if backend == "trtllm":
+            layouts = []
+            for layout in self._generation.get_nccl_reshard_layouts():
+                if layout["etp_size"] != 1:
+                    raise ValueError(
+                        f"TRT-LLM {layout['role']} engines split experts by TP "
+                        f"(moe_tensor_parallel_size {layout['etp_size']}); the reshard "
+                        "refit needs pure expert parallelism (moe_expert_parallel_size "
+                        "== tensor_parallel_size)"
+                    )
+                layouts.append(
+                    {
+                        "role": layout["role"],
+                        "tp_size": layout["tp_size"],
+                        "ep_size": layout["ep_size"],
+                        "etp_size": layout["etp_size"],
+                        "pp_size": layout["pp_size"],
+                        "world_size": layout["world_size"],
+                    }
+                )
+            return layouts
         raise ValueError(
-            "NCCL M-to-N refit only supports vLLM or Megatron generation, got "
-            f"{generation_cfg['backend']!r}."
+            "NCCL M-to-N refit only supports vLLM, Megatron or TRT-LLM generation, got "
+            f"{backend!r}."
         )
 
     def sync_weights(
@@ -273,7 +310,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         self._generation.set_refit_membership(membership)
 
         train_parallelism = self._train_parallelism()
-        gen_parallelism = self._gen_parallelism()
         train_world_size = membership.train_world_size
         world_size = membership.world_size
         inference_world_size = world_size - train_world_size
@@ -305,75 +341,105 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)
 
-        # 2. Bulk-path comm group(s): one per PP stage, each spanning that
-        #    stage's train ranks + all gen ranks (non-PP == a single stage over
-        #    all train + gen ranks).  Separate NCCL communicator from
-        #    model_update_group; the workers run the misc broadcast strictly
-        #    after the bulk reshard (concurrent communicators can deadlock).
+        # 2. Bulk-path comm group(s): one per (generation layout, PP stage),
+        #    each spanning that stage's train ranks + the layout's gen ranks
+        #    (non-PP, one layout == a single group over all train + gen ranks).
+        #    Separate NCCL communicators from model_update_group; the workers
+        #    run the misc broadcast strictly after the bulk reshard (concurrent
+        #    communicators can deadlock).
         pp_size = train_parallelism["pp_size"]
         train_gpus_per_node = self._train_cluster.num_gpus_per_node
         train_ranks_per_stage = train_world_size // pp_size
-        sub_world_size = train_ranks_per_stage + inference_world_size
         pp_stages = [r // train_ranks_per_stage for r in range(train_world_size)]
         ranks_in_group = [r % train_ranks_per_stage for r in range(train_world_size)]
-        # An IP and free port for each stage's group (one when non-PP).
-        pp_ips: list[str] = []
-        pp_ports: list[int] = []
-        for stage in range(pp_size):
-            node_idx = stage * train_ranks_per_stage // train_gpus_per_node
-            stage_ip, stage_port = self._train_cluster.get_available_address_and_port(
-                pg_idx=node_idx, bundle_idx=0
+        layouts = self._gen_layouts()
+        layout_worlds = [
+            inference_world_size
+            if layout["world_size"] is None
+            else layout["world_size"]
+            for layout in layouts
+        ]
+        if sum(layout_worlds) != inference_world_size:
+            raise RuntimeError(
+                f"generation layouts cover {sum(layout_worlds)} ranks but the inference "
+                f"world has {inference_world_size}"
             )
-            pp_ips.append(stage_ip)
-            pp_ports.append(stage_port)
-        print(
-            f"nccl_reshard bulk comm group IPs/ports ({pp_size} stage(s)): "
-            f"{list(zip(pp_ips, pp_ports))}",
-            flush=True,
-        )
-        futures_train = self._policy.init_nccl_reshard_comm_group(
-            pp_ips=pp_ips,
-            pp_ports=pp_ports,
-            pp_size=pp_size,
-            pp_stages=pp_stages,
-            sub_world_size=sub_world_size,
-            ranks_in_group=ranks_in_group,
-        )
-        futures_inference = self._generation.rebuild_nccl_reshard_comm_group(
-            membership,
-            pp_ips=pp_ips,
-            pp_ports=pp_ports,
-            pp_size=pp_size,
-            train_ranks_per_stage=train_ranks_per_stage,
-            sub_world_size=sub_world_size,
-        )
-        ray.get(futures_train + futures_inference)
-
+        for layout_index, (layout, layout_world) in enumerate(
+            zip(layouts, layout_worlds)
+        ):
+            sub_world_size = train_ranks_per_stage + layout_world
+            # An IP and free port for each stage's group (one when non-PP).
+            pp_ips: list[str] = []
+            pp_ports: list[int] = []
+            for stage in range(pp_size):
+                node_idx = stage * train_ranks_per_stage // train_gpus_per_node
+                stage_ip, stage_port = (
+                    self._train_cluster.get_available_address_and_port(
+                        pg_idx=node_idx, bundle_idx=0
+                    )
+                )
+                pp_ips.append(stage_ip)
+                pp_ports.append(stage_port)
+            print(
+                f"nccl_reshard bulk comm group IPs/ports (layout {layout_index}"
+                f"{' ' + layout['role'] if 'role' in layout else ''}, {pp_size} stage(s), "
+                f"sub_world_size {sub_world_size}): {list(zip(pp_ips, pp_ports))}",
+                flush=True,
+            )
+            futures_train = self._policy.init_nccl_reshard_comm_group(
+                pp_ips=pp_ips,
+                pp_ports=pp_ports,
+                pp_size=pp_size,
+                pp_stages=pp_stages,
+                sub_world_size=sub_world_size,
+                ranks_in_group=ranks_in_group,
+                layout_index=layout_index,
+            )
+            futures_inference = self._generation.rebuild_nccl_reshard_comm_group(
+                membership,
+                pp_ips=pp_ips,
+                pp_ports=pp_ports,
+                pp_size=pp_size,
+                train_ranks_per_stage=train_ranks_per_stage,
+                sub_world_size=sub_world_size,
+                layout_index=layout_index,
+            )
+            ray.get(futures_train + futures_inference)
         # 3. Refit metadata.  Train builds backend-agnostic per-layer metadata
-        #    (HF naming convention); gen maps it into its own fused layout
-        #    (e.g. vLLM's w13/w2).
+        #    (HF naming convention) per layout; gen maps it into its own fused
+        #    layout (e.g. vLLM's w13/w2, TRT-LLM's EP slots).
         #
         #    Regenerated, not reused, on a rebuild. Each parameter's destination
-        #    placements are derived from inference_world_size, so a plan built for the
-        #    old fleet would have survivors writing the slices the dead shard used to
-        #    own and leaving their own unwritten -- with no error, because a stale mesh
-        #    is still a valid mesh.
-        nccl_reshard_refit_info = self._policy.prepare_nccl_reshard_refit_info(
-            train_parallelism,
-            gen_parallelism,
-            train_world_size,
-            inference_world_size,
-        )
-
-        # nccl_reshard_refit_info holds MeshInfo rank tensors created under
-        # Megatron, whose pickles resolve a Megatron-patched storage loader and
-        # therefore need `import megatron` on unpickle. Convert them to plain
-        # lists here; the vLLM worker rebuilds them in
-        # `restore_refit_info_placements()`.
-        wire_refit_info = make_nccl_reshard_refit_info_wire_safe(
-            nccl_reshard_refit_info
-        )
-        self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
+        #    placements are derived from the layout's world size, so a plan built
+        #    for the old fleet would have survivors writing the slices the dead
+        #    shard used to own and leaving their own unwritten -- with no error,
+        #    because a stale mesh is still a valid mesh.
+        wire_refit_infos = []
+        for layout_index, (layout, layout_world) in enumerate(
+            zip(layouts, layout_worlds)
+        ):
+            gen_parallelism = {
+                key: layout[key]
+                for key in ("tp_size", "ep_size", "etp_size", "pp_size")
+            }
+            nccl_reshard_refit_info = self._policy.prepare_nccl_reshard_refit_info(
+                train_parallelism,
+                gen_parallelism,
+                train_world_size,
+                layout_world,
+                layout_index=layout_index,
+            )
+            if self._policy.cfg["generation"]["backend"] == "trtllm":
+                check_trtllm_nccl_reshard_bulk_params(nccl_reshard_refit_info)
+            # nccl_reshard_refit_info holds MeshInfo rank tensors created under
+            # Megatron, whose pickles resolve a Megatron-patched storage loader and
+            # therefore need `import megatron` on unpickle. Convert them to plain
+            # lists here; the gen worker rebuilds them in
+            # `restore_refit_info_placements()`.
+            wire_refit_infos.append(
+                make_nccl_reshard_refit_info_wire_safe(nccl_reshard_refit_info)
+            )
+        self._generation.prepare_nccl_reshard_refit_info(wire_refit_infos)
         self._built_membership = membership
 
     def _settle_budget_s(self) -> float:

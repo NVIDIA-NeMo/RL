@@ -634,8 +634,14 @@ class GenerationInterface(ABC):
         """Return a backend-specific collective world size when required."""
         return None
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
-        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+    def prepare_nccl_reshard_refit_info(self, refit_infos: list[dict]) -> None:
+        """Prepare per-layer param metadata for nccl_reshard-based refit.
+
+        ``refit_infos`` holds one plan per destination layout, in the order of
+        the ``layout_index`` the bulk communicators were built with. vLLM and
+        Megatron generation have a single layout; disaggregated TRT-LLM has one
+        per engine role.
+        """
         raise NotImplementedError
 
     def nccl_reshard_refit(

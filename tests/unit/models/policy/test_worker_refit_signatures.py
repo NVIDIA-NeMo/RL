@@ -56,6 +56,14 @@ FANOUT_METHODS = [
             "interfaces.py",
         ],
     ),
+    (
+        "prepare_nccl_reshard_refit_info",
+        [
+            "workers/base_policy_worker.py",
+            "workers/megatron_policy_worker.py",
+            "interfaces.py",
+        ],
+    ),
 ]
 
 # The same contract on the generation side, and worse there: VllmGeneration picks the
