@@ -140,6 +140,7 @@ def _make_controller(
         invalidate_kv_cache=MagicMock(),
         pause_generation_for_refit=MagicMock(return_value=True),
         resume_generation_after_refit=MagicMock(return_value=True),
+        set_serving_shards=MagicMock(),
         # The probe asks by shard index; the shard-to-worker layout stays in the backend.
         shard_liveness_ref=_liveness,
     )
@@ -195,6 +196,8 @@ def test_failed_pause_recovers_and_pauses_survivors_before_refit(failure):
         mock.call(clear_cache=False, timeout_s=61.0),
     ]
     assert sync.reconciled_with[-1] == [0]
+    # A backend behind its own router (Dynamo) learns the serving set before resuming.
+    assert ctrl._gen.set_serving_shards.call_args.args == ({1},)
     ctrl._gen.resume_generation_after_refit.assert_called_once_with(timeout_s=61.0)
     assert ctrl._rollout_permitted.is_set()
 

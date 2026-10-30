@@ -33,8 +33,18 @@ run_test() {
     fi
 }
 
-run_test fast uv run --no-sync bash ./tests/functional/grpo_dynamo.sh
-run_test uv run --no-sync bash ./tests/functional/grpo_dynamo_single_controller.sh
+# Dynamo overlays: native SingleController tests rerun with policy.generation.dynamo=true.
+# Each keeps the native test's checks and adds check_dynamo_overlay.sh's.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh ++policy.generation.dynamo=true
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true ++policy.generation.dynamo=true
+# Gym's default mode: token arrays come back through the frontend in engine_data.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++policy.generation.dynamo=true
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh ++policy.generation.dynamo=true
+# Router replay with deferred routes: the engine stages each captured call's routed experts.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true policy.model_name=silence09/DeepSeek-R1-Small-2layers ++policy.router_replay.enabled=true ++token_capture.defer_routed_experts_to_policy=true ++policy.generation.dynamo=true
+# Fleet health: a lost shard leaves the frontend's routing, and a restarted one rejoins it.
+run_test uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh ++policy.generation.dynamo=true
+run_test env RESTART_DEAD_SHARDS=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh ++policy.generation.dynamo=true
 
 cd "${PROJECT_ROOT}/tests"
 if compgen -G ".coverage*" > /dev/null; then

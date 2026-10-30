@@ -15,7 +15,7 @@
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import is_dataclass, replace
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
 
@@ -318,6 +318,76 @@ def _as_routed_experts_tensor(
     return tensor.to(dtype=dtype)
 
 
+def off_policy_sampling_error(
+    *,
+    temperature: Optional[float],
+    top_p: Optional[float],
+    top_k: Optional[int],
+    generation_config: Any,
+) -> Optional[str]:
+    """Why an HTTP rollout request would sample off-policy, or None if it would not.
+
+    Request sampling must match NeMo RL's exactly, or inference runs off-policy and
+    destabilizes training. Validation rollouts are the one exception: they carry the
+    validation profile (``val_temperature`` / ``val_top_p``), which is metric-only.
+    Multi-turn agents issue their own requests, so the serving HTTP endpoint is the
+    one chokepoint they all pass.
+
+    Args:
+        temperature: The request's temperature.
+        top_p: The request's top_p. It must be explicit: vLLM resolves an unset top_p
+            from the model's generation_config.json (``ModelConfig.generation_config``
+            defaults to ``"auto"``), not necessarily 1.0.
+        top_k: The request's top_k, which must be unset or -1 (disabled), matching
+            ``BaseVllmGenerationWorker._build_sampling_params``. vLLM resolves an
+            unset top_k from generation_config.json too, so None means on-policy only
+            once the caller sends the request with top_k=-1.
+        generation_config: ``policy.generation``, with the train and validation
+            sampling parameters.
+    """
+    if top_k not in (None, -1):
+        return f"Top k sampling parameter must be unset, empty, or -1. Got `{top_k}`"
+    if top_p is None:
+        return (
+            "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
+            "resolved by vLLM from the model's generation_config.json and would "
+            "bypass the on-policy sampling check."
+        )
+    is_train_sampling = (
+        temperature == generation_config["temperature"]
+        and top_p == generation_config["top_p"]
+    )
+    is_val_sampling = (
+        temperature == generation_config["val_temperature"]
+        and top_p == generation_config["val_top_p"]
+    )
+    if is_train_sampling or is_val_sampling:
+        return None
+    return (
+        f"request sampling (temperature={temperature}, top_p={top_p}) matches neither "
+        f"the train sampling params (temperature={generation_config['temperature']}, "
+        f"top_p={generation_config['top_p']}) nor the validation sampling params "
+        f"(val_temperature={generation_config['val_temperature']}, "
+        f"val_top_p={generation_config['val_top_p']})"
+    )
+
+
+def import_parser_plugins(vllm_cfg: Mapping[str, Any]) -> None:
+    """Import ``vllm_cfg``'s tool and reasoning parser plugins into vLLM's registries.
+
+    The native OpenAI server resolves its parser names against them, and Dynamo
+    registration checks which names a plugin provides.
+    """
+    # vLLM is installed only in the generation workers' venv.
+    from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+    from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
+
+    if tool_parser_plugin := vllm_cfg.get("tool_parser_plugin"):
+        ToolParserManager.import_tool_parser(tool_parser_plugin)
+    if reasoning_parser_plugin := vllm_cfg.get("reasoning_parser_plugin"):
+        ReasoningParserManager.import_reasoning_parser(reasoning_parser_plugin)
+
+
 def validate_rollout_prompt(expected: list[int], actual: list[int] | None) -> None:
     """Reject rollouts generated from a different prompt than the learner's."""
     if actual != expected:
@@ -496,6 +566,56 @@ def pad_and_align_routed_expert_indices(
     return (full, stats) if return_stats else full
 
 
+def chat_routed_experts(
+    final_request_output: Any,
+    generation_details: Any,
+    *,
+    prompt_token_count: int,
+    device: torch.device,
+    logger: Any,
+    routed_experts_dtype: torch.dtype,
+) -> str:
+    """The routed-experts envelope the chat endpoint attaches to one choice."""
+    generation_token_count = len(getattr(generation_details, "token_ids", []) or [])
+    # return_stats=True returns the (routes, stats) pair.
+    routed_experts, r3_stats = cast(
+        tuple[Optional[torch.Tensor], dict[str, int]],
+        pad_and_align_routed_expert_indices(
+            final_request_output,
+            generation_details,
+            valid_length=prompt_token_count + generation_token_count,
+            padded_length=prompt_token_count + generation_token_count,
+            device=device,
+            require_complete_routed_experts=True,
+            return_stats=True,
+            routed_experts_dtype=routed_experts_dtype,
+        ),
+    )
+    if routed_experts is None:
+        raise RuntimeError(
+            "vLLM was asked to return routed experts for the "
+            "OpenAI-compatible chat endpoint but the generation "
+            "output did not include routed_experts."
+        )
+    if r3_stats["missing_routes"] > 0 and logger is not None:
+        logger.warning(
+            "R3 router replay fallback: vLLM returned incomplete "
+            "routed_experts for chat choice_idx=%d, "
+            "missing_token_routes=%d, actual_routes=%d, "
+            "expected_routes=%d. Megatron will use its own router "
+            "for those missing token routes.",
+            generation_details.index,
+            r3_stats["missing_routes"],
+            r3_stats["actual_routes"],
+            r3_stats["expected_routes"],
+        )
+    # Base64 envelope instead of .tolist(): nested JSON int lists cost
+    # ~1s of CPU per serialize/parse hop at long context lengths and get
+    # re-validated at every gym HTTP hop; a single string passes through
+    # the gym chain opaquely.
+    return encode_routed_experts(routed_experts.to(dtype=routed_experts_dtype))
+
+
 def attach_routed_experts_to_chat_response_choices(
     response: Any,
     final_request_output: Any,
@@ -519,48 +639,13 @@ def attach_routed_experts_to_chat_response_choices(
         if generation_details is None:
             continue
         attached_choice_indices.add(choice.index)
-
-        generation_token_count = len(getattr(generation_details, "token_ids", []) or [])
-        routed_result = pad_and_align_routed_expert_indices(
+        choice.message.routed_experts = chat_routed_experts(
             final_request_output,
             generation_details,
-            valid_length=prompt_token_count + generation_token_count,
-            padded_length=prompt_token_count + generation_token_count,
+            prompt_token_count=prompt_token_count,
             device=device,
-            require_complete_routed_experts=True,
-            return_stats=True,
+            logger=logger,
             routed_experts_dtype=routed_experts_dtype,
-        )
-        if not isinstance(routed_result, tuple):
-            raise RuntimeError(
-                "Expected routed_experts alignment to return stats for the "
-                "OpenAI-compatible chat endpoint."
-            )
-        routed_experts, r3_stats = routed_result
-        if routed_experts is None:
-            raise RuntimeError(
-                "vLLM was asked to return routed experts for the "
-                "OpenAI-compatible chat endpoint but the generation "
-                "output did not include routed_experts."
-            )
-        if r3_stats["missing_routes"] > 0 and logger is not None:
-            logger.warning(
-                "R3 router replay fallback: vLLM returned incomplete "
-                "routed_experts for chat choice_idx=%d, "
-                "missing_token_routes=%d, actual_routes=%d, "
-                "expected_routes=%d. Megatron will use its own router "
-                "for those missing token routes.",
-                choice.index,
-                r3_stats["missing_routes"],
-                r3_stats["actual_routes"],
-                r3_stats["expected_routes"],
-            )
-        # Base64 envelope instead of .tolist(): nested JSON int lists cost
-        # ~1s of CPU per serialize/parse hop at long context lengths and get
-        # re-validated at every gym HTTP hop; a single string passes through
-        # the gym chain opaquely.
-        choice.message.routed_experts = encode_routed_experts(
-            routed_experts.to(dtype=routed_experts_dtype)
         )
 
     if len(attached_choice_indices) != len(choices):
@@ -623,55 +708,66 @@ def attach_token_information_to_chat_response_choices(
         )
 
     for choice in choices:
-        generation_details = outputs_by_index[choice.index]
-        output_token_ids = getattr(generation_details, "token_ids", None)
-        if output_token_ids is None:
-            raise RuntimeError(
-                "vLLM was asked to return token information for the "
-                "OpenAI-compatible chat endpoint but generation output "
-                f"choice_idx={choice.index} did not include token_ids."
-            )
-        generation_token_ids = list(output_token_ids)
-
-        generation_logprob_details = getattr(generation_details, "logprobs", None)
-        if generation_logprob_details is None:
-            if generation_token_ids:
-                raise RuntimeError(
-                    "vLLM was asked to return token information for the "
-                    "OpenAI-compatible chat endpoint but generation output "
-                    f"choice_idx={choice.index} did not include logprobs."
-                )
-            generation_log_probs = []
-        else:
-            if len(generation_token_ids) != len(generation_logprob_details):
-                raise RuntimeError(
-                    "vLLM returned mismatched generation token IDs and log "
-                    "probabilities for the OpenAI-compatible chat endpoint: "
-                    f"choice_idx={choice.index}, "
-                    f"token_count={len(generation_token_ids)}, "
-                    f"logprob_count={len(generation_logprob_details)}."
-                )
-            generation_log_probs = []
-            for token_id, position_logprobs in zip(
-                generation_token_ids, generation_logprob_details
-            ):
-                selected_token_logprob = position_logprobs.get(token_id)
-                if selected_token_logprob is None:
-                    raise RuntimeError(
-                        "vLLM generation log probabilities did not include the "
-                        "selected token while attaching token information to "
-                        "the OpenAI-compatible chat response: "
-                        f"choice_idx={choice.index}, token_id={token_id}."
-                    )
-                generation_log_probs.append(
-                    max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
-                )
-
+        generation_token_ids, generation_log_probs = chat_generation_tokens(
+            outputs_by_index[choice.index]
+        )
         choice.message.prompt_token_ids = list(prompt_token_ids)
         choice.message.generation_token_ids = generation_token_ids
         choice.message.generation_log_probs = generation_log_probs
 
     return response
+
+
+def chat_generation_tokens(generation_details: Any) -> tuple[list[int], list[float]]:
+    """One choice's generated token IDs and their sampled-token log probabilities.
+
+    As the chat endpoint reports them in ``generation_token_ids`` and
+    ``generation_log_probs``: each log probability is floored at
+    ``VLLM_LOGPROB_FLOOR``.
+    """
+    choice_index = generation_details.index
+    output_token_ids = getattr(generation_details, "token_ids", None)
+    if output_token_ids is None:
+        raise RuntimeError(
+            "vLLM was asked to return token information for the "
+            "OpenAI-compatible chat endpoint but generation output "
+            f"choice_idx={choice_index} did not include token_ids."
+        )
+    generation_token_ids = list(output_token_ids)
+
+    generation_logprob_details = getattr(generation_details, "logprobs", None)
+    if generation_logprob_details is None:
+        if generation_token_ids:
+            raise RuntimeError(
+                "vLLM was asked to return token information for the "
+                "OpenAI-compatible chat endpoint but generation output "
+                f"choice_idx={choice_index} did not include logprobs."
+            )
+        return generation_token_ids, []
+    if len(generation_token_ids) != len(generation_logprob_details):
+        raise RuntimeError(
+            "vLLM returned mismatched generation token IDs and log "
+            "probabilities for the OpenAI-compatible chat endpoint: "
+            f"choice_idx={choice_index}, "
+            f"token_count={len(generation_token_ids)}, "
+            f"logprob_count={len(generation_logprob_details)}."
+        )
+    generation_log_probs = []
+    for token_id, position_logprobs in zip(
+        generation_token_ids, generation_logprob_details
+    ):
+        selected_token_logprob = position_logprobs.get(token_id)
+        if selected_token_logprob is None:
+            raise RuntimeError(
+                "vLLM generation log probabilities did not include the "
+                "selected token while attaching token information to "
+                "the OpenAI-compatible chat response: "
+                f"choice_idx={choice_index}, token_id={token_id}."
+            )
+        generation_log_probs.append(
+            max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
+        )
+    return generation_token_ids, generation_log_probs
 
 
 def model_dump_chat_response_with_dynamic_message_fields(
