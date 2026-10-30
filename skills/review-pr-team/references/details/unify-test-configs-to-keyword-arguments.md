@@ -2,7 +2,7 @@
 
 > A unit test that builds a BaseModel config from a dict literal is a consistency finding; ask to unify it to keyword arguments
 
-**Why:** tests across the repo build config models in several ways (`Foo(k=v)`, `Foo.model_construct(...)`, `Foo.model_validate({...})`, `Foo(**{...})`). One way makes them easy to read and grep, and keyword arguments fail on a misspelled field name where a dict literal can hide it.
+**Why:** tests across the repo build config models in several ways (`Foo(k=v)`, `Foo.model_construct(...)`, `Foo.model_validate({...})`, `Foo(**{...})`). One way makes them easy to read and grep.
 
 **How to apply:**
 

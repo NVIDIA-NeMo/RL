@@ -1,4 +1,3 @@
-
 # Removing a Config Key
 
 Deleting a key from the schema and the shipped YAMLs is only half the job. Users have their own configs. If nothing rejects the old key they get one of two bad outcomes:
