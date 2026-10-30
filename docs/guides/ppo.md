@@ -14,7 +14,7 @@ uv run examples/run_ppo.py --config <PATH TO YAML CONFIG> {overrides}
 
 If not specified, `config` will default to [examples/configs/ppo_math_1B.yaml](../../examples/configs/ppo_math_1B.yaml).
 
-**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for gated models.
+**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `hf auth login` as well for gated models.
 
 In this guide, we'll walk through how we handle:
 
