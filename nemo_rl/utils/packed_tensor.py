@@ -23,7 +23,7 @@ import torch
 
 @lru_cache(maxsize=1)
 def get_target_packed_tensor_size():
-    memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.02")
+    memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.01")
     device = torch.device("cuda")
     props = torch.cuda.get_device_properties(device)
     total_memory_bytes = props.total_memory
