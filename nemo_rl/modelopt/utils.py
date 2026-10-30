@@ -22,6 +22,26 @@ from typing import Any
 MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS = 600_000
 
 
+def modelopt_kv_cache_format(config: dict[str, Any]) -> str | None:
+    """Read the symmetric KV format from canonical ModelOpt metadata."""
+    scheme = config.get("kv_cache_scheme")
+    if scheme is None:
+        return None
+    if scheme == "NVFP4":
+        return "NVFP4"
+    if isinstance(scheme, dict) and (
+        scheme.get("type") == "float"
+        and scheme.get("num_bits") == 8
+        and scheme.get("dynamic") is False
+        and scheme.get("strategy") in (None, "tensor")
+    ):
+        return "FP8"
+    raise ValueError(
+        "ModelOpt real-quant refit supports symmetric per-tensor FP8 or NVFP4 KV caches, "
+        f"got kv_cache_scheme={scheme!r}"
+    )
+
+
 def validate_real_quant_policy_config(policy_config: dict[str, Any]) -> None:
     """Validate static policy requirements for real-quant rollout."""
     if not policy_config.get("megatron_cfg", {}).get("enabled", False):

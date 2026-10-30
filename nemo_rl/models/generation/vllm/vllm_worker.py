@@ -669,7 +669,13 @@ class BaseVllmGenerationWorker:
 
         # Call init_fp8 when precision is fp8
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
-        if self.cfg["vllm_cfg"]["precision"] == "fp8":
+        if self.cfg.get("real_quant") and self.precision == "fp8":
+            # Model dtype remains BF16; canonical ModelOpt metadata, not the
+            # legacy init_fp8 patch, chooses packed weights and KV storage.
+            self.precision = "bfloat16"
+        if self.cfg["vllm_cfg"]["precision"] == "fp8" and not self.cfg.get(
+            "real_quant"
+        ):
             from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
 
             fp8_kwargs = init_fp8(

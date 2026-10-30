@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import types
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from typing import Any, Optional
 
@@ -25,7 +25,10 @@ from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuanti
 from nemo_rl.modelopt.models.generation.vllm_quant_moe_amax import (
     route_moe_input_quantizer_amax,
 )
-from nemo_rl.modelopt.utils import MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
+from nemo_rl.modelopt.utils import (
+    MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS,
+    modelopt_kv_cache_format,
+)
 from nemo_rl.models.generation.vllm.checkpoint_engine import VllmCheckpointEngineMixin
 from nemo_rl.models.generation.vllm.patches import modelopt_moe_amax_aliases
 from nemo_rl.models.generation.vllm.vllm_backend import (
@@ -40,6 +43,40 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         "k_bmm_quantizer._amax",
         "v_bmm_quantizer._amax",
     )
+
+    @contextmanager
+    def _kv_scale_refit(self) -> Iterator[None]:
+        if not self._is_real_quant_model():
+            yield
+            return
+        hf_config = getattr(self.model_config, "hf_config", None)
+        config = getattr(hf_config, "quantization_config", None)
+        kv_format = modelopt_kv_cache_format(config) if config else None
+        if kv_format is None:
+            yield
+            return
+        from nemo_rl.modelopt.models.generation.vllm_quant_kv import refit_kv_scales
+
+        try:
+            with refit_kv_scales(
+                self.model_runner,
+                self.state_dict_info,
+                kv_format,
+                on_scales_changed=self._on_kv_scales_changed,
+            ):
+                yield
+        except Exception as error:
+            # Never serve after a partly refitted cache/graph lifecycle.
+            self._nrl_layerwise_reload_failure = error
+            raise
+
+    def update_weights_via_ipc_zmq(self) -> bool:
+        with self._kv_scale_refit():
+            return super().update_weights_via_ipc_zmq()
+
+    def _update_weights_from_collective(self, refit_with_reload_api: bool) -> bool:
+        with self._kv_scale_refit():
+            return super()._update_weights_from_collective(refit_with_reload_api)
 
     def _supports_unquantized_flashinfer_trtllm_refit(self) -> bool:
         return False

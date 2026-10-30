@@ -82,6 +82,13 @@ def _configure_quant_engine_kwargs(
                 "Real quantization requires a policy-produced "
                 "hf_overrides.quantization_config before vLLM initialization"
             )
+        if quantization_config.get("kv_cache_scheme") is not None:
+            # Register before vLLM builds ModelConfig, not after loading weights.
+            from nemo_rl.modelopt.models.generation.vllm_quant_kv import (
+                register_modelopt_kv_configs,
+            )
+
+            register_modelopt_kv_configs()
     else:
         llm_kwargs["worker_cls"] = (
             "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
