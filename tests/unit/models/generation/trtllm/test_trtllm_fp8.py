@@ -21,13 +21,13 @@ from nemo_rl.models.generation.trtllm.quantization.fp8 import (
     MXFP8_BLOCK_QUANT_KWARGS,
     MXFP8_BLOCK_SIZE,
     UE8M0_BIAS,
+    build_local_expert_lookup,
     cast_tensor_to_fp8_blockwise,
     cast_tensor_to_mxfp8_blockwise,
     configure_fp8_llm_kwargs,
     configure_fp8_moe_backend,
     load_weights,
     validate_fused_expert_layout,
-    build_local_expert_lookup,
     validate_model_type,
     validate_routed_experts,
 )
@@ -412,6 +412,23 @@ def test_local_expert_lookup_converts_only_local_experts(is_mx):
         assert tensor.dtype == full[name].dtype
     assert f"{prefix}.0.gate_proj.weight" not in local
     assert f"{prefix}.2.down_proj.weight" not in local
+
+
+def test_local_expert_lookup_covering_every_expert_skips_the_gather(monkeypatch):
+    prefix = "model.layers.0.mlp.experts"
+    _gate, _up, down, gate_up = _fused_expert_stacks(3)
+    weights = [(f"{prefix}.gate_up_proj", gate_up), (f"{prefix}.down_proj", down)]
+    full = load_weights(weights)
+
+    def no_gather(*_args, **_kwargs):
+        raise AssertionError("all experts are local; the stack must not be gathered")
+
+    monkeypatch.setattr(torch.Tensor, "index_select", no_gather)
+    local = load_weights(weights, local_experts=lambda p: [2, 0, 1])
+
+    assert set(local) == set(full)
+    for name, tensor in local.items():
+        assert torch.equal(tensor.float(), full[name].float())
 
 
 def test_local_expert_lookup_unknown_prefix_converts_everything():
