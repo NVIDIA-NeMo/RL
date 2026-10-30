@@ -18,14 +18,16 @@
 - **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GRPO.
 - **NeMo-Gym Integration** - RL environment integration.
 - **GB200** - Container support for GB200.
+- **Muon Optimizer** - Muon optimizer support for SFT/RL. See the [Muon guide](../guides/muon-optimizer.md).
+- **SGLang Inference** - SGLang rollout backend. See the [Generation design doc](../design-docs/generation.md).
+- **Speculative Decoding** - Eagle3 draft models for rollout acceleration. See the [Eagle3 guide](../guides/eagle3-speculative-decoding.md).
+- **GDPO** - See `examples/configs/gdpo_math_1B.yaml`.
+- **Nemotron-Super** - See the [Nemotron 3 Super guide](../guides/models/nemotron/nemotron-3-super.md).
 
 ## Planned / In Progress
 
-- **Muon Optimizer** - Emerging optimizer support for SFT/RL.
-- **SGLang Inference** - SGLang rollout support for optimized inference.
 - **Improved Native Performance** - Improved training time for native PyTorch models.
 - **Improved Large MoE Performance** - Improved Megatron Core training and generation performance.
-- **New Models** - Qwen3-Next and Nemotron-Super.
-- **Expanded Algorithms** - GDPO and broader LoRA coverage for GRPO and DPO.
+- **New Models** - Qwen3-Next.
+- **Expanded Algorithms** - Broader LoRA coverage for GRPO and DPO.
 - **Resiliency** - Fault tolerance and auto-scaling support.
-- **Speculative Decoding** - Speculative decoding support for rollout acceleration.
