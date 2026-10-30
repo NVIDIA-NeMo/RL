@@ -33,6 +33,7 @@ from nemo_rl.algorithms.opd import TeacherResourceConfig
 from nemo_rl.data.multimodal_utils import teacher_multimodal_fields
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
 from nemo_rl.data_plane.column_io import round_up
+from nemo_rl.data_plane.interfaces import backend_config
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, TEACHER_LP_FIELDS
 from nemo_rl.distributed.batched_data_dict import (
@@ -282,6 +283,8 @@ class TeacherWorkerGroup:
         self._opd_full_teacher_index_field: Optional[str] = (
             opd_full_cfg["teacher_index_field"] if opd_full_cfg else None
         )
+        # Decided in setup_data_plane, once the data-plane transport is known.
+        self._keep_outputs_on_gpu = False
 
         # Set up sequence packing / dynamic batching (mirrors lm_policy.py)
         self.use_sequence_packing = cfg["sequence_packing"]["enabled"]
@@ -317,6 +320,13 @@ class TeacherWorkerGroup:
                 "setup_data_plane", cfg=dp_cfg
             )
         )
+        # Only a GDR PUT reads straight from GPU, so only then can the teacher
+        # skip copying what it writes (logprobs and any payload) to CPU.
+        if dp_cfg["backend"] == "mooncake_cpu":
+            mooncake_cfg = backend_config(dp_cfg)
+            self._keep_outputs_on_gpu = (
+                mooncake_cfg.use_gdr and mooncake_cfg.gdr_keep_teacher_payload_on_gpu
+            )
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         """Dispatch a TQ metadata batch; workers fetch and write teacher logprobs."""
@@ -383,6 +393,7 @@ class TeacherWorkerGroup:
                 "micro_batch_size": self._micro_batch_size,
                 "opd_full_payload": self._opd_full_payload,
                 "opd_full_payload_dtype": self._opd_full_payload_dtype,
+                "keep_outputs_on_gpu": self._keep_outputs_on_gpu,
                 "opd_full_payload_field": self._opd_full_payload_field,
                 "opd_full_teacher_index": self.teacher_index,
                 "opd_full_teacher_index_field": self._opd_full_teacher_index_field,

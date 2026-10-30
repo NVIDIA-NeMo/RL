@@ -463,6 +463,7 @@ data_plane:
     staging_buffer_size:  536870912    # 512 MiB/pool slot; bigger payloads register per transfer
     use_gdr: false                      # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024         # persistent MiB per active GDR client
+    gdr_keep_teacher_payload_on_gpu: true  # MOPD only, with use_gdr: teacher outputs stay on GPU until the PUT
     storage_unit_segment_size: 0       # >0: storage units on (see "Storage layout")
     num_storage_units: null            # total units; null = 2 per selected node
     storage_unit_placement: all        # all, or cluster names: [inference], [train, teacher:<name>]
@@ -884,6 +885,15 @@ into groups. In the mixed CPU-producer/GDR-receiver flow used by
 SingleController, however, each individual tensor must currently fit because
 the CPU PUT path does not create the chunk metadata required by an oversized
 GDR GET.
+
+`mooncake_cpu.gdr_keep_teacher_payload_on_gpu` only matters for MOPD with
+`use_gdr: true`; every other run ignores it. When it is on (the default), the
+MOPD teacher keeps what it writes on the GPU until the PUT: its logprobs and,
+with full-vocabulary MOPD, its hidden-state or logits payload. The PUT then
+copies them GPU to GPU into the GDR staging buffer instead of going
+GPU → CPU → GPU. The cost is teacher GPU memory: each last-stage teacher GPU
+holds its data-parallel share of one prompt group's payload until the PUT. Set
+it to `false` to copy them to CPU first, as without GDR.
 
 ### Mooncake storage layout: clients vs storage units
 
