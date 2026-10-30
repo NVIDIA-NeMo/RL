@@ -710,7 +710,9 @@ fi
 
 if (( EXIT_CODE != 0 )); then
     echo "[recovery] FAIL: a surviving shard should have carried the run to completion"
-    grep -E "Error|Traceback|NoSurvivingShards|RayActorError" "$RUN_LOG" | tail -20
+    # Keep stack frames and NCCL warnings; filtering for exception names hides
+    # the cause of failures during communicator reconstruction.
+    cat "$RUN_LOG"
     exit 1
 fi
 
