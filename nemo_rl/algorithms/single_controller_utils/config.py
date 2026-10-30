@@ -1574,7 +1574,7 @@ def resolve_ppo_chunk_alignment(
     return group_multiple, min_remaining_groups
 
 
-def _validate_automodel_stage_one_config(master_config: MasterConfig) -> None:
+def _validate_automodel_single_controller_config(master_config: MasterConfig) -> None:
     """Fail before allocating workers for unsupported AutoModel SC combinations."""
     policy = master_config.policy
     automodel = policy.get("automodel_cfg")
@@ -1647,7 +1647,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "Use the non-streaming GRPO trainer."
         )
     _validate_algo_settings(master_config)
-    _validate_automodel_stage_one_config(master_config)
+    _validate_automodel_single_controller_config(master_config)
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
