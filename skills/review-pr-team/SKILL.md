@@ -116,7 +116,7 @@ This ensures review comments can point authors to the established pattern rather
 ### 1.4 Read root context
 
 - Read `CLAUDE.md` from repo root
-- Read all `.claude/skills/*/SKILL.md` files (except `review-pr` and `review-pr-team`)
+- Read all `.claude/skills/*/SKILL.md` files (except `review-pr-team`)
 - Read every `references/*.md` file in this skill's own directory. These are the shared review lessons for this repo, grouped by theme. A rule marked ★ has come up three or more times; list those first when you pass the lessons on. A rule that ends with `Details: [name](details/name.md)` has a full lesson behind it, with the steps, commands and repo maps the one-line rule leaves out. Keep those links when you pass the lessons on, and tell every agent to read the detail file whenever its rule applies to what it is checking.
 - Read every `skills/contributing/references/*.md` and treat each rule as a finding checklist, the same as this skill's own references. A rule that ends with `Review Details: [name](...)` has a review lesson behind it, and one that ends with `Contributing Details:` has an author how-to under `skills/contributing/references/details/`; tell every agent to read the linked file whenever the rule applies.
 - Then glob `~/.claude/review-memory/RL/*.md` and read EVERY match. This is the optional, machine-local store of lessons that are not in `references/` yet. It may be empty or absent; an empty glob is fine. New lessons are written here in Phase 6. A memory's `count` is how many times its pattern has shown up in reviewed PRs; list the ones with count 2 or more first.

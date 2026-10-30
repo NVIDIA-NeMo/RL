@@ -19,9 +19,7 @@ Any task that writes or changes code also loads the `contributing` skill and rea
 
 For formal GitHub reviews, comment `/review` or `/review mode=strict` on the PR. See CONTRIBUTING.md for service integration prerequisites. The existing repository review guidance and local interactive commands below are unchanged.
 
-Use `/review-pr <pr-number>` for interactive local PR review.
-
-Use `/review-pr-team <pr-number>` for a deeper review by a coordinated team of specialized agents (requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`). Related: `/review-pr-team-with-html <pr-number>` adds a public explainer page built with `/pr-html-concise-public`, and `/review-pr-team-verify-followup <pr-number>` checks the author's fixes after a published review and scans the new commits for major issues they introduced.
+Use `/review-pr-team <pr-number>` for interactive local PR review by a coordinated team of specialized agents (requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`). Related: `/review-pr-team-with-html <pr-number>` adds a public explainer page built with `/pr-html-concise-public`, and `/review-pr-team-verify-followup <pr-number>` checks the author's fixes after a published review and scans the new commits for major issues they introduced.
 
 When reviewing code, follow these principles:
 
