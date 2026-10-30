@@ -31,6 +31,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from ray import cloudpickle
 
 from nemo_rl.environments.nemo_gym import NemoGym
 
@@ -98,8 +99,9 @@ async def _drain(async_generator: AsyncIterator[Any]) -> None:
 class TestHealthCheck:
     @pytest.mark.nemo_gym
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("serialize_spinup", [False, True])
     async def test_spinup_reuses_rollout_client_and_refreshes_it_on_restart(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, serialize_spinup: bool
     ) -> None:
         import nemo_gym.cli
         import nemo_gym.server_utils as gym_utils
@@ -130,9 +132,13 @@ class TestHealthCheck:
         monkeypatch.setattr(gym_utils, "is_global_aiohttp_client_setup", lambda: True)
 
         env = _unspun()
+        spinup = NemoGymClass._spinup
+        if serialize_spinup:
+            # Ray ships the method by value; annotation-only globals can be lost.
+            spinup = cloudpickle.loads(cloudpickle.dumps(spinup))
         clients = []
         for _ in range(2):
-            env._spinup()
+            spinup(env)
             assert load.call_count == len(clients) * 2 + 1
             clients.append(env.rch.setup_server_client(env.head_server_config))
             for _ in range(64):

@@ -210,7 +210,7 @@ def _sealed_attempt_state() -> dict[str, Any]:
             generation_index=0,
             gate_rollout_id=gate_id,
             receipt={
-                "rollout_id": gate_id,
+                "capture_key": gate_id,
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
@@ -218,6 +218,59 @@ def _sealed_attempt_state() -> dict[str, Any]:
         )
     )
     return ledger.state_dict()
+
+
+@pytest.mark.parametrize("schema", [2, 3])
+def test_restore_rejects_capture_receipts_before_v4(schema: int) -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = schema
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    receipt = attempt["receipt"]
+    receipt["rollout_id"] = receipt.pop("capture_key")
+
+    with pytest.raises(
+        ValueError,
+        match="Token-capture rollout checkpoints from before schema v4 cannot be resumed",
+    ):
+        RolloutRecoveryLedger.from_state_dict(state)
+    assert "rollout_id" in receipt
+    assert "capture_key" not in receipt
+
+
+@pytest.mark.parametrize("schema", [2, 3, 4])
+@pytest.mark.parametrize("sealed", [False, True])
+def test_receipt_free_recovery_still_loads(schema: int, sealed: bool) -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = schema
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    attempt["receipt"] = None
+    attempt["staging_keys"] = []
+    if not sealed:
+        state["groups"][0]["status"] = "generating"
+        attempt.update(status="dispatched", reward=None, mask_sample=None)
+    if schema == 2:
+        for key in ("reward_checks", "reward_log_context"):
+            attempt.pop(key)
+
+    sidecar = {
+        **state,
+        "batch_shortfall": {7: 1},
+        "sampler_stamps_target_steps": True,
+    }
+    if schema >= 3:
+        sidecar.update(
+            reward_settings=None,
+            finalizer_metrics_by_group={},
+            finalizer_rewards_by_group={},
+        )
+    parsed = parse_rollout_recovery_state(sidecar)
+    restored = RolloutRecoveryLedger.from_state_dict(parsed.ledger_state)
+    current = restored.get_group("g7").siblings[0].current_attempt
+    assert current.receipt is None
+    assert current.reward == (1.0 if sealed else None)
+    assert parsed.batch_shortfall == {7: 1}
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict()["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
 
 
 @pytest.mark.parametrize(
@@ -265,7 +318,7 @@ def test_restore_rejects_malformed_attempt_fields(
     elif case == "receipt_manifest_type":
         attempt["receipt"]["manifest"] = None
     elif case == "receipt_identity":
-        attempt["receipt"]["rollout_id"] = "wrong"
+        attempt["receipt"]["capture_key"] = "wrong"
     elif case == "receipt_manifest":
         attempt["receipt"]["manifest"] = [{"staging_key": "wrong"}]
     elif case == "unsealed_payload":
@@ -738,7 +791,7 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
             generation_index=0,
             gate_rollout_id=sealed_id,
             receipt={
-                "rollout_id": sealed_id,
+                "capture_key": sealed_id,
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
@@ -792,7 +845,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     receipts = [
         None,
         {
-            "rollout_id": gate_ids[1],
+            "capture_key": gate_ids[1],
             "manifest": [{"staging_key": f"{gate_ids[1]}/call"}],
         },
     ]
@@ -915,7 +968,7 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
         results[generation_index] = SiblingSealResult(
             gate_rollout_id=gate_id,
             receipt={
-                "rollout_id": gate_id,
+                "capture_key": gate_id,
                 "manifest": [{"staging_key": f"g7/sibling-{generation_index}/call-0"}],
             },
             reward=1.0,
@@ -959,7 +1012,7 @@ def test_prompt_group_seal_is_atomic() -> None:
         0: SiblingSealResult(
             gate_rollout_id=gate_id,
             receipt={
-                "rollout_id": gate_id,
+                "capture_key": gate_id,
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
@@ -1003,7 +1056,7 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
             generation_index=0,
             gate_rollout_id=gate_id,
             receipt={
-                "rollout_id": gate_id,
+                "capture_key": gate_id,
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
@@ -1088,12 +1141,16 @@ def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
     assert parsed.sampler_stamps_target_steps is False
 
 
-@pytest.mark.parametrize("version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [2, 3, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> None:
     state = _sealed_attempt_state()
     state["schema_version"] = version
     for group in state["groups"]:
         group.pop("resolved_agent_name", None)
+    if version < 4:
+        attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+        attempt["receipt"] = None
+        attempt["staging_keys"] = []
     ledger = RolloutRecoveryLedger.from_state_dict(state)
     group_id = state["groups"][0]["group_id"]
     before = ledger.finalization_inputs(group_id)
@@ -1237,7 +1294,7 @@ def test_reward_checks_seals_and_survives_checkpoint(granularity):
     context = RewardLogContext("agent", '{"answer":"ok"}')
     result = SiblingSealResult(
         rollout_id,
-        {"rollout_id": rollout_id, "manifest": []},
+        {"capture_key": rollout_id, "manifest": []},
         -2.0,
         False,
         evidence,
@@ -1338,7 +1395,7 @@ def test_restore_rejects_malformed_reward_checks(raw_checks):
     rollout_id = group.gate_rollout_ids[0]
     result = SiblingSealResult(
         rollout_id,
-        {"rollout_id": rollout_id, "manifest": []},
+        {"capture_key": rollout_id, "manifest": []},
         1.0,
         False,
         RewardChecks(False, False, False),

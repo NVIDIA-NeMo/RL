@@ -228,7 +228,7 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     receipt, expected = _stage_fixture(
         tq_client, "worked_example", rollout_id=f"{group_id}_g0"
     )
-    receipt["rollout_id"] = f"{group_id}_g0"
+    receipt["capture_key"] = f"{group_id}_g0"
     # Mark this receipt's terminal as heuristically selected so the group
     # metric sees a mixed declared/heuristic population.
     receipt["terminal_selection"] = "heuristic"
@@ -262,6 +262,14 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     assert finalized.metrics["finalize/terminal_selection_heuristic_count"] == 1.0
     assert finalized.metrics["finalize/terminal_selection_heuristic_fraction"] == 0.5
     assert finalized.metrics["finalize/terminal_selection_declared_count"] == 0.0
+    assert {
+        key
+        for key in finalized.metrics
+        if key.startswith("finalize/terminal_selection_") and key.endswith("_count")
+    } == {
+        f"finalize/terminal_selection_{method}_count"
+        for method in ("declared", "response_id", "content", "heuristic")
+    }
     assert finalized.metrics["finalize/terminal_witness_disagreement_count"] == 0.0
     assert finalized.canonical_output_tokens == sum(expected.token_mask)
 
@@ -297,12 +305,12 @@ def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
     receipt, expected = _stage_fixture(
         tq_client, "worked_example", rollout_id=f"{group_id}_g0"
     )
-    receipt["rollout_id"] = f"{group_id}_g0"
+    receipt["capture_key"] = f"{group_id}_g0"
     assert receipt["terminal_selection"] == "declared"
     # A manifest that never parsed ran no attribution stage, so the receipt
     # carries terminal_selection=None (Gym #2823, pinned 9fc05c0f) rather than a method.
     unset = {
-        "rollout_id": f"{group_id}_g1",
+        "capture_key": f"{group_id}_g1",
         "reward": 0.0,
         "terminal_model_call_id": None,
         "manifest": [],
@@ -355,7 +363,7 @@ def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(
         "worked_example",
         rollout_id=physical_id,
     )
-    receipt["rollout_id"] = physical_id
+    receipt["capture_key"] = physical_id
 
     finalized = _finalizer(tq_client).finalize_group(
         group_id,
@@ -479,7 +487,7 @@ def _record_with_routes(record: StagedCallRecord, routes: list) -> StagedCallRec
         schema_version=record.schema_version,
         digest_version=record.digest_version,
         extras_digest_version=record.extras_digest_version,
-        rollout_id=record.rollout_id,
+        capture_key=record.capture_key,
         model_call_id=record.model_call_id,
         parent_call_id=record.parent_call_id,
         mode=record.mode,
@@ -643,7 +651,7 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
     coords_c1 = _stage_minf_call(
         stager,
         nemo_gym.CaptureAdmission(
-            rollout_id=rollout_id, model_call_id="c1", mode="text"
+            capture_key=rollout_id, model_call_id="c1", mode="text"
         ),
         prompt=[10, 11],
         generated=[12, 13],
@@ -656,7 +664,7 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
     coords_c2 = _stage_minf_call(
         stager,
         nemo_gym.CaptureAdmission(
-            rollout_id=rollout_id,
+            capture_key=rollout_id,
             model_call_id="c2",
             parent_call_id="c1",
             prev_len=4,
@@ -669,7 +677,7 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
         routes=routes_c2,
     )
     receipt = nemo_gym.RolloutReceipt(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         terminal_model_call_id="c2",
         manifest=[
             _manifest_from_coords(coords_c1, mode="text"),
@@ -1072,7 +1080,7 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
     from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
     receipt = RolloutReceipt(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         terminal_model_call_id="c2",
         manifest=[_manifest(root), _manifest(child)],
         terminal_selection="declared",
@@ -1302,7 +1310,7 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
         return coords
 
     root = nemo_gym.CaptureAdmission(
-        rollout_id=rollout_id, model_call_id="c1", mode="text"
+        capture_key=rollout_id, model_call_id="c1", mode="text"
     )
     c1 = stage(
         "c1",
@@ -1312,7 +1320,7 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
         {"ng_capture": root.model_dump(mode="json")},
     )
     child = nemo_gym.CaptureAdmission(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=c1["cum_len"],
@@ -1346,7 +1354,7 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
         for c in (c1, c2)
     ]
     receipt = RolloutReceipt(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         terminal_model_call_id="c2",
         manifest=manifest,
         terminal_selection="declared",
@@ -1806,7 +1814,7 @@ def test_effort_uses_terminal_call_with_carries_and_abandoned_branch(
         )
     )
     receipt = RolloutReceipt(
-        rollout_id="effort",
+        capture_key="effort",
         reward=raw_reward,
         terminal_model_call_id=f"c{len(generations) - 1}",
         manifest=[_manifest(record) for record in records],

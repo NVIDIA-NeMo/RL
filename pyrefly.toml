@@ -25,6 +25,8 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/environments/call_selection.py",
+  "nemo_rl/algorithms/single_controller_utils/logical_advantage.py",
   "nemo_rl/data/captured_media.py",
   "nemo_rl/experience/reward_penalties.py",
   # TODO: enable these once we have 100 correctness
@@ -85,9 +87,9 @@ project-includes = [
   "nemo_rl/data/__init__.py",
   "nemo_rl/data/chat_templates.py",
   "nemo_rl/data/chat_utils.py",
-  "nemo_rl/data/xtoken/__init__.py",
-  "nemo_rl/data/xtoken/native_chat.py",
-  "nemo_rl/data/xtoken/cross_tokenizer_collate.py",
+  "nemo_rl/data/cross_tokenizer/__init__.py",
+  "nemo_rl/data/cross_tokenizer/native_chat.py",
+  "nemo_rl/data/cross_tokenizer/cross_tokenizer_collate.py",
   "nemo_rl/data/collate_fn.py",
   "nemo_rl/data/dataloader.py",
   "nemo_rl/data/datasets/__init__.py",
@@ -254,6 +256,7 @@ project-includes = [
   "nemo_rl/models/generation/megatron/token_capture.py",
   "nemo_rl/models/generation/megatron/utils.py",
   "nemo_rl/models/generation/openai_server_utils.py",
+  "nemo_rl/models/generation/capture_context.py",
   "nemo_rl/models/generation/sglang/config.py",
   "nemo_rl/models/generation/sglang/utils/http_utils.py",
   "nemo_rl/models/generation/sglang/utils/ip_port_utils.py",
@@ -301,6 +304,7 @@ project-includes = [
   "nemo_rl/models/megatron/draft/training.py",
   "nemo_rl/models/megatron/draft/utils.py",
   "nemo_rl/models/megatron/hybridep.py",
+  "nemo_rl/models/megatron/manual_gc.py",
   "nemo_rl/models/megatron/memory_saver.py",
   "nemo_rl/models/megatron/opd_full_capture.py",
   "nemo_rl/models/policy/__init__.py",

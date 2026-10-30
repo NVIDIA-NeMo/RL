@@ -764,6 +764,17 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert "if (( vllm_status == 0 )); then" in source
 
 
+def test_load_balancers_use_lb_container_and_its_python():
+    source = (REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh").read_text()
+
+    assert (
+        'EXTERNAL_VLLM_LB_CONTAINER="${EXTERNAL_VLLM_LB_CONTAINER:-${CONTAINER}}"'
+        in source
+    )
+    assert '--container-image="${EXTERNAL_VLLM_LB_CONTAINER}"' in source
+    assert "PYTHON='${lb_python}' /opt/external-vllm-tools/lb_watchdog.sh" in source
+
+
 def test_private_ray_and_vllm_ports_match_sub_ephemeral_layout():
     script = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh"
     source = script.read_text()

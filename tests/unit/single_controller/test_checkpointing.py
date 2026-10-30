@@ -93,6 +93,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     RolloutSnapshotManifest,
     bootstrap_compatibility_identity,
     commit_snapshot,
+    ensure_bootstrap_anchor,
     prepare_snapshot_paths,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
@@ -224,6 +225,45 @@ class _GatedFinalizeTrainer(_FakeTrainer):
     def finalize_async_save(self) -> None:
         assert self.release.wait(timeout=30.0), "test never released the writer"
         super().finalize_async_save()
+
+
+class _PollingTrainer(_FakeTrainer):
+    """Async-save stand-in for deferred finalize: poll_async_save answers in order."""
+
+    def __init__(self, poll_answers: list[bool], checkpoint_dir: Path) -> None:
+        super().__init__()
+        self._poll_answers = list(poll_answers)
+        self._checkpoint_dir = checkpoint_dir
+        self.poll_calls = 0
+        self._train_step_open = False
+        self.polled_inside_a_train_step = False
+        # Published step_N dirs at each save_checkpoint call, in call order. The
+        # tmp_step_N of the save in progress already exists then, so it's excluded.
+        self.published_at_save: list[set[str]] = []
+
+    def begin_train_step(self, loss_fn: Any) -> None:
+        self._train_step_open = True
+
+    def finish_train_step(self) -> dict[str, Any]:
+        self._train_step_open = False
+        return super().finish_train_step()
+
+    def poll_async_save(self) -> bool:
+        # The finalize runs collectives on the training communicator, so the poll
+        # has to land between steps, never inside an open one.
+        self.polled_inside_a_train_step |= self._train_step_open
+        self.poll_calls += 1
+        return self._poll_answers.pop(0) if self._poll_answers else False
+
+    def save_checkpoint(self, **kwargs: Any) -> None:
+        self.published_at_save.append(
+            {
+                name
+                for name in _step_dir_names(self._checkpoint_dir)
+                if name.startswith("step_")
+            }
+        )
+        super().save_checkpoint(**kwargs)
 
 
 class _FailingFinalizeTrainer(_FakeTrainer):
@@ -535,6 +575,7 @@ class _RefitRecordingTrainer(_FakeTrainer):
 class _FakeRolloutManager:
     def __init__(self, events: Optional[list[str]] = None) -> None:
         self.weight_versions: list[int] = []
+        self.next_nemo_gym_task_index = 0
         self._tq_buffer = None
         self.recovery_ledger = RolloutRecoveryLedger()
         self._events = events
@@ -570,6 +611,12 @@ class _FakeRolloutManager:
             }
         )
         return f"regenerated-{len(self.reserved_prompts)}"
+
+    def get_next_nemo_gym_task_index(self) -> int:
+        return self.next_nemo_gym_task_index
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        self.next_nemo_gym_task_index = value
 
     def suspend_request_deadlines(self) -> None:
         if self._events is not None:
@@ -758,6 +805,7 @@ def _actor_master_config(
     rollout_checkpoint_attempt_interval_s: Optional[float] = None,
     token_capture_enabled: bool = False,
     load_replay_buffer: bool = True,
+    defer_finalize: bool = False,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -815,6 +863,7 @@ def _actor_master_config(
             min_groups_for_streaming_train=1,
             max_inflight_prompts=4,
             max_buffered_rollouts=4,
+            defer_async_checkpoint_finalize=defer_finalize,
         ),
         rollout_checkpointing=RolloutCheckpointConfig(
             snapshot_attempt_interval_s=rollout_checkpoint_attempt_interval_s
@@ -922,7 +971,7 @@ def _sealed_recovery_ledger(staging_key: str) -> RolloutRecoveryLedger:
                 generation_index=0,
                 gate_rollout_id=gate_id,
                 receipt={
-                    "rollout_id": gate_id,
+                    "capture_key": gate_id,
                     "manifest": [{"staging_key": staging_key}],
                 },
                 reward=1.0,
@@ -1089,6 +1138,7 @@ class TestCounterRestore:
         save_state.current_epoch = 2
         save_state.consumed_samples = 42
         save_state.total_valid_tokens = 1234
+        save_state.next_nemo_gym_task_index = 321
 
         actor = _ACTOR_CLS(
             _actor_master_config(tmp_path),
@@ -1104,6 +1154,7 @@ class TestCounterRestore:
         assert actor._consumed_samples == 42
         assert actor._current_epoch == 2
         assert actor._total_valid_tokens == 1234
+        assert actor._rollout_manager.get_next_nemo_gym_task_index() == 321
 
     def test_restores_trainer_version_independently_from_train_step(self, tmp_path):
         save_state = _initial_grpo_save_state()
@@ -1194,6 +1245,23 @@ class TestCounterRestore:
 
 
 class TestSaveTrigger:
+    def test_saves_live_gym_counter_and_restores_it(self, tmp_path: Path) -> None:
+        mc = _actor_master_config(tmp_path, max_num_steps=1, save_period=1)
+
+        def advance_counter(actor: Any) -> None:
+            actor._rollout_manager.set_next_nemo_gym_task_index(123)
+
+        _run_train_pump(mc, _make_actor_args(), seed=advance_counter)
+        info = _training_info(tmp_path / "checkpoints", 1)
+        assert info["next_nemo_gym_task_index"] == 123
+
+        restored = _ACTOR_CLS(
+            mc,
+            _make_actor_args(save_state=_get_grpo_save_state(info)),
+            SetupTimingMetrics(),
+        )
+        assert restored._rollout_manager.get_next_nemo_gym_task_index() == 123
+
     def test_saves_on_period_boundary_and_last_step(self, tmp_path):
         mc = _actor_master_config(tmp_path, max_num_steps=4, save_period=2)
         trainer = _FakeTrainer()
@@ -1209,6 +1277,7 @@ class TestSaveTrigger:
         assert info_2["current_step"] == 2
         assert info_2["trainer_version"] == 2
         assert info_2["sampler_dispatch_index"] == -1
+        assert info_2["next_nemo_gym_task_index"] == 0
         assert info_2["total_steps"] == 2
         assert info_2["consumed_samples"] == 4  # 2 prompts/step * 2 steps
         # No validation ran, so the default val_reward is dropped.
@@ -1439,6 +1508,185 @@ class TestSaveTrigger:
         # step_2 from ft_save_period, step_3 from last-step.
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_2", "step_3"}
 
+    def test_deferred_finalize_publishes_after_a_successful_poll(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=4, save_period=2, defer_finalize=True
+        )
+        ckpt_dir = tmp_path / "checkpoints"
+        # Step 3's poll finds the step-2 writes unfinished; step 4's finds them done.
+        trainer = _PollingTrainer([False, True], ckpt_dir)
+
+        _run_train_pump(mc, _make_actor_args(trainer=trainer))
+
+        assert trainer.poll_calls == 2
+        assert not trainer.polled_inside_a_train_step
+        # step_2 was published by the poll, before the step-4 save started.
+        assert trainer.published_at_save == [set(), {"step_2"}]
+        # Only the save left pending at exit was finalized blocking.
+        assert trainer.finalize_calls == 1
+        assert _step_dir_names(ckpt_dir) == {"step_2", "step_4"}
+        with open(ckpt_dir / "latest_checkpoint_status.json") as status_file:
+            assert json.load(status_file)["last_checkpoint_step"] == 4
+
+    def test_deferred_finalize_blocks_at_the_next_save_if_writes_are_unfinished(
+        self, tmp_path
+    ):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=4, save_period=2, defer_finalize=True
+        )
+        ckpt_dir = tmp_path / "checkpoints"
+        trainer = _PollingTrainer([False, False], ckpt_dir)
+
+        _run_train_pump(mc, _make_actor_args(trainer=trainer))
+
+        assert trainer.poll_calls == 2
+        assert not trainer.polled_inside_a_train_step
+        # The step-4 save first finalized and published step_2 itself.
+        assert trainer.published_at_save == [set(), {"step_2"}]
+        assert trainer.finalize_calls == 2
+        assert _step_dir_names(ckpt_dir) == {"step_2", "step_4"}
+
+    @staticmethod
+    def _run_with_pending_save_and_failing_pump(mc, trainer) -> None:
+        async def _main():
+            actor = _ACTOR_CLS(
+                mc, _make_actor_args(trainer=trainer), SetupTimingMetrics()
+            )
+            # A step-1 save is still pending when the train pump fails.
+            path = actor._checkpointer.init_tmp_checkpoint(1, {}, mc)
+            actor._pending_checkpoint = (path, 1)
+
+            async def _failing_train_pump():
+                raise RuntimeError("injected train failure")
+
+            actor._train_pump = _failing_train_pump
+            await asyncio.wait_for(actor.run(), timeout=60.0)
+
+        with pytest.raises(RuntimeError, match="injected train failure"):
+            asyncio.run(_main())
+
+    def test_deferred_finalize_publishes_the_pending_save_when_the_run_fails(
+        self, tmp_path
+    ):
+        mc = _actor_master_config(tmp_path, max_num_steps=0, defer_finalize=True)
+        trainer = _FakeTrainer()
+
+        self._run_with_pending_save_and_failing_pump(mc, trainer)
+
+        assert trainer.finalize_calls == 1
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
+
+    def test_failed_teardown_publish_does_not_mask_the_run_failure(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=0, defer_finalize=True)
+
+        # Raises the train failure, not the finalize one.
+        self._run_with_pending_save_and_failing_pump(mc, _FailingFinalizeTrainer())
+
+        assert _step_dir_names(tmp_path / "checkpoints") == {"tmp_step_1"}
+
+    def test_pending_save_survives_a_cancel_while_waiting_for_the_lock(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=0, defer_finalize=True)
+        trainer = _FakeTrainer()
+
+        async def _main():
+            actor = _ACTOR_CLS(
+                mc, _make_actor_args(trainer=trainer), SetupTimingMetrics()
+            )
+            path = actor._checkpointer.init_tmp_checkpoint(1, {}, mc)
+            actor._pending_checkpoint = (path, 1)
+            # Another publication (e.g. a rollout snapshot) holds the lock.
+            await actor._checkpoint_save_lock.acquire()
+            finish = asyncio.create_task(actor._finish_pending_save(blocking=True))
+            while trainer.finalize_calls == 0:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0.05)  # now parked on the lock
+            finish.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await finish
+            actor._checkpoint_save_lock.release()
+            # Still pending, so the teardown publish finds it.
+            assert actor._pending_checkpoint == (path, 1)
+            await actor._finish_pending_save(blocking=True)
+            assert actor._pending_checkpoint is None
+            actor._checkpointer.shutdown()
+
+        asyncio.run(_main())
+
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
+
+    @pytest.mark.parametrize("defer_finalize", [False, True])
+    def test_nothing_is_written_into_the_checkpoint_after_publish_starts(
+        self, tmp_path, defer_finalize
+    ):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=2, save_period=2, defer_finalize=defer_finalize
+        )
+        at_publish: list[set[str]] = []
+
+        def _files(path) -> set[str]:
+            return {
+                str(p.relative_to(path)) for p in Path(path).rglob("*") if p.is_file()
+            }
+
+        def _seed(actor):
+            publish = actor._publish_when_policy_write_done
+
+            async def _record(checkpoint_path):
+                at_publish.append(_files(checkpoint_path))
+                await publish(checkpoint_path)
+
+            actor._publish_when_policy_write_done = _record
+
+        _run_train_pump(mc, _make_actor_args(trainer=_FakeTrainer()), seed=_seed)
+
+        # The rename waits only for the policy's async write, so every other part
+        # must already be on disk when publishing starts.
+        assert at_publish == [_files(tmp_path / "checkpoints" / "step_2")]
+        assert at_publish[0]
+        # A write that lost the race to the rename recreates tmp_step_2/.
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_2"}
+
+    @pytest.mark.parametrize(
+        "megatron_cfg",
+        [
+            None,
+            {"enabled": False, "checkpoint": {"async_save": True}},
+            {"enabled": True, "checkpoint": {"async_save": False}},
+            {"enabled": True},
+        ],
+        ids=["no-megatron", "megatron-disabled", "sync-save", "no-checkpoint-block"],
+    )
+    def test_deferred_finalize_requires_megatron_async_save(
+        self, tmp_path, megatron_cfg
+    ):
+        mc = _actor_master_config(tmp_path, defer_finalize=True)
+        if megatron_cfg is not None:
+            mc.policy["megatron_cfg"] = megatron_cfg
+
+        with pytest.raises(ValueError, match="checkpoint.async_save=true"):
+            validate_single_controller_config(mc)
+
+    def test_deferred_finalize_accepts_megatron_async_save(self, tmp_path):
+        mc = _actor_master_config(tmp_path, defer_finalize=True)
+        mc.policy["megatron_cfg"] = {
+            "enabled": True,
+            "checkpoint": {"async_save": True},
+        }
+
+        validate_single_controller_config(mc)
+
+    def test_deferred_finalize_rejects_rollout_snapshots(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path, defer_finalize=True, rollout_checkpoint_attempt_interval_s=30.0
+        )
+        mc.policy["megatron_cfg"] = {
+            "enabled": True,
+            "checkpoint": {"async_save": True},
+        }
+
+        with pytest.raises(ValueError, match="rollout_checkpointing"):
+            validate_single_controller_config(mc)
+
 
 class TestFinalizerStateRelease:
     def test_evicted_group_releases_pending_finalizer_state(self, tmp_path: Path):
@@ -1508,6 +1756,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         try:
             actor._sampler.restore_dispatch_index(5)
+            actor._rollout_manager.set_next_nemo_gym_task_index(123)
             result = asyncio.run(actor._save_rollout_checkpoint(force=True))
             assert result.saved
             assert result.reason == "completed"
@@ -1526,6 +1775,7 @@ class TestPeriodicRolloutCheckpoint:
             (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
         )
         assert manifest["sampler_dispatch_index"] == 5
+        assert manifest["next_nemo_gym_task_index"] == 123
         assert (snapshot / "data_plane" / "metadata.json").is_file()
         assert (snapshot / "train_dataloader.pt").is_file()
         assert (snapshot / REPLAY_BUFFER_METADATA_FILENAME).is_file()
@@ -2571,6 +2821,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     actor._checkpoint_save_lock = asyncio.Lock()
     actor._save_state = SimpleNamespace()
+    actor._rollout_manager = _FakeRolloutManager()
     actor._train_steps = 1
     actor._trainer_version = 1
     actor._current_epoch = 0
@@ -2617,6 +2868,13 @@ class TestPPOSaveOrder:
         )
         calls: list[str] = []
         actor = _ppo_save_actor(tmp_path, calls)
+        publish = actor._publish_when_policy_write_done
+
+        async def _record_publish(checkpoint_path):
+            calls.append("publish")
+            await publish(checkpoint_path)
+
+        actor._publish_when_policy_write_done = _record_publish
 
         asyncio.run(
             actor._save_checkpoint(
@@ -2624,6 +2882,7 @@ class TestPPOSaveOrder:
             )
         )
 
+        # Publishing comes last: the rename waits only for the policy's write.
         assert calls == [
             "policy.offload_to_cpu",
             "critic.prepare_for_training",
@@ -2631,6 +2890,7 @@ class TestPPOSaveOrder:
             "critic.finish_training",
             "policy.prepare_for_training",
             "policy.save_checkpoint",
+            "publish",
         ]
         assert actor._trainer.save_kwargs["is_final_checkpoint"] is True
         assert actor._value.save_kwargs["is_final_checkpoint"] is True
@@ -2807,7 +3067,13 @@ def _write_checkpoint(
     return step_dir
 
 
-def _write_periodic_snapshot(step_dir: Path) -> Path:
+def _write_periodic_snapshot(
+    step_dir: Path,
+    *,
+    train_step: int = 3,
+    bootstrap_fingerprint: Optional[str] = None,
+    next_nemo_gym_task_index: Optional[int] = None,
+) -> Path:
     """Write one committed rollout snapshot newer than its trainer anchor."""
     tmp_snapshot, final_snapshot, _ = prepare_snapshot_paths(step_dir)
     torch.save(
@@ -2821,16 +3087,21 @@ def _write_periodic_snapshot(step_dir: Path) -> Path:
     (tmp_snapshot / DATA_PLANE_CHECKPOINT_DIR).mkdir()
     manifest = RolloutSnapshotManifest(
         schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
-        base_train_step=3,
-        trainer_version=3,
+        base_train_step=train_step,
+        trainer_version=train_step,
         current_epoch=4,
         sampler_dispatch_index=6,
         mutation_version=9,
         rolled_back_train_group_count=0,
-        bootstrap_fingerprint=None,
+        bootstrap_fingerprint=bootstrap_fingerprint,
+        next_nemo_gym_task_index=next_nemo_gym_task_index,
     )
+    manifest_dict = manifest.to_dict()
+    if next_nemo_gym_task_index is None:
+        # Model snapshots written before the counter field existed.
+        manifest_dict.pop("next_nemo_gym_task_index")
     (tmp_snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text(
-        json.dumps(manifest.to_dict())
+        json.dumps(manifest_dict)
     )
     commit_snapshot(tmp_snapshot, final_snapshot, keep_latest_k=2)
     return final_snapshot
@@ -2952,19 +3223,16 @@ class TestSetupResumeWiring:
         assert actor_args.save_state == _get_grpo_save_state(dict(_STEP_3_SAVE_STATE))
         assert actor_args.last_checkpoint_path == str(step_3)
 
-    def test_periodic_snapshot_restores_exact_dispatch_cursor(
+    @pytest.mark.parametrize("bootstrap", [False, True])
+    @pytest.mark.parametrize("snapshot_counter", [None, 0, 123])
+    def test_periodic_snapshot_restores_dispatch_cursor_and_task_counter(
         self,
         patched_factories,  # noqa: F811
         tmp_path,
+        bootstrap: bool,
+        snapshot_counter: Optional[int],
     ):
         ckpt_dir = tmp_path / "ckpts"
-        step_3 = _write_checkpoint(
-            ckpt_dir,
-            3,
-            _STEP_3_SAVE_STATE,
-            dataloader_state={"fake_position": 3},
-        )
-        final_snapshot = _write_periodic_snapshot(step_3)
         mc = _setup_master_config(str(ckpt_dir))
         mc.checkpointing["save_period"] = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
@@ -2981,17 +3249,48 @@ class TestSetupResumeWiring:
             }
         )
         mc.logger.log_dir = str(tmp_path / "logs")
+        bootstrap_identity = bootstrap_compatibility_identity(mc)
+        if bootstrap:
+            anchor = ensure_bootstrap_anchor(ckpt_dir, identity=bootstrap_identity)
+            train_step = 0
+            trainer_counter = 0
+        else:
+            train_step = 3
+            trainer_counter = 42
+            anchor = _write_checkpoint(
+                ckpt_dir,
+                train_step,
+                {
+                    **_STEP_3_SAVE_STATE,
+                    "next_nemo_gym_task_index": trainer_counter,
+                },
+                dataloader_state={"fake_position": 3},
+            )
+        final_snapshot = _write_periodic_snapshot(
+            anchor,
+            train_step=train_step,
+            bootstrap_fingerprint=(
+                bootstrap_identity.fingerprint() if bootstrap else None
+            ),
+            next_nemo_gym_task_index=snapshot_counter,
+        )
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
         )
-        tq_metadata = _native_tq_metadata(step=3, trainer_version=3, epoch=4)
+        tq_metadata = _native_tq_metadata(
+            step=train_step, trainer_version=train_step, epoch=4
+        )
         tq_metadata["replay_group_count"] = 0
         patched_factories[
             "fake_policy"
         ].load_data_plane_checkpoint.return_value = tq_metadata
 
         with (
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.setup.bootstrap_compatibility_identity",
+                return_value=bootstrap_identity,
+            ),
             patch(
                 "nemo_rl.algorithms.single_controller_utils.setup.should_use_nemo_gym",
                 return_value=True,
@@ -3014,6 +3313,9 @@ class TestSetupResumeWiring:
 
         assert actor_args.save_state.current_epoch == 4
         assert actor_args.save_state.sampler_dispatch_index == 6
+        assert actor_args.save_state.next_nemo_gym_task_index == (
+            trainer_counter if snapshot_counter is None else snapshot_counter
+        )
         assert actor_args.last_checkpoint_path == str(final_snapshot)
         assert actor_args.rollout_checkpoint_load_metrics is not None
         assert {
