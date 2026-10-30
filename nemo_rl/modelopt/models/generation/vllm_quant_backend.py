@@ -23,15 +23,11 @@ import vllm  # noqa: F401
 import zmq
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
-from nemo_rl.modelopt.models.generation.vllm_quant_moe_amax import (
-    route_moe_input_quantizer_amax,
-)
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     matches_quant_ignore_pattern,
 )
 from nemo_rl.models.generation.vllm.checkpoint_engine import VllmCheckpointEngineMixin
-from nemo_rl.models.generation.vllm.patches import modelopt_moe_amax_aliases
 from nemo_rl.models.generation.vllm.vllm_backend import (
     IPCWeightManifestError,
     VllmInternalWorkerExtension,
@@ -492,8 +488,11 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     ) -> Iterator[WeightUpdateFinalizer]:
         """Use vLLM's native layerwise reload lifecycle for real quantization."""
         if not self._is_real_quant_model():
-            with super()._weight_update_lifecycle(transport) as finalize:
-                yield finalize
+            with self._patch_named_parameters_to_include_buffers(
+                self.model_runner.model
+            ):
+                with super()._weight_update_lifecycle(transport) as finalize:
+                    yield finalize
             return
 
         from vllm.config import set_current_vllm_config
@@ -583,72 +582,121 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         return None
 
     @contextmanager
-    def _patch_named_parameters_to_include_buffers(self, model):
-        """Temporarily expose activation-quantizer amax buffers as parameters.
+    def _patch_named_parameters_to_include_buffers(
+        self, model: torch.nn.Module
+    ) -> Iterator[None]:
+        """Expose scalar activation amax buffers to native loaders for one refit.
 
-        Weights arrive pre-folded from the Megatron side, so weight-quantizer
-        buffers are skipped. Input and KV-cache amax values use the same vLLM
-        weight-loading path.
+        Weights arrive pre-folded, so weight-quantizer buffers are skipped.
+        The first load replaces the previous range; later contributions to a
+        fused quantizer take the maximum across packets.
         """
-        original_named_parameters = model.named_parameters
-        quant_amax_suffixes = self._QUANT_AMAX_SUFFIXES
-        patched_quantizer_buffers = []
+        seen: set[int] = set()
+        event: torch.cuda.Event | None = None
+        missing = object()
 
-        def amax_loader(param, loaded_weight, *args, **kwargs):
-            # Input amax may fan in; K/V amax is fixed after calibration.
-            param.copy_(torch.max(param, loaded_weight))
+        @torch.no_grad()
+        def amax_loader(
+            param: torch.Tensor, loaded_weight: torch.Tensor, *args: Any, **kwargs: Any
+        ) -> bool | None:
+            nonlocal event
+            if loaded_weight.numel() != 1:
+                raise ValueError("Fake-quant refit requires scalar activation amax")
+            # Collective packets can load on alternating CUDA streams.
+            stream = torch.cuda.current_stream(param.device) if param.is_cuda else None
+            if stream is not None:
+                if event is None:
+                    event = torch.cuda.Event()
+                else:
+                    stream.wait_event(event)
+            incoming = loaded_weight.to(
+                device=param.device, dtype=param.dtype
+            ).reshape_as(param)
+            if id(param) in seen:
+                param.copy_(torch.maximum(param, incoming))
+            else:
+                param.copy_(incoming)
+                seen.add(id(param))
+            if stream is not None:
+                event.record(stream)
+            return True if kwargs.get("return_success", False) else None
 
-        def new_named_parameters(self, *args, **kwargs):
-            yield from original_named_parameters(*args, **kwargs)
-            for name, buf in self.named_buffers(*args, **kwargs):
-                if not name.endswith(quant_amax_suffixes):
-                    continue
-                if not hasattr(buf, "weight_loader"):
-                    buf.weight_loader = amax_loader
-                    patched_quantizer_buffers.append(buf)
-                yield name, buf
+        with ExitStack() as cleanup:
 
-        model.named_parameters = types.MethodType(new_named_parameters, model)
-        try:
+            def patch_attribute(obj: Any, name: str, value: Any) -> None:
+                original = vars(obj).get(name, missing)
+                setattr(obj, name, value)
+                if original is missing:
+                    cleanup.callback(delattr, obj, name)
+                else:
+                    cleanup.callback(setattr, obj, name, original)
+
+            def patch_named_parameters(module: torch.nn.Module) -> None:
+                original_named_parameters = module.named_parameters
+
+                def named_parameters(
+                    owner: torch.nn.Module,
+                    prefix: str = "",
+                    recurse: bool = True,
+                    remove_duplicate: bool = True,
+                ) -> Iterator[tuple[str, torch.Tensor]]:
+                    yielded: set[int] = set()
+                    for name, param in original_named_parameters(
+                        prefix=prefix,
+                        recurse=recurse,
+                        remove_duplicate=remove_duplicate,
+                    ):
+                        yielded.add(id(param))
+                        yield name, param
+                    for name, buf in owner.named_buffers(
+                        prefix=prefix,
+                        recurse=recurse,
+                        remove_duplicate=remove_duplicate,
+                    ):
+                        if name.endswith(self._QUANT_AMAX_SUFFIXES) and (
+                            not remove_duplicate or id(buf) not in yielded
+                        ):
+                            yielded.add(id(buf))
+                            yield name, buf
+
+                patch_attribute(
+                    module,
+                    "named_parameters",
+                    types.MethodType(named_parameters, module),
+                )
+
+            attached: set[int] = set()
+            for module in model.modules():
+                for name, quantizer in module.named_children():
+                    if not f"{name}._amax".endswith(self._QUANT_AMAX_SUFFIXES):
+                        continue
+                    buf = quantizer._buffers.get("_amax")
+                    if buf is None:
+                        continue
+                    if buf.numel() != 1:
+                        raise ValueError(
+                            "Fake-quant refit requires scalar activation amax"
+                        )
+                    if id(buf) not in attached:
+                        patch_attribute(buf, "weight_loader", amax_loader)
+                        attached.add(id(buf))
+                    aliases = [f"{name}._amax"]
+                    if name.endswith("input_quantizer"):
+                        weight_name = f"{name.removesuffix('input_quantizer')}weight"
+                        if isinstance(getattr(module, weight_name, None), torch.Tensor):
+                            # Packed expert mapping includes the weight's full name.
+                            aliases.append(f"{weight_name}_input_quantizer._amax")
+                    for alias in aliases:
+                        existing = getattr(module, alias, missing)
+                        if existing is not missing and existing is not buf:
+                            raise ValueError(
+                                f"Conflicting quantizer buffer alias: {alias}"
+                            )
+                        if existing is missing:
+                            patch_attribute(module, alias, buf)
+            for module in (model, *model.children()):
+                patch_named_parameters(module)
             yield
-        finally:
-            model.named_parameters = original_named_parameters
-            for buf in patched_quantizer_buffers:
-                del buf.weight_loader
-
-    @contextmanager
-    def _attach_input_quantizer_amax_loaders(self, model):
-        """Eagerly attach weight_loaders to input_quantizer amax buffers.
-
-        vLLM's per-module refit loaders (e.g.
-        ``MergedColumnParallelLinear.load_weights``) resolve
-        targets via ``getattr`` and call ``param.weight_loader(param,
-        loaded_weight, shard_id)`` directly — they never iterate
-        ``model.named_parameters()``, so the lazy attach in
-        ``_patch_named_parameters_to_include_buffers`` no longer fires and
-        quantizer amax buffers arrive without a loader (AttributeError:
-        'Tensor' object has no attribute 'weight_loader').
-
-        The scoped MoE alias workaround is owned by ``patches.py``;
-        ``modelopt_moe_amax_aliases`` applies it around this refit.
-        """
-
-        def input_amax_loader(param, loaded_weight, *args, **kwargs):
-            param.copy_(torch.max(param, loaded_weight))
-
-        attached = []
-        for name, buf in model.named_buffers():
-            if "input_quantizer" not in name:
-                continue
-            if not hasattr(buf, "weight_loader"):
-                buf.weight_loader = input_amax_loader
-                attached.append(buf)
-        try:
-            with modelopt_moe_amax_aliases(model):
-                yield
-        finally:
-            for buf in attached:
-                del buf.weight_loader
 
     def _load_weights(self, weights):
         """Load pre-folded weights and activation-quantizer amax buffers.
@@ -699,19 +747,6 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         source_storage_ptrs,
                     )
 
-        # vLLM 0.28 routes every ``experts.*`` name through
-        # ``RoutedExperts.load_weights``, which resolves the rewritten name with a
-        # single ``getattr`` and therefore cannot reach the dotted quantizer
-        # buffers (``w13_input_quantizer._amax``). Fan the per-expert amax values
-        # into the fused quantizers here and keep them away from vLLM's loader.
-        # Checkpoint names (e.g. Nemotron-H's ``backbone.*``) only turn into the
-        # module's vLLM ``layer_name`` through the model's hf_to_vllm_mapper.
-        weights = route_moe_input_quantizer_amax(
-            self.model_runner.model,
-            weights,
-            mapper=getattr(self.model_runner.model, "hf_to_vllm_mapper", None),
-        )
-
         # MBridge exports K/V amax with the HF-semantic attention path, such as
         # ``self_attn.k_bmm_quantizer._amax``. ModelOpt installs these quantizers
         # on vLLM's inner Attention module, whose runtime path contains ``.attn``.
@@ -719,6 +754,11 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         # loader still owns model-specific HF mapping and PP-local filtering.
         remapped_weights = []
         for name, weight in weights:
+            if name.endswith(self._QUANT_AMAX_SUFFIXES):
+                if weight.numel() != 1:
+                    raise ValueError("Fake-quant refit requires scalar activation amax")
+                # Expert loaders classify 3-D tensors as packed weights.
+                weight = weight.reshape(())
             for suffix in self._QUANT_AMAX_SUFFIXES:
                 if (
                     "_bmm_quantizer" in suffix
@@ -729,15 +769,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                     break
             remapped_weights.append((name, weight))
 
-        with ExitStack() as contexts:
-            for _, child in self.model_runner.model.named_children():
-                contexts.enter_context(
-                    self._patch_named_parameters_to_include_buffers(child)
-                )
-            contexts.enter_context(
-                self._attach_input_quantizer_amax_loaders(self.model_runner.model)
-            )
-            return super()._load_weights(remapped_weights)
+        return super()._load_weights(remapped_weights)
 
     def get_weight_snapshot(self, name: str) -> torch.Tensor:
         """Return a CPU copy of a named parameter for before/after comparison."""
