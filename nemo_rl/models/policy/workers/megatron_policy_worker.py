@@ -950,7 +950,7 @@ class MegatronPolicyWorkerImpl(
         self.megatron_cfg = runtime_config.megatron_cfg
         if self.megatron_cfg.model.transformer_impl == "inference_optimized" and (
             not init_optimizer
-            or getattr(self.megatron_cfg.model, "moe_inference_training_forward", False)
+            or getattr(self.megatron_cfg.model, "moe_match_generation_forward", False)
         ):
             # Bridge's generic GPT provider defaults to its training layer spec.
             # Dedicated inference workers need MCore inference linears instead, and

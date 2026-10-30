@@ -8,7 +8,7 @@ policy:
     transformer_impl: inference_optimized
     inference_grouped_gemm_backend: flashinfer
     inference_moe_token_dispatcher_type: nvls
-    moe_inference_training_forward: true
+    moe_match_generation_forward: true
     inference_moe_nvfp4_recipe: per_token
     activation_checkpointing: true
     recompute_granularity: selective
