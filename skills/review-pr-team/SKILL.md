@@ -146,11 +146,15 @@ just saying "this is wrong."
   full lesson behind it, with the steps, commands and repo maps the one-line rule leaves out. Keep those
   links when you pass the lessons on, and tell every agent to read the detail file whenever its rule
   applies to what it is checking.
+- Read every `skills/contributing/references/*.md` and treat each rule as a finding checklist,
+  the same as this skill's own references. A rule that ends with `Source: [name](...)` has a
+  review lesson behind it; tell every agent to read that file whenever the rule applies, as
+  with `Details:` links.
 - Then glob `~/.claude/review-memory/RL/*.md` and read EVERY match. This is the optional, machine-local
   store of lessons that are not in `references/` yet. It may be empty or absent; an empty glob is fine.
   New lessons are written here in Phase 6. A memory's `count` is how many times its pattern has shown
   up in reviewed PRs; list the ones with count 2 or more first.
-- Treat both as binding guidance and pass their content to every spawned agent in its prompt.
+- Treat all of them as binding guidance and pass their content to every spawned agent in its prompt.
 
 ### 1.5 Detect GPU availability & set up local testing
 
