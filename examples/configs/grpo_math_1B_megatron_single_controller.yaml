@@ -30,6 +30,11 @@ async_rl:
   recompute_kv_cache_after_weight_updates: true
   # Min ready groups the streaming trainer waits for before dispatching a batch.
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  # Max groups dispatched in one chunk; null leaves chunks unbounded, so a warm
+  # buffer trains the whole step at once and generation idles for the training
+  # tail. Must be >= min_groups_for_streaming_train, which this file pins to the
+  # whole step -- lower that too or the cap can never bind.
+  max_groups_for_streaming_train: null
   # Cap on in-flight generate_and_push calls in the rollout pump.
   max_inflight_prompts: ${grpo.num_prompts_per_step}
   # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).

@@ -261,6 +261,36 @@ class TestRolloutFailureValidation:
             AsyncRLConfig(**{old: 60.0})
 
 
+class TestStreamingChunkBounds:
+    def test_the_cap_is_unset_by_default(self):
+        """None is the pre-existing unbounded behaviour, and stays the default."""
+        assert AsyncRLConfig().max_groups_for_streaming_train is None
+
+    def test_a_cap_at_or_above_the_floor_is_accepted(self):
+        cfg = AsyncRLConfig(
+            min_groups_for_streaming_train=8, max_groups_for_streaming_train=8
+        )
+        assert cfg.max_groups_for_streaming_train == 8
+
+    def test_a_cap_below_the_floor_is_rejected_rather_than_silently_winning(self):
+        """Below the floor the clamp fires on every chunk, not just the tail.
+
+        The run would stream at the cap and the configured floor would never
+        apply -- dead config that still reads as if it bounds something.
+        """
+        with pytest.raises(ValidationError, match="no effect"):
+            AsyncRLConfig(
+                min_groups_for_streaming_train=32, max_groups_for_streaming_train=16
+            )
+
+    @pytest.mark.parametrize("cap", [0, -1])
+    def test_a_non_positive_cap_is_rejected(self, cap):
+        with pytest.raises(ValidationError, match="must be >= 1"):
+            AsyncRLConfig(
+                min_groups_for_streaming_train=1, max_groups_for_streaming_train=cap
+            )
+
+
 class TestWatchdogValidation:
     def test_stall_timeout_must_exceed_the_tick(self):
         with pytest.raises(ValidationError, match="stall_timeout_s"):
