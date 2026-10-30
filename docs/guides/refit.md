@@ -183,8 +183,8 @@ policy:
 ```
 
 This option requires the Megatron policy backend. It applies to non-colocated
-vLLM collective and `nccl_reshard` transports, non-colocated TensorRT-LLM
-collective refit, plus non-colocated Megatron generation. Unsupported
+vLLM and TensorRT-LLM collective and `nccl_reshard` transports, plus
+non-colocated Megatron generation. Unsupported
 combinations fail during synchronizer setup. It is
 disabled by default because CPU offload adds transfer overhead when the export
 already fits in trainer GPU memory.
@@ -227,10 +227,9 @@ policy:
       moe_expert_parallel_size: 4   # must equal tensor_parallel_size
 ```
 
-With vLLM or Megatron generation, `offload_policy_before_refit` also works with
-this transport. The reshard moves only parameters, so releasing gradient
-buffers, optimizer state, and caches before transfer is safe. It is not
-supported with TensorRT-LLM generation and `nccl_reshard`.
+With vLLM, TensorRT-LLM, or Megatron generation, `offload_policy_before_refit`
+also works with this transport. The reshard moves only parameters, so releasing
+gradient buffers, optimizer state, and caches before transfer is safe.
 
 For sparse delta, select one data plane and configure its scope:
 
