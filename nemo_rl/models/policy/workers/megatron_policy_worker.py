@@ -4471,14 +4471,8 @@ class MegatronPolicyWorkerImpl(
         # refits.
         from nemo_rl.distributed.refit_watchdog import sync_stream_within
 
-        # Source pre hooks and spec.post enqueue on this worker's current stream. With a single generation layout (vLLM,
-        # aggregated TRT-LLM) the transfer shares that stream, exactly as before.
-        # PD-disaggregated TRT-LLM has one layout per engine role (prefill and
-        # decode engines), each behind its own communicator and destination
-        # set: they get a stream each so both transfers are in flight together.
-        # Sending them back to back left every trainer rank feeding one
-        # destination P2P pair at a time while the second layout's receivers
-        # idled until the first layout had fully landed.
+        # Materialization runs on the current stream; one layout sends there too,
+        # several get a stream each so prefill and decode transfers overlap.
         materialize_stream = torch.cuda.current_stream()
         layout_indices = self._nccl_reshard_layout_indices()
         if len(layout_indices) == 1:
@@ -4492,9 +4486,7 @@ class MegatronPolicyWorkerImpl(
                 refit_timeout_s,
                 f"the bulk parameter transfer (generation layout {idx})",
             )
-        # TRT-LLM keeps the cached segments: returning them to the driver here
-        # costs seconds inside the refit bubble, and the misc broadcast's packed
-        # buffers come out of the caching allocator anyway.
+        # TRT-LLM reuses cached allocations for the following misc broadcast.
         if not self._refit_is_trtllm_nccl_reshard():
             torch.cuda.empty_cache()
         misc_t0 = time.perf_counter()
@@ -4526,7 +4518,9 @@ class MegatronPolicyWorkerImpl(
 
         Each layer's local sources are materialized once (on ``materialize_stream``)
         and enqueued to every layout on that layout's stream, so the layouts'
-        transfers overlap instead of running back to back.
+        transfers overlap instead of running back to back. With a single layout
+        each source is post-processed and freed right after its send, so peak
+        memory stays at one materialized buffer.
         """
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
@@ -4548,11 +4542,10 @@ class MegatronPolicyWorkerImpl(
                     f"generation layout {layout_index} orders the bulk layers differently "
                     "from layout 0; the layer-interleaved send needs one order"
                 )
+        # Share each materialization across layouts, retaining at most one layer;
+        # a single layout frees each source right after its send.
+        cache_layer = len(layouts) > 1
         for layer_name in layer_names:
-            # Every layout reads the same local sources: materialize each spec
-            # once per layer and keep it only until the layer has been enqueued
-            # to every layout, rather than retaining a model-sized BF16 cache
-            # for the full refit.
             layer_ctxs: dict[int, tuple[LocalParamSpec, RefitCtx]] = {}
             try:
                 for layout_index, refit_info, group, stream in layouts:
@@ -4572,12 +4565,12 @@ class MegatronPolicyWorkerImpl(
                             assert ctx.buf is not None, (
                                 f"no local tensor for {param_info['name']!r}"
                             )
-                            layer_ctxs[id(spec)] = (spec, ctx)
+                            if cache_layer:
+                                layer_ctxs[id(spec)] = (spec, ctx)
                         else:
                             ctx = cached[1]
                         if stream is not materialize_stream:
-                            # Order the send after this param's materialization,
-                            # which was just enqueued on the materialize stream.
+                            # Wait for materialization before sending this buffer.
                             stream.wait_stream(materialize_stream)
                         src_tensor = DTensorRef(
                             local_tensor=ctx.buf,
@@ -4594,11 +4587,13 @@ class MegatronPolicyWorkerImpl(
                             stream,
                         )
                         if stream is not materialize_stream:
-                            # The source buffer is released on the materialize
-                            # stream when this layer's cache is dropped; keep its
-                            # storage until the send stream is past the transfer.
+                            # Keep source storage alive until this stream finishes sending it.
                             ctx.buf.record_stream(stream)
                         del src_tensor
+                        if not cache_layer:
+                            if spec.post is not None:
+                                spec.post(ctx)
+                            del ctx
                 for spec, ctx in layer_ctxs.values():
                     if spec.post is not None:
                         spec.post(ctx)

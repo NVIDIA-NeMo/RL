@@ -31,7 +31,7 @@ live in ``nemo_rl/weight_sync/xferdtensor.py`` — import both from there.
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Optional, Protocol, cast, runtime_checkable
 
 import torch
 from torch.distributed._tensor import Shard
@@ -705,11 +705,12 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
     if megatron_enabled:
         etp = megatron_cfg.get("expert_tensor_parallel_size", 1)
 
-        # ETP with vLLM generation has not been fully tested yet.
-        if backend == "vllm" and etp not in (1, None):
+        # ETP with vLLM or TRT-LLM generation has not been fully tested yet.
+        if backend in ("vllm", "trtllm") and etp not in (1, None):
+            backend_name = "vLLM" if backend == "vllm" else "TRT-LLM"
             violations.append(
                 "policy.megatron_cfg.expert_tensor_parallel_size must be 1 "
-                f"for vLLM generation until ETP is fully tested (got {etp})."
+                f"for {backend_name} generation until ETP is fully tested (got {etp})."
             )
 
         # PP-layout knobs that _build_layer_to_pp_stage doesn't yet handle.
@@ -839,20 +840,19 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                 )
 
     if backend == "trtllm":
-        # Experts must be pure expert-parallel: the reshard writes EP slices of
-        # the HF expert stacks, and TRT-LLM's expert-TP layouts (interleaved
-        # gate/up, swizzled scales) are not HF slices. Both engine roles of a
-        # disaggregated deployment are checked. Models with dense MLP layers
-        # are rejected once the plan exists (check_trtllm_nccl_reshard_bulk_params).
+        # TRT-LLM's loader needs full EP-local experts; validate every engine role.
+        # Dense MLP layers are rejected later (check_trtllm_nccl_reshard_bulk_params).
         from nemo_rl.models.generation.trtllm.config import (
+            TrtllmConfig,
             resolve_disagg_layout,
             resolve_role_overrides,
             role_engine_config,
         )
 
-        if resolve_disagg_layout(generation).enabled:
+        trtllm_generation = cast(TrtllmConfig, generation)
+        if resolve_disagg_layout(trtllm_generation).enabled:
             # Idempotent, so an already-resolved config passes through as is.
-            resolved = resolve_role_overrides(generation)
+            resolved = resolve_role_overrides(trtllm_generation)
             roles = {
                 f"trtllm_cfg.{role}_engine": role_engine_config(resolved, role)
                 for role in ("prefill", "decode")

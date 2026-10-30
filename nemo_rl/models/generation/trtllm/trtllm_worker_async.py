@@ -652,7 +652,9 @@ class TrtllmAsyncGenerationWorkerImpl:
             import traceback
 
             traceback.print_exc()
-            return False
+            # Raise instead of returning False so the engine-side cause reaches
+            # the caller.
+            raise RuntimeError(f"TRT-LLM nccl_reshard refit failed: {e!r}") from e
 
     async def report_device_id_async(self) -> list[str]:
         assert self.llm is not None

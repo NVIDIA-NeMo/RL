@@ -390,7 +390,7 @@ def test_megatron_generation_uses_common_refit_worker_api(
     monkeypatch.setattr(megatron_generation.ray, "get", lambda refs: refs)
     refit_info = {"layer_names": [], "per_layer_params": {}}
 
-    generation.prepare_nccl_reshard_refit_info(refit_info)
+    generation.prepare_nccl_reshard_refit_info([refit_info])
     assert generation.nccl_reshard_refit() == [
         worker.nccl_reshard_refit.remote.return_value for worker in workers
     ]

@@ -22,7 +22,7 @@ to time-multiplex GPU memory between training and inference phases.
 import asyncio
 import os
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Optional, Union, cast
+from typing import Any, AsyncGenerator, Literal, Optional, Union, cast
 
 import numpy as np
 import ray
@@ -135,6 +135,8 @@ class TrtllmGeneration(GenerationInterface):
         # under disaggregation a replica is several engines, and overloading
         # "dp" to mean engines is what makes the two concepts collide.
         self.dp_size = self.num_replicas
+        # The fleet the refit communicators were last built over.
+        self._refit_membership: Any = None
         self.num_engines = len(self._engine_tps)
 
         # GPUs held by the widest single engine; see
@@ -943,10 +945,13 @@ class TrtllmGeneration(GenerationInterface):
         for engine_idx, (role, tp) in enumerate(
             zip(self._engine_roles, self._engine_tps)
         ):
+            kwargs: dict[str, Any]
             if self._disagg_cfg.enabled:
-                kwargs = role_engine_config(self.cfg, role)
+                kwargs = role_engine_config(
+                    self.cfg, cast(Literal["prefill", "decode"], role)
+                )
             else:
-                kwargs = self.cfg["trtllm_cfg"]
+                kwargs = cast(dict[str, Any], self.cfg["trtllm_cfg"])
             ep = int(kwargs.get("moe_expert_parallel_size") or 1)
             pp = int(kwargs.get("pipeline_parallel_size") or 1)
             if tp % ep != 0:
@@ -1053,12 +1058,12 @@ class TrtllmGeneration(GenerationInterface):
     def rebuild_nccl_reshard_comm_group(
         self,
         membership: Any,
-        layout_index: int,
         pp_ips: list[str],
         pp_ports: list[int],
         pp_size: int,
         train_ranks_per_stage: int,
         sub_world_size: int,
+        layout_index: int = 0,
     ) -> list[ray.ObjectRef]:
         self.set_refit_membership(membership)
         return self.init_nccl_reshard_comm_group(
@@ -1070,13 +1075,11 @@ class TrtllmGeneration(GenerationInterface):
             sub_world_size,
         )
 
-    def prepare_nccl_reshard_refit_info(self, refit_infos: Any) -> None:
-        """One refit plan per layout (a single dict is accepted for one layout)."""
+    def prepare_nccl_reshard_refit_info(self, refit_infos: list[dict]) -> None:
+        """One refit plan per layout, in layout order."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group not initialised")
         layouts = self.get_nccl_reshard_layouts()
-        if isinstance(refit_infos, dict):
-            refit_infos = [refit_infos]
         if len(refit_infos) != len(layouts):
             raise ValueError(
                 f"got {len(refit_infos)} refit plans for {len(layouts)} engine layouts"

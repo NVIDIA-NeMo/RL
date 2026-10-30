@@ -14,6 +14,9 @@
 
 """Unit tests for the TRT-LLM shard-to-shard (nccl_reshard) refit plumbing."""
 
+# trtllm_backend imports tensorrt_llm eagerly, so import it only inside tests.
+
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -26,9 +29,9 @@ from nemo_rl.models.generation.trtllm.quantization.fp8 import (
     convert_expert_projection_stack,
     load_weights,
 )
-from nemo_rl.models.generation.trtllm.trtllm_backend import NcclExtension
 from nemo_rl.models.generation.trtllm.trtllm_generation import TrtllmGeneration
 from nemo_rl.weight_sync.nccl_reshard_utils import MeshInfo
+from nemo_rl.weight_sync.xferdtensor_python import local_shard_slices
 
 pytestmark = pytest.mark.trtllm
 
@@ -156,6 +159,8 @@ def _param_info(name, global_shape, proj, ep_size, rank_offset, dtype="torch.bfl
 
 
 def _extension(rank, local_ids_by_layer, quantized=False, device="cpu"):
+    from nemo_rl.models.generation.trtllm.trtllm_backend import NcclExtension
+
     ext = NcclExtension.__new__(NcclExtension)
     ext.device_id = 0
     ext.pp_comm_groups = {0: SimpleNamespace(rank=rank)}
@@ -183,7 +188,7 @@ def test_local_shard_slices_and_expert_specs(monkeypatch):
     )
     # rank 3 in the group = mesh coordinate 1 -> experts 2..3
     ext, model_loader = _extension(rank=3, local_ids_by_layer={prefix: [2, 3]})
-    slices = NcclExtension._local_shard_slices(info, 3)
+    slices = local_shard_slices(info, 3)
     assert slices[0] == slice(2, 4)
     param_map = ext._build_expert_local_param_map(
         {"layer_names": ["layer0"], "per_layer_params": {"layer0": [info]}}
@@ -265,7 +270,7 @@ def test_received_experts_reload_in_batches(monkeypatch):
         {"layer_names": ["layer0"], "per_layer_params": {"layer0": infos}}
     )
     # Large budget: both stacks wait for the flush and share one reload.
-    monkeypatch.setenv("NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES", str(1 << 40))
+    ext._reload_batch_bytes = 1 << 40
     for info in infos:
         spec = param_map.get(info["name"])
         ctx = spec.pre(spec.base)
@@ -282,7 +287,7 @@ def test_received_experts_reload_in_batches(monkeypatch):
     }
     # Budget 0: every stack loads on the spot, as before batching.
     model_loader.reload.reset_mock()
-    monkeypatch.setenv("NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES", "0")
+    ext._reload_batch_bytes = 0
     spec = param_map.get(infos[0]["name"])
     ctx = spec.pre(spec.base)
     spec.post(ctx)
@@ -298,13 +303,13 @@ def test_received_experts_load_directly_into_moe_modules(monkeypatch):
     monkeypatch.setattr(
         trtllm_backend.fp8_quantization, "is_quantized_expert_refit", lambda cfg: False
     )
-    monkeypatch.setenv("NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES", str(1 << 40))
     monkeypatch.delenv("NRL_TRTLLM_REFIT_DIRECT_EXPERT_LOAD", raising=False)
     prefix = "model.layers.0.mlp.experts"
     info = _param_info(
         f"{prefix}.down_proj.weight", (8, 16, 4), "down_proj", ep_size=4, rank_offset=2
     )
     ext, model_loader = _extension(rank=3, local_ids_by_layer={prefix: [2, 3]})
+    ext._reload_batch_bytes = 1 << 40
     calls = []
     mapper = MagicMock()
     mapper.preprocess_weights.side_effect = lambda w, allow_partial_loading=False: dict(
@@ -333,12 +338,74 @@ def test_received_experts_load_directly_into_moe_modules(monkeypatch):
         (moe_module, "experts", ["2.down_proj.weight", "3.down_proj.weight"], True)
     ]
     model_loader.reload.assert_not_called()
-    # A prefix no MoE module owns falls back to the generic loader.
+    # Every queued weight is a routed expert, so a prefix no MoE module owns
+    # means the names drifted: fail loudly instead of a silent generic reload.
     monkeypatch.setattr(ext, "_moe_weight_owners", lambda: {})
     ctx = spec.pre(spec.base)
     spec.post(ctx)
-    ext._flush_received_experts()
-    model_loader.reload.assert_called_once()
+    with pytest.raises(RuntimeError, match="expected one TRT-LLM MoE weight owner"):
+        ext._flush_received_experts()
+    model_loader.reload.assert_not_called()
+
+
+def test_moe_weight_owner_matches_prefixes_under_a_vlm_wrapper(monkeypatch):
+    """Owners are named from the engine root; VLM wrappers nest the decoder under ``llm.``."""
+    from tensorrt_llm._torch.moe.fused_moe import weight_owner
+
+    layer0, layer1, mtp0 = SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+    owners = (layer0, layer1, mtp0)
+    # The engine model is the Qwen3.5 VLM wrapper; on the first refit the weight
+    # mapper is still bound to it, so the module tree is the only reliable name source.
+    wrapper = SimpleNamespace(
+        named_modules=lambda: iter(
+            [
+                ("llm.model.layers.0.mlp", SimpleNamespace()),
+                ("llm.model.layers.0.mlp.experts.backend", layer0),
+                ("llm.model.layers.1.mlp.experts", layer1),
+                ("llm.mtp.layers.0.mlp.experts", mtp0),
+            ]
+        )
+    )
+    ext, _ = _extension(rank=0, local_ids_by_layer={})
+    ext.engine.model_engine.model = wrapper
+    ext._moe_weight_owner_map = None
+    monkeypatch.setattr(
+        weight_owner, "is_moe_weight_owner", lambda module: module in owners
+    )
+    assert ext._moe_weight_owner("model.layers.0.mlp.experts") is layer0
+    assert ext._moe_weight_owner("model.layers.1.mlp.experts") is layer1
+    assert ext._moe_weight_owner("mtp.layers.0.mlp.experts") is mtp0
+    with pytest.raises(RuntimeError, match="found 0"):
+        ext._moe_weight_owner("model.layers.2.mlp.experts")
+
+    # Two owners ending in the same prefix are ambiguous: fail, never guess.
+    ext._moe_weight_owner_map = {
+        "a.model.layers.0.mlp.experts": layer0,
+        "b.model.layers.0.mlp.experts": layer1,
+    }
+    with pytest.raises(RuntimeError, match="found 2"):
+        ext._moe_weight_owner("model.layers.0.mlp.experts")
+
+
+@pytest.mark.parametrize(
+    "knob", ["NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES", "NRL_REFIT_NUM_STREAMS"]
+)
+def test_malformed_refit_knob_fails_at_prepare(monkeypatch, knob):
+    """A bad knob must fail at setup, not mid-receive (which hangs the trainers)."""
+    from nemo_rl.models.generation.trtllm import trtllm_backend
+
+    monkeypatch.setenv(knob, "2G")
+    restore = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
+        restore,
+    )
+    ext, _ = _extension(rank=0, local_ids_by_layer={})
+    with pytest.raises(ValueError, match="2G"):
+        trtllm_backend.NcclExtension.prepare_nccl_reshard_refit_info(
+            ext, {"layer_names": []}
+        )
+    restore.assert_not_called()
 
 
 def test_expert_spec_rejects_slot_mismatch_and_non_expert_bulk(monkeypatch):
@@ -389,8 +456,6 @@ def test_synchronizer_layouts_for_trtllm():
         ("prefill", 8, 8),
         ("decode", 16, 16),
     ]
-    with pytest.raises(ValueError, match="several layouts"):
-        sync._gen_parallelism()
     sync._generation = _generation_stub(
         ["aggregated"],
         [8],
@@ -426,6 +491,12 @@ def test_support_check_accepts_pure_ep_trtllm():
     with pytest.raises(ValueError, match="pure expert parallelism"):
         check_nccl_reshard_refit_support(config(4))
 
+    # Trainer ETP>1 into TRT-LLM is untested, so setup rejects it.
+    etp2 = config(8)
+    etp2.policy["megatron_cfg"]["expert_tensor_parallel_size"] = 2
+    with pytest.raises(ValueError, match="expert_tensor_parallel_size must be 1"):
+        check_nccl_reshard_refit_support(etp2)
+
     # Disaggregated: each role is checked over the shared trtllm_cfg.
     pure_ep_decode = {
         "decode_engine": {"tensor_parallel_size": 16, "moe_expert_parallel_size": 16}
@@ -457,3 +528,175 @@ def test_bulk_param_check_rejects_dense_mlp_for_trtllm():
                 "per_layer_params": {"l0": [dense], "l1": [expert]},
             }
         )
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_nccl_reshard_refit_runs_weight_update_lifecycle(monkeypatch, fails):
+    """Bulk, then misc, inside begin/finish; a failure aborts the update."""
+    from nemo_rl.models.generation.trtllm import trtllm_backend
+
+    ext = trtllm_backend.NcclExtension.__new__(trtllm_backend.NcclExtension)
+    model_loader = MagicMock()
+    engine = MagicMock()
+    engine.model_engine = SimpleNamespace(model=MagicMock(), model_loader=model_loader)
+    engine.control_action.side_effect = lambda **_: contextlib.nullcontext()
+    ext.engine = engine
+    ext.nccl_reshard_refit_info = {"layer_names": [], "per_layer_params": {}}
+    ext.pp_comm_groups = {0: object()}
+    ext.hf_to_local_param_map = object()
+    calls = []
+    ext.begin_weight_update = lambda: calls.append("begin")
+    ext._recv_bulk_params = lambda: calls.append("bulk")
+
+    def receive_misc():
+        calls.append("misc")
+        if fails:
+            raise RuntimeError("misc failed")
+
+    ext._receive_and_load_misc_params = receive_misc
+    ext._finish_refit = lambda recompute_kv: calls.append(("finish", recompute_kv))
+    monkeypatch.setattr(
+        trtllm_backend.torch.cuda, "empty_cache", lambda: calls.append("empty_cache")
+    )
+
+    if fails:
+        with pytest.raises(RuntimeError, match="misc failed"):
+            ext.nccl_reshard_refit(drain=False, recompute_kv=True)
+        assert calls == ["begin", "bulk", "empty_cache", "misc"]
+        model_loader.abort_update_weights.assert_called_once_with()
+    else:
+        assert ext.nccl_reshard_refit(drain=False, recompute_kv=True) is True
+        assert calls == ["begin", "bulk", "empty_cache", "misc", ("finish", True)]
+        model_loader.abort_update_weights.assert_not_called()
+    engine.control_action.assert_called_once_with(drain=False)
+
+
+def test_prepare_nccl_reshard_refit_info_keeps_misc_meta_and_needs_ep_slots(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.trtllm import trtllm_backend
+
+    ext, _ = _extension(rank=0, local_ids_by_layer={})
+    monkeypatch.setattr(
+        trtllm_backend.fp8_quantization, "is_quantized_expert_refit", lambda cfg: False
+    )
+    monkeypatch.setattr(
+        trtllm_backend.fp8_quantization, "build_local_expert_lookup", lambda m: None
+    )
+    with pytest.raises(RuntimeError, match="initial_local_expert_ids"):
+        ext.prepare_nccl_reshard_refit_info({"layer_names": [], "per_layer_params": {}})
+
+    monkeypatch.setattr(
+        trtllm_backend.fp8_quantization,
+        "build_local_expert_lookup",
+        lambda m: lambda prefix: None,
+    )
+    ext._build_expert_local_param_map = MagicMock()
+    # Before init_nccl_reshard_comm_group: the slot map waits for the groups.
+    ext.pp_comm_groups = None
+    ext.prepare_nccl_reshard_refit_info(
+        {
+            "layer_names": [],
+            "per_layer_params": {},
+            "misc_meta": {
+                "model.norm.weight": {"shape": [4], "dtype": "torch.bfloat16"},
+                "lm_head.weight": {"shape": [2, 4], "dtype": "torch.float32"},
+            },
+        }
+    )
+    assert ext.misc_state_dict_info == {
+        "model.norm.weight": (torch.Size([4]), torch.bfloat16),
+        "lm_head.weight": (torch.Size([2, 4]), torch.float32),
+    }
+    ext._build_expert_local_param_map.assert_not_called()
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=0)}
+    ext.prepare_nccl_reshard_refit_info({"layer_names": [], "per_layer_params": {}})
+    ext._build_expert_local_param_map.assert_called_once_with(
+        ext.nccl_reshard_refit_info
+    )
+    assert ext.hf_to_local_param_map is ext._build_expert_local_param_map.return_value
+
+
+def test_synchronizer_builds_one_bulk_group_and_plan_per_trtllm_layout(monkeypatch):
+    from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+        NcclReshardWeightSynchronizer,
+    )
+
+    monkeypatch.setattr("ray.get", lambda futures: futures)
+
+    def build(plan, world_size=8 + 24):
+        calls = []
+        generation = _generation_stub(
+            ["prefill", "decode"],
+            [8, 16],
+            {"enabled": True},
+            prefill_kwargs={"tensor_parallel_size": 8, "moe_expert_parallel_size": 8},
+            decode_kwargs={"tensor_parallel_size": 16, "moe_expert_parallel_size": 16},
+        )
+        generation.set_refit_membership = lambda membership: None
+        generation.get_collective_sender_spec = lambda: SimpleNamespace(
+            nccl_peer="nemo"
+        )
+        generation.rebuild_collective = lambda *a, **k: []
+        generation.rebuild_nccl_reshard_comm_group = lambda membership, **k: (
+            calls.append(("gen_group", k["layout_index"], k["sub_world_size"])) or []
+        )
+        generation.prepare_nccl_reshard_refit_info = lambda plans: calls.append(
+            ("gen_plans", len(plans))
+        )
+        policy = SimpleNamespace(
+            cfg={
+                "megatron_cfg": {
+                    "tensor_model_parallel_size": 2,
+                    "expert_model_parallel_size": 4,
+                    "expert_tensor_parallel_size": 1,
+                },
+                "generation": {"backend": "trtllm"},
+            },
+            init_collective=lambda *a, **k: [],
+            init_nccl_reshard_comm_group=lambda **k: (
+                calls.append(("train_group", k["layout_index"], k["sub_world_size"]))
+                or []
+            ),
+            prepare_nccl_reshard_refit_info=lambda tp, gp, tws, gws, **k: (
+                calls.append(("train_plan", k["layout_index"], gp["ep_size"], gws))
+                or dict(plan)
+            ),
+        )
+        ports = iter(range(9001, 9100))
+        sync = NcclReshardWeightSynchronizer(
+            policy=policy,
+            generation=generation,
+            train_cluster=SimpleNamespace(
+                num_gpus_per_node=4,
+                get_master_address_and_port=lambda: ("10.0.0.1", next(ports)),
+                get_available_address_and_port=lambda pg_idx, bundle_idx: (
+                    "10.0.0.1",
+                    next(ports),
+                ),
+            ),
+            inference_cluster=None,
+        )
+        sync._build(SimpleNamespace(train_world_size=8, world_size=world_size))
+        return calls
+
+    empty = {"layer_names": [], "per_layer_params": {}, "misc_meta": {}}
+    # Each layout gets its own bulk group (8 train + its ranks) and its own plan.
+    assert build(empty) == [
+        ("train_group", 0, 8 + 8),
+        ("gen_group", 0, 8 + 8),
+        ("train_group", 1, 8 + 16),
+        ("gen_group", 1, 8 + 16),
+        ("train_plan", 0, 8, 8),
+        ("train_plan", 1, 16, 16),
+        ("gen_plans", 2),
+    ]
+    dense = {
+        "layer_names": ["l0"],
+        "per_layer_params": {"l0": [{"name": "model.layers.0.mlp.gate_proj.weight"}]},
+        "misc_meta": {},
+    }
+    with pytest.raises(ValueError, match="dense MLP layers"):
+        build(dense)
+    with pytest.raises(RuntimeError, match="cover 24 ranks but the inference world"):
+        build(empty, world_size=8 + 20)

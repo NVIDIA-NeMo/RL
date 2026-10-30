@@ -1778,6 +1778,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     worker.my_pp_stage = 0
     worker.pp_comm_group = object()
+    worker.cfg = {"generation": {"backend": "vllm"}}
     worker._broadcast_misc_params_packed = MagicMock()
     source = torch.arange(8, dtype=source_dtype).reshape(4, 2)
     wire_dtype = torch.bfloat16 if source_dtype == torch.uint8 else source_dtype
@@ -1909,6 +1910,98 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
         source.add_(10)
 
     assert worker._broadcast_misc_params_packed.call_count == 2
+    # vLLM keeps empty_cache() after the bulk send; TRT-LLM reshard skips it.
+    assert torch.cuda.empty_cache.call_count == 2
+    worker.cfg = {
+        "generation": {"backend": "trtllm", "refit_transport": "nccl_reshard"}
+    }
+    torch.cuda.empty_cache.reset_mock()
+    worker._nccl_reshard_refit()
+    torch.cuda.empty_cache.assert_not_called()
+
+
+def test_nccl_reshard_send_materializes_each_layer_once_for_every_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    import nemo_rl.weight_sync.xferdtensor as transfer_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.my_pp_stage = 0
+    layer_names = ["model.layers.0", "model.layers.1"]
+    names = [f"{layer}.mlp.experts.down_proj.weight" for layer in layer_names]
+
+    def plan(role: str) -> dict:
+        # The role stands in for each layout's destination mesh.
+        return {
+            "layer_names": list(layer_names),
+            "per_layer_params": {
+                layer: [
+                    {
+                        "name": name,
+                        "global_shape": [4, 2, 2],
+                        "src_mesh_info": role,
+                        "src_placements": (),
+                        "dst_mesh_info": role,
+                        "dst_placements": (),
+                    }
+                ]
+                for layer, name in zip(layer_names, names)
+            },
+        }
+
+    worker.nccl_reshard_refit_infos = {0: plan("prefill"), 1: plan("decode")}
+    # Single-layout fallbacks; prepare/init always set them on a real worker.
+    worker.nccl_reshard_refit_info = None
+    worker.pp_comm_group = None
+    groups = {0: object(), 1: object()}
+    worker.pp_comm_groups_by_layout = groups
+    events = []
+
+    def make_spec(name: str) -> SimpleNamespace:
+        def materialize() -> worker_module.RefitCtx:
+            events.append(("materialize", name))
+            return worker_module.RefitCtx(buf=MagicMock(name=name))
+
+        return SimpleNamespace(
+            materialize=materialize,
+            post=lambda ctx: events.append(("post", ctx.buf._mock_name)),
+        )
+
+    specs = {name: make_spec(name) for name in names}
+    worker.hf_to_local_param_map = SimpleNamespace(get=specs.get)
+    materialize_stream = object()
+    streams = {0: MagicMock(), 1: MagicMock()}
+    layout_of = {"prefill": 0, "decode": 1}
+
+    def transfer(src, _src_mesh, _src_pl, _dst, dst_mesh, _dst_pl, group, stream):
+        assert group is groups[layout_of[dst_mesh]]
+        assert stream is streams[layout_of[dst_mesh]]
+        events.append(("send", dst_mesh, src._local_tensor._mock_name))
+
+    monkeypatch.setattr(transfer_module, "xferdtensor", transfer)
+
+    assert worker._nccl_reshard_layout_indices() == [0, 1]
+    worker._send_bulk_params([0, 1], streams, materialize_stream)
+
+    n0, n1 = names
+    assert events == [
+        ("materialize", n0),
+        ("send", "prefill", n0),
+        ("send", "decode", n0),
+        ("post", n0),
+        ("materialize", n1),
+        ("send", "prefill", n1),
+        ("send", "decode", n1),
+        ("post", n1),
+    ]
+    # Each send stream waits for the materialization it reads.
+    for stream in streams.values():
+        assert stream.wait_stream.call_count == 2
+
+    worker.nccl_reshard_refit_infos[1]["layer_names"] = layer_names[::-1]
+    with pytest.raises(RuntimeError, match="orders the bulk layers differently"):
+        worker._send_bulk_params([0, 1], streams, materialize_stream)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA streams")

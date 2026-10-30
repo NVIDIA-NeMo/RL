@@ -158,18 +158,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             "pp_size": megatron_cfg.get("pipeline_model_parallel_size", 1),
         }
 
-    def _gen_parallelism(self) -> dict[str, int]:
-        """The single generation layout (vLLM / Megatron generation)."""
-        layouts = self._gen_layouts()
-        if len(layouts) != 1:
-            raise ValueError(
-                "generation backend exposes several layouts; use _gen_layouts()"
-            )
-        return {
-            key: layouts[0][key]
-            for key in ("tp_size", "ep_size", "etp_size", "pp_size")
-        }
-
     def _gen_layouts(self) -> list[dict[str, Any]]:
         """Destination layouts, each ``{tp_size, ep_size, etp_size, pp_size, world_size}``.
 
@@ -365,7 +353,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         pp_stages = [r // train_ranks_per_stage for r in range(train_world_size)]
         ranks_in_group = [r % train_ranks_per_stage for r in range(train_world_size)]
         layouts = self._gen_layouts()
-        multi_layout = len(layouts) > 1 or "role" in layouts[0]
         layout_worlds = [
             inference_world_size
             if layout["world_size"] is None
@@ -399,30 +386,23 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 f"sub_world_size {sub_world_size}): {list(zip(pp_ips, pp_ports))}",
                 flush=True,
             )
-            # Single-layout backends keep the upstream call shapes (no
-            # ``layout_index``); only the multi-layout TRT-LLM path adds it.
-            train_kwargs = dict(
+            futures_train = self._policy.init_nccl_reshard_comm_group(
                 pp_ips=pp_ips,
                 pp_ports=pp_ports,
                 pp_size=pp_size,
                 pp_stages=pp_stages,
                 sub_world_size=sub_world_size,
                 ranks_in_group=ranks_in_group,
+                layout_index=layout_index,
             )
-            if multi_layout:
-                train_kwargs["layout_index"] = layout_index
-            futures_train = self._policy.init_nccl_reshard_comm_group(**train_kwargs)
-            gen_kwargs = dict(
+            futures_inference = self._generation.rebuild_nccl_reshard_comm_group(
+                membership,
                 pp_ips=pp_ips,
                 pp_ports=pp_ports,
                 pp_size=pp_size,
                 train_ranks_per_stage=train_ranks_per_stage,
                 sub_world_size=sub_world_size,
-            )
-            if multi_layout:
-                gen_kwargs["layout_index"] = layout_index
-            futures_inference = self._generation.rebuild_nccl_reshard_comm_group(
-                membership, **gen_kwargs
+                layout_index=layout_index,
             )
             ray.get(futures_train + futures_inference)
         # 3. Refit metadata.  Train builds backend-agnostic per-layer metadata
@@ -442,13 +422,12 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 key: layout[key]
                 for key in ("tp_size", "ep_size", "etp_size", "pp_size")
             }
-            refit_kwargs = {"layout_index": layout_index} if multi_layout else {}
             nccl_reshard_refit_info = self._policy.prepare_nccl_reshard_refit_info(
                 train_parallelism,
                 gen_parallelism,
                 train_world_size,
                 layout_world,
-                **refit_kwargs,
+                layout_index=layout_index,
             )
             if self._policy.cfg["generation"]["backend"] == "trtllm":
                 check_trtllm_nccl_reshard_bulk_params(nccl_reshard_refit_info)
@@ -460,9 +439,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             wire_refit_infos.append(
                 make_nccl_reshard_refit_info_wire_safe(nccl_reshard_refit_info)
             )
-        self._generation.prepare_nccl_reshard_refit_info(
-            wire_refit_infos if multi_layout else wire_refit_infos[0]
-        )
+        self._generation.prepare_nccl_reshard_refit_info(wire_refit_infos)
         self._built_membership = membership
 
     def _settle_budget_s(self) -> float:

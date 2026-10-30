@@ -28,10 +28,13 @@ single `ValueError` listing every violation. The current requirements are:
   path uses IPC and is unaffected by this feature.
 * **Megatron training backend** — `policy.megatron_cfg.enabled=true` (the Automodel
   training backend is not supported yet.).
-* **vLLM or Megatron generation backend** — `policy.generation.backend` must be
-  `vllm` or `megatron` (SGLang and TRTLLM are not supported yet).
+* **vLLM, Megatron or TensorRT-LLM generation backend** — `policy.generation.backend`
+  must be `vllm`, `megatron` or `trtllm` (SGLang is not supported yet). TensorRT-LLM
+  moves only routed MoE experts shard-to-shard, needs pure expert parallelism
+  (`moe_expert_parallel_size == tensor_parallel_size`, `pipeline_parallel_size: 1`)
+  on every engine role, and rejects models with dense MLP layers.
 * Training-side Megatron supports expert tensor parallelism when the generation
-  destination is Megatron. A vLLM destination still requires
+  destination is Megatron. A vLLM or TensorRT-LLM destination still requires
   `expert_tensor_parallel_size: 1`. Custom PP layouts
   (`pipeline_model_parallel_layout`, virtual PP > 1, embedding/loss
   pipeline-split accounting) are not supported yet.
@@ -118,6 +121,12 @@ shard-layout requirements in this document.
   uses to overlap per-PP-stage bulk reshards. Having higher number can increase
   concurrency of the transportation when PP-size is large, but will have higher
   memory overhead.
+* `NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES` (default 2 GiB) — TensorRT-LLM only: converted
+  expert bytes collected before one batched reload; `0` reloads each received stack
+  on its own.
+* `NRL_TRTLLM_REFIT_DIRECT_EXPERT_LOAD` (default `1`) — TensorRT-LLM only: load
+  received expert stacks straight into their MoE modules; `0` uses
+  `model_loader.reload` instead.
 
 ## Design Overview
 

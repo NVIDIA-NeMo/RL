@@ -536,9 +536,7 @@ def _convert_fused_expert_weight(
             f"Qwen3.5 gate_up_proj dimension must be even, got {tuple(tensor.shape)}"
         )
 
-    # Expert ids in stack order; with a local lookup only this rank's experts
-    # are gathered (one small copy) and converted, the rest of the stack is
-    # never read.
+    # Convert selected experts in stack order.
     expert_ids: Sequence[int] = range(num_experts)
     if local_expert_ids is not None:
         expert_ids = sorted({int(i) for i in local_expert_ids})
@@ -550,9 +548,12 @@ def _convert_fused_expert_weight(
             )
         if not expert_ids:
             return
-        tensor = tensor.index_select(
-            0, torch.as_tensor(expert_ids, dtype=torch.long, device=tensor.device)
-        )
+        # Sorted, unique and in range: as many ids as experts means all of them,
+        # so skip the gather (a full-stack copy) and convert the stack in place.
+        if len(expert_ids) != num_experts:
+            tensor = tensor.index_select(
+                0, torch.as_tensor(expert_ids, dtype=torch.long, device=tensor.device)
+            )
     if projection == "gate_up_proj":
         intermediate_size = tensor.shape[1] // 2
         projections = (

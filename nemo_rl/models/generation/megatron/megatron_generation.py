@@ -532,8 +532,10 @@ class MegatronGeneration(GenerationInterface):
         pp_size: int,
         train_ranks_per_stage: int,
         sub_world_size: int,
+        layout_index: int = 0,
     ) -> list[ray.ObjectRef]:
         """Build bulk communicators over the selected Megatron ranks."""
+        assert layout_index == 0, "Megatron generation has a single reshard layout"
         return [
             worker.init_nccl_reshard_comm_groups_generation.remote(
                 pp_ips=pp_ips,
@@ -546,8 +548,12 @@ class MegatronGeneration(GenerationInterface):
             for worker, rank, _original_rank in self._refit_ranked_workers(membership)
         ]
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict[str, Any]) -> None:
+    def prepare_nccl_reshard_refit_info(
+        self, refit_infos: list[dict[str, Any]]
+    ) -> None:
         """Build each inference worker's HF-to-Megatron M-to-N receive map."""
+        assert len(refit_infos) == 1, "Megatron generation has a single reshard layout"
+        refit_info = refit_infos[0]
         futures = [
             worker.prepare_nccl_reshard_refit_info.remote(refit_info=refit_info)
             for worker, _rank, _original_rank in self._refit_ranked_workers()
