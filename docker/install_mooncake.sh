@@ -35,12 +35,12 @@ set -euo pipefail
 # Without this a failure inside a $(...) command substitution would not abort the script.
 shopt -s inherit_errexit
 
-GO_VERSION=1.26.9
-GO_AMD64_SHA256=42d158b4d8f7b61ac0a830567c940a86098fb7aac52e467a5ebec03ef5cc2f8d
-GO_ARM64_SHA256=4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052
+GO_VERSION=1.26.10
+GO_AMD64_SHA256=ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5
+GO_ARM64_SHA256=3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797
 ETCD_VERSION=3.5.33
 GO_TEXT_VERSION=0.42.0
-# gRPC 1.83.2 requires x/net >= 0.58.0.
+# gRPC 1.83.2 requires x/net >= 0.58.0; x/net 0.60.0 requires x/text >= 0.42.0.
 GO_NET_VERSION=0.60.0
 GRPC_VERSION=1.83.2
 
