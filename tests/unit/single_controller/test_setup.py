@@ -824,7 +824,7 @@ class TestSetup:
         # that restriction is covered by test_automodel_stage_one_config.
         with patch(
             "nemo_rl.algorithms.single_controller_utils.config."
-            "_validate_automodel_stage_one_config"
+            "_validate_automodel_single_controller_config"
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 

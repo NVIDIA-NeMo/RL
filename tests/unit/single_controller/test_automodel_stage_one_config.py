@@ -19,7 +19,7 @@ from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
-    _validate_automodel_stage_one_config,
+    _validate_automodel_single_controller_config,
 )
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
@@ -42,7 +42,7 @@ def config():
 
 
 def test_supported(config):
-    _validate_automodel_stage_one_config(MasterConfig(**config))
+    _validate_automodel_single_controller_config(MasterConfig(**config))
 
 
 @pytest.mark.parametrize(
@@ -69,7 +69,7 @@ def test_unsupported(config, path, value):
     raw = OmegaConf.create(config)
     OmegaConf.update(raw, path, value, merge=False)
     with pytest.raises(ValueError, match="Stage 1"):
-        _validate_automodel_stage_one_config(
+        _validate_automodel_single_controller_config(
             MasterConfig(**OmegaConf.to_container(raw, resolve=True))
         )
 
@@ -77,4 +77,4 @@ def test_unsupported(config, path, value):
 def test_megatron_unchanged(config):
     config["policy"]["automodel_cfg"]["enabled"] = False
     config["async_rl"]["sampler"]["max_lookahead_versions"] = 2
-    _validate_automodel_stage_one_config(MasterConfig(**config))
+    _validate_automodel_single_controller_config(MasterConfig(**config))
