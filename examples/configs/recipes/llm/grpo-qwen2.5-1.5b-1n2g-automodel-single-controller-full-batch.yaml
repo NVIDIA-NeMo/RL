@@ -1,65 +1,30 @@
 # Small full-batch SC regression recipe: one training GPU and one rollout GPU.
-defaults: ../../grpo_math_1B.yaml
+defaults: ../../grpo_math_1B_automodel_single_controller.yaml
 
 grpo:
-  async_grpo: null
   max_num_steps: 100
   num_prompts_per_step: 2
   num_generations_per_prompt: 4
-  val_period: 0
   seq_logprob_error_threshold: 1000
 
 policy:
   model_name: Qwen/Qwen2.5-1.5B
-  train_global_batch_size: 8
   train_micro_batch_size: 1
   max_total_sequence_length: 1024
-  dynamic_batching:
-    enabled: false
-  sequence_packing:
-    enabled: false
   generation:
     max_new_tokens: 512
     vllm_cfg:
-      async_engine: true
       enforce_eager: true
-    colocated:
-      enabled: false
-      resources:
-        num_nodes: 1
-        gpus_per_node: 1
 
 data:
   max_input_seq_length: 512
 
-data_plane:
-  enabled: true
-
-async_rl:
-  sampler:
-    name: in_order
-    max_lookahead_versions: 0
-  recompute_kv_cache_after_weight_updates: true
-  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
-  max_inflight_prompts: ${grpo.num_prompts_per_step}
-  max_buffered_rollouts: ${grpo.num_prompts_per_step}
-
 checkpointing:
   enabled: true
   checkpoint_dir: results/grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch
-  metric_name: null
   save_period: 10
-  save_optimizer: true
-  save_data_plane: true
 
 logger:
   log_dir: logs/grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch
-  tensorboard_enabled: true
-  wandb_enabled: false
   wandb:
-    project: nemo-rl-automodel-sc
     name: grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch
-
-cluster:
-  num_nodes: 1
-  gpus_per_node: 2
