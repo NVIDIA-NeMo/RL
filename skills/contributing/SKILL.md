@@ -12,7 +12,7 @@ The rules live in `references/`, one file per theme. Before writing or changing 
 
 | File | Covers |
 |------|--------|
-| [code-comments-and-docstrings](references/code-comments-and-docstrings.md) | comments and docstrings a change adds, edits or moves |
+| [comments-docstrings-and-docs](references/comments-docstrings-and-docs.md) | comments, docstrings and docs a change adds, edits or moves |
 
 ## PR Title Format
 

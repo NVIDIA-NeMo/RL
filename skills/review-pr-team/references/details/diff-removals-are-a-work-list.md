@@ -27,7 +27,8 @@ Then classify what survives:
 | a guard or validation | a `docs/` page describing what it rejected | the doc now describes behaviour that no longer exists |
 
 For a removed guard, grep `docs/` for the thing it rejected, not the function name: docs describe a
-rejection in prose and rarely name the function.
+rejection in prose and rarely name the function. A doc line outside a hunk cannot take an inline
+comment; anchor the finding on the code line that made it wrong.
 
 **Check each hit before reporting it.** A mechanical sweep produces false positives in bulk. Resolve
 class-scoped test IDs (`path::Class::method`) and parametrized IDs (`name[param]`) to the real `def`
