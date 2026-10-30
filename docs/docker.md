@@ -88,7 +88,7 @@ docker buildx build -f docker/Dockerfile \
 
 ## Using a Local TensorRT-LLM Checkout
 
-To skip the hour-long TensorRT-LLM wheel build, set `NRL_TRTLLM_EDITABLE` to the path of a TensorRT-LLM checkout you have already built (comma-separated for several). NeMo RL then installs it editable (`uv pip install --no-deps -e`) into the TensorRT-LLM worker environment instead of building the pinned wheel. The path must be reachable from every node.
+To use a locally built TensorRT-LLM instead of building the pinned wheel, set `NRL_TRTLLM_EDITABLE` to the path of a TensorRT-LLM checkout you have already built (comma-separated for several). NeMo RL then installs it editable (`uv pip install --no-deps -e`) into the TensorRT-LLM worker environment instead of building the pinned wheel. The path must be reachable from every node.
 
 ## Custom Setup Commands
 
