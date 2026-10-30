@@ -12,143 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Validated configuration for the managed Dynamo generation backend."""
+"""Configuration for serving NeMo RL's vLLM workers behind Dynamo.
 
-import warnings
-from typing import Annotated, Any, Literal
+``policy.generation.dynamo: true`` on any vLLM config is the whole switch;
+``policy.generation.dynamo_cfg`` only tunes the frontend and registration, and
+every field below carries its default.
+"""
 
-from pydantic import (
-    BaseModel,
-    BeforeValidator,
-    PositiveFloat,
-    PositiveInt,
-    model_validator,
-)
+from typing import Annotated, Any, Literal, Mapping
 
-# Packed weight-transfer geometry. NeMo RL declares it to each Dynamo worker in
-# the NCCL init info, and the trainer packs with the same values, so both sides
-# recompute identical chunk boundaries.
-VLLM_PACKED_BUFFER_SIZE_BYTES = 1024**3
-VLLM_PACKED_NUM_BUFFERS = 2
-
-DYNAMO_VLLM_FLAGS: dict[str, str] = {
-    "tensor_parallel_size": "--tensor-parallel-size",
-    "pipeline_parallel_size": "--pipeline-parallel-size",
-    "gpu_memory_utilization": "--gpu-memory-utilization",
-    "max_model_len": "--max-model-len",
-    "kv_cache_dtype": "--kv-cache-dtype",
-    "load_format": "--load-format",
-    "precision": "--dtype",
-    "enforce_eager": "--enforce-eager",
-}
-
-_VLLM_CFG_STRUCTURAL = {
-    "env_vars",
-    "expert_parallel_size",
-}
-
-_VLLM_CFG_MOVED = {
-    "http_server_serving_chat_kwargs": (
-        "dynamo_cfg.worker_args.custom_jinja_template and tool_call_parser"
-    ),
-    "reasoning_parser_plugin": "dynamo_cfg.worker_args.reasoning_parser",
-    "tool_parser_plugin": "dynamo_cfg.worker_args.tool_call_parser",
-}
-
-_VLLM_CFG_UNSUPPORTED = {
-    # Applied inside NeMo RL's in-process vLLM worker; it cannot configure the
-    # managed ``dynamo.vllm`` subprocess.
-    "cap_max_tokens_to_context",
-    # Enforced by NeMo RL's own HTTP server; the managed Dynamo frontend checks
-    # no bearer token, so a truthy value is rejected below rather than warned.
-    "http_server_api_key_required",
-    "is_mx",
-    "num_first_layers_in_bf16",
-    "num_last_layers_in_bf16",
-    "skip_tokenizer_init",
-    "use_deep_gemm",
-}
-
-_VLLM_CFG_MANAGED_RUNTIME = {
-    "enable_vllm_metrics_logger",
-    "expose_http_server",
-    "logprobs_mode",
-    "vllm_metrics_logger_interval",
-}
-
-_VLLM_CFG_INAPPLICABLE = {
-    "async_engine",
-    "enable_return_routed_experts",
-    "http_refit_api_key_env_var",
-    "http_refit_server_port",
-    "use_tqdm",
-    "zmq_refit_server_port",
-}
-
-_VLLM_SINGLE_RANK_ONLY_FIELDS = {
-    "data_parallel_size",
-    "decode_context_parallel_size",
-    "prefill_context_parallel_size",
-}
-
-# Top-level ``policy.generation`` keys outside the declared fields that are accounted
-# for; any other active key would be silently dropped, so it is warned about.
-_GENERATION_CLASSIFIED = {
-    # Read by Dynamo generation, or validated in DynamoConfig.
-    "model_name",
-    "max_new_tokens",
-    "temperature",
-    "top_p",
-    "top_k",
-    "stop_token_ids",
-    "stop_strings",
-    "_pad_token_id",
-    "colocated",
-    "refit_transport",
-    "quant_cfg",
-    "real_quant",
-    "sglang_cfg",
-    "trtllm_cfg",
-    # Read by the algorithm, rollouts, or NeMo-Gym rather than the engine.
-    "val_temperature",
-    "val_top_p",
-    "val_top_k",
-    "port_range_low",
-    "port_range_high",
-    "use_async_rollouts",
-    "_debug_payload_metrics",
-    "_draft_weights_from_refit",
-    "_mtp_weights_from_refit",
-    "_draft_full_refit",
-    # Shared-YAML sections for other backends and refit paths.
-    "mcore_generation_config",
-    "refit_cfg",
-    "real_quant_export_cpu_offload",
-    "real_quant_ignore",
-}
-
-
-def _is_active(value: Any) -> bool:
-    """Whether a setting is on; a block with an ``enabled`` switch counts only then."""
-    if isinstance(value, BaseModel):
-        value = value.model_dump()
-    if isinstance(value, dict) and "enabled" in value:
-        return bool(value["enabled"])
-    return bool(value)
+from pydantic import BaseModel, Field, PositiveFloat, model_validator
 
 
 class DynamoWorkerArgs(BaseModel, extra="forbid"):
-    """Structured arguments passed to every managed ``dynamo.vllm`` worker."""
+    """How each vLLM engine registers with Dynamo (``WorkerConfig`` fields)."""
 
-    tool_call_parser: str | None
-    reasoning_parser: str | None
-    exclude_tools_when_tool_choice_none: bool
-    enable_structural_tag: bool
-    structural_tag_scope: Literal["auto", "always"]
-    structural_tag_schema: Literal["auto", "strict"]
-    custom_jinja_template: str | None
-    endpoint_types: list[Literal["chat", "completions"]]
-    extra_cli_args: list[str]
+    # Dynamo's built-in parser names (dynamo-parsers). None follows the native
+    # server's vllm_cfg.http_server_serving_chat_kwargs (see dynamo_parsers).
+    tool_call_parser: str | None = None
+    reasoning_parser: str | None = None
+    # False, as vLLM's OpenAIServingChat (the native server) defaults it.
+    exclude_tools_when_tool_choice_none: bool = False
+    enable_structural_tag: bool = False
+    structural_tag_scope: Literal["auto", "always"] = "auto"
+    structural_tag_schema: Literal["auto", "strict"] = "auto"
+    # A Jinja chat template file that replaces the model's own. None follows
+    # vllm_cfg.http_server_serving_chat_kwargs.chat_template.
+    custom_jinja_template: str | None = None
+    endpoint_types: list[Literal["chat", "completions"]] = ["chat", "completions"]
 
     @model_validator(mode="after")
     def _validate_endpoint_types(self) -> "DynamoWorkerArgs":
@@ -160,235 +51,210 @@ class DynamoWorkerArgs(BaseModel, extra="forbid"):
 
 
 class DynamoFrontendArgs(BaseModel, extra="forbid"):
-    """Structured arguments passed to the managed Dynamo frontend."""
+    """Arguments for the managed ``dynamo.frontend`` process."""
 
-    tokenizer: Literal["default", "fastokens"]
-    tokenizer_cache: bool
-    tokenizer_cache_bytes: PositiveInt
+    # "kv" routes each request to the engine holding most of its prefix, fed by
+    # the engines' vLLM KV-cache events. No "direct": it needs a worker ID on
+    # every request, and NeMo RL's rollouts name none.
     router_mode: Literal[
         "round-robin",
         "random",
         "power-of-two",
         "kv",
-        "direct",
         "least-loaded",
         "device-aware-weighted",
-    ]
-    extra_cli_args: list[str]
+    ] = "kv"
+    # Idle TTL in seconds for keeping one session on one engine, or None to
+    # disable it. NeMo-Gym names the session on every call (its capture key, else
+    # its own session), as the native backend pins each Gym session to one
+    # server; the engine splices a call's echoed or staged prefix after routing,
+    # so the KV router alone cannot see where that prefix is cached. Dynamo keeps
+    # at most 65,536 sessions and answers a new one past that with HTTP 529, so
+    # keep (rollouts started per second) x TTL below 65,536. The bound is the
+    # frontend's own.
+    session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = 300
+    extra_cli_args: list[str] = Field(default_factory=list)
 
 
 class DynamoCfg(BaseModel, extra="forbid"):
-    """Driver-owned Dynamo service and worker-fleet configuration."""
+    """``policy.generation.dynamo_cfg``: the frontend and engine registration."""
 
-    engine: Literal["vllm"]
-    startup_timeout_s: PositiveFloat
-    request_timeout_s: PositiveFloat
-    control_timeout_s: PositiveFloat
-    worker_args: DynamoWorkerArgs
-    frontend_args: DynamoFrontendArgs
-    metrics_include_prefixes: list[str] | None
-    metrics_exclude_prefixes: list[str] | None
+    # Bounds etcd/NATS/frontend start-up and every engine's registration.
+    startup_timeout_s: PositiveFloat = 600.0
+    # Deadline for one NeMo RL rollout through the frontend. None waits as long
+    # as generation takes, as native generate_async does; on the SingleController,
+    # async_rl.rollout_failure.native.generation_timeout_s bounds both paths.
+    # NeMo-Gym's own calls keep Gym's timeouts.
+    request_timeout_s: PositiveFloat | None = None
+    worker_args: DynamoWorkerArgs = Field(default_factory=DynamoWorkerArgs)
+    frontend_args: DynamoFrontendArgs = Field(default_factory=DynamoFrontendArgs)
 
 
-class DynamoVllmConfig(BaseModel, extra="allow"):
-    """Known vLLM settings consumed by ``dynamo.vllm``.
+# vLLM parser names whose Dynamo built-in parser goes by another name. nano_v3 is
+# NeMo RL's vLLM plugin: DeepSeek-R1 reasoning parsing, with the whole output as
+# content when chat_template_kwargs.enable_thinking is false, as Dynamo's
+# nemotron_v3 parser does.
+_DYNAMO_REASONING_PARSER_NAMES = {"nano_v3": "nemotron_v3"}
+_DYNAMO_TOOL_PARSER_NAMES = {"openai": "harmony"}
 
-    Additional fields remain visible in ``model_extra`` so argument construction
-    can warn rather than silently dropping an inherited vLLM setting.
+
+# (kind, the dynamo_cfg.worker_args field naming it, Dynamo's renames).
+_PARSER_KINDS = (
+    ("tool", "tool_call_parser", _DYNAMO_TOOL_PARSER_NAMES),
+    ("reasoning", "reasoning_parser", _DYNAMO_REASONING_PARSER_NAMES),
+)
+
+
+def dynamo_parsers(
+    generation_config: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    """The ``(tool_call_parser, reasoning_parser)`` Dynamo's frontend applies.
+
+    ``dynamo_cfg.worker_args`` names them explicitly. Otherwise they follow the
+    native server's ``vllm_cfg.http_server_serving_chat_kwargs``, renamed where
+    Dynamo calls the same parser differently. A name that a parser plugin
+    provides has no Dynamo equivalent; the engine refuses it at registration
+    (see ``plugin_parser_names``).
     """
+    worker_args = dynamo_cfg(generation_config).worker_args
+    serving = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs") or {}
+    names = []
+    for kind, worker_arg, renames in _PARSER_KINDS:
+        configured = getattr(worker_args, worker_arg)
+        native = serving.get(f"{kind}_parser")
+        if configured is not None or native is None:
+            names.append(configured)
+        else:
+            names.append(renames.get(native, native))
+    tool_call_parser, reasoning_parser = names
+    return tool_call_parser, reasoning_parser
 
-    async_engine: bool
-    tensor_parallel_size: PositiveInt
-    pipeline_parallel_size: PositiveInt
-    expert_parallel_size: PositiveInt
-    gpu_memory_utilization: float
-    max_model_len: PositiveInt
-    kv_cache_dtype: str
-    load_format: str
-    precision: str
-    enforce_eager: bool
-    expose_http_server: bool
-    enable_vllm_metrics_logger: bool
-    vllm_metrics_logger_interval: PositiveFloat
-    env_vars: dict[str, str] | None
 
-    @model_validator(mode="after")
-    def _validate_parallelism_and_precision(self) -> "DynamoVllmConfig":
-        if self.expert_parallel_size not in (1, self.tensor_parallel_size):
-            raise ValueError(
-                "backend='dynamo' requires expert_parallel_size to be 1 or "
-                "equal tensor_parallel_size"
-            )
-        if self.precision.lower() not in {
-            "bf16",
-            "bfloat16",
-        }:
-            raise ValueError(
-                f"policy.generation.vllm_cfg.precision={self.precision!r} is not "
-                "supported by backend='dynamo'; managed weight refit currently "
-                "supports BF16 generation only"
-            )
-        if self.kv_cache_dtype != "auto":
-            raise ValueError(
-                f"policy.generation.vllm_cfg.kv_cache_dtype={self.kv_cache_dtype!r} "
-                "is not supported by backend='dynamo'; use 'auto'"
-            )
-        extra = self.model_extra or {}
-        if extra.get("is_mx"):
-            raise ValueError(
-                "policy.generation.vllm_cfg.is_mx is not supported by "
-                "backend='dynamo'; use backend='vllm' for MXFP8 generation"
-            )
-        if extra.get("http_server_api_key_required"):
-            raise ValueError(
-                "policy.generation.vllm_cfg.http_server_api_key_required is not "
-                "supported by backend='dynamo'; the managed Dynamo frontend checks "
-                "no bearer token, so the exposed server would stay open"
-            )
+def plugin_parser_names(
+    generation_config: Mapping[str, Any],
+) -> list[tuple[str, str, str, str]]:
+    """``(kind, name, plugin, worker_arg)`` for each parser to check against a plugin.
+
+    These are the native parser names Dynamo takes as they are while
+    ``vllm_cfg.<kind>_parser_plugin`` is set. The plugin may provide the name,
+    and then Dynamo's Rust frontend cannot run it, or the name may be a vLLM
+    built-in that Dynamo also ships. Only the engine has vLLM to tell which, so
+    it checks these at registration.
+    """
+    worker_args = dynamo_cfg(generation_config).worker_args
+    vllm_cfg = generation_config["vllm_cfg"]
+    serving = vllm_cfg.get("http_server_serving_chat_kwargs") or {}
+    checks = []
+    for kind, worker_arg, renames in _PARSER_KINDS:
+        native = serving.get(f"{kind}_parser")
+        plugin = vllm_cfg.get(f"{kind}_parser_plugin")
         if (
-            int(extra.get("num_first_layers_in_bf16") or 0) != 0
-            or int(extra.get("num_last_layers_in_bf16") or 0) != 0
+            getattr(worker_args, worker_arg) is None
+            and native is not None
+            and native not in renames
+            and plugin
         ):
+            checks.append((kind, native, plugin, worker_arg))
+    return checks
+
+
+def _media_items_allowed(generation_config: Mapping[str, Any]) -> int | None:
+    """The most items of one modality a prompt may carry; None when unbounded.
+
+    vLLM allows 999 of a modality ``vllm_kwargs.limit_mm_per_prompt`` leaves
+    out, so an unset limit is unbounded.
+    """
+    limits = (generation_config.get("vllm_kwargs") or {}).get("limit_mm_per_prompt")
+    if not limits:
+        return None
+    return max(
+        limit["count"] if isinstance(limit, Mapping) else limit
+        for limit in limits.values()
+    )
+
+
+def check_dynamo_serving_chat_kwargs(generation_config: Mapping[str, Any]) -> None:
+    """Reject native chat-server settings Dynamo's frontend would not reproduce.
+
+    The frontend renders templates and parses output itself. Its renderer keeps
+    string content as strings and passes content arrays to the template, which
+    for text and for one media item renders what vLLM's ``string`` and
+    ``openai`` formats do. It differs only for several media items in one
+    message: vLLM's ``string`` puts their placeholders first, while the template
+    places them. It always parses ``tool_choice="auto"`` calls when a tool parser
+    is set. And its reasoning parsers return a non-thinking turn as content,
+    where vLLM's ``deepseek_r1`` returns it as reasoning.
+    """
+    serving = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs") or {}
+    if serving.get("chat_template_content_format") == "string":
+        items = _media_items_allowed(generation_config)
+        if items is None or items > 1:
             raise ValueError(
-                "mixed BF16/FP8 generation is not supported by backend='dynamo'; "
-                "use backend='vllm'"
+                "policy.generation.vllm_cfg.http_server_serving_chat_kwargs."
+                "chat_template_content_format='string' with "
+                "policy.generation.dynamo=true needs "
+                "policy.generation.vllm_kwargs.limit_mm_per_prompt to allow at "
+                "most one item of each modality (vLLM allows 999 of a modality it "
+                "leaves out). With several items in one message, vLLM's 'string' "
+                "format puts their placeholders first, while Dynamo's frontend "
+                "lets the chat template place them. Lower the limits, or remove "
+                "the content format."
             )
-        logprobs_mode = extra.get("logprobs_mode")
-        if logprobs_mode not in (None, "processed_logprobs"):
-            raise ValueError(
-                "policy.generation.vllm_cfg.logprobs_mode must be "
-                "'processed_logprobs' when backend='dynamo'; the managed "
-                "--enable-rl option selects processed rollout log probabilities"
-            )
-
-        configured_fields = self.model_fields_set | set(extra)
-        for key, replacement in _VLLM_CFG_MOVED.items():
-            if extra.get(key) is not None:
-                raise ValueError(
-                    f"policy.generation.vllm_cfg.{key} is not read by the "
-                    f"Dynamo backend; set {replacement} instead"
-                )
-        for key in sorted(_VLLM_CFG_UNSUPPORTED & configured_fields):
-            if not extra.get(key):
-                continue
-            warnings.warn(
-                f"policy.generation.vllm_cfg.{key} is ignored by backend='dynamo'",
-                stacklevel=2,
-            )
-        classified = (
-            set(DYNAMO_VLLM_FLAGS)
-            | _VLLM_CFG_STRUCTURAL
-            | set(_VLLM_CFG_MOVED)
-            | _VLLM_CFG_UNSUPPORTED
-            | _VLLM_CFG_MANAGED_RUNTIME
-            | _VLLM_CFG_INAPPLICABLE
-            | _VLLM_SINGLE_RANK_ONLY_FIELDS
-        )
-        unclassified = {
-            key for key in configured_fields if getattr(self, key, None) is not None
-        } - classified
-        if unclassified:
-            warnings.warn(
-                "vllm_cfg keys ignored by backend='dynamo': "
-                f"{sorted(unclassified)}. Add them to DYNAMO_VLLM_FLAGS or an "
-                "explicit not-forwarded classification.",
-                stacklevel=2,
-            )
-        return self
-
-
-def _require_nonempty_vllm_config(value: Any) -> Any:
-    if not isinstance(value, dict) or not value:
+    if serving.get("enable_auto_tools") is False:
         raise ValueError(
-            "policy.generation.vllm_cfg must be a nonempty mapping when "
-            "backend='dynamo'"
+            "policy.generation.vllm_cfg.http_server_serving_chat_kwargs."
+            "enable_auto_tools=false is not supported with "
+            "policy.generation.dynamo=true: Dynamo's frontend always parses "
+            "tool_choice='auto' calls when a tool parser is set. Remove it, or "
+            "remove the tool parser."
         )
-    return value
-
-
-class DynamoConfig(BaseModel, extra="allow"):
-    """Validated boundary for ``policy.generation.backend=dynamo``."""
-
-    backend: Literal["dynamo"]
-    dynamo_cfg: DynamoCfg
-    vllm_cfg: Annotated[
-        DynamoVllmConfig, BeforeValidator(_require_nonempty_vllm_config)
-    ]
-    vllm_kwargs: dict[str, Any]
-
-    @property
-    def engine_world_size(self) -> int:
-        """Return the derived ranks in each single-node vLLM engine."""
-        return self.vllm_cfg.tensor_parallel_size * self.vllm_cfg.pipeline_parallel_size
-
-    @model_validator(mode="after")
-    def _validate_backend_boundary(self) -> "DynamoConfig":
-        extra = self.model_extra or {}
-        # Shared GRPO YAML inheritance supplies mcore_generation_config and
-        # refit_cfg. Managed Dynamo uses vLLM arguments and the collective
-        # synchronizer instead, so these two sections are intentionally ignored.
-        for backend_cfg in ("sglang_cfg", "trtllm_cfg"):
-            if extra.get(backend_cfg):
-                raise ValueError(
-                    f"policy.generation.{backend_cfg} is not valid when "
-                    "backend='dynamo'; Dynamo manages vLLM only"
-                )
-        colocated = extra.get("colocated")
-        if isinstance(colocated, dict) and colocated.get("enabled"):
-            raise ValueError(
-                "policy.generation.colocated.enabled must be false when "
-                "backend='dynamo'"
-            )
-        if extra.get("refit_transport") is not None:
-            raise ValueError(
-                "policy.generation.refit_transport must be null when "
-                "backend='dynamo'; managed Dynamo supports NCCL collective refit only"
-            )
-        for quantization_field in ("quant_cfg", "real_quant"):
-            if extra.get(quantization_field):
-                raise ValueError(
-                    f"policy.generation.{quantization_field} is not supported "
-                    "when backend='dynamo'"
-                )
-        speculative_config = self.vllm_kwargs.get("speculative_config") or (
-            self.vllm_cfg.model_extra or {}
-        ).get("speculative_config")
-        if speculative_config:
-            raise ValueError(
-                "policy.generation.vllm_kwargs.speculative_config is not "
-                "supported by backend='dynamo' because draft weights are not "
-                "refit after step 0"
-            )
-        if self.vllm_kwargs.get("quantization") is not None:
-            raise ValueError(
-                "policy.generation.vllm_kwargs.quantization is not supported "
-                "when backend='dynamo'"
-            )
-        vllm_extra = self.vllm_cfg.model_extra or {}
-        for field in sorted(_VLLM_SINGLE_RANK_ONLY_FIELDS):
-            for source, value in (
-                ("vllm_cfg", vllm_extra.get(field)),
-                ("vllm_kwargs", self.vllm_kwargs.get(field)),
-            ):
-                if value is not None and int(value) != 1:
-                    raise ValueError(
-                        f"policy.generation.{source}.{field} must be 1 when "
-                        "backend='dynamo'; managed refit rank geometry is TP × PP"
-                    )
-        stop_strings = extra.get("stop_strings")
-        if stop_strings is not None and len(stop_strings) > 32:
-            raise ValueError(
-                "policy.generation.stop_strings supports at most 32 values when "
-                "backend='dynamo'"
-            )
-        ignored = sorted(
-            key
-            for key, value in extra.items()
-            if key not in _GENERATION_CLASSIFIED and _is_active(value)
+    thinking = native_default_chat_template_kwargs(generation_config).get(
+        "enable_thinking"
+    )
+    if serving.get("reasoning_parser") == "deepseek_r1" and thinking is False:
+        raise ValueError(
+            "http_server_serving_chat_kwargs.reasoning_parser='deepseek_r1' with "
+            "default_chat_template_kwargs.enable_thinking=false is not supported "
+            "with policy.generation.dynamo=true: vLLM's deepseek_r1 parser returns "
+            "a non-thinking turn as reasoning, and Dynamo's reasoning parsers "
+            "return it as content. Use the nano_v3 reasoning parser, which returns "
+            "it as content natively too, or enable thinking."
         )
-        if ignored:
-            warnings.warn(
-                f"policy.generation keys ignored by backend='dynamo': {ignored}",
-                stacklevel=2,
-            )
-        return self
+
+
+def dynamo_chat_template(generation_config: Mapping[str, Any]) -> str | None:
+    """The chat template the frontend renders with: a file path or literal Jinja.
+
+    ``dynamo_cfg.worker_args.custom_jinja_template``, else the native server's
+    ``http_server_serving_chat_kwargs.chat_template``; None uses the model's own.
+    """
+    configured = dynamo_cfg(generation_config).worker_args.custom_jinja_template
+    if configured is not None:
+        return configured
+    serving = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs") or {}
+    return serving.get("chat_template")
+
+
+def native_default_chat_template_kwargs(
+    generation_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The template kwargs the native server merges under every request's own.
+
+    ``default_chat_template_kwargs``, or the older ``chat_template_kwargs``
+    spelling, of ``vllm_cfg.http_server_serving_chat_kwargs``.
+    """
+    serving = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs") or {}
+    kwargs = serving.get("default_chat_template_kwargs")
+    if kwargs is None:
+        kwargs = serving.get("chat_template_kwargs")
+    return dict(kwargs or {})
+
+
+def dynamo_enabled(generation_config: Mapping[str, Any]) -> bool:
+    """Whether ``policy.generation.dynamo`` is on for a vLLM generation config."""
+    return bool(generation_config.get("dynamo"))
+
+
+def dynamo_cfg(generation_config: Mapping[str, Any]) -> DynamoCfg:
+    """The validated ``dynamo_cfg`` block; an absent block means all defaults."""
+    return DynamoCfg.model_validate(generation_config.get("dynamo_cfg") or {})
