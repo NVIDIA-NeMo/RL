@@ -2,47 +2,14 @@
 
 > In NeMo-RL, hard-failing on a missing key is the sanctioned pattern — never suggest .get(key, default) as a fix, for TypedDict config keys OR internal invariants; also check defaults: inheritance chains before claiming a new required key breaks recipes
 
-When a NeMo-RL PR adds a new key to a v1 TypedDict config (e.g. `VllmConfig`) and reads it
-without a fallback (bare subscript, or `.get()` + isinstance/None check that raises), that
-fail-loud-on-missing behavior IS the repo convention — the default lives ONLY in the exemplar
-YAML (`examples/configs/*.yaml`), and `cfg.get("key", default)` at the call site is an
-explicitly FORBIDDEN pattern per `skills/contributing/references/details/config-conventions.md` and
-docs/design-docs/design-and-philosophy.md.
+When a NeMo-RL PR adds a new key to a v1 TypedDict config (e.g. `VllmConfig`) and reads it without a fallback (bare subscript, or `.get()` + isinstance/None check that raises), that fail-loud-on-missing behavior IS the repo convention — the default lives ONLY in the exemplar YAML (`examples/configs/*.yaml`), and `cfg.get("key", default)` at the call site is an explicitly FORBIDDEN pattern per `skills/contributing/references/details/config-conventions.md` and docs/design-docs/design-and-philosophy.md.
 
-**Why:** In PR #3308 review, design-reviewer flagged the hard-require of
-`real_quant_export_cpu_offload` as a backward-compat break and proposed
-`.get("real_quant_export_cpu_offload", True)` — the exact forbidden hidden-default pattern.
-rl-expert read the convention correctly; devil-advocate adjudicated in rl-expert's favor and
-the design finding was dropped. Note the nearby `real_quant_ignore` `.get()`+substitute-default
-is itself convention-bending legacy — don't cite it as the pattern to copy.
+**Why:** In PR #3308 review, design-reviewer flagged the hard-require of `real_quant_export_cpu_offload` as a backward-compat break and proposed `.get("real_quant_export_cpu_offload", True)` — the exact forbidden hidden-default pattern. rl-expert read the convention correctly; devil-advocate adjudicated in rl-expert's favor and the design finding was dropped. Note the nearby `real_quant_ignore` `.get()`+substitute-default is itself convention-bending legacy — don't cite it as the pattern to copy.
 
-**This is not limited to config keys — it covers internal invariants too.** On PR #3652 I flagged
-that `_log_effective_quantization_ignore_patterns` (`vllm_worker.py:143`) does
-`vllm_kwargs["hf_overrides"]["quantization_config"]` unguarded, and would `KeyError` when
-`quantization_ignore_patterns` is set on a non-fp8 run (`init_fp8` never runs, so the key is never
-created). I proposed `.get("quantization_config", {})` — the forbidden pattern again, two PRs after
-learning it. The user reframed it correctly: **the question is not "is the key guaranteed to exist"
-but "do we require it to exist."** Here we do: if patterns are set, the user asked for MXFP8 ignore
-scoping, so a missing `quantization_config` means the patterns are silently inert — the exact
-silent-wrong-scope bug the PR existed to prevent. `.get(..., {})` would print an empty effective
-list and let the run proceed with attention quantized. Crashing is correct.
+**This is not limited to config keys — it covers internal invariants too.** On PR #3652 I flagged that `_log_effective_quantization_ignore_patterns` (`vllm_worker.py:143`) does `vllm_kwargs["hf_overrides"]["quantization_config"]` unguarded, and would `KeyError` when `quantization_ignore_patterns` is set on a non-fp8 run (`init_fp8` never runs, so the key is never created). I proposed `.get("quantization_config", {})` — the forbidden pattern again, two PRs after learning it. The user reframed it correctly: **the question is not "is the key guaranteed to exist" but "do we require it to exist."** Here we do: if patterns are set, the user asked for MXFP8 ignore scoping, so a missing `quantization_config` means the patterns are silently inert — the exact silent-wrong-scope bug the PR existed to prevent. `.get(..., {})` would print an empty effective list and let the run proceed with attention quantized. Crashing is correct.
 
-**The test to apply, from the user:** ask whether the code *requires* the key at that point. If yes,
-direct indexing is right and a `KeyError` is the feature, not a bug — do not file it. If the key is
-genuinely optional there, `.get()` is fine. Also run the baseline check from
-`fail-fast-is-not-strictly-worse` (see [proposed-fixes](../proposed-fixes.md)): the pre-change behaviour here was *silently ignoring* the
-patterns, so failing loudly is a strict improvement. At most, ask for a clearer error message —
-never for a default that hides the broken invariant.
+**The test to apply, from the user:** ask whether the code *requires* the key at that point. If yes, direct indexing is right and a `KeyError` is the feature, not a bug — do not file it. If the key is genuinely optional there, `.get()` is fine. Also run the baseline check from `fail-fast-is-not-strictly-worse` (see [proposed-fixes](../proposed-fixes.md)): the pre-change behaviour here was *silently ignoring* the patterns, so failing loudly is a strict improvement. At most, ask for a clearer error message — never for a default that hides the broken invariant.
 
-In review, never suggest `.get(key, default)` for a required key or invariant; a KeyError there is
-the feature, at most ask for a clearer message (#3308, #3652).
+In review, never suggest `.get(key, default)` for a required key or invariant; a KeyError there is the feature, at most ask for a clearer message (#3308, #3652).
 
-**How to apply:** (1) Before flagging "new required key breaks existing configs", trace every
-in-repo recipe's `defaults:` inheritance chain (nemo_rl/utils/config.py
-`load_config_with_inheritance` deep-merges parents) — recipes rooting at the updated exemplar
-inherit the key and are safe; the only break is out-of-tree standalone YAMLs, which is LOW
-severity and by design. (2) Never propose `.get(key, non-None-default)` as a fix in this repo;
-the correct asks are exemplar+reference-YAML defaults (both files, kept in sync for
-tests/unit/test_config_v2.py) and, at most, a clearer error message. (3) Verify against the
-config conventions (`skills/contributing/references/details/config-conventions.md`) before letting any agent's "sibling uses .get()" argument stand —
-the sibling may be the legacy anti-pattern. Related: [stacked-pr-check-threads-before-flagging](stacked-pr-check-threads-before-flagging.md).
+**How to apply:** (1) Before flagging "new required key breaks existing configs", trace every in-repo recipe's `defaults:` inheritance chain (nemo_rl/utils/config.py `load_config_with_inheritance` deep-merges parents) — recipes rooting at the updated exemplar inherit the key and are safe; the only break is out-of-tree standalone YAMLs, which is LOW severity and by design. (2) Never propose `.get(key, non-None-default)` as a fix in this repo; the correct asks are exemplar+reference-YAML defaults (both files, kept in sync for tests/unit/test_config_v2.py) and, at most, a clearer error message. (3) Verify against the config conventions (`skills/contributing/references/details/config-conventions.md`) before letting any agent's "sibling uses .get()" argument stand — the sibling may be the legacy anti-pattern. Related: [stacked-pr-check-threads-before-flagging](stacked-pr-check-threads-before-flagging.md).
