@@ -1593,7 +1593,9 @@ Depending on your data shape, you may want to change these values."""
                 # so the caller can hydrate its own row copy before postprocessing.
                 yield (
                     nemo_gym_row["_rowidx"],
-                    None if is_nemo_gym_task(nemo_gym_row) else nemo_gym_row["agent_ref"],
+                    None
+                    if is_nemo_gym_task(nemo_gym_row)
+                    else nemo_gym_row["agent_ref"],
                     nemo_rl_result,
                     timing_metrics,
                 )
@@ -1719,6 +1721,7 @@ Depending on your data shape, you may want to change these values."""
     async def _postprocess_captured_history(self, row: dict, result: dict) -> dict:
         """Select capture paths while retaining the scored terminal's identity."""
         # Optional Gym dependencies remain confined to the Gym adapter.
+        from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
@@ -1728,7 +1731,8 @@ Depending on your data shape, you may want to change these values."""
             RolloutSelection,
         )
 
-        owner = row[_NG_ROLLOUT_ID_BODY_KEY]
+        owner = maybe_rollout_id_from_run_body(row)
+        assert owner is not None
         reward = result.get("reward")
         if (
             isinstance(reward, bool)
@@ -1843,6 +1847,7 @@ Depending on your data shape, you may want to change these values."""
             key: value
             for key, value in result.items()
             if isinstance(value, (str, int, float, bool))
+            or key in ("_ng_episode_id", "_ng_task_id")
         }
         full_result["instance_config"] = {
             "mask_sample": result["instance_config"]["mask_sample"]

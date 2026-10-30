@@ -221,12 +221,13 @@ def test_episode_receipt_uses_fallback_identity_without_response(attempt, captur
     del reply["result"]["responses_create_params"]
     result = _normalize_nemo_gym_episode_result(row, reply, token_capture_enabled=True)
     env_class = NemoGym.__ray_metadata__.modified_class
-    env = object.__new__(env_class)
+    env = env_class({})
     env._control = AsyncMock(return_value={"records": [], "failures": []})
     processed = asyncio.run(env._postprocess_receipt_mode(row, result))
     env._control.assert_awaited_once_with(
         "GET", f"/training-token-capture/control/rollouts/{capture_key}/manifest"
     )
     assert processed["rollout_id"] == capture_key
+    assert processed["receipt"]["capture_key"] == capture_key
     assert processed["receipt"]["reward"] == 0.75
     assert processed["full_result"]["ng_agent_observations"] == {"custom": "kept"}

@@ -1473,7 +1473,7 @@ def test_restore_rejects_unsupported_schema_version(version: int) -> None:
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("version", [2, 3, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
     state = {
         "schema_version": version,
@@ -1496,7 +1496,7 @@ def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
     assert parsed.sampler_stamps_target_steps is False
 
 
-@pytest.mark.parametrize("version", [2, 3, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> None:
     state = _sealed_attempt_state()
     state["schema_version"] = version
@@ -1524,7 +1524,7 @@ def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> Non
     assert upgraded["groups"][0]["attribution_key"] is None
 
 
-@pytest.mark.parametrize("version", [2, 3])
+@pytest.mark.parametrize("version", [2, 3, 4, 5])
 def test_legacy_flat_checkpoint_restores_attribution_from_agent_name(
     version: int,
 ) -> None:
@@ -1533,9 +1533,14 @@ def test_legacy_flat_checkpoint_restores_attribution_from_agent_name(
     group_state = state["groups"][0]
     group_state["resolved_agent_name"] = "flat-agent"
     group_state.pop("attribution_key", None)
-    attempt = group_state["siblings"][0]["attempts"][0]
-    attempt["receipt"] = None
-    attempt["staging_keys"] = []
+    if version < 5:
+        for sibling in group_state["siblings"]:
+            for attempt in sibling["attempts"]:
+                attempt.pop("logical_selection")
+    if version < 4:
+        attempt = group_state["siblings"][0]["attempts"][0]
+        attempt["receipt"] = None
+        attempt["staging_keys"] = []
     ledger = RolloutRecoveryLedger.from_state_dict(state)
     group_id = group_state["group_id"]
     before = ledger.finalization_inputs(group_id)

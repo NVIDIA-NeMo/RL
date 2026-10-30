@@ -43,8 +43,14 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
     from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 5
-SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, 3, 4, ROLLOUT_RECOVERY_SCHEMA_VERSION}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 6
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
+    2,
+    3,
+    4,
+    5,
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -1228,7 +1234,7 @@ class RolloutRecoveryLedger:
         prompt_id = raw_group.get("prompt_id")
         task_source = raw_group.get("task_source")
         resolved_agent_name = raw_group.get("resolved_agent_name")
-        # v2/v3 checkpoints predate taskset attribution and stored only the flat agent.
+        # v2-v5 checkpoints predate taskset attribution and stored only the flat agent.
         attribution_key = raw_group.get("attribution_key", resolved_agent_name)
         raw_recovery_granularity = raw_group.get("recovery_granularity")
         expected_generations = raw_group.get("expected_generations")
