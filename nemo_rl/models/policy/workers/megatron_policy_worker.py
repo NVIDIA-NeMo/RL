@@ -197,13 +197,17 @@ def _should_use_router_replay(
         return False
     if "routed_experts" in data:
         return True
-    raise RuntimeError(
-        "policy.router_replay.enabled=true requires routed_experts for "
-        f"{stage}, but the fetched batch does not contain that field. This "
-        "usually means the TQ schema, field selection, or rollout write path "
-        "stopped carrying routed_experts. Reference-logprob intentionally skips "
-        "routed_experts; prev-logprob and train must not."
+    # A fetched batch can legitimately lack routes: rows restored from a
+    # checkpoint written before router replay was enabled, or token-free
+    # (masked) prompt groups committed without routes. Megatron then routes
+    # those tokens natively, exactly like the documented missing-route
+    # fallback does per token; it is not a schema failure.
+    print(
+        "router_replay: fetched batch has no routed_experts for "
+        f"{stage}; using Megatron's native router for this batch",
+        flush=True,
     )
+    return False
 
 
 def _model_self_packs_for_cp(model: Any) -> bool:

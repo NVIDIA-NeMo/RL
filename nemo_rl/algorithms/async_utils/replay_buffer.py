@@ -41,6 +41,7 @@ from typing import (
 )
 
 import ray
+import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
@@ -1264,11 +1265,34 @@ class TQReplayBuffer:
             prompt_idx=record.prompt_idx,
         )
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
-            raise RuntimeError(
-                "policy.router_replay.enabled=true requires routed_experts in "
-                "the SingleController rollout payload, but payload packing did "
-                "not produce that field. Check vLLM routed-expert capture and "
-                "the async message-log flattening path."
+            # A group whose every completion is token-free (every sandbox failed
+            # before the model spoke and the rollouts were masked) has no
+            # generation to route: it is legitimately routeless and must not take
+            # the run down. Masked placeholders may still carry assistant tokens,
+            # so "every completion is masked" counts as token-free too. Only
+            # groups with trainable tokens are required to carry routes.
+            # BatchedDataDict is tensordict-backed: `in` would coerce it to bool.
+            token_mask = train_batch.get("token_mask", None)
+            mask_sample = train_batch.get("mask_sample", None)
+            all_masked = mask_sample is not None and bool(
+                torch.as_tensor(mask_sample).bool().all().item()
+            )
+            has_generation_tokens = (
+                token_mask is None or bool(torch.as_tensor(token_mask).sum().item() > 0)
+            ) and not all_masked
+            if has_generation_tokens:
+                raise RuntimeError(
+                    "policy.router_replay.enabled=true requires routed_experts in "
+                    "the SingleController rollout payload, but payload packing did "
+                    "not produce that field. Check vLLM routed-expert capture and "
+                    "the async message-log flattening path."
+                )
+            print(
+                "router_replay: committing a token-free group without "
+                f"routed_experts (group_id={group_id}, prompt_idx={record.prompt_idx}, "
+                f"completions={len(record.completions)}); Megatron has nothing to "
+                "route for it",
+                flush=True,
             )
         trace_rollout_payload(keys=sample_ids, data=train_batch)
         async with self._data_plane_checkpoint_barrier.mutation("group_commits") as cut:
