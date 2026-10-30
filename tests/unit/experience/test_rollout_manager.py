@@ -1059,7 +1059,7 @@ def test_gate_off_keeps_the_mask_flag_in_the_per_agent_metrics():
 def _mask_gate_receipt_result():
     return {
         "message_log": [],
-        "receipt": {"rollout_id": "r0", "manifest": []},
+        "receipt": {"capture_key": "r0", "manifest": []},
         "rollout_id": "r0",
         "full_result": {
             "reward": 1.0,
@@ -1243,13 +1243,20 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
     assert "agent/reward_score_raw/mean" not in metrics
 
 
-def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():
+@pytest.mark.parametrize("forest_training", [False, True])
+def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics(
+    forest_training,
+):
     def _receipt_completion(manifest, truncated):
+        manifest = [dict(entry, response_id=str(i)) for i, entry in enumerate(manifest)]
         return Completion(
             message_log=[],
             env_extras={
                 "reward": 0.5,
-                "ng_receipt": {"rollout_id": "r", "manifest": manifest},
+                "ng_receipt": {"capture_key": "r", "manifest": manifest},
+                "ng_logical_selection": SimpleNamespace(
+                    response_ids=tuple(str(i) for i in range(len(manifest)))
+                ),
             },
             truncated=truncated,
             reward=0.5,
@@ -1263,13 +1270,15 @@ def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():
         _receipt_completion([{"cum_len": 4, "delta_len": 4}], truncated=True),
     ]
 
-    metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
+    impl = _nemo_gym_impl(True)
+    impl._forest_training = forest_training
+    metrics = impl._compute_rollout_metrics(completions, "agent")
 
     assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
     assert metrics["agent/total_tokens_per_sample/histogram"] == [9, 4]
     assert metrics["agent/total_tokens_per_sample/mean"] == pytest.approx(6.5)
-    assert metrics["agent/gen_tokens_per_sample/histogram"] == [5, 4]
-    assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(4.5)
+    # Receipts cannot distinguish generated tokens from inputs; no proxy escapes.
+    assert not any("gen_tokens" in key for key in metrics)
 
 
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
@@ -2034,6 +2043,8 @@ def _make_capture_manager(
     recovery_config: RolloutRecoveryConfig | None = None,
 ):
     mgr = object.__new__(RolloutManager)
+    mgr._forest_training = False
+    mgr._execution_row_multiple = 1
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
     mgr._rollout_recovery_config = recovery_config or RolloutRecoveryConfig()
@@ -2090,7 +2101,7 @@ def _make_capture_manager(
             )
             receipts = [
                 {
-                    "rollout_id": rollout_id,
+                    "capture_key": rollout_id,
                     "manifest": [{"staging_key": f"{rollout_id}/call"}],
                 }
                 for rollout_id in selected_ids
@@ -2203,7 +2214,7 @@ class TestGenerateForFinalizationFlow:
         assert request.prompt_idx == 0
         assert request.rollout_ids == tuple(attempt_ids)
         assert request.canonical_sample_ids == tuple(canonical_ids)
-        assert [r["rollout_id"] for r in request.receipts] == attempt_ids
+        assert [r["capture_key"] for r in request.receipts] == attempt_ids
         assert request.rewards == (0.5, 0.5)
         assert request.mask_sample == (False, False)
         assert request.loss_multiplier == 0.25
@@ -2244,7 +2255,7 @@ class TestGenerateForFinalizationFlow:
                 generation_index = generation_indices[0]
                 rollout_id = rollout_ids[generation_index]
                 receipt = {
-                    "rollout_id": rollout_id,
+                    "capture_key": rollout_id,
                     "manifest": [{"staging_key": f"{rollout_id}/call"}],
                 }
                 completion = _receipt_record([rollout_id], [receipt]).completions[0]
@@ -2360,7 +2371,7 @@ class TestGenerateForFinalizationFlow:
                 for generation_index in indices:
                     rollout_id = rollout_ids[generation_index]
                     receipt = {
-                        "rollout_id": rollout_id,
+                        "capture_key": rollout_id,
                         "manifest": [{"staging_key": f"{rollout_id}/call"}],
                     }
                     completion = _receipt_record([rollout_id], [receipt]).completions[0]
@@ -2455,7 +2466,7 @@ def test_capture_completion_preserves_checks_and_raw_reward_until_finalization()
     checks = RewardChecks(False, True, True)
     result = {
         "rollout_id": "r",
-        "receipt": {"rollout_id": "r", "manifest": []},
+        "receipt": {"capture_key": "r", "manifest": []},
         "reward_checks": checks,
         "message_log": [],
         "input_message_log": [],
@@ -2594,3 +2605,19 @@ class TestStepRewardMetrics:
         _run(mgr.generate_and_push({"idx": 0}))
 
         assert mgr._step_rewards == {}
+
+
+@pytest.mark.parametrize("honor_mask", [False, True])
+def test_receipt_raw_metrics_preserve_mask_but_defer_reward(honor_mask: bool) -> None:
+    impl = _nemo_gym_impl(honor_mask)
+    result = _mask_gate_receipt_result()
+    completions, _ = impl._results_to_completions([result])
+    metrics = impl._compute_rollout_metrics(
+        completions, "agent", full_results=[result["full_result"]]
+    )
+    assert metrics["agent/mask_sample/mean"] == 1.0
+    assert not any("reward" in key for key in metrics)
+    assert not any(
+        "ng_receipt" in key or "ng_logical_selection" in key for key in metrics
+    )
+    assert ("mask_sample" in completions[0].env_extras) is honor_mask

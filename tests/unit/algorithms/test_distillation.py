@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers import PretrainedConfig
 
 import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
@@ -820,7 +821,11 @@ def test_validate_works_without_logger(mock_components):
     assert "avg_length" in val_metrics
 
 
-def test_check_vocab_equality_pass(monkeypatch):
+@pytest.mark.parametrize("student_composite", [False, True])
+@pytest.mark.parametrize("teacher_composite", [False, True])
+def test_check_vocab_equality_pass(
+    monkeypatch, student_composite: bool, teacher_composite: bool
+):
     student_tokenizer = MagicMock()
     student_tokenizer.get_vocab.return_value = {"a": 0, "b": 1}
     student_tokenizer.__len__.return_value = 2
@@ -829,10 +834,12 @@ def test_check_vocab_equality_pass(monkeypatch):
     teacher_tokenizer.get_vocab.return_value = {"a": 0, "b": 1}
     teacher_tokenizer.__len__.return_value = 2
 
-    student_config = MagicMock()
-    student_config.vocab_size = 2
-    teacher_config = MagicMock()
-    teacher_config.vocab_size = 2
+    student_config = PretrainedConfig(vocab_size=2)
+    teacher_config = PretrainedConfig(vocab_size=2)
+    if student_composite:
+        student_config = PretrainedConfig(text_config=student_config)
+    if teacher_composite:
+        teacher_config = PretrainedConfig(text_config=teacher_config)
 
     monkeypatch.setattr(
         distil_mod.AutoTokenizer,
@@ -909,7 +916,11 @@ def test_check_vocab_equality_length_mismatch_raises(monkeypatch):
         check_vocab_equality(student_tokenizer, "student-model", "teacher-model")
 
 
-def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
+@pytest.mark.parametrize("student_composite", [False, True])
+@pytest.mark.parametrize("teacher_composite", [False, True])
+def test_check_vocab_equality_config_vocab_size_mismatch_raises(
+    monkeypatch, student_composite: bool, teacher_composite: bool
+):
     vocab = {"a": 0, "b": 1}
     student_tokenizer = MagicMock()
     student_tokenizer.get_vocab.return_value = vocab
@@ -919,10 +930,12 @@ def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
     teacher_tokenizer.get_vocab.return_value = vocab
     teacher_tokenizer.__len__.return_value = 2
 
-    student_config = MagicMock()
-    student_config.vocab_size = 2
-    teacher_config = MagicMock()
-    teacher_config.vocab_size = 3
+    student_config = PretrainedConfig(vocab_size=2)
+    teacher_config = PretrainedConfig(vocab_size=3)
+    if student_composite:
+        student_config = PretrainedConfig(text_config=student_config)
+    if teacher_composite:
+        teacher_config = PretrainedConfig(text_config=teacher_config)
 
     monkeypatch.setattr(
         distil_mod.AutoTokenizer,

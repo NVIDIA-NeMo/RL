@@ -5499,6 +5499,62 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
     checkpointer.shutdown.assert_called_once()
 
 
+def test_grpo_train_without_epoch_limit_cycles_until_max_num_steps(
+    mock_grpo_components, tmp_path
+):
+    """max_num_epochs=None keeps cycling the dataloader until max_num_steps."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.checkpoint_dir = tmp_path
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_epochs = None
+    master_config.grpo.max_num_steps = 3
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.checkpointing["enabled"] = False
+
+    single_batch_dataloader = MagicMock(spec=StatefulDataLoader)
+    single_batch_dataloader.__iter__ = lambda self: iter([mock_batch])
+    single_batch_dataloader.__len__ = MagicMock(return_value=1)
+    single_batch_dataloader.state_dict = MagicMock(return_value={})
+
+    with (
+        _patched_logprob_phase(policy),
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+        patch("nemo_rl.algorithms.grpo.refit_policy_generation", return_value={}),
+    ):
+        grpo_mod.grpo_train(
+            policy,
+            _mock_policy_generation(),
+            single_batch_dataloader,
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert policy.train.call_count == 3
+
+
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
 def test_grpo_ft_save_period_triggers_periodic_saves(
     mock_grpo_components, train_func, tmp_path
@@ -7906,6 +7962,59 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         ]
         if masked_position:
             assert math.isfinite(result["max_seq_mult_prob_error"])
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+    @pytest.mark.parametrize("field", ["prev_logprobs", "generation_logprobs"])
+    @pytest.mark.parametrize("threshold", [None, 1.1])
+    def test_pooled_nonfinite_error_is_owner_local(
+        self, bad: float, field: str, threshold: float | None
+    ) -> None:
+        train_data = self._create_train_data(
+            4,
+            3,
+            torch.zeros(4, 3),
+            torch.zeros(4, 3),
+            sample_mask=torch.tensor([1.0, 1.0, 1.0, 0.0]),
+        )
+        train_data[field][0, 1] = bad
+        train_data[field][3] = torch.nan
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data,
+            torch.ones(4),
+            threshold,
+            row_owner=torch.tensor([7, 7, 12, -1]),
+        )
+        keep = float(threshold is None)
+        assert train_data["sample_mask"].tolist() == [keep, keep, 1.0, 0.0]
+        assert result["num_masked_seqs"] == (0 if threshold is None else 2)
+        if threshold is not None:
+            assert result["max_seq_mult_prob_error_after_mask"] == 1.0
+
+    @pytest.mark.parametrize("filtering_on", [False, True])
+    def test_pooled_filtering_uses_only_supported_token_counts(
+        self, filtering_on: bool
+    ) -> None:
+        train_data = self._create_train_data(
+            3,
+            4,
+            torch.zeros(3, 4),
+            torch.zeros(3, 4),
+            token_mask=torch.tensor([[0, 1, 1, 1], [0, 1, 0, 0], [0, 1, 1, 1]]),
+        )
+        train_data["generation_logprobs"][0, 1:] = -torch.inf
+        train_data["generation_logprobs"][1, 1] = -math.log(1.2)
+        original_token_mask = train_data["token_mask"].clone()
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data,
+            torch.ones(3),
+            1.1,
+            filtering_on=filtering_on,
+            row_owner=torch.tensor([0, 0, 1]),
+        )
+        # Unsupported tokens cannot dilute the remaining token's error to 0.3.
+        assert train_data["sample_mask"].tolist() == [0.0, 0.0, 1.0]
+        assert result["num_masked_seqs"] == 2
+        torch.testing.assert_close(train_data["token_mask"], original_token_mask)
 
     @pytest.mark.parametrize("threshold", [None, 2.0])
     def test_support_filtered_tokenless_rows_are_excluded(self, threshold):
