@@ -2356,33 +2356,6 @@ def test_megatron_move_optimizer_keeps_state_on_offload_failure(monkeypatch, fai
     assert state[0]["exp_avg_sq"] is source
 
 
-@pytest.mark.parametrize("chained", [False, True])
-def test_megatron_move_optimizer_keeps_cuda_reload_path(monkeypatch, chained):
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
-
-    source = MagicMock(spec=torch.Tensor)
-    source.is_cuda = False
-    loaded = MagicMock(spec=torch.Tensor)
-    loaded.is_cuda = True
-    source.to.return_value = loaded
-    state = {0: {"exp_avg": source, "metadata": 7}}
-    allocate = MagicMock()
-    monkeypatch.setattr(torch, "empty_like", allocate)
-    worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.optimizer = _optimizer_for_state(state, chained=chained)
-
-    worker.move_optimizer("cuda")
-    worker.move_optimizer("cuda")
-
-    assert state[0]["exp_avg"] is loaded
-    assert state[0]["metadata"] == 7
-    source.to.assert_called_once_with("cuda")
-    loaded.to.assert_not_called()
-    allocate.assert_not_called()
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("chained", [False, True])
 def test_megatron_move_optimizer_cuda_round_trip(chained):

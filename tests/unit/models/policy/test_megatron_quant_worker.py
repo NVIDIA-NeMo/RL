@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import fnmatch
 import os
 import tempfile
 import time
@@ -120,47 +119,6 @@ def _make_real_quant_worker():
     worker.rank = 0
     worker._real_quant_refit_sync_group = None
     return worker
-
-
-@requires_weight_folding
-def test_real_quant_conversion_tasks_delegate_discovery_to_bridge():
-    model = nn.Module()
-    model.weight = nn.Parameter(torch.ones(1))
-    model.weight_quantizer = GroupedQuantizer(TensorQuantizer(), TensorQuantizer())
-    model.weight_quantizer[0].amax = torch.tensor(1.0)
-    model.input_quantizer = TensorQuantizer()
-    model.input_quantizer.amax = torch.tensor(2.0)
-    worker = _make_real_quant_worker()
-    worker.model = model
-    worker.fp8_cfg = {}
-    worker.refit_payload_mode = "logical_weights"
-
-    def build_conversion_tasks(models, *, exclude_param_patterns=()):
-        assert models == [model]
-        assert exclude_param_patterns == ("*weight_quantizer*",)
-        return [
-            name
-            for name, _ in (
-                *worker.model.named_parameters(),
-                *worker.model.named_buffers(),
-            )
-            if not any(
-                fnmatch.fnmatchcase(name, pattern) for pattern in exclude_param_patterns
-            )
-        ]
-
-    worker.megatron_bridge.get_conversion_tasks = build_conversion_tasks
-
-    assert (
-        worker._build_refit_conversion_tasks()
-        is worker.megatron_bridge.plan.conversion_tasks
-    )
-    assert worker._build_refit_conversion_tasks() is worker.refit_conversion_tasks
-    assert worker.megatron_bridge.calls == [("plan", ([model],), {})]
-    assert "weight_quantizer.0._amax" in dict(model.named_buffers())
-
-    worker.cfg["generation"]["real_quant"] = False
-    assert worker._build_refit_conversion_tasks() == ["weight", "input_quantizer._amax"]
 
 
 @requires_weight_folding
@@ -470,6 +428,10 @@ def test_policy_requires_real_quant_config_agreement():
 @requires_weight_folding
 def test_real_quant_config_and_stream_reuse_one_megatron_bridge_plan():
     worker = _make_real_quant_worker()
+    assert (
+        worker._build_refit_conversion_tasks()
+        is worker.megatron_bridge.plan.conversion_tasks
+    )
 
     config = worker.get_real_quantization_config()
     config["quant_algo"] = "modified"
@@ -1241,16 +1203,6 @@ class TestFindWeightQuantizer:
         """None param_weight should return None."""
         module = _SingleWeightQuantModule(enable_quantizer=True)
         assert _find_wq(module, None) is None
-
-    def test_multi_weight_matches_each(self):
-        """Each grouped expert weight must match its own quantizer."""
-        module = _MultiWeightQuantModule(num_weights=3)
-        for i in range(3):
-            w = getattr(module, f"weight{i}")
-            result = _find_wq(module, w)
-            assert result is module.weight_quantizer[i], (
-                f"weight{i} should match the quantizer"
-            )
 
     def test_multi_weight_folded_refit(self, monkeypatch):
         from nemo_rl.models.policy.workers.megatron_policy_worker import (

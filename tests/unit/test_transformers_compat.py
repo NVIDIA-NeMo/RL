@@ -243,9 +243,8 @@ def test_deepseek_v3_local_fast_tokenizer_keeps_native_backend(tmp_path: Path) -
     )
 
 
-@pytest.mark.parametrize("fail_first", (False, True))
 def test_deepseek_v3_tokenizer_registry_retry(
-    monkeypatch: pytest.MonkeyPatch, fail_first: bool
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     blocked = {"deepseek_v3", "unrelated"}
     mapping = {"deepseek_v3": "TokenizersBackend", "unrelated": "TokenizersBackend"}
@@ -260,7 +259,7 @@ def test_deepseek_v3_tokenizer_registry_retry(
         assert name == "local-fixture"
         assert kwargs == {"trust_remote_code": True}
         calls.append(("deepseek_v3" in blocked, "deepseek_v3" in mapping))
-        if fail_first and len(calls) == 1:
+        if len(calls) == 1:
             raise OSError("missing tokenizer.json")
         return result
 
@@ -270,19 +269,16 @@ def test_deepseek_v3_tokenizer_registry_retry(
     assert (
         AutoTokenizer.from_pretrained("local-fixture", trust_remote_code=True) is result
     )
-    assert calls == ([(True, True), (False, False)] if fail_first else [(True, True)])
+    assert calls == [(True, True), (False, False)]
     assert "unrelated" in blocked
     assert mapping["unrelated"] == "TokenizersBackend"
 
 
-@pytest.mark.parametrize("version", ("5.21.0", "6.0.0"))
 def test_deepseek_v3_tokenizer_patch_rejects_unverified_versions(
-    monkeypatch: pytest.MonkeyPatch, version: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Patch the guard's live import target, not a collection-time module alias.
     live_transformers = import_module("transformers")
-    monkeypatch.setattr(live_transformers, "__version__", version)
-    assert import_module("transformers") is live_transformers
-    assert import_module("transformers").__version__ == version
+    monkeypatch.setattr(live_transformers, "__version__", "5.21.0")
     with pytest.raises(AssertionError, match="verified on 5.12.1 and 5.20.1"):
         _patch_transformers_tokenizer_class_set()

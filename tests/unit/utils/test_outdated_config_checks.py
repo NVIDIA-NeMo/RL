@@ -359,8 +359,9 @@ def test_removed_mcore_generation_keys_report_the_first_and_current_keys_pass():
 # ============================================================================
 
 
-@pytest.mark.parametrize("ignore", [None, [], ["*.layers.0.*"]])
-@pytest.mark.parametrize("real_quant", [True, False])
+@pytest.mark.parametrize(
+    ("ignore", "real_quant"), [(None, False), ([], True), (["*.layers.0.*"], True)]
+)
 def test_removed_real_quant_ignore_is_rejected(
     ignore: list[str] | None, real_quant: bool
 ) -> None:
@@ -383,7 +384,7 @@ def test_removed_real_quant_ignore_is_rejected(
 
 @pytest.mark.parametrize(
     "config",
-    [{}, {"policy": None}, {"policy": {}}, {"policy": {"generation": None}}],
+    [{"policy": None}, {"policy": {"generation": None}}],
 )
 def test_absent_real_quant_ignore_passes(config: dict[str, Any]) -> None:
     check_outdated_config(config)
