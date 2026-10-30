@@ -23,7 +23,6 @@ from nemo_rl.models.policy.draft_config import (
     DSparkDraftConfig,
     Eagle3DraftConfig,
 )
-from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
 def _patch_transformers_tokenizer_class_set():
@@ -746,7 +745,11 @@ class PolicyConfig(TypedDict):
     automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     draft: NotRequired[DraftConfig]
-    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    # model_dump() of nemo_rl.utils.checkpoint.PretrainedCheckpointConfig, copied
+    # here from checkpointing.pretrained_checkpoint by each algorithm's setup.
+    # PolicyConfig is still a TypedDict that crosses the Ray boundary, and the
+    # Megatron setup path reads it with key access, so it stays a plain dict.
+    pretrained_checkpoint: NotRequired[dict[str, Any]]
     # Resolved once by the driver and carried to the student workers and (via
     # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.
     on_policy_distillation_full: NotRequired[OnPolicyDistillationFullTransport]
