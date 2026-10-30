@@ -1121,7 +1121,7 @@ def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs
     assert (
         config["initial_global_config_dict"]["policy_model"]["responses_api_models"][
             "vllm_model"
-        ]["checkpoint_policy"]
+        ]["checkpoint"]["policy"]
         is True
     )
     assert token_capture["capture_dir"] == "/capture"
@@ -1179,7 +1179,10 @@ def test_checkpointing_leaves_the_callers_policy_model_untouched(detected_uv_dir
     vllm_model = cfg["initial_global_config_dict"]["policy_model"][
         "responses_api_models"
     ]["vllm_model"]
-    assert vllm_model == {"uses_reasoning_parser": False, "checkpoint_policy": True}
+    assert vllm_model == {
+        "uses_reasoning_parser": False,
+        "checkpoint": {"policy": True},
+    }
     assert env_configs == env_configs_before
 
 

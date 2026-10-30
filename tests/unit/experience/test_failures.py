@@ -308,7 +308,7 @@ def _gym_failure_row(
 
 
 _ADMISSION_CLOSED_BODY = (
-    '{"error":{"code":"admission_closed",'
+    '{"error":{"code":"checkpoint_admission_closed",'
     '"detail":"agent admission is closed for a checkpoint"}}'
 )
 
@@ -326,7 +326,7 @@ class TestGymFailureRowsKeepTheirRow:
         restored = ray_cloudpickle.loads(ray_cloudpickle.dumps(failure))
         assert isinstance(restored, GymAdmissionClosed)
         assert restored.rowidx == 3
-        assert "admission_closed" in str(restored)
+        assert "checkpoint_admission_closed" in str(restored)
         # A raise without a dispatch recorder is retried, never charged as data.
         assert classify_rollout_failure(restored) is FailureClass.INFRA
 
@@ -347,7 +347,7 @@ class TestGymFailureRowsKeepTheirRow:
         )
 
     def test_another_409_stays_a_data_failure(self):
-        body = '{"error":{"code":"stale_attempt","detail":"older attempt"}}'
+        body = '{"error":{"code":"checkpoint_stale_attempt","detail":"older attempt"}}'
         failure = _gym_failure_row_error(
             {"_rowidx": 0}, _gym_failure_row(status=409, body=body)
         )

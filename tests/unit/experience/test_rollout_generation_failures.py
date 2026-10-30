@@ -996,7 +996,7 @@ class _AdmissionClosedGymMethod:
 
     @staticmethod
     async def _parked_item(rowidx):
-        return GymAdmissionClosed("admission_closed", rowidx)
+        return GymAdmissionClosed("checkpoint_admission_closed", rowidx)
 
     async def _admitted_item(self, rowidx):
         await self.release_admitted.wait()

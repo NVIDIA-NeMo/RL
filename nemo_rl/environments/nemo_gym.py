@@ -2796,7 +2796,7 @@ def _build_gym_actor_config(
             .setdefault("responses_api_models", {})
             .setdefault("vllm_model", {})
         )
-        policy_overrides["checkpoint_policy"] = True
+        policy_overrides["checkpoint"] = {"policy": True}
 
     return NemoGymConfig(
         model_name=model_name,
