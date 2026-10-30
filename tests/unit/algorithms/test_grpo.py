@@ -7801,6 +7801,82 @@ class TestValidateFunction:
         assert val_metrics["accuracy"] == pytest.approx(0.125)
         assert val_metrics["pass_k"] == pytest.approx(0.5)
 
+    @pytest.mark.parametrize(
+        ("max_val_samples", "expected_waves"),
+        [
+            # Partial last wave is scored rather than dropped.
+            (5, [[0, 1], [2, 3], [4]]),
+            # The wave that crosses the cap is cut to it.
+            (3, [[0, 1], [2]]),
+            # A cap past the dataset size scores the whole dataset.
+            (10, [[0, 1], [2, 3], [4, 5]]),
+        ],
+    )
+    def test_validate_scores_exactly_max_val_samples(
+        self, mock_grpo_components, max_val_samples, expected_waves
+    ):
+        def make_batch(indices):
+            return BatchedDataDict[DatumSpec](
+                {
+                    "message_log": [
+                        [
+                            {
+                                "role": "user",
+                                "content": "q",
+                                "token_ids": torch.tensor([i]),
+                            }
+                        ]
+                        for i in indices
+                    ],
+                    "task_name": ["math"] * len(indices),
+                    "extra_env_info": [{}] * len(indices),
+                    "loss_multiplier": torch.ones(len(indices)),
+                    "idx": torch.tensor(indices),
+                    "length": torch.ones(len(indices), dtype=torch.long),
+                    "total_reward": torch.zeros(len(indices)),
+                }
+            )
+
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(
+            return_value=iter(
+                [make_batch([0, 1]), make_batch([2, 3]), make_batch([4, 5])]
+            )
+        )
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.max_val_samples = max_val_samples
+        mock_config.grpo.val_batch_size = 2
+        mock_config.grpo.val_num_generations_per_prompt = 1
+
+        scored_waves = []
+
+        def run_rollout(_policy, batch, *_args, **_kwargs):
+            scored_waves.append(batch["idx"].tolist())
+            return batch, {"mean_gen_tokens_per_sample": 1.0}
+
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                side_effect=run_rollout,
+            ),
+            patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=False),
+            patch(
+                "nemo_rl.algorithms.grpo.should_use_async_rollouts",
+                return_value=False,
+            ),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            validate(
+                MagicMock(),
+                mock_dataloader,
+                MagicMock(),
+                {"math": MagicMock(spec=EnvironmentInterface)},
+                step=0,
+                master_config=mock_config,
+            )
+
+        assert scored_waves == expected_waves
+
     def test_validation_uses_val_sampling_params_on_gym_path(
         self, mock_grpo_components
     ):

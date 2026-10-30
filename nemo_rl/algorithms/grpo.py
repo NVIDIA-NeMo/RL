@@ -4820,14 +4820,18 @@ def validate(
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
-        # Cover the whole validation set: the last wave may be a partial batch
-        # (e.g. 251 prompts in waves of 126), so round up instead of down.
-        max_batches = -(
-            -master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
-        )
+        max_val_samples = master_config.grpo.max_val_samples
+        val_batch_size = master_config.grpo.val_batch_size
+        # Round up so a partial last batch is still scored (251 prompts in
+        # batches of 126 -> 126 + 125), and trim the last batch so no more than
+        # max_val_samples prompts are scored when the dataset is larger.
+        max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
+            num_left = max_val_samples - batch_idx * val_batch_size
+            if val_batch.size > num_left:
+                val_batch = val_batch.slice(0, num_left)
 
             if val_num_generations_per_prompt > 1:
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
