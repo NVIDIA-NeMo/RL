@@ -19,6 +19,24 @@ import pytest
 
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
+
+@pytest.mark.parametrize("value", [True, False, None])
+@pytest.mark.parametrize("new_key", [{}, {"forest_training": True}])
+def test_context_compaction_key_requires_explicit_migration(value, new_key):
+    with pytest.raises(ValueError, match="renamed to token_capture.forest_training"):
+        check_outdated_config(
+            {"token_capture": {"context_compaction": value, **new_key}}
+        )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [{}, {"token_capture": {}}, {"token_capture": {"forest_training": True}}],
+)
+def test_forest_config_has_no_obsolete_switch(config):
+    check_outdated_config(config)
+
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # The entrypoints under test are every file under ENTRYPOINTS_DIRS that imports

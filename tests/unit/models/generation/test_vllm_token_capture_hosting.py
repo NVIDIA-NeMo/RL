@@ -149,11 +149,11 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
 
     asyncio.run(VllmAsyncGenerationWorkerImpl.set_rollout_weight_version(worker, 4))
     first = worker.token_capture.begin_call(
-        CaptureAdmission(rollout_id="r", model_call_id="c1", mode="text")
+        CaptureAdmission(capture_key="r", model_call_id="c1", mode="text")
     )
     asyncio.run(VllmAsyncGenerationWorkerImpl.set_rollout_weight_version(worker, 5))
     second = worker.token_capture.begin_call(
-        CaptureAdmission(rollout_id="r", model_call_id="c2", mode="text")
+        CaptureAdmission(capture_key="r", model_call_id="c2", mode="text")
     )
 
     assert (first.weight_version, second.weight_version) == (4, 5)
@@ -283,7 +283,7 @@ def test_request_capture_round_trip_stages_and_rides_coords(
     worker = _worker_with_capture(sink)
     request = _FakeRequest(
         ng_capture={
-            "rollout_id": "r0",
+            "capture_key": "r0",
             "model_call_id": "c1",
             "parent_call_id": None,
             "prev_len": 0,
@@ -340,7 +340,7 @@ def test_request_capture_token_in_prev_len_chains():
     worker = _worker_with_capture(sink)
     request = _FakeRequest(
         ng_capture={
-            "rollout_id": "r0",
+            "capture_key": "r0",
             "model_call_id": "c2",
             "parent_call_id": "c1",
             "prev_len": 3,
@@ -366,7 +366,7 @@ def test_request_capture_token_in_prev_len_chains():
 def _staging_chain_request(prev_len: int = 3) -> _FakeRequest:
     return _FakeRequest(
         ng_capture={
-            "rollout_id": "r0",
+            "capture_key": "r0",
             "model_call_id": "c3",
             "parent_call_id": "c2",
             "prev_len": prev_len,
@@ -416,7 +416,7 @@ def test_inline_prefix_admission_resolves_without_a_fetch():
     worker._chain_prefix.install(source)
     request = _FakeRequest(
         ng_capture={
-            "rollout_id": "r0",
+            "capture_key": "r0",
             "model_call_id": "c2",
             "parent_call_id": "c1",
             "prev_len": 2,
@@ -431,7 +431,7 @@ def test_inline_prefix_admission_resolves_without_a_fetch():
     assert source.calls == []
     text_root = worker._capture_admission(
         _FakeRequest(
-            ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
+            ng_capture={"capture_key": "r0", "model_call_id": "c1", "mode": "text"}
         )
     )
     assert worker._resolve_admission_prefix(text_root) == []
@@ -495,7 +495,7 @@ def test_request_capture_is_a_noop_without_context_or_capture(
     plain = _FakeRequest(stream=False)  # no ng_capture attribute
     if not capture_enabled:
         worker.token_capture = None
-        plain.ng_capture = {"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
+        plain.ng_capture = {"capture_key": "r0", "model_call_id": "c1", "mode": "text"}
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, plain, [1, 2])
     content = _served_content([3], [-0.1])
     content["choices"][0]["message"].update(
@@ -516,7 +516,7 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
     worker = _worker_with_capture(sink)
     request = _FakeRequest(
         ng_capture={
-            "rollout_id": "r0",
+            "capture_key": "r0",
             "model_call_id": "c1",
             "parent_call_id": None,
             "prev_len": 0,
@@ -586,3 +586,34 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
         # The engine's model dtype and the HF patch size, as pinned on the sink.
         assert spec == MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=2)
         assert worker._capture_image_token_id == 18
+
+
+@pytest.mark.parametrize("prev_len", [0, 3])
+def test_route_delta_preserves_actual_predecessor_tail(prev_len):
+    import torch
+    from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
+
+    from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+
+    routes = [[[i]] for i in range(7)]
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "routed_experts": routes,
+                }
+            }
+        ]
+    }
+    VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
+        payload,
+        prev_len=prev_len,
+        prompt_len=5,
+        generated_len=2,
+    )
+    extras = VLLMCaptureAdapter().extract_extras(payload)
+    assert (
+        decode_routed_experts(extras["routed_experts"], torch.int16).tolist()
+        == routes[max(0, prev_len - 1) :]
+    )
+    assert "predecessor_tail_route" not in extras
