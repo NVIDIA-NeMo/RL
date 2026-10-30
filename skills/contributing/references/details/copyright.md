@@ -1,9 +1,3 @@
----
-name: copyright
-description: NVIDIA copyright header requirements for NeMo-RL. Covers which files need headers and the exact header text.
-when_to_use: Adding a new file; checking copyright headers; 'missing copyright', 'NVIDIA header', 'license header', 'is a header required here', during code review.
----
-
 # NVIDIA Copyright Header
 
 Add the following NVIDIA copyright header to all Python files and shell scripts. The header should include the current year. Exclude test files (files under `tests/` or test-only scripts).
