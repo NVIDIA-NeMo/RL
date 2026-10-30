@@ -456,6 +456,9 @@ class GRPOSaveState:
     # adaptive-ppo-clip's upper-bound offset k. None when adaptive-ppo-clip is
     # off and on checkpoints that predate it.
     cur_adaptive_ppo_clip_k: Optional[float] = None
+    # SingleController NeMo-Gym only: next per-attempt task ID. Zero keeps
+    # checkpoints written before the counter was introduced loadable.
+    next_nemo_gym_task_index: int = 0
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
