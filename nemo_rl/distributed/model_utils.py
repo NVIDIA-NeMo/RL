@@ -304,13 +304,12 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        # Opt-in: write the grad into the fp32 logits' storage instead of a second
+        # Opt-in: write the grad into the logits' storage instead of a second
         # [B, S, V/TP] tensor. Only safe when this op is the logits' sole consumer;
-        # each chunk is read before it is overwritten, and leaf tensors are left intact.
+        # each chunk is upcast (a copy) before it is overwritten, and a leaf passed
+        # directly is left intact.
         reuse_logits_storage = (
-            ctx.reuse_logits_storage
-            and vocab_parallel_logits.dtype == torch.float32
-            and not vocab_parallel_logits.is_leaf
+            ctx.reuse_logits_storage and not vocab_parallel_logits.is_leaf
         )
         grad_input: torch.Tensor = (
             vocab_parallel_logits
@@ -1106,7 +1105,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         return_packed_layout (bool): Keep the physical ``[1, T-1]`` layout.
             This is used when the input data was packed before it reached the
             model worker.
-        reuse_logits_storage (bool): Let the chunked path write its fp32 grad into
+        reuse_logits_storage (bool): Let the chunked path write its grad into
             the logits' storage. After backward the logits tensor holds the grad,
             so reading it as logits afterwards gives wrong values. Only for callers
             whose logits have no other consumer.

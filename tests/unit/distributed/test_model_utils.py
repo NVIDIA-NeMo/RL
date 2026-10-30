@@ -1999,29 +1999,24 @@ def test_student_teacher_kernels_normalize_bf16_logits_in_fp32(
     torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
 @pytest.mark.parametrize("leaf", [False, True])
-def test_chunked_logprob_backward_fp32_grad_reuses_logits_storage(monkeypatch, leaf):
-    """fp32 activation logits take their grad in place; leaves are never overwritten.
-
-    TP=1, so the all-reduces are identities and run without a process group.
-    """
-    from nemo_rl.distributed.model_utils import ChunkedDistributedLogprob
-
-    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, **_kw: t)
-    monkeypatch.setattr(
-        torch.distributed.nn.functional, "all_reduce", lambda t, **_kw: t
-    )
+def test_chunked_logprob_backward_grad_reuses_logits_storage(
+    single_rank_collectives, leaf, dtype
+):
+    """Activation logits take their grad in place; leaves are never overwritten."""
     torch.manual_seed(0)
     batch, seq, vocab = 2, 7, 11
-    base = torch.randn(batch, seq, vocab, requires_grad=True)
+    base = torch.randn(batch, seq, vocab, dtype=dtype, requires_grad=True)
     target = torch.randint(0, vocab, (batch, seq))
 
-    expected = torch.log_softmax(base, dim=-1).gather(-1, target.unsqueeze(-1))
-    expected.sum().backward()
-    expected_grad = base.grad.clone()
-    base.grad = None
+    ref = base.detach().float().requires_grad_(True)
+    expected = torch.log_softmax(ref, dim=-1).gather(-1, target.unsqueeze(-1))
+    (expected_grad,) = torch.autograd.grad(expected.sum(), ref)
+    # The grad is computed in fp32 and rounded to the logits' dtype.
+    expected_grad = expected_grad.to(dtype)
 
-    logits = base if leaf else base * 1.0  # non-leaf fp32 activation
+    logits = base if leaf else base * 1.0  # non-leaf activation
     before = logits.detach().clone()
     logprobs = ChunkedDistributedLogprob.apply(
         logits, target, 0, vocab, 3, None, False, True
