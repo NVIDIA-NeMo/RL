@@ -121,6 +121,35 @@ _ENV_FIELD_MAP = {
 # Standard-OTel env var that also propagates to workers via the Ray runtime_env.
 _SERVICE_NAME_ENV = "OTEL_SERVICE_NAME"
 
+# Any one of these pointing somewhere is enough to call the run "wired up". The
+# signal-specific vars are included because the OTel SDK prefers them over the
+# generic one, so a run can be configured with only
+# ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` set.
+_OTLP_ENDPOINT_ENVS = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+)
+
+
+def _otlp_endpoint_configured() -> bool:
+    """Whether an OTLP endpoint was configured for this run.
+
+    ``telemetry.enabled`` defaults to true, so this is what keeps that default
+    honest. Nothing downstream checks reachability -- lens sets
+    ``is_exporting`` from ``enabled`` alone, and the OTel SDK falls back to
+    ``http://localhost:4317`` -- so a default-on run with no collector would
+    export into a refused connection, retry per batch, and then block the
+    shutdown flush until it times out, on every run that never asked for
+    telemetry. An unset endpoint is the one case we can read as "not
+    configured" without a network call.
+
+    Only consulted for the OTLP exporter: ``console`` writes to stdout and needs
+    no endpoint.
+    """
+    return any(os.environ.get(name, "").strip() for name in _OTLP_ENDPOINT_ENVS)
+
 
 def _is_env_truthy(name: str) -> bool:
     """Return True if env var ``name`` is set to a truthy value."""
@@ -458,6 +487,12 @@ def init_telemetry_driver(
     # Before building the config below, so the settings reach workers through
     # the environment even on the paths that return early here.
     tel = getattr(master_config, "telemetry", None)
+    # Read before _config_to_env, whose setdefault writes the YAML value into
+    # this same variable and would make every run look like an env opt-in.
+    _enabled_set_in_env = bool(
+        os.environ.get(_ENV_FIELD_MAP["enabled"], "").strip()
+        or os.environ.get(f"{_OTEL_FALLBACK_PREFIX}_ENABLED", "").strip()
+    )
     if tel is not None:
         _config_to_env(tel)
     # Projected here for the same reason, and because a worker has no algorithm
@@ -474,6 +509,34 @@ def init_telemetry_driver(
         prefix=_OTEL_PREFIX,
         fallback_prefix=_OTEL_FALLBACK_PREFIX,
     )
+
+    # ``enabled`` defaults to true, so a run that never mentioned telemetry
+    # reaches here switched on. Exporting into an endpoint nobody configured
+    # costs that run a retry per batch and a blocked shutdown flush, so the
+    # default yields -- but an explicit opt-in is honoured and merely warned
+    # about, because silently ignoring it is the worse failure.
+    if config.enabled and config.exporter == "otlp" and not _otlp_endpoint_configured():
+        asked_for_it = _enabled_set_in_env or (
+            tel is not None and "enabled" in getattr(tel, "model_fields_set", ())
+        )
+        if asked_for_it:
+            logger.warning(
+                "nemo-lens: telemetry is enabled but no OTLP endpoint is set. "
+                "Export will target the SDK default (http://localhost:4317) and "
+                "likely fail. Set OTEL_EXPORTER_OTLP_ENDPOINT, or "
+                "telemetry.exporter=console to print spans instead."
+            )
+        else:
+            config.enabled = False
+            # Propagated so workers reach the same verdict: they rebuild their
+            # config from this environment and cannot see the endpoint check.
+            os.environ[_ENV_FIELD_MAP["enabled"]] = "0"
+            logger.info(
+                "nemo-lens: no OTLP endpoint configured; telemetry stays off. "
+                "Set OTEL_EXPORTER_OTLP_ENDPOINT to export, or "
+                "telemetry.enabled=true to override this check."
+            )
+
     if not config.enabled:
         _TELEMETRY_INITIALISED = True
         return None
