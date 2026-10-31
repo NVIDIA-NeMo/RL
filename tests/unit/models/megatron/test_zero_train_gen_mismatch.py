@@ -1137,6 +1137,8 @@ def test_logprob_shim_backward_is_the_replaced_functions_backward(
     assert calls == []  # the forward does not call the replaced function
     out.backward(grad_output)
 
-    assert calls == [(*original_args, False, *trailing_args)]
+    # The shim passes reuse_logits_storage explicitly, defaulting to False.
+    expected_trailing = (trailing_args or (False,)) if chunked else ()
+    assert calls == [(*original_args, False, *expected_trailing)]
     assert logits.grad.dtype == torch.bfloat16
     assert torch.equal(logits.grad, reference_logits.grad)
