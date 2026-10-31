@@ -284,11 +284,6 @@ def setup(
         Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, master_config, logger
     """
     set_seed(master_config.sft.seed)
-    if master_config.sft.defer_async_checkpoint_finalize:
-        raise ValueError(
-            "sft.defer_async_checkpoint_finalize is only supported by SFT v2. "
-            "Set it to false, or run SFT v2 (examples/run_sft_v2.py)."
-        )
 
     # Extract individual configs for easier access
     policy_config = master_config.policy
@@ -339,32 +334,29 @@ def setup(
     # ==========================
     #           Data
     # ==========================
-    if data_config.get("backend") == "energon":
-        raise ValueError("Energon SFT is not supported yet.")
-    else:
-        if train_dataset is None:
-            raise ValueError("The Hugging Face SFT backend requires a train dataset.")
-        sft_collate_fn = _build_sft_collate_fn(policy_config)
-        train_dataloader = StatefulDataLoader(
-            train_dataset,
-            batch_size=policy_config["train_global_batch_size"],
-            shuffle=data_config["shuffle"],
+    if train_dataset is None:
+        raise ValueError("The Hugging Face SFT backend requires a train dataset.")
+    sft_collate_fn = _build_sft_collate_fn(policy_config)
+    train_dataloader = StatefulDataLoader(
+        train_dataset,
+        batch_size=policy_config["train_global_batch_size"],
+        shuffle=data_config["shuffle"],
+        collate_fn=sft_collate_fn,
+        drop_last=True,
+        num_workers=data_config["num_workers"],
+    )
+
+    if val_dataset is not None:
+        val_dataloader = StatefulDataLoader(
+            val_dataset,
+            batch_size=sft_config.val_global_batch_size,
+            shuffle=False,
             collate_fn=sft_collate_fn,
-            drop_last=True,
+            drop_last=False,
             num_workers=data_config["num_workers"],
         )
-
-        if val_dataset is not None:
-            val_dataloader = StatefulDataLoader(
-                val_dataset,
-                batch_size=sft_config.val_global_batch_size,
-                shuffle=False,
-                collate_fn=sft_collate_fn,
-                drop_last=False,
-                num_workers=data_config["num_workers"],
-            )
-        else:
-            val_dataloader = None
+    else:
+        val_dataloader = None
 
     if last_checkpoint_path is not None:
         load_dataloader_state(train_dataloader, last_checkpoint_path, data_config)

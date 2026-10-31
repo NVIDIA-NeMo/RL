@@ -14,7 +14,7 @@
 """Checks configuration for unsupported features before worker startup."""
 
 from enum import Enum
-from typing import Any
+from typing import Any, NoReturn
 
 
 class EntryPoint(str, Enum):
@@ -34,6 +34,29 @@ class EntryPoint(str, Enum):
     XTOKEN_OFF_POLICY_DISTILLATION = "xtoken_off_policy_distillation"
 
 
+def _raise_unsupported_feature(
+    *,
+    feature: str,
+    condition: str | None = None,
+    suggestion: str | None = None,
+    tracking_url: str | None = None,
+) -> NoReturn:
+    """Raise ValueError with the feature, context, workaround, and tracking link."""
+    message = f"Currently, {feature} is not supported"
+    if condition:
+        message += f" when {condition}"
+    parts = [f"{message}."]
+    if suggestion:
+        parts.append(f"Please {suggestion}")
+    if tracking_url:
+        parts.append(f"Tracking: {tracking_url}")
+    else:
+        parts.append(
+            "Please file an issue at https://github.com/NVIDIA-NeMo/RL if needed."
+        )
+    raise ValueError(" ".join(parts))
+
+
 def check_common(config: dict[str, Any]) -> None:
     """Reject unsupported configurations shared by all entrypoints."""
     pass
@@ -41,7 +64,25 @@ def check_common(config: dict[str, Any]) -> None:
 
 def _check_algo_distillation(config: dict[str, Any]) -> None:
     """Reject unsupported configurations for distillation."""
-    pass
+    for section, who in (("policy", "student"), ("teacher", "teacher")):
+        backend_config = config.get(section)
+        if not isinstance(backend_config, dict):
+            continue
+        automodel_cfg = backend_config.get("automodel_cfg")
+        packing = backend_config.get("sequence_packing")
+        if (
+            isinstance(automodel_cfg, dict)
+            and automodel_cfg.get("enabled")
+            and automodel_cfg.get("sequence_parallel")
+            and isinstance(packing, dict)
+            and packing.get("enabled")
+        ):
+            _raise_unsupported_feature(
+                feature="sequence parallel + sequence packing",
+                condition=f"distilling with an Automodel {who}",
+                suggestion=f"set {section}.automodel_cfg.sequence_parallel=false.",
+                tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/1178",
+            )
 
 
 def _check_algo_dpo(config: dict[str, Any]) -> None:
@@ -61,17 +102,77 @@ def _check_algo_grpo(config: dict[str, Any]) -> None:
 
 def _check_algo_ppo(config: dict[str, Any]) -> None:
     """Reject unsupported configurations for ppo."""
-    pass
+    loss_config = config.get("loss_fn")
+    if isinstance(loss_config, dict) and loss_config.get("seq_logprob_error_in_loss"):
+        _raise_unsupported_feature(
+            feature="loss_fn.seq_logprob_error_in_loss",
+            condition="using PPO",
+            suggestion="disable it or use non-streaming GRPO.",
+        )
+
+    value_config = config.get("value")
+    if not isinstance(value_config, dict):
+        return
+    megatron_cfg = value_config.get("megatron_cfg")
+    if isinstance(megatron_cfg, dict) and megatron_cfg.get("enabled"):
+        return
+    automodel_cfg = value_config.get("automodel_cfg")
+    if not isinstance(automodel_cfg, dict) or not automodel_cfg.get("enabled"):
+        return
+    packing = value_config.get("sequence_packing")
+    if isinstance(packing, dict) and packing.get("enabled"):
+        _raise_unsupported_feature(
+            feature="sequence packing",
+            condition="using the Automodel PPO value model",
+            suggestion="set value.sequence_packing.enabled=false.",
+            tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/2951",
+        )
+    cp_size = automodel_cfg.get("context_parallel_size")
+    if cp_size is not None and cp_size != 1:
+        _raise_unsupported_feature(
+            feature="context parallelism",
+            condition="using the Automodel PPO value model",
+            suggestion="set value.automodel_cfg.context_parallel_size=1.",
+            tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/2951",
+        )
 
 
 def _check_algo_rm(config: dict[str, Any]) -> None:
     """Reject unsupported configurations for rm."""
-    pass
+    policy_config = config.get("policy")
+    if not isinstance(policy_config, dict):
+        return
+    automodel_cfg = policy_config.get("automodel_cfg")
+    if not isinstance(automodel_cfg, dict) or not automodel_cfg.get("enabled"):
+        return
+    cp_size = automodel_cfg.get("context_parallel_size")
+    if cp_size is not None and cp_size > 1:
+        _raise_unsupported_feature(
+            feature="context parallelism",
+            condition="using Automodel RM",
+            suggestion="set policy.automodel_cfg.context_parallel_size=1.",
+            tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/2482",
+        )
 
 
 def _check_algo_sft(config: dict[str, Any]) -> None:
     """Reject unsupported configurations for sft."""
-    pass
+    data_config = config.get("data")
+    if isinstance(data_config, dict) and data_config.get("backend") == "energon":
+        _raise_unsupported_feature(
+            feature="energon",
+            condition="using SFT v1",
+            suggestion="use SFT v2.",
+        )
+    sft_config = config.get("sft")
+    if isinstance(sft_config, dict) and sft_config.get(
+        "defer_async_checkpoint_finalize"
+    ):
+        _raise_unsupported_feature(
+            feature="sft.defer_async_checkpoint_finalize",
+            condition="using SFT v1",
+            suggestion="disable it or use SFT v2.",
+        )
 
 
 def _check_algo_sft_v2(config: dict[str, Any]) -> None:

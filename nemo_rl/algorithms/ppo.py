@@ -374,12 +374,6 @@ def setup(
     logger_config = master_config.logger
     cluster_config = master_config.cluster
 
-    if loss_config.seq_logprob_error_in_loss:
-        raise ValueError(
-            "loss_fn.seq_logprob_error_in_loss is not supported by PPO. "
-            "Use the non-streaming GRPO trainer."
-        )
-
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
@@ -432,18 +426,9 @@ def setup(
                 "value.sequence_packing.enabled=true."
             )
     else:
-        # Automodel PPO value model currently doesn't support sequence packing and CP.
         assert (value_config.get("automodel_cfg") or {}).get("enabled"), (
             "Exactly one of value.megatron_cfg.enabled or value.automodel_cfg.enabled "
             "must be true for the PPO value model."
-        )
-        assert value_config["sequence_packing"]["enabled"] is False, (
-            "Sequence packing is currently not supported for the Automodel PPO value model. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
-        )
-        assert value_config["automodel_cfg"]["context_parallel_size"] == 1, (
-            "Context parallelism (CP>1) is currently not supported for the Automodel PPO value model. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
     # Set seed for all random number generators
     set_seed(ppo_config.seed)

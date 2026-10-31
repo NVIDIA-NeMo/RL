@@ -240,12 +240,7 @@ def main(is_vlm: bool = False):
         tokenizer = get_tokenizer(config.policy["tokenizer"], get_processor=is_vlm)
 
         # setup data
-        if config.data.get("backend") == "energon":
-            raise ValueError(
-                "Energon backend is not supported for V1, use `run_sft_v2.py` instead."
-            )
-        else:
-            dataset, val_dataset = setup_data(tokenizer, config.data, config.policy)
+        dataset, val_dataset = setup_data(tokenizer, config.data, config.policy)
 
         (
             policy,
