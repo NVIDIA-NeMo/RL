@@ -46,6 +46,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
+    replays_sampler_support,
 )
 from nemo_rl.algorithms.loss import (
     DraftRuntimeLossWrapper,
@@ -53,6 +54,7 @@ from nemo_rl.algorithms.loss import (
     prepare_loss_input,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
+from nemo_rl.algorithms.loss.loss_input import sampler_support_logprobs
 from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -845,6 +847,34 @@ class LogprobsPostProcessor:
             policy support information in logprobs for the actor loss.
         """
         input_lengths = data_dict["input_lengths"]
+
+        if replays_sampler_support(self.sampling_params):
+            # Same support-renormalized log-probs as the actor loss (score
+            # centering runs Automodel with TP=1, CP=1).
+            cu_seqlens = None
+            if self.enable_seq_packing:
+                cu_seqlens = to_cpu_int_tuple(
+                    processed_inputs.flash_attn_kwargs.cu_seqlens_q
+                )
+            token_logprobs, _ = sampler_support_logprobs(
+                logits,
+                data_dict,
+                self.sampling_params,
+                chunk_size=self.logprob_chunk_size,
+                cp_sharder=cp_sharder,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens,
+            )
+            token_logprobs = torch.cat(
+                [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
+            )
+            positions = torch.arange(token_logprobs.shape[1], device=logits.device)
+            lengths = torch.as_tensor(input_lengths, device=logits.device)
+            token_logprobs = torch.where(
+                positions < lengths.unsqueeze(-1), token_logprobs, 0.0
+            )
+            mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
+            return mask_filtered_logprobs_outside_tokens(token_logprobs, mask)
 
         if cp_sharder is not None:
             # ``data_dict`` stays canonical under CP: ``_build_model_batch`` clones

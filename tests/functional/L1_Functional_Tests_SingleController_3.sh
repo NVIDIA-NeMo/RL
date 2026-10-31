@@ -49,6 +49,9 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller
 # Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
 # custodying token lineage and the finalizer publishing training rows.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+# Score centering through capture, canonical TQ columns, trainer gather and loss.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_gym_single_controller.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_filtered_gym_single_controller.sh
 # BrowseComp hides old tool results; valid rows must prove a context boundary.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_context_compaction.sh
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and

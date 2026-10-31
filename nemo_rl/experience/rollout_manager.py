@@ -1095,10 +1095,16 @@ class AsyncNemoGymRolloutImpl:
     def _validate_init_params(self) -> None:
         """Validate initialization parameters."""
         # Validate generation config.
-        for key in ["stop_strings", "stop_token_ids", "top_k"]:
+        for key in ["stop_strings", "stop_token_ids"]:
             assert not self._generation_config[key], (  # type: ignore
                 f"{key} is not supported in the generation config in NeMo-Gym path!"
             )
+        # NeMo-Gym requests leave top_k unset (it is not OpenAI-compatible); only
+        # NeMo-RL's vLLM server pins it to the configured profile.
+        assert (
+            not self._generation_config["top_k"]
+            or self._generation_config["backend"] == "vllm"
+        ), "top_k in the NeMo-Gym path needs the vLLM generation backend!"
 
         # Validate max_rollout_turns.
         assert self._max_rollout_turns == 1, (

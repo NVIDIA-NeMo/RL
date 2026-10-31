@@ -30,6 +30,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.openai_server_utils import PrefixSplice
+from nemo_rl.models.generation.score_centering import (
+    VLLM_LOGPROB_FLOOR,
+    extract_score_centering_samples,
+)
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.metric_names import (
     FINISHED_REASON_LABEL,
@@ -57,7 +61,6 @@ def _format_refit_key_error(label: str, keys: set[str]) -> str:
 
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
-VLLM_LOGPROB_FLOOR = -9999.0
 
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
@@ -674,6 +677,35 @@ def attach_token_information_to_chat_response_choices(
     return response
 
 
+def attach_sampler_topk_logprobs_to_chat_response_choices(
+    response: Any,
+    final_request_output: Any,
+    *,
+    top_k: int,
+) -> Any:
+    """Attach each generated position's ``top_k`` engine log-probs to the choice messages.
+
+    The engine reports the sampled token plus the top ``top_k`` candidates per
+    position, each with its rank; the ``top_k`` lowest ranks are the sampler's
+    head. Sets ``sampler_topk_token_ids`` (int32) and ``sampler_topk_logprobs``
+    (float32), both ``[generated_len, top_k]``, next to the fields attached by
+    ``attach_token_information_to_chat_response_choices``, which already
+    matched choices to generation outputs.
+    """
+    outputs_by_index = {
+        output.index: output for output in getattr(final_request_output, "outputs", [])
+    }
+    for choice in getattr(response, "choices", []):
+        (
+            choice.message.sampler_topk_token_ids,
+            choice.message.sampler_topk_logprobs,
+        ) = extract_score_centering_samples(
+            outputs_by_index[choice.index], num_candidates=top_k
+        )
+
+    return response
+
+
 def model_dump_chat_response_with_dynamic_message_fields(
     response: Any,
 ) -> dict[str, Any]:
@@ -688,6 +720,8 @@ def model_dump_chat_response_with_dynamic_message_fields(
             "prompt_token_ids",
             "generation_token_ids",
             "generation_log_probs",
+            "sampler_topk_token_ids",
+            "sampler_topk_logprobs",
         ):
             field_value = getattr(message, field_name, None)
             if field_value is not None:

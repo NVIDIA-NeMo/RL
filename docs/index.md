@@ -326,6 +326,7 @@ guides/cispo.md
 guides/prorlv2.md
 guides/swe-rl-qwen3.md
 guides/grpo.md
+guides/score-centering.md
 guides/length-penalty.md
 guides/ppo.md
 guides/grpo-deepscaler.md
@@ -349,6 +350,7 @@ guides/refit.md
 guides/checkpoint-engine-refit.md
 guides/dynamo-generation.md
 guides/router-replay.md
+guides/sampler-replay.md
 guides/muon-optimizer.md
 guides/automodel-tp-accuracy.md
 guides/ft-launcher-guide.md

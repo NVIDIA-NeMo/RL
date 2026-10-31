@@ -598,6 +598,51 @@ class TestForwardWithPostProcessingFn:
         assert forward_kwargs["position_ids"] is processed_mb.position_ids
 
     @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_forward_passes_unpadded_cu_seqlens_to_logprobs_post_processor(
+        self, mock_model_forward
+    ):
+        """Replaying the sampler support on packed rows needs the unpadded boundaries."""
+        from types import SimpleNamespace
+
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LogprobsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        mock_model_forward.return_value = torch.randn(1, 8, 100)
+        packed_seq_params = SimpleNamespace(
+            cu_seqlens_q=torch.tensor([0, 3, 5]),
+            cu_seqlens_q_padded=torch.tensor([0, 4, 8]),
+        )
+        processed_mb = ProcessedMicrobatch(
+            data_dict=MagicMock(),
+            input_ids=torch.zeros(1, 8, dtype=torch.long),
+            input_ids_cp_sharded=torch.zeros(1, 8, dtype=torch.long),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=packed_seq_params,
+            cu_seqlens_padded=packed_seq_params.cu_seqlens_q_padded,
+            original_seq_length=4,
+        )
+        post_processor = LogprobsPostProcessor(
+            cfg={"sequence_packing": {"enabled": True}}
+        )
+
+        with patch.object(
+            LogprobsPostProcessor, "__call__", return_value=MagicMock()
+        ) as call:
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=post_processor,
+            )
+
+        kwargs = call.call_args.kwargs
+        assert kwargs["cu_seqlens"] is packed_seq_params.cu_seqlens_q
+        assert kwargs["cu_seqlens_padded"] is packed_seq_params.cu_seqlens_q_padded
+
+    @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_topk_post_processor(self, mock_model_forward):
         """Test forward with TopkLogitsPostProcessor."""
         from nemo_rl.models.megatron.data import ProcessedMicrobatch
@@ -1530,6 +1575,7 @@ class TestLossPostProcessor:
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(0.5), {"loss": 0.5}))
         mock_loss_fn.input_type = LossInputType.LOGIT
+        mock_loss_fn.score_centering = False
         cfg = {"sequence_packing": {"enabled": False}}
 
         processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg, cp_normalize=False)
@@ -1569,6 +1615,7 @@ class TestLossPostProcessor:
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(1.0), {}))
         mock_loss_fn.input_type = LossInputType.LOGIT
+        mock_loss_fn.score_centering = False
         cfg = {"sequence_packing": {"enabled": False}}
 
         processor = LossPostProcessor(
@@ -1806,6 +1853,74 @@ class TestLogprobsPostProcessor:
 
         mock_from_logits_packed.assert_called_once()
         assert "logprobs" in result
+
+    @pytest.mark.parametrize("packed", [False, True])
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_group", return_value=None
+    )
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_group",
+        return_value=None,
+    )
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    def test_logprobs_post_processor_replays_the_sampler_support(
+        self, mock_tp_rank, mock_tp_grp, mock_cp_grp, packed
+    ):
+        """Prev logprobs renormalize over the captured S_q, like the actor loss."""
+        from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.train import LogprobsPostProcessor
+
+        torch.manual_seed(0)
+        processor = LogprobsPostProcessor(
+            cfg={"sequence_packing": {"enabled": packed}, "logprob_chunk_size": 2},
+            sampling_params=TrainingSamplingParams(
+                top_k=3, top_p=0.9, sampler_replay=True
+            ),
+        )
+        logits = torch.randn(2, 4, 6)
+        head_ids = torch.tensor([[2, 4, 1], [5, 0, 3]]).repeat(2, 2, 1)  # [2, 4, 3]
+        head_logprobs = torch.tensor([0.6, 0.4, 0.0]).log().expand(2, 4, 3)
+        input_ids = head_ids[..., 0].clone()
+        input_ids[:, 2] = head_ids[:, 2, 1]
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                # Row 1 has three tokens; its last position is padding.
+                "token_mask": torch.tensor(
+                    [[0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 1.0, 0.0]]
+                ),
+                "sample_mask": torch.ones(2),
+                "sampler_topk_token_ids": head_ids,
+                "sampler_topk_logprobs": head_logprobs.clone(),
+            }
+        )
+        if packed:
+            # Each sequence is padded to 4 in the pack: unpadded (0, 4, 7).
+            output_tensor = torch.cat(
+                [logits[0], logits[1, :3], torch.zeros(1, 6)]
+            ).unsqueeze(0)
+            boundaries = dict(cu_seqlens_padded=(0, 4, 8), cu_seqlens=(0, 4, 7))
+        else:
+            output_tensor = logits
+            boundaries = dict(cu_seqlens_padded=None)
+        wrapped_fn = processor(
+            data_dict=data,
+            input_ids=input_ids,
+            original_seq_length=4,
+            **boundaries,
+        )
+        _, result = wrapped_fn(output_tensor)
+
+        support = head_ids[:, 1:, :2]  # the sampler kept the first two head ids
+        z = logits[:, :-1].gather(-1, support)
+        sampled = (support == input_ids[:, 1:, None]).int().argmax(-1, keepdim=True)
+        replayed = (z - z.logsumexp(-1, keepdim=True)).gather(-1, sampled).squeeze(-1)
+        expected = torch.cat([torch.zeros(2, 1), replayed], dim=1)
+        expected = torch.where(data["token_mask"].bool(), expected, 0.0)
+        torch.testing.assert_close(result["logprobs"], expected)
 
 
 @pytest.mark.parametrize("boundary_type", [torch.tensor, tuple])

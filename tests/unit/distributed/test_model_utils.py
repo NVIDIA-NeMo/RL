@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import math
 import os
+from datetime import timedelta
 
 import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
+)
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedCrossEntropyToFixedLogits,
     ChunkedDistributedEntropy,
@@ -28,6 +33,7 @@ from nemo_rl.distributed.model_utils import (
     ChunkedDistributedReverseKLToFixedLogits,
     DistributedLogprob,
     DistributedLogprobWithSampling,
+    SamplerSupportLogprob,
     _compute_distributed_log_softmax,
     _compute_distributed_selected_logprobs,
     _get_tokens_on_this_cp_rank,
@@ -36,6 +42,8 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
+    get_policy_logprobs_at_sampler_topk,
+    sampler_support_ids,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -254,6 +262,74 @@ class ModelUtilsTestActor:
         )
         return {"success": True, "error": None}
 
+    def test_topk_logprobs_equivalence(self):
+        """TP+CP top-k log-probs and their gradient match a full-vocab log-softmax."""
+        torch.distributed.init_process_group(backend="nccl")
+
+        # Rank layout: rank = cp_rank * tp_size + tp_rank. Every rank creates
+        # every group, in the same order, as new_group requires.
+        rank = int(os.environ["RANK"])
+        tp_rank = rank % self.tp_size
+        cp_rank = rank // self.tp_size
+        tp_group = cp_group = None
+        for cp_r in range(self.cp_size):
+            ranks = [cp_r * self.tp_size + tp_r for tp_r in range(self.tp_size)]
+            group = torch.distributed.new_group(ranks=ranks)
+            if rank in ranks:
+                tp_group = group
+        for tp_r in range(self.tp_size):
+            ranks = [cp_r * self.tp_size + tp_r for cp_r in range(self.cp_size)]
+            group = torch.distributed.new_group(ranks=ranks)
+            if rank in ranks:
+                cp_group = group
+
+        batch_size, seq_len, vocab_size, top_k = 2, 16, 64, 5
+        vocab_part_size = vocab_size // self.tp_size
+        torch.manual_seed(7)  # identical full tensors on every rank
+        full_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+        sampler_topk_token_ids = torch.randint(
+            0,
+            vocab_size,
+            (batch_size, seq_len, top_k),
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        reference_logits = full_logits.clone().requires_grad_(True)
+        expected = torch.log_softmax(reference_logits, dim=-1)[:, :-1].gather(
+            dim=-1, index=sampler_topk_token_ids.long()[:, 1:]
+        )
+        expected.sum().backward()
+
+        shard = full_logits[
+            ..., tp_rank * vocab_part_size : (tp_rank + 1) * vocab_part_size
+        ]
+        shard = _get_tokens_on_this_cp_rank(shard, cp_rank, self.cp_size, seq_dim=1)
+        shard = shard.clone().requires_grad_(True)
+        actual = get_policy_logprobs_at_sampler_topk(
+            sampler_topk_token_ids=sampler_topk_token_ids,
+            next_token_logits=shard,
+            vocab_parallel_rank=tp_rank,
+            vocab_parallel_group=tp_group,
+            context_parallel_group=cp_group if self.cp_size > 1 else None,
+            chunk_size=4,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+        actual.sum().backward()
+        expected_grad = reference_logits.grad[
+            ..., tp_rank * vocab_part_size : (tp_rank + 1) * vocab_part_size
+        ]
+        expected_grad = _get_tokens_on_this_cp_rank(
+            expected_grad, cp_rank, self.cp_size, seq_dim=1
+        )
+        # The CP all-gather's backward sums the identical per-rank losses, which
+        # LossPostProcessor undoes by dividing by cp_size.
+        torch.testing.assert_close(
+            shard.grad / self.cp_size, expected_grad, rtol=1e-5, atol=1e-5
+        )
+        return {"success": True, "error": None}
+
 
 MODEL_UTILS_TEST_ACTOR_FQN = f"{ModelUtilsTestActor.__module__}.ModelUtilsTestActor"
 
@@ -345,6 +421,67 @@ def test_from_parallel_logits_to_logprobs_packed_sequences(
 
         worker_group.shutdown(force=True)
 
+    finally:
+        cluster.shutdown()
+
+
+def test_get_policy_logprobs_at_sampler_topk_single_device():
+    """The unsharded path is a rolled gather of the full log-softmax, with gradient."""
+    torch.manual_seed(0)
+    logits = torch.randn(2, 6, 11, requires_grad=True)
+    sampler_topk_token_ids = torch.randint(0, 11, (2, 6, 3), dtype=torch.int32)
+
+    actual = get_policy_logprobs_at_sampler_topk(
+        sampler_topk_token_ids=sampler_topk_token_ids, next_token_logits=logits
+    )
+    expected = torch.log_softmax(logits, dim=-1)[:, :-1].gather(
+        dim=-1, index=sampler_topk_token_ids.long()[:, 1:]
+    )
+
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+@pytest.mark.parametrize(
+    "tp_cp_config",
+    [
+        (2, 1),  # TP=2, CP=1
+        (1, 2),  # TP=1, CP=2
+        (2, 2),  # TP=2, CP=2
+    ],
+)
+def test_get_policy_logprobs_at_sampler_topk_tp_cp(
+    register_model_utils_test_actor, tp_cp_config
+):
+    """Score centering's head log-probs under TP and CP against a full-vocab reference."""
+    tp_size, cp_size = tp_cp_config
+    world_size = tp_size * cp_size
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {world_size}, got {torch.cuda.device_count()}"
+        )
+
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[world_size], use_gpus=True)
+    try:
+        sharding = NamedSharding(
+            layout=np.arange(world_size).reshape(tp_size, cp_size), names=["tp", "cp"]
+        )
+        builder = RayWorkerBuilder(
+            register_model_utils_test_actor, tp_size, cp_size, sharding
+        )
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+        results = ray.get(
+            worker_group.run_all_workers_single_data("test_topk_logprobs_equivalence")
+        )
+        for i, result in enumerate(results):
+            assert result["success"], f"Worker {i} failed: {result['error']}"
+        worker_group.shutdown(force=True)
     finally:
         cluster.shutdown()
 
@@ -1997,3 +2134,300 @@ def test_student_teacher_kernels_normalize_bf16_logits_in_fp32(
 
     expected_kl, _, _ = _student_teacher_reference(student, teacher)
     torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-5)
+
+
+# Filtered score centering replays the sampler's support captured in the head.
+_SCORE_CENTERING_FILTERS = TrainingSamplingParams(
+    top_k=8, top_p=0.9, sampler_replay=True
+)
+
+
+def _run_score_centering_packed_equivalence(
+    rank, world_size, tp_size, cp_size, device, sampling_params=None
+):
+    """Compare packed TP/CP values and gradients with a full-vocabulary reference."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+    from nemo_rl.algorithms.loss.loss_input import prepare_packed_loss_input
+    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+
+    tp_groups = [
+        torch.distributed.new_group([c * tp_size + t for t in range(tp_size)])
+        for c in range(cp_size)
+    ]
+    cp_groups = [
+        torch.distributed.new_group([c * tp_size + t for c in range(cp_size)])
+        for t in range(tp_size)
+    ]
+    tp_rank, cp_rank = rank % tp_size, rank // tp_size
+    tp_group = tp_groups[cp_rank]
+    cp_group = cp_groups[tp_rank] if cp_size > 1 else None
+    torch.manual_seed(12)
+    full = torch.randn(2, 8, 12, device=device, requires_grad=True)
+    ids = torch.stack([torch.randperm(12)[:3] for _ in range(16)]).view(2, 8, 3)
+    ids = ids.to(device)
+    sampler_logprobs = torch.zeros(2, 8, 3, device=device)
+    if sampling_params is not None:
+        # The sampler kept slots 0 and 1 (all of its mass) and filtered slot 2.
+        sampler_logprobs[..., :2] = -math.log(2)
+        sampler_logprobs[..., 2] = -float("inf")
+    # Under replay the caller marks filtered head slots with -1.
+    head_ids = sampler_support_ids(ids, sampler_logprobs) if sampling_params else ids
+    lengths, padded = (0, 5, 12), (0, 8, 20)
+
+    def pack_rows(tensor):
+        rows = []
+        for i, (actual_len, padded_len) in enumerate([(5, 8), (7, 12)]):
+            row = torch.cat(
+                [
+                    tensor[i : i + 1, :actual_len],
+                    tensor.new_zeros(1, padded_len - actual_len, 12),
+                ],
+                dim=1,
+            )
+            rows.append(_get_tokens_on_this_cp_rank(row, cp_rank, cp_size, seq_dim=1))
+        return torch.cat(rows, dim=1)
+
+    local = (
+        pack_rows(full)[..., tp_rank * 6 : (tp_rank + 1) * 6]
+        if tp_size == 2
+        else pack_rows(full)
+    )
+    local = local.detach().requires_grad_()
+    actual = get_policy_logprobs_at_sampler_topk(
+        sampler_topk_token_ids=head_ids,
+        next_token_logits=local,
+        vocab_parallel_rank=tp_rank,
+        vocab_parallel_group=tp_group,
+        context_parallel_group=cp_group,
+        chunk_size=2,
+        cu_seqlens_q=lengths,
+        cu_seqlens_q_padded=padded,
+        packed_sampler_topk_token_ids=_pack_input_ids(
+            head_ids, lengths, padded, cp_rank=cp_rank, cp_size=cp_size, roll_shift=-1
+        ),
+        sampling_params=sampling_params,
+    )
+    data = {
+        "input_ids": ids[..., 0],
+        "token_mask": torch.ones(2, 8, device=device),
+        "sample_mask": torch.ones(2, device=device),
+        "sampler_topk_token_ids": ids,
+        "sampler_topk_logprobs": sampler_logprobs,
+    }
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
+    prepared, _ = prepare_packed_loss_input(
+        local,
+        data,
+        loss_fn,
+        lengths,
+        padded,
+        vocab_parallel_rank=tp_rank,
+        vocab_parallel_group=tp_group,
+        context_parallel_group=cp_group,
+        sampling_params=sampling_params,
+        chunk_size=2,
+    )
+    torch.testing.assert_close(prepared["policy_logprobs_at_sampler_topk"], actual)
+    with pytest.raises(ValueError, match="externally prepacked"):
+        prepare_packed_loss_input(
+            local,
+            {**data, "cu_seqlens": lengths},
+            loss_fn,
+            lengths,
+            padded,
+            vocab_parallel_rank=tp_rank,
+            vocab_parallel_group=tp_group,
+            context_parallel_group=cp_group,
+            chunk_size=2,
+        )
+    actual = prepared["policy_logprobs_at_sampler_topk"]
+    if sampling_params is None:
+        expected = full[:, :-1].log_softmax(-1).gather(-1, ids[:, 1:])
+    else:
+        expected = _sampler_support_reference(full[:, :-1], head_ids[:, 1:])
+    mask = torch.zeros_like(expected, dtype=torch.bool)
+    mask[0, :4] = True
+    mask[1, :6] = True
+    assert torch.isneginf(expected[mask]).any() == (sampling_params is not None)
+    torch.testing.assert_close(
+        prepared["next_token_logprobs"].where(mask[..., 0], 0.0),
+        expected[..., 0].where(mask[..., 0], 0.0),
+    )
+    torch.testing.assert_close(
+        actual.where(mask, 0.0), expected.where(mask, 0.0), atol=1e-6, rtol=1e-5
+    )
+    mask &= torch.isfinite(expected)
+    (actual.where(mask, 0.0).sum() / cp_size).backward()
+    expected.where(mask, 0.0).sum().backward()
+    reference_grad = pack_rows(full.grad)
+    if tp_size == 2:
+        reference_grad = reference_grad[..., tp_rank * 6 : (tp_rank + 1) * 6]
+    torch.testing.assert_close(local.grad, reference_grad, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+@pytest.mark.parametrize("tp_size,cp_size", [(2, 1), (1, 2), (2, 2)])
+def test_score_centering_packed_tp_cp(
+    distributed_test_runner, tp_size, cp_size, filtered
+):
+    if torch.cuda.device_count() < tp_size * cp_size:
+        pytest.skip(f"Packed TP/CP gradient test requires {tp_size * cp_size} GPUs")
+    distributed_test_runner(
+        functools.partial(
+            _run_score_centering_packed_equivalence,
+            tp_size=tp_size,
+            cp_size=cp_size,
+            device="cuda",
+            sampling_params=_SCORE_CENTERING_FILTERS if filtered else None,
+        ),
+        world_size=tp_size * cp_size,
+    )
+
+
+def _run_score_centering_packed_gloo(rank, tp_size, cp_size, init_file, filtered):
+    """Exercise combined TP/CP collectives without requiring four GPU devices."""
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=tp_size * cp_size,
+        timeout=timedelta(seconds=120),
+    )
+    try:
+        _run_score_centering_packed_equivalence(
+            rank,
+            tp_size * cp_size,
+            tp_size,
+            cp_size,
+            device="cpu",
+            sampling_params=_SCORE_CENTERING_FILTERS if filtered else None,
+        )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+@pytest.mark.parametrize("tp_size,cp_size", [(2, 1), (1, 2), (2, 2)])
+def test_score_centering_packed_tp_cp_gloo(tmp_path, tp_size, cp_size, filtered):
+    """Retain combined TP=2/CP=2 value/gradient coverage on two-GPU CI runners."""
+    torch.multiprocessing.spawn(
+        _run_score_centering_packed_gloo,
+        args=(tp_size, cp_size, str(tmp_path / "gloo-init"), filtered),
+        nprocs=tp_size * cp_size,
+        join=True,
+    )
+
+
+def _sampler_support(batch_size, seq_len, vocab_size, k, generator=None):
+    """Distinct per-position support ids ``[B, S, k]``, ``-1`` where the sampler filtered."""
+    ids = torch.stack(
+        [
+            torch.randperm(vocab_size, generator=generator)[:k]
+            for _ in range(batch_size * seq_len)
+        ]
+    ).view(batch_size, seq_len, k)
+    filtered = torch.rand(batch_size, seq_len, k, generator=generator) < 0.3
+    filtered[..., 0] = False  # the likeliest id is always kept
+    return ids.masked_fill(filtered, -1)
+
+
+def _sampler_support_reference(logits, support):
+    """Log-softmax over each position's support ids, ``-inf`` at filtered slots."""
+    valid = support >= 0
+    z = (
+        logits.float()
+        .gather(-1, support.clamp(min=0))
+        .masked_fill(~valid, -float("inf"))
+    )
+    log_norm = z.logsumexp(-1, keepdim=True)
+    return z - torch.where(torch.isneginf(log_norm), 0.0, log_norm)
+
+
+@pytest.mark.parametrize("chunk_size", [None, 2])
+def test_sampler_support_logprob_matches_the_renormalized_support(chunk_size):
+    """Exact sampler replay: renormalize over the captured S_q, no vocab top-k."""
+    torch.manual_seed(0)
+    logits = torch.randn(2, 5, 11, dtype=torch.float64).float().requires_grad_(True)
+    support = _sampler_support(2, 5, 11, 4)
+    support[1, 4] = -1  # a position without support (e.g. padding) stays finite-free
+    actual = SamplerSupportLogprob.apply(logits, support, 0, None, chunk_size, False)
+    expected = _sampler_support_reference(logits, support)
+    torch.testing.assert_close(actual, expected)
+    assert torch.isneginf(actual[1, 4]).all() and not actual.isnan().any()
+
+    finite = torch.isfinite(expected)
+    weights = torch.randn(expected.shape)
+    grad = torch.autograd.grad(actual.where(finite, 0.0).mul(weights).sum(), logits)[0]
+    reference = torch.autograd.grad(
+        expected.where(finite, 0.0).mul(weights).sum(), logits
+    )[0]
+    torch.testing.assert_close(grad, reference)
+
+
+def _run_sampler_support_tp_gloo(rank, world_size, init_file):
+    """TP=2: one all-reduce of the K gathered logits per chunk, nothing vocabulary-sized."""
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=120),
+    )
+    dist = torch.distributed
+    originals = {
+        name: getattr(dist, name)
+        for name in ("all_reduce", "all_gather", "all_to_all", "all_to_all_single")
+    }
+    calls = []
+
+    def spy(name):
+        def wrapped(*args, **kwargs):
+            calls.append((name, args[0].numel()))
+            return originals[name](*args, **kwargs)
+
+        return wrapped
+
+    for name in originals:
+        setattr(dist, name, spy(name))
+    try:
+        batch_size, seq_len, vocab_size, k = 2, 6, 16, 4
+        local_vocab = vocab_size // world_size
+        generator = torch.Generator().manual_seed(3)
+        full = torch.randn(batch_size, seq_len, vocab_size, generator=generator)
+        full = full.to(torch.bfloat16).requires_grad_(True)
+        support = _sampler_support(batch_size, seq_len, vocab_size, k, generator)
+        local = full.detach()[..., rank * local_vocab : (rank + 1) * local_vocab]
+        local = local.clone().requires_grad_(True)
+        actual = SamplerSupportLogprob.apply(
+            local, support, rank * local_vocab, dist.group.WORLD, 4, False
+        )
+        assert [name for name, _ in calls] == ["all_reduce"] * 2, calls
+        assert all(numel <= batch_size * 4 * k for _, numel in calls), calls
+
+        expected = _sampler_support_reference(full, support)
+        torch.testing.assert_close(actual, expected.detach())
+        finite = torch.isfinite(expected)
+        actual.where(finite, 0.0).sum().backward()
+        expected.where(finite, 0.0).sum().backward()
+        torch.testing.assert_close(
+            local.grad,
+            full.grad[..., rank * local_vocab : (rank + 1) * local_vocab],
+        )
+        assert [name for name, _ in calls] == ["all_reduce"] * 2, calls
+    finally:
+        for name, fn in originals.items():
+            setattr(dist, name, fn)
+        torch.distributed.destroy_process_group()
+
+
+def test_sampler_support_logprob_tp_gloo(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_sampler_support_tp_gloo,
+        args=(2, str(tmp_path / "gloo-init")),
+        nprocs=2,
+        join=True,
+    )
