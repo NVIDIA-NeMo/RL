@@ -111,7 +111,6 @@ def _controller(actor: object) -> Any:
     ctrl._rollout_recovery_ledger = MagicMock()
     ctrl._rollout_recovery_ledger.__contains__.return_value = False
     ctrl._rollout_manager = MagicMock()
-    ctrl._rollout_manager.pop_capture_rollout_metrics.return_value = {}
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
@@ -148,7 +147,7 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
     ctrl = _controller(actor)
     request = _request()
 
-    committed = asyncio.run(ctrl._finalize_with_actor(request))
+    committed = asyncio.run(ctrl._finalize_with_actor(request, {}))
 
     assert committed is result
     assert finalize.calls == [request]
@@ -165,7 +164,6 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         extra_env_info=None,
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
-    ctrl._rollout_manager.pop_capture_rollout_metrics.assert_called_once_with("group")
 
 
 def test_capture_rollout_metrics_ride_on_the_committed_meta() -> None:
@@ -188,11 +186,9 @@ def test_capture_rollout_metrics_ride_on_the_committed_meta() -> None:
     )
     ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
     metrics = {"agent/rollout_time_taken/mean": 12.5}
-    ctrl._rollout_manager.pop_capture_rollout_metrics.return_value = metrics
 
-    asyncio.run(ctrl._finalize_with_actor(_request()))
+    asyncio.run(ctrl._finalize_with_actor(_request(), metrics))
 
-    ctrl._rollout_manager.pop_capture_rollout_metrics.assert_called_once_with("group")
     committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
     assert committed_meta.extra_info == {"existing": 1, ROLLOUT_METRICS: [metrics]}
     # The finalizer's own meta is not mutated.
@@ -267,6 +263,7 @@ def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
         task = asyncio.create_task(
             ctrl._finalize_with_actor(
                 _request(None if outcome == "missing_route" else "image_agent"),
+                {},
             )
         )
         try:
@@ -356,7 +353,7 @@ def test_below_threshold_group_releases_pending_finalizer_state() -> None:
     async def _below_threshold_branch() -> None:
         # The same calls the rollout pump makes when
         # valid_row_count / total_row_count < min_valid_fraction_per_group.
-        assert await ctrl._finalize_with_actor(request) is result
+        assert await ctrl._finalize_with_actor(request, {}) is result
         assert "group" in ctrl._finalizer_metrics_by_group
         assert "group" in ctrl._finalizer_rewards_by_group
         await ctrl._discard_committed_group(request)
@@ -375,7 +372,7 @@ def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> Non
     request = _request()
 
     with pytest.raises(RuntimeError, match="actor died after submission"):
-        asyncio.run(ctrl._finalize_with_actor(request))
+        asyncio.run(ctrl._finalize_with_actor(request, {}))
 
     assert finalize.calls == [request]
     assert ctrl._available_finalizers.empty()
@@ -398,7 +395,7 @@ def test_missing_actor_metadata_cleans_known_canonical_and_staging_ownership() -
     ctrl = _controller(actor)
 
     with pytest.raises(RuntimeError, match="no metadata for non-dropped group"):
-        asyncio.run(ctrl._finalize_with_actor(_request()))
+        asyncio.run(ctrl._finalize_with_actor(_request(), {}))
 
     assert ctrl._dp_client.clear_calls == [
         {"sample_ids": ["group_g0"], "partition_id": "canonical"},
@@ -428,7 +425,7 @@ def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
     actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
     ctrl = _controller(actor)
 
-    committed = asyncio.run(ctrl._finalize_with_actor(_request()))
+    committed = asyncio.run(ctrl._finalize_with_actor(_request(), {}))
 
     assert committed is None
     assert ctrl._dp_client.clear_calls == [

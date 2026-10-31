@@ -1987,7 +1987,7 @@ class SingleControllerActor:
         self._finalizer_rewards_by_group.pop(request.group_id, None)
 
     async def _finalize_with_actor(
-        self, request: "ReassemblyRequest"
+        self, request: "ReassemblyRequest", rollout_metrics: dict[str, Any]
     ) -> Optional["FinalizedGroup"]:
         """Finalize and index one group atomically with respect to TQ saves.
 
@@ -1999,10 +1999,6 @@ class SingleControllerActor:
         valid-rollout fraction is no longer a finalizer-side drop -- the caller
         decides that, since only the caller can source a replacement.
         """
-        # Popped before any await, so a dropped or cancelled group leaves no entry.
-        rollout_metrics = self._rollout_manager.pop_capture_rollout_metrics(
-            request.group_id
-        )
         self._finalizer_waiters += 1
         queue_depth = max(
             0,
@@ -2307,13 +2303,13 @@ class SingleControllerActor:
                             # spans under it must be gated on PER_PROMPT.
                             with per_prompt_scope():
                                 if lineage_group_id is None:
-                                    request = await self._rollout_manager.generate_for_finalization(
+                                    captured = await self._rollout_manager.generate_for_finalization(
                                         prompt,
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
                                     )
                                 else:
-                                    request = await self._rollout_manager.generate_for_finalization(
+                                    captured = await self._rollout_manager.generate_for_finalization(
                                         prompt,
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
@@ -2325,7 +2321,7 @@ class SingleControllerActor:
                             if not generation_permit_released:
                                 sem.release()
                                 generation_permit_released = True
-                            if request is None:
+                            if captured is None:
                                 # Dropped within the infra budget: nothing was
                                 # committed, so the train pump will never release
                                 # this permit, and the step it was stamped for
@@ -2345,7 +2341,10 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return
-                            finalized = await self._finalize_with_actor(request)
+                            request, rollout_metrics = captured
+                            finalized = await self._finalize_with_actor(
+                                request, rollout_metrics
+                            )
                             if finalized is None:
                                 # Finalizer dropped the group as a structural
                                 # outcome (e.g. router replay with no routed

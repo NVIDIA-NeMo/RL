@@ -1172,7 +1172,7 @@ def test_min_valid_fraction_counts_rollouts_independently_of_segments(
         ctrl._algo_cfg = ctrl._master_config.grpo
         request = SimpleNamespace(group_id="group")
         ctrl._rollout_manager = SimpleNamespace(
-            generate_for_finalization=AsyncMock(return_value=request),
+            generate_for_finalization=AsyncMock(return_value=(request, {})),
             record_finalizer_dropped_prompt=MagicMock(),
             stats=SimpleNamespace(committed=0),
         )
@@ -1230,7 +1230,7 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             self.generated += 1
             if self.generated == 2:
                 self.two_generated.set()
-            return SimpleNamespace(group_id=f"g{self.generated}")
+            return SimpleNamespace(group_id=f"g{self.generated}"), {}
 
     async def _main() -> None:
         manager = _SplitRolloutManager()
@@ -1239,11 +1239,12 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
 
         async def _delayed_finalize(
             request: Any,
+            rollout_metrics: dict[str, Any],
             *,
             target_step: int | None = None,
         ) -> bool:
             nonlocal finalizers_started
-            del request, target_step
+            del request, rollout_metrics, target_step
             finalizers_started += 1
             await release_finalizers.wait()
             return True
@@ -1360,7 +1361,7 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         ) -> Any:
             del prompt, target_step, inflight_registry
             assert self.recovery_ledger.get_group(lineage_group_id)
-            return SimpleNamespace(group_id=lineage_group_id)
+            return SimpleNamespace(group_id=lineage_group_id), {}
 
     async def _main() -> None:
         manager = _RecoveryCaptureManager()
@@ -1404,6 +1405,7 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
 
         async def _finalize(
             request: Any,
+            rollout_metrics: dict[str, Any],
         ) -> Any:
             async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
                 manager.recovery_ledger.discard_group(cut, request.group_id)

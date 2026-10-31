@@ -2144,7 +2144,6 @@ def _make_capture_manager(
     mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
-    mgr._capture_rollout_metrics = {}
     mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._data_plane_checkpoint_barrier = buf.data_plane_checkpoint_barrier
 
@@ -2216,7 +2215,7 @@ class TestGenerateForFinalizationFlow:
             _FakeCaptureBuffer(),
             recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
         )
-        request = _run(first.generate_for_finalization(prompt))
+        request, _ = _run(first.generate_for_finalization(prompt))
         assert request.resolved_agent_name == "resolved-agent"
         assert "agent_ref" not in prompt["extra_env_info"]
 
@@ -2236,7 +2235,7 @@ class TestGenerateForFinalizationFlow:
             restored._tq_buffer,
             lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
         )
-        recovered = _run(
+        recovered, _ = _run(
             restored.generate_for_finalization(
                 prompt, lineage_group_id=request.group_id
             )
@@ -2261,7 +2260,7 @@ class TestGenerateForFinalizationFlow:
             ],
         )
 
-        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+        request, _ = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
 
         # The gym mask flag is read from env_extras exactly like the token
         # path's _mask_sample_flags: either form flags the row. truncated is
@@ -2274,12 +2273,11 @@ class TestGenerateForFinalizationFlow:
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(buf)
 
-        request = _run(
+        request, rollout_metrics = _run(
             mgr.generate_for_finalization(
                 {"prompt": "p", "idx": 0, "loss_multiplier": 0.25}, target_step=5
             )
         )
-        assert request is not None
 
         # Rollout ids were minted from the reserved group id and threaded
         # end to end: reserve -> impl -> metadata-only actor request.
@@ -2301,11 +2299,8 @@ class TestGenerateForFinalizationFlow:
         assert request.mask_sample == (False, False)
         assert request.loss_multiplier == 0.25
         assert request.fallback_weight_version == 7
-        # The group's rollout metrics wait for the controller and are popped once.
-        assert mgr.pop_capture_rollout_metrics(group_id) == {
-            "agent/rollout_time_taken/mean": 12.5
-        }
-        assert mgr.pop_capture_rollout_metrics(group_id) == {}
+        # The group's rollout metrics travel next to the request.
+        assert rollout_metrics == {"agent/rollout_time_taken/mean": 12.5}
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
@@ -2321,7 +2316,7 @@ class TestGenerateForFinalizationFlow:
             _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
         assert len(buf.abort_calls) == 1
 
-    def test_failure_after_rollout_drops_the_groups_rollout_metrics(self, monkeypatch):
+    def test_failure_after_rollout_aborts_the_reservation(self, monkeypatch):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(buf)
 
@@ -2332,7 +2327,6 @@ class TestGenerateForFinalizationFlow:
         with pytest.raises(RuntimeError, match="ledger exploded"):
             _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
         assert len(buf.abort_calls) == 1
-        assert mgr._capture_rollout_metrics == {}
 
     def test_exhausted_capture_cleans_internally_owned_recovery_group(self, capsys):
         buf = _FakeCaptureBuffer()
@@ -2422,9 +2416,8 @@ class TestGenerateForFinalizationFlow:
             backoff_base_s=0.0,
         )
 
-        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 4}))
+        request, _ = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 4}))
 
-        assert request is not None
         assert request.prompt_idx == 4
         assert attempts == 2
         assert len(buf.reserve_rollout_ids) == 2
@@ -2491,9 +2484,8 @@ class TestGenerateForFinalizationFlow:
         impl = _PartialCaptureImpl()
         mgr._impl = impl
 
-        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 9}))
+        request, _ = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 9}))
 
-        assert request is not None
         assert request.prompt_idx == 9
         assert impl.generation_indices == [[0, 1], [0, 1]]
         assert impl.recovery_granularities == [
@@ -2505,6 +2497,60 @@ class TestGenerateForFinalizationFlow:
         assert second_ids[0] != first_ids[0]
         assert second_ids[1] != first_ids[1]
         assert request.rollout_ids == (second_ids[0], second_ids[1])
+
+    def test_partial_sibling_retry_drops_the_groups_rollout_metrics(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+        mgr._retry_policy = RolloutRetryPolicy.single_attempt(
+            max_infra_attempts=2,
+            backoff_base_s=0.0,
+        )
+
+        class _SealOneThenFailImpl:
+            def __init__(self):
+                self.generation_indices: list[list[int]] = []
+
+            async def run_rollout(
+                self,
+                _sample,
+                *,
+                rollout_ids=None,
+                generation_indices=None,
+                on_completion=None,
+                recovery_granularity=RecoveryGranularity.SIBLING,
+            ):
+                indices = list(generation_indices)
+                self.generation_indices.append(indices)
+                for generation_index in indices:
+                    rollout_id = rollout_ids[generation_index]
+                    receipt = {
+                        "capture_key": rollout_id,
+                        "manifest": [{"staging_key": f"{rollout_id}/call"}],
+                    }
+                    completion = _receipt_record([rollout_id], [receipt]).completions[0]
+                    await on_completion(generation_index, completion)
+                    if len(self.generation_indices) == 1:
+                        raise GenerationUnavailable("worker disappeared")
+                return PromptGroupRecord(
+                    prompt_idx=0,
+                    prompt=[],
+                    extra_env_info={},
+                    metadata={"task_name": "nemo_gym"},
+                    completions=[],
+                    rollout_metrics={"agent/rollout_time_taken/mean": 12.5},
+                )
+
+        impl = _SealOneThenFailImpl()
+        mgr._impl = impl
+
+        _, rollout_metrics = _run(
+            mgr.generate_for_finalization({"prompt": "p", "idx": 9})
+        )
+
+        # Sibling 0 sealed before the failure, so the retry ran only sibling 1;
+        # its metrics would under-report the group and are dropped.
+        assert impl.generation_indices == [[0, 1], [1]]
+        assert rollout_metrics == {}
 
     def test_prompt_group_restore_redispatches_every_sibling(self):
         recovery_config = RolloutRecoveryConfig(
@@ -2541,7 +2587,7 @@ class TestGenerateForFinalizationFlow:
             lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
         )
 
-        request = _run(
+        request, _ = _run(
             restored.generate_for_finalization(
                 prompt,
                 target_step=7,
@@ -2549,7 +2595,6 @@ class TestGenerateForFinalizationFlow:
             )
         )
 
-        assert request is not None
         assert request.prompt_idx == 9
         assert restored._impl.seen_generation_indices == [0, 1]
         assert (
@@ -2603,7 +2648,7 @@ def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
         _FakeCaptureBuffer(),
         recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
     )
-    request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+    request, _ = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
     assert request.rewards == (0.5, 0.5)
     assert request.reward_checks == (checks, checks)
     assert request.reward_log_contexts == (log_context, log_context)

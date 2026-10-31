@@ -193,7 +193,7 @@ def test_forest_seals_failed_owner_without_claiming_its_pending_write():
         return record
 
     manager._impl.run_rollout = completed
-    request = asyncio.run(manager.generate_for_finalization({"idx": 1}))
+    request, _ = asyncio.run(manager.generate_for_finalization({"idx": 1}))
     assert request.receipts[1]["pending_call_ids"] == ["failed"]
     group = manager._recovery_ledger.get_group(request.group_id)
     assert group.siblings[0].current_attempt.staging_keys == [
@@ -426,7 +426,7 @@ def test_forest_retry_and_restart_reuse_durable_selection(
             )
         return await manager.generate_for_finalization({"idx": 99})
 
-    request = asyncio.run(exercise())
+    request, _ = asyncio.run(exercise())
     assert_metadata_only(request)
     if interruption == "sealed_cold":
         assert len(calls) == 1

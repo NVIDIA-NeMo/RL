@@ -1845,9 +1845,6 @@ class RolloutManager:
         # deliberately: the question it answers -- "is the fleet still answering
         # anyone?" -- is about the fleet, not about one prompt's history.
         self._consecutive_infra_drops: int = 0
-        # Token capture: per-group rollout_metrics, held until the controller
-        # attaches them to the finalized meta (capture rows have no PromptGroupRecord).
-        self._capture_rollout_metrics: dict[str, dict[str, Any]] = {}
 
     @property
     def execution_row_multiple(self) -> int:
@@ -1866,17 +1863,6 @@ class RolloutManager:
     def resume_request_deadlines(self) -> None:
         """Resume live request-deadline clocks when a colocated engine exits training mode."""
         self._request_deadlines.resume()
-
-    def pop_capture_rollout_metrics(self, group_id: str) -> dict[str, Any]:
-        """Return and forget a token-capture group's rollout metrics.
-
-        Args:
-            group_id: Replay group id of the finalization request.
-
-        Returns:
-            The group's rollout metrics, or an empty dict when none were recorded.
-        """
-        return self._capture_rollout_metrics.pop(group_id, {})
 
     @property
     def recovery_ledger(self) -> RolloutRecoveryLedger:
@@ -2319,11 +2305,13 @@ class RolloutManager:
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
         lineage_group_id: Optional[str] = None,
-    ) -> Optional["ReassemblyRequest"]:
+    ) -> Optional[tuple["ReassemblyRequest", dict[str, Any]]]:
         """Capture siblings with stable lineage and configured retry granularity.
 
-        Returns ``None`` when infrastructure retries are exhausted within the
-        configured drop budget. The caller then owns the backpressure permit and
+        Returns the metadata-only request and the group's rollout metrics, which
+        are empty unless the successful attempt dispatched every sibling. Returns
+        ``None`` when infrastructure retries are exhausted within the configured
+        drop budget. The caller then owns the backpressure permit and
         target-step shortfall.
         """
         assert self._tq_buffer is not None, (
@@ -2362,7 +2350,7 @@ class RolloutManager:
         last_infra_error: Optional[Exception] = None
         while infra_attempts < policy.max_infra_attempts:
             try:
-                request = await self._generate_for_finalization_attempt(
+                captured = await self._generate_for_finalization_attempt(
                     input_sample,
                     recovery_group_id=recovery_group_id,
                     inflight_registry=inflight_registry,
@@ -2388,7 +2376,7 @@ class RolloutManager:
                 continue
 
             self._consecutive_infra_drops = 0
-            return request
+            return captured
 
         assert last_infra_error is not None
         reason = type(last_infra_error).__name__
@@ -2426,7 +2414,7 @@ class RolloutManager:
         *,
         recovery_group_id: str,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
-    ) -> "ReassemblyRequest":
+    ) -> tuple["ReassemblyRequest", dict[str, Any]]:
         """Dispatch the current sibling cohort and leave one slot unready."""
         from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
@@ -2459,6 +2447,7 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
+        rollout_metrics: dict[str, Any] = {}
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -2585,9 +2574,10 @@ class RolloutManager:
                         on_completion=_record_streamed_completion,
                         recovery_granularity=recovery_group.recovery_granularity,
                     )
-                    self._capture_rollout_metrics[group_id] = dict(
-                        record.rollout_metrics
-                    )
+                    # A retry of only the unsealed siblings would under-report
+                    # the group, so keep metrics only when every sibling ran.
+                    if len(pending_indices) == recovery_group.expected_generations:
+                        rollout_metrics = dict(record.rollout_metrics)
             finally:
                 if inflight_registry is not None:
                     inflight_registry.pop(group_id, None)
@@ -2628,7 +2618,7 @@ class RolloutManager:
                 ).resolved_agent_name,
             )
             assert_metadata_only(request)
-            return request
+            return request, rollout_metrics
         except UnresolvedCaptureAcknowledgement:
             # Neither retry nor abandon an attempt whose capture writes may still
             # be in flight. Surface the failure with its ledger ownership intact.
@@ -2639,7 +2629,6 @@ class RolloutManager:
             # run end (there is no prefix-clear primitive in the data plane
             # yet). Their ledger files are inert — failure rows or missing
             # terminal rows keep any later read fail-closed.
-            self._capture_rollout_metrics.pop(group_id, None)
             self._tq_buffer.abort(group_id)
             async with self._recovery_mutation() as cut:
                 # Intentional staleness aborts discard the ledger owner before
