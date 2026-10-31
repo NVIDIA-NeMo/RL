@@ -104,10 +104,14 @@ class TestGetValuesPresharded:
             w.get_values_presharded(meta=_meta(["s0", "s1"]))
 
 
-def _make_tq_value() -> tuple[TQValue, MagicMock]:
+def _make_tq_value(*, megatron_enabled: bool = True) -> tuple[TQValue, MagicMock]:
     """Bare TQValue with the attributes the fan-out touches."""
     v = object.__new__(TQValue)
-    v.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
+    v.cfg = {
+        "train_global_batch_size": 8,
+        "train_micro_batch_size": 2,
+        "megatron_cfg": {"enabled": megatron_enabled},
+    }
     wg = MagicMock()
     v.worker_group = wg
     v.sharding_annotations = MagicMock()
@@ -142,6 +146,56 @@ class TestTQValueFanout:
         # The forward pass is inference-shaped, so it sizes microbatches off
         # logprob_mb_tokens rather than the (larger) train budget.
         assert mock_packing.call_args.args[0] == "logprob_mb_tokens"
+
+    @pytest.mark.parametrize("dispatch", ["get_values", "train"])
+    @pytest.mark.parametrize(
+        ("megatron_enabled", "expects_media"),
+        [(True, True), (False, False)],
+        ids=["megatron_critic", "automodel_critic"],
+    )
+    def test_multimodal_fields_follow_value_backend(
+        self, dispatch, megatron_enabled, expects_media
+    ):
+        v, wg = _make_tq_value(megatron_enabled=megatron_enabled)
+        meta = _meta()
+        meta.fields = [
+            *VALUE_SEED_FIELDS,
+            *DP_VALUE_TRAIN_FIELDS,
+            "pixel_values",
+            "image_grid_thw",
+            "content",
+        ]
+        wg.get_all_worker_results.return_value = [
+            {
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {},
+            }
+        ]
+
+        with (
+            patch.object(TQValue, "_stamp_pad_seqlen"),
+            patch.object(TQValue, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            if dispatch == "get_values":
+                v.get_values_from_meta(meta)
+                static_fields = set(VALUE_SEED_FIELDS)
+            else:
+                v.train_from_meta(meta, loss_fn="LF")
+                static_fields = set(DP_VALUE_TRAIN_FIELDS)
+
+        dispatched_fields = set(mock_shard.call_args.args[0].fields)
+        media_fields = {"pixel_values", "image_grid_thw"}
+        if expects_media:
+            assert media_fields <= dispatched_fields
+        else:
+            assert media_fields.isdisjoint(dispatched_fields)
+        assert static_fields <= dispatched_fields
+        assert "content" not in dispatched_fields
 
     def test_train_from_meta_requests_the_value_train_columns(self):
         v, wg = _make_tq_value()

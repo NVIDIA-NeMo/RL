@@ -47,6 +47,7 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "dpo": "examples/configs/dpo.yaml",
     "grpo": "examples/configs/grpo_math_1B.yaml",
     "vlm_grpo": "examples/configs/vlm_grpo_3B.yaml",
+    "vlm_ppo": "examples/configs/ppo_math_1B_megatron_single_controller.yaml",
     "vlm_sft": "examples/configs/sft_vlm_3B.yaml",
     "vlm_mpo": "examples/configs/vlm_mpo.yaml",
     "distillation": "examples/configs/distillation_math.yaml",
