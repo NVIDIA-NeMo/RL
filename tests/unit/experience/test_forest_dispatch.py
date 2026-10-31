@@ -378,7 +378,7 @@ def test_forest_retry_and_restart_reuse_durable_selection(
         generation_indices,
         on_completion,
         recovery_granularity,
-        gym_instance_id=None,
+        environment_instance_id=None,
         dispatch_recorder=None,
     ):
         calls.append((list(rollout_ids), list(generation_indices)))
@@ -488,7 +488,7 @@ def test_forest_unsafe_custody_never_reaches_cleanup(
         generation_indices,
         on_completion,
         recovery_granularity,
-        gym_instance_id=None,
+        environment_instance_id=None,
         dispatch_recorder=None,
     ):
         calls.append(rollout_ids)

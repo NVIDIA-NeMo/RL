@@ -43,6 +43,50 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
 
 
+@dataclass(frozen=True, order=True)
+class EnvironmentEpisode:
+    """One rollout attempt as the environment backend knows it.
+
+    The recovery ledger names the environment's rollouts this way when it asks
+    the backend to retire, forget or continue them.
+
+    Attributes:
+        rollout_id: The rollout's base ID, the same for every attempt.
+        attempt: How many times the backend restored this rollout. 0 is the
+            first run; a restore continues it as the next attempt.
+    """
+
+    rollout_id: str
+    attempt: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.rollout_id, str) or not self.rollout_id:
+            raise ValueError("environment episode rollout_id must not be empty")
+        if (
+            not isinstance(self.attempt, int)
+            or isinstance(self.attempt, bool)
+            or self.attempt < 0
+        ):
+            raise ValueError("environment episode attempt must be non-negative")
+
+    @property
+    def capture_key(self) -> str:
+        """The attempt's key on rollout rows: ``<rollout_id>-a<attempt>``.
+
+        Attempt 0 uses the bare rollout ID. A backend must key its rows the
+        same way.
+        """
+        return (
+            self.rollout_id
+            if self.attempt == 0
+            else f"{self.rollout_id}-a{self.attempt}"
+        )
+
+    def next_attempt(self) -> EnvironmentEpisode:
+        """Return the attempt the backend creates when it restores this one."""
+        return EnvironmentEpisode(self.rollout_id, self.attempt + 1)
+
+
 @dataclass(frozen=True)
 class RestoredEnvironmentRollouts:
     """What an environment restore continued, so RL can match it.

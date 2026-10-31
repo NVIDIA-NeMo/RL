@@ -458,7 +458,7 @@ class RolloutRestorer(_UsesRolloutParts):
                     )
                 recovery_ledger.prepare_for_restart(
                     cut,
-                    restored_gym_episodes=set(restored.continued_attempts),
+                    continued_attempts=set(restored.continued_attempts),
                 )
                 if self._master_config.token_capture.enabled:
                     await validate_rollout_recovery_inventory(
