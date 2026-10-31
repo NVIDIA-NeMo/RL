@@ -319,6 +319,7 @@ def test_train_normalizes_survivors_before_optimizer_step(
     worker = MagicMock()
     worker.dp_size = 1
     worker.mtp_enabled = False
+    worker.draft_provider = None
     worker.model.modules.return_value = []
     worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
     worker.model.scale_gradients.side_effect = scale_gradients

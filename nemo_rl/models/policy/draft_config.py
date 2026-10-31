@@ -23,7 +23,7 @@ backends read ``policy.draft`` the same way.
 
 import difflib
 from collections.abc import Mapping
-from typing import Annotated, Any, Literal, Self, Union
+from typing import Annotated, Any, ClassVar, Literal, Self, Union
 
 from pydantic import BaseModel, Discriminator, Field, Tag, TypeAdapter, model_validator
 
@@ -71,12 +71,23 @@ class Eagle3DraftConfig(_DraftConfigBase):
     config.json instead.
     """
 
+    supports_context_parallel: ClassVar[bool] = False
+    # Packed EAGLE-3 still requires pipeline_model_parallel_size=1 (see the
+    # guard in lm_policy.py).
+    supports_sequence_packing: ClassVar[bool] = True
+    supports_target_sequence_parallel: ClassVar[bool] = False
+
     speculator_type: Literal["eagle3"] = "eagle3"
     enabled: bool = False
     model_name: str | None = None
     loss_weight: float = 0.1
     num_layers: int | None = None
     aux_layer_indices: list[int] | None = None
+    # Tokens per FP32 vocab tile in the streaming soft-CE (Megatron path).
+    # Mirrors DEFAULT_DRAFT_TOKEN_CHUNK_SIZE in nemo_rl/algorithms/loss/draft.py,
+    # which is not imported here: the loss package pulls in nemo_rl.models.* and
+    # would make this module circular.
+    token_chunk_size: Annotated[int, Field(gt=0)] = 4096
     # Megatron-path-only override of the draft optimizer's lr/min_lr/
     # weight_decay schedule (NVIDIA-NeMo/RL#3707); unused by the Automodel
     # TTT path below, which always uses learning_rate.
@@ -150,6 +161,150 @@ class DFlashDraftConfig(_BlockDraftConfig):
     confidence_loss_alpha: float = 0.0
 
 
+class _MegatronBlockDraftConfigBase(BaseModel, extra="forbid"):
+    """Strict base for the Megatron block drafters."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_inherited_eagle3_defaults(cls, data: Any) -> Any:
+        # Recipes deep-merge policy.draft from grpo_math_1B.yaml, and a nested
+        # override cannot delete its Eagle3 knobs. Drop such a key only while it
+        # still holds the Eagle3 default; any other value stays extra_forbidden.
+        if not isinstance(data, Mapping):
+            return data
+        eagle3_fields = Eagle3DraftConfig.model_fields
+        return {
+            key: value
+            for key, value in data.items()
+            if key in cls.model_fields
+            or key not in eagle3_fields
+            or value != eagle3_fields[key].default
+        }
+
+
+class MegatronDFlashDraftConfig(_MegatronBlockDraftConfigBase):
+    """Body-only DFlash co-training with a live target (Megatron backend only).
+
+    Selected over ``DFlashDraftConfig`` when ``target_hidden_state_layer_ids``
+    is set. The draft architecture comes from this config, not a checkpoint.
+    """
+
+    supports_context_parallel: ClassVar[bool] = True
+    supports_sequence_packing: ClassVar[bool] = True
+    supports_target_sequence_parallel: ClassVar[bool] = True
+
+    speculator_type: Literal["dflash"] = "dflash"
+    enabled: bool = False
+    model_name: str | None = None
+    model_revision: str | None = None
+    aux_layer_indices: None = Field(default=None, exclude=True, repr=False)
+    loss_weight: Annotated[float, Field(gt=0)] = 0.1
+    gamma: Annotated[int, Field(gt=0)]
+    anchors_per_sample: Annotated[int, Field(gt=0)]
+    mask_token_id: Annotated[int, Field(ge=0)]
+    target_hidden_state_layer_ids: Annotated[list[int], Field(min_length=1)]
+    num_layers: Annotated[int, Field(gt=0)] = 5
+    seed: int = 0
+    vocab_tile_size: Annotated[int, Field(gt=0)] = 256
+    position_decay: Annotated[float, Field(gt=0, le=1)] = 1.0
+    max_cp_boundary_exclusion_fraction: Annotated[
+        float,
+        Field(ge=0, le=1),
+    ] = 0.25
+    optimizer: DraftOptimizerConfig | None = None
+    update_probe_enabled: bool = False
+
+    @model_validator(mode="after")
+    def validate_target_taps(self) -> Self:
+        """Reject ambiguous and out-of-range layer taps before model creation."""
+        if any(layer_id < 0 for layer_id in self.target_hidden_state_layer_ids):
+            raise ValueError("target hidden-state layer IDs must be non-negative")
+        if len(set(self.target_hidden_state_layer_ids)) != len(
+            self.target_hidden_state_layer_ids
+        ):
+            raise ValueError("target hidden-state layer IDs must be unique")
+        return self
+
+
+class MegatronDSparkDraftConfig(_MegatronBlockDraftConfigBase):
+    """DSpark co-training with target-owned embeddings/head (Megatron backend only).
+
+    Selected over ``DSparkDraftConfig`` when ``target_hidden_state_layer_ids``
+    is set. The draft architecture comes from this config, not a checkpoint.
+    """
+
+    supports_context_parallel: ClassVar[bool] = True
+    supports_sequence_packing: ClassVar[bool] = True
+    supports_target_sequence_parallel: ClassVar[bool] = True
+
+    speculator_type: Literal["dspark"] = "dspark"
+    enabled: bool = False
+    model_name: str | None = None
+    model_revision: str | None = None
+    loss_weight: Annotated[float, Field(gt=0)] = 0.1
+    aux_layer_indices: None = Field(default=None, exclude=True, repr=False)
+    block_size: Annotated[int, Field(gt=1)]
+    anchors_per_sample: Annotated[int, Field(gt=0)]
+    mask_token_id: Annotated[int, Field(ge=0)]
+    target_hidden_state_layer_ids: Annotated[list[int], Field(min_length=1)]
+    num_layers: Annotated[int, Field(gt=0)] = 5
+    draft_vocab_size: Annotated[int, Field(gt=0)] | None = None
+    markov_rank: Annotated[int, Field(gt=0)] = 256
+    markov_head_type: Literal["vanilla"] = "vanilla"
+    confidence_enabled: bool = True
+    confidence_with_markov: bool = True
+    ce_loss_weight: Annotated[float, Field(ge=0)] = 0.1
+    tv_loss_weight: Annotated[float, Field(ge=0)] = 0.9
+    confidence_loss_weight: Annotated[float, Field(ge=0)] = 1.0
+    loss_decay_gamma: Annotated[float, Field(gt=0)] = 4.0
+    seed: int = 0
+    vocab_tile_size: Annotated[int, Field(gt=0)] = 256
+    max_cp_boundary_exclusion_fraction: Annotated[
+        float,
+        Field(ge=0, le=1),
+    ] = 0.25
+    optimizer: DraftOptimizerConfig | None = None
+    update_probe_enabled: bool = False
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> Self:
+        """Reject invalid taps and confidence dependencies before model creation."""
+        if any(layer_id < 0 for layer_id in self.target_hidden_state_layer_ids):
+            raise ValueError("target hidden-state layer IDs must be non-negative")
+        if len(set(self.target_hidden_state_layer_ids)) != len(
+            self.target_hidden_state_layer_ids
+        ):
+            raise ValueError("target hidden-state layer IDs must be unique")
+        if self.confidence_with_markov and not self.confidence_enabled:
+            raise ValueError("confidence_with_markov requires confidence_enabled")
+        if not any(
+            weight > 0
+            for weight in (
+                self.ce_loss_weight,
+                self.tv_loss_weight,
+                self.confidence_loss_weight,
+            )
+        ):
+            raise ValueError("at least one DSpark loss weight must be positive")
+        return self
+
+    def resolve_draft_vocab_size(self, *, target_vocab_size: int) -> int:
+        """Require the online draft to share the live target vocabulary."""
+        if target_vocab_size <= 0:
+            raise ValueError("live target vocabulary size must be positive")
+        if (
+            self.draft_vocab_size is not None
+            and self.draft_vocab_size != target_vocab_size
+        ):
+            raise ValueError(
+                "DSpark draft vocabulary must match the live target vocabulary"
+            )
+        return target_vocab_size
+
+
+MEGATRON_BLOCK_DRAFT_ALGOS = ("dflash", "dspark")
+
+
 def _speculator_type(v: Any) -> str:
     """Discriminator callback: default a missing tag to eagle3.
 
@@ -159,9 +314,19 @@ def _speculator_type(v: Any) -> str:
     fails with ``union_tag_not_found``). Mirrors the pre-union implicit-
     eagle3-only default.
     """
+    if isinstance(v, (MegatronDFlashDraftConfig, MegatronDSparkDraftConfig)):
+        return f"megatron_{v.speculator_type}"
     if isinstance(v, Mapping):
-        return v.get("speculator_type", "eagle3")
-    return getattr(v, "speculator_type", "eagle3")
+        tag = v.get("speculator_type", "eagle3")
+        has_taps = "target_hidden_state_layer_ids" in v
+    else:
+        tag = getattr(v, "speculator_type", "eagle3")
+        has_taps = False
+    # The Megatron block drafters build their architecture from config and
+    # always declare target taps; the Automodel ones read it from a checkpoint.
+    if tag in MEGATRON_BLOCK_DRAFT_ALGOS and has_taps:
+        return f"megatron_{tag}"
+    return tag
 
 
 DraftConfig = Annotated[
@@ -169,30 +334,47 @@ DraftConfig = Annotated[
         Annotated[Eagle3DraftConfig, Tag("eagle3")],
         Annotated[DSparkDraftConfig, Tag("dspark")],
         Annotated[DFlashDraftConfig, Tag("dflash")],
+        Annotated[MegatronDFlashDraftConfig, Tag("megatron_dflash")],
+        Annotated[MegatronDSparkDraftConfig, Tag("megatron_dspark")],
     ],
     Discriminator(_speculator_type),
 ]
+
+AnyDraftConfig = (
+    Eagle3DraftConfig
+    | DSparkDraftConfig
+    | DFlashDraftConfig
+    | MegatronDFlashDraftConfig
+    | MegatronDSparkDraftConfig
+)
 
 _DRAFT_CONFIG_ADAPTER: TypeAdapter[Any] = TypeAdapter(DraftConfig)
 
 
 def coerce_draft_config(
-    config: "Eagle3DraftConfig | DSparkDraftConfig | DFlashDraftConfig | Mapping[str, Any] | None",
-) -> Eagle3DraftConfig | DSparkDraftConfig | DFlashDraftConfig | None:
+    config: "AnyDraftConfig | Mapping[str, Any] | None",
+) -> AnyDraftConfig | None:
     """Accept either a validated model or a raw mapping at API boundaries.
 
     ``MasterConfig`` validation normally produces the model, but ``PolicyConfig``
     is a TypedDict, so callers that assemble one by hand still pass a plain dict.
     """
     if config is None or isinstance(
-        config, (Eagle3DraftConfig, DSparkDraftConfig, DFlashDraftConfig)
+        config,
+        (
+            Eagle3DraftConfig,
+            DSparkDraftConfig,
+            DFlashDraftConfig,
+            MegatronDFlashDraftConfig,
+            MegatronDSparkDraftConfig,
+        ),
     ):
         return config
     return _DRAFT_CONFIG_ADAPTER.validate_python(config)
 
 
 def draft_refit_enabled(
-    config: "Eagle3DraftConfig | DSparkDraftConfig | DFlashDraftConfig | Mapping[str, Any] | None",
+    config: "AnyDraftConfig | Mapping[str, Any] | None",
 ) -> bool:
     """Return whether generation must accept refitted draft weights."""
     coerced = coerce_draft_config(config)
