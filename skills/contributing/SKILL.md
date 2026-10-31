@@ -1,7 +1,7 @@
 ---
 name: contributing
 description: Contribution conventions for NeMo-RL. Covers the rules every code change follows, PR title format, commit sign-off, and CI triggering.
-when_to_use: Writing or changing code; asking about code conventions (config keys and defaults, error handling, style, copyright headers); removing, renaming or reshaping a config key; opening a PR; writing a commit message; triggering CI; 'PR title format', 'sign-off', 'conventional commits', 'how do I trigger CI', during code review.
+when_to_use: Writing or changing code; asking about code conventions (config keys and defaults, error handling, style, copyright headers); removing, renaming or reshaping a config key; writing tests, adding a nightly test or naming a recipe; opening a PR; writing a commit message; triggering CI; 'PR title format', 'sign-off', 'conventional commits', 'how do I trigger CI', during code review.
 ---
 
 # Contributing Conventions
@@ -19,6 +19,7 @@ The rules live in `references/`, one file per theme. Before writing or changing 
 | [error-handling](references/error-handling.md) | exceptions a change catches, and misconfigurations it must reject |
 | [linting-and-formatting](references/linting-and-formatting.md) | style of the Python and shell a change writes: naming, signatures, types, imports |
 | [reuse-and-precedent](references/reuse-and-precedent.md) | helpers, mechanisms, components, files and CI a change adds, where the repo may already have one |
+| [testing](references/testing.md) | unit, functional and nightly tests a change adds or changes |
 
 ## PR Title Format
 

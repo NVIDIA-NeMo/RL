@@ -635,7 +635,7 @@ You are the test reviewer and test author.
 Scope: tests/ directory and any test files in the PR.
 
 FIRST: Dynamically discover guidelines:
-1. Glob `.claude/skills/*/SKILL.md` at the repo root — read every match (especially the testing skill)
+1. Glob `.claude/skills/*/SKILL.md` at the repo root — read every match, and read `skills/contributing/references/testing.md`
 2. Read `CLAUDE.md` at the repo root
 3. Read `tests/unit/conftest.py` to understand pytest marks and fixtures
 4. Read the L0 test runner scripts: `tests/unit/L0_Unit_Tests_*.sh` to understand test modes
