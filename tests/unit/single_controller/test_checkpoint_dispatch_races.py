@@ -91,6 +91,10 @@ from tests.unit.single_controller._checkpoint_scenarios import (
     _record,
     patch_converter,
 )
+from tests.unit.single_controller._rollout_checkpoints import (
+    attach_rollout_checkpointing,
+    bare_rollout_snapshotter,
+)
 from tests.unit.single_controller.test_checkpointing import (
     _actor_master_config,
     _FakeDataloader,
@@ -750,6 +754,7 @@ def test_turn_trainer_checkpoint_leaves_gym_state_to_the_rollout_snapshot(
         controller._environment_checkpoint = _gym_environment_for(
             controller, gym_coordinator(gym_actor)
         )
+        attach_rollout_checkpointing(controller)
         try:
             await controller._save_checkpoint(
                 {"loss": 1.0},
@@ -767,8 +772,8 @@ def test_turn_trainer_checkpoint_leaves_gym_state_to_the_rollout_snapshot(
     # A trainer checkpoint never holds Gym state, and never calls Gym.
     assert gym_actor.calls == []
     assert not list(checkpoint.glob("gym*"))
-    assert controller._rollout_checkpoint_wakeup.is_set()
-    assert controller._last_rollout_snapshot_mutation_version is None
+    assert controller._rollout_snapshots._wakeup.is_set()
+    assert controller._rollout_snapshots._last_snapshot_mutation_version is None
 
 
 @pytest.mark.parametrize("step_commits", [True, False])
@@ -780,11 +785,10 @@ def test_gym_phase_stops_when_a_train_step_starts_committing(
     async def exercise() -> None:
         actor = FakeGymActor(exported_episodes=(), block_commit=True)
         controller = _controller_for(gym_coordinator(actor))
-        controller._optimizer_commit_in_progress = False
-        controller._optimizer_commit_started = asyncio.Event()
+        controller._rollout_snapshots = bare_rollout_snapshotter()
         async with contextlib.AsyncExitStack() as stack:
             phase = asyncio.create_task(
-                controller._enter_environment_phase_unless_a_step_commits(
+                controller._rollout_snapshots._enter_environment_phase_unless_a_step_commits(
                     stack,
                     _gym_commit(controller, tmp_path, checkpoint_id="save-1"),
                 )
@@ -793,7 +797,7 @@ def test_gym_phase_stops_when_a_train_step_starts_committing(
                 actor.commit_started.wait(), timeout=_ASYNC_TEST_TIMEOUT_S
             )
             if step_commits:
-                controller._begin_optimizer_commit()
+                controller._rollout_snapshots._begin_optimizer_commit()
             else:
                 actor.release_commit.set()
             entered, gym_commit = await asyncio.wait_for(

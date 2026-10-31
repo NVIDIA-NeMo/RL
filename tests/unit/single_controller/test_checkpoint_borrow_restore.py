@@ -27,6 +27,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DATA_PLANE_CHECKPOINT_DIR,
     REPLAY_BUFFER_METADATA_FILENAME,
     DataPlaneCheckpointBarrier,
     TQReplayBuffer,
@@ -34,7 +35,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import (
-    DATA_PLANE_CHECKPOINT_DIR,
     RolloutRuntimeState,
     SingleControllerActor,
 )
@@ -54,6 +54,9 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
 )
 from tests.unit.single_controller import _checkpoint_scenarios as scenarios
+from tests.unit.single_controller._rollout_checkpoints import (
+    attach_rollout_checkpointing,
+)
 
 _GROUP_SIZE = 2
 _PROMPTS_PER_STEP = 3
@@ -259,6 +262,7 @@ def _controller(
         str(checkpoint_path) if checkpoint_path is not None else None
     )
     controller._data_plane_checkpoint_metadata = checkpoint_metadata
+    attach_rollout_checkpointing(controller)
     return controller
 
 
@@ -340,7 +344,7 @@ async def _exercise_round_trip(
     checkpoint_path = tmp_path / "step_0"
     checkpoint_path.mkdir()
     async with first._data_plane_checkpoint_barrier.checkpoint() as cut:
-        snapshot = await first._capture_rollout_state(
+        snapshot = await first._rollout_snapshots.capture(
             cut, checkpoint_path, "rollout_snapshot"
         )
     assert snapshot.replay_metadata is not None

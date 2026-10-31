@@ -65,6 +65,13 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
+    BOOTSTRAP_DIRNAME,
+    BootstrapCompatibilityIdentity,
+    bootstrap_compatibility_identity,
+    resolve_latest_snapshot,
+    validate_bootstrap_anchor,
+)
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
 )
@@ -75,13 +82,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     is_ppo_run,
     logprob_passes_required,
     validate_single_controller_config,
-)
-from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
-    BOOTSTRAP_DIRNAME,
-    BootstrapCompatibilityIdentity,
-    bootstrap_compatibility_identity,
-    resolve_latest_snapshot,
-    validate_bootstrap_anchor,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn

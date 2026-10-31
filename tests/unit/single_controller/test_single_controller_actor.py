@@ -97,6 +97,7 @@ from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
 )
+from tests.unit.single_controller._rollout_checkpoints import bare_rollout_snapshotter
 
 
 class FakeWeightSynchronizer:
@@ -2312,8 +2313,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._buffer = _EmptyBuffer()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._rollout_exhausted = asyncio.Event()
-    ctrl._optimizer_commit_in_progress = False
-    ctrl._optimizer_commit_started = asyncio.Event()
+    ctrl._rollout_snapshots = bare_rollout_snapshotter()
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
     ctrl._is_ppo = False
@@ -2339,8 +2339,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
-    ctrl._checkpoint_save_lock = asyncio.Lock()
-    ctrl._optimizer_commit_in_progress = False
+    ctrl._rollout_snapshots = bare_rollout_snapshotter()
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
@@ -3385,7 +3384,7 @@ def _streaming_ppo_controller(
     async def sync_weights(*, calibration_data) -> int:
         assert calibration_data is None
         assert ctrl._trainer_version == 1
-        assert ctrl._optimizer_commit_in_progress
+        assert ctrl._rollout_snapshots._optimizer_commit_in_progress
         calls.append("refit")
         return 0
 
@@ -3434,7 +3433,7 @@ def test_streaming_ppo_prepares_critic_before_waiting_for_next_chunk(
             assert ctrl._value.inference_prepared
             assert ctrl._trainer.gradients_offloaded == ctrl._trainer.step_open
             assert ctrl._train_steps == ctrl._trainer_version == 0
-            assert not ctrl._optimizer_commit_in_progress
+            assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
             assert "clear_samples" not in calls
             if attempts <= 4:
                 assert calls.count("critic.prepare_for_inference") == 2
@@ -3697,7 +3696,7 @@ def test_streaming_ppo_selection_failure_does_not_commit_pending_step(
     assert "critic.train_from_meta" not in calls
     assert "refit" not in calls
     assert "clear_samples" not in calls
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -3710,8 +3709,8 @@ def test_ppo_blocks_rollout_snapshots_until_full_batch_critic_finishes(
     train_epochs = ctrl._value_train_epochs
 
     async def check_snapshot_then_train(meta: KVBatchMeta, *, num_epochs: int) -> dict:
-        assert ctrl._optimizer_commit_in_progress
-        snapshot = await ctrl._save_rollout_checkpoint(force=True)
+        assert ctrl._rollout_snapshots._optimizer_commit_in_progress
+        snapshot = await ctrl._rollout_snapshots.save_snapshot(force=True)
         assert not snapshot.saved
         assert snapshot.reason == "optimizer_commit_in_progress"
         assert ctrl._trainer_version == (0 if warmup else 1)
@@ -3721,7 +3720,7 @@ def test_ppo_blocks_rollout_snapshots_until_full_batch_critic_finishes(
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
     assert ctrl._trainer_version == ctrl._train_steps == 1
     assert calls.count("refit") == (0 if warmup else 1)
 
@@ -3786,7 +3785,7 @@ def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
         assert "critic.finish_training" in calls
         assert len(ctrl._dp_client.cleared_ids) == len(metas)
         assert ctrl._trainer_version == ctrl._train_steps == 1
-        assert not ctrl._optimizer_commit_in_progress
+        assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
         assert "critic/loss" in metrics
         calls.append("checkpoint")
 
@@ -3850,7 +3849,7 @@ def test_streaming_ppo_accumulates_policy_then_trains_full_batch_critic(
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
     assert ctrl._train_steps == ctrl._trainer_version == 1
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
 
 
 @pytest.mark.parametrize(
@@ -3975,7 +3974,7 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
 
     async def run_with_inflight_snapshot() -> None:
         waiting_for_snapshot = asyncio.Event()
-        acquire = ctrl._checkpoint_save_lock.acquire
+        acquire = ctrl._rollout_snapshots._save_lock.acquire
 
         async def observe_acquire() -> bool:
             waiting_for_snapshot.set()
@@ -3983,8 +3982,12 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
 
         # A snapshot has captured the old train step and is still writing it.
         # Signal the exact lock acquisition instead of relying on a timed sleep.
-        async with ctrl._checkpoint_save_lock:
-            monkeypatch.setattr(ctrl._checkpoint_save_lock, "acquire", observe_acquire)
+        async with ctrl._rollout_snapshots._save_lock:
+            monkeypatch.setattr(
+                ctrl._rollout_snapshots._save_lock,
+                "acquire",
+                observe_acquire,
+            )
             pump = asyncio.create_task(ctrl._train_pump())
             await asyncio.wait_for(waiting_for_snapshot.wait(), timeout=1.0)
             assert len(ctrl._trainer.trained_metas) == (len(metas) if streaming else 1)
@@ -3992,7 +3995,7 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
             assert "critic.train_from_meta" not in calls
             assert "refit" not in calls
             assert ctrl._train_steps == ctrl._trainer_version == 0
-            assert not ctrl._optimizer_commit_in_progress
+            assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
 
         await asyncio.wait_for(pump, timeout=1.0)
 
@@ -4004,7 +4007,7 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
     assert ctrl._train_steps == ctrl._trainer_version == 1
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
 
 
 @pytest.mark.parametrize("warmup", [False, True])

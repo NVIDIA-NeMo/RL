@@ -24,12 +24,16 @@ import shutil
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from nemo_rl.algorithms.grpo import RewardPenaltyConfig
-from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.experience.reward_penalties import CaptureRewardSettings
 from nemo_rl.experience.rollouts import get_effort_config
+
+if TYPE_CHECKING:
+    # Annotations only: importing the config at runtime would import
+    # single_controller_utils, whose setup imports this module.
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 3
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
