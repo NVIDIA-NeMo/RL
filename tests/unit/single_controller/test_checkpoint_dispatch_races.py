@@ -33,7 +33,6 @@ import contextlib
 import hashlib
 import threading
 import warnings
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +53,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import _initial_grpo_save_state
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import (
+    RolloutRuntimeState,
     SingleControllerActor,
     _summarize_gym_episodes,
 )
@@ -580,9 +580,9 @@ def test_recovery_rehydration_rejects_invalid_collator_results(
 def _reserve_controller() -> Any:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._rollout_runtime = RolloutRuntimeState()
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
-    controller._replacement_reserve = deque()
-    controller._sampler_stamps_target_steps = True
+    controller._rollout_runtime.sampler_stamps_target_steps = True
     controller._rollout_recovery_enabled = True
     controller._async_cfg = SimpleNamespace(
         rollout_failure=SimpleNamespace(
@@ -1601,6 +1601,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        controller._rollout_runtime = RolloutRuntimeState()
         _init_recovery_telemetry(controller, train_steps=7)
         controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
@@ -1650,8 +1651,8 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
         assert sampler.admit_calls == 0
         assert sampler.admission_commits == 0
         assert sampler.dispatch_index == 7
-        assert controller._batch_shortfall == {6: 1}
-        assert controller._sampler_stamps_target_steps is True
+        assert controller._rollout_runtime.batch_shortfall == {6: 1}
+        assert controller._rollout_runtime.sampler_stamps_target_steps is True
         recovery_metrics = controller._logger.log_metrics.call_args.args[0]
         assert recovery_metrics["groups_unfinished_found"] == 1.0
         assert recovery_metrics["siblings_reused"] == 0.0
@@ -1714,6 +1715,7 @@ async def _turn_recovery_restart(
     gym_actor = gym_actor if gym_actor is not None else FakeGymActor()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._rollout_runtime = RolloutRuntimeState()
     _init_recovery_telemetry(controller, train_steps=7)
     controller._sampler = _CountingInOrderSampler()
     controller._rollout_manager = rollout_manager
@@ -2047,6 +2049,7 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        controller._rollout_runtime = RolloutRuntimeState()
         _init_recovery_telemetry(controller, train_steps=7)
         controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
@@ -2142,6 +2145,7 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        controller._rollout_runtime = RolloutRuntimeState()
         _init_recovery_telemetry(controller, train_steps=6)
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
@@ -2208,6 +2212,7 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        controller._rollout_runtime = RolloutRuntimeState()
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         controller._restored_replay_groups_to_regenerate = []
         controller._rollout_manager = rollout_manager
@@ -2278,7 +2283,10 @@ def test_checkpoint_waits_for_replacement_reserve_refill() -> None:
         async def checkpoint_snapshot() -> list[int]:
             async with controller._data_plane_checkpoint_barrier.checkpoint():
                 checkpoint_entered.set()
-                return [prompt["idx"] for prompt in controller._replacement_reserve]
+                return [
+                    prompt["idx"]
+                    for prompt in controller._rollout_runtime.replacement_reserve
+                ]
 
         refill_task = asyncio.create_task(refill())
         await mutation_applied.wait()
@@ -2305,7 +2313,7 @@ def test_checkpoint_waits_for_replacement_pop_and_reownership() -> None:
                 _reserve_prompt(20),
                 target_step=7,
             )
-        controller._replacement_reserve.append(_reserve_prompt(21))
+        controller._rollout_runtime.replacement_reserve.append(_reserve_prompt(21))
         mutation_applied = asyncio.Event()
         release_mutation = asyncio.Event()
         checkpoint_entered = asyncio.Event()
@@ -2323,7 +2331,8 @@ def test_checkpoint_waits_for_replacement_pop_and_reownership() -> None:
             async with controller._data_plane_checkpoint_barrier.checkpoint():
                 checkpoint_entered.set()
                 reserve_ids = [
-                    prompt["idx"] for prompt in controller._replacement_reserve
+                    prompt["idx"]
+                    for prompt in controller._rollout_runtime.replacement_reserve
                 ]
                 ledger_prompt_ids = [
                     group.prompt_id for group in manager.recovery_ledger.groups()
@@ -2351,7 +2360,7 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
 
     async def exercise() -> None:
         controller = _reserve_controller()
-        controller._replacement_reserve.extend(
+        controller._rollout_runtime.replacement_reserve.extend(
             [_reserve_prompt(20), _reserve_prompt(21)]
         )
         admission_started = asyncio.Event()
@@ -2384,7 +2393,7 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
         await admission_started.wait()
 
         async with controller._data_plane_checkpoint_barrier.checkpoint():
-            assert list(controller._replacement_reserve) == []
+            assert list(controller._rollout_runtime.replacement_reserve) == []
             groups = controller._rollout_manager.recovery_ledger.groups()
             assert [group.prompt_id for group in groups] == ["20", "21"]
             assert all(group.phase is PromptGroupPhase.RESERVED for group in groups)
