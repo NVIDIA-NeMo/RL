@@ -35,6 +35,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import (
     DATA_PLANE_CHECKPOINT_DIR,
+    RolloutRuntimeState,
     SingleControllerActor,
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
@@ -197,6 +198,7 @@ def _controller(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._rollout_runtime = RolloutRuntimeState()
     controller._data_plane_checkpoint_barrier = barrier
     controller._buffer = buffer
     controller._dp_client = client
@@ -241,16 +243,12 @@ def _controller(
     controller._trainer_version = 0
     controller._train_steps = 0
     controller._current_epoch = 0
-    controller._sampler_stamps_target_steps = False
     controller._rollout_recovery_enabled = True
     controller._restored_replay_groups_to_regenerate = []
-    controller._batch_shortfall = {}
     controller._batch_replacements = {}
     controller._batch_promotions = {}
     controller._finalizer_actors = []
-    controller._finalizer_metrics_by_group = {}
-    controller._finalizer_rewards_by_group = {}
-    controller._replacement_reserve = deque(replacement_reserve or [])
+    controller._rollout_runtime.replacement_reserve = deque(replacement_reserve or [])
     controller._rollout_slot_waiters = 0
     controller._rollout_permitted_waiters = 0
     controller._buffer_capacity_waiters = 0
@@ -401,7 +399,7 @@ async def _exercise_round_trip(
         ).values()
         for prompt_idx in prompt_indices
     }
-    spares = {prompt["idx"] for prompt in restored._replacement_reserve}
+    spares = {prompt["idx"] for prompt in restored._rollout_runtime.replacement_reserve}
     assert present | spares | {1} == set(range(15))
 
     recovery_metrics: dict[str, float] = {}

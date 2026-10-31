@@ -79,6 +79,7 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import (
+    RolloutRuntimeState,
     SingleControllerActor,
     _RolloutCheckpointSaveResult,
 )
@@ -1830,10 +1831,10 @@ class TestFinalizerStateRelease:
         def seed(actor) -> None:
             actor._sampler = _EvictOnceSampler()
             # A committed, never-consumed group that the sampler evicts as stale.
-            actor._finalizer_metrics_by_group["evicted-group"] = {
+            actor._rollout_runtime.finalizer_metrics_by_group["evicted-group"] = {
                 "finalize/invalid_row_rate": 0.0
             }
-            actor._finalizer_rewards_by_group["evicted-group"] = [
+            actor._rollout_runtime.finalizer_rewards_by_group["evicted-group"] = [
                 FinalizedReward("evicted-group_g0", "attempt", 1.0, None)
             ]
 
@@ -1841,8 +1842,8 @@ class TestFinalizerStateRelease:
 
         assert actor._train_steps == 2
         assert actor._sampler.evict_calls >= 1
-        assert "evicted-group" not in actor._finalizer_metrics_by_group
-        assert "evicted-group" not in actor._finalizer_rewards_by_group
+        assert "evicted-group" not in actor._rollout_runtime.finalizer_metrics_by_group
+        assert "evicted-group" not in actor._rollout_runtime.finalizer_rewards_by_group
 
 
 class TestPeriodicRolloutCheckpoint:
@@ -2545,7 +2546,7 @@ class TestPeriodicRolloutCheckpoint:
         actor._buffer.training_claims = [canonical_group]
         actor._dp_client.sample_ids = list(claimed_meta.sample_ids)
         pending = {"finalize/reward_count": 1.0, "finalize/reward_sum": 2.0}
-        actor._finalizer_metrics_by_group = {
+        actor._rollout_runtime.finalizer_metrics_by_group = {
             "claimed-group": dict(pending),
             "unfinished-group": {"finalize/reward_count": 9.0},
         }
@@ -2557,7 +2558,7 @@ class TestPeriodicRolloutCheckpoint:
                 RewardLogContext("agent", '{"answer":"ok"}'),
             )
         ]
-        actor._finalizer_rewards_by_group = {
+        actor._rollout_runtime.finalizer_rewards_by_group = {
             "claimed-group": observations,
             "unfinished-group": [],
         }
@@ -2585,8 +2586,8 @@ class TestPeriodicRolloutCheckpoint:
             "claimed-group": observations
         }
 
-        actor._finalizer_metrics_by_group = {}
-        actor._finalizer_rewards_by_group = {}
+        actor._rollout_runtime.finalizer_metrics_by_group = {}
+        actor._rollout_runtime.finalizer_rewards_by_group = {}
         actor._buffer.training_claims = []
         actor._buffer._metadata_state["groups"] = [canonical_group]
         actor._last_checkpoint_path = str(snapshot)
@@ -2594,8 +2595,12 @@ class TestPeriodicRolloutCheckpoint:
             "metadata"
         ]
         asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=1))
-        assert actor._finalizer_metrics_by_group == {"claimed-group": pending}
-        assert actor._finalizer_rewards_by_group == {"claimed-group": observations}
+        assert actor._rollout_runtime.finalizer_metrics_by_group == {
+            "claimed-group": pending
+        }
+        assert actor._rollout_runtime.finalizer_rewards_by_group == {
+            "claimed-group": observations
+        }
 
     def test_snapshot_reindexes_rows_owned_by_active_streamed_step(
         self, tmp_path: Path
@@ -3507,6 +3512,7 @@ class _OrderRecordingCritic:
 def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     """Bare actor carrying only what _save_checkpoint reads."""
     actor = object.__new__(_ACTOR_CLS)
+    actor._rollout_runtime = RolloutRuntimeState()
     checkpoint_path = tmp_path / "tmp_step_1"
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
@@ -3519,9 +3525,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._current_epoch = 0
     actor._consumed_samples = 0
     actor._total_valid_tokens = 0
-    actor._replacement_reserve = []
-    actor._finalizer_metrics_by_group = {}
-    actor._finalizer_rewards_by_group = {}
+    actor._rollout_runtime.replacement_reserve = []
     actor._async_cfg = SimpleNamespace(
         sampler=SimpleNamespace(name="in_order"),
         max_buffered_rollouts=4,
@@ -4709,7 +4713,7 @@ class TestReplacementReservePersistence:
                     asyncio.run(actor._maybe_restore_replacement_reserve())
             else:
                 asyncio.run(actor._maybe_restore_replacement_reserve())
-            assert list(actor._replacement_reserve) == []
+            assert list(actor._rollout_runtime.replacement_reserve) == []
         finally:
             actor._checkpointer.shutdown()
 
@@ -4728,14 +4732,16 @@ class TestReplacementReservePersistence:
         actor = _run_train_pump(
             mc,
             _make_actor_args(),
-            seed=lambda a: a._replacement_reserve.extend(["spare0", "spare1"]),
+            seed=lambda a: a._rollout_runtime.replacement_reserve.extend(
+                ["spare0", "spare1"]
+            ),
         )
 
         reserve_path = tmp_path / "checkpoints" / "step_2" / "replacement_reserve.pt"
         assert reserve_path.exists()
         assert torch.load(reserve_path, weights_only=False) == ["spare0", "spare1"]
         # Saved, not consumed: the pool the run continues with is untouched.
-        assert list(actor._replacement_reserve) == ["spare0", "spare1"]
+        assert list(actor._rollout_runtime.replacement_reserve) == ["spare0", "spare1"]
 
     def test_save_writes_an_empty_reserve(self, tmp_path):
         """New checkpoints distinguish an empty pool from a missing sidecar."""
@@ -4761,7 +4767,7 @@ class TestReplacementReservePersistence:
             ),
         )
 
-        assert list(actor._replacement_reserve) == ["spare0", "spare1"]
+        assert list(actor._rollout_runtime.replacement_reserve) == ["spare0", "spare1"]
 
     def test_run_restores_the_pool_when_replay_metadata_is_absent(self, tmp_path):
         """An empty replay restore must not suppress the independent spare pool.
@@ -4788,7 +4794,7 @@ class TestReplacementReservePersistence:
         )
 
         assert buffer.load_calls == []
-        assert list(actor._replacement_reserve) == ["spare0"]
+        assert list(actor._rollout_runtime.replacement_reserve) == ["spare0"]
 
     def test_run_without_a_reserve_file_starts_with_an_empty_pool(self, tmp_path):
         """A checkpoint predating this file, or any run that never diverted."""
@@ -4804,4 +4810,4 @@ class TestReplacementReservePersistence:
             ),
         )
 
-        assert list(actor._replacement_reserve) == []
+        assert list(actor._rollout_runtime.replacement_reserve) == []
