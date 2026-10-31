@@ -26,6 +26,11 @@ from nemo_rl.utils.config import (
 
 RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
 FUNCTIONAL_ROOT = Path(__file__).parents[2] / "tests/functional"
+ASYNC_1OFF_NON_DEEPSEEK_RECIPES = sorted(
+    path
+    for path in (RECIPE_ROOT / "llm/performance").glob("grpo-*-async-1off*.yaml")
+    if "deepseek" not in path.name
+)
 MEGATRON_FUNCTIONAL_SCRIPTS = sorted(
     {
         path.name
@@ -208,3 +213,56 @@ def test_deepseek_performance_recipes_preserve_checkpoint_save_mode(
     register_omegaconf_resolvers()
     config = load_config(RECIPE_ROOT / "llm/performance" / recipe_name)
     assert config.policy.megatron_cfg.checkpoint.async_save is expected_async_save
+
+
+@pytest.mark.parametrize("recipe_path", ASYNC_1OFF_NON_DEEPSEEK_RECIPES)
+def test_non_deepseek_async_1off_recipes_use_nccl_reshard(
+    recipe_path: Path,
+) -> None:
+    register_omegaconf_resolvers()
+    config = load_config(recipe_path)
+    assert config.grpo.async_grpo.enabled is True
+    assert config.policy.megatron_cfg.enabled is True
+    assert config.policy.generation.colocated.enabled is False
+    assert config.policy.generation.refit_transport == "nccl_reshard"
+
+
+def test_qwen235_async_refit_buffer_size_matches_on_both_sides() -> None:
+    register_omegaconf_resolvers()
+    config = load_config(
+        RECIPE_ROOT / "llm/performance/grpo-qwen3-235b-32n8g-async-1off.yaml"
+    )
+    train_ratio = config.policy.megatron_cfg.env_vars.NRL_REFIT_BUFFER_MEMORY_RATIO
+    generation_ratio = (
+        config.policy.generation.vllm_cfg.env_vars.NRL_REFIT_BUFFER_MEMORY_RATIO
+    )
+
+    assert train_ratio == generation_ratio == "0.005"
+
+
+def test_nemotron3_super_bf16_trtllm_async_refit_uses_generation_ep() -> None:
+    register_omegaconf_resolvers()
+    config = load_config(
+        RECIPE_ROOT
+        / "llm/performance/grpo-nemotron3-super-120BA12B-32n4g-async-1off.yaml"
+    )
+    generation = config.policy.generation
+
+    assert generation.refit_transport == "nccl_reshard"
+    assert generation.vllm_kwargs.moe_backend == "flashinfer_trtllm"
+    assert (
+        generation.vllm_cfg.expert_parallel_size
+        == generation.vllm_cfg.tensor_parallel_size
+        == 4
+    )
+
+
+def test_nemotron3_super_mxfp8_rollout_keeps_generation_tp_sharding() -> None:
+    register_omegaconf_resolvers()
+    config = load_config(
+        RECIPE_ROOT
+        / "llm/performance/grpo-nemotron3-super-120BA12B-32n4g-async-1off-mxfp8-rollout.yaml"
+    )
+
+    assert config.policy.generation.vllm_cfg.precision == "fp8"
+    assert config.policy.generation.vllm_cfg.expert_parallel_size == 1

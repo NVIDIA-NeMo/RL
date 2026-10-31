@@ -19,12 +19,14 @@ policy:
       NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
       NVLINK_DOMAIN_SIZE: "8"
       USE_MNNVL: "0"
+      NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
     tensor_model_parallel_size: 4
     sequence_parallel: true
     context_parallel_size: 1
     pipeline_model_parallel_size: 8
     expert_model_parallel_size: 16
   generation:
+    refit_transport: nccl_reshard
     colocated:
       enabled: false
       resources:
@@ -34,6 +36,8 @@ policy:
       tensor_parallel_size: 8
       gpu_memory_utilization: 0.88
       async_engine: true
+      env_vars:
+        NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
 logger:
   log_dir: logs/grpo-qwen3-235b-32n8g-16T16G-async-1off
   wandb:
