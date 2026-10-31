@@ -118,6 +118,56 @@ def test_megatron_functional_scripts_keep_kv_settings_consistent(
     )
 
 
+def test_speechlm_recipe_logs_typed_config_to_tensorboard(tmp_path, monkeypatch):
+    from omegaconf import OmegaConf
+
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.utils.logger import TensorboardConfig, TensorboardLogger
+
+    for name in ("MODEL", "DATA", "OUTPUT_DIR"):
+        monkeypatch.setenv(f"SPEECHLM_GSPO_{name}", str(tmp_path / name))
+    register_omegaconf_resolvers()
+    config = load_config(
+        RECIPE_ROOT
+        / "vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml"
+    )
+    params = MasterConfig(**OmegaConf.to_container(config, resolve=True)).model_dump()
+    # The validated native config keeps the exact trainable surface immutable.
+    assert isinstance(params["policy"]["native_model"]["trainable_names"], tuple)
+    logger = TensorboardLogger(TensorboardConfig(), log_dir=str(tmp_path / "logs"))
+    try:
+        logger.log_hyperparams(params)
+    finally:
+        logger.finish()
+
+
+@pytest.mark.automodel
+def test_speechlm_recipe_uses_native_checkpoint_config(tmp_path, monkeypatch):
+    from omegaconf import OmegaConf
+
+    from nemo_rl.models.automodel.checkpoint import build_checkpoint_config
+    from nemo_rl.utils.checkpoint import CheckpointManager
+
+    for name in ("MODEL", "DATA", "OUTPUT_DIR"):
+        monkeypatch.setenv(f"SPEECHLM_GSPO_{name}", str(tmp_path / name))
+    register_omegaconf_resolvers()
+    config = load_config(
+        RECIPE_ROOT
+        / "vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml"
+    )
+    resolved = OmegaConf.to_container(config, resolve=True)
+    CheckpointManager(resolved["checkpointing"])
+    checkpoint = build_checkpoint_config(
+        resolved["policy"]["automodel_cfg"],
+        model_repo_id=str(tmp_path / "MODEL"),
+        dequantize_base_checkpoint=False,
+        is_peft=False,
+        is_async=False,
+    )
+    assert checkpoint["model_save_format"] == "torch_save"
+    assert checkpoint["save_consolidated"] == "false"
+
+
 @pytest.mark.parametrize(
     "recipe_name",
     [

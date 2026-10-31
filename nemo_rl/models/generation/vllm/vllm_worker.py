@@ -51,6 +51,7 @@ from nemo_rl.models.generation.vllm.config import (
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
 from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
+from nemo_rl.models.generation.vllm.output_limits import per_request_output_limits
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     FINISHED_REASON_LABEL,
@@ -87,6 +88,18 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _set_mm_normalization_default(vllm_kwargs: dict[str, Any]) -> None:
+    """Keep CPU image normalization when the engine exposes the device option.
+
+    Older vLLM releases already normalize on the CPU and reject this keyword.
+    Preserve explicit caller options so unsupported requests still fail visibly.
+    """
+    from vllm.engine.arg_utils import EngineArgs
+
+    if "mm_device_do_normalize" in inspect.signature(EngineArgs).parameters:
+        vllm_kwargs.setdefault("mm_device_do_normalize", False)
 
 
 def _context_capped_max_new_tokens(
@@ -501,16 +514,29 @@ class BaseVllmGenerationWorker:
         self.py_executable = sys.executable
 
         vllm_cfg = self.cfg["vllm_cfg"]
-        _apply_vllm_patches(
-            self.py_executable,
-            extra_env_vars=extra_env_vars,
-            nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
-            require_moe_routed_experts_capture=bool(
-                (self.cfg.get("vllm_kwargs") or {}).get(
-                    "enable_return_routed_experts", False
+        if vllm_cfg.get("native_speechlm"):
+            if vllm_cfg["async_engine"] or (self.cfg.get("vllm_kwargs") or {}).get(
+                "speculative_config"
+            ):
+                raise ValueError(
+                    "Native SpeechLM requires synchronous MTP-off generation"
                 )
-            ),
-        )
+            from nemo.collections.speechlm2.vllm.salm import (
+                register,
+            )  # Optional Speech plugin.
+
+            register()
+        else:
+            _apply_vllm_patches(
+                self.py_executable,
+                extra_env_vars=extra_env_vars,
+                nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
+                require_moe_routed_experts_capture=bool(
+                    (self.cfg.get("vllm_kwargs") or {}).get(
+                        "enable_return_routed_experts", False
+                    )
+                ),
+            )
 
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
@@ -563,7 +589,7 @@ class BaseVllmGenerationWorker:
         # already shipped one silent-corruption fix for the device path
         # (vllm-project/vllm#55370, encoder cudagraphs). Users can opt back in via
         # policy.generation.vllm_kwargs.mm_device_do_normalize=true.
-        vllm_kwargs.setdefault("mm_device_do_normalize", False)
+        _set_mm_normalization_default(vllm_kwargs)
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
         if checkpoint_engine_config is not None:
             from nemo_rl.models.generation.vllm.checkpoint_engine import (
@@ -1186,6 +1212,24 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 stop_strings=stop_strings,
             )
 
+        if data.get("max_output_tokens") is not None:
+            if spec_lookahead:
+                raise ValueError(
+                    "Per-row output caps do not support speculative decoding"
+                )
+            limits = per_request_output_limits(
+                data["max_output_tokens"],
+                input_lengths.tolist(),
+                configured_max_new_tokens=int(self.cfg["max_new_tokens"]),
+                max_model_len=int(self.cfg["vllm_cfg"]["max_model_len"]),
+            )
+            sampling_params = [
+                self._build_sampling_params(
+                    greedy=greedy, stop_strings=stop_strings, max_new_tokens=limit
+                )
+                for limit in limits
+            ]
+
         # Convert inputs to vLLM format and generate outputs.
         prompts = format_prompt_for_vllm_generation(data)
         prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in prompts]
@@ -1214,11 +1258,18 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         for output in outputs:
             max_length = max(max_length, len(output.outputs[0].token_ids))
 
+        expanded_placeholder_token_id = None
+        if self.cfg["vllm_cfg"].get("native_speechlm"):
+            tokenizer = self.llm.renderer.get_tokenizer()
+            expanded_placeholder_token_id = tokenizer.get_vocab()["<|audio|>"]
+
         for i, output in enumerate(outputs):
             # Extract generated tokens
             sequence_length = input_lengths[i]
             validate_rollout_prompt(
-                input_ids[i, :sequence_length].tolist(), output.prompt_token_ids
+                input_ids[i, :sequence_length].tolist(),
+                output.prompt_token_ids,
+                expanded_placeholder_token_id=expanded_placeholder_token_id,
             )
             generation = output.outputs[0]
             generated_tokens = list(generation.token_ids)

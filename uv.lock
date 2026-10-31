@@ -4529,7 +4529,7 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform != 'darwin' and extra == 'vllm'", specifier = "==0.28.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "transferqueue", git = "https://github.com/Ascend/TransferQueue.git?rev=05d4cc3377bee9b0f2897bbb90914ee20c0aea39" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'automodel'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1" },
-    { name = "transformers", specifier = ">=5.5.0,<=5.16.1" },
+    { name = "transformers", specifier = ">=5.5.0,<=5.18.0" },
     { name = "transformers", marker = "extra == 'automodel'", specifier = "==5.12.1" },
     { name = "transformers", marker = "extra == 'mcore'", specifier = "==5.16.1" },
     { name = "transformers", marker = "extra == 'sglang'", specifier = "==5.12.1" },

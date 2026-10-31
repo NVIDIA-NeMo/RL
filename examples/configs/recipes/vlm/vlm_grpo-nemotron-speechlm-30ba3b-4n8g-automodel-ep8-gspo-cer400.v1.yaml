@@ -1,0 +1,402 @@
+defaults: ../../grpo_math_1B.yaml
+data_plane:
+  simple:
+    num_storage_units: 8
+grpo:
+  num_prompts_per_step: 20
+  num_generations_per_prompt: 64
+  batch_multiplier: 2
+  dynamic_sampling_max_gen_batches: 2
+  use_dynamic_sampling: true
+  max_num_steps: 400
+  max_num_epochs: 2
+  skip_reference_policy_logprobs_calculation: true
+  val_period: 0
+  max_val_samples: 0
+  val_batch_size: 1
+  adv_estimator:
+    full_group_std: true
+loss_fn:
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+  reference_policy_kl_penalty: 0.0
+checkpointing:
+  checkpoint_dir: ${oc.env:SPEECHLM_GSPO_OUTPUT_DIR,results/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400}/checkpoints
+  metric_name: null
+  keep_top_k: 20
+  save_period: 20
+  checkpoint_must_save_by: 00:03:20:00
+policy:
+  model_name: ${oc.env:SPEECHLM_GSPO_MODEL,nvidia/Nemotron-3.5-Transcribe-30B-A4B}
+  tokenizer:
+    chat_template: default
+    chat_template_kwargs:
+      enable_thinking: false
+    processor_class: nemo_rl.data.asr.SpeechLMProcessor
+  native_model:
+    model_config_overrides:
+      automodel_backend:
+        attn: te
+        linear: te
+        experts: gmm
+        dispatcher: deepep
+        dispatcher_num_sms: 32
+    trainable_names:
+    - llm.model.layers.0.mixer._fp32_params.A_log
+    - llm.model.layers.0.mixer._fp32_params.D
+    - llm.model.layers.0.mixer.conv1d.bias
+    - llm.model.layers.0.mixer.conv1d.weight
+    - llm.model.layers.0.mixer._fp32_params.dt_bias
+    - llm.model.layers.0.mixer.in_proj.weight
+    - llm.model.layers.0.mixer.norm.weight
+    - llm.model.layers.0.mixer.out_proj.weight
+    - llm.model.layers.0.norm.weight
+    - llm.model.layers.2.mixer._fp32_params.A_log
+    - llm.model.layers.2.mixer._fp32_params.D
+    - llm.model.layers.2.mixer.conv1d.bias
+    - llm.model.layers.2.mixer.conv1d.weight
+    - llm.model.layers.2.mixer._fp32_params.dt_bias
+    - llm.model.layers.2.mixer.in_proj.weight
+    - llm.model.layers.2.mixer.norm.weight
+    - llm.model.layers.2.mixer.out_proj.weight
+    - llm.model.layers.2.norm.weight
+    - llm.model.layers.4.mixer._fp32_params.A_log
+    - llm.model.layers.4.mixer._fp32_params.D
+    - llm.model.layers.4.mixer.conv1d.bias
+    - llm.model.layers.4.mixer.conv1d.weight
+    - llm.model.layers.4.mixer._fp32_params.dt_bias
+    - llm.model.layers.4.mixer.in_proj.weight
+    - llm.model.layers.4.mixer.norm.weight
+    - llm.model.layers.4.mixer.out_proj.weight
+    - llm.model.layers.4.norm.weight
+    - llm.model.layers.5.mixer.k_proj.weight
+    - llm.model.layers.5.mixer.o_proj.weight
+    - llm.model.layers.5.mixer.q_proj.weight
+    - llm.model.layers.5.mixer.v_proj.weight
+    - llm.model.layers.5.norm.weight
+    - llm.model.layers.7.mixer._fp32_params.A_log
+    - llm.model.layers.7.mixer._fp32_params.D
+    - llm.model.layers.7.mixer.conv1d.bias
+    - llm.model.layers.7.mixer.conv1d.weight
+    - llm.model.layers.7.mixer._fp32_params.dt_bias
+    - llm.model.layers.7.mixer.in_proj.weight
+    - llm.model.layers.7.mixer.norm.weight
+    - llm.model.layers.7.mixer.out_proj.weight
+    - llm.model.layers.7.norm.weight
+    - llm.model.layers.9.mixer._fp32_params.A_log
+    - llm.model.layers.9.mixer._fp32_params.D
+    - llm.model.layers.9.mixer.conv1d.bias
+    - llm.model.layers.9.mixer.conv1d.weight
+    - llm.model.layers.9.mixer._fp32_params.dt_bias
+    - llm.model.layers.9.mixer.in_proj.weight
+    - llm.model.layers.9.mixer.norm.weight
+    - llm.model.layers.9.mixer.out_proj.weight
+    - llm.model.layers.9.norm.weight
+    - llm.model.layers.11.mixer._fp32_params.A_log
+    - llm.model.layers.11.mixer._fp32_params.D
+    - llm.model.layers.11.mixer.conv1d.bias
+    - llm.model.layers.11.mixer.conv1d.weight
+    - llm.model.layers.11.mixer._fp32_params.dt_bias
+    - llm.model.layers.11.mixer.in_proj.weight
+    - llm.model.layers.11.mixer.norm.weight
+    - llm.model.layers.11.mixer.out_proj.weight
+    - llm.model.layers.11.norm.weight
+    - llm.model.layers.12.mixer.k_proj.weight
+    - llm.model.layers.12.mixer.o_proj.weight
+    - llm.model.layers.12.mixer.q_proj.weight
+    - llm.model.layers.12.mixer.v_proj.weight
+    - llm.model.layers.12.norm.weight
+    - llm.model.layers.14.mixer._fp32_params.A_log
+    - llm.model.layers.14.mixer._fp32_params.D
+    - llm.model.layers.14.mixer.conv1d.bias
+    - llm.model.layers.14.mixer.conv1d.weight
+    - llm.model.layers.14.mixer._fp32_params.dt_bias
+    - llm.model.layers.14.mixer.in_proj.weight
+    - llm.model.layers.14.mixer.norm.weight
+    - llm.model.layers.14.mixer.out_proj.weight
+    - llm.model.layers.14.norm.weight
+    - llm.model.layers.16.mixer._fp32_params.A_log
+    - llm.model.layers.16.mixer._fp32_params.D
+    - llm.model.layers.16.mixer.conv1d.bias
+    - llm.model.layers.16.mixer.conv1d.weight
+    - llm.model.layers.16.mixer._fp32_params.dt_bias
+    - llm.model.layers.16.mixer.in_proj.weight
+    - llm.model.layers.16.mixer.norm.weight
+    - llm.model.layers.16.mixer.out_proj.weight
+    - llm.model.layers.16.norm.weight
+    - llm.model.layers.18.mixer._fp32_params.A_log
+    - llm.model.layers.18.mixer._fp32_params.D
+    - llm.model.layers.18.mixer.conv1d.bias
+    - llm.model.layers.18.mixer.conv1d.weight
+    - llm.model.layers.18.mixer._fp32_params.dt_bias
+    - llm.model.layers.18.mixer.in_proj.weight
+    - llm.model.layers.18.mixer.norm.weight
+    - llm.model.layers.18.mixer.out_proj.weight
+    - llm.model.layers.18.norm.weight
+    - llm.model.layers.19.mixer.k_proj.weight
+    - llm.model.layers.19.mixer.o_proj.weight
+    - llm.model.layers.19.mixer.q_proj.weight
+    - llm.model.layers.19.mixer.v_proj.weight
+    - llm.model.layers.19.norm.weight
+    - llm.model.layers.21.mixer._fp32_params.A_log
+    - llm.model.layers.21.mixer._fp32_params.D
+    - llm.model.layers.21.mixer.conv1d.bias
+    - llm.model.layers.21.mixer.conv1d.weight
+    - llm.model.layers.21.mixer._fp32_params.dt_bias
+    - llm.model.layers.21.mixer.in_proj.weight
+    - llm.model.layers.21.mixer.norm.weight
+    - llm.model.layers.21.mixer.out_proj.weight
+    - llm.model.layers.21.norm.weight
+    - llm.model.layers.23.mixer._fp32_params.A_log
+    - llm.model.layers.23.mixer._fp32_params.D
+    - llm.model.layers.23.mixer.conv1d.bias
+    - llm.model.layers.23.mixer.conv1d.weight
+    - llm.model.layers.23.mixer._fp32_params.dt_bias
+    - llm.model.layers.23.mixer.in_proj.weight
+    - llm.model.layers.23.mixer.norm.weight
+    - llm.model.layers.23.mixer.out_proj.weight
+    - llm.model.layers.23.norm.weight
+    - llm.model.layers.25.mixer._fp32_params.A_log
+    - llm.model.layers.25.mixer._fp32_params.D
+    - llm.model.layers.25.mixer.conv1d.bias
+    - llm.model.layers.25.mixer.conv1d.weight
+    - llm.model.layers.25.mixer._fp32_params.dt_bias
+    - llm.model.layers.25.mixer.in_proj.weight
+    - llm.model.layers.25.mixer.norm.weight
+    - llm.model.layers.25.mixer.out_proj.weight
+    - llm.model.layers.25.norm.weight
+    - llm.model.layers.26.mixer.k_proj.weight
+    - llm.model.layers.26.mixer.o_proj.weight
+    - llm.model.layers.26.mixer.q_proj.weight
+    - llm.model.layers.26.mixer.v_proj.weight
+    - llm.model.layers.26.norm.weight
+    - llm.model.layers.28.mixer._fp32_params.A_log
+    - llm.model.layers.28.mixer._fp32_params.D
+    - llm.model.layers.28.mixer.conv1d.bias
+    - llm.model.layers.28.mixer.conv1d.weight
+    - llm.model.layers.28.mixer._fp32_params.dt_bias
+    - llm.model.layers.28.mixer.in_proj.weight
+    - llm.model.layers.28.mixer.norm.weight
+    - llm.model.layers.28.mixer.out_proj.weight
+    - llm.model.layers.28.norm.weight
+    - llm.model.layers.30.mixer._fp32_params.A_log
+    - llm.model.layers.30.mixer._fp32_params.D
+    - llm.model.layers.30.mixer.conv1d.bias
+    - llm.model.layers.30.mixer.conv1d.weight
+    - llm.model.layers.30.mixer._fp32_params.dt_bias
+    - llm.model.layers.30.mixer.in_proj.weight
+    - llm.model.layers.30.mixer.norm.weight
+    - llm.model.layers.30.mixer.out_proj.weight
+    - llm.model.layers.30.norm.weight
+    - llm.model.layers.32.mixer._fp32_params.A_log
+    - llm.model.layers.32.mixer._fp32_params.D
+    - llm.model.layers.32.mixer.conv1d.bias
+    - llm.model.layers.32.mixer.conv1d.weight
+    - llm.model.layers.32.mixer._fp32_params.dt_bias
+    - llm.model.layers.32.mixer.in_proj.weight
+    - llm.model.layers.32.mixer.norm.weight
+    - llm.model.layers.32.mixer.out_proj.weight
+    - llm.model.layers.32.norm.weight
+    - llm.model.layers.33.mixer.k_proj.weight
+    - llm.model.layers.33.mixer.o_proj.weight
+    - llm.model.layers.33.mixer.q_proj.weight
+    - llm.model.layers.33.mixer.v_proj.weight
+    - llm.model.layers.33.norm.weight
+    - llm.model.layers.35.mixer._fp32_params.A_log
+    - llm.model.layers.35.mixer._fp32_params.D
+    - llm.model.layers.35.mixer.conv1d.bias
+    - llm.model.layers.35.mixer.conv1d.weight
+    - llm.model.layers.35.mixer._fp32_params.dt_bias
+    - llm.model.layers.35.mixer.in_proj.weight
+    - llm.model.layers.35.mixer.norm.weight
+    - llm.model.layers.35.mixer.out_proj.weight
+    - llm.model.layers.35.norm.weight
+    - llm.model.layers.37.mixer._fp32_params.A_log
+    - llm.model.layers.37.mixer._fp32_params.D
+    - llm.model.layers.37.mixer.conv1d.bias
+    - llm.model.layers.37.mixer.conv1d.weight
+    - llm.model.layers.37.mixer._fp32_params.dt_bias
+    - llm.model.layers.37.mixer.in_proj.weight
+    - llm.model.layers.37.mixer.norm.weight
+    - llm.model.layers.37.mixer.out_proj.weight
+    - llm.model.layers.37.norm.weight
+    - llm.model.layers.39.mixer._fp32_params.A_log
+    - llm.model.layers.39.mixer._fp32_params.D
+    - llm.model.layers.39.mixer.conv1d.bias
+    - llm.model.layers.39.mixer.conv1d.weight
+    - llm.model.layers.39.mixer._fp32_params.dt_bias
+    - llm.model.layers.39.mixer.in_proj.weight
+    - llm.model.layers.39.mixer.norm.weight
+    - llm.model.layers.39.mixer.out_proj.weight
+    - llm.model.layers.39.norm.weight
+    - llm.model.layers.41.mixer._fp32_params.A_log
+    - llm.model.layers.41.mixer._fp32_params.D
+    - llm.model.layers.41.mixer.conv1d.bias
+    - llm.model.layers.41.mixer.conv1d.weight
+    - llm.model.layers.41.mixer._fp32_params.dt_bias
+    - llm.model.layers.41.mixer.in_proj.weight
+    - llm.model.layers.41.mixer.norm.weight
+    - llm.model.layers.41.mixer.out_proj.weight
+    - llm.model.layers.41.norm.weight
+    - llm.model.layers.42.mixer.k_proj.weight
+    - llm.model.layers.42.mixer.o_proj.weight
+    - llm.model.layers.42.mixer.q_proj.weight
+    - llm.model.layers.42.mixer.v_proj.weight
+    - llm.model.layers.42.norm.weight
+    - llm.model.layers.44.mixer._fp32_params.A_log
+    - llm.model.layers.44.mixer._fp32_params.D
+    - llm.model.layers.44.mixer.conv1d.bias
+    - llm.model.layers.44.mixer.conv1d.weight
+    - llm.model.layers.44.mixer._fp32_params.dt_bias
+    - llm.model.layers.44.mixer.in_proj.weight
+    - llm.model.layers.44.mixer.norm.weight
+    - llm.model.layers.44.mixer.out_proj.weight
+    - llm.model.layers.44.norm.weight
+    - llm.model.layers.46.mixer._fp32_params.A_log
+    - llm.model.layers.46.mixer._fp32_params.D
+    - llm.model.layers.46.mixer.conv1d.bias
+    - llm.model.layers.46.mixer.conv1d.weight
+    - llm.model.layers.46.mixer._fp32_params.dt_bias
+    - llm.model.layers.46.mixer.in_proj.weight
+    - llm.model.layers.46.mixer.norm.weight
+    - llm.model.layers.46.mixer.out_proj.weight
+    - llm.model.layers.46.norm.weight
+    - llm.model.layers.48.mixer._fp32_params.A_log
+    - llm.model.layers.48.mixer._fp32_params.D
+    - llm.model.layers.48.mixer.conv1d.bias
+    - llm.model.layers.48.mixer.conv1d.weight
+    - llm.model.layers.48.mixer._fp32_params.dt_bias
+    - llm.model.layers.48.mixer.in_proj.weight
+    - llm.model.layers.48.mixer.norm.weight
+    - llm.model.layers.48.mixer.out_proj.weight
+    - llm.model.layers.48.norm.weight
+    - llm.model.layers.50.mixer._fp32_params.A_log
+    - llm.model.layers.50.mixer._fp32_params.D
+    - llm.model.layers.50.mixer.conv1d.bias
+    - llm.model.layers.50.mixer.conv1d.weight
+    - llm.model.layers.50.mixer._fp32_params.dt_bias
+    - llm.model.layers.50.mixer.in_proj.weight
+    - llm.model.layers.50.mixer.norm.weight
+    - llm.model.layers.50.mixer.out_proj.weight
+    - llm.model.layers.50.norm.weight
+    - perception.encoder.asr_encoder.layers.30.norm1.weight
+    - perception.encoder.asr_encoder.layers.30.norm1.bias
+    - perception.encoder.asr_encoder.layers.30.attn.w_qkv.weight
+    - perception.encoder.asr_encoder.layers.30.attn.out_proj.weight
+    - perception.encoder.asr_encoder.layers.30.attn.out_proj.bias
+    - perception.encoder.asr_encoder.layers.30.attn.q_norm.weight
+    - perception.encoder.asr_encoder.layers.30.attn.q_norm.bias
+    - perception.encoder.asr_encoder.layers.30.attn.k_norm.weight
+    - perception.encoder.asr_encoder.layers.30.attn.k_norm.bias
+    - perception.encoder.asr_encoder.layers.30.norm2.weight
+    - perception.encoder.asr_encoder.layers.30.norm2.bias
+    - perception.encoder.asr_encoder.layers.30.ffn.net.0.weight
+    - perception.encoder.asr_encoder.layers.30.ffn.net.0.bias
+    - perception.encoder.asr_encoder.layers.30.ffn.net.3.weight
+    - perception.encoder.asr_encoder.layers.30.ffn.net.3.bias
+    - perception.encoder.asr_encoder.layers.31.norm1.weight
+    - perception.encoder.asr_encoder.layers.31.norm1.bias
+    - perception.encoder.asr_encoder.layers.31.attn.w_qkv.weight
+    - perception.encoder.asr_encoder.layers.31.attn.out_proj.weight
+    - perception.encoder.asr_encoder.layers.31.attn.out_proj.bias
+    - perception.encoder.asr_encoder.layers.31.attn.q_norm.weight
+    - perception.encoder.asr_encoder.layers.31.attn.q_norm.bias
+    - perception.encoder.asr_encoder.layers.31.attn.k_norm.weight
+    - perception.encoder.asr_encoder.layers.31.attn.k_norm.bias
+    - perception.encoder.asr_encoder.layers.31.norm2.weight
+    - perception.encoder.asr_encoder.layers.31.norm2.bias
+    - perception.encoder.asr_encoder.layers.31.ffn.net.0.weight
+    - perception.encoder.asr_encoder.layers.31.ffn.net.0.bias
+    - perception.encoder.asr_encoder.layers.31.ffn.net.3.weight
+    - perception.encoder.asr_encoder.layers.31.ffn.net.3.bias
+    - perception.proj.weight
+    - perception.proj.bias
+    expected_trainable_tensors: 269
+    expected_trainable_scalars: 1074318400
+    max_expanded_sequence_length: ${policy.max_total_sequence_length}
+    projection_chunk_size: 256
+    deterministic_perception: true
+    activation_checkpointing_perception: true
+  train_global_batch_size: 1280
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  generation_batch_size: 1280
+  max_total_sequence_length: 62464
+  offload_optimizer_for_logprob: true
+  make_sequence_length_divisible_by: 1
+  sequence_packing:
+    enabled: false
+  automodel_cfg:
+    checkpoint:
+      model_save_format: torch_save
+    activation_checkpointing: true
+    expert_parallel_size: 8
+    moe_parallelizer:
+      ignore_router_for_ac: true
+  optimizer:
+    kwargs:
+      lr: 1.0e-06
+      foreach: false
+      fused: false
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1.0
+      total_iters: 5
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 5
+  generation:
+    max_new_tokens: 17278
+    temperature: 0.8
+    stop_token_ids:
+    - 11
+    vllm_cfg:
+      native_speechlm: true
+      speculative_config: null
+      enforce_eager: true
+      tensor_parallel_size: 8
+      expert_parallel_size: 8
+      max_model_len: 62464
+      gpu_memory_utilization: 0.23
+      skip_tokenizer_init: false
+      load_format: auto
+      env_vars:
+        VLLM_USE_DEEP_GEMM: '0'
+        VLLM_PLUGINS: nemo_speechlm
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        audio:
+          count: 1
+          length: 57566936
+      skip_mm_profiling: true
+data:
+  max_input_seq_length: 62464
+  shuffle: false
+  default:
+    prompt_file: null
+    processor: asr
+    env_name: asr
+  train:
+    dataset_name: ResponseDataset
+    data_path: ${oc.env:SPEECHLM_GSPO_DATA,/path/to/consumer.parquet}
+    input_key: prompt
+    output_key: expected_answer
+    processor: asr
+    env_name: asr
+    split_validation_size: 0
+    task_name: ResponseDataset
+env:
+  _override_: true
+  asr:
+    num_workers: 1
+logger:
+  log_dir: ${oc.env:SPEECHLM_GSPO_OUTPUT_DIR,results/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400}/logs
+  tensorboard_enabled: true
+cluster:
+  num_nodes: 4
+  gpus_per_node: 8

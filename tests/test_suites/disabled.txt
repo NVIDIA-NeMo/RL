@@ -4,6 +4,11 @@
 # validating the production topology.
 tests/test_suites/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken.sh
 
+# The SpeechLM GSPO resume check needs 128 GPU-hours, a SpeechLM seed, consumer
+# Parquet data and a prepared policy interpreter (docs/guides/gspo-speechlm.md).
+# Run this driver manually.
+tests/test_suites/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.sh
+
 # Still hangs in sample_tokens on vLLM 0.25.1, unlike the AutoModel variants of
 # https://github.com/vllm-project/vllm/issues/36237, which the bump does fix.
 # Not specific to this vLLM version: the enabled
