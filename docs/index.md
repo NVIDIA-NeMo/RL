@@ -406,6 +406,7 @@ design-docs/nccl-reshard-refit.md
 design-docs/dspark-auxiliary-heads.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
+design-docs/policy-lifecycle.md
 design-docs/token-capture-ledger.md
 ```
 
