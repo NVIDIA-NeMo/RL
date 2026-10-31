@@ -413,12 +413,10 @@ def test_forest_restores_discovered_checkpoint(
 ) -> None:
     mc = _make_forest_master_config()
     mc.policy["sequence_packing"]["enabled"] = packing
-    mc.checkpointing.update(
-        checkpoint_dir=str(tmp_path),
-        enabled=saving,
-        save_data_plane=True,
-        save_period=1,
-    )
+    mc.checkpointing.checkpoint_dir = str(tmp_path)
+    mc.checkpointing.enabled = saving
+    mc.checkpointing.save_data_plane = True
+    mc.checkpointing.save_period = 1
     mc.rollout_checkpointing = RolloutCheckpointConfig(
         snapshot_attempt_interval_s=interval, restore_mode=restore_mode
     )
@@ -486,9 +484,8 @@ def test_forest_retains_shared_checkpoint_requirements(
     reason: str,
 ) -> None:
     mc = _make_forest_master_config()
-    mc.checkpointing.update(
-        enabled=invalid != "no_trainer", save_data_plane=invalid != "no_data"
-    )
+    mc.checkpointing.enabled = invalid != "no_trainer"
+    mc.checkpointing.save_data_plane = invalid != "no_data"
     mc.rollout_checkpointing.snapshot_attempt_interval_s = 60
     with pytest.raises(ValueError, match=reason):
         setup_single_controller(mc, MagicMock(pad_token_id=0))

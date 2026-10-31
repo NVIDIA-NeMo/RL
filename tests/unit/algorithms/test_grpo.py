@@ -5524,7 +5524,7 @@ def test_grpo_train_without_epoch_limit_cycles_until_max_num_steps(
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
-    master_config.checkpointing["enabled"] = False
+    master_config.checkpointing.enabled = False
 
     single_batch_dataloader = MagicMock(spec=StatefulDataLoader)
     single_batch_dataloader.__iter__ = lambda self: iter([mock_batch])

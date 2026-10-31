@@ -352,6 +352,21 @@ def test_load_training_metadata(checkpoint_manager, checkpoint_dir):
     assert metadata == training_info
 
 
+def test_checkpoint_manager_defaults_when_optional_keys_omitted(tmp_path):
+    # save_optimizer/keep_top_k are BaseModel defaults; omitting them must yield
+    # the documented default instead of the pre-migration KeyError.
+    config = {
+        "enabled": True,
+        "checkpoint_dir": str(tmp_path.resolve() / "checkpoints"),
+        "metric_name": "loss",
+        "higher_is_better": False,
+        "save_period": 1,
+    }
+    manager = CheckpointManager(CheckpointingConfig.model_validate(config))
+    assert manager.save_optimizer is True
+    assert manager.keep_top_k is None
+
+
 def test_checkpoint_without_keep_top_k(tmp_path):
     # Test checkpoint manager without keep_top_k
     config = {
