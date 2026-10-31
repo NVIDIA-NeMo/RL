@@ -5,6 +5,7 @@
 import asyncio
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -400,6 +401,7 @@ def test_forest_retry_and_restart_reuse_durable_selection(
                     raise ValueError("invalid unfinished sibling")
                 if interruption == "cold" or index == 1:
                     raise asyncio.CancelledError()
+        return SimpleNamespace(rollout_metrics={})
 
     async def exercise():
         nonlocal manager
