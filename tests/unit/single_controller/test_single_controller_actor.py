@@ -55,6 +55,7 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import (
+    RolloutRuntimeState,
     SingleControllerActor,
     _pooled_opd_metrics,
 )
@@ -2271,6 +2272,7 @@ class _NoOpDataPlane:
 def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._master_config = SimpleNamespace(
         token_capture=TokenCaptureConfig(),
         grpo=GRPOConfig.model_construct(
@@ -2340,11 +2342,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._checkpoint_save_lock = asyncio.Lock()
     ctrl._optimizer_commit_in_progress = False
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
-    ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
-    ctrl._finalizer_metrics_by_group = {}
-    ctrl._finalizer_rewards_by_group = {}
     ctrl._log_full_result_tables = False
     ctrl._step_log_dict = {
         "reward_partials": [],
@@ -2408,7 +2407,7 @@ class _DroppingSampler(_OneThenEmptySampler):
         self.ctrl = None
 
     def _credit(self) -> None:
-        self.ctrl._batch_shortfall[self.ctrl._trainer_version] = 1
+        self.ctrl._rollout_runtime.batch_shortfall[self.ctrl._trainer_version] = 1
 
     async def evict(self, *, current_train_weight: int) -> int:
         del current_train_weight
@@ -2480,7 +2479,7 @@ def test_train_pump_closes_a_step_short_when_a_stamped_prompt_is_dropped(
     # which would report 0 for every step forever.
     assert ctrl._trainer_version == 1
     # This step's counts are pruned; a later step's survive to be reported by it.
-    assert ctrl._batch_shortfall == {}
+    assert ctrl._rollout_runtime.batch_shortfall == {}
     assert ctrl._batch_replacements == {}
     assert ctrl._batch_promotions == {3: 1}
 
@@ -2506,12 +2505,12 @@ def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
     ctrl._trainer_version = 3
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
-    ctrl._batch_shortfall = {2: 1, 3: 1, 5: 1}
+    ctrl._rollout_runtime.batch_shortfall = {2: 1, 3: 1, 5: 1}
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert ctrl._batch_shortfall == {5: 1}
+    assert ctrl._rollout_runtime.batch_shortfall == {5: 1}
 
 
 @pytest.mark.parametrize(
@@ -4359,10 +4358,10 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
             ],
         },
     )
-    ctrl._finalizer_metrics_by_group = parse_rollout_recovery_state(
+    ctrl._rollout_runtime.finalizer_metrics_by_group = parse_rollout_recovery_state(
         state
     ).finalizer_metrics_by_group
-    ctrl._finalizer_rewards_by_group = parse_rollout_recovery_state(
+    ctrl._rollout_runtime.finalizer_rewards_by_group = parse_rollout_recovery_state(
         state
     ).finalizer_rewards_by_group
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
@@ -4382,8 +4381,8 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     assert metrics["median_length_low"] == 950
     assert metrics["mean_length_reward_low"] == pytest.approx(0.2)
     assert not any(name.startswith("finalize/effort/") for name in metrics)
-    assert ctrl._finalizer_metrics_by_group == {}
-    assert ctrl._finalizer_rewards_by_group == {}
+    assert ctrl._rollout_runtime.finalizer_metrics_by_group == {}
+    assert ctrl._rollout_runtime.finalizer_rewards_by_group == {}
 
 
 @pytest.mark.parametrize("policy", ["exclude", "include"])
