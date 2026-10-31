@@ -98,6 +98,7 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    merge_policy_hf_overrides,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
@@ -948,8 +949,8 @@ def setup(
             )
 
         ## make vllm hf overrides match the training policy
-        generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
-            "hf_config_overrides", {}
+        merge_policy_hf_overrides(
+            generation_config["vllm_kwargs"], policy_config.get("hf_config_overrides")
         )
 
         policy_generation, policy, value_model = initialize_generation_with_policy(

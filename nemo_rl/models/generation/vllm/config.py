@@ -43,6 +43,38 @@ VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
 REFITTABLE_FP8_KV_CACHE_DTYPES = frozenset({"fp8", "fp8_e4m3"})
 
 
+def merge_policy_hf_overrides(
+    vllm_kwargs: dict[str, Any], policy_hf_config_overrides: Mapping[str, Any] | None
+) -> None:
+    """Sync ``vllm_kwargs["hf_overrides"]`` with ``policy.hf_config_overrides`` in place.
+
+    The trainer and vLLM must load the same HF config, so a key set to
+    different values in both dicts raises a ``ValueError`` naming it. Keys only set
+    under ``policy.generation.vllm_kwargs.hf_overrides`` survive: they exist to
+    correct the generation engine's view of the HF config without touching the
+    trainer, and a wholesale ``vllm_kwargs["hf_overrides"] = ...`` silently
+    discarded them (#3728). Mirrors ``_merge_fp8_kwargs`` one layer down.
+    """
+    generation_overrides = vllm_kwargs.get("hf_overrides") or {}
+    if not isinstance(generation_overrides, Mapping):
+        raise ValueError("policy.generation.vllm_kwargs.hf_overrides must be a mapping")
+    policy_overrides = dict(policy_hf_config_overrides or {})
+
+    conflicts = sorted(
+        key
+        for key, value in policy_overrides.items()
+        if key in generation_overrides and generation_overrides[key] != value
+    )
+    if conflicts:
+        raise ValueError(
+            f"policy.generation.vllm_kwargs.hf_overrides sets {conflicts} to values "
+            "that differ from policy.hf_config_overrides. The trainer and vLLM must "
+            "load the same HF config; set these keys only in policy.hf_config_overrides."
+        )
+
+    vllm_kwargs["hf_overrides"] = {**generation_overrides, **policy_overrides}
+
+
 # TODO(rohitrango): Move model-specific video fields behind ProcessorInterface.
 class VllmVideoConfig(BaseModel):
     """Video sampling contract shared by policy preprocessing and vLLM."""

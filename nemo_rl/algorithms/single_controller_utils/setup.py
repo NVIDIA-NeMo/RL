@@ -142,7 +142,10 @@ from nemo_rl.models.generation.megatron.megatron_generation import MegatronGener
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    merge_policy_hf_overrides,
+)
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -628,8 +631,9 @@ def _build_generation(
 
     if backend == "vllm":
         vllm_config = cast(VllmConfig, generation_config)
-        vllm_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            master_config.policy.get("hf_config_overrides", {})
+        merge_policy_hf_overrides(
+            vllm_config.setdefault("vllm_kwargs", {}),
+            master_config.policy.get("hf_config_overrides"),
         )
         configure_vllm_for_router_replay(master_config.policy)
         gen = VllmGeneration(
@@ -1282,8 +1286,9 @@ def setup_single_controller(
         # Validate the complete managed-Dynamo boundary before allocating Ray
         # placement groups or starting any external services, as grpo.setup does.
         dynamo_config = cast(dict[str, Any], generation_config)
-        dynamo_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            policy_config.get("hf_config_overrides") or {}
+        merge_policy_hf_overrides(
+            dynamo_config.setdefault("vllm_kwargs", {}),
+            policy_config.get("hf_config_overrides"),
         )
         generation_config = cast(
             GenerationConfig, DynamoConfig.model_validate(dynamo_config).model_dump()
