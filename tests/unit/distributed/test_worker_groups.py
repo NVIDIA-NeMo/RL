@@ -14,6 +14,7 @@
 
 import os
 import sys
+import types
 
 import pytest
 import ray
@@ -1400,3 +1401,56 @@ def test_environment_variable_precedence_full(
                 os.environ[key] = original_env[key]
             else:
                 os.environ.pop(key, None)
+
+
+class _RecordingWorker:
+    """Stands in for a Ray actor class: returns the options create_worker passes to it."""
+
+    @classmethod
+    def options(cls, **options):
+        return types.SimpleNamespace(remote=lambda *args, **kwargs: options)
+
+
+class _SharedGpuGenerationWorker(_RecordingWorker):
+    _nsys_gpu_metrics_on_shared_gpu = False
+
+
+@pytest.mark.parametrize(
+    "worker_cls,num_gpus,expected",
+    [
+        (_RecordingWorker, 1, "5"),
+        (_RecordingWorker, 0.5, "5"),  # colocated training worker samples
+        (_SharedGpuGenerationWorker, 0.5, None),  # colocated generation does not
+        (_RecordingWorker, 0, None),  # no GPU
+    ],
+)
+def test_create_worker_resolves_worker_gpu_metrics(
+    worker_cls, num_gpus, expected, monkeypatch
+):
+    """RayWorkerBuilder points "worker" GPU metrics at the worker's bundle GPU."""
+    from unittest.mock import patch
+
+    initializer_cls = (
+        RayWorkerBuilder.IsolatedWorkerInitializer.__ray_metadata__.modified_class
+    )
+    initializer = initializer_cls(f"{worker_cls.__module__}.{worker_cls.__name__}")
+    monkeypatch.setattr(
+        "nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS", {"gpu-metrics-devices": "worker"}
+    )
+    pg = object()
+    with patch(
+        "nemo_rl.distributed.virtual_cluster.get_bundle_gpu_id", return_value=5
+    ) as probe:
+        options = initializer.create_worker(
+            placement_group=pg,
+            placement_group_bundle_index=3,
+            num_gpus=num_gpus,
+            runtime_env={"nsight": {"t": "cuda,nvtx"}},
+        )
+    nsight = options["runtime_env"]["nsight"]
+    assert nsight.get("gpu-metrics-devices") == expected
+    if expected is None:
+        probe.assert_not_called()
+    else:
+        probe.assert_called_once_with(pg, 3)
+    assert options["num_gpus"] == num_gpus

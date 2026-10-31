@@ -18,11 +18,35 @@ from importlib.metadata import entry_points
 from unittest.mock import patch
 
 import pytest
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from nemo_rl.utils.vllm_nsight_plugin import register_nsight_inner_worker_profiling
+# nemo_rl.utils.nsys reads NRL_NSYS_* once, at import. Import it here, before any test
+# sets those variables, so its module constants never capture a test's environment.
+import nemo_rl.utils.nsys  # noqa: F401
+from nemo_rl.utils.vllm_nsight_plugin import (
+    _WorkerGpuMetricsRay,
+    register_nsight_inner_worker_profiling,
+)
 
 V2_MODULE = "vllm.v1.executor.ray_executor_v2"
 PLUGIN_LOGGER = "nemo_rl.utils.vllm_nsight_plugin"
+
+
+class _FakeRay:
+    """Records the actor options a vLLM executor passes to ``ray``."""
+
+    def __init__(self):
+        self.options = []
+
+    def remote(self, *args, **kwargs):
+        if kwargs:  # v1 executor: ray.remote(**options)(cls)
+            self.options.append(kwargs)
+            return lambda cls: cls
+        recorded = self.options  # v2 executor: ray.remote(cls).options(**options)
+        return types.SimpleNamespace(options=lambda **kw: recorded.append(kw))
+
+    def get(self, ref):
+        return ref
 
 
 @pytest.fixture
@@ -34,9 +58,9 @@ def fake_v2(monkeypatch):
     """
 
     class RayExecutorV2:
-        def __init__(self, use_nsight=True):
+        def __init__(self, use_nsight=True, world_size=1):
             self.parallel_config = types.SimpleNamespace(
-                ray_workers_use_nsight=use_nsight
+                ray_workers_use_nsight=use_nsight, world_size=world_size
             )
 
         def _build_runtime_env(self):
@@ -44,6 +68,8 @@ def fake_v2(monkeypatch):
 
     module = types.ModuleType(V2_MODULE)
     module.RayExecutorV2 = RayExecutorV2
+    module.ray = _FakeRay()
+    RayExecutorV2.__module__ = V2_MODULE
     monkeypatch.setitem(sys.modules, V2_MODULE, module)
     monkeypatch.setenv("NRL_NSYS_WORKER_PATTERNS", "*vllm*")
     return RayExecutorV2
@@ -158,3 +184,181 @@ def test_real_ray_executor_v2_matches_stub_contract(monkeypatch):
     register_nsight_inner_worker_profiling()
     assert RayExecutorV2._build_runtime_env is not original
     assert RayExecutorV2._nrl_nsight_patched is True
+
+
+WORKER_GPU_METRICS = {"gpu-metrics-devices": "worker", "cuda-memory-usage": "true"}
+
+
+def _strategy(bundle_index):
+    return PlacementGroupSchedulingStrategy(
+        placement_group="pg", placement_group_bundle_index=bundle_index
+    )
+
+
+def test_inner_workers_sample_their_own_gpu(fake_v2, monkeypatch):
+    """v2: each inner worker created with the shared runtime_env samples its bundle's GPU."""
+    # Non-colocated TP=2 engine: 2 x 0.5 GPU per inner worker = whole GPUs.
+    monkeypatch.setenv("VLLM_RAY_PER_WORKER_GPUS", "0.5")
+    module = sys.modules[V2_MODULE]
+    fake_ray = module.ray
+    with (
+        patch("nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS", WORKER_GPU_METRICS),
+        patch(
+            "nemo_rl.distributed.virtual_cluster.get_bundle_gpu_id",
+            side_effect=lambda pg, bundle: {4: 2, 5: 3}[bundle],
+        ),
+    ):
+        register_nsight_inner_worker_profiling()
+        runtime_env = fake_v2(world_size=2)._build_runtime_env()
+        assert runtime_env["nsight"]["gpu-metrics-devices"] == "worker"
+        assert isinstance(module.ray, _WorkerGpuMetricsRay)
+        fake_v2(
+            world_size=2
+        )._build_runtime_env()  # second executor in the same process
+        assert not isinstance(module.ray._ray, _WorkerGpuMetricsRay)  # no double wrap
+        # v2 creates each inner worker with the one shared runtime_env.
+        for bundle in (4, 5):
+            module.ray.remote(object).options(
+                runtime_env=runtime_env, scheduling_strategy=_strategy(bundle)
+            )
+    devices = [
+        o["runtime_env"]["nsight"]["gpu-metrics-devices"] for o in fake_ray.options
+    ]
+    assert devices == ["2", "3"]
+    assert all(
+        o["runtime_env"]["nsight"]["cuda-memory-usage"] == "true"
+        for o in fake_ray.options
+    )
+    # The shared runtime_env keeps the marker; each worker got its own copy.
+    assert runtime_env["nsight"]["gpu-metrics-devices"] == "worker"
+
+
+def test_colocated_inner_workers_do_not_sample(fake_v2, monkeypatch):
+    """An engine sharing its GPUs with the training workers leaves the GPUs to them."""
+    # Colocated TP=2 engine: 2 x 0.25 GPU per inner worker.
+    monkeypatch.setenv("VLLM_RAY_PER_WORKER_GPUS", "0.25")
+    module = sys.modules[V2_MODULE]
+    fake_ray = module.ray
+    with patch("nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS", WORKER_GPU_METRICS):
+        register_nsight_inner_worker_profiling()
+        nsight = fake_v2(world_size=2)._build_runtime_env()["nsight"]
+    assert "gpu-metrics-devices" not in nsight
+    assert nsight["cuda-memory-usage"] == "true"
+    assert module.ray is fake_ray
+
+
+def test_inherited_outer_config_gets_worker_gpu_metrics(fake_v2, monkeypatch):
+    """Only the outer async worker profiled: inner workers inherit its config (``_nsight``
+    in vLLM's ray_runtime_env) and still sample their own GPU."""
+    monkeypatch.setenv("VLLM_RAY_PER_WORKER_GPUS", "0.5")
+    module = sys.modules[V2_MODULE]
+    outer = {"o": "'vllm_async_generation_worker_1:3_%p'", "t": "cuda-sw,nvtx"}
+    monkeypatch.setattr(
+        fake_v2, "_build_runtime_env", lambda self: {"_nsight": dict(outer)}
+    )
+    with patch("nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS", WORKER_GPU_METRICS):
+        register_nsight_inner_worker_profiling()
+        runtime_env = fake_v2(use_nsight=False, world_size=2)._build_runtime_env()
+    assert runtime_env == {"nsight": {**outer, "gpu-metrics-devices": "worker"}}
+    assert isinstance(module.ray, _WorkerGpuMetricsRay)
+    with patch("nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS", {}):
+        # Without the request the inherited config is left as it is.
+        assert fake_v2(use_nsight=False, world_size=2)._build_runtime_env() == {
+            "_nsight": outer
+        }
+
+
+def test_worker_gpu_metrics_ray_resolves_v1_options_and_delegates():
+    """Only marked options are rewritten; unpinned workers do not sample; other calls pass through."""
+    fake_ray = _FakeRay()
+    wrapped = _WorkerGpuMetricsRay(fake_ray)
+    shared = {"nsight": {"t": "cuda", "gpu-metrics-devices": "worker"}}
+    with (
+        patch("nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS", WORKER_GPU_METRICS),
+        patch("nemo_rl.distributed.virtual_cluster.get_bundle_gpu_id", return_value=1),
+    ):
+        wrapped.remote(
+            num_gpus=0.5, scheduling_strategy=_strategy(1), runtime_env=shared
+        )
+        # Not pinned to a bundle: the GPU is unknown, so no GPU metrics.
+        wrapped.remote(num_gpus=0.5, runtime_env=shared)
+        # Options without the marker pass through as they are.
+        plain = {"runtime_env": {"nsight": {"t": "cuda"}}}
+        wrapped.remote(**plain)
+        # Ray's "any bundle" index: not pinned, so the GPU is unknown -> no GPU metrics.
+        wrapped.remote(
+            num_gpus=0.5, scheduling_strategy=_strategy(-1), runtime_env=shared
+        )
+    assert fake_ray.options[0]["runtime_env"]["nsight"] == {
+        "t": "cuda",
+        "gpu-metrics-devices": "1",
+    }
+    assert fake_ray.options[1]["runtime_env"]["nsight"] == {"t": "cuda"}
+    assert fake_ray.options[2] == plain
+    assert fake_ray.options[3]["runtime_env"]["nsight"] == {"t": "cuda"}
+    assert wrapped.get("ref") == "ref"
+
+
+def test_v1_executor_inner_workers_sample_their_own_gpu(monkeypatch):
+    """v1 (in-process patch): each inner worker samples its bundle's GPU."""
+    from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+    v1_module_name = "vllm.v1.executor.ray_executor"
+
+    class RayDistributedExecutor:
+        def __init__(self):
+            self.parallel_config = types.SimpleNamespace(world_size=2)
+
+    RayDistributedExecutor.__module__ = v1_module_name
+    module = types.ModuleType(v1_module_name)
+    module.RayDistributedExecutor = RayDistributedExecutor
+    module.ray = _FakeRay()
+    fake_ray = module.ray
+    monkeypatch.setitem(sys.modules, v1_module_name, module)
+    monkeypatch.setenv("VLLM_RAY_PER_WORKER_GPUS", "0.5")
+    with (
+        patch("nemo_rl.utils.nsys.NRL_NSYS_PROFILE_STEP_RANGE", "1:3"),
+        patch("nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS", WORKER_GPU_METRICS),
+        patch(
+            "nemo_rl.distributed.virtual_cluster.get_bundle_gpu_id",
+            side_effect=lambda pg, bundle: bundle,
+        ),
+    ):
+        BaseVllmGenerationWorker._patch_vllm_nsight_config()
+        kwargs = RayDistributedExecutor()._configure_ray_workers_use_nsight({})
+        # v1 creates each inner worker with ray.remote(**shared_kwargs)(cls).
+        for bundle in (0, 1):
+            module.ray.remote(
+                num_gpus=0.5, scheduling_strategy=_strategy(bundle), **kwargs
+            )
+    nsight = kwargs["runtime_env"]["nsight"]
+    assert nsight["capture-range-end"] == "repeat"
+    assert nsight["o"] == "'vllm_tp_worker_1:3_%p'"
+    devices = [
+        o["runtime_env"]["nsight"]["gpu-metrics-devices"] for o in fake_ray.options
+    ]
+    assert devices == ["0", "1"]
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "module_name,method",
+    [
+        ("vllm.v1.executor.ray_executor_v2", "RayExecutorV2._init_executor"),
+        ("vllm.v1.executor.ray_executor", "RayDistributedExecutor._init_workers_ray"),
+    ],
+)
+def test_real_executors_create_workers_through_module_ray(module_name, method):
+    """_WorkerGpuMetricsRay relies on vLLM creating each inner worker through the
+    executor module's ``ray`` with a per-worker scheduling strategy and the shared
+    runtime_env; fail at the vLLM bump if that changes."""
+    import importlib
+    import inspect
+
+    module = importlib.import_module(module_name)
+    cls_name, func_name = method.split(".")
+    source = inspect.getsource(getattr(getattr(module, cls_name), func_name))
+    assert hasattr(module, "ray")
+    assert "ray.remote(" in source
+    assert "PlacementGroupSchedulingStrategy(" in source
+    assert "placement_group_bundle_index=" in source

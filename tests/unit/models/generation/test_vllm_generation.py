@@ -503,6 +503,9 @@ def test_v1_executor_patch_uses_repeat_without_wait(monkeypatch):
     uses stop + wait=primary. Both come from build_inner_nsight_config."""
 
     class RayDistributedExecutor:
+        # read by build_executor_nsight_config (per-worker GPU metrics)
+        parallel_config = types.SimpleNamespace(world_size=2)
+
         def _configure_ray_workers_use_nsight(self, ray_remote_kwargs):
             raise AssertionError("vLLM's stock nsight config must be replaced")
 

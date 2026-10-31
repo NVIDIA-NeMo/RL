@@ -30,12 +30,16 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+from nemo_rl.distributed.worker_group_utils import (
+    recursive_merge_options,
+    samples_own_gpu_metrics,
+)
 from nemo_rl.telemetry.host_memory import (
     forget_worker_group_nodes,
     register_worker_group_placement,
 )
 from nemo_rl.telemetry.vocabulary import WORKER_GROUP_ENV
+from nemo_rl.utils.nsys import set_worker_gpu_metrics_device
 from nemo_rl.utils.venvs import (
     add_hf_modules_cache_to_pythonpath,
     create_local_venv_on_each_node,
@@ -273,6 +277,16 @@ class RayWorkerBuilder:
                 # Apply initialization parameters
                 if init_kwargs:
                     worker_kwargs.update(init_kwargs)
+
+            # nsys GPU metrics with NRL_NSYS_EXTRA_OPTIONS {"gpu-metrics-devices": "worker"}:
+            # sample the GPU of this worker's placement-group bundle.
+            nsight_config = options.get("runtime_env", {}).get("nsight")
+            if isinstance(nsight_config, dict) and samples_own_gpu_metrics(
+                worker_class, num_gpus
+            ):
+                set_worker_gpu_metrics_device(
+                    nsight_config, placement_group, placement_group_bundle_index
+                )
 
             # Create options for Ray actor
             options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(

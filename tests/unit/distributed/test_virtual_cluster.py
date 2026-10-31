@@ -57,6 +57,8 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_and_free_port,
     _init_ray,
     _reserve_data_plane_ports,
+    get_bundle_gpu_id,
+    get_reordered_bundle,
 )
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
@@ -421,6 +423,19 @@ def test_create_sorted_bundle_indices_for_unified_pg():
     assert len(cluster._sorted_bundle_indices) == 2
     assert 0 in cluster._sorted_bundle_indices
     assert 1 in cluster._sorted_bundle_indices
+
+
+def test_get_bundle_gpu_id_matches_bundle_probe():
+    """get_bundle_gpu_id returns the GPU Ray assigned to each bundle."""
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
+    try:
+        (pg,) = cluster.get_placement_groups()
+        bundles, gpu_ids, _ = get_reordered_bundle(pg)
+        expected = dict(zip(bundles, gpu_ids))
+        assert {b: get_bundle_gpu_id(pg, b) for b in range(2)} == expected
+        assert len(set(expected.values())) == 2
+    finally:
+        cluster.shutdown()
 
 
 def test_not_create_sorted_bundle_indices_for_per_node_pg():

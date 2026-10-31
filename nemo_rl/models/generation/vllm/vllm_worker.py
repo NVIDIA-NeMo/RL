@@ -270,6 +270,10 @@ def _configure_nvfp4_pertoken_engine_kwargs(
 
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
+    # Colocated with the training workers (fractional num_gpus), leave each shared
+    # GPU's nsys GPU-metrics sampler to them; only one process can sample a GPU.
+    _nsys_gpu_metrics_on_shared_gpu = False
+
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -941,11 +945,7 @@ class BaseVllmGenerationWorker:
         tracing until start_gpu_profiling() triggers cudaProfilerStart() on each
         internal worker via collective_rpc.
         """
-        from nemo_rl.utils.nsys import build_inner_nsight_config
-
-        # NRL_NSYS_EXTRA_OPTIONS is merged in (e.g. t=cuda-sw,nvtx on platforms where
-        # the HW cuda target crashes at cudaProfilerStart).
-        nsight_config = build_inner_nsight_config(capture_range_end="repeat")
+        from nemo_rl.utils.vllm_nsight_plugin import build_executor_nsight_config
 
         # vLLM v1 Ray executor (VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0).
         try:
@@ -956,8 +956,14 @@ class BaseVllmGenerationWorker:
             )
 
         def _patched_configure(self, ray_remote_kwargs):
+            # NRL_NSYS_EXTRA_OPTIONS is merged in (e.g. t=cuda-sw,nvtx on platforms
+            # where the HW cuda target crashes at cudaProfilerStart).
             runtime_env = ray_remote_kwargs.setdefault("runtime_env", {})
-            runtime_env.update({"nsight": nsight_config})
+            runtime_env["nsight"] = build_executor_nsight_config(
+                RayDistributedExecutor,
+                self.parallel_config,
+                capture_range_end="repeat",
+            )
             return ray_remote_kwargs
 
         RayDistributedExecutor._configure_ray_workers_use_nsight = _patched_configure

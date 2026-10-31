@@ -82,6 +82,22 @@ def get_nsight_config_if_pattern_matches(worker_name: str) -> dict[str, Any]:
     return {}
 
 
+def samples_own_gpu_metrics(worker_class: Any, num_gpus: float) -> bool:
+    """Whether a worker may sample the nsys GPU metrics of the GPU it runs on.
+
+    Only one process can sample a GPU. A worker without a GPU (e.g. the outer vLLM
+    actor at TP>1, whose inner workers run on the GPUs) does not sample. A worker that
+    shares its GPU with a colocated worker group (fractional ``num_gpus``) samples
+    unless its class leaves shared GPUs to the other group
+    (``_nsys_gpu_metrics_on_shared_gpu = False``, as the vLLM workers do).
+    """
+    if num_gpus <= 0:
+        return False
+    return num_gpus >= 1 or getattr(
+        worker_class, "_nsys_gpu_metrics_on_shared_gpu", True
+    )
+
+
 def recursive_merge_options(
     default_options: dict[str, Any], extra_options: dict[str, Any]
 ) -> dict[str, Any]:

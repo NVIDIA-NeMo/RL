@@ -19,6 +19,8 @@ from nemo_rl.utils.nsys import (
     apply_nsys_extra_options,
     build_inner_nsight_config,
     maybe_gpu_profile_step,
+    set_worker_gpu_metrics_device,
+    worker_gpu_metrics_flag,
 )
 
 
@@ -593,3 +595,69 @@ def test_build_inner_nsight_config_does_not_mutate_module_options():
         second = build_inner_nsight_config(capture_range_end="stop")
     assert first == second and first is not second
     assert extras == {"t": "cuda-sw,nvtx", "cuda-graph-trace": None}
+
+
+@pytest.mark.parametrize("flag", ["gpu-metrics-devices", "gpu-metrics-device"])
+def test_worker_gpu_metrics_flag(flag):
+    """Only the "worker" value of either flag spelling requests per-worker GPU metrics."""
+    with patch("nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS", {flag: "worker"}):
+        assert worker_gpu_metrics_flag() == flag
+    with patch("nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS", {flag: "all"}):
+        assert worker_gpu_metrics_flag() is None
+
+
+def test_apply_nsys_extra_options_leaves_worker_gpu_metrics_unset():
+    """ "worker" is resolved per worker at creation; any other value passes through."""
+    cfg = apply_nsys_extra_options(
+        {}, {"gpu-metrics-devices": "worker", "cuda-memory-usage": "true"}
+    )
+    assert cfg == {"cuda-memory-usage": "true"}
+    cfg = apply_nsys_extra_options({}, {"gpu-metrics-devices": "all"})
+    assert cfg == {"gpu-metrics-devices": "all"}
+
+
+def test_set_worker_gpu_metrics_device():
+    """The flag is set to the GPU Ray assigned to the worker's placement-group bundle."""
+    pg = object()
+    cfg = {"t": "cuda"}
+    with (
+        patch(
+            "nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS",
+            {"gpu-metrics-devices": "worker"},
+        ),
+        patch(
+            "nemo_rl.distributed.virtual_cluster.get_bundle_gpu_id", return_value=3
+        ) as get_gpu,
+    ):
+        set_worker_gpu_metrics_device(cfg, pg, 7)
+    get_gpu.assert_called_once_with(pg, 7)
+    assert cfg == {"t": "cuda", "gpu-metrics-devices": "3"}
+
+
+def test_set_worker_gpu_metrics_device_noop_without_request():
+    """Without "worker" nothing is probed and the config is unchanged."""
+    cfg = {"t": "cuda"}
+    with (
+        patch("nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS", {}),
+        patch("nemo_rl.distributed.virtual_cluster.get_bundle_gpu_id") as get_gpu,
+    ):
+        set_worker_gpu_metrics_device(cfg, object(), 0)
+    get_gpu.assert_not_called()
+    assert cfg == {"t": "cuda"}
+
+
+@pytest.mark.parametrize("per_worker", [True, False])
+def test_build_inner_nsight_config_worker_gpu_metrics_marker(per_worker):
+    """The inner config keeps "worker" as a marker only when the executor resolves it."""
+    with (
+        patch("nemo_rl.utils.nsys.NRL_NSYS_PROFILE_STEP_RANGE", "1:2"),
+        patch(
+            "nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS",
+            {"gpu-metrics-devices": "worker", "cuda-memory-usage": "true"},
+        ),
+    ):
+        cfg = build_inner_nsight_config(
+            capture_range_end="stop", gpu_metrics_per_worker=per_worker
+        )
+    assert cfg["cuda-memory-usage"] == "true"
+    assert cfg.get("gpu-metrics-devices") == ("worker" if per_worker else None)

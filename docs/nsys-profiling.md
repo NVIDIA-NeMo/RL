@@ -37,11 +37,12 @@ on conflict with the built-in defaults (`t`, `o`, `stop-on-exit`, `capture-range
 `capture-range-end`, `cuda-graph-trace`).
 
 ```bash
-export NRL_NSYS_EXTRA_OPTIONS='{"gpu-metrics-device": "all", "cuda-memory-usage": "true", "cpuctxsw": "none"}'
+export NRL_NSYS_EXTRA_OPTIONS='{"gpu-metrics-devices": "worker", "cuda-memory-usage": "true", "cpuctxsw": "none"}'
 ```
 
 Common additions:
-- `gpu-metrics-device`: sample SM/memory utilization counters (e.g. `"all"` or a specific device id).
+- `gpu-metrics-devices`: sample SM/memory utilization counters; use `"worker"` to give each profiled
+  worker the metrics of its own GPU (see [GPU Metrics for Every Profiled Worker](#gpu-metrics-for-every-profiled-worker)).
 - `cuda-memory-usage`: track host/device memory allocations (`"true"`).
 - `cpuctxsw`: control CPU context-switch sampling (`"none"`, `"process-tree"`).
 
@@ -55,6 +56,42 @@ export NRL_NSYS_EXTRA_OPTIONS='{"t": "cuda-sw,nvtx", "cuda-graph-trace": null}'
 
 Empty or unset means no extras — defaults apply unchanged. Invalid JSON or a non-object
 payload raises at startup so misconfiguration surfaces immediately.
+
+### GPU Metrics for Every Profiled Worker
+
+nsys samples GPU hardware metrics (SM activity, memory bandwidth, clocks and more) with
+`--gpu-metrics-devices`. Each GPU can be sampled by only one nsys process at a time: when two
+processes ask for the same GPU, one of them records no GPU metrics, without an error. NeMo-RL
+runs one nsys process per profiled worker, and most workers see every GPU of their node, so a
+single value for all workers (`"all"`, `"cuda-visible"` or a fixed GPU id) makes the workers of a
+node compete for the same GPUs: some reports get the metrics of several GPUs, others get none.
+A single value only works when one profiled process runs per node.
+
+To give each profiled worker the metrics of the GPU it runs on, set the flag to `"worker"`:
+
+```bash
+export NRL_NSYS_EXTRA_OPTIONS='{"gpu-metrics-devices": "worker", "cuda-memory-usage": "true"}'
+```
+
+For each profiled process, NeMo-RL replaces `"worker"` with the id of the GPU that Ray assigned
+to that worker:
+- Policy (training) workers sample their own GPU.
+- vLLM with tensor parallel size 1: each generation worker samples its own GPU.
+- vLLM with tensor parallel size > 1: each internal TP worker samples its own GPU, whichever
+  pattern selected it (see the note under [Supported Workers](#supported-workers)). The outer vLLM
+  worker runs no GPU work, so it samples none and cannot take a GPU away from the TP worker that
+  runs on it.
+- Colocated generation (vLLM shares the GPUs with the policy): only the policy workers sample.
+  Their reports also cover the generation phase, which runs on the same GPUs; the vLLM reports
+  carry no GPU metrics.
+
+All other keys in `NRL_NSYS_EXTRA_OPTIONS` (for example `gpu-metrics-frequency` or
+`cuda-memory-usage`) apply unchanged to the policy workers, the vLLM generation workers and the
+vLLM internal TP workers. Values other than `"worker"` are passed to nsys as they are. The flag is
+`gpu-metrics-devices` in current nsys releases; the deprecated spelling `gpu-metrics-device` also
+accepts `"worker"`. GPU ids follow the PCI order that nsys uses when CUDA does too
+(`CUDA_DEVICE_ORDER=PCI_BUS_ID`). Another nsys session that samples the same GPUs at the same
+time, such as a node-level GPU-metrics sampler, still competes with the workers for them.
 
 ### Pattern Format
 
@@ -72,8 +109,12 @@ The supported worker types are:
 - **VllmAsyncGenerationWorker**: Pattern matched against `"vllm_async_generation_worker"` (used when `async_engine` is `true`)
 - **TrtllmAsyncGenerationWorker**: Pattern matched against `"trtllm_async_generation_worker"`
 
-> [!IMPORTANT]
-> For the async vLLM engine, match `vllm_async_generation_worker` exactly. Do not use `*vllm*` or `*generation_worker`: they also match `vllm_generation_worker`, which sets `ray_workers_use_nsight=True` for the inner TP workers. Those workers then use vLLM's own always-on nsight config instead of the deferred-capture one, so the capture range is lost. With the async engine the inner TP workers inherit their nsight config from the outer `VllmAsyncGenerationWorker`, which is why its name must match.
+> [!NOTE]
+> For the async vLLM engine with tensor parallel size > 1, both pattern styles profile every internal TP worker with deferred capture:
+> - A pattern that also matches `vllm_generation_worker` (for example `*vllm*` or `*generation_worker`) sets `ray_workers_use_nsight=True`, and the `nemo_rl_nsight_inner` plugin gives each internal TP worker NeMo RL's deferred-capture config. Reports: `vllm_tp_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep`.
+> - Matching `vllm_async_generation_worker` exactly leaves `ray_workers_use_nsight` off, and the internal TP workers inherit the nsight config of the outer `VllmAsyncGenerationWorker`. Reports: `vllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep`, one per internal TP worker.
+>
+> `NRL_NSYS_EXTRA_OPTIONS`, including `"gpu-metrics-devices": "worker"`, applies to the internal TP workers either way.
 
 ## Example Usage
 

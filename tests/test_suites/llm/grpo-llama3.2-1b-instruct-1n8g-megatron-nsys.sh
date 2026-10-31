@@ -8,7 +8,8 @@ NUM_NODES=1
 STEPS_PER_RUN=20
 MAX_STEPS=20
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=45
+# The full run (20 steps, profile window, report write-out) measured about 13 minutes.
+NUM_MINUTES=30
 # ===== END CONFIG =====
 
 # End-to-end check of nsys profiling. Runs the base recipe under this wrapper's identity
@@ -30,8 +31,6 @@ if [[ -n "${RAY_SESSION_ROOT:-}" ]]; then
 else
     mapfile -t REPORT_ROOTS < <(printf '%s/ray\n' "${RAY_TMPDIR:-/tmp}" "${TMPDIR:-/tmp}" /tmp | awk '!seen[$0]++')
 fi
-# nsys keeps in-progress captures (.qdstrm) in its temp dir until the report is written.
-NSYS_TMP_DIRS=("${TMPDIR:-/tmp}"/nsys-*)
 
 if ! command -v nsys >/dev/null; then
     echo "[ERROR] nsys is not on PATH; this test needs Nsight Systems on the node"
@@ -118,6 +117,9 @@ if [[ -n $(list_reports -name 'worker_process_*') ]]; then
         "vLLM environment (reinstall nemo-rl there; keep it in VLLM_PLUGINS if that is set)"
     exit 1
 fi
+# nsys keeps in-progress captures (.qdstrm) in its temp dir until the report is written;
+# expand the glob now, after the run, so temp dirs created by the run are searched too.
+shopt -s nullglob; NSYS_TMP_DIRS=("${TMPDIR:-/tmp}"/nsys-*); shopt -u nullglob
 if [[ -n $(find "${NSYS_TMP_DIRS[@]}" "${REPORT_ROOTS[@]}" -name '*.qdstrm' -newer "$START_MARKER" 2>/dev/null) ]]; then
     echo "[ERROR] Found unfinished .qdstrm captures: reports were not written before the run" \
         "ended; run more steps after NRL_NSYS_PROFILE_STEP_RANGE"
