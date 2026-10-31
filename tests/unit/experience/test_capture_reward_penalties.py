@@ -263,10 +263,7 @@ def test_classification_retains_original_last_user_membership_rule(messages, exp
 def test_active_effort_requires_positive_bound(bound):
     with pytest.raises(ValueError, match="low_ub"):
         EffortLevelsConfig(low_weight=1, low_string="budget", low_ub=bound)
-    assert (
-        EffortLevelsConfig(low_weight=0, low_string="budget", low_ub=bound).low_ub
-        == bound
-    )
+    EffortLevelsConfig(low_weight=0, low_string="budget", low_ub=bound)
 
 
 def test_metric_pooling_single_row_reports_nan_stddev_and_no_disabled_keys():

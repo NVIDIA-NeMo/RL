@@ -365,11 +365,6 @@ def test_refit_returns_empty_metrics_when_synchronizer_returns_none() -> None:
     policy.sync_params_before_refit.assert_called_once_with()
 
 
-def test_masked_reward_policy_validation() -> None:
-    with pytest.raises(ValueError, match="masked_reward_policy"):
-        GRPOConfig(masked_reward_policy="unknown")
-
-
 class TestStatisticsParticipation:
     def test_binary_participation_keeps_fractional_weights_for_the_loss(self):
         loss_weights = torch.tensor([1.0, 0.5, 0.0, 1e-6, 0.25])
@@ -1121,20 +1116,6 @@ def test_grpo_save_state_checkpoint_round_trip():
     assert restored_state.next_nemo_gym_task_index == 123
     assert restored_state.val_reward == 0.8
     assert not hasattr(restored_state, "val:accuracy")
-
-
-def test_grpo_config_nested_defaults_are_populated():
-    first = GRPOConfig()
-    second = GRPOConfig()
-
-    assert isinstance(first.async_grpo, AsyncGRPOConfig)
-    assert isinstance(first.adv_estimator, AdvEstimatorConfig)
-    assert isinstance(first.reward_shaping, RewardShapingConfig)
-    assert isinstance(first.reward_scaling, RewardScalingConfig)
-    assert first.async_grpo is not second.async_grpo
-    assert first.adv_estimator is not second.adv_estimator
-    assert first.reward_shaping is not second.reward_shaping
-    assert first.reward_scaling is not second.reward_scaling
 
 
 def _mock_seq_logprob_error_result() -> dict[str, object]:

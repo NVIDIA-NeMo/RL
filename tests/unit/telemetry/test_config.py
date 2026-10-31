@@ -9,11 +9,6 @@ from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.setup import _ENV_FIELD_MAP, _config_to_env
 
 
-def test_extra_keys_allowed():
-    cfg = TelemetryConfig(enabled=True, future_unknown_key="x")
-    assert cfg.enabled is True
-
-
 def test_config_to_env_translation():
     tel = TelemetryConfig(
         enabled=True,

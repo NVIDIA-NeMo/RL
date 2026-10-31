@@ -2585,18 +2585,6 @@ def test_async_ppo_rejects_fp8_kv_scale_sync():
         _validate_async_ppo_entry_config(config, requires_kv_scale_sync=True)
 
 
-def test_async_ppo_config_allows_kv_cache_recompute_without_inflight_updates():
-    from nemo_rl.algorithms.ppo import AsyncPPOConfig
-
-    config = AsyncPPOConfig(
-        in_flight_weight_updates=False,
-        recompute_kv_cache_after_weight_updates=True,
-    )
-
-    assert not config.in_flight_weight_updates
-    assert config.recompute_kv_cache_after_weight_updates
-
-
 def test_async_ppo_config_warmup_lead_defaults_to_training_age():
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 

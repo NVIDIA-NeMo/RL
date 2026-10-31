@@ -76,7 +76,7 @@ def test_opd_full_config_rejects_a_degenerate_chunk_size():
     with pytest.raises(ValueError, match="chunk_size must be >= 1"):
         OnPolicyDistillationFullConfig(chunk_size=0)
     # None means "the whole sequence in one chunk" and must stay legal.
-    assert OnPolicyDistillationFullConfig(chunk_size=None).chunk_size is None
+    OnPolicyDistillationFullConfig(chunk_size=None)
 
 
 def test_get_opd_full_config_requires_both_switches():

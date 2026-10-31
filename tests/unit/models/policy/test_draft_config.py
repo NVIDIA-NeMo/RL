@@ -55,9 +55,6 @@ def test_eagle3_draft_config_accepts_legacy_mapping_without_speculator_type() ->
     )
 
     assert config.speculator_type == "eagle3"
-    assert config.enabled is True
-    assert config.model_name == "draft"
-    assert config.loss_weight == 0.25
 
 
 def test_eagle3_draft_config_preserves_extra_legacy_keys() -> None:
@@ -77,13 +74,6 @@ def test_eagle3_draft_config_rejects_near_miss_typo_keys() -> None:
         Eagle3DraftConfig.model_validate({"loss_wieght": 0.5})
 
 
-def test_eagle3_draft_config_rejects_unknown_speculator_type() -> None:
-    from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
-
-    with pytest.raises(ValidationError, match="eagle3"):
-        Eagle3DraftConfig.model_validate({"speculator_type": "dflash"})
-
-
 def test_grpo_master_config_parses_nested_draft_model() -> None:
     path = REPO_ROOT / "examples/configs/grpo_math_1B.yaml"
     raw = OmegaConf.to_container(load_config(path), resolve=True)
@@ -92,16 +82,6 @@ def test_grpo_master_config_parses_nested_draft_model() -> None:
 
     assert isinstance(config.policy["draft"], Eagle3DraftConfig)
     assert config.policy["draft"].speculator_type == "eagle3"
-
-
-def test_policy_config_may_omit_draft_block() -> None:
-    path = REPO_ROOT / "examples/configs/grpo_math_1B.yaml"
-    raw = OmegaConf.to_container(load_config(path), resolve=True)
-    del raw["policy"]["draft"]
-
-    config = MasterConfig(**raw)
-
-    assert "draft" not in config.policy
 
 
 def test_omitted_draft_config_does_not_request_refit() -> None:

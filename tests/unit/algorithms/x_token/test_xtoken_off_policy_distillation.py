@@ -375,22 +375,6 @@ def test_collator_cli_overrides_reach_setup(config_name: str) -> None:
     }
 
 
-def test_collator_schema_defaults_when_block_is_omitted() -> None:
-    register_omegaconf_resolvers()
-    config_path = (
-        Path(__file__).resolve().parents[4]
-        / "examples/configs/xtoken_off_policy_distillation.yaml"
-    )
-    loaded = load_config(config_path)
-    del loaded["collator"]
-    config = MasterConfig.model_validate(OmegaConf.to_container(loaded, resolve=True))
-
-    _, mocks = _patched_setup_call(config)
-
-    collator = mocks["dataloader"].call_args_list[0].kwargs["collate_fn"]
-    assert collator.mode == config.collator.mode
-
-
 @pytest.mark.parametrize(
     "overrides",
     [

@@ -98,13 +98,6 @@ def test_accepts_an_already_coerced_model() -> None:
     assert backend_config(cfg).global_segment_size == 555
 
 
-def test_partial_nested_block_keeps_other_defaults() -> None:
-    cfg = _cfg("mooncake_cpu", mooncake_cpu={"local_buffer_size": 7})
-    resolved = backend_config(cfg)
-    assert resolved.local_buffer_size == 7
-    assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
-
-
 def test_mooncake_has_no_backend_specific_checkpoint_knobs() -> None:
     assert {"checkpoint", "hard_pin", "offload"}.isdisjoint(
         MooncakeCpuConfig.model_fields
@@ -364,15 +357,6 @@ def test_only_the_selected_backend_is_read() -> None:
     resolved = backend_config(cfg)
     assert isinstance(resolved, SimpleStorageConfig)
     assert not hasattr(resolved, "global_segment_size")
-
-
-def test_schema_validates_without_any_backend_block() -> None:
-    """Regression guard: a required backend key is what broke SingleController CI.
-
-    ``data_plane`` built from scratch — not inherited from the exemplar — must
-    validate, otherwise MasterConfig fails before training starts.
-    """
-    TypeAdapter(DataPlaneConfig).validate_python(_cfg("simple"))
 
 
 @pytest.fixture

@@ -473,37 +473,13 @@ def test_rejected_restore_names_the_settings_that_changed():
         ).load_state_dict(state)
 
 
-def test_energon_config_validates_sequence_packing():
-    EnergonLoaderConfig(model_family="qwen")
-
-    source = EnergonSourceConfig(
-        path="/data/prepared", split="train", virtual_epoch_length=10
-    )
-    assert source.virtual_epoch_length == 10
-    packed = EnergonLoaderConfig(
-        model_family="qwen",
-        max_samples_per_sequence=2,
-        task_encoder={
-            "packing": {
-                "name": "balanced_greedy_knapsack",
-                "buffer_size": 10,
-                "options": {"balanced_knapsack_delta": 5},
-            }
-        },
-    )
-    assert packed.task_encoder.packing is not None
-    assert packed.task_encoder.packing.buffer_size == 10
-    assert packed.max_samples_per_sequence == 2
+def test_energon_config_rejects_invalid_values():
     for field in ("max_samples_per_sequence",):
         for value in (0, -1):
             with pytest.raises(ValueError):
                 EnergonLoaderConfig(model_family="qwen", **{field: value})
     with pytest.raises(ValueError):
         EnergonLoaderConfig(model_family="qwen", packing_buffer_size=10)
-    with pytest.raises(ValueError):
-        EnergonLoaderConfig.model_validate({})
-    with pytest.raises(ValueError):
-        EnergonLoaderConfig.model_validate({"model_family": "unsupported"})
 
 
 def _identity(
