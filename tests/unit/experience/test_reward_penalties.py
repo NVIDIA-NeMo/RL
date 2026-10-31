@@ -659,6 +659,21 @@ class TestPenalizeMultiEndThink:
         counts = apply_reward_penalties([result], cfg)
         assert result["full_result"]["reward"] == 1.0
 
+    def test_half_resolved_think_tag_ids_rejected_at_setup(self):
+        with pytest.raises(ValueError, match="must both be set"):
+            resolve_reward_penalty_config(
+                {"penalize_malformed_think_tag": True, "token_ids": {"think_open": 12}},
+                _FakeTokenizer(token_map={"<think>": [12], "</think>": [13, 14]}),
+            )
+
+    def test_single_thinking_tag_rejected_at_setup(self):
+        with pytest.raises(ValueError, match="open and close thinking tags"):
+            resolve_reward_penalty_config(
+                {"penalize_malformed_think_tag": True},
+                _FakeTokenizer(),
+                thinking_tags=["<think>"],
+            )
+
     def test_custom_thinking_tags_used_for_inference_and_string_check(self):
         cfg = resolve_reward_penalty_config(
             {"penalize_malformed_think_tag": True},

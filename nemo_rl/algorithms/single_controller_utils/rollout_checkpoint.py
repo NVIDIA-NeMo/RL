@@ -29,7 +29,7 @@ from typing import Any, Mapping, Optional
 from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.experience.reward_penalties import CaptureRewardSettings
-from nemo_rl.experience.rollouts import get_effort_config
+from nemo_rl.experience.rollouts import get_effort_config, get_nemo_gym_thinking_tags
 
 ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 3
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
@@ -348,6 +348,7 @@ def _normalize_capture_reward_config(dumped: dict[str, Any]) -> None:
     settings = CaptureRewardSettings.from_configs(
         RewardPenaltyConfig.model_validate(dumped["reward_penalties"]),
         get_effort_config(dumped["env"]),
+        get_nemo_gym_thinking_tags(dumped["env"]),
     ).to_state()
     dumped["reward_penalties"] = settings["penalties"]
     gym = dumped["env"].get("nemo_gym")

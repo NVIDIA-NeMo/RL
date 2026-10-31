@@ -226,6 +226,8 @@ policy:
     manual_gc: false
     manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     cuda_graph_impl: "none"
     cuda_graph_modules: []
     cuda_graph_warmup_steps: 3

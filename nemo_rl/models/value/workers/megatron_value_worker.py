@@ -59,6 +59,7 @@ from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.common import (
     broadcast_tensor,
+    clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
 )
@@ -1045,6 +1046,11 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             and not self.optimizer_cpu_offload
         ):
             self.move_optimizer("cpu")
+
+        # Same transient caches the policy clears before refit; see
+        # clear_transient_megatron_caches.
+        if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit"):
+            clear_transient_megatron_caches(self.model)
 
         gc.collect()
         torch.cuda.empty_cache()

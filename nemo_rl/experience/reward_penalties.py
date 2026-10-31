@@ -115,6 +115,38 @@ def has_unwanted_tokens(
     )
 
 
+def has_malformed_think_tag(
+    carry: Sequence[int],
+    generation: Sequence[int],
+    *,
+    think_tag_ids: tuple[int, int] | None,
+    thinking_tags: Sequence[str],
+    decode: Callable[[Sequence[int]], str],
+) -> bool:
+    """One turn of ``apply_reward_penalties``' malformed-think-tag check.
+
+    ``carry`` is the turn's prompt delta and ``generation`` its sampled tokens.
+    With single-token tag IDs, the prompt sets the thinking mode: balanced tags
+    mean thinking off (no tags generated), one trailing open tag means thinking
+    on (exactly one close tag generated); any other prompt is a violation. Tags
+    spelled with ordinary tokens bypass the ID check, so the decoded generation
+    must also hold no open tag and at most one close tag.
+    """
+    if think_tag_ids is not None:
+        think_open, think_close = think_tag_ids
+        prompt_open, prompt_close = carry.count(think_open), carry.count(think_close)
+        if prompt_open == prompt_close:
+            expected = (0, 0)
+        elif prompt_open == prompt_close + 1:
+            expected = (0, 1)
+        else:
+            return True
+        if (generation.count(think_open), generation.count(think_close)) != expected:
+            return True
+    text = decode(generation)
+    return text.count(thinking_tags[0]) > 0 or text.count(thinking_tags[1]) > 1
+
+
 @dataclass(frozen=True)
 class RewardChecks:
     """Scored-text and original-prompt checks saved with a rollout attempt."""
@@ -168,6 +200,13 @@ CAPTURE_PENALTIES = (
         lambda config: config.penalize_unwanted_tokens,
         None,
     ),
+    CapturePenalty(
+        "malformed_think_tag",
+        "penalize_malformed_think_tag",
+        "malformed_think_tag_rate",
+        lambda config: config.penalize_malformed_think_tag,
+        None,
+    ),
 )
 
 
@@ -188,18 +227,33 @@ class CaptureRewardSettings:
     enabled_penalties: tuple[str, ...]
     unwanted_tokens: tuple[int, ...]
     effort: EffortRewardSettings | None
+    # Malformed-think-tag rules, None while that penalty is off. IDs are the
+    # configured ones (None = inferred from the tokenizer, which is fixed per run).
+    think_tag_ids: tuple[int | None, int | None] | None
+    thinking_tags: tuple[str, ...] | None
 
     @classmethod
     def from_configs(
-        cls, penalties: RewardPenaltyConfig, effort: EffortLevelsConfig | None
+        cls,
+        penalties: RewardPenaltyConfig,
+        effort: EffortLevelsConfig | None,
+        thinking_tags: Sequence[str] | None,
     ) -> CaptureRewardSettings:
-        if penalties.penalize_malformed_think_tag:
-            raise ValueError("capture does not support penalize_malformed_think_tag")
         unwanted: tuple[int, ...] = ()
         if penalties.penalize_unwanted_tokens:
             assert penalties.token_ids is not None
             assert penalties.token_ids.unwanted is not None
             unwanted = tuple(sorted(set(penalties.token_ids.unwanted)))
+        think_tag_ids = None
+        if penalties.penalize_malformed_think_tag:
+            if not thinking_tags:
+                raise ValueError(
+                    "penalize_malformed_think_tag requires resolved thinking_tags"
+                )
+            ids = penalties.token_ids
+            think_tag_ids = (
+                (ids.think_open, ids.think_close) if ids is not None else (None, None)
+            )
         return cls(
             tuple(spec.flag for spec in CAPTURE_PENALTIES if spec.enabled(penalties)),
             unwanted,
@@ -208,13 +262,28 @@ class CaptureRewardSettings:
             )
             if effort is not None and effort_shaping_enabled(effort)
             else None,
+            think_tag_ids,
+            tuple(thinking_tags)
+            if penalties.penalize_malformed_think_tag and thinking_tags
+            else None,
         )
 
     def to_state(self) -> dict[str, Any]:
-        """Serialize version 1 using the existing config field names."""
+        """Serialize version 1 using the existing config field names.
+
+        Think-tag rules appear only with the think-tag penalty, which version-1
+        sidecars could not record before (capture rejected it), so no migration.
+        """
         penalties: dict[str, Any] = {flag: True for flag in self.enabled_penalties}
+        token_ids: dict[str, Any] = {}
         if self.unwanted_tokens:
-            penalties["token_ids"] = {"unwanted": list(self.unwanted_tokens)}
+            token_ids["unwanted"] = list(self.unwanted_tokens)
+        if self.think_tag_ids is not None:
+            token_ids["think_open"], token_ids["think_close"] = self.think_tag_ids
+        if token_ids:
+            penalties["token_ids"] = token_ids
+        if self.thinking_tags is not None:
+            penalties["thinking_tags"] = list(self.thinking_tags)
         return {
             "version": 1,
             "penalties": penalties,
@@ -250,7 +319,10 @@ class CaptureRewardSettings:
             if value["effort"] is not None
             else None
         )
-        return cls.from_configs(penalties, effort)
+        # An extra field on RewardPenaltyConfig; absent unless the think-tag
+        # penalty was on, where from_configs rejects its absence.
+        thinking_tags = value["penalties"].get("thinking_tags")
+        return cls.from_configs(penalties, effort, thinking_tags)
 
     def require_compatible(self, current: CaptureRewardSettings) -> None:
         """Reject changed reward rules with actionable field names."""
@@ -259,17 +331,22 @@ class CaptureRewardSettings:
             if (spec.flag in self.enabled_penalties) != (
                 spec.flag in current.enabled_penalties
             ):
-                differences.append(f"penalties.{spec.flag}")
+                differences.append(f"reward_penalties.{spec.flag}")
         if self.unwanted_tokens != current.unwanted_tokens:
-            differences.append("penalties.token_ids.unwanted")
+            differences.append("reward_penalties.token_ids.unwanted")
+        if self.think_tag_ids != current.think_tag_ids:
+            differences.append("reward_penalties.token_ids.think_open/think_close")
+        if self.thinking_tags != current.thinking_tags:
+            differences.append("env.nemo_gym.thinking_tags")
         if self.effort != current.effort:
             if self.effort is None or current.effort is None:
-                differences.append("effort.enabled")
+                # No enabled flag: shaping is off when the block disables it.
+                differences.append("env.nemo_gym.effort_levels")
             else:
                 previous = asdict(self.effort)
                 for name, value in asdict(current.effort).items():
                     if value != previous[name]:
-                        differences.append(f"effort.{name}")
+                        differences.append(f"env.nemo_gym.effort_levels.{name}")
         if differences:
             raise ValueError(
                 "capture reward settings differ from the checkpoint: "
@@ -361,8 +438,17 @@ def finalize_capture_reward(
     effort_config: EffortLevelsConfig | None,
     token_ids: list[int],
     link_spans: list[tuple[str, int, int]],
+    decode: Callable[[Sequence[int]], str] | None = None,
+    thinking_tags: Sequence[str] | None = None,
 ) -> tuple[float, dict[str, int], dict[str, float]]:
-    """Shape, then penalize. Token IDs and spans must already be verified by Gym."""
+    """Shape, then penalize. Token IDs and spans must already be verified by Gym.
+
+    Token-scoped penalties walk the verified (carry, generation) spans, the
+    capture-path equivalent of the echo path's (user, assistant) message pairs.
+    The malformed-think-tag check needs ``decode`` and the resolved
+    ``thinking_tags``; the echo path's message-level ``has_malformed_thinking``
+    flag has no capture source and is not consulted.
+    """
     counts = {spec.name: 0 for spec in CAPTURE_PENALTIES}
     metrics: dict[str, float] = {}
     shaping = effort_shaping_enabled(effort_config)
@@ -390,20 +476,48 @@ def finalize_capture_reward(
                     counts[spec.name] = int(
                         spec.enabled(penalty_config) and spec.text_match(checks)
                     )
+        unwanted_ids: list[int] | None = None
         if penalty_config.penalize_unwanted_tokens:
             assert penalty_config.token_ids is not None
             unwanted_ids = penalty_config.token_ids.unwanted
             assert unwanted_ids is not None
-            offset = 0
-            for _, carry, generated in link_spans:
-                end = offset + carry + generated
-                if has_unwanted_tokens(
-                    (token_ids[offset + carry : end],),
-                    unwanted_ids,
-                ):
-                    counts["unwanted_token"] = 1
-                    break
-                offset = end
+        think_tags: Sequence[str] | None = None
+        think_tag_ids: tuple[int, int] | None = None
+        if penalty_config.penalize_malformed_think_tag:
+            if decode is None or thinking_tags is None or len(thinking_tags) < 2:
+                raise RuntimeError(
+                    "penalize_malformed_think_tag needs decode and open/close "
+                    "thinking_tags; the finalizer was built without them"
+                )
+            think_tags = thinking_tags
+            think_ids = penalty_config.token_ids
+            if (
+                think_ids is not None
+                and think_ids.think_open is not None
+                and think_ids.think_close is not None
+            ):
+                think_tag_ids = (think_ids.think_open, think_ids.think_close)
+        offset = 0
+        for _, carry, generated in link_spans:
+            start = offset + carry
+            end = start + generated
+            generation = token_ids[start:end]
+            if unwanted_ids is not None and has_unwanted_tokens(
+                (generation,), unwanted_ids
+            ):
+                counts["unwanted_token"] = 1
+            if think_tags is not None and not counts["malformed_think_tag"]:
+                assert decode is not None
+                counts["malformed_think_tag"] = int(
+                    has_malformed_think_tag(
+                        token_ids[offset:start],
+                        generation,
+                        think_tag_ids=think_tag_ids,
+                        thinking_tags=think_tags,
+                        decode=decode,
+                    )
+                )
+            offset = end
     return (0.0 if any(counts.values()) else reward), counts, metrics
 
 
@@ -424,6 +538,7 @@ def aggregate_capture_reward_metrics(
     if not count:
         return {}
     result: dict[str, Any] = {"finalize/reward_count": float(count)}
+    # finalize/penalty_count/*: summed over groups, then divided by valid rows.
     for category, metric in CAPTURE_PENALTY_METRICS.items():
         key = f"finalize/penalty_count/{category}"
         if key in metrics:
@@ -442,6 +557,18 @@ def aggregate_capture_reward_metrics(
         result.update(
             calculate_single_metric(values, len(values), f"{agent_name}/reward")
         )
+    # finalize/truncated_count: pooled the same way into the termination rates.
+    if "finalize/truncated_count" in metrics:
+        truncated = sum(metrics["finalize/truncated_count"])
+        result["truncation_rate"] = truncated / count
+        result["natural_termination_rate"] = (count - truncated) / count
+        for agent_name, values in agent_rewards.items():
+            key = f"finalize/truncated_count/{agent_name}"
+            if key in metrics:
+                result[f"{agent_name}/truncation_rate"] = sum(metrics[key]) / len(
+                    values
+                )
+    # finalize/effort/*: per-length row counts, expanded back to per-row lengths.
     for bucket in ("low", "high"):
         lengths = [
             int(name.rsplit("/", 1)[1])

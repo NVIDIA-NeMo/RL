@@ -605,8 +605,8 @@ class MegatronConfig(TypedDict):
     # When True, detach MTP heads from the main model so MTP loss does not affect main-model gradients.
     mtp_detach_heads: NotRequired[bool]
     # When True, clear the RotaryEmbedding LRU cache and MoE token dispatcher
-    # routing tensors in offload_before_refit (before weight transfer to the
-    # inference engine). Useful when training and logprob runs use different
+    # routing tensors after training (the policy before refit, the critic in
+    # finish_training). Useful when training and logprob runs use different
     # sequence lengths (rope cache) or for MoE models with activation recompute
     # (dispatcher reference cycles).
     clear_memory_caches_before_refit: NotRequired[bool]
