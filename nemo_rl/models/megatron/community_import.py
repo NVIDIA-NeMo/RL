@@ -13,18 +13,18 @@
 # limitations under the License.
 
 import os
+import pickle
 import shutil
 import threading
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 import torch
 from megatron.bridge import AutoBridge
 from megatron.core.transformer import ModuleSpec
 
-from nemo_rl.models.policy import MegatronConfig
+from nemo_rl.models.policy import MegatronConfig, provider_override_allowed
 
 
 def iter_vlm_config_overrides(
@@ -36,11 +36,16 @@ def iter_vlm_config_overrides(
     provider's own default rather than silently forcing False.
     """
     keys = (
+        "radio_force_eval_mode",
         "radio_force_cpe_eval_mode",
         "freeze_vision_model",
         "freeze_vision_projection",
         "freeze_sound_encoder",
         "freeze_sound_projection",
+        "recompute_vision",
+        "vision_recompute_granularity",
+        "vision_recompute_method",
+        "vision_recompute_num_layers",
     )
     for key in keys:
         if key in megatron_config:
@@ -67,8 +72,23 @@ def to_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
 
 def megatron_conversion_is_complete(pretrained_path: str) -> bool:
     """Whether a completed HF->Megatron conversion exists at `pretrained_path`."""
-    return os.path.exists(
-        os.path.join(pretrained_path, "iter_0000000", "run_config.yaml")
+    iteration_path = os.path.join(pretrained_path, "iter_0000000")
+    if not os.path.isfile(os.path.join(iteration_path, "run_config.yaml")):
+        return False
+    try:
+        with open(os.path.join(iteration_path, ".metadata"), "rb") as metadata_file:
+            metadata = pickle.load(metadata_file)
+    except (OSError, EOFError, pickle.UnpicklingError):
+        return False
+
+    storage_data = getattr(metadata, "storage_data", None)
+    if not storage_data:
+        return False
+    relative_paths = {item.relative_path for item in storage_data.values()}
+    return all(
+        os.path.isfile(path := os.path.join(iteration_path, relative_path))
+        and os.path.getsize(path) > 0
+        for relative_path in relative_paths
     )
 
 
@@ -135,43 +155,6 @@ def publish_megatron_conversion(
         ).start()
 
 
-@contextmanager
-def _prefer_nvrx_for_dist_ckpt_save():
-    """Prefer NVRx async strategy for torch_dist save in HF->Megatron import.
-
-    Megatron-LM's torch_dist sync save currently routes through the MCore async
-    finalize path, which can fail when write results contain non-picklable
-    objects (e.g., code objects) during gather_object.
-    """
-    try:
-        from megatron.core.dist_checkpointing.strategies.torch import (
-            TorchDistSaveShardedStrategy,
-        )
-    except ImportError:
-        # If dist-checkpoint strategy cannot be imported, leave behavior unchanged.
-        yield
-        return
-
-    original_save = TorchDistSaveShardedStrategy.save
-
-    def _save_with_nvrx_fallback(self, sharded_state_dict, checkpoint_dir):
-        try:
-            async_request = self.async_save(
-                sharded_state_dict, checkpoint_dir, async_strategy="nvrx"
-            )
-            async_request.execute_sync()
-            del async_request
-        except (ImportError, ModuleNotFoundError):
-            # Keep backward compatibility on environments without nvrx.
-            original_save(self, sharded_state_dict, checkpoint_dir)
-
-    TorchDistSaveShardedStrategy.save = _save_with_nvrx_fallback
-    try:
-        yield
-    finally:
-        TorchDistSaveShardedStrategy.save = original_save
-
-
 def import_model_from_hf_name(
     hf_model_name: str,
     output_path: str,
@@ -210,6 +193,8 @@ def import_model_from_hf_name(
 
     if megatron_config is not None:
         for key, value in iter_vlm_config_overrides(megatron_config):
+            if not provider_override_allowed(megatron_config, key):
+                continue
             # Match the import-time behaviour in megatron/setup.py: a key the
             # recipe set explicitly must not be dropped just because this
             # provider lacks the field, or a frozen tower silently trains.
@@ -319,8 +304,7 @@ def import_model_from_hf_name(
         output_parent, f".{os.path.basename(output_path)}.staging-{staging_token}"
     )
 
-    with _prefer_nvrx_for_dist_ckpt_save():
-        bridge.save_megatron_model(megatron_model, staging_path)
+    bridge.save_megatron_model(megatron_model, staging_path)
 
     # Every rank must finish writing before rank 0 publishes the staging dir,
     # and no rank may read output_path before the rename lands.

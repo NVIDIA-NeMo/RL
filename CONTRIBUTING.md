@@ -8,7 +8,7 @@ Thanks for your interest in contributing to NeMo RL!
 
 1. **Build and run the Docker container**:
 ```sh
-docker buildx build -t nemo-rl:latest -f Dockerfile .
+docker buildx build -t nemo-rl:latest -f docker/Dockerfile .
 ```
 
 To start a shell in the container to interactively run/develop:
@@ -150,6 +150,7 @@ If you have write access to the repository (NVIDIA contributors):
       - CI:L0 - Runs doctests and unit tests
       - CI:L1 - Runs doctests, unit tests, and functional tests
       - CI:Lfast - Runs fast unit tests and functional tests only. Skips the container build.
+      - Use `CI:docs` for docs-only changes. Otherwise use `CI:Lfast` by default, including for new features and bug fixes; use `CI:L1` only for a large refactor, broad changes to core code, or dependency changes. See [docs/ci-cd.md](docs/ci-cd.md) for the full guide.
    - Comment `/ok to test commit-sha`. Replace `commit-sha` with the most recent commit to test such as `/ok to test 7166bce`.
       - A bot will acknowledge the comment with a thumbs-up and begin the CI.
       - It is possible to simplify the comment to `/ok to test` without the commit-sha. However, this is only allowed if all commits are from a trusted Nvidia developer and [cryptographically signed](https://docs.github.com/en/authentication/managing-commit-signature-verification).
@@ -172,7 +173,7 @@ Quality documentation is essential for both the usability of NeMo RL and its abi
 
 ## Code Quality
 
-- Follow the coding guidelines in [`.claude/skills/`](.claude/skills/) — each skill covers a specific topic (style, config conventions, error handling, testing, copyright, docs)
+- Follow the coding guidelines in [`skills/`](skills/) — each skill covers a specific topic (style, config conventions, error handling, testing, copyright, docs)
 - Write tests for new features
 - Update documentation to reflect your changes
 - Ensure all tests pass before submitting a PR
@@ -232,3 +233,23 @@ Quality documentation is essential for both the usability of NeMo RL and its abi
       maintained indefinitely and may be redistributed consistent with
       this project or the open source license(s) involved.
   ```
+
+## Pull-request reviews
+
+Comment `/review` on a pull request for the formal review service. Use
+`/review mode=strict` for deeper analysis, or add `model=claude` to select a
+Claude reviewer instead of the default Codex reviewer. `/review help` lists
+all options. Reviews are explicitly requested, not automatically run on
+pull-request events.
+
+The retired `/claude review` and `/claude strict-review` commands only reply
+with migration instructions when posted as an exact command by an
+owner, member, or collaborator. Other commenters, bots, and quoted mentions
+do not trigger a notice. These commands never run or automatically request a review.
+
+Repository review guidance remains in AGENTS.md and
+[the existing team-review skill](skills/review-pr-team/SKILL.md).
+The local `/review-pr` and `/review-pr-team` workflows are unchanged.
+Before relying on repository-specific formal reviews, verify the service's
+profile registration and a Ready snapshot of the protected-main guidance.
+This migration does not register or activate that integration.

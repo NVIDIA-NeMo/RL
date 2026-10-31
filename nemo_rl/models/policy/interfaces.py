@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 import ray
 import torch
@@ -22,9 +22,12 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.utils.timer import Timer
 
+if TYPE_CHECKING:
+    from nemo_rl.models.policy import PolicyConfig
+
 
 class LogprobOutputSpec(TypedDict):
-    """logprobs: Tensor of log probabilities."""
+    """Token log probabilities; filtered unsupported tokens retain -inf."""
 
     logprobs: torch.Tensor
 
@@ -46,6 +49,21 @@ class TopkLogitsOutputSpec(TypedDict):
 
     topk_logits: torch.Tensor
     topk_indices: torch.Tensor
+
+
+class TeacherFullPayloadOutputSpec(TypedDict):
+    """Sampled-token logprobs plus the full-vocabulary MOPD teacher payload.
+
+    ``teacher_full_payload`` is ``[B, S, hidden_size]`` or ``[B, S, vocab_size]``
+    depending on ``on_policy_distillation.full.teacher_payload``. It is ``None``
+    off the last pipeline stage: the payload is far too large to broadcast, so
+    only the stage that produced it writes it back. It comes back on CPU --
+    each microbatch is moved off the device inside the forward schedule, which
+    is what bounds the resident payload to one microbatch.
+    """
+
+    logprobs: torch.Tensor
+    teacher_full_payload: Optional[torch.Tensor]
 
 
 class PolicyInterface(ABC):
@@ -164,6 +182,8 @@ class PolicyInterface(ABC):
 
 
 class ColocatablePolicyInterface(PolicyInterface):
+    cfg: "PolicyConfig"
+
     @abstractmethod
     def init_collective(
         self,
@@ -172,8 +192,14 @@ class ColocatablePolicyInterface(PolicyInterface):
         world_size: int,
         *,
         train_world_size: int,
+        rank_offset: int = 0,
         nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
+        pass
+
+    @abstractmethod
+    def sync_params_before_refit(self) -> None:
+        """Materialize the latest policy parameters before weight transfer."""
         pass
 
     @abstractmethod
@@ -190,6 +216,18 @@ class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass
+
+    def enable_refit_prequantize(
+        self, param_names: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Quantize the listed params on the trainer during refit streaming.
+
+        Returns:
+            Refit info updated with the quantized dtypes and scale entries.
+        """
+        raise NotImplementedError(
+            "enable_refit_prequantize is not implemented for this policy worker"
+        )
 
     @abstractmethod
     def stream_weights_via_ipc_zmq(
@@ -254,6 +292,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> list[ray.ObjectRef]:
         pass
 

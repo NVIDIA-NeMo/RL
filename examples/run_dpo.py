@@ -25,6 +25,7 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 def parse_args():
@@ -55,6 +56,7 @@ def main():
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
@@ -62,8 +64,8 @@ def main():
     print("Final config:")
     pprint.pprint(config)
 
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
     if config.checkpointing["enabled"]:
         print(
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
@@ -71,7 +73,7 @@ def main():
 
     # Initialise telemetry on the driver BEFORE init_ray() so the resolved
     # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited
-    # by every worker. No-op unless nemo-lens is installed and telemetry is on.
+    # by every worker. No-op unless telemetry is on.
     init_telemetry_driver(config, algorithm="dpo")
 
     try:

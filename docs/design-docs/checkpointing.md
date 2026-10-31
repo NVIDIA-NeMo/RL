@@ -2,6 +2,23 @@
 
 NeMo RL provides two checkpoint formats for Hugging Face models: Torch distributed and Hugging Face format. Torch distributed is used by default for efficiency, and Hugging Face format is provided for compatibility with Hugging Face's `AutoModel.from_pretrained` API. Note that Hugging Face format checkpoints save only the model weights, ignoring the optimizer states. It is recommended to use Torch distributed format to save intermediate checkpoints and to save a Hugging Face checkpoint only at the end of training. 
 
+## Automodel consolidated checkpoints
+
+Automodel-backed policies accept three canonical values for
+`policy.automodel_cfg.checkpoint.save_consolidated`: quoted `"false"`, `"final"`, and
+`"every"`.
+`"final"` exports Hugging Face weights only after a completed training run;
+timeout checkpoints remain resumable distributed checkpoints and are not treated as
+final saves.
+
+> [!IMPORTANT]
+> NeMo RL no longer accepts YAML booleans for `save_consolidated`. Migrate
+> `checkpointing.save_consolidated: false` to
+> `policy.automodel_cfg.checkpoint.save_consolidated: "false"`, and migrate
+> `checkpointing.save_consolidated: true` to
+> `policy.automodel_cfg.checkpoint.save_consolidated: "every"`.
+> PPO value models use the corresponding `value.automodel_cfg.checkpoint` fields.
+
 ## Converting Torch Distributed Checkpoints to Hugging Face Format
 
 A checkpoint converter is provided to convert a Torch distributed checkpoint to Hugging Face format after training:
@@ -48,7 +65,7 @@ This script requires Megatron-Core, so make sure to launch with the `mcore` extr
 
 ### Option A — Merged checkpoint
 
-Loads the base model, applies the LoRA adapter weights on top, and saves the merged result in HuggingFace format. The output can be used directly with `AutoModelForCausalLM.from_pretrained` or passed to the [evaluation pipeline](../guides/eval.md).
+Loads the base model, applies the LoRA adapter weights on top, and saves the merged result in HuggingFace format. The output can be used directly with `AutoModelForCausalLM.from_pretrained` or served with vLLM using the [evaluation workflow](../about/evaluation.md).
 
 **Example:**
 
@@ -86,3 +103,39 @@ uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
 | `--hf-model-name` | HuggingFace model identifier used to resolve the model architecture and tokenizer (e.g. `Qwen/Qwen2.5-7B`). |
 | `--hf-ckpt-path` | Output directory for the exported HuggingFace checkpoint or adapter. Must not already exist. |
 | `--adapter-only` | Export only the LoRA adapter in HuggingFace PEFT format without merging into the base model. |
+
+## Object-storage checkpoints (MSC / S3)
+
+`checkpointing.checkpoint_dir` (and `policy.pretrained_checkpoint.path`) may be an
+`msc://<profile>/<prefix>` URL instead of a filesystem path. Checkpoints are then
+written to and resumed from object storage through
+[Multi-Storage Client](https://github.com/NVIDIA/multi-storage-client) (MSC), for
+example S3. Ordinary paths are unaffected.
+
+```yaml
+checkpointing:
+  checkpoint_dir: msc://my-s3/runs/grpo-llama-1b   # profile `my-s3` is defined in MSC_CONFIG
+  save_data_plane: false                           # required for msc:// (no data-plane snapshots yet)
+```
+
+- **Profile:** point `MSC_CONFIG` at an MSC JSON/YAML config on every Ray process,
+  e.g. `{"profiles": {"my-s3": {"storage_provider": {"type": "s3", "options":
+  {"base_path": "<bucket>/<prefix>", "region_name": "us-east-2"}}}}}`. Credentials come
+  from the usual AWS environment/role chain; keep them out of the config file.
+- **Publish marker:** a step is written directly under `step_N/` and only becomes
+  visible to resume and retention after an `_SUCCESS` object is written once every
+  shard (including async writes) has finished. An unfinished step is never resumed.
+- **No overwrite:** saving into an existing `step_N` raises `FileExistsError`; use a
+  fresh `checkpoint_dir` prefix for a new run.
+- **Resuming:** use the same `max_num_steps` (or compatible LR-scheduler settings) as
+  the run that wrote the checkpoint; Megatron validates the scheduler state on load.
+- **Support:** Megatron policy backend; dataloader state for all algorithms
+  (`save_dataloader_state`); async GRPO, including its replay buffer and rollout
+  state (`replay_buffer.pt`, `rollouts.pt`), as long as `save_data_plane=false`;
+  SingleController (async) with `checkpointing.metric_name=null` and
+  `save_data_plane=false`. SingleController cannot snapshot its data plane to
+  `msc://`, so a resume restores weights and the dataloader cursor and regenerates
+  the buffered rollouts (a warning says so at setup).
+- **Trust:** resume deserializes `torch` pickles (`train_dataloader*.pt`) from the
+  bucket; only point `msc://` at storage you control.
+

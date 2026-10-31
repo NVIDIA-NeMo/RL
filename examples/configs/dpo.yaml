@@ -56,14 +56,23 @@ policy:
   precision: "bfloat16"
 
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
+  automodel_cfg:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
@@ -88,6 +97,7 @@ policy:
       dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
       lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
       use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   dynamic_batching:
     enabled: false
@@ -97,7 +107,7 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -107,7 +117,7 @@ policy:
       weight_decay: 0.1
       betas: [0.9, 0.98]
       eps: 1e-5
-      # when using Dtensor, we need to set foreach
+      # when using Automodel, we need to set foreach
       # and fused to False
       foreach: False
       fused: False
@@ -134,6 +144,10 @@ policy:
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
     cuda_graph_impl: "none"
@@ -178,14 +192,19 @@ policy:
     moe_permute_fusion: true
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
+    flash_attention_version: 2
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    fp32_lm_head: false # Emit fp32 logits from Megatron's LM head.
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
 
@@ -201,6 +220,7 @@ policy:
       lora_B_init_method: "zero"
       a2a_experimental: false
       lora_dtype: null
+      restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
 
     optimizer:
       optimizer: "adam"
@@ -317,6 +337,7 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb:
     project: "dpo-dev"
     name: "dpo"

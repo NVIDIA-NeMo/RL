@@ -53,6 +53,7 @@ from nemo_rl.models.megatron.train import (  # noqa: E402
     LogprobsPostProcessor,
     megatron_forward_backward,
 )
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 
 pytestmark = pytest.mark.mcore
 
@@ -123,6 +124,8 @@ def _build_distributed_model(
     sequence_parallel: bool = False,
     language_layer_pattern: str = "M",
     attention_backend: AttnBackend | None = None,
+    mtp_num_layers: int | None = None,
+    mtp_hybrid_override_pattern: str | None = None,
 ):
     if parallel_state.model_parallel_is_initialized():
         parallel_state.destroy_model_parallel()
@@ -146,6 +149,9 @@ def _build_distributed_model(
     }
     if attention_backend is not None:
         provider_kwargs["attention_backend"] = attention_backend
+    if mtp_num_layers is not None:
+        provider_kwargs["mtp_num_layers"] = mtp_num_layers
+        provider_kwargs["mtp_hybrid_override_pattern"] = mtp_hybrid_override_pattern
     provider = _TinyOmniProvider(
         **provider_kwargs,
     )
@@ -203,7 +209,7 @@ def _forward(model):
     logprobs = from_parallel_logits_to_logprobs_packed_sequences(
         output,
         target=processed.input_ids,
-        cu_seqlens_padded=processed.cu_seqlens_padded,
+        cu_seqlens_padded=to_cpu_int_tuple(processed.cu_seqlens_padded),
         unpacked_seqlen=input_ids.shape[1],
         vocab_start_index=parallel_state.get_tensor_model_parallel_rank()
         * output.shape[-1],
@@ -241,7 +247,8 @@ def _deduplicated_expanded_fixture(device: torch.device):
             "pixel_values": PackedTensor(
                 [image.clone(), image.clone()],
                 dim_to_pack=0,
-                pad_to_max_shape=True,
+                preprocess_mode="patchify",
+                preprocess_kwargs={"patch_dim": 16},
             ),
             "imgs_sizes": PackedTensor(
                 [image_size.clone(), image_size.clone()],
@@ -252,7 +259,8 @@ def _deduplicated_expanded_fixture(device: torch.device):
     pixel_row = PackedTensor(
         image,
         dim_to_pack=0,
-        pad_to_max_shape=True,
+        preprocess_mode="patchify",
+        preprocess_kwargs={"patch_dim": 16},
     ).enable_deduplication()
     image_size_row = PackedTensor(
         image_size,
@@ -290,7 +298,7 @@ def _forward_dedup_fixture(model, data: BatchedDataDict):
     logprobs = from_parallel_logits_to_logprobs_packed_sequences(
         output,
         target=processed.input_ids,
-        cu_seqlens_padded=processed.cu_seqlens_padded,
+        cu_seqlens_padded=to_cpu_int_tuple(processed.cu_seqlens_padded),
         unpacked_seqlen=input_ids.shape[1],
         vocab_start_index=0,
         vocab_end_index=output.shape[-1],
@@ -669,3 +677,91 @@ def _run_pipeline_forward_contract(rank: int, world_size: int) -> None:
 
 def test_nemotron_omni_pp2_scheduled_forward_contract(distributed_test_runner):
     distributed_test_runner(_run_pipeline_forward_contract, world_size=2)
+
+
+def _run_mtp_multimodal_forward_contract(rank: int, world_size: int) -> None:
+    """Multimodal batch through the NeMo-RL forward with an MTP-enabled hybrid LM.
+
+    HybridModel asserts position_ids are present whenever its MTP block runs.
+    The worker builds them for caller-packed models, and model_forward must keep
+    them on multimodal batches for this model instead of dropping them.
+    """
+    assert world_size == 2
+    model = _build_distributed_model(
+        context_parallel_size=2,
+        mtp_num_layers=1,
+        mtp_hybrid_override_pattern="M",
+    )
+    model.eval()
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    input_ids, lengths, images, image_sizes = _expanded_fixture(device)
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": lengths,
+            "pixel_values": PackedTensor(
+                [images[0:1], images[1:2]],
+                dim_to_pack=0,
+            ),
+            "imgs_sizes": PackedTensor(
+                [image_sizes[0:1], image_sizes[1:2]],
+                dim_to_pack=0,
+            ),
+        }
+    )
+    data.micro_batch_indices = [[[0, 2]]]
+    data.micro_batch_lengths = [[int(lengths.sum().item())]]
+    cfg = {
+        "dynamic_batching": {"enabled": False},
+        "sequence_packing": {"enabled": True},
+        "make_sequence_length_divisible_by": 4,
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 2,
+            "sequence_parallel": False,
+            "mtp_num_layers": 1,
+        },
+    }
+    (
+        data_iterator,
+        num_microbatches,
+        micro_batch_size,
+        _,
+        padded_seq_length,
+    ) = get_microbatch_iterator(
+        data,
+        cfg,
+        mbs=2,
+        straggler_timer=None,
+        model_slices_context_parallel_inputs=True,
+        mtp_enabled=True,
+    )
+
+    with torch.no_grad():
+        results = megatron_forward_backward(
+            model=model,
+            data_iterator=data_iterator,
+            num_microbatches=num_microbatches,
+            seq_length=padded_seq_length,
+            mbs=micro_batch_size,
+            post_processing_fn=LogprobsPostProcessor(cfg),
+            forward_only=True,
+            model_slices_context_parallel_inputs=True,
+        )
+
+    assert len(results) == num_microbatches
+    for result in results:
+        assert torch.isfinite(result["logprobs"]).all()
+        assert result["logprobs"].shape == input_ids.shape
+
+    del model, results
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.distributed.barrier()
+    parallel_state.destroy_model_parallel()
+
+
+def test_nemotron_omni_cp2_mtp_multimodal_logprob_forward(distributed_test_runner):
+    distributed_test_runner(_run_mtp_multimodal_forward_contract, world_size=2)

@@ -57,8 +57,6 @@ checkpointing:
   ft_keep_latest_k: 1
   ft_save_period: 1
   checkpoint_must_save_by: "00:03:30:00"
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 # =============================================================================
@@ -169,9 +167,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
     cpu_offload: false
     sequence_parallel: false
@@ -402,7 +401,21 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: true
   nemo_gym:
-    nemo_gym_log_dir: "logs/nemo_gym"
+    swe_agents_train_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_train
+    swe_agents_val_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_val
+
     skip_venv_if_present: false
     # NeMo-RL-side effort shaping; stripped before forwarding to Gym.
     effort_levels:

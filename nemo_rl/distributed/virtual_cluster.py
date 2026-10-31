@@ -13,12 +13,14 @@
 # limitations under the License.
 import logging
 import os
+import random
 import socket
 import sys
 import time
-from typing import NamedTuple, NotRequired, Optional, Sequence, TypedDict
+from typing import NamedTuple, Optional, Sequence
 
 import ray
+from pydantic import BaseModel
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -27,13 +29,27 @@ from ray.util.placement_group import (
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from nemo_rl.telemetry.instrumentation import (
+    safe_set_span_attributes,
+    setup_span,
+)
 from nemo_rl.utils.venvs import add_hf_modules_cache_to_pythonpath
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# How init_ray obtained its cluster, recorded on the rl.setup.ray_init span.
+RAY_CLUSTER_SOURCE_ATTR = "rl.ray.cluster_source"
+RAY_CLUSTER_EXTERNAL = "attached_external"
+RAY_CLUSTER_REUSED_LOCAL = "reused_local"
+RAY_CLUSTER_STARTED_LOCAL = "started_local"
+# See nemo_rl.distributed.ray_worker_setup.
+_WORKER_PROCESS_SETUP_HOOK = (
+    "nemo_rl.distributed.ray_worker_setup.ray_worker_process_setup"
+)
 
-class ClusterConfig(TypedDict):
+
+class ClusterConfig(BaseModel, extra="allow"):
     gpus_per_node: int
     num_nodes: int
     # Port range for the distributed master address (TCPStore / NCCL rendezvous)
@@ -42,11 +58,10 @@ class ClusterConfig(TypedDict):
     # TOCTOU collisions with kernel-assigned source ports.  When absent,
     # RayVirtualCluster falls back to DEFAULT_MASTER_PORT_RANGE_LOW/HIGH
     # (1400-1999).  See ray.sub for the full port layout.
-    master_port_range_low: NotRequired[int]
-    master_port_range_high: NotRequired[int]
-    segment_size: NotRequired[
-        int | None
-    ]  # Nodes per NVLink domain segment for topology-aware alignment; None to disable
+    master_port_range_low: Optional[int] = None
+    master_port_range_high: Optional[int] = None
+    # Nodes per NVLink domain segment for topology-aware alignment; None to disable
+    segment_size: Optional[int] = None
 
 
 # Get the directory path of the current module and the root of the package
@@ -68,9 +83,6 @@ class PY_EXECUTABLES:
 
     # Use NeMo-RL direct dependencies and vllm.
     VLLM = f"uv run --locked --extra vllm --directory {git_root}"
-
-    # Use NeMo-RL direct dependencies and fsdp.
-    FSDP = f"uv run --locked --extra fsdp --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and nemo-automodel.
     AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
@@ -138,6 +150,9 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #
 # Python port-range bounds below are half-open: [low, high).
 #
+#   1150-1199    Data plane (TQ/mooncake)        (DEFAULT_DATA_PLANE_PORT_RANGE_*, driver-local
+#                                                 allocation: metadata server, master RPC,
+#                                                 master metrics)
 #   [1202, 1300) SingleController gen. router    (driver-local allocation)
 #   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
@@ -149,6 +164,9 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #                                                 sidecar per allocated node, driver included)
 #   6001-6999    NeMo-Skills sandbox uWSGI       (SANDBOX_BASE_PORT)
 #   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)
+#   [8300, 8556) PD-disagg frontends             (generation.disaggregation.frontend_base_port;
+#                                                 carved out of the vLLM band like SGLang below,
+#                                                 256 = the replicas * frontends cap)
 #   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
 #                                                 carved out of the vLLM band — only one rollout
 #                                                 backend runs at a time)
@@ -174,6 +192,13 @@ DEFAULT_VLLM_PORTS_PER_ENGINE = 100
 # safe because only one rollout backend runs at a time, and a vLLM run only
 # climbs past 8600 with >=16 engines on a single node.  Both bands also steer
 # clear of the Ray dashboard carve-out at 8265 (see ray.sub).
+# PD-disagg frontend ports: deterministic, base + replica_idx *
+# num_frontend_workers + frontend_idx, so a restarted frontend re-binds the URL
+# Gym holds. Carved out of the vLLM band (TRT-LLM is the only backend with
+# disaggregation) above the Ray dashboard at 8265; 256 ports is the
+# replicas * frontends cap that TRT-LLM's request ids impose.
+DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW = 8300
+DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH = 8556
 DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW = 8600
 DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH = 8799
 DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW = 8800
@@ -181,6 +206,16 @@ DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH = 8999
 # Master address / TCPStore range, tucked below the Ray worker-gRPC band (2000+).
 DEFAULT_MASTER_PORT_RANGE_LOW = 1400
 DEFAULT_MASTER_PORT_RANGE_HIGH = 1999
+# One band for every port the data plane binds on the driver: mooncake's
+# metadata server, the master's RPC endpoint, and the master's metrics server.
+# The defaults those three land on -- 50050 and 50051 from TransferQueue's
+# config.yaml, 9003 from mooncake_master's own gflag -- all sit inside the
+# 9000-65000 ephemeral range these nodes use, so the kernel can hand one out as
+# a source port for outgoing traffic before the master binds it. This band is
+# the gap left below the Ray GCS ports (1200+) — see ray.sub's port map. Fifty
+# ports is ample: one master serves the whole job.
+DEFAULT_DATA_PLANE_PORT_RANGE_LOW = 1150
+DEFAULT_DATA_PLANE_PORT_RANGE_HIGH = 1200
 
 # ---------------------------------------------------------------------------
 # Topology resource keys
@@ -238,14 +273,22 @@ def _bind_socket_in_range(
     port_range_high: int,
     max_retries: int | None = 50,
     excluded_ports: set[int] | None = None,
+    rng: Optional[random.Random] = None,
 ) -> int:
     """Try to bind *sock* to a random port in [port_range_low, port_range_high).
 
     When *max_retries* is ``None``, try every non-excluded port once. Otherwise,
     preserve the existing bounded random-retry behavior.
-    """
-    import random
 
+    Args:
+        rng: Source of candidate ports. Defaults to the ``random`` module. That
+            module's state is process-wide and seeded per run, so every rank of a
+            job draws the same sequence; ranks sharing a node then contend for one
+            port, and whichever binds after the others have closed silently reuses
+            it. Pass a rank-seeded ``random.Random`` to decorrelate them.
+
+    Raises ``RuntimeError`` after *max_retries* failed attempts.
+    """
     excluded = excluded_ports or set()
     if max_retries is None:
         candidates = [
@@ -253,7 +296,10 @@ def _bind_socket_in_range(
             for port in range(port_range_low, port_range_high)
             if port not in excluded
         ]
-        random.shuffle(candidates)
+        if rng is None:
+            random.shuffle(candidates)
+        else:
+            rng.shuffle(candidates)
         for port in candidates:
             try:
                 sock.bind(("", port))
@@ -263,7 +309,10 @@ def _bind_socket_in_range(
         retry_description = f"all {len(candidates)} available ports"
     else:
         for _ in range(max_retries):
-            port = random.randint(port_range_low, port_range_high - 1)
+            if rng is None:
+                port = random.randint(port_range_low, port_range_high - 1)
+            else:
+                port = rng.randint(port_range_low, port_range_high - 1)
             if port in excluded:
                 continue
             try:
@@ -285,7 +334,15 @@ def _get_free_port_local(
     *,
     max_retries: int | None = 50,
     excluded_ports: set[int] | None = None,
+    rng: Optional[random.Random] = None,
 ) -> int:
+    """Find a free port, holding it only long enough to learn its number.
+
+    Args:
+        rng: Source of candidate ports; see :func:`_bind_socket_in_range`. Callers
+            that run on several ranks of one node should pass a rank-seeded
+            generator, or they will all be handed the same port.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         port = _bind_socket_in_range(
             s,
@@ -293,6 +350,7 @@ def _get_free_port_local(
             port_range_high,
             max_retries=max_retries,
             excluded_ports=excluded_ports,
+            rng=rng,
         )
         s.listen(1)
 
@@ -333,7 +391,56 @@ def _get_free_consecutive_ports_local(
     )
 
 
+def _reserve_data_plane_ports(count: int) -> list[int]:
+    """Reserve *count* distinct ports for the data plane's driver-side servers.
+
+    The defaults those servers land on -- 50050 and 50051 from TransferQueue's
+    ``config.yaml``, 9003 from mooncake_master's ``metrics_port`` gflag -- sit
+    inside the 9000-65000 ephemeral range these nodes use. The kernel can
+    therefore hand any of them to an outgoing connection during the minutes
+    between job start and the master's bind, after which the master dies with
+    EADDRINUSE. That is why ray.sub's port map keeps every service below 9000,
+    and this allocates from the band that map leaves free.
+
+    Every one of these ports is passed to the servers explicitly and reaches
+    clients through the TQ controller actor rather than being assumed, so
+    relocating them costs nothing.
+
+    ``excluded_ports`` keeps the returned ports distinct, and
+    ``_get_free_port_local`` binds without ``SO_REUSEADDR``, matching
+    mooncake_master: a port obtainable only by reusing a lingering slot is not
+    one the master could bind either.
+
+    Returns:
+        *count* ports from the data-plane band, in allocation order.
+    """
+    reserved: list[int] = []
+    for _ in range(count):
+        reserved.append(
+            _get_free_port_local(
+                DEFAULT_DATA_PLANE_PORT_RANGE_LOW,
+                DEFAULT_DATA_PLANE_PORT_RANGE_HIGH,
+                max_retries=None,
+                excluded_ports=set(reserved),
+            )
+        )
+    return reserved
+
+
 def init_ray(log_dir: Optional[str] = None) -> None:
+    """Initialise Ray, under a ``rl.setup.ray_init`` span.
+
+    Split from :func:`_init_ray` only so the span can record which of the three
+    outcomes below happened. Attaching to a cluster someone else is running and
+    booting a fresh one differ by tens of seconds, and that difference is the
+    usual reason two otherwise identical runs disagree on time-to-first-step.
+    """
+    with setup_span("ray_init") as span:
+        outcome = _init_ray(log_dir)
+        safe_set_span_attributes(span, {RAY_CLUSTER_SOURCE_ATTR: outcome})
+
+
+def _init_ray(log_dir: Optional[str] = None) -> str:
     """Initialise Ray.
 
     Try to attach to an existing local cluster.
@@ -350,21 +457,10 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 
     Args:
         log_dir: Optional directory to store Ray logs and temp files.
-    """
-    # Strip MPI/PMIx/SLURM launcher vars from the driver env before they get
-    # captured into runtime_env (both by `dict(os.environ)` below and by
-    # RayWorkerGroup, which re-reads os.environ). Otherwise they are forwarded
-    # into every actor, where they cause two failures in the TRT-LLM generation
-    # worker: (1) PMIX_/SLURM_STEP_ID make OMPI's MPI_Init abort with "OMPI was
-    # not built with SLURM's PMI support"; (2) any residual OMPI_/MPI_/SLURM_
-    # var makes TRT-LLM think it runs under an MPI launcher and pick the MPI
-    # orchestrator (MPI_Comm_Spawn -> MPI_ERR_SPAWN) instead of the Ray
-    # orchestrator. init_ray() runs before any worker group is built, so
-    # popping here cleans the env for all downstream captures.
-    for _k in list(os.environ):
-        if _k.startswith(("PMIX_", "PMI_", "MPI_", "OMPI_", "SLURM_")):
-            os.environ.pop(_k, None)
 
+    Returns:
+        How the cluster was obtained: one of the ``RAY_CLUSTER_*`` constants.
+    """
     # Ray actors deserialize constructor arguments before importing NeMo-RL.
     # Put Hugging Face's generated ``transformers_modules`` package on the
     # cluster-wide PYTHONPATH so trust_remote_code objects can be unpickled at
@@ -374,6 +470,11 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
+        # A module path, not the function: Ray rewrites a callable hook's
+        # runtime_env entry to its bare name, so a nested ray.init (vLLM's
+        # EngineCore at TP>1) sees a hook that no longer matches and refuses
+        # to connect.
+        "worker_process_setup_hook": _WORKER_PROCESS_SETUP_HOOK,
     }
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
@@ -402,7 +503,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
                 logger.info(
                     f"Connected to existing Ray cluster (driver CVD_TAG '{cvd_tag}' matched): {cluster_res}"
                 )
-                return
+                return RAY_CLUSTER_REUSED_LOCAL
 
             # If neither reuse condition is met, but we connected to *something*
             logger.info(
@@ -422,7 +523,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         # Always reuse if it's an externally managed cluster.
         else:
             logger.info(f"Connected to existing Ray cluster: {cluster_res}")
-            return
+            return RAY_CLUSTER_EXTERNAL
 
     except ConnectionError:
         logger.debug("No existing Ray cluster found, will start a new one.")
@@ -446,6 +547,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     logger.info(
         f"Started local cluster with tag '{cvd_tag}': {ray.cluster_resources()}"
     )
+    return RAY_CLUSTER_STARTED_LOCAL
 
 
 @ray.remote(num_gpus=1)
@@ -1186,6 +1288,62 @@ class RayVirtualCluster:
             f"to pin nodes to complete segments before creating this cluster."
         )
         return reordered_bundle_indices
+
+    def get_topology_sorted_pg_indices(self) -> list[int]:
+        """Placement group indices ordered by physical topology.
+
+        The unified-PG path sorts *bundles* (see ``_get_sorted_bundle_indices``),
+        but with per-node placement groups the caller consumes whole PGs, and Ray
+        decides which physical node backs each one. Two PGs that are adjacent in
+        creation order can therefore sit in different NVLink domains, which for a
+        consumer whose unit spans several nodes (a TRT-LLM disaggregated replica,
+        say) silently demotes its inter-node traffic from NVLink to InfiniBand.
+
+        Sorting by ``(nvlink_domain's smallest topo_rank, topo_rank)`` puts nodes
+        of one domain next to each other, so consecutive PGs belong to the same
+        domain wherever the allocation allows it. Ordering *within* a domain is
+        not a bandwidth concern (an NVL72 fabric is uniform) but keeps a given
+        config reproducible across runs.
+
+        Returns:
+            Indices into ``get_placement_groups()``. Falls back to the existing
+            order when the cluster is CPU-only, is a single unified PG, or has no
+            topology information -- ordering is an optimization, never a
+            requirement.
+        """
+        pgs = self.get_placement_groups()
+        identity = list(range(len(pgs)))
+        if not self.use_gpus or len(pgs) <= 1:
+            return identity
+
+        topology = get_ray_cluster_topology()
+        if not any(domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()):
+            return identity
+
+        node_of_pg: list[str] = []
+        for pg in pgs:
+            bundles_to_node = placement_group_table(pg)["bundles_to_node_id"]
+            if not bundles_to_node:
+                return identity
+            node_of_pg.append(next(iter(bundles_to_node.values())))
+        if any(node_id not in topology for node_id in node_of_pg):
+            return identity
+
+        # Rank domains by their smallest topo_rank so domain order is stable and
+        # follows the fabric, not dict iteration order.
+        domain_rank: dict[str, int] = {}
+        for domain, topo_rank in topology.values():
+            if domain not in domain_rank or topo_rank < domain_rank[domain]:
+                domain_rank[domain] = topo_rank
+
+        return sorted(
+            identity,
+            key=lambda i: (
+                domain_rank[topology[node_of_pg[i]][0]],
+                topology[node_of_pg[i]][1],
+                i,
+            ),
+        )
 
     def shutdown(self) -> bool:
         """Cleans up and releases all resources associated with this virtual cluster.

@@ -8,13 +8,44 @@ import logging
 import pytest
 
 from nemo_rl.telemetry.metrics import map_efficiency_seconds
+from nemo_rl.telemetry.vocabulary import (
+    TELEMETRY_TRAIN_STEP_KEY,
+    TELEMETRY_WALL_TIME_METRIC,
+)
 
 
-def test_tee_noop_when_not_exporting():
+def _import_teed_metric_owners() -> None:
+    """Import every module that declares teed rows.
+
+    A row exists only once its owner is imported, so a test that reads the
+    registry has to name the owners rather than inherit whatever an earlier
+    test happened to pull in.
+    """
+    for owner in (
+        "nemo_rl.algorithms.loss.loss_functions",
+        "nemo_rl.algorithms.metric_utils",
+        "nemo_rl.algorithms.ppo",
+        "nemo_rl.models.generation.vllm.metric_names",
+    ):
+        pytest.importorskip(owner)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "train",
+        "timing/rollout_checkpoint",
+        "timing/rollout_recovery",
+        "rollout/checkpoint_outcome",
+    ],
+)
+def test_tee_noop_when_not_exporting(prefix):
     # No telemetry handle set -> must be a silent no-op (no exception).
     from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
 
-    tee_rl_metrics_to_otel({"efficiency/idle/refit_bubble_s": 12.0}, "train")
+    tee_rl_metrics_to_otel(
+        {"efficiency/idle/refit_bubble_s": 12.0, "total_save_seconds": 3.0}, prefix
+    )
 
 
 _MEASUREMENTS = {
@@ -127,18 +158,322 @@ def _gauge_points(data, name):
 
 def _start_exporting_telemetry():
     """Install an exporting telemetry handle; returns its metric reader."""
+    return _start_exporting_telemetry_with_spans()[0]
+
+
+def _start_exporting_telemetry_with_spans(span_groups="default"):
+    """Install an exporting telemetry handle with in-memory span capture.
+
+    Returns ``(metric reader, span exporter, handle)``. Spans always go to
+    memory, so a test that does not look at them still exports nowhere.
+    """
     from nemo.lens import NemoLensConfig, setup_telemetry
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
 
     import nemo_rl.telemetry.setup as setup_mod
-    from nemo_rl.telemetry.span_groups import RLSpanGroup
+
+    # Every rl.* series is declared through lens's consumer-driven metric
+    # registry, so nothing is emitted at all on a lens that predates it.
+    # Skipping keeps these assertions meaningful instead of failing for a
+    # reason that has nothing to do with what they cover.
+    instruments = pytest.importorskip("nemo.lens.instruments")
+    if not hasattr(instruments, "register_metric_group"):
+        pytest.skip("installed nemo-lens has no metric registry (lens PR #46)")
 
     reader = InMemoryMetricReader()
-    cfg = NemoLensConfig(enabled=True, _span_group_cls=RLSpanGroup)
-    setup_mod._TELEMETRY_HANDLE = setup_telemetry(
-        cfg, rank=0, world_size=1, metric_reader=reader
+    exporter = InMemorySpanExporter()
+    cfg = NemoLensConfig(enabled=True, span_groups=span_groups)
+    handle = setup_telemetry(cfg, metric_reader=reader, span_exporter=exporter)
+    setup_mod._TELEMETRY_HANDLE = handle
+    return reader, exporter, handle
+
+
+def test_checkpoint_save_and_restore_emit_separate_phase_histograms():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(
+        {
+            "total_save_seconds": 30,
+            "tq_save_seconds": 12,
+            "snapshot_sequence": 99,
+            "replay_rows": 256,
+            "controller_sidecar_bytes": 4096,
+            # Added to every checkpoint dict by _log_telemetry_metrics; neither
+            # is a phase, and neither may become a label.
+            TELEMETRY_TRAIN_STEP_KEY: 7,
+            TELEMETRY_WALL_TIME_METRIC: 1.7e9,
+        },
+        "timing/rollout_checkpoint",
     )
-    return reader
+    tee_rl_metrics_to_otel(
+        {"total_load_seconds": 8, "tq_load_seconds": 5, "siblings_reused": 16},
+        "timing/rollout_recovery",
+    )
+    data = reader.get_metrics_data()
+    durations = _gauge_points(data, "rl.checkpoint.duration")
+    assert {
+        (
+            p.attributes["rl.checkpoint.operation"],
+            p.attributes["rl.checkpoint.phase"],
+        ): p.sum
+        for p in durations
+    } == {
+        ("save", "total"): 30,
+        ("save", "tq"): 12,
+        ("restore", "total"): 8,
+        ("restore", "tq"): 5,
+    }
+    assert all(p.count == 1 for p in durations)
+    assert all("rl.bucket" not in p.attributes for p in durations)
+    assert _gauge_points(data, "rl.checkpoint.rows")[0].value == 256
+    assert _gauge_points(data, "rl.checkpoint.siblings")[0].value == 16
+    assert _gauge_points(data, "rl.checkpoint.sidecar_bytes")[0].value == 4096
+
+
+_SAVE_END_SECONDS = 1_700_000_000.5
+
+
+def _tee_completed_save(**overrides):
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    metrics = {
+        "total_save_seconds": 30.0,
+        "barrier_wait_seconds": 4.0,
+        "snapshot_commit_seconds": 0.25,
+        "snapshot_sequence": 99.0,
+        "replay_rows": 256.0,
+        TELEMETRY_TRAIN_STEP_KEY: 7.0,
+        TELEMETRY_WALL_TIME_METRIC: _SAVE_END_SECONDS,
+    }
+    metrics.update(overrides)
+    tee_rl_metrics_to_otel(
+        {key: value for key, value in metrics.items() if value is not None},
+        "timing/rollout_checkpoint",
+    )
+
+
+def _finished_spans(exporter, handle):
+    # Spans are batched; shutting down flushes them to the exporter.
+    handle.shutdown()
+    return exporter.get_finished_spans()
+
+
+def test_checkpoint_save_emits_one_unbucketed_span_from_logged_timings():
+    from nemo_rl.telemetry.instrumentation import RL_BUCKET_ATTR
+    from nemo_rl.telemetry.metrics import RL_CHECKPOINT_SAVE_SPAN
+
+    _, exporter, handle = _start_exporting_telemetry_with_spans()
+    _tee_completed_save()
+    (span,) = _finished_spans(exporter, handle)
+
+    assert span.name == RL_CHECKPOINT_SAVE_SPAN
+    end_ns = int(_SAVE_END_SECONDS * 1e9)
+    assert span.end_time == end_ns
+    assert span.start_time == end_ns - 30 * 10**9
+    assert dict(span.attributes) == {
+        "rl.checkpoint.total_save_seconds": 30,
+        "rl.checkpoint.barrier_wait_seconds": 4,
+        "rl.checkpoint.snapshot_commit_seconds": 0.25,
+        "rl.checkpoint.replay_rows": 256,
+        # Identity is fine on a span -- it is what ties a slow save to its
+        # snapshot -- though it must never become a metric label.
+        "rl.checkpoint.snapshot_sequence": 99,
+        "rl.iteration": 7,
+    }
+    # CHECKPOINT is an overhead group, but the pump runs beside training.
+    assert RL_BUCKET_ATTR not in span.attributes
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"total_save_seconds": None}, id="no-total"),
+        pytest.param({TELEMETRY_WALL_TIME_METRIC: None}, id="no-wall-time"),
+        pytest.param({"total_save_seconds": float("nan")}, id="nan-total"),
+    ],
+)
+def test_checkpoint_save_span_needs_a_placeable_interval(overrides):
+    _, exporter, handle = _start_exporting_telemetry_with_spans()
+    _tee_completed_save(**overrides)
+    assert _finished_spans(exporter, handle) == ()
+
+
+def test_checkpoint_save_span_follows_the_checkpoint_group():
+    reader, exporter, handle = _start_exporting_telemetry_with_spans("setup")
+    _tee_completed_save()
+    # The metrics do not depend on the span group.
+    assert _gauge_points(reader.get_metrics_data(), "rl.checkpoint.duration")
+    assert _finished_spans(exporter, handle) == ()
+
+
+def test_checkpoint_save_span_survives_a_failed_metric_registration(monkeypatch):
+    import nemo_rl.telemetry.metrics as metrics_mod
+
+    reader, exporter, handle = _start_exporting_telemetry_with_spans()
+    monkeypatch.setattr(metrics_mod, "ensure_metric_group_registered", lambda: False)
+    _tee_completed_save()
+    assert _gauge_points(reader.get_metrics_data(), "rl.checkpoint.duration") == []
+    (span,) = _finished_spans(exporter, handle)
+    assert span.name == metrics_mod.RL_CHECKPOINT_SAVE_SPAN
+
+
+def test_checkpoint_save_span_parents_to_the_current_span():
+    # In the controller the snapshot pump task is created inside rl.sc.job, so
+    # the save span joins the run's trace rather than starting its own.
+    _, exporter, handle = _start_exporting_telemetry_with_spans()
+    with handle.tracer.start_as_current_span("rl.sc.job") as parent:
+        _tee_completed_save()
+    spans = {span.name: span for span in _finished_spans(exporter, handle)}
+    save = spans["rl.sc.rollout_checkpoint.save"]
+    assert save.context.trace_id == parent.get_span_context().trace_id
+    assert save.parent is not None
+    assert save.parent.span_id == parent.get_span_context().span_id
+
+
+def test_checkpoint_restore_emits_no_span():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    _, exporter, handle = _start_exporting_telemetry_with_spans()
+    tee_rl_metrics_to_otel(
+        {
+            "total_load_seconds": 8.0,
+            TELEMETRY_WALL_TIME_METRIC: _SAVE_END_SECONDS,
+        },
+        "timing/rollout_recovery",
+    )
+    assert _finished_spans(exporter, handle) == ()
+
+
+def _attempt_outcome(outcome, reason, **extra):
+    """An attempt dict shaped like ``_log_rollout_checkpoint_outcome``'s."""
+    from nemo_rl.algorithms.metric_utils import (
+        ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
+        ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
+        rollout_checkpoint_reason_key,
+    )
+
+    return {
+        "attempt": 1.0,
+        "configured_interval_seconds": 60.0,
+        **{
+            rollout_checkpoint_reason_key(r): float(r == reason)
+            for r in ROLLOUT_CHECKPOINT_ATTEMPT_REASONS
+        },
+        **{o: float(o == outcome) for o in ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES},
+        **extra,
+    }
+
+
+def test_skipped_snapshot_attempts_are_counted_with_their_reason():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    for _ in range(3):
+        tee_rl_metrics_to_otel(
+            _attempt_outcome(
+                "skipped",
+                "missing_trainer_anchor",
+                attempt_duration_seconds=0.02,
+                seconds_since_last_success=840.0,
+            ),
+            "rollout/checkpoint_outcome",
+        )
+    data = reader.get_metrics_data()
+    (attempts,) = _gauge_points(data, "rl.checkpoint.attempts")
+    assert dict(attempts.attributes) == {
+        "rl.checkpoint.outcome": "skipped",
+        "rl.checkpoint.reason": "missing_trainer_anchor",
+    }
+    assert attempts.value == 3
+    (duration,) = _gauge_points(data, "rl.checkpoint.attempt_duration")
+    assert dict(duration.attributes) == {"rl.checkpoint.outcome": "skipped"}
+    assert duration.count == 3
+    (staleness,) = _gauge_points(data, "rl.checkpoint.seconds_since_last_success")
+    assert staleness.value == 840.0
+
+
+def test_snapshot_staleness_is_zero_on_success_and_absent_before_one():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    # No success yet: the controller logs no staleness, so neither does Lens.
+    tee_rl_metrics_to_otel(
+        _attempt_outcome("skipped", "no_data_plane_mutations"),
+        "rollout/checkpoint_outcome",
+    )
+    assert (
+        _gauge_points(
+            reader.get_metrics_data(), "rl.checkpoint.seconds_since_last_success"
+        )
+        == []
+    )
+    tee_rl_metrics_to_otel(
+        _attempt_outcome("completed", "completed", seconds_since_previous_success=90),
+        "rollout/checkpoint_outcome",
+    )
+    (staleness,) = _gauge_points(
+        reader.get_metrics_data(), "rl.checkpoint.seconds_since_last_success"
+    )
+    assert staleness.value == 0.0
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        pytest.param(
+            {**_attempt_outcome("skipped", "timeout"), "failed": 1.0},
+            id="two-outcomes",
+        ),
+        pytest.param(
+            {**_attempt_outcome("failed", "timeout"), "reason_timeout": 0.0},
+            id="no-reason",
+        ),
+    ],
+)
+def test_malformed_snapshot_attempt_is_not_counted(metrics):
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(metrics, "rollout/checkpoint_outcome")
+    assert _gauge_points(reader.get_metrics_data(), "rl.checkpoint.attempts") == []
+
+
+def test_checkpoint_mapping_skips_invalid_values_and_unknown_keys():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(
+        {
+            "total_save_seconds": float("nan"),
+            "tq_save_seconds": float("inf"),
+            "barrier_wait_seconds": -1,
+            "sidecar_save_seconds": True,
+            "exclusive_hold_seconds": 0,
+            "replay_rows": "256",
+            "unknown_seconds": 123,
+            "snapshot_sequence": 100000,
+        },
+        "timing/rollout_checkpoint",
+    )
+    data = reader.get_metrics_data()
+    durations = _gauge_points(data, "rl.checkpoint.duration")
+    assert len(durations) == 1
+    assert durations[0].attributes["rl.checkpoint.phase"] == "exclusive_hold"
+    assert durations[0].sum == 0
+    assert _gauge_points(data, "rl.checkpoint.rows") == []
+
+
+def test_checkpoint_metrics_are_not_duplicated_under_train_or_other_prefixes():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    for prefix in ("train", "timing/checkpoint", "", None):
+        tee_rl_metrics_to_otel({"total_save_seconds": 10}, prefix)
+    assert _gauge_points(reader.get_metrics_data(), "rl.checkpoint.duration") == []
 
 
 def test_tee_emits_efficiency_seconds_tagged_by_measurement(monkeypatch):
@@ -212,25 +547,6 @@ def test_efficiency_window_separates_per_step_from_cumulative():
     assert (
         efficiency_window("wasted/failed_trajectory", THREAD_SECONDS_MEASUREMENT)
         == RUN_WINDOW
-    )
-
-
-def test_run_window_categories_match_the_efficiency_summary():
-    """The window split is restated here; the summary excludes the same set.
-
-    ``print_efficiency_summary`` keeps run-window categories out of its per-step
-    waste ratio using its own copy of this set. If the two drifted, a category
-    could be tagged ``step`` here while being excluded from the step ratio
-    there, or charged to every step while advertised as a run constant.
-    """
-    from nemo_rl.telemetry.metrics import _RUN_WINDOW_WALL_CLOCK_CATEGORIES
-    from tests.unit.telemetry.conftest import algorithms_utils_categories
-
-    canonical = algorithms_utils_categories("RUN_WINDOW_WALL_CLOCK_CATEGORIES")
-
-    assert (
-        set(_RUN_WINDOW_WALL_CLOCK_CATEGORIES)
-        == canonical["RUN_WINDOW_WALL_CLOCK_CATEGORIES"]
     )
 
 
@@ -434,6 +750,257 @@ def test_tee_never_raises_into_the_training_step(monkeypatch, caplog):
         tee_rl_metrics_to_otel({"reward": 1.0}, "train")
 
     assert [r.levelno for r in caplog.records] == [logging.WARNING]
+
+
+def test_map_teed_scalars_reads_training_and_vllm_keys():
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+
+    values = map_teed_scalars(
+        {
+            "reward": 0.75,
+            "kl_penalty": 0.01,
+            "loss": 1.5,
+            "critic/loss": 2.5,
+            "approx_entropy": 3.0,
+            "mean_gen_tokens_per_sample": 128.0,
+            "grad_norm": 0.9,
+            "lr": 1e-6,
+            "vllm/prompt_tokens": 400.0,
+            "vllm/generations_failed": 2.0,
+            "not_a_declared_key": 1.0,
+        }
+    )
+
+    assert values == {
+        "reward_mean": 0.75,
+        "kl_divergence": 0.01,
+        "policy_loss": 1.5,
+        "value_loss": 2.5,
+        "entropy": 3.0,
+        "response_length_mean": 128.0,
+        "grad_norm": 0.9,
+        "learning_rate": 1e-6,
+        "vllm_prompt_tokens": 400.0,
+        "vllm_generations_failed": 2.0,
+    }
+
+
+def test_map_teed_scalars_skips_bool_and_non_numeric():
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+
+    assert map_teed_scalars({"reward": True, "loss": "nan", "lr": None}) == {}
+
+
+def test_every_declared_scalar_has_a_unique_key_and_name():
+    """A duplicate key would make one declaration silently shadow another."""
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.vocabulary import teed_metrics
+
+    rows = teed_metrics()
+    keys = [teed.key for teed in rows]
+    names = [teed.name for teed in rows]
+
+    assert len(set(keys)) == len(keys)
+    assert len(set(names)) == len(names)
+    # The registry key is what a caller records under, so it has to be a valid
+    # Python identifier -- lens rejects anything else at construction.
+    assert all(key.isidentifier() for key in keys)
+
+
+def test_tee_emits_the_training_scalars(monkeypatch):
+    """The scalars were previously absent from OTel entirely.
+
+    Mapping NeMo-RL's logger keys onto lens's fixed instrument fields was never
+    settled; owning the names removes the need to.
+    """
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    monkeypatch.setattr(metrics_mod, "efficiency_measurements", lambda: _MEASUREMENTS)
+
+    tee_rl_metrics_to_otel({"reward": 0.75, "lr": 1e-6}, "train")
+
+    data = reader.get_metrics_data()
+    assert [p.value for p in _gauge_points(data, "rl.reward.mean")] == [0.75]
+    assert [p.value for p in _gauge_points(data, "rl.learning_rate")] == [1e-6]
+
+
+def test_tee_emits_the_vllm_engine_metrics(monkeypatch):
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    monkeypatch.setattr(metrics_mod, "efficiency_measurements", lambda: _MEASUREMENTS)
+
+    tee_rl_metrics_to_otel(
+        {"vllm/generation_length_mean": 150.0, "vllm/generations_failed": 2.0},
+        "train",
+    )
+
+    data = reader.get_metrics_data()
+    assert [p.value for p in _gauge_points(data, "rl.vllm.generation_length.mean")] == [
+        150.0
+    ]
+
+
+def test_a_missing_metric_registry_disables_the_tee_without_raising(
+    monkeypatch, caplog
+):
+    """A lens without the registry must cost the run its metrics, not its step."""
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    monkeypatch.setattr(metrics_mod, "_REGISTERED", False)
+    monkeypatch.setattr(metrics_mod, "_REGISTRATION_FAILED", False)
+    monkeypatch.setattr(metrics_mod, "_WARNED", set())
+    monkeypatch.setattr(
+        metrics_mod,
+        "_metric_specs",
+        lambda: (_ for _ in ()).throw(ImportError("no registry")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=metrics_mod.__name__):
+        tee_rl_metrics_to_otel({"reward": 1.0}, "train")
+
+    assert not metrics_mod.ensure_metric_group_registered()
+
+
+def test_setup_phase_strips_the_duration_suffixes():
+    from nemo_rl.telemetry.metrics import setup_phase
+
+    assert setup_phase("generation_init_time_s") == "generation_init"
+    assert setup_phase("parallel_wall_time_s") == "parallel_wall"
+    # An extras key the declared fields know nothing about still maps.
+    assert setup_phase("vllm_nccl_sparse_init_time_s") == "vllm_nccl_sparse_init"
+
+
+def test_setup_phase_rejects_keys_that_are_not_durations():
+    """The suffix requirement is the filter, so a flag must not become a phase."""
+    from nemo_rl.telemetry.metrics import setup_phase
+
+    assert setup_phase("parallel_init_enabled") is None
+    assert setup_phase("_s") is None
+
+
+def test_map_setup_seconds_reads_every_phase_including_extras():
+    from nemo_rl.telemetry.metrics import map_setup_seconds
+
+    assert map_setup_seconds(
+        {
+            "generation_init_time_s": 300.0,
+            "total_setup_time_s": 420,
+            "vllm_nccl_sparse_init_time_s": 5.0,
+            "parallel_init_enabled": 1.0,
+            "parallel_init_notes": "ignored",
+        }
+    ) == {
+        "generation_init": 300.0,
+        "total_setup": 420.0,
+        "vllm_nccl_sparse_init": 5.0,
+    }
+
+
+def test_tee_emits_the_setup_phases_under_their_own_prefix():
+    from nemo_rl.telemetry.metrics import (
+        RL_SETUP_DURATION_METRIC,
+        RL_SETUP_PHASE_ATTR,
+        tee_rl_metrics_to_otel,
+    )
+
+    reader = _start_exporting_telemetry()
+
+    tee_rl_metrics_to_otel(
+        {"generation_init_time_s": 300.0, "total_setup_time_s": 420.0},
+        "timing/setup",
+    )
+
+    points = _gauge_points(reader.get_metrics_data(), RL_SETUP_DURATION_METRIC)
+    assert {p.attributes[RL_SETUP_PHASE_ATTR]: p.value for p in points} == {
+        "generation_init": 300.0,
+        "total_setup": 420.0,
+    }
+
+
+def test_setup_phases_carry_no_bucket():
+    """They overlap each other, so anything summing them by bucket would lie."""
+    from nemo_rl.telemetry.metrics import (
+        RL_BUCKET_ATTR,
+        RL_SETUP_DURATION_METRIC,
+        tee_rl_metrics_to_otel,
+    )
+
+    reader = _start_exporting_telemetry()
+
+    tee_rl_metrics_to_otel({"total_setup_time_s": 420.0}, "timing/setup")
+
+    points = _gauge_points(reader.get_metrics_data(), RL_SETUP_DURATION_METRIC)
+    assert points
+    assert all(RL_BUCKET_ATTR not in p.attributes for p in points)
+
+
+def test_a_train_dict_does_not_reach_the_setup_tee():
+    """The two prefixes share no key, so neither may be scanned for the other."""
+    from nemo_rl.telemetry.metrics import (
+        RL_SETUP_DURATION_METRIC,
+        tee_rl_metrics_to_otel,
+    )
+
+    reader = _start_exporting_telemetry()
+
+    # Ends in _s and would parse as a phase, but arrives under "train".
+    tee_rl_metrics_to_otel({"total_step_time_s": 12.0}, "train")
+
+    assert not _gauge_points(reader.get_metrics_data(), RL_SETUP_DURATION_METRIC)
+
+
+def test_a_broken_setup_tee_does_not_raise(monkeypatch, caplog):
+    """setup() logs this dict unguarded, so a failure must not abort startup."""
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    _start_exporting_telemetry()
+    monkeypatch.setattr(metrics_mod, "_WARNED", set())
+    monkeypatch.setattr(
+        metrics_mod,
+        "map_setup_seconds",
+        lambda _: (_ for _ in ()).throw(RuntimeError("setup tee is wedged")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=metrics_mod.__name__):
+        tee_rl_metrics_to_otel({"total_setup_time_s": 1.0}, "timing/setup")
+
+    assert any("setup" in r.message for r in caplog.records)
+
+
+def test_a_broken_scalar_tee_does_not_silence_the_efficiency_tee(monkeypatch, caplog):
+    """Each family has its own handler, so one failure cannot cost the others."""
+    import nemo_rl.telemetry.metrics as metrics_mod
+    from nemo_rl.telemetry.metrics import (
+        RL_EFFICIENCY_SECONDS_METRIC,
+        tee_rl_metrics_to_otel,
+    )
+
+    reader = _start_exporting_telemetry()
+    monkeypatch.setattr(metrics_mod, "efficiency_measurements", lambda: _MEASUREMENTS)
+    monkeypatch.setattr(metrics_mod, "_WARNED", set())
+    monkeypatch.setattr(
+        metrics_mod,
+        "map_teed_scalars",
+        lambda _: (_ for _ in ()).throw(RuntimeError("scalars are wedged")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=metrics_mod.__name__):
+        tee_rl_metrics_to_otel(
+            {"efficiency/idle/refit_bubble_s": 12.0, "reward": 1.0}, "train"
+        )
+
+    points = _gauge_points(reader.get_metrics_data(), RL_EFFICIENCY_SECONDS_METRIC)
+    assert [p.value for p in points] == [12.0]
+    assert any("scalars" in r.message for r in caplog.records)
 
 
 def test_a_broken_tee_warns_once_not_once_per_step(monkeypatch, caplog):

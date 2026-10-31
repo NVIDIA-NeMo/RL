@@ -107,11 +107,31 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_local_node_ip_returns_empty_on_exception` — DNS exception → returns empty string (no crash).
 - `test_mc_tcp_bind_address_overwrites_existing` — TQDataPlaneClient `__init__` uses direct assignment (not `setdefault`).
 
-## `test_message_log_decompose.py` (11 tests)
+## `test_mooncake_gdr.py` (4 tests)
+
+- `test_init_tq_forwards_nested_gdr_config_and_keeps_rdma` — Nested GDR settings reach TransferQueue without changing #2935's RDMA/all-rail transport.
+- `test_cpu_only_client_may_attach_with_gdr_config` — A CPU-only producer may attach because GDR eligibility is client-local.
+- `test_gdr_tensor_put_is_confirmed_once_and_never_falls_back` — A CUDA client's tensor PUT raises rather than downgrading to CPU RDMA, and logs the GDR confirmation exactly once.
+- `test_gdr_receiver_requires_cuda_initialized` — A policy receiver must initialize CUDA before attaching its GDR client.
+
+## `test_mooncake_metrics_port.py` (9 tests)
+
+- `test_master_argv_gains_the_reserved_metrics_port` — The proxy appends `--metrics_port=<reserved>` to `mooncake_master`'s argv.
+- `test_flag_is_appended_so_gflags_takes_it_last` — The flag lands last, which is the occurrence gflags keeps.
+- `test_binary_is_matched_by_basename` — An absolute path to the master still matches.
+- `test_other_launches_pass_through_untouched` — The offload client's launch is left alone and does not mark the master as launched.
+- `test_unknown_attributes_delegate_to_the_real_module` — Everything but `Popen` delegates to the real `subprocess`.
+- `test_patch_covers_the_registry_entry_that_is_actually_called` — Re-registration reaches the bootstrap TQ resolves, not just the module attribute.
+- `test_reinstalling_repoints_the_port_without_stacking` — A second install keeps one wrapper and repoints it.
+- `test_bootstrap_that_skips_the_wrapped_popen_is_a_drift_error` — A bootstrap that launches the master by another route fails loudly instead of silently keeping 9003.
+- `test_init_tq_reserves_every_master_port_from_the_band` — Metadata, master RPC and metrics ports all come from the data-plane band, and no `metrics_port` config key is sent.
+
+## `test_message_log_decompose.py` (14 tests)
 
 - `test_decompose_message_log_basic_shapes` — Basic shapes of decompose output.
 - `test_decompose_message_log_no_assistant_turn` — No-assistant case handled.
-- `test_decompose_message_log_picks_first_assistant` — Multiple assistant turns → first wins for `response_token_lengths`.
+- `test_decompose_message_log_sums_assistant_turns` — Multiple generated assistant turns → `response_token_lengths` is their total.
+- `test_decompose_message_log_excludes_prompt_history` — Prompt history stays in turn metadata but contributes no response tokens, including when generated turns are empty or absent.
 - `test_decompose_message_log_jagged_turn_count` — Different turn counts pad `turn_lengths` with zeros.
 - `test_decompose_message_log_missing_role_raises` — Missing `role` raises KeyError loudly.
 - `test_reconstruct_message_log_roundtrip` — decompose → flatten → reconstruct equivalent message_log.
@@ -120,6 +140,8 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_attach_message_log_view_populates_batch` — `attach_message_log_view` populates batch view.
 - `test_attach_message_log_view_noop_when_fields_absent` — Without decomposed fields, attach is a no-op.
 - `test_attach_message_log_view_idempotent` — Calling twice produces same shape.
+- `test_decompose_realistic_multi_turn_jagged_count` — Jagged turn counts (1, 4, 2) with alternating roles: `turn_lengths` padded with zeros, non-padding lengths and roles match the source.
+- `test_decompose_reconstruct_roundtrip_realistic_multi_turn` — decompose → flat `input_ids` → reconstruct on jagged turn counts (1, 3, 4) preserves roles, contents, and token ids per turn.
 
 ## `test_observability.py` (8 tests)
 

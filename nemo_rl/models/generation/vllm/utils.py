@@ -13,18 +13,48 @@
 # limitations under the License.
 
 from collections import defaultdict
+from collections.abc import Mapping
+from dataclasses import is_dataclass, replace
 from typing import Any, Optional
 
 import torch
 
+from nemo_rl.data.multimodal_utils import (
+    VLLM_CONTENT_KEY,
+    VLLM_MULTI_MODAL_DATA_KEY,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationDatumSpec,
 )
+from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.metric_names import (
+    FINISHED_REASON_LABEL,
+    GENERATION_LENGTH_HISTOGRAMS,
+    GENERATION_LENGTH_MEAN_KEY,
+    GENERATION_TOKEN_COUNTERS,
+    GENERATION_TOKENS_KEY,
+    GENERATIONS_FAILED_KEY,
+    GENERATIONS_OK_KEY,
+    OK_FINISH_REASONS,
+    PROMPT_LENGTH_HISTOGRAMS,
+    PROMPT_LENGTH_MEAN_KEY,
+    PROMPT_TOKEN_COUNTERS,
+    PROMPT_TOKENS_KEY,
+    REQUEST_SUCCESS_COUNTERS,
+)
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+
+def _format_refit_key_error(label: str, keys: set[str]) -> str:
+    """Format a bounded refit-key diagnostic."""
+    ordered = sorted(keys)
+    suffix = " ..." if len(ordered) > 8 else ""
+    return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
+
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 VLLM_LOGPROB_FLOOR = -9999.0
@@ -32,9 +62,6 @@ VLLM_LOGPROB_FLOOR = -9999.0
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
-GROUPED_MOE_MXFP8_REFIT_ERROR = (
-    "MXFP8 refit does not support grouped MoE expert weights."
-)
 _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
@@ -43,7 +70,8 @@ _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
 
 def assert_reload_refit_config_supported(config: VllmConfig) -> None:
     """Reject pure-config combinations unsupported by vLLM reload refit."""
-    if not config["vllm_cfg"].get("refit_with_reload_api"):
+    vllm_cfg = config.get("vllm_cfg")
+    if not vllm_cfg or not vllm_cfg.get("refit_with_reload_api"):
         return
 
     assert not config["colocated"]["enabled"], (
@@ -110,17 +138,159 @@ def is_grouped_moe_expert_weight_name(name: str) -> bool:
     return name.endswith(_GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES)
 
 
-def assert_refit_unsupported_grouped_moe_params(
-    config: VllmConfig, state_dict_info: dict[str, Any]
-) -> None:
-    """Reject grouped MoE MXFP8 state-dict params before refit starts."""
-    vllm_cfg = config["vllm_cfg"]
-    if (
-        vllm_cfg.get("precision") == "fp8"
-        and vllm_cfg.get("is_mx")
-        and any(is_grouped_moe_expert_weight_name(name) for name in state_dict_info)
+def _placeholder_range_bounds(placeholder_range: Any) -> tuple[int, int]:
+    if isinstance(placeholder_range, Mapping):
+        return int(placeholder_range["offset"]), int(placeholder_range["length"])
+    return int(placeholder_range.offset), int(placeholder_range.length)
+
+
+def remap_multimodal_placeholders(
+    *,
+    template_token_ids: list[int],
+    final_token_ids: list[int],
+    mm_placeholders: Mapping[str, list[Any]],
+    splice: Optional[PrefixSplice] = None,
+) -> dict[str, list[Any]]:
+    """Move vLLM multimodal ranges into the final prompt coordinates.
+
+    vLLM computes multimodal placeholder offsets while preprocessing the
+    chat-template token sequence. NeMo-RL subsequently replaces the
+    re-tokenized history with the exact model-generated token prefix
+    (``splice_prefix_tokens``). Every media span that survives the splice must
+    be relocated in the final sequence so its multimodal features stay aligned
+    with the placeholder tokens the engine actually sees.
+
+    When ``splice`` is given, ranges at or after ``splice.template_cut_start``
+    are shifted arithmetically (the template suffix is copied verbatim, so
+    their new offset is exact) and ranges entirely before the cut are located
+    by search inside the exact prefix ``final_token_ids[:model_cut_end]``. A
+    range straddling the cut cannot be represented and fails closed. Without a
+    splice, every range is located by search in global prompt order.
+
+    Ranges are matched in global prompt order because different media items can
+    accumulate different shifts. Coincident ranges resolve to the same offset:
+    Qwen2.5-Omni derives an audio range from its paired video range with an
+    identical ``(offset, length)``, so a span is only consumed once.
+
+    A span that cannot be located fails closed rather than submitting token IDs
+    with incorrect multimodal positions.
+
+    Args:
+        template_token_ids: The chat-template token sequence vLLM used to
+            compute ``mm_placeholders``.
+        final_token_ids: The exact-token prompt produced by
+            ``splice_prefix_tokens``, which will be submitted to the engine.
+        mm_placeholders: vLLM's per-modality placeholder ranges, in
+            ``template_token_ids`` coordinates.
+        splice: The splice that produced ``final_token_ids``; enables the
+            exact arithmetic remap for the template suffix.
+
+    Returns:
+        A new per-modality mapping with the same item ordering, whose ranges are
+        expressed in ``final_token_ids`` coordinates.
+
+    Raises:
+        ValueError: If an input range is out of bounds for
+            ``template_token_ids``, straddles the splice boundary, or cannot
+            be relocated in ``final_token_ids``.
+        TypeError: If a range is neither a mapping nor a dataclass instance.
+    """
+    if template_token_ids == final_token_ids or not mm_placeholders:
+        return {modality: list(ranges) for modality, ranges in mm_placeholders.items()}
+
+    entries: list[tuple[int, str, int, Any, int]] = []
+    remapped = {modality: list(ranges) for modality, ranges in mm_placeholders.items()}
+    for modality, ranges in mm_placeholders.items():
+        for item_index, placeholder_range in enumerate(ranges):
+            offset, length = _placeholder_range_bounds(placeholder_range)
+            if offset < 0 or length <= 0 or offset + length > len(template_token_ids):
+                raise ValueError(
+                    f"Invalid {modality} placeholder range {item_index}: "
+                    f"offset={offset}, length={length}, "
+                    f"template_length={len(template_token_ids)}"
+                )
+            entries.append((offset, modality, item_index, placeholder_range, length))
+
+    search_start = 0
+    previous_old = previous_end = previous_new = 0
+    resolved: dict[tuple[int, int], int] = {}
+    for old_offset, modality, item_index, placeholder_range, length in sorted(
+        entries, key=lambda entry: entry[0]
     ):
-        raise AssertionError(GROUPED_MOE_MXFP8_REFIT_ERROR)
+        # Two modalities can describe the same span, so a resolved offset is
+        # reused instead of scanning past it. Only a newly located span
+        # advances the cursor.
+        new_offset = resolved.get((old_offset, length))
+        if new_offset is None:
+            expected = template_token_ids[old_offset : old_offset + length]
+            search_end = len(final_token_ids)
+            if splice is not None:
+                if old_offset >= splice.template_cut_start:
+                    # The template suffix is copied verbatim after the exact
+                    # prefix, so this span moved by a known amount.
+                    new_offset = (
+                        splice.model_cut_end + old_offset - splice.template_cut_start
+                    )
+                    if final_token_ids[new_offset : new_offset + length] != expected:
+                        raise ValueError(
+                            f"{modality} placeholder range {item_index} at template "
+                            f"offset {old_offset} does not match the final prompt at "
+                            f"offset {new_offset} after the prefix splice"
+                        )
+                elif old_offset + length > splice.template_cut_start:
+                    raise ValueError(
+                        f"{modality} placeholder range {item_index} (offset "
+                        f"{old_offset}, length {length}) crosses the prefix splice "
+                        f"boundary at template offset {splice.template_cut_start}"
+                    )
+                else:
+                    # Prefix-region media lives inside the exact model prefix.
+                    search_end = splice.model_cut_end
+            if new_offset is None:
+                max_start = search_end - length
+                candidates = range(search_start, max_start + 1)
+                if old_offset < previous_end:
+                    # Gemma can share a delimiter token between adjacent ranges.
+                    # Preserve their overlap without reusing unrelated pad runs.
+                    start = previous_new + old_offset - previous_old
+                    candidates = (
+                        range(start, start + 1) if 0 <= start <= max_start else range(0)
+                    )
+                new_offset = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if final_token_ids[candidate] == expected[0]
+                        and final_token_ids[candidate : candidate + length] == expected
+                    ),
+                    None,
+                )
+            if new_offset is None:
+                raise ValueError(
+                    f"Could not locate {modality} placeholder range {item_index} "
+                    f"from template offset {old_offset} in the final exact-token prompt"
+                )
+            resolved[(old_offset, length)] = new_offset
+            search_start = new_offset + length
+            previous_old, previous_end = old_offset, old_offset + length
+            previous_new = new_offset
+
+        if isinstance(placeholder_range, Mapping):
+            updated_range = dict(placeholder_range)
+            updated_range["offset"] = new_offset
+        elif is_dataclass(placeholder_range) and not isinstance(
+            placeholder_range, type
+        ):
+            updated_range = replace(placeholder_range, offset=new_offset)
+        else:
+            raise TypeError(
+                "Multimodal placeholder ranges must be mappings or dataclass "
+                f"instances, got {type(placeholder_range).__name__}"
+            )
+
+        remapped[modality][item_index] = updated_range
+
+    return remapped
 
 
 def _as_routed_experts_tensor(
@@ -146,6 +316,17 @@ def _as_routed_experts_tensor(
             )
         G_ROUTED_EXPERTS_RANGE_CHECKED = True
     return tensor.to(dtype=dtype)
+
+
+def validate_rollout_prompt(expected: list[int], actual: list[int] | None) -> None:
+    """Reject rollouts generated from a different prompt than the learner's."""
+    if actual != expected:
+        actual_length = None if actual is None else len(actual)
+        raise ValueError(
+            "vLLM processed prompt differs from the learner prompt: "
+            f"expected_length={len(expected)}, actual_length={actual_length}. "
+            "Refusing to train on a different prompt."
+        )
 
 
 def format_prompt_for_vllm_generation(
@@ -182,37 +363,33 @@ def format_prompt_for_vllm_generation(
         token_ids = valid_ids.tolist()
         return {"prompt_token_ids": token_ids}
 
-    def _get_multi_modal_data(index: int) -> dict[str, Any]:
-        multi_modal_data = {}
-        images = data.get("vllm_images", None)
-        if images is not None and len(images[index]) > 0:
-            multi_modal_data["image"] = (
-                images[index][0] if len(images[index]) == 1 else images[index]
-            )
-        audios = data.get("vllm_audios", None)
-        if audios is not None and len(audios[index]) > 0:
-            multi_modal_data["audio"] = (
-                audios[index][0] if len(audios[index]) == 1 else audios[index]
-            )
-        videos = data.get("vllm_videos", None)
-        if videos is not None and len(videos[index]) > 0:
-            multi_modal_data["video"] = (
-                videos[index][0] if len(videos[index]) == 1 else videos[index]
-            )
-        return multi_modal_data
+    content_rows = data.get(VLLM_CONTENT_KEY)
+    multi_modal_rows = data.get(VLLM_MULTI_MODAL_DATA_KEY)
 
-    # Native image, audio, and video side channels share this formatter path.
-    if "vllm_content" in data:
+    def _get_multi_modal_data(index: int) -> dict[str, Any]:
+        row = multi_modal_rows[index] if multi_modal_rows is not None else None
+        if not row:
+            return {}
+        return {
+            modality: value
+            for modality, value in row.items()
+            if value is not None
+            and (not isinstance(value, (list, tuple)) or len(value) > 0)
+        }
+
+    # vLLM-ready content and modality data share this formatter path.
+    if content_rows is not None or multi_modal_rows is not None:
         # VLM generation using content and multi_modal_data
         for i in range(start_idx, end_idx):
-            msg = data["vllm_content"][i]
+            msg = content_rows[i] if content_rows is not None else None
             multi_modal_data = _get_multi_modal_data(i)
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
-            # Raw processor content is valid only for the initial turn. Later
-            # turns use the updated pre-tokenized conversation plus the same
-            # native media, preventing vLLM from regenerating the stale prompt.
+            # Later native turns clear the initial content to avoid replaying
+            # a stale prompt, sending updated token IDs with the same media.
+            # vLLM may re-expand image placeholders on that path; the worker's
+            # prompt validation rejects any resulting token-ID mismatch.
             prompt_dict = {"prompt": msg} if msg is not None else _get_regular_prompt(i)
             prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
@@ -307,21 +484,15 @@ def pad_and_align_routed_expert_indices(
             "Router replay allows at most one surplus final-token route."
         )
 
-    default_route = torch.arange(
-        routed.shape[2],
+    full = torch.full(
+        (padded_length, routed.shape[1], routed.shape[2]),
+        R3_MISSING_ROUTE_SENTINEL,
         dtype=routed_experts_dtype,
         device=device,
-    )
-    full = (
-        default_route.view(1, 1, -1)
-        .expand(padded_length, routed.shape[1], routed.shape[2])
-        .clone()
     )
     routes_to_copy = min(expected_routes, routed.shape[0])
     if routes_to_copy > 0:
         full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
-    if stats["missing_routes"] > 0:
-        full[routes_to_copy:expected_routes] = R3_MISSING_ROUTE_SENTINEL
     return (full, stats) if return_stats else full
 
 
@@ -524,13 +695,53 @@ def model_dump_chat_response_with_dynamic_message_fields(
     return response_dict
 
 
+# --- vLLM engine counters -------------------------------------------------
+#
+# Workers hand the driver a flat ``{str: float | list[float]}`` dict, which is
+# all the aggregation below needs (it only ever sums). vLLM's reader, though,
+# reports labelled series as several objects sharing one ``name``, and
+# histograms as a ``count``/``sum``/``buckets`` triple with no scalar at all.
+# Both are folded into that flat shape by encoding the extra dimension in the
+# key, so a plain sum across workers still gives the right fleet total.
+COUNTER_KEY_SEP = "|"
+HISTOGRAM_SUM_PART = "sum"
+HISTOGRAM_COUNT_PART = "count"
+
+# Metric names kept from a worker's snapshot. The snapshot carries every series
+# vLLM exposes (~40), and forwarding all of them would put unbounded,
+# version-dependent cardinality on the step metrics.
+#
+# Matched exactly, not by prefix: vLLM ships close siblings of these names
+# (``vllm:prompt_tokens_by_source``, ``vllm:prompt_tokens_cached``) that a
+# prefix test would pull in as extra per-step payload nothing here reads.
+_KEPT_COUNTER_NAMES: tuple[str, ...] = (
+    PROMPT_TOKEN_COUNTERS
+    + GENERATION_TOKEN_COUNTERS
+    + PROMPT_LENGTH_HISTOGRAMS
+    + GENERATION_LENGTH_HISTOGRAMS
+    + REQUEST_SUCCESS_COUNTERS
+)
+
+
+def encode_counter_key(name: str, part: str) -> str:
+    """Encode a histogram component or a label into a flat counter key."""
+    return f"{name}{COUNTER_KEY_SEP}{part}"
+
+
+def _is_kept(metric_name: str) -> bool:
+    """Whether a snapshot key belongs to a family the driver consumes."""
+    base = metric_name.split(COUNTER_KEY_SEP, 1)[0]
+    return "spec_decode" in base or base in _KEPT_COUNTER_NAMES
+
+
 def aggregate_spec_decode_counters(
     worker_metrics: list[dict[str, float | list[float]]],
 ) -> dict[str | tuple[str, int], float]:
-    """Aggregate speculative decoding counters from multiple workers.
+    """Aggregate vLLM engine counters from multiple workers.
 
-    Combines spec decode metrics collected from DP leader workers into
-    a single aggregated counter dictionary.
+    Combines the metrics collected from DP leader workers into a single
+    aggregated counter dictionary. Retains the spec-decode family and the engine
+    series listed above; everything else in the snapshot is dropped.
 
     Args:
         worker_metrics: List of metric dictionaries from each worker.
@@ -551,15 +762,110 @@ def aggregate_spec_decode_counters(
 
     for report in worker_metrics:
         for metric_name, value in report.items():
-            if "spec_decode" in metric_name:
-                if isinstance(value, list):
-                    # Per-position metrics (e.g., acceptance counts at each draft position)
-                    for position, pos_value in enumerate(value, 1):
-                        counters[metric_name, position] += pos_value
-                else:
-                    counters[metric_name] += value
+            if not _is_kept(metric_name):
+                continue
+            if isinstance(value, list):
+                # Per-position metrics (e.g., acceptance counts at each draft position)
+                for position, pos_value in enumerate(value, 1):
+                    counters[metric_name, position] += pos_value
+            else:
+                counters[metric_name] += value
 
     return dict(counters)
+
+
+def _first_delta(
+    delta: dict[str | tuple[str, int], float],
+    candidates: tuple[str, ...],
+    part: Optional[str] = None,
+) -> Optional[float]:
+    """Return the delta for the first candidate name present, else ``None``."""
+    for name in candidates:
+        key = encode_counter_key(name, part) if part is not None else name
+        if key in delta:
+            return delta[key]
+    return None
+
+
+def _mean_from_histogram(
+    delta: dict[str | tuple[str, int], float], candidates: tuple[str, ...]
+) -> Optional[float]:
+    """Mean of a histogram over the step, from its ``sum``/``count`` delta.
+
+    Exact rather than bucket-interpolated: vLLM tracks both, so the mean needs no
+    approximation. ``None`` when the engine served no request in the step, which
+    is a real state (a step spent entirely in training) and not a zero-length
+    sequence.
+    """
+    total = _first_delta(delta, candidates, HISTOGRAM_SUM_PART)
+    count = _first_delta(delta, candidates, HISTOGRAM_COUNT_PART)
+    if total is None or count is None or count <= 0:
+        return None
+    return total / count
+
+
+def compute_engine_step_metrics(
+    start_counters: dict[str | tuple[str, int], float],
+    end_counters: dict[str | tuple[str, int], float],
+) -> dict[str, float]:
+    """Compute per-step vLLM engine token, sequence-length and outcome metrics.
+
+    These are the engine's own accounting, which is why they are worth carrying
+    even though the driver already derives token counts from the tensors a
+    ``generate()`` call returns: sequence-length distributions and aborted
+    requests leave no trace in the returned tensors at all.
+
+    Args:
+        start_counters: Counter snapshot taken before generation.
+        end_counters: Counter snapshot taken after generation.
+
+    Returns:
+        Metrics for logging, keyed with a ``vllm/`` prefix. Absent series are
+        omitted rather than reported as zero, so a vLLM release that renames one
+        leaves a gap in the dashboard instead of a plausible-looking zero.
+    """
+    # Drop series that went backwards: an engine restart reset its counters.
+    delta = {
+        k: end - start_counters.get(k, 0.0)
+        for k, end in end_counters.items()
+        if end >= start_counters.get(k, 0.0)
+    }
+
+    metrics: dict[str, float] = {}
+
+    prompt_tokens = _first_delta(delta, PROMPT_TOKEN_COUNTERS)
+    if prompt_tokens is not None:
+        metrics[PROMPT_TOKENS_KEY] = prompt_tokens
+    generation_tokens = _first_delta(delta, GENERATION_TOKEN_COUNTERS)
+    if generation_tokens is not None:
+        metrics[GENERATION_TOKENS_KEY] = generation_tokens
+
+    prompt_length = _mean_from_histogram(delta, PROMPT_LENGTH_HISTOGRAMS)
+    if prompt_length is not None:
+        metrics[PROMPT_LENGTH_MEAN_KEY] = prompt_length
+    generation_length = _mean_from_histogram(delta, GENERATION_LENGTH_HISTOGRAMS)
+    if generation_length is not None:
+        metrics[GENERATION_LENGTH_MEAN_KEY] = generation_length
+
+    ok, failed, saw_any = 0.0, 0.0, False
+    for name in REQUEST_SUCCESS_COUNTERS:
+        prefix = encode_counter_key(name, f"{FINISHED_REASON_LABEL}=")
+        for key, value in delta.items():
+            if not isinstance(key, str) or not key.startswith(prefix):
+                continue
+            saw_any = True
+            reason = key[len(prefix) :]
+            if reason in OK_FINISH_REASONS:
+                ok += value
+            else:
+                failed += value
+        if saw_any:
+            break
+    if saw_any:
+        metrics[GENERATIONS_OK_KEY] = ok
+        metrics[GENERATIONS_FAILED_KEY] = failed
+
+    return metrics
 
 
 def compute_spec_decode_metrics(

@@ -18,11 +18,15 @@ from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data.captured_media import MediaColumnSpec
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 # Routed-expert index tensors ([seq, layers, topk]) are carried in the narrowest
 # signed dtype that fits ids 0..num_experts-1 plus the -1 missing-route sentinel:
@@ -191,6 +195,33 @@ class OptionalResourcesConfig(TypedDict):
     num_nodes: int | None
 
 
+class DisaggConfig(BaseModel, extra="allow"):
+    """Prefill/decode disaggregation, in the terms every backend shares."""
+
+    enabled: bool = False
+
+    # Engines per replica; independent, so the P:D ratio is free.
+    num_prefill_engines: int = 1
+    num_decode_engines: int = 1
+
+    # Frontend servers per replica, each its own actor with a distinct URL. The
+    # rollout client shards conversations across them by session, so one
+    # frontend's CPU stops being the replica's throughput ceiling.
+    num_frontend_workers: int = 1
+
+    # Render and tokenize on the frontends instead of the prefill adapter,
+    # which is one thread per engine and scales only by adding GPUs.
+    # Frontends are CPU-only -- this is what num_frontend_workers buys.
+    frontend_tokenize: bool = False
+
+    # base + replica_idx * num_frontend_workers + frontend_idx. Deterministic
+    # so a restarted frontend re-binds the same port and its URL stays valid.
+    # Like every service port it must stay below 9000, the ephemeral floor on
+    # some DGX/GB200 nodes; the default band is virtual_cluster's
+    # DEFAULT_DISAGG_FRONTEND_PORT_RANGE_*.
+    frontend_base_port: int = DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
+
+
 class ColocationConfig(TypedDict):
     enabled: bool
     resources: OptionalResourcesConfig
@@ -226,6 +257,7 @@ class GenerationConfig(TypedDict):
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
     bad_words: NotRequired[list[str] | None]
+    ignore_eos: NotRequired[bool]
     colocated: NotRequired[ColocationConfig]
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
@@ -236,9 +268,17 @@ class GenerationConfig(TypedDict):
     _draft_weights_from_refit: NotRequired[bool]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
+    # The trainer streams the drafter's full weight set (incl. embed/lm_head)
+    # on refit (Automodel draft co-training); drafter module sharing must be
+    # disabled and the draft manifest is validated exactly.
+    _draft_full_refit: NotRequired[bool]
     # Internal debug-only measurement of exact Ray generation arguments.
     # Populated from grpo.debug_payload_metrics; not meant to be set by the user.
     _debug_payload_metrics: NotRequired[bool]
+
+    # The layout, in the terms every backend shares. How a backend *implements*
+    # disaggregation goes in that backend's own block.
+    disaggregation: NotRequired[DisaggConfig]
 
 
 def should_use_async_rollouts(
@@ -402,6 +442,28 @@ class CollectiveSenderSpec:
     nccl_peer: str = "nemo"
     buffer_size_bytes: int | None = None
     num_buffers: int | None = None
+    use_legacy_packing: bool = False
+
+
+def agreed_media_columns(
+    reported: list["Optional[MediaColumnSpec]"],
+) -> "Optional[MediaColumnSpec]":
+    """The one media column spec the capture workers pinned, or ``None``.
+
+    Each ``setup_token_capture`` fan-out target reports the spec it pinned its
+    staging media column to (``None`` from text-only workers and ranks that
+    host no capture). The reassembler mints empty media rows from this spec,
+    so two workers disagreeing would publish two pixel dtypes or widths into
+    one column; that is refused here, at setup, rather than found by
+    TransferQueue mid-run.
+    """
+    specs = {spec for spec in reported if spec is not None}
+    if len(specs) > 1:
+        raise RuntimeError(
+            "capture workers pinned different media column specs: "
+            f"{sorted(map(str, specs))}"
+        )
+    return next(iter(specs), None)
 
 
 def reject_unenforceable_refit_deadline(
@@ -412,18 +474,17 @@ def reject_unenforceable_refit_deadline(
     Accepting it and doing nothing would be worse than refusing. The deadline exists so
     that a generation rank dying mid-refit cannot hang the weight-sync collective
     forever; a user who sets it on a backend that ignores it gets exactly that hang,
-    while believing they are protected. Only vLLM threads the deadline down to the
-    collective today.
+    while believing they are protected. Only transports whose workers own an
+    abortable collective can enforce it.
 
-    ``None`` -- every path that does not configure a deadline, which is all of them by
-    default -- passes through untouched, so this is inert unless someone opts in.
+    ``None`` disables the deadline and passes through untouched.
     """
     if refit_timeout_s is not None:
         raise NotImplementedError(
-            f"{backend} generation cannot enforce a refit deadline "
-            f"(refit_timeout_s={refit_timeout_s}). Only the vLLM backend threads it "
-            "into the refit collective. Unset "
-            "async_rl.generation_fleet_health.refit_timeout_s, or use vLLM generation."
+            f"{backend} refit cannot enforce a refit deadline "
+            f"(refit_timeout_s={refit_timeout_s}). Unset "
+            "async_rl.generation_fleet_health.refit_timeout_s, or select a refit "
+            "transport with worker-side watchdog support."
         )
 
 
@@ -486,13 +547,65 @@ class GenerationInterface(ABC):
         """Resume previously paused generation on the backend."""
         raise NotImplementedError
 
+    def restart_shard(self, shard_idx: int) -> Optional[str]:
+        """Rebuild one data-parallel shard's workers and bring its engine back up.
+
+        Declared here because ``EngineSupervisor`` calls it by name on whatever backend it
+        was handed. Undeclared, a backend that does not implement it -- or one that loses
+        the method to a merge, which has happened once already -- degrades to an
+        ``AttributeError`` swallowed by the supervisor's ``except``, and the shard is
+        recorded as a failed restart rather than as an unsupported one. Raising here says
+        which it is.
+
+        Blocking and slow -- it reloads the model -- so callers run it off the control
+        loop.
+
+        Returns:
+            The replacement's OpenAI base URL, or None for an engine that exposes no HTTP
+            server. The URL is expected to differ from the old one: the new engine binds
+            its own port, so callers must publish it rather than assume the fleet's URL
+            list is still accurate.
+        """
+        raise NotImplementedError
+
+    def shard_liveness_ref(self, shard_idx: int) -> ray.ObjectRef:
+        """Liveness of the worker leading one data-parallel shard.
+
+        Which Ray worker leads shard N depends on how shards are laid out across workers,
+        which is the backend's business. Asking for it by shard index keeps that here
+        rather than in the control loop, where the same arithmetic had a second copy that
+        also assumed every backend has a ``worker_group`` -- an assumption that has already
+        broken a lane once (``'DynamoGeneration' object has no attribute 'worker_group'``).
+        """
+        raise NotImplementedError
+
+    def log_shard_gpu_state(
+        self, shard_idx: int, *, label: str, timeout_s: float = 30.0
+    ) -> None:
+        """Print the state of the GPU one shard holds, from that shard's own node.
+
+        A no-op by default rather than ``NotImplementedError``, unlike ``restart_shard``
+        above: this is a diagnostic taken on the restart path, and a backend that cannot
+        provide it should cost the caller nothing. Failing a restart over a missing log
+        line would be worse than the missing log line.
+        """
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Whether the generation backend requires KV cache scales synchronization."""
         return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
+
+        Returns:
+            Optionally, the parameter names the backend wants pre-quantized on
+            the trainer before streaming (e.g. vllm_cfg.refit_prequantize);
+            None when no trainer-side pre-quantization is requested. The vLLM
+            implementation also installs its FP8 configuration on the workers.
+        """
         raise NotImplementedError
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
@@ -559,41 +672,104 @@ class GenerationInterface(ABC):
             f"{type(self).__name__} generation backend"
         )
 
-    # Optional hook; backends may override to invalidate any reusable caches
-    # (e.g., vLLM prefix/KV caches) after weight updates.
+    def setup_token_capture(
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
+    ) -> "Optional[MediaColumnSpec]":
+        """Install token capture in the serving workers (``token_capture.enabled``).
+
+        Declared here for the same reason as :meth:`attach_fleet_health`: the
+        single-controller setup calls this on whichever backend is configured, so an
+        unsupported backend says so itself instead of failing with AttributeError.
+
+        Args:
+            dp_cfg: Data-plane config the workers use to build their in-worker client.
+            staging_partition: Data-plane partition that captured rows are staged in.
+            capture_media: Whether the staging partition carries media columns and
+                the workers must stage the media the engine consumed beside each
+                call's tokens.
+
+        Returns:
+            With ``capture_media``, the pixel dtype and patch size the workers
+            pinned the staging media column to (every worker reports the same
+            spec); the reassembler publishes empty media rows in that geometry
+            for groups without media. ``None`` for text-only capture.
+        """
+        raise NotImplementedError(
+            f"token_capture.enabled is not supported for {type(self).__name__}"
+        )
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the weight version workers stamp on captured model calls.
+
+        Args:
+            version: Trainer weight version now being served, applied to all
+                subsequent captured requests.
+        """
+        raise NotImplementedError(
+            f"token_capture.enabled is not supported for {type(self).__name__}"
+        )
+
     def invalidate_kv_cache(self) -> bool:
+        """Confirm stale KV state cannot be reused after a weight update.
+
+        Backends may implement this by invalidating active-request KV state directly or
+        by performing equivalent engine-side handling atomically with refit. Clearing
+        only unreferenced prefix-cache entries is insufficient while requests are active.
+
+        Returns:
+            True only when the backend guarantees the recompute contract; False when it
+            is unsupported or could not be completed.
+        """
         return False
 
-    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
-        """Pause in-flight generation while preserving request state.
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Arrange a safe generation pause around the upcoming weight refit.
 
         Backends with native in-flight refit support override this hook. The default
         implementation warns once per backend type and lets the refit continue with
-        the backend's existing in-flight behavior. On supported backends, in-flight
-        requests are frozen rather than aborted and resume from
-        :meth:`resume_generation_after_refit`; new requests queue until then.
+        the backend's existing in-flight behavior. Native pause implementations
+        freeze requests until :meth:`resume_generation_after_refit`. A backend
+        may instead acknowledge a lifecycle owned by its weight synchronizer,
+        which must pause and handle the requested cache clearing before transfer
+        and resume before returning. Such backends document their request handling
+        and timeout semantics; for example, SGLang may retract or abort requests.
 
         Args:
             clear_cache: Also clear the engine's reusable caches at pause time so
                 preserved requests recompute their KV after the weight update.
+            timeout_s: Maximum time to wait for engines to pause; None waits indefinitely.
 
         Returns:
-            True if every engine paused; False when the backend has no native pause
-            support. Backends with native support raise when pausing fails.
+            True if every engine paused or the weight synchronizer guarantees the
+            lifecycle above; False when neither is supported. Pause failures raise
+            from this hook or the synchronizer that owns the pause.
         """
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
-    def resume_generation_after_refit(self) -> bool:
+    def resume_generation_after_refit(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
         """Resume generation paused by :meth:`pause_generation_for_refit`.
 
         The default implementation shares the once-per-backend warning emitted by
         :meth:`pause_generation_for_refit` and lets the refit continue for backends
         without native pause/resume support.
 
+        Args:
+            timeout_s: Maximum time to wait for engines to resume; None waits indefinitely.
+
         Returns:
-            True if every engine resumed; False when the backend has no native resume
-            support. Backends with native support raise when resuming fails.
+            True if every surviving engine resumed, including when the weight
+            synchronizer already performed the resume; False when neither path is
+            supported. With fleet health, confirmed dead engines may be excluded
+            if enough survivors remain. Other resume failures raise.
         """
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
@@ -652,3 +828,15 @@ class GenerationInterface(ABC):
             metrics return an empty dictionary.
         """
         return {}
+
+    def drain_latest_logger_metrics(self) -> dict[str, Any]:
+        """Consume a bounded latest-value snapshot for frequent telemetry polls.
+
+        Implementations may clear or compact their accumulated metric histories.
+        Callers must not assume that a later ``get_logger_metrics`` includes values
+        observed before this drain. Backends supporting raw rollout throughput
+        should return cumulative sampled-token counters under ``generation_tokens``
+        as ``data_parallel_worker_id -> list[counter]``. The controller computes
+        per-worker deltas before summing them, so counter resets are detectable.
+        """
+        return self.get_logger_metrics()

@@ -16,8 +16,8 @@
 #   total = exactly 10 nodes, no headroom.
 #
 # Training parallelism: TP=8, EP=32, CP=8, PP=1, SP=true.
-# vLLM parallelism: TP=8, EP=8 (EP=TP keeps vllm_dp_size=1; EP>TP is blocked
-# by https://github.com/NVIDIA-NeMo/RL/issues/1101).
+# vLLM parallelism: TP=8, EP=8 (EP=TP keeps vllm_dp_size=1;
+# EP>TP is supported but not needed for this recipe).
 # =============================================================================
 
 # =============================================================================
@@ -41,8 +41,6 @@ checkpointing:
   ft_keep_latest_k: 1
   ft_save_period: 1
   checkpoint_must_save_by: "00:47:35:00"
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 # =============================================================================
@@ -151,9 +149,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
     cpu_offload: false
     sequence_parallel: false
@@ -317,7 +316,7 @@ policy:
     stop_strings: null
     # TP=8 EP=8: EP=TP so vllm_dp_size=1, async_engine=true works with NeMo Gym.
     # Same memory as EP=1 but uses all-to-all for expert routing.
-    # EP > TP blocked by https://github.com/NVIDIA-NeMo/RL/issues/1101.
+    # EP=TP keeps vLLM DP disabled for this recipe.
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
@@ -391,7 +390,14 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: true
   nemo_gym:
-    nemo_gym_log_dir: "logs/nemo_gym"
+    equivalence_llm_judge_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: equivalence_llm_judge_simple_agent
+
     skip_venv_if_present: true
     num_gpu_nodes: 10
     # NeMo-RL-side effort shaping; stripped before forwarding to Gym.

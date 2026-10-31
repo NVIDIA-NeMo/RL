@@ -64,6 +64,56 @@ A key design principle for generation backends is that they process tokens direc
 
 NeMo RL supports multiple generation backends that implement the {py:class}`GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>` to provide efficient text generation for different use cases.
 
+## SGLang Fault Tolerance
+
+SGLang fault tolerance is opt-in. Its serving-health monitor checks engines
+during generation; a separate bounded actor/process liveness probe covers the
+training and offloaded windows. The latter does not detect a live-but-wedged
+server, so both detectors are necessary. Replacements wait until the next refit
+to receive current policy weights before rollout resumes. Failure after a
+weight transfer starts is outside this recovery boundary.
+
+The SGLang exemplar documents the defaults below. Fault-tolerance and client
+defaults are centralized in `SGLangFaultToleranceConfig` and
+`SGLangHttpClientConfig`, respectively:
+
+```yaml
+policy:
+  generation:
+    sglang_cfg:
+      sglang_fault_tolerance_config:
+        use_fault_tolerance: false
+        rollout_health_check_interval: 60
+        rollout_health_check_timeout: 60
+        rollout_health_check_first_wait: 60
+        rollout_max_restart_attempts: 3
+      sglang_router_config:
+        use_external_router: false
+        retry_max_retries: 5
+        cb_failure_threshold: 10
+      sglang_http_client_config:
+        max_retries: 3
+```
+
+Health intervals and timeouts are positive, finite seconds; the first-wait grace
+can be zero. The restart limit is a nonnegative integer per logical engine over
+the run's lifetime. Exhaustion aborts refit; zero disables restarts. The
+`sglang_fault_tolerance_config` block is required and inherited from the SGLang
+exemplar. An empty block uses the defaults above, including disabled recovery.
+
+The two router knobs require positive integers and configure only a router
+launched by NeMo-RL. Omitting them retains the pinned router's defaults. An
+external router owns its own retry/circuit configuration. The independent
+client budget still applies with `use_external_router: true`.
+
+Despite their names, `retry_max_retries` and client `max_retries` count **total
+attempts including the first**, not additional retries. A client attempt can
+therefore contain several router attempts. Distributed HTTP dispatch uses the
+client budget, and its existing local fallback gets that budget again if the
+actor call fails. These settings permit tuning bounded nonstreaming recovery;
+they do not guarantee survival after fleet loss or retry exhaustion. A streaming
+response that has already started cannot be replayed.
+
 ## VLLM Backend
 
 The VLLM backend (`models/generation/vllm/vllm_generation.py`) implements the {py:class}`GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>` to provide efficient text generation using the VLLM library, which is optimized for large language models.
@@ -130,18 +180,37 @@ policy:
     top_p: 1.0
     top_k: null
     mcore_generation_config:
-      buffer_size_gb: 10               # Memory buffer size for requests, total buffer size is 2x this value (active requests + paused requests)
-      num_cuda_graphs: 16              # Number of CUDA graphs to pre-allocate
+      buffer_size_gb: 10               # On-GPU KV-cache block pool shared by all active requests
+      num_cuda_graphs: -1              # Number of CUDA graphs to build; -1 autotunes
       max_tokens: 16384                # Maximum number of tokens for inference
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
 ```
 
 ### Configuration Parameters
 
 The `mcore_generation_config` section controls Megatron Core inference engine behavior:
 
-- **buffer_size_gb**: Buffer size reserved for active requests that live on the GPU. The total buffer size (stored in unified memory) is 2x this value, with the other half of the buffer reserved for paused requests that live on the CPU.
-- **num_cuda_graphs**: Number of CUDA graphs to pre-allocate for different batch sizes. More graphs can improve performance by avoiding runtime graph capture, but consume more memory.
+- **buffer_size_gb**: Size of the on-GPU KV-cache block pool shared by all active requests. When `max_requests` is unset, Megatron-Core derives it from this pool.
+- **num_cuda_graphs**: Number of CUDA graphs to build; `-1` autotunes, `null` disables inference CUDA graphs.
 - **max_tokens**: Maximum total number of tokens (across all requests) that can be processed simultaneously. This limits the maximum batch size and sequence length combinations. Increasing this might throw OOM depending on vocab size and buffer size allocated. 
+
+#### CUDA-graph capture
+
+- **cuda_graph_sizing_distribution** (`hybrid`) and **cuda_graph_max_tokens** (`512`) bound graph-capture cost while keeping decode graphs dense and prefill graphs compact. Use `exponential` or `linear` when one layout is a better fit for a known workload.
+- **inference_cuda_graph_scope** controls where local inference graphs live: `layer` owns them per Transformer/Mamba layer and `block` owns them per enclosing block. `none` runs eagerly. This setting only applies with `cuda_graph_impl: local`.
+
+#### Prefix-cache routing and HTTP frontends
+
+- **prefix_caching_mamba_gb** (`null`) leaves Mamba-state prefix caching disabled until a hybrid Mamba model has an explicit GPU budget.
+- **prefix_caching_eviction_policy** (`lru`), **prefix_caching_coordinator_policy** (`longest_prefix`), **prefix_cache_ttl_seconds** (`300.0`), and **prefix_caching_routing_alpha** (`1.0`) retain useful prefixes while steering requests toward cache hits without ignoring an overloaded inference rank.
+- **http_server_num_replicas** (`8`) sets the number of CPU HTTP frontends per model-parallel coordinator. These frontends spread request parsing, prompt processing, and cache-key work across CPU cores.
 
 ### Multimodal Megatron Generation
 
@@ -170,6 +239,7 @@ data:
 ```
 
 - `image_dynamic_resolution` preserves variable image shapes instead of forcing one fixed resolution; for example, a wide image uses a wider patch grid than a square image.
+- `image_dynamic_resolution_model_length`, `image_dynamic_resolution_rounding_mode`, and `image_dynamic_resolution_resize_mode` must match the HF processor that vLLM and training use, or Megatron inference produces a different patch grid for the same image. `model_length` overrides the processor's `max_model_len` token budget. `rounding_mode` is `ceil` (MCore default) or `round_plus_half` (HF's `round(x + 0.5)`); for a 48-px side and 16-px patches they give 3 and 4 patches. `resize_mode` is `pil` (MCore default) or `torch_bicubic_antialias` for torch-based HF processors. Nemotron Super VL uses `round_plus_half` and `torch_bicubic_antialias`.
 - `vision_model_type` optionally selects the MCore vision encoder type used by image and video preprocessing. Set it to the encoder expected by the inference wrapper; when omitted, MCore uses its default (`radio`).
 - `num_frames` controls uniform video-frame sampling. Use `video_num_frames` for the corresponding MCore key.
 - `video_temporal_patch_size` groups sampled frames into temporal tubelets; for example, size `2` turns 16 frames into 8 temporal groups.
@@ -180,6 +250,114 @@ data:
 - `expose_http_server` should be `true` for NeMo Gym.
 
 Keep the video preprocessing values identical in `data.default` and `mcore_generation_config` to avoid disparity between the training policy and inference generation.
+
+#### Multimodal prompt contracts
+
+`multimodal_prompt_config` controls how structured image and video content is
+lowered into model prompt tokens. It contains optional `image_spec` and
+`video_spec` mappings. Each mapping may override the Megatron inference wrapper's
+defaults:
+
+```yaml
+policy:
+  generation:
+    mcore_generation_config:
+      megatron_inference_wrapper: path.to.MultimodalInferenceWrapper
+      multimodal_prompt_config:
+        image_spec:
+          model_token: "<image>"
+          prefix: ""
+          suffix: ""
+          input_marker: null
+          content_part_separator: ""
+          expansion_mode: single
+        video_spec:
+          model_token: "<video>"
+          content_part_separator: "\n"
+          expansion_mode: temporal_patch
+          include_frame_timestamps_for_nemotron_vl: true
+```
+
+The mappings are partial overrides: omitted values come from the selected
+wrapper's `multimodal_prompt_config`. Consequently,
+`multimodal_prompt_config` requires a `megatron_inference_wrapper`, and that
+wrapper must define a default prompt contract.
+
+- `model_token` is the model-specific placeholder that is later replaced by
+  multimodal embeddings.
+  - Example: `model_token: "<image>"` lowers one structured image block to
+    `<image>` before tokenization.
+- `prefix` and `suffix` wrap each model placeholder.
+  - Example: `prefix: "<img>"`, `model_token: "<image>"`, and
+    `suffix: "</img>"` produce `<img><image></img>`.
+- `content_part_separator` joins adjacent structured content parts before the
+  chat template is applied.
+  - Example: Given a text part `Describe this` followed by an image block,
+    `content_part_separator: "\n"` produces
+    `Describe this\n<img><image></img>` instead of
+    `Describe this<img><image></img>`.
+- `input_marker` removes a marker already present in incoming text when the
+  same message also contains structured media. Current built-in wrappers leave
+  this setting unset.
+  - Example: For a custom contract with `input_marker: "<video>"`, incoming
+    text `Describe this: <video>` plus a structured video block becomes
+    `Describe this: ` plus the configured video prompt, rather than retaining
+    two video markers.
+- `expansion_mode` controls how compact media placeholders are expanded.
+  - `single` emits one compact model placeholder per structured media item.
+    - Example: A video block initially becomes one `<img><image></img>` span;
+      the `<image>` token is expanded internally to the number of projected
+      video features.
+  - `temporal_patch` rewrites one compact video placeholder into one
+    placeholder per temporal tubelet before feature expansion.
+    - Example: Four frames with temporal patch size `2` form two tubelets, so
+      the compact video span is rewritten as
+      `<img><image></img> <img><image></img>`: one span for frames 1–2 and one
+      for frames 3–4.
+- `include_frame_timestamps_for_nemotron_vl: true` adds the sampled-frame times
+  to each temporal-patch span. This option is valid only with
+  `expansion_mode: temporal_patch`.
+  - Example: For frame indices `[0, 1, 2, 3]`, FPS `1`, and temporal patch size
+    `2`, the prompt fragment becomes:
+
+    ```text
+    Frame 1 sampled at 0.00 seconds and frame 2 sampled at 1.00 seconds: <img><image></img>
+    Frame 3 sampled at 2.00 seconds and frame 4 sampled at 3.00 seconds: <img><image></img>
+    ```
+
+Omitting `data.default.video_sampling_style` keeps the default/simple video
+path. To opt into Nemotron-VL sampling, set the style explicitly:
+
+```yaml
+data:
+  default:
+    video_sampling_style: nemotron_vl
+```
+
+Nemotron-VL video preprocessing always uses timestamped `temporal_patch`
+expansion, the only video format Nemotron checkpoints are trained on, so keep
+the Megatron inference `video_spec` on that format.
+
+These settings control NeMo-RL's video preprocessing only. They do not change the
+Megatron inference prompt, which comes from the selected
+`megatron_inference_wrapper`. The Nemotron Omni wrapper already defaults to
+timestamped temporal-patch video prompts. For other wrappers, or to change these
+values, set them explicitly:
+
+```yaml
+policy:
+  generation:
+    mcore_generation_config:
+      multimodal_prompt_config:
+        video_spec:
+          content_part_separator: "\n"
+          expansion_mode: temporal_patch
+          include_frame_timestamps_for_nemotron_vl: true
+```
+
+The current engine has one prompt contract for all requests. Supporting
+different prompt styles in one engine would require a future per-request
+endpoint or engine configuration.
 
 ## Usage Examples
 
@@ -243,8 +421,16 @@ policy:
     top_k: null
     mcore_generation_config:
       buffer_size_gb: 10
-      num_cuda_graphs: 16
+      num_cuda_graphs: -1
       max_tokens: 16384
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
 ```
 
 For a complete example, see

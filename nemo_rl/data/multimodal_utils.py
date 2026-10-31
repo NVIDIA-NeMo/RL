@@ -15,14 +15,16 @@
 import base64
 import inspect
 import logging
+import math
 import re
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
-from copy import deepcopy
+from copy import copy, deepcopy
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
+from urllib.parse import unquote
 
 import requests
 import torch
@@ -37,14 +39,21 @@ if TYPE_CHECKING:
     # ``nemo_rl.data_plane`` and ``nemo_rl.data`` mutually importing.
     from nemo_rl.data_plane.interfaces import KVBatchMeta
 
-VLLM_MULTIMODAL_DATA_KEYS = frozenset({"vllm_images", "vllm_videos", "vllm_audios"})
-NATIVE_MULTIMODAL_KEYS = frozenset({"vllm_content", *VLLM_MULTIMODAL_DATA_KEYS})
+VLLM_CONTENT_KEY = "vllm_content"
+VLLM_MULTI_MODAL_DATA_KEY = "vllm_multi_modal_data"
+VLLM_PROMPT_KEYS = frozenset({VLLM_CONTENT_KEY, VLLM_MULTI_MODAL_DATA_KEY})
 IMAGE_CONTENT_TYPES = frozenset({"input_image", "image", "image_url"})
 VIDEO_CONTENT_TYPES = frozenset({"input_video", "video", "video_url"})
 AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
     {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
+# Provenance marker set on user messages whose media tensors were attached
+# rollout-matched (repaired to the rollout's per-image placeholder runs). The
+# driver-side static reattach must not overwrite such media; key presence
+# alone is not provenance (targets may carry placeholder or stale payloads
+# that the reattach is expected to replace).
+ROLLOUT_MATCHED_MEDIA_KEY = "_rollout_matched_media"
 
 # List of allowed placeholder strings for different media types in the dataset string
 # e.g. "This is an example of <image>"
@@ -69,6 +78,8 @@ _PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
     {
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
+        "NemotronH_Omni_Reasoning_V3Processor",
+        "NemotronH_Super_Omni_Reasoning_V3Processor",
     }
 )
 
@@ -123,6 +134,8 @@ PER_TOKEN_MULTIMODAL_FIELDS = frozenset(
     {
         "token_type_ids",  # gemma3: which tokens are image
         "mm_token_type_ids",  # qwen2.5-vl (transformers>=5.3): text(0)/image(1)/video(2) for 3D RoPE
+        # Which tokens are allowed to be replaced by multimodal embeddings.
+        "media_token_validity_mask",
     }
 )
 
@@ -165,7 +178,8 @@ def row_shapes_key(field: str) -> str:
 # Keys inside the :func:`row_shapes_key` tag value. A plain dict rather than a
 # record because ``tags`` rides TQ's own serializer.
 ROW_GEOMETRY_SHAPES = "shapes"
-ROW_GEOMETRY_PAD = "pad"
+ROW_GEOMETRY_PREPROCESS_MODE = "preprocess_mode"
+ROW_GEOMETRY_PREPROCESS_KWARGS = "preprocess_kwargs"
 
 
 # Include-list of multimodal fields every forward-running dispatch (logprob
@@ -187,6 +201,37 @@ def present_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
     return sorted(WIRE_MULTIMODAL_FIELDS & set(meta.fields or ()))
 
 
+def teacher_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
+    """Omit packed columns whose row shapes prove the whole teacher batch empty.
+
+    Capture keeps empty media columns for the trainer's partition schema, but
+    text teachers do not accept media arguments. Keep per-token fields and any
+    packed field with missing or malformed shapes for the decoder to validate.
+    """
+    fields = present_multimodal_fields(meta)
+    if not meta.tags or len(meta.tags) != meta.size:
+        return fields
+
+    def row_is_empty(tag: dict[str, Any], field: str) -> bool:
+        geometry = tag.get(row_shapes_key(field))
+        if not isinstance(geometry, dict):
+            return False
+        shapes = geometry.get(ROW_GEOMETRY_SHAPES)
+        return isinstance(shapes, (list, tuple)) and all(
+            isinstance(shape, (list, tuple))
+            and all(type(dim) is int and dim >= 0 for dim in shape)
+            and math.prod(shape) == 0
+            for shape in shapes
+        )
+
+    return [
+        field
+        for field in fields
+        if field not in PACKED_MULTIMODAL_FIELDS
+        or not all(row_is_empty(tag, field) for tag in meta.tags)
+    ]
+
+
 def multimodal_row_tags(
     multimodal: dict, sample_count: int
 ) -> "Optional[list[dict[str, Any]]]":
@@ -199,11 +244,10 @@ def multimodal_row_tags(
     contents.
 
     Carries ``shapes`` (per-row, and unrecoverable once ``to_wire`` flattens)
-    and ``pad`` (the field's policy flag). Deliberately *not* a pad target: the
-    width padding lands at is scratch that the model discards -- mcore crops it
-    via ``imgs_sizes`` before patchification, and the AutoModel path rejects
-    mixed-resolution batches outright -- so each consumer pads to its own view
-    and nothing batch-wide has to be agreed across shards.
+    and the field's preprocessing settings. Deliberately *not* a pad target: the
+    width padding lands at is scratch that the model discards. Mcore consumes
+    pre-patchified pixels without spatial dimensions, while AutoModel pads at
+    materialization, so nothing batch-wide has to be agreed across shards.
     """
     tags: list[dict[str, Any]] = [{} for _ in range(sample_count)]
     for key, value in multimodal.items():
@@ -223,11 +267,11 @@ def multimodal_row_tags(
                 "sample_ids, so a disagreement here would pair one sample's "
                 "pixels with another's shapes."
             )
-        pad = value.pad_to_max_shape
         for row, row_shapes in enumerate(shapes):
             tags[row][row_shapes_key(key)] = {
                 ROW_GEOMETRY_SHAPES: row_shapes,
-                ROW_GEOMETRY_PAD: pad,
+                ROW_GEOMETRY_PREPROCESS_MODE: value.preprocess_mode,
+                ROW_GEOMETRY_PREPROCESS_KWARGS: dict(value.preprocess_kwargs),
             }
     # ``None`` rather than ``B`` empty dicts: a text-only run has no packed
     # field, and an all-empty tags list would still be pickled on every
@@ -272,14 +316,79 @@ def reassemble_packed_multimodal(
                 + ". to_wire flattens each row, so without the companion the "
                 "true per-segment shapes are unrecoverable."
             )
-        # Indexed, not ``.get``-with-default: a producer-side rename of either
-        # key must fail here rather than silently restore ``pad=False``, which
-        # changes what ``as_tensor`` hands the vision encoder.
+        # Indexed, not ``.get``-with-default: a producer-side rename of any key
+        # must fail here rather than silently change what ``as_tensor`` hands
+        # the vision encoder.
         fields[key] = PackedTensor.from_wire(
             value,
             [[] if r is None else r[ROW_GEOMETRY_SHAPES] for r in rows],  # type: ignore[union-attr]
-            pad_to_max_shape=bool(present[0][ROW_GEOMETRY_PAD]),
+            preprocess_mode=present[0][ROW_GEOMETRY_PREPROCESS_MODE],
+            preprocess_kwargs=present[0][ROW_GEOMETRY_PREPROCESS_KWARGS],
         )
+
+
+def _patchify_segments(segments: list[torch.Tensor], *, patch_dim: int) -> torch.Tensor:
+    """Cut pixel segments into vision patches and pack them into one sequence.
+
+    Each ``[N, channels, H, W]`` segment is processed at its native resolution
+    into a ``[C_i, P²]`` block, where ``C_i`` is ``N * rows * columns`` and
+    ``P²`` is the flattened patch width (``channels * patch_dim**2``). Blocks
+    are packed along dimension zero, then a batch dimension is added to produce
+    ``[1, total_C, P²]``. Already-patchified segments in that final layout are
+    accepted so repeated materialization is safe.
+    """
+    if patch_dim <= 0:
+        raise ValueError(f"patch_dim must be positive, got {patch_dim}")
+
+    patch_features = 3 * patch_dim**2
+    flattened: list[torch.Tensor] = []
+    for segment in segments:
+        if segment.ndim == 3:
+            if segment.shape[0] != 1 or segment.shape[-1] != patch_features:
+                raise ValueError(
+                    f"Pre-patchified segments must be [1, total_C, P²] with P²={patch_features}, "
+                    f"got shape {tuple(segment.shape)}"
+                )
+            flattened.append(segment[0])
+            continue
+        if segment.ndim != 4:
+            raise ValueError(
+                "patchify expects [N, C, H, W] pixel segments or "
+                "[1, total_C, P²] pre-patchified segments, got shape "
+                f"{tuple(segment.shape)}"
+            )
+        count, channels, height, width = segment.shape
+        if height % patch_dim or width % patch_dim:
+            raise ValueError(
+                f"Image size {(height, width)} is not divisible by "
+                f"patch_dim={patch_dim}"
+            )
+        rows = height // patch_dim
+        columns = width // patch_dim
+        flattened.append(
+            segment.reshape(count, channels, rows, patch_dim, columns, patch_dim)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(count * rows * columns, channels * patch_dim * patch_dim)
+        )
+
+    widths = {tensor.shape[-1] for tensor in flattened}
+    if len(widths) != 1:
+        raise ValueError(
+            f"patchify produced mismatched P² widths {sorted(widths)}; "
+            "the segments do not share a channel count"
+        )
+    return torch.cat(flattened, dim=0).unsqueeze(0).contiguous()
+
+
+def _shared_preprocess_spec(
+    from_packed_tensors: list["PackedTensor"],
+) -> dict[str, Any]:
+    """Return the preprocessing setting shared by every input."""
+    first = from_packed_tensors[0]._preprocess_spec
+    assert all(
+        packed_tensor._preprocess_spec == first for packed_tensor in from_packed_tensors
+    ), "All packed tensors must have the same preprocess setting"
+    return first
 
 
 class PackedTensor:
@@ -325,7 +434,8 @@ class PackedTensor:
         tensors: Union[torch.Tensor, list[Optional[torch.Tensor]], list[None]],
         dim_to_pack: int,
         *,
-        pad_to_max_shape: bool = False,
+        preprocess_mode: Optional[str] = None,
+        preprocess_kwargs: Optional[dict[str, Any]] = None,
         _row_offsets: Optional[list[int]] = None,
         _segment_indices: Optional[list[int]] = None,
         _segment_provenance: Optional[list[bytes]] = None,
@@ -336,8 +446,12 @@ class PackedTensor:
             tensors: A tensor or list of per-item tensors. List entries may be
                 ``None`` for items without this modality.
             dim_to_pack: Dimension along which ``as_tensor`` concatenates.
-            pad_to_max_shape: Pad every non-packing dimension to its batch-wide
-                maximum before concatenating. All tensors must have the same rank.
+            preprocess_mode: Optional preprocessing applied by ``as_tensor``.
+                Supported values are ``pad_to_max_shape`` and ``patchify``.
+                Patchify requires ``dim_to_pack=0`` and changes 4-D inputs into
+                a 3-D ``[1, total_patches, P²]`` tensor.
+            preprocess_kwargs: Extra arguments for ``preprocess_mode``.
+                Patchify requires ``patch_dim``.
         """
         assert tensors is not None, "Input tensors to PackedTensor cannot be None"
 
@@ -354,7 +468,17 @@ class PackedTensor:
                 f"Unsupported type for input tensors to PackedTensor: {type(tensors)}"
             )
         self.dim_to_pack = dim_to_pack
-        self.pad_to_max_shape = pad_to_max_shape
+        if preprocess_mode not in (None, "pad_to_max_shape", "patchify"):
+            raise ValueError(
+                f"Unknown preprocess_mode {preprocess_mode!r}; expected None, "
+                "'pad_to_max_shape', or 'patchify'"
+            )
+        if preprocess_mode == "patchify" and not (preprocess_kwargs or {}).get(
+            "patch_dim"
+        ):
+            raise ValueError("patchify requires patch_dim")
+        self.preprocess_mode = preprocess_mode
+        self.preprocess_kwargs: dict[str, Any] = dict(preprocess_kwargs or {})
         if (_row_offsets is None) != (_segment_indices is None):
             raise ValueError(
                 "_row_offsets and _segment_indices must either both be set or both be None"
@@ -394,6 +518,89 @@ class PackedTensor:
         self.__dict__.setdefault("_row_offsets", None)
         self.__dict__.setdefault("_segment_indices", None)
         self.__dict__.setdefault("_segment_provenance", None)
+
+    def broadcast_parts(
+        self,
+    ) -> tuple[
+        "PackedTensor",
+        list[Optional[tuple[int, ...]]],
+        str,
+        str,
+        list[torch.Tensor],
+    ]:
+        """Split semantic state from physical data for replica broadcast.
+
+        The tensor-free header retains every other instance attribute, so new
+        semantic state does not require a parallel broadcast schema update.
+        """
+        tensors = [tensor for tensor in self.tensors if tensor is not None]
+        dtype = tensors[0].dtype if tensors else torch.uint8
+        source_device = tensors[0].device if tensors else torch.device("cpu")
+        if any(tensor.dtype != dtype for tensor in tensors):
+            raise TypeError("PackedTensor segments must have one dtype for broadcast.")
+        if any(tensor.device != source_device for tensor in tensors):
+            raise TypeError(
+                "PackedTensor segments must be on one device for broadcast."
+            )
+        header = copy(self)
+        header.tensors = []
+        header.preprocess_kwargs = dict(self.preprocess_kwargs)
+        header._row_offsets = (
+            None if self._row_offsets is None else list(self._row_offsets)
+        )
+        header._segment_indices = (
+            None if self._segment_indices is None else list(self._segment_indices)
+        )
+        header._segment_provenance = (
+            None if self._segment_provenance is None else list(self._segment_provenance)
+        )
+        tensor_attributes = [
+            name
+            for name, value in header.__dict__.items()
+            if isinstance(value, torch.Tensor)
+        ]
+        if tensor_attributes:
+            raise TypeError(
+                "PackedTensor broadcast header must be tensor-free; give attributes "
+                f"{tensor_attributes} their own payload."
+            )
+        shapes = [
+            None if tensor is None else tuple(tensor.shape) for tensor in self.tensors
+        ]
+        return header, shapes, str(dtype), str(source_device), tensors
+
+    def rebuild_from_broadcast_parts(
+        self,
+        shapes: list[Optional[tuple[int, ...]]],
+        payload: torch.Tensor,
+    ) -> "PackedTensor":
+        """Attach received physical data to a header from ``broadcast_parts``."""
+        tensors: list[Optional[torch.Tensor]] = []
+        offset: int = 0
+        for shape in shapes:
+            if shape is None:
+                tensors.append(None)
+                continue
+            numel: int = 1
+            for dimension in shape:
+                numel *= dimension
+            tensors.append(payload.narrow(0, offset, numel).view(shape))
+            offset += numel
+        if offset != payload.numel():
+            raise ValueError(
+                f"PackedTensor broadcast shapes describe {offset} elements, "
+                f"but the payload has {payload.numel()}."
+            )
+        self.tensors = tensors
+        return self
+
+    @property
+    def _preprocess_spec(self) -> dict[str, Any]:
+        """Return keyword arguments that preserve preprocessing in a copy."""
+        return {
+            "preprocess_mode": self.preprocess_mode,
+            "preprocess_kwargs": self.preprocess_kwargs,
+        }
 
     @property
     def deduplication_enabled(self) -> bool:
@@ -445,7 +652,7 @@ class PackedTensor:
             copied = PackedTensor(
                 [deepcopy(item, memo) for item in self.tensors],
                 self.dim_to_pack,
-                pad_to_max_shape=self.pad_to_max_shape,
+                **self._preprocess_spec,
             )
         else:
             copied = PackedTensor(
@@ -455,7 +662,7 @@ class PackedTensor:
                     else [deepcopy(item, memo) for item in self.tensors]
                 ),
                 self.dim_to_pack,
-                pad_to_max_shape=self.pad_to_max_shape,
+                **self._preprocess_spec,
                 _row_offsets=(
                     list(self._row_offsets) if self._row_offsets is not None else None
                 ),
@@ -474,8 +681,9 @@ class PackedTensor:
         return copied
 
     def as_tensor(
-        self, device: Optional[torch.device] = None
+        self, device: torch.device | None = None, mode: str | None = None
     ) -> Optional[torch.Tensor]:
+        mode = mode or self.preprocess_mode
         if device is not None:
             # Move only non-None tensors to device, preserve Nones
             for i, item in enumerate(self.tensors):
@@ -488,12 +696,21 @@ class PackedTensor:
         if len(non_none_tensors) == 0:
             return None
 
+        if mode == "patchify":
+            if self.dim_to_pack != 0:
+                raise ValueError(
+                    f"patchify requires dim_to_pack=0, got {self.dim_to_pack}"
+                )
+            return _patchify_segments(non_none_tensors, **self.preprocess_kwargs).to(
+                device
+            )
+
         # Some multimodal processors produce a different shape per prompt,
         # such as dynamic-resolution images, variable-frame videos, or audio
         # feature sequences. Concatenation already permits the packing
         # dimension to vary; when explicitly requested, pad every other
         # dimension to the largest size in the batch.
-        if self.pad_to_max_shape:
+        if mode == "pad_to_max_shape":
             ranks = {tensor.ndim for tensor in non_none_tensors}
             if len(ranks) != 1:
                 raise ValueError(
@@ -599,7 +816,7 @@ class PackedTensor:
                 else list(self.tensors)
             ),
             self.dim_to_pack,
-            pad_to_max_shape=self.pad_to_max_shape,
+            **self._preprocess_spec,
             _row_offsets=(
                 list(self._row_offsets) if self._row_offsets is not None else None
             ),
@@ -626,7 +843,7 @@ class PackedTensor:
             return PackedTensor(
                 tensors,
                 self.dim_to_pack,
-                pad_to_max_shape=self.pad_to_max_shape,
+                **self._preprocess_spec,
             )
 
         physical_remap: dict[int, int] = {}
@@ -650,7 +867,7 @@ class PackedTensor:
         return PackedTensor(
             tensors,
             self.dim_to_pack,
-            pad_to_max_shape=self.pad_to_max_shape,
+            **self._preprocess_spec,
             _row_offsets=row_offsets,
             _segment_indices=segment_indices,
             _segment_provenance=(
@@ -672,7 +889,7 @@ class PackedTensor:
             return cls(
                 [],
                 other.dim_to_pack,
-                pad_to_max_shape=other.pad_to_max_shape,
+                **other._preprocess_spec,
                 _row_offsets=[0] * (num_rows + 1),
                 _segment_indices=[],
                 _segment_provenance=[],
@@ -681,7 +898,7 @@ class PackedTensor:
             return cls(
                 [],
                 other.dim_to_pack,
-                pad_to_max_shape=other.pad_to_max_shape,
+                **other._preprocess_spec,
                 _row_offsets=[0],
                 _segment_indices=[],
                 _segment_provenance=None,
@@ -689,7 +906,7 @@ class PackedTensor:
         return cls(
             [None] * num_rows,
             other.dim_to_pack,
-            pad_to_max_shape=other.pad_to_max_shape,
+            **other._preprocess_spec,
         )
 
     @classmethod
@@ -718,10 +935,7 @@ class PackedTensor:
         assert len(set(dim_to_packs)) == 1, (
             "All packed tensors must have the same dim_to_pack"
         )
-        pad_to_max_shapes = [batch.pad_to_max_shape for batch in from_packed_tensors]
-        assert len(set(pad_to_max_shapes)) == 1, (
-            "All packed tensors must have the same pad_to_max_shape setting"
-        )
+        preprocess_spec = _shared_preprocess_spec(from_packed_tensors)
         if any(
             packed_tensor.deduplication_enabled
             or packed_tensor._row_offsets is not None
@@ -762,7 +976,7 @@ class PackedTensor:
             return cls(
                 tensors,
                 dim_to_packs[0],
-                pad_to_max_shape=pad_to_max_shapes[0],
+                **preprocess_spec,
                 _row_offsets=row_offsets,
                 _segment_indices=segment_indices,
                 _segment_provenance=provenances,
@@ -776,7 +990,7 @@ class PackedTensor:
         return cls(
             tensors,
             dim_to_pack,
-            pad_to_max_shape=pad_to_max_shapes[0],
+            **preprocess_spec,
         )
 
     @classmethod
@@ -800,7 +1014,7 @@ class PackedTensor:
         return cls(
             concatenated.tensors,
             concatenated.dim_to_pack,
-            pad_to_max_shape=concatenated.pad_to_max_shape,
+            **concatenated._preprocess_spec,
             _row_offsets=[0, len(concatenated._segment_indices)],
             _segment_indices=concatenated._segment_indices,
             _segment_provenance=concatenated._segment_provenance,
@@ -836,10 +1050,7 @@ class PackedTensor:
         assert len(set(dim_to_packs)) == 1, (
             "All packed tensors must have the same dim_to_pack"
         )
-        pad_to_max_shapes = [batch.pad_to_max_shape for batch in from_packed_tensors]
-        assert len(set(pad_to_max_shapes)) == 1, (
-            "All packed tensors must have the same pad_to_max_shape setting"
-        )
+        preprocess_spec = _shared_preprocess_spec(from_packed_tensors)
         if any(
             packed_tensor.deduplication_enabled
             or packed_tensor._row_offsets is not None
@@ -854,7 +1065,7 @@ class PackedTensor:
         return cls(
             tensors,
             from_packed_tensors[0].dim_to_pack,
-            pad_to_max_shape=pad_to_max_shapes[0],
+            **preprocess_spec,
         )
 
     # ── Wire encoding (data-plane roundtrip) ─────────────────────────
@@ -948,12 +1159,12 @@ class PackedTensor:
         #     storage, and TQ never falls back to the deprecated strided layout.
         #   * The per-row concat is 1-D, so it cannot raise on segments whose
         #     trailing dims differ -- which is what previously forced
-        #     ``pad_to_max_shape`` to pad *before* the concat.
+        #     preprocessing to pad *before* the concat.
         #
         # The true shapes travel beside the payload (see the returned
         # ``shapes``) because TQ derives ``per_sample_shapes`` from what it is
         # handed: give it flat rows and it records flat lengths. Padding still
-        # happens for ``pad_to_max_shape`` values, but in worker memory at use
+        # happens for values that need it, but in worker memory at use
         # time via :meth:`as_tensor`, not on the wire.
         shapes = self._shapes_of(row_segments)
         # ``reshape(-1)`` on contiguous processor output is a view, so the
@@ -990,7 +1201,8 @@ class PackedTensor:
         nested: torch.Tensor,
         shapes: list[list[list[int]]],
         *,
-        pad_to_max_shape: bool = False,
+        preprocess_mode: Optional[str] = None,
+        preprocess_kwargs: Optional[dict[str, Any]] = None,
     ) -> Optional["PackedTensor"]:
         """Reconstruct from the value produced by :meth:`to_wire`.
 
@@ -1009,10 +1221,9 @@ class PackedTensor:
         reconstructs as legacy does: ``as_tensor`` returns ``None`` and
         ``logical_segment_counts_by_row`` reports 0 rather than 1.
 
-        ``pad_to_max_shape`` is restored onto the rebuilt value as a flag, not
+        The preprocessing settings are restored onto the rebuilt value, not
         materialized. Segments come back at their true shapes and stay separate
-        via the CSR row map, so nothing is padded or concatenated here;
-        :meth:`as_tensor` pads at use time.
+        via the CSR row map; :meth:`as_tensor` preprocesses at use time.
 
         Mirrors :meth:`to_wire`; both assume ``dim_to_pack=0``.
         """
@@ -1053,7 +1264,8 @@ class PackedTensor:
         return cls(
             segments_flat,  # type: ignore[arg-type]
             dim_to_pack=0,
-            pad_to_max_shape=pad_to_max_shape,
+            preprocess_mode=preprocess_mode,
+            preprocess_kwargs=preprocess_kwargs,
             _row_offsets=row_offsets,
             _segment_indices=list(range(len(segments_flat))),
         )
@@ -1071,7 +1283,7 @@ def encode_multimodal_for_wire(
     Payload only. Per-token fields ride rectangular; packed fields ride as one
     flattened ``torch.jagged`` value. The geometry :meth:`PackedTensor.from_wire`
     needs to undo that flattening -- per-row segment shapes plus the
-    ``pad_to_max_shape`` flag -- is minted separately by
+    preprocessing settings -- is minted separately by
     :func:`multimodal_row_tags` and shipped on ``KVBatchMeta.tags``. TQ cannot
     derive it, because it reads ``per_sample_shapes`` off the flattened rows it
     is handed.
@@ -1123,6 +1335,16 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
     all_keys.update(processor.model_input_names)
     all_keys.difference_update(set(processor.tokenizer.model_input_names))
     return list(all_keys)
+
+
+def per_token_multimodal_schema(processor) -> tuple[str, ...]:
+    """Per-token media fields a multimodal run writes on every row; none if text-only."""
+    if processor is None:
+        return ()
+    keys = set(get_multimodal_keys_from_processor(processor))
+    return tuple(
+        sorted({"media_token_validity_mask"} | (keys & PER_TOKEN_MULTIMODAL_FIELDS))
+    )
 
 
 def get_multimodal_default_settings_from_processor(
@@ -1181,9 +1403,16 @@ def get_dim_to_pack_along(processor, key: str) -> int:
     return 0
 
 
-def get_pad_to_max_shape(processor: Any, key: str) -> bool:
-    """Return whether a processor input must pad non-packing dimensions."""
-    return uses_image_placeholder(processor) and key == "pixel_values"
+def get_preprocess(processor: Any, key: str) -> dict[str, Any]:
+    """Return materialization preprocessing for one processor input."""
+    if uses_image_placeholder(processor) and key == "pixel_values":
+        image_processor = getattr(processor, "image_processor", processor)
+        patch_dim = getattr(image_processor, "patch_size", 16)
+        return {
+            "preprocess_mode": "patchify",
+            "preprocess_kwargs": {"patch_dim": patch_dim},
+        }
+    return {"preprocess_mode": None, "preprocess_kwargs": {}}
 
 
 def extract_multimodal_model_inputs(
@@ -1194,6 +1423,7 @@ def extract_multimodal_model_inputs(
     if (
         uses_image_placeholder(processor)
         and "pixel_values" in processed
+        and isinstance(processed["pixel_values"], torch.Tensor)
         and "imgs_sizes" not in processed
         and processed["pixel_values"].ndim == 4
     ):
@@ -1208,6 +1438,21 @@ def extract_multimodal_model_inputs(
             len(processed["imgs_sizes"]),
             dtype=torch.long,
         )
+    sizes = processed.get("imgs_sizes")
+    if uses_image_placeholder(processor) and isinstance(sizes, torch.Tensor):
+        pixels = processed["pixel_values"]
+        segments = pixels if isinstance(pixels, list) else [pixels]
+        preprocess = get_preprocess(processor, "pixel_values")
+        patch_dim = preprocess["preprocess_kwargs"]["patch_dim"]
+        pixel_count = sum(
+            segment.shape[1]
+            if segment.ndim == 3
+            else segment.numel() // (3 * patch_dim**2)
+            for segment in segments
+        )
+        size_count = int(torch.prod(sizes // patch_dim, dim=1).sum())
+        if pixel_count != size_count:
+            raise ValueError("pixel_values and imgs_sizes have different patch counts")
 
     input_ids = processed.get("input_ids")
     if input_ids is None:
@@ -1235,7 +1480,7 @@ def extract_multimodal_model_inputs(
         if key not in processed:
             continue
         value = processed[key]
-        if not isinstance(value, torch.Tensor):
+        if not isinstance(value, (torch.Tensor, list)):
             raise ValueError(
                 f"Processor model input {key!r} must be a torch.Tensor, got "
                 f"{type(value).__name__}."
@@ -1245,7 +1490,7 @@ def extract_multimodal_model_inputs(
         extracted[key] = PackedTensor(
             value,
             dim_to_pack=get_dim_to_pack_along(processor, key),
-            pad_to_max_shape=get_pad_to_max_shape(processor, key),
+            **get_preprocess(processor, key),
         )
 
     for key in ("token_type_ids", "mm_token_type_ids"):
@@ -1296,10 +1541,29 @@ def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
         image_data = base64.b64decode(encoded)
         return Image.open(BytesIO(image_data)).convert("RGB")
     elif image_path_or_image.startswith("file://"):
-        return Image.open(image_path_or_image.removeprefix("file://")).convert("RGB")
+        image_path = unquote(image_path_or_image.removeprefix("file://"))
+        return Image.open(image_path).convert("RGB")
     else:
         # Handle local file path
         return Image.open(image_path_or_image).convert("RGB")
+
+
+def image_size_from_source(source: str | Image.Image) -> tuple[int, int]:
+    """Return ``(width, height)`` for an image source."""
+    if isinstance(source, Image.Image):
+        return source.width, source.height
+    if source.startswith("data:"):
+        _, encoded = source.split(",", 1)
+        with Image.open(BytesIO(base64.b64decode(encoded))) as image:
+            return image.width, image.height
+    if source.startswith("file://"):
+        with Image.open(source.removeprefix("file://")) as image:
+            return image.width, image.height
+    if not source.startswith(("http://", "https://")):
+        with Image.open(source) as image:
+            return image.width, image.height
+    image = resolve_to_image(source)
+    return image.width, image.height
 
 
 def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
@@ -1385,13 +1649,9 @@ def media_sources_equal(
 def _materialize_ragged_pixel_values(
     processed: dict[str, Any], processor: Any
 ) -> dict[str, Any]:
-    """Fold a ragged per-image ``pixel_values`` list into one padded tensor.
+    """Preserve a ragged per-image ``pixel_values`` list for materialization.
 
-    Processors with dynamic per-image resolution return a list of CHW tensors
-    rather than a stacked batch. ``imgs_sizes`` is derived from the *unpadded*
-    shapes first, since those exact sizes are what the projector slices with;
-    padding happens afterwards so downstream sees the single tensor its
-    torch.Tensor contract expects.
+    Tiles remain separate until ``PackedTensor.as_tensor`` materializes them.
     """
     processed = dict(processed)
     pixel_values = processed.get("pixel_values")
@@ -1417,19 +1677,13 @@ def _materialize_ragged_pixel_values(
 def _stack_ragged_pixel_values(
     processed: dict[str, Any], tiles: list[torch.Tensor], processor: Any
 ) -> None:
-    """Derive imgs_sizes from unpadded shapes, then pad into one tensor."""
+    """Derive image sizes and preserve native-shape tiles for patchification."""
     if uses_image_placeholder(processor) and "imgs_sizes" not in processed:
         processed["imgs_sizes"] = torch.tensor(
             [[int(item.shape[-2]), int(item.shape[-1])] for item in tiles],
             dtype=torch.long,
         )
-    stacked = PackedTensor(
-        [item.unsqueeze(0) for item in tiles],
-        dim_to_pack=0,
-        pad_to_max_shape=True,
-    ).as_tensor()
-    assert stacked is not None
-    processed["pixel_values"] = stacked
+    processed["pixel_values"] = [item.unsqueeze(0) for item in tiles]
 
 
 def _restore_tensors(processed: dict[str, Any]) -> None:
@@ -1452,16 +1706,37 @@ def _restore_tensors(processed: dict[str, Any]) -> None:
                 continue
 
 
+def _image_num_tokens_from_processed(processed: dict[str, Any]) -> list[int]:
+    value = processed.get("num_tokens")
+    if value is None:
+        raise ValueError(
+            "Processor output has no per-image 'num_tokens'; cannot verify "
+            "image parity with the rollout tokens."
+        )
+    if isinstance(value, torch.Tensor):
+        return [int(item) for item in value.tolist()]
+    return [int(item) for item in value]
+
+
 def attach_image_model_inputs_to_message(
     message: dict[str, Any],
     *,
     images: list[Image.Image],
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
+    expected_num_tokens_per_image: Sequence[int] | None = None,
 ) -> None:
-    """Attach processor-owned image tensors without replacing rollout tokens."""
+    """Attach image tensors while preserving rollout-token/media parity."""
     if not images or processor is None:
         return
+    if expected_num_tokens_per_image is not None and len(
+        expected_num_tokens_per_image
+    ) != len(images):
+        raise ValueError(
+            f"Got {len(images)} images but {len(expected_num_tokens_per_image)} "
+            "rollout placeholder runs for this turn. Refusing to train on "
+            "misaligned media."
+        )
 
     image_token = getattr(processor, "image_token", "<image>")
     # Processors that emit dynamic per-image resolutions return a ragged CHW list
@@ -1475,6 +1750,17 @@ def attach_image_model_inputs_to_message(
         return_tensors=None if allow_ragged_output else "pt",
     )
     processed = dict(processed)
+    if expected_num_tokens_per_image is not None:
+        expected = [int(count) for count in expected_num_tokens_per_image]
+        if _image_num_tokens_from_processed(processed) != expected:
+            # Local import: exact-count repair is Nemotron-processor-specific.
+            from nemo_rl.environments.nemotron_utils import (
+                reprocess_images_at_rollout_budgets,
+            )
+
+            processed = reprocess_images_at_rollout_budgets(processor, images, expected)
+            # Corrected tiles may be ragged even when the originals were not.
+            allow_ragged_output = len(images) > 1
     if allow_ragged_output:
         processed = _materialize_ragged_pixel_values(processed, processor)
     model_inputs = extract_multimodal_model_inputs(processor, processed)
@@ -1485,6 +1771,38 @@ def attach_image_model_inputs_to_message(
             if isinstance(value, PackedTensor)
         }
     )
+    attach_processor_media_token_validity_mask(message, processor)
+    if expected_num_tokens_per_image is not None:
+        message[ROLLOUT_MATCHED_MEDIA_KEY] = True
+
+
+def attach_processor_media_token_validity_mask(
+    message: dict[str, Any], processor: Any
+) -> None:
+    """Record which rollout tokens are processor-owned media placeholders."""
+    # TODO: Add support for audio placeholder masks. This function only
+    # handles image (and video) placeholder tokens.
+    token_ids = message.get("token_ids")
+    image_token = getattr(processor, "image_token", None)
+    tokenizer = getattr(processor, "tokenizer", None)
+    convert_token = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if (
+        not isinstance(token_ids, torch.Tensor)
+        or not isinstance(image_token, str)
+        or not callable(convert_token)
+    ):
+        return
+
+    media_token_id = convert_token(image_token)
+    if isinstance(media_token_id, bool) or not isinstance(media_token_id, int):
+        return
+    if media_token_id == getattr(tokenizer, "unk_token_id", None):
+        # An unknown-token fallback does not prove that the processor owns
+        # those positions; masking every literal UNK as media would corrupt text.
+        return
+    # Construct the media placeholder token validity mask, which represents
+    # which tokens are permitted substitutes of multimodal embeddings.
+    message["media_token_validity_mask"] = token_ids.eq(media_token_id)
 
 
 _VIDEO_EXT_TO_MIME = {
@@ -1503,7 +1821,7 @@ def video_path_to_data_url(video_path: str) -> str:
         return video_path
 
     resolved = (
-        video_path.removeprefix("file://")
+        unquote(video_path.removeprefix("file://"))
         if video_path.startswith("file://")
         else str(Path(video_path).expanduser().resolve())
     )
@@ -1716,20 +2034,40 @@ def image_counts_by_row(batch: Any, num_rows: int) -> Optional[list[int]]:
 
 
 def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) -> None:
-    """Mark media tokens that anchor nothing, so the model keeps their embedding.
+    """Attach a ``[B, S]`` mask of media-token positions that anchor media features.
 
     Builds the mask while rows still are samples. Sequence packing later
     concatenates those rows into one THD sequence, after which no per-row
-    question can be asked, so the packing step carries this through the same
-    transform as ``input_ids`` rather than deriving it downstream.
+    information can be recovered, so the packing step carries this through
+    the same transform as ``input_ids`` rather than deriving it downstream.
 
-    The batch is duck-typed rather than annotated as ``BatchedDataDict``:
-    that module imports this one, so naming it here would be circular.
+    Args:
+        batch: Batch with ``[B, S]`` ``input_ids``.
+        media_token_id: Media placeholder token ID, or None if the model does not
+            accept the mask, in which case any existing mask is removed. The
+            Megatron policy worker passes None when
+            ``_model_accepts_media_token_validity_mask`` is False.
     """
     if media_token_id is None:
+        batch.pop("media_token_validity_mask", None)
         return
     input_ids = batch.get("input_ids", None)
     if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        return
+    existing_mask = batch.get("media_token_validity_mask", None)
+    if existing_mask is not None:
+        if not isinstance(existing_mask, torch.Tensor):
+            raise TypeError(
+                "media_token_validity_mask must be a torch.Tensor, got "
+                f"{type(existing_mask).__name__}."
+            )
+        if existing_mask.shape != input_ids.shape:
+            raise ValueError(
+                "media_token_validity_mask must align with input_ids: "
+                f"mask={tuple(existing_mask.shape)}, "
+                f"input_ids={tuple(input_ids.shape)}."
+            )
+        batch["media_token_validity_mask"] = existing_mask.bool()
         return
     counts = image_counts_by_row(batch, input_ids.shape[0])
     if counts is None:

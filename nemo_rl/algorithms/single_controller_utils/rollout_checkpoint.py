@@ -26,7 +26,10 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.experience.reward_penalties import CaptureRewardSettings
+from nemo_rl.experience.rollouts import get_effort_config
 
 ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 3
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
@@ -228,6 +231,8 @@ class RolloutSnapshotManifest:
     mutation_version: int
     rolled_back_train_group_count: int
     bootstrap_fingerprint: Optional[str]
+    # None preserves the trainer counter when loading an older snapshot.
+    next_nemo_gym_task_index: Optional[int] = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> RolloutSnapshotManifest:
@@ -252,6 +257,15 @@ class RolloutSnapshotManifest:
             raise ValueError(
                 "rollout snapshot bootstrap_fingerprint must be a string or null"
             )
+        next_nemo_gym_task_index = raw.get("next_nemo_gym_task_index")
+        if next_nemo_gym_task_index is not None and (
+            not isinstance(next_nemo_gym_task_index, int)
+            or isinstance(next_nemo_gym_task_index, bool)
+            or next_nemo_gym_task_index < 0
+        ):
+            raise ValueError(
+                "rollout snapshot next_nemo_gym_task_index must be a non-negative integer"
+            )
         manifest = cls(
             schema_version=raw["schema_version"],
             base_train_step=raw["base_train_step"],
@@ -261,6 +275,7 @@ class RolloutSnapshotManifest:
             mutation_version=raw["mutation_version"],
             rolled_back_train_group_count=raw["rolled_back_train_group_count"],
             bootstrap_fingerprint=fingerprint,
+            next_nemo_gym_task_index=next_nemo_gym_task_index,
         )
         if manifest.schema_version != ROLLOUT_SNAPSHOT_SCHEMA_VERSION:
             raise ValueError(
@@ -321,11 +336,35 @@ class BootstrapCompatibilityIdentity:
         return hashlib.sha256(payload).hexdigest()
 
 
+def _normalize_capture_reward_config(dumped: dict[str, Any]) -> None:
+    """Replace capture reward config with the projection sidecar restore compares.
+
+    Otherwise the bootstrap fingerprint would reject harmless reward-config
+    extras before the sidecar's semantic comparison ever ran.
+    """
+    capture = dumped.get("token_capture")
+    if capture is None or not capture["enabled"]:
+        return
+    settings = CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig.model_validate(dumped["reward_penalties"]),
+        get_effort_config(dumped["env"]),
+    ).to_state()
+    dumped["reward_penalties"] = settings["penalties"]
+    gym = dumped["env"].get("nemo_gym")
+    if gym is not None:
+        gym.pop("effort_levels", None)
+        if settings["effort"] is not None:
+            gym["effort_levels"] = settings["effort"]
+        if not gym:
+            dumped["env"].pop("nemo_gym")
+
+
 def bootstrap_compatibility_identity(
     master_config: MasterConfig,
 ) -> BootstrapCompatibilityIdentity:
     """Remove explicitly operational paths from the fail-closed run identity."""
     dumped = master_config.model_dump(mode="json")
+    _normalize_capture_reward_config(dumped)
     rollout_checkpointing = dumped.get("rollout_checkpointing", {})
     if not isinstance(rollout_checkpointing, Mapping):
         raise TypeError("rollout_checkpointing config must be a mapping")

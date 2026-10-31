@@ -20,6 +20,8 @@ import pybase64
 import torch
 from torch.multiprocessing import reductions
 
+from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
+
 
 class MultiprocessingSerializer:  # pragma: no cover
     """Serialize/deserialize Python objects using ForkingPickler for IPC.
@@ -70,12 +72,22 @@ class MultiprocessingSerializer:  # pragma: no cover
         return ForkingPickler.loads(data)
 
 
+# Captured at import time, not inside the patch. A process that unpickles one of
+# our reduced CUDA tensors without having called monkey_patch_torch_reductions()
+# -- nvidia_resiliency_ext's spawned async-checkpoint worker does exactly that --
+# would otherwise find no original to delegate to and die with AttributeError.
+_REDUCE_TENSOR_ORIGINAL = reductions.reduce_tensor
+_REBUILD_CUDA_TENSOR_ORIGINAL = reductions.rebuild_cuda_tensor
+
+
 def monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed."""
     if hasattr(reductions, "_reduce_tensor_original"):
         return
-    reductions._reduce_tensor_original = reductions.reduce_tensor
-    reductions._rebuild_cuda_tensor_original = reductions.rebuild_cuda_tensor
+    # sglang's patch skips itself on this same check, but its wrappers read both
+    # attributes, so whoever wins the check must set both.
+    reductions._reduce_tensor_original = _REDUCE_TENSOR_ORIGINAL
+    reductions._rebuild_cuda_tensor_original = _REBUILD_CUDA_TENSOR_ORIGINAL
 
     reductions.reduce_tensor = _reduce_tensor_modified
     reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
@@ -85,10 +97,11 @@ def monkey_patch_torch_reductions():
 # The signature has not been changed for years, and we will not need this when the next version is released,
 # so it looks safe to use a constant.
 _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
+_REDUCE_TENSOR_ARG_STORAGE_HANDLE_INDEX = 7
 
 
 def _reduce_tensor_modified(*args, **kwargs):
-    output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
+    output_fn, output_args = _REDUCE_TENSOR_ORIGINAL(*args, **kwargs)
     # ``reduce_tensor`` has different rebuild functions and argument layouts
     # for CUDA, CPU, meta, sparse, and nested tensors. Only the dense CUDA path
     # returns our patched CUDA rebuild function with the device at index 6.
@@ -103,7 +116,12 @@ def _reduce_tensor_modified(*args, **kwargs):
 
 def _rebuild_cuda_tensor_modified(*args):
     args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_from_maybe_uuid)
-    return reductions._rebuild_cuda_tensor_original(*args)
+    # The training venv that produced the handle may run a newer torch than
+    # this sglang venv; see nemo_rl.utils.cuda_ipc for the version-byte rewrite.
+    args = _modify_tuple(
+        args, _REDUCE_TENSOR_ARG_STORAGE_HANDLE_INDEX, normalize_cuda_ipc_handle
+    )
+    return _REBUILD_CUDA_TENSOR_ORIGINAL(*args)
 
 
 def _device_to_uuid(device: int) -> str:

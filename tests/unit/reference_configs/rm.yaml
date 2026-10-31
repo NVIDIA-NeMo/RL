@@ -38,16 +38,24 @@ policy:
   activation_checkpointing_enabled: false
 
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   reward_model_cfg:
     enabled: true  # loads model as a Reward Model (do not change)
     reward_model_type: "bradley_terry"  # only "bradley_terry" is currently supported
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
@@ -60,7 +68,7 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -70,7 +78,7 @@ policy:
       weight_decay: 0.1
       betas: [0.9, 0.98]
       eps: 1e-5
-      # when using Dtensor, we need to set `foreach` and `fused` to false
+      # when using Automodel, we need to set `foreach` and `fused` to false
       foreach: false
       fused: false
     
@@ -82,6 +90,10 @@ policy:
       ckpt_assume_constant_structure: false
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 2
@@ -209,6 +221,10 @@ logger:
   wandb:
     project: "rm-dev"
     name: "rm-dev-${data.train.dataset_name}"
+    entity: null
+    id: null
+    resume: null
+    log_nemo_gym_full_result_tables: false
   swanlab:
     project: "rm-dev"
     name: "rm-dev-${data.train.dataset_name}"
@@ -218,14 +234,20 @@ logger:
     experiment_name: "rm-dev"
     run_name: "rm-dev-${data.train.dataset_name}"
     tracking_uri: "http://localhost:5000"
+    run_id: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+  num_val_samples_to_print: 0
+  extra_backends: []
 
 cluster:
   gpus_per_node: 1
   num_nodes: 1
   segment_size: null
+  master_port_range_low: null
+  master_port_range_high: null
 
 # OpenTelemetry instrumentation; null = disabled (default). Mirrors the optional
 # field on the MasterConfig, which stays None unless a run opts in.

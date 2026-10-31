@@ -20,10 +20,14 @@ the world_size compatibility validation that prevents confusing reshape errors
 when the cluster size is insufficient for the specified parallelism configuration.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from nemo_rl.models.generation.vllm.patches import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -33,6 +37,30 @@ def test_shutdown_succeeds_before_worker_group_is_initialized(capsys) -> None:
 
     assert policy.shutdown()
     assert capsys.readouterr().out == ""
+
+
+def test_enable_refit_prequantize_forwards_names_and_returns_metadata(
+    monkeypatch,
+) -> None:
+    policy = Policy.__new__(Policy)
+    futures = [object()]
+    updated_info = {
+        "model.weight": ((2, 2), "float8_e4m3fn"),
+        "model.weight_scale_from_checkpoint": ((2, 1), "uint8"),
+    }
+    policy.worker_group = MagicMock()
+    policy.worker_group.run_all_workers_single_data.return_value = futures
+    ray_get = MagicMock(return_value=[updated_info])
+    monkeypatch.setattr("nemo_rl.models.policy.lm_policy.ray.get", ray_get)
+
+    result = policy.enable_refit_prequantize(["model.weight"])
+
+    assert result is updated_info
+    policy.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "enable_refit_prequantize",
+        param_names=["model.weight"],
+    )
+    ray_get.assert_called_once_with(futures)
 
 
 def create_mock_cluster(world_size: int):
@@ -61,10 +89,10 @@ def create_mock_tokenizer():
     return tokenizer
 
 
-def create_dtensor_config(
+def create_automodel_config(
     model_name: str, tp: int, pp: int = 1, cp: int = 1
 ) -> PolicyConfig:
-    """Create a DTensor configuration for testing."""
+    """Create an Automodel configuration for testing."""
     return {
         "model_name": model_name,
         "tokenizer": {"name": model_name},
@@ -91,7 +119,7 @@ def create_dtensor_config(
                 },
             },
         },
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": True,
             "cpu_offload": False,
             "sequence_parallel": False,
@@ -171,10 +199,246 @@ def create_megatron_config(
     }
 
 
+def set_vllm_generation(
+    config: PolicyConfig, vllm_cfg_overrides: dict[str, object]
+) -> PolicyConfig:
+    config["generation"] = {
+        "backend": "vllm",
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "max_new_tokens": 16,
+        "stop_token_ids": None,
+        "stop_strings": None,
+        "colocated": {
+            "enabled": False,
+            "resources": {
+                "gpus_per_node": 1,
+                "num_nodes": 1,
+            },
+        },
+        "vllm_cfg": {
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "expert_parallel_size": 1,
+            "gpu_memory_utilization": 0.6,
+            "max_model_len": 128,
+            "skip_tokenizer_init": True,
+            "async_engine": False,
+            "kv_cache_dtype": "auto",
+            **vllm_cfg_overrides,
+        },
+    }
+    return config
+
+
+def construct_policy_with_mocks(
+    config: PolicyConfig, model_config: object | None = None
+) -> Policy:
+    if model_config is None:
+        model_config = SimpleNamespace(
+            architectures=["NemotronHForCausalLM"], model_type="nemotron_h"
+        )
+    with (
+        patch.dict("os.environ", {"TORCH_CUDA_ARCH_LIST": "9.0"}),
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder"),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+        patch(
+            "nemo_rl.models.policy.lm_policy.get_hf_config", return_value=model_config
+        ),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker.from_config"),
+    ):
+        return Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+
+def test_policy_accepts_matched_vllm_and_megatron_fp32_lm_head():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = True
+    set_vllm_generation(config, {"fp32_lm_head": True})
+
+    policy = construct_policy_with_mocks(config)
+
+    assert policy.worker_group is not None
+
+
+def test_policy_warns_when_vllm_fp32_lm_head_model_is_not_nemotron_h():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = True
+    set_vllm_generation(config, {"fp32_lm_head": True})
+
+    with pytest.warns(UserWarning, match="Nemotron-H"):
+        policy = construct_policy_with_mocks(
+            config,
+            model_config=SimpleNamespace(
+                architectures=["Qwen2ForCausalLM"], model_type="qwen2"
+            ),
+        )
+
+    assert policy.worker_group is not None
+
+
+def test_policy_accepts_nested_nemotron_h_model_config():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = True
+    set_vllm_generation(config, {"fp32_lm_head": True})
+
+    policy = construct_policy_with_mocks(
+        config,
+        model_config=SimpleNamespace(
+            architectures=["NemotronH_Nano_VL_V2"],
+            model_type="NemotronH_Nano_VL_V2",
+            llm_config=SimpleNamespace(
+                architectures=["NemotronHForCausalLM"],
+                model_type="nemotron_h",
+            ),
+        ),
+    )
+
+    assert policy.worker_group is not None
+
+
+@pytest.mark.parametrize(
+    ("trainer_fp32", "vllm_fp32"),
+    [
+        (True, False),
+        (False, True),
+    ],
+)
+def test_policy_rejects_mismatched_vllm_and_megatron_fp32_lm_head(
+    trainer_fp32, vllm_fp32
+):
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = trainer_fp32
+    set_vllm_generation(config, {"fp32_lm_head": vllm_fp32})
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="both Megatron training and vLLM generation"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    worker_group.assert_not_called()
+
+
+def test_policy_rejects_vllm_fp32_lm_head_with_automodel_trainer():
+    config = create_automodel_config("test-model", tp=1)
+    set_vllm_generation(config, {"fp32_lm_head": True})
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="Automodel has no matching"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    worker_group.assert_not_called()
+
+
+def test_policy_accepts_vllm_fp32_lm_head_disabled_with_automodel_trainer():
+    config = create_automodel_config("test-model", tp=1)
+    set_vllm_generation(config, {})
+
+    policy = construct_policy_with_mocks(config)
+
+    assert policy.worker_group is not None
+
+
+def test_policy_rejects_fp32_lm_head_env_var_toggle():
+    config = create_automodel_config("test-model", tp=1)
+    set_vllm_generation(
+        config, {"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1"}}
+    )
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="policy.generation.vllm_cfg.fp32_lm_head"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    worker_group.assert_not_called()
+
+
+def test_policy_rejects_megatron_fp32_lm_head_with_fused_logprobs():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = True
+    config["megatron_cfg"]["use_fused_linear_logprobs"] = True
+    set_vllm_generation(config, {"fp32_lm_head": True})
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="use_fused_linear_logprobs"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    worker_group.assert_not_called()
+
+
+def test_validate_fp32_lm_head_rejects_fused_logprobs_without_generation():
+    from nemo_rl.models.policy.utils import validate_fp32_lm_head_config
+
+    config = create_megatron_config("test-model", tp=1)
+    del config["generation"]
+    config["megatron_cfg"]["fp32_lm_head"] = True
+    config["megatron_cfg"]["use_fused_linear_logprobs"] = True
+
+    with pytest.raises(ValueError, match="use_fused_linear_logprobs"):
+        validate_fp32_lm_head_config(
+            config, megatron_enabled=True, automodel_enabled=False
+        )
+
+
+def test_policy_rejects_non_bool_megatron_fp32_lm_head():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = "tf32"
+    set_vllm_generation(config, {"fp32_lm_head": True})
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="true or false"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    worker_group.assert_not_called()
+
+
+def test_policy_accepts_megatron_fp32_lm_head_with_megatron_generation():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = True
+    config["generation"]["backend"] = "megatron"
+
+    policy = construct_policy_with_mocks(config)
+
+    assert policy.worker_group is not None
+
+
 def test_policy_flops_tracker_uses_hf_config_overrides() -> None:
     cluster = create_mock_cluster(world_size=1)
     tokenizer = create_mock_tokenizer()
-    config = create_dtensor_config("test/model", tp=1)
+    config = create_automodel_config("test/model", tp=1)
     overrides = {"qk_rope_head_dim": 64}
     config["hf_config_overrides"] = overrides
     model_config = MagicMock()
@@ -195,10 +459,152 @@ def test_policy_flops_tracker_uses_hf_config_overrides() -> None:
     mock_from_config.assert_called_once_with("test/model", model_config)
 
 
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_nvfp4_pertoken_rejects_automodel_training_backend(
+    mock_ray_worker_group,
+    tiny_llama_model_path,
+):
+    config = create_automodel_config(tiny_llama_model_path, tp=1)
+    config["generation"]["backend"] = "vllm"
+    config["generation"]["nvfp4_pertoken_rollout"] = {"enabled": True}
+
+    with pytest.raises(ValueError, match="requires the Megatron training backend"):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    mock_ray_worker_group.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("configured_extension_fqn", "explicit_extension_fqn"),
+    [
+        ("tests.extensions.CustomPolicyWorker", None),
+        (None, "tests.extensions.CustomPolicyWorker"),
+        (
+            "tests.extensions.CustomPolicyWorker",
+            "tests.extensions.CustomPolicyWorker",
+        ),
+    ],
+)
+def test_policy_selects_worker_extension_from_config_or_constructor(
+    configured_extension_fqn: str | None,
+    explicit_extension_fqn: str | None,
+) -> None:
+    config = create_automodel_config("test-model", tp=1)
+    if configured_extension_fqn is not None:
+        config["worker_extension_cls_fqn"] = configured_extension_fqn
+    with (
+        patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch.dict(
+            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
+            {"tests.extensions.CustomPolicyWorker": "python"},
+        ),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn=explicit_extension_fqn,
+        )
+
+    assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
+
+
+def test_policy_constructor_worker_extension_allows_quantization() -> None:
+    """The constructor argument may extend the quant-resolved worker; the config field may not."""
+    config = create_automodel_config("test-model", tp=1)
+    config["quant_cfg"] = "NVFP4"
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch.dict(
+            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
+            {"tests.extensions.CustomPolicyWorker": "python"},
+        ),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+        patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn="tests.extensions.CustomPolicyWorker",
+        )
+
+    assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
+
+
+@pytest.mark.parametrize(
+    ("config_updates", "explicit_extension_fqn", "error_match"),
+    [
+        (
+            {
+                "worker_extension_cls_fqn": "tests.extensions.CustomPolicyWorker",
+                "quant_cfg": "NVFP4",
+            },
+            None,
+            "worker_extension_cls_fqn and quant_cfg are mutually exclusive",
+        ),
+        (
+            {"worker_extension_cls_fqn": "tests.extensions.ConfigWorker"},
+            "tests.extensions.ArgumentWorker",
+            "different values",
+        ),
+    ],
+)
+def test_policy_rejects_invalid_worker_extension_config(
+    config_updates,
+    explicit_extension_fqn,
+    error_match,
+) -> None:
+    config = create_automodel_config("test-model", tp=1)
+    config.update(config_updates)
+
+    with pytest.raises(ValueError, match=error_match):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn=explicit_extension_fqn,
+        )
+
+
+@pytest.mark.parametrize("from_config", [False, True])
+def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None:
+    extension_fqn = "tests.extensions.UnregisteredPolicyWorker"
+    config = create_automodel_config("test-model", tp=1)
+    if from_config:
+        config["worker_extension_cls_fqn"] = extension_fqn
+    cluster = create_mock_cluster(world_size=1)
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="No actor environment registered"),
+    ):
+        Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn=None if from_config else extension_fqn,
+        )
+
+    worker_group.assert_not_called()
+    cluster._init_placement_groups.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "world_size,tp,cp,should_pass,expected_error_type,description",
     [
-        # Valid cases - DTensor backend (PP is always 1 for DTensor)
+        # Valid cases - Automodel backend (PP is always 1 for Automodel)
         (8, 8, 1, True, None, "Valid: DP=1, TP=8, PP=1, CP=1"),
         (16, 8, 1, True, None, "Valid: DP=2, TP=8, PP=1, CP=1"),
         (8, 4, 2, True, None, "Valid: DP=1, TP=4, PP=1, CP=2"),
@@ -215,7 +621,7 @@ def test_policy_flops_tracker_uses_hf_config_overrides() -> None:
     ],
 )
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_world_size_validation_dtensor(
+def test_world_size_validation_automodel(
     mock_ray_worker_group,
     tiny_llama_model_path,
     world_size,
@@ -225,16 +631,16 @@ def test_world_size_validation_dtensor(
     expected_error_type,
     description,
 ):
-    """Test world_size validation with DTensor backend.
+    """Test world_size validation with Automodel backend.
 
-    Note: DTensor backend always uses PP=1 (no pipeline parallelism support).
+    Note: Automodel backend always uses PP=1 (no pipeline parallelism support).
     Tests the constraint: world_size = DP * PP * CP * TP where DP >= 1 and DP must be integer.
     """
     cluster = create_mock_cluster(world_size)
     tokenizer = create_mock_tokenizer()
-    config = create_dtensor_config(
+    config = create_automodel_config(
         tiny_llama_model_path, tp, pp=1, cp=cp
-    )  # DTensor always has PP=1
+    )  # Automodel always has PP=1
 
     # Mock RayWorkerGroup to prevent actual worker creation
     mock_worker_group_instance = MagicMock()
@@ -245,7 +651,7 @@ def test_world_size_validation_dtensor(
         try:
             policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
             # Verify the calculated DP makes sense
-            expected_dp = world_size // (1 * cp * tp)  # PP=1 for DTensor
+            expected_dp = world_size // (1 * cp * tp)  # PP=1 for Automodel
             assert expected_dp >= 1, f"Expected DP should be >= 1, got {expected_dp}"
             # Verify that worker group was created (validation passed)
             mock_ray_worker_group.assert_called_once()
@@ -276,16 +682,15 @@ def test_world_size_validation_dtensor(
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_dp_replicate_size_sets_batching_dp(
+def test_automodel_dp_replicate_size_sets_batching_dp(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):
     """Test that dp_replicate_size is separated from the batching DP axis."""
     cluster = create_mock_cluster(world_size=8)
     tokenizer = create_mock_tokenizer()
-    config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["_v2"] = True
-    config["dtensor_cfg"]["dp_replicate_size"] = 2
+    config = create_automodel_config(tiny_llama_model_path, tp=1)
+    config["automodel_cfg"]["dp_replicate_size"] = 2
 
     policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
 
@@ -295,7 +700,7 @@ def test_dtensor_dp_replicate_size_sets_batching_dp(
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_hsdp_dispatches_distinct_batches(
+def test_automodel_hsdp_dispatches_distinct_batches(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):
@@ -308,9 +713,8 @@ def test_dtensor_hsdp_dispatches_distinct_batches(
     """
     cluster = create_mock_cluster(world_size=8)
     tokenizer = create_mock_tokenizer()
-    config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["_v2"] = True
-    config["dtensor_cfg"]["dp_replicate_size"] = 2  # HSDP enabled
+    config = create_automodel_config(tiny_llama_model_path, tp=1)
+    config["automodel_cfg"]["dp_replicate_size"] = 2  # HSDP enabled
 
     policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
 
@@ -363,23 +767,6 @@ def test_dtensor_hsdp_dispatches_distinct_batches(
     )
 
 
-@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_dp_replicate_size_requires_v2(
-    mock_ray_worker_group,
-    tiny_llama_model_path,
-):
-    """Test that HSDP requires the Automodel DTensor v2 worker."""
-    cluster = create_mock_cluster(world_size=8)
-    tokenizer = create_mock_tokenizer()
-    config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["dp_replicate_size"] = 2
-
-    with pytest.raises(ValueError, match="_v2: true"):
-        Policy(cluster=cluster, config=config, tokenizer=tokenizer)
-
-    mock_ray_worker_group.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "world_size,tp,pp,cp,should_pass,expected_error_type,description",
     [
@@ -425,7 +812,7 @@ def test_world_size_validation_megatron(
 ):
     """Test world_size validation with Megatron backend.
 
-    Megatron backend supports pipeline parallelism (PP > 1) unlike DTensor.
+    Megatron backend supports pipeline parallelism (PP > 1) unlike Automodel.
     Tests the constraint: world_size = DP * PP * CP * TP where DP >= 1 and DP must be integer.
     Note: Expert Parallelism (EP) is handled internally by Megatron-Core, not at the worker level.
     """

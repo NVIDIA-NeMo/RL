@@ -16,6 +16,12 @@ import pytest
 import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.codec import pad_field
+from nemo_rl.data_plane.schema import (
+    OPD_FULL_HIDDEN_STATES_FIELD,
+    OPD_FULL_LOGITS_FIELD,
+    OPD_FULL_TEACHER_INDEX_FIELD,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -679,28 +685,48 @@ def test_repeat_interleave_shares_only_flagged_multimodal_segments():
     assert flag_on["message_log"][0] is not flag_on["message_log"][1]
 
 
-def test_repeat_interleave_shares_native_image_video_and_audio_leaves():
+def test_repeat_interleave_shares_vllm_multimodal_data_leaves():
     image = torch.ones(1, 2)
     video = np.ones((2, 2), dtype=np.float32)
     audio = np.ones(16, dtype=np.float32)
     batch = BatchedDataDict(
         {
-            "vllm_images": [[image]],
-            "vllm_videos": [[video]],
-            "vllm_audios": [[(audio, 16_000)]],
+            "vllm_multi_modal_data": [
+                {"image": image, "video": video, "audio": (audio, 16_000)}
+            ],
         }
     )
 
     flag_off = batch.repeat_interleave(2)
-    assert flag_off["vllm_images"][0][0] is not flag_off["vllm_images"][1][0]
-    assert flag_off["vllm_videos"][0][0] is not flag_off["vllm_videos"][1][0]
-    assert flag_off["vllm_audios"][0][0][0] is not flag_off["vllm_audios"][1][0][0]
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["image"]
+        is not flag_off["vllm_multi_modal_data"][1]["image"]
+    )
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["video"]
+        is not flag_off["vllm_multi_modal_data"][1]["video"]
+    )
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["audio"][0]
+        is not flag_off["vllm_multi_modal_data"][1]["audio"][0]
+    )
 
     flag_on = batch.repeat_interleave(2, share_immutable_media=True)
-    assert flag_on["vllm_images"][0] is not flag_on["vllm_images"][1]
-    assert flag_on["vllm_images"][0][0] is flag_on["vllm_images"][1][0]
-    assert flag_on["vllm_videos"][0][0] is flag_on["vllm_videos"][1][0]
-    assert flag_on["vllm_audios"][0][0][0] is flag_on["vllm_audios"][1][0][0]
+    assert (
+        flag_on["vllm_multi_modal_data"][0] is not flag_on["vllm_multi_modal_data"][1]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["image"]
+        is flag_on["vllm_multi_modal_data"][1]["image"]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["video"]
+        is flag_on["vllm_multi_modal_data"][1]["video"]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["audio"][0]
+        is flag_on["vllm_multi_modal_data"][1]["audio"][0]
+    )
 
 
 @pytest.mark.parametrize("share_immutable_media", [False, True])
@@ -1442,3 +1468,128 @@ def test_sequence_packing_rejects_oversized_preference_pair():
 
     with pytest.raises(ValueError, match="pair group 0 requires 1200 tokens"):
         batch.shard_by_batch_size(shards=2, sequence_packing_args=packing_args)
+
+
+def test_truncate_tensors_narrows_opd_full_payloads_but_never_widens_them():
+    """The teacher payload follows the microbatch seqlen, but only downwards.
+
+    ``materialize`` leaves it at its natural width, which can already be
+    shorter than the microbatch's, so the narrow has to clamp.
+    """
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(12).reshape(2, 6),
+            # Wider than the microbatch seqlen: narrow it.
+            OPD_FULL_HIDDEN_STATES_FIELD: torch.randn(2, 6, 3),
+            # Already shorter than the microbatch seqlen: leave it alone.
+            OPD_FULL_LOGITS_FIELD: torch.randn(2, 3, 5),
+            OPD_FULL_TEACHER_INDEX_FIELD: torch.tensor([1, 0]),
+        }
+    )
+    hidden_before = batch[OPD_FULL_HIDDEN_STATES_FIELD].clone()
+    logits_before = batch[OPD_FULL_LOGITS_FIELD].clone()
+
+    batch.truncate_tensors(dim=1, truncated_len=4)
+
+    assert batch["input_ids"].shape == (2, 4)
+    assert batch[OPD_FULL_HIDDEN_STATES_FIELD].shape == (2, 4, 3)
+    assert torch.equal(batch[OPD_FULL_HIDDEN_STATES_FIELD], hidden_before[:, :4])
+    assert batch[OPD_FULL_LOGITS_FIELD].shape == (2, 3, 5)
+    assert torch.equal(batch[OPD_FULL_LOGITS_FIELD], logits_before)
+    assert batch[OPD_FULL_TEACHER_INDEX_FIELD].shape == (2,)
+
+
+def test_truncate_tensors_keeps_nested_rows():
+    rows = [torch.arange(n) for n in (2, 5, 1, 3)]
+    batch = BatchedDataDict(
+        {
+            "routes": torch.nested.as_nested_tensor(rows, layout=torch.jagged),
+            "input_ids": torch.zeros(4, 6, dtype=torch.long),
+        }
+    )
+
+    batch.truncate_tensors(dim=1, truncated_len=4)
+    assert batch["input_ids"].shape == (4, 4)
+    assert [r.tolist() for r in batch["routes"].unbind()] == [r.tolist() for r in rows]
+
+
+def _routes_batch(nested: bool) -> BatchedDataDict:
+    lengths = [5, 2, 7, 3, 6, 1]
+    width = 8
+    rows = [
+        (torch.arange(n * 4, dtype=torch.int16) + 100 * i).reshape(n, 2, 2)
+        for i, n in enumerate(lengths)
+    ]
+    if nested:
+        routes = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+    else:
+        routes = torch.full((len(rows), width, 2, 2), -1, dtype=torch.int16)
+        for i, row in enumerate(rows):
+            routes[i, : len(row)] = row
+    return BatchedDataDict(
+        {
+            "input_ids": torch.arange(len(rows) * width).reshape(len(rows), width),
+            "input_lengths": torch.tensor(lengths),
+            "routed_experts": routes,
+        }
+    )
+
+
+def _padded_routes(batch) -> torch.Tensor:
+    width = batch["input_ids"].shape[1]
+    return pad_field("routed_experts", batch["routed_experts"], -1, width)
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [
+        lambda b: b.slice(1, 4),
+        lambda b: b.select_indices([4, 0, 2]),
+        lambda b: b.chunk(rank=1, chunks=2),
+        lambda b: b.select_indices([]),
+        lambda b: (b.reorder_data([5, 3, 1, 0, 2, 4]), b)[1],
+        lambda b: b.shard_by_batch_size(
+            shards=1,
+            sequence_packing_args={
+                "max_tokens_per_microbatch": 12,
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "algorithm": "modified_first_fit_decreasing",
+                "sequence_length_pad_multiple": 1,
+            },
+        )[0][0],
+    ],
+    ids=[
+        "slice",
+        "select_indices",
+        "chunk",
+        "select_empty",
+        "reorder_data",
+        "shard_seqpack",
+    ],
+)
+def test_nested_routes_match_padded_routes_through_row_ops(transform):
+    expected = transform(_routes_batch(nested=False))
+    got = transform(_routes_batch(nested=True))
+
+    assert torch.equal(got["input_ids"], expected["input_ids"])
+    assert torch.equal(_padded_routes(got), expected["routed_experts"])
+
+
+def test_multimodal_sharing_tolerates_dict_valued_type_key():
+    """Tool/JSON-schema payloads can have a parameter literally named "type"
+    whose value is a dict; the media-sharing walk must not crash on it."""
+    from nemo_rl.distributed.batched_data_dict import _prepare_multimodal_sharing
+
+    tool_schema_row = {
+        "role": "assistant",
+        "tool_schema": {
+            "parameters": {
+                # a parameter named "type": its schema definition is a dict
+                "type": {"type": "string", "enum": ["observation", "question"]},
+                "content": {"type": "string"},
+            }
+        },
+    }
+    shared = _prepare_multimodal_sharing(tool_schema_row)
+    assert isinstance(shared, dict)

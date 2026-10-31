@@ -32,6 +32,13 @@ class AbstractPolicyWorker:
     # Same, for the per-PP-stage group the nccl_reshard transport builds.
     pp_comm_group: Optional[Any] = None
 
+    def sync_params_before_refit(self) -> None:
+        """Materialize optimizer updates before refit when the backend requires it."""
+        # Automodel policy parameters already contain the latest optimizer update.
+        # Megatron overrides this whenever the distributed optimizer overlaps the
+        # parameter all-gather (MXFP8 shared-buffer and plain BF16 alike).
+        pass
+
     def init_collective(
         self,
         ip: str,
@@ -39,6 +46,7 @@ class AbstractPolicyWorker:
         world_size: int,
         *,
         train_world_size: int,
+        rank_offset: int = 0,
         nccl_peer: str = "nemo",
     ) -> None:
         """Initialize the collective communication.
@@ -48,6 +56,7 @@ class AbstractPolicyWorker:
             port: Port for the process group
             world_size: Total world size (train_world_size + inference_world_size)
             train_world_size: Number of training workers (used in inference cluster)
+            rank_offset: Offset added to this worker group's local rank.
             nccl_peer: NCCL initialization protocol used by the inference workers
         """
         from nemo_rl.distributed.refit_watchdog import RELEASE_GRACE_S, release_within
@@ -59,9 +68,9 @@ class AbstractPolicyWorker:
         # about which port to use. rank 0 is a trainer and is this store's master.
         print(
             f"  refit: collective rendezvous [train] addr={ip}:{port} "
-            f"rank={self.rank} world_size={world_size} "
+            f"rank={self.rank + rank_offset} world_size={world_size} "
             f"train_world_size={train_world_size} peer={nccl_peer} "
-            f"master={self.rank == 0}",
+            f"master={self.rank + rank_offset == 0}",
             flush=True,
         )
 
@@ -72,7 +81,10 @@ class AbstractPolicyWorker:
         old_group, self.model_update_group = (
             self.model_update_group,
             StatelessProcessGroup(
-                master_address=ip, port=port, rank=self.rank, world_size=world_size
+                master_address=ip,
+                port=port,
+                rank=self.rank + rank_offset,
+                world_size=world_size,
             ),
         )
         # Rebuilding is the recovery path for a dead generation rank, so this runs more
@@ -335,8 +347,11 @@ class AbstractPolicyWorker:
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         with self.use_reference_model():
+            # Rollout routes (R3) belong to the policy, never to the reference model.
             reference_logprobs = self.get_logprobs(
-                data=data, micro_batch_size=micro_batch_size
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
@@ -346,6 +361,16 @@ class AbstractPolicyWorker:
     def finalize_async_save(self) -> None:
         """Block until any in-flight async checkpoint write completes. No-op by default."""
         pass
+
+    def poll_async_save(self) -> bool:
+        """Finalize a completed async checkpoint write without waiting; True when none is pending.
+
+        Not implemented by default: answering True for a backend that writes in the
+        background would let the caller publish a checkpoint whose write hasn't landed.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support polling async checkpoint saves."
+        )
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation

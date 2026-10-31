@@ -27,6 +27,8 @@ loss_fn:
   token_level_loss: false
 
 policy:
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
   model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
   logprob_chunk_size: null
 
@@ -36,8 +38,8 @@ policy:
   # max_total_sequence_length goes up to 131072, but we default to 32768 to make training more efficient for this instruct model which doesn't initially have such long output length.
   max_total_sequence_length: 32768
 
-  # Don't use dtensor. optimizer and scheduler are dtensor only (mcore has its own version of these)
-  dtensor_cfg:
+  # Don't use Automodel. optimizer and scheduler are Automodel only (mcore has its own version of these)
+  automodel_cfg:
     enabled: False
   optimizer: null
   scheduler: null
@@ -53,6 +55,10 @@ policy:
   generation:
     vllm_cfg:
       tensor_parallel_size: 4
+      # Required for rollout-throughput checkpoint A/B telemetry. Keep this
+      # identical in baseline and checkpoint-enabled runs.
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
       # This is a very low GPU mem utilization. We GPU OOM in two places:
       # Refit after train, refit before validation.
       gpu_memory_utilization: 0.7
@@ -66,21 +72,30 @@ policy:
     mcore_generation_config:
       max_model_len: ${policy.max_total_sequence_length}
       cuda_graph_impl: "local"
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
       inference_cuda_graph_scope: "block"
       buffer_size_gb: 10
-      num_cuda_graphs: 4
+      num_cuda_graphs: -1  # Number of CUDA graphs to build; -1 autotunes
       block_size_tokens: 256
       use_cuda_graphs_for_non_decode_steps: true
       enable_chunked_prefill: true
-      enable_prefix_caching: false
+      enable_prefix_caching: true
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
       max_tokens: 16384
       kv_cache_management_mode: "persist"
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
+      refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
+      refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs
-      refit_backend: "nccl"
       parsers: []
       expose_http_server: false
+      http_server_num_replicas: 8
 
   # Needs to be set to whatever backend TP size.
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
@@ -173,3 +188,8 @@ checkpointing:
   # 4. The checkpoint time for this model is around 10 mins.
   checkpoint_must_save_by: "00:03:30:00"
   save_period: 1
+
+# Optional wall-clock benchmark sampling. This is independent of the rollout
+# checkpoint save interval and may be enabled for baseline runs as well.
+rollout_checkpointing:
+  telemetry_interval_s: null

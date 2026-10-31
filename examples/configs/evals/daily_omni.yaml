@@ -40,6 +40,7 @@ data:
   dataset_name: "daily-omni"
   split: "train"
   env_name: vlm
+  max_samples: null # cap rows evaluated; null evaluates the whole split
 
 env:
   vlm:

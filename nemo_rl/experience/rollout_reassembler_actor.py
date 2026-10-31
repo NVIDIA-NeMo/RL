@@ -15,36 +15,28 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
 
 import ray
-import torch
 
+from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
-from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
-
-# Field names whose values are per-token and therefore large, but whose Python
-# type is indistinguishable from metadata -- a list[int] of token ids looks just
-# like a short list of ids. assert_metadata_only() below already rejects tensors
-# and unrecognised types; this list is only for heavy values that would otherwise
-# pass it. Add a name here whenever a new per-token field could reach an RPC
-# boundary, and update the dataclass inventory test that guards this file.
-_FORBIDDEN_RPC_KEYS = frozenset(
-    {
-        "input_ids",
-        "token_ids",
-        "token_ids_delta",
-        "token_mask",
-        "token_mask_delta",
-        "generation_logprobs",
-        "generation_logprobs_delta",
-        "generation_log_probs_delta",
-        "logprobs",
-        "logprobs_delta",
-        "routed_experts",
-    }
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.schema import forest_row_ids
+from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
+from nemo_rl.experience.rollout_reassembler import (
+    FinalizedGroup,
+    RolloutReassembler,
+    RolloutSelection,
 )
+from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+from nemo_rl.utils.rpc_guard import assert_metadata_only
+from nemo_rl.utils.venvs import make_actor_runtime_env
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
 
 
 @dataclass(frozen=True)
@@ -66,6 +58,66 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    logical_selections: Optional[tuple[RolloutSelection, ...]] = None
+    execution_row_multiple: int = 1
+    reward_checks: tuple[RewardChecks | None, ...] | None = None
+    reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
+    # Resolved by Gym and persisted with the sealed receipts for teacher routing.
+    resolved_agent_name: Optional[str] = None
+
+    @property
+    def capture_receipts(self) -> tuple[Optional[dict[str, Any]], ...]:
+        """Return cleanup receipts only after validating Forest capture ownership."""
+        if self.logical_selections is None:
+            return self.receipts
+        from nemo_gym.token_id_capture.staging.records import (
+            RolloutReceipt,
+            staging_key,
+        )
+
+        if len(self.logical_selections) != len(self.rollout_ids) or len(
+            self.receipts
+        ) != len(self.rollout_ids):
+            raise ValueError("Selection must cover every dispatched owner")
+        if self.canonical_sample_ids != tuple(
+            f"{self.group_id}_g{i}" for i in range(len(self.rollout_ids))
+        ):
+            raise ValueError("Canonical owners must match dispatch slots")
+        if any(
+            len(set(selection.response_ids)) != len(selection.response_ids)
+            or len(selection.action_flags) != len(selection.response_ids)
+            for selection in self.logical_selections
+        ):
+            raise ValueError("Selection must be unique and parallel to action flags")
+        for owner, receipt, selection in zip(
+            self.rollout_ids, self.receipts, self.logical_selections, strict=True
+        ):
+            parsed = RolloutReceipt.model_validate(receipt)
+            _receipt_staging_keys(receipt)
+            if not selection.response_ids and not parsed.capture_poisoned:
+                raise ValueError("Trainable capture requires a nonempty selection")
+            if parsed.capture_key != owner or any(
+                record.staging_key != staging_key(owner, record.model_call_id)
+                for record in parsed.manifest
+            ):
+                raise ValueError("Foreign capture scope in finalizer request")
+        return self.receipts
+
+    @property
+    def cleanup_sample_ids(self) -> tuple[str, ...]:
+        """Return the segment publication plan, including exact padding."""
+        if self.logical_selections is None:
+            return self.canonical_sample_ids
+        _ = self.capture_receipts  # Validate scope before exposing cleanup IDs.
+        plans = RolloutReassembler._plan_selected_calls(
+            list(self.rollout_ids), list(self.receipts), list(self.logical_selections)
+        )
+        return forest_row_ids(
+            self.group_id,
+            self.canonical_sample_ids,
+            [len(segments) for segments in plans],
+            execution_row_multiple=self.execution_row_multiple,
+        )
 
 
 @dataclass(frozen=True)
@@ -78,35 +130,14 @@ class RolloutReassemblerActorConfig:
     router_replay_enabled: bool
     defer_routed_experts_to_policy: bool
     max_seq_len: int
-
-
-def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
-    """Reject tensors and known heavy row fields reachable from an RPC graph."""
-    if isinstance(value, torch.Tensor):
-        raise TypeError(
-            f"{path} contains a torch.Tensor with shape {tuple(value.shape)}"
-        )
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return
-    if is_dataclass(value) and not isinstance(value, type):
-        for field_info in fields(value):
-            assert_metadata_only(
-                getattr(value, field_info.name),
-                path=f"{path}.{field_info.name}",
-            )
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key in _FORBIDDEN_RPC_KEYS:
-                raise TypeError(f"{path} contains forbidden heavy field {key!r}")
-            assert_metadata_only(key, path=f"{path}.key")
-            assert_metadata_only(item, path=f"{path}[{key!r}]")
-        return
-    if isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            assert_metadata_only(item, path=f"{path}[{index}]")
-        return
-    raise TypeError(f"{path} contains unsupported RPC type {type(value).__name__}")
+    # Whether the staging partition carries media columns (VLM capture).
+    capture_media: bool
+    # The pixel dtype and patch size the serving workers pinned the media
+    # column to; required with ``capture_media`` (the reassembler mints empty
+    # media rows in this geometry for groups without media), ``None`` otherwise.
+    media_columns: Optional[MediaColumnSpec]
+    reward_penalty_config: RewardPenaltyConfig | None = None
+    effort_config: EffortLevelsConfig | None = None
 
 
 @ray.remote(
@@ -132,6 +163,26 @@ class RolloutReassemblerActor:  # pragma: no cover
             router_replay_enabled=config.router_replay_enabled,
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
+            capture_media=config.capture_media,
+            media_columns=config.media_columns,
+            reward_penalty_config=config.reward_penalty_config,
+            effort_config=config.effort_config,
+        )
+
+    def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Run an owner-local checkpoint command; return metadata, never payloads."""
+        return run_checkpoint_command(body)
+
+    def check_dependencies(self) -> None:
+        """Import the finalization API before the controller starts rollouts."""
+        # Deferred: only the actor's environment needs the optional Gym extra.
+        from nemo_gym.token_id_capture.staging.rebuild import (  # noqa: F401
+            RebuildError,
+            ReceiptVerificationError,
+            verify_and_linearize,
+        )
+        from nemo_gym.token_id_capture.staging.records import (
+            RolloutReceipt,  # noqa: F401
         )
 
     def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
@@ -158,6 +209,18 @@ class RolloutReassemblerActor:  # pragma: no cover
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),
+            logical_selections=(
+                list(request.logical_selections)
+                if request.logical_selections is not None
+                else None
+            ),
+            execution_row_multiple=request.execution_row_multiple,
+            reward_checks=list(request.reward_checks)
+            if request.reward_checks is not None
+            else None,
+            reward_log_contexts=list(request.reward_log_contexts)
+            if request.reward_log_contexts is not None
+            else None,
         )
         assert_metadata_only(result)
         return result
@@ -169,9 +232,26 @@ def create_rollout_reassembler_actors(
     *,
     num_workers: int,
 ) -> list[Any]:
-    """Construct the fixed validation pool after TQ partitions are registered."""
+    """Construct and validate the pool after TQ partitions are registered."""
     if num_workers <= 0:
         raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
-    return [
-        RolloutReassemblerActor.remote(dp_config, config) for _ in range(num_workers)
+    runtime_env = make_actor_runtime_env(
+        "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+    )
+    actors = [
+        RolloutReassemblerActor.options(runtime_env=runtime_env).remote(
+            dp_config, config
+        )
+        for _ in range(num_workers)
     ]
+    try:
+        ray.get([actor.check_dependencies.remote() for actor in actors])
+    except ray.exceptions.RayError:
+        # Cleanup errors must not hide the startup failure or skip other actors.
+        for actor in actors:
+            try:
+                ray.kill(actor)
+            except Exception as error:
+                print(f"finalizer actor termination failed: {error}", flush=True)
+        raise
+    return actors

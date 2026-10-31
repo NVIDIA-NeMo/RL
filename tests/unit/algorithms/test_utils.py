@@ -14,7 +14,7 @@
 
 import math
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -27,14 +27,17 @@ from nemo_rl.algorithms.utils import (
     STEP_WINDOW_WALL_CLOCK_CATEGORIES,
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
+    calculate_trivial_reward_distributions,
     get_tokenizer,
     maybe_pad_last_batch,
     print_efficiency_summary,
     print_performance_metrics,
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.deepseek_v4_tokenizer import get_deepseek_v4_tokenizer
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 @pytest.fixture
@@ -149,6 +152,66 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     assert formatted == expected
 
 
+def test_get_processor_custom_template_updates_processor_and_tokenizer():
+    class NemotronH_Super_Omni_Reasoning_V3Processor:
+        pass
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.bos_token = "<bos>"
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    tokenizer.bos_token_id = 2
+    tokenizer.name_or_path = "test-processor"
+    processor = NemotronH_Super_Omni_Reasoning_V3Processor()
+    processor.tokenizer = tokenizer
+    processor.chat_template = "stale-template"
+
+    with patch(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ):
+        result = get_tokenizer(
+            {"name": "test-processor", "chat_template": "new-template"},
+            get_processor=True,
+        )
+
+    assert result is processor
+    assert tokenizer.chat_template == "new-template"
+    assert processor.chat_template == "new-template"
+
+
+def test_get_processor_custom_template_preserves_native_multimodal_template():
+    class Qwen2_5_VLProcessor:
+        pass
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.bos_token = "<bos>"
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    tokenizer.bos_token_id = 2
+    tokenizer.name_or_path = "test-processor"
+    processor = Qwen2_5_VLProcessor()
+    processor.tokenizer = tokenizer
+    processor.chat_template = "native-multimodal-template"
+
+    with patch(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ):
+        result = get_tokenizer(
+            {"name": "test-processor", "chat_template": "new-template"},
+            get_processor=True,
+        )
+
+    assert result is processor
+    assert tokenizer.chat_template == "new-template"
+    assert processor.chat_template == "native-multimodal-template"
+
+
 def test_get_tokenizer_forwards_tokenizer_kwargs():
     """Test get_tokenizer unpacks tokenizer_kwargs into from_pretrained."""
     config = {
@@ -184,6 +247,60 @@ def test_get_processor_forwards_tokenizer_kwargs():
         "model_max_length": 123,
         "use_fast": False,
     }
+
+
+@patch("nemo_rl.algorithms.utils.AutoTokenizer")
+@patch("nemo_rl.algorithms.utils.get_deepseek_v4_tokenizer")
+def test_get_tokenizer_uses_vllm_deepseek_v4_renderer(
+    mock_get_deepseek_v4_tokenizer, mock_auto_tokenizer, capsys
+):
+    base_tokenizer = MagicMock()
+    base_tokenizer.pad_token = "<pad>"
+    tokenizer = MagicMock()
+    mock_auto_tokenizer.from_pretrained.return_value = base_tokenizer
+    mock_get_deepseek_v4_tokenizer.return_value = tokenizer
+
+    result = get_tokenizer(
+        {
+            "name": "deepseek-ai/DeepSeek-V4-Flash-Base",
+            "chat_template": "deepseek_v4",
+            "chat_template_kwargs": {"enable_thinking": True},
+        }
+    )
+
+    assert result is tokenizer
+    mock_auto_tokenizer.from_pretrained.assert_called_once_with(
+        "deepseek-ai/DeepSeek-V4-Flash-Base", trust_remote_code=True
+    )
+    mock_get_deepseek_v4_tokenizer.assert_called_once_with(
+        base_tokenizer, {"enable_thinking": True}
+    )
+    assert "Using vLLM 0.25.1's DeepSeek V4 chat renderer" in capsys.readouterr().out
+
+
+class DummyDeepSeekV4Tokenizer:
+    vocab_size = 10
+
+    def get_added_vocab(self):
+        return {}
+
+    def encode(self, text, add_special_tokens=False, **kwargs):
+        assert add_special_tokens is False
+        return [ord(character) % 256 for character in text]
+
+
+def test_deepseek_v4_renderer_matches_single_turn_chat_format():
+    tokenizer = get_deepseek_v4_tokenizer(DummyDeepSeekV4Tokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Solve 1+1."}],
+        tokenize=False,
+        enable_thinking=False,
+    )
+
+    assert (
+        prompt == "<｜begin▁of▁sentence｜><｜User｜>Solve 1+1.<｜Assistant｜></think>"
+    )
 
 
 def test_maybe_pad_last_batch():
@@ -319,12 +436,76 @@ def test_maybe_pad_last_batch_preserves_multimodal_rows():
     assert all(shard.size == 3 for shard in shards)
 
 
+def _single_direct_packed_validation_row() -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "target_ids": torch.tensor([[2, 3, 4, -100]]),
+            "token_mask": torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+            "position_ids": torch.tensor([[0, 1, 2, 3]]),
+            "input_lengths": torch.tensor([4]),
+            "sample_mask": torch.tensor([1.0]),
+            "packed_cu_seqlens": torch.tensor([[0, 2, 4]], dtype=torch.int32),
+            "packed_cu_seqlens_lengths": torch.tensor([3]),
+            "packed_max_seqlen": torch.tensor([2]),
+            "idx": ["row-0"],
+            "task_name": ["sft"],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "input_ids",
+        "target_ids",
+        "token_mask",
+        "position_ids",
+        "input_lengths",
+        "packed_cu_seqlens",
+        "packed_cu_seqlens_lengths",
+        "packed_max_seqlen",
+    ],
+)
+def test_maybe_pad_last_direct_packed_batch_duplicates_tensor_row_fields(key: str):
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert torch.equal(result[key][1], result[key][0])
+
+
+@pytest.mark.parametrize("key", ["idx", "task_name"])
+def test_maybe_pad_last_direct_packed_batch_duplicates_list_row_fields(key: str):
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert result[key] == [result[key][0], result[key][0]]
+
+
+def test_maybe_pad_last_direct_packed_batch_marks_padding_row_invalid():
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert torch.equal(result["sample_mask"], torch.tensor([1.0, 0.0]))
+
+
+def test_maybe_pad_last_direct_packed_batch_rejects_unaligned_field():
+    batch = _single_direct_packed_validation_row()
+    batch["metadata"] = object()
+
+    with pytest.raises(TypeError, match="Unsupported type .* for index selection"):
+        maybe_pad_last_batch(batch, dp_size=2, mbs=1)
+
+
 # Performance Metrics Tests
 
 
 def _base_master_config(colocated: bool):
     return MasterConfig.model_construct(
-        cluster={"num_nodes": 2, "gpus_per_node": 8},
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         policy={
             "generation": {
                 "temperature": 1.0,
@@ -344,7 +525,7 @@ def _base_master_config(colocated: bool):
 
 def _base_ppo_master_config(colocated: bool):
     return PPOMasterConfig.model_construct(
-        cluster={"num_nodes": 2, "gpus_per_node": 8},
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         policy={
             "generation": {
                 "temperature": 1.0,
@@ -662,7 +843,9 @@ def test_calculate_baseline_and_std_per_prompt_basic():
     )
     valid_mask = torch.ones(6)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([2.5, 2.0, 1.5, 5.5, 5.0, 4.5])
     expected_std = torch.tensor(
@@ -685,7 +868,9 @@ def test_calculate_baseline_and_std_per_prompt_single_generation_per_prompt():
     )
     valid_mask = torch.ones(2)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     # When num_valid <= 1 (single generation per prompt), baseline equals reward
     expected_baseline = torch.tensor([2.5, 4.0])
@@ -711,13 +896,96 @@ def test_calculate_baseline_and_std_per_prompt_identical_rewards():
     )
     valid_mask = torch.ones(6)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([3.0, 3.0, 3.0, 7.0, 7.0, 7.0])
     expected_std = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
     assert torch.allclose(std, expected_std, rtol=1e-5)
+    assert is_trivial.all()
+
+
+def test_calculate_baseline_and_std_per_prompt_marks_trivial_leave_one_out_set():
+    """A sample's leave-one-out peers may be identical even when the full group is not."""
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+    prompts = torch.zeros(8, 1, dtype=torch.long)
+    valid_mask = torch.ones(8)
+
+    baseline, _, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
+
+    torch.testing.assert_close(baseline[0], torch.tensor(0.95))
+    assert is_trivial.tolist() == [True] + [False] * 7
+
+
+def test_calculate_baseline_and_std_per_prompt_trivial_set_respects_valid_mask():
+    """An invalid peer must not count toward the leave-one-out uniqueness check."""
+    rewards = torch.tensor([0.0, 0.95, 0.95, 7.0])
+    prompts = torch.zeros(4, 1, dtype=torch.long)
+
+    _, _, masked = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, torch.tensor([1.0, 1.0, 1.0, 0.0])
+    )
+    _, _, unmasked = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, torch.ones(4)
+    )
+
+    # Index 3 is the invalid row; its flag is incidental, so it is not pinned.
+    assert masked.tolist()[:3] == [True, False, False]
+    assert unmasked.tolist()[:3] == [False, False, False]
+
+
+def test_calculate_trivial_reward_distributions_uses_full_group():
+    """A mixed prompt is non-trivial for every row, independent of LOO peers."""
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+    prompts = torch.zeros(8, 1, dtype=torch.long)
+
+    is_trivial = calculate_trivial_reward_distributions(
+        prompts, rewards, torch.ones_like(rewards)
+    )
+
+    assert is_trivial.tolist() == [False] * 8
+
+
+def test_calculate_baseline_and_std_per_prompt_marks_trivial_from_std_rewards():
+    """DAPO case: triviality must be computed on std_rewards, not on rewards."""
+    rewards = torch.tensor([0.0, -0.2, -1.0, 1.0, 0.0, 1.0])
+    std_rewards = torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0, 1.0])
+    prompts = torch.tensor([[0], [0], [0], [1], [1], [1]])
+    valid_mask = torch.ones(6)
+
+    _, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts,
+        rewards,
+        valid_mask,
+        leave_one_out_baseline=False,
+        std_rewards=std_rewards,
+    )
+
+    assert is_trivial.tolist() == [True, True, True, False, False, False]
+    assert torch.allclose(std[:3], torch.zeros(3))
+    assert (std[3:] > 0).all()
+
+
+def test_calculate_baseline_and_std_per_prompt_marks_trivial_full_group_when_not_leave_one_out():
+    """Without leave-one-out, the comparison set includes self, so an outlier's
+    own group (not just its peers) determines triviality."""
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+    prompts = torch.zeros(8, 1, dtype=torch.long)
+    valid_mask = torch.ones(8)
+
+    _, _, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts,
+        rewards,
+        valid_mask,
+        leave_one_out_baseline=False,
+    )
+
+    assert is_trivial.tolist() == [False] * 8
 
 
 def test_calculate_baseline_and_std_per_prompt_mixed_prompt_sizes():
@@ -735,7 +1003,9 @@ def test_calculate_baseline_and_std_per_prompt_mixed_prompt_sizes():
     )
     valid_mask = torch.ones(5)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([2.0, 1.0, 5.5, 5.0, 4.5])
     expected_std = torch.tensor([0.0, 0.0, 0.707107, 1.414214, 0.707107])
@@ -750,10 +1020,13 @@ def test_calculate_baseline_and_std_per_prompt_empty_input():
     prompts = torch.empty(0, 3, dtype=torch.long)
     valid_mask = torch.tensor([])
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     assert baseline.shape == torch.Size([0])
     assert std.shape == torch.Size([0])
+    assert is_trivial.shape == torch.Size([0])
     assert torch.equal(baseline, torch.tensor([]))
     assert torch.equal(std, torch.tensor([]))
 
@@ -776,7 +1049,9 @@ def test_calculate_baseline_and_std_per_prompt_nan_handling():
     # Mark the second sample as invalid
     valid_mask = torch.tensor([1.0, 0.0, 1.0, 1.0, 1.0, 1.0])
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([3.0, 4.0, 1.0, 5.5, 5.0, 4.5])
     expected_std = torch.tensor([0.0, 0.0, 0.0, 0.707107, 1.414214, 0.707107])
@@ -801,11 +1076,14 @@ def test_calculate_baseline_and_std_per_prompt_cuda_compatibility():
     ).cuda()
     valid_mask = torch.ones(4).cuda()
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     # Verify results are on CUDA and have expected values
     assert baseline.device.type == "cuda"
     assert std.device.type == "cuda"
+    assert is_trivial.device.type == "cuda"
 
     expected_baseline = torch.tensor([2.0, 1.0, 4.0, 3.0]).cuda()
     expected_std = torch.tensor([0.0, 0.0, 0.0, 0.0]).cuda()
@@ -830,7 +1108,9 @@ def test_calculate_baseline_and_std_per_prompt_numerical_precision():
     )
     valid_mask = torch.ones(6)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([2.5e-8, 2e-8, 1.5e-8, 2.5e8, 2e8, 1.5e8])
 

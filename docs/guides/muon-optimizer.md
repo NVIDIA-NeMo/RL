@@ -20,7 +20,7 @@ To use Muon with NeMo RL, you need to configure the optimizer through the Megatr
 ```bash
 uv run examples/run_sft.py \
     policy.megatron_cfg.enabled=true \
-    policy.dtensor_cfg.enabled=false \
+    policy.automodel_cfg.enabled=false \
     ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
     ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
     ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
@@ -96,7 +96,7 @@ The full Muon command used for this run is:
 uv run examples/run_sft.py \
   --config examples/configs/sft_openmathinstruct2_megatron.yaml \
   policy.megatron_cfg.enabled=true \
-  policy.dtensor_cfg.enabled=false \
+  policy.automodel_cfg.enabled=false \
   ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
   ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
   ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
@@ -134,7 +134,7 @@ The command to generate the Muon results is:
 uv run examples/run_grpo.py \
   --config examples/configs/recipes/llm/dapo-qwen2.5-7b.v2.yaml \
   policy.megatron_cfg.enabled=true \
-  policy.dtensor_cfg.enabled=false \
+  policy.automodel_cfg.enabled=false \
   ++policy.megatron_cfg.optimizer.optimizer=dist_muon \
   ++policy.megatron_cfg.optimizer.muon_scale_mode=spectral \
   ++policy.megatron_cfg.optimizer.muon_momentum=0.9 \
@@ -144,6 +144,5 @@ uv run examples/run_grpo.py \
   policy.megatron_cfg.optimizer.use_distributed_optimizer=false \
   policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=false \
   cluster.num_nodes=16 cluster.gpus_per_node=8 \
-  policy.sequence_packing.enabled=true \
-  ~checkpointing.model_save_format
+  policy.sequence_packing.enabled=true
 ```

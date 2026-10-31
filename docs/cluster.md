@@ -111,7 +111,7 @@ sbatch ray.sub \
 * - `WANDB_API_KEY`
   - Setting this allows you to use the wandb logger without having to run `wandb login`.
 * - `HF_TOKEN`
-  - Setting the token used by huggingface-hub. Avoids having to run the `huggingface-cli login`
+  - Setting the token used by huggingface-hub. Avoids having to run the `hf auth login`
 * - `HF_DATASETS_CACHE`
   - Sets the cache dir for downloaded Huggingface datasets.
 ``````
@@ -133,7 +133,7 @@ sbatch ray.sub \
   - Explanation
 * - `UV_CACHE_DIR_OVERRIDE`
   - By default, this variable does not need to be set. If unset, `ray.sub` uses the 
-    `UV_CACHE_DIR` defined within the container (defaulting to `/root/.cache/uv`). 
+    `UV_CACHE_DIR` defined within the container (`/opt/nemo_rl_cache/uv` in images built from `docker/Dockerfile`; set `CONTAINER_UV_CACHE_DIR` for a container that uses another path). 
     `ray.sub` intentionally avoids using the `UV_CACHE_DIR` from the user's host 
     environment to prevent the host's cache from interfering with the container's cache. 
     Set `UV_CACHE_DIR_OVERRIDE` if you have a customized `uv` environment (e.g., 
@@ -172,8 +172,57 @@ sbatch ray.sub \
     **Watch segment divisibility.** With topology-aware placement the allocation
     becomes `--nodes=N+1`, which can trip the "`SEGMENT_SIZE` must evenly divide
     `NUM_NODES`" check in `tools/launch`.
+* - `NRL_MOUNT_HOST_ENROOT`
+  - Unset by default; set to `1` to bind-mount the compute node's own enroot
+    installation (every `/usr/bin/enroot*` file and the enroot library, share
+    and configuration directories that exist) into the training container, so a
+    process inside it, such as a NeMo Gym agent server that runs each agent in
+    its own sandbox, can start containers. Any value other than unset, `0` or
+    `1` is rejected when the batch script starts on the first allocated node.
+    pyxis validates every mount source on each node where a step starts and
+    fails with `pyxis: --container-mounts: source path does not exist`, so every
+    allocated node needs the same enroot layout. Only enroot's own files are
+    mounted: the training container must still provide the tools enroot's
+    subcommands invoke (`unsquashfs` for `enroot create`, `squashfuse` and
+    `fuse-overlayfs` for starting a `.sqsh` image directly). With
+    `tools/launch`, pass the variable through `EXTRA_ENV`.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
+* - `LOKI_PUSH_URL`
+  - Set this to stream logs to a Loki endpoint with
+    [Grafana Alloy](https://grafana.com/docs/alloy/), which runs alongside each
+    Ray container. Unset by default, which leaves log export off. Four streams
+    are shipped, distinguished by the `log_kind` label: Ray's own logs under
+    `/tmp/ray/session_*/logs` (`ray-internal`), which are otherwise lost when
+    the container exits; this container's wrapper log (`wrapper`); the driver
+    log (`driver`); and the sandbox sidecar logs (`sandbox`). Unlike
+    `RAY_LOG_SYNC_FREQUENCY`, which copies the same files to `BASE_LOG_DIR`,
+    this sends them over the network and so does not add per-file writes to the
+    shared filesystem.
+
+    It is separate from `telemetry.logs_enabled`
+    ([observability](observability/observability-stack.md)), which sends Python
+    log records from NeMo-RL processes over OTLP and does not see these files.
+
+    Requires an image providing `/usr/local/bin/alloy` (the included
+    `docker/Dockerfile` installs it) and a readable `alloy/config.alloy` under
+    the submission directory.
+
+    The shipped config authenticates with mTLS, so it also needs
+    `LOKI_CA_FILE`, `LOKI_CERT_FILE`, and `LOKI_KEY_FILE`. These are read inside
+    the container, so their directory must be listed in `MOUNTS`. For any other
+    scheme Loki supports, such as basic auth, a bearer token, or a tenant ID,
+    copy the config, edit its `loki.write` block, and point `ALLOY_CONFIG` at
+    the copy; the certificate variables are then not required.
+
+    If anything is missing, or if Alloy fails to start, `ray.sub` logs a warning
+    and the job runs normally without exporting logs.
+* - `ALLOY_CONFIG=$SLURM_SUBMIT_DIR/alloy/config.alloy`
+  - Path to the Alloy configuration, read inside the container. Override it to
+    use a config with different auth or different log sources.
+* - `CLUSTER_NAME=$SLURM_CLUSTER_NAME`
+  - Value of the `cluster` label on exported logs. Defaults to the cluster name
+    Slurm reports, so it only needs setting to label streams with something else.
 * - `NODE_MANAGER_PORT=1301`
   - Port for the Ray node manager on worker nodes.
 * - `OBJECT_MANAGER_PORT=1303`
@@ -276,7 +325,7 @@ SEGMENT_SIZE=2     # nodes per NVLink-domain segment; -> sbatch --segment
 
 ## Kubernetes
 
-This guide outlines the process of migrating NemoRL training jobs from a Slurm environment to a Kubernetes cluster utilizing Ray orchestration and NVIDIA GPUs.
+This guide outlines the process of migrating NeMo RL training jobs from a Slurm environment to a Kubernetes cluster utilizing Ray orchestration and NVIDIA GPUs.
 
 ---
 
@@ -313,11 +362,11 @@ docker login nvcr.io
 ```
 
 **Build and Push**
-Clone the NemoRL repository and build the container.
+Clone the NeMo RL repository and build the container.
 
 ```bash
 # Clone recursively
-git clone [https://github.com/NVIDIA-NeMo/RL](https://github.com/NVIDIA-NeMo/RL) --recursive
+git clone https://github.com/NVIDIA-NeMo/RL.git --recursive
 cd RL
 
 # If you already cloned without --recursive, update submodules:
@@ -382,7 +431,7 @@ We will create a Ray cluster with **1x Head node** and **1x Worker node** (with 
 * **Memory:** Disables Ray's OOM killer to prevent false positives.
 * **Caching:** Redirects HuggingFace cache to the shared PVC.
 * **Version Match:** The `rayVersion` spec must match the version in `RL/pyproject.toml`. Check this example [version snapshot](https://github.com/NVIDIA-NeMo/RL/blob/b2e4265d4f2424c0467691f2f0f864cdebe1ab0f/pyproject.toml#L25).
-* **Container image:** Replace the image name `nvcr.io/nvidian/nemo-rl:latest` with your actual image, e.g., `nvcr.io/YOUR_NGC_ORG/nemo-rl:latest`.
+* **Container image:** Replace `<NGC_ORG>` in `nvcr.io/<NGC_ORG>/nemo-rl:latest` with the NGC org you pushed to in the build step.
 
 > [!WARNING]
 > **Check Your Node Capacity & Resource Limits**
@@ -431,7 +480,7 @@ spec:
         
         containers:
         - name: ray-head
-          image: nvcr.io/nvidian/nemo-rl:latest
+          image: nvcr.io/<NGC_ORG>/nemo-rl:latest
           imagePullPolicy: Always
           resources:
             limits:
@@ -502,7 +551,7 @@ spec:
 
         containers:
         - name: ray-worker
-          image: nvcr.io/nvidian/nemo-rl:latest
+          image: nvcr.io/<NGC_ORG>/nemo-rl:latest
           imagePullPolicy: Always
           resources:
             limits:
@@ -553,7 +602,7 @@ spec:
 
 ---
 
-## Phase 3: Run Sample NemoRL Workloads
+## Phase 3: Run Sample NeMo RL Workloads
 
 Once the cluster is running, you can interact with the Ray head node to submit jobs.
 
@@ -567,7 +616,7 @@ Inside the pod, clone the code to the shared PVC (`/shared`). This ensures worke
 
 ```bash
 cd /shared
-git clone [https://github.com/NVIDIA-NeMo/RL](https://github.com/NVIDIA-NeMo/RL) --recursive
+git clone https://github.com/NVIDIA-NeMo/RL.git --recursive
 cd RL
 git submodule update --init --recursive
 ```

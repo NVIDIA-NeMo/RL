@@ -52,11 +52,16 @@ class MediaRef:
 
 @edataclass
 class CanonicalSFTSample(Sample):
-    """Model-neutral conversation produced by an Energon cooker."""
+    """Model-neutral conversation produced by an Energon cooker.
+
+    ``chat_template_preapplied`` marks text-only turns rendered upstream; the
+    generic adapter encodes their text directly instead of applying its template.
+    """
 
     messages: list[dict[str, Any]]
     media: list[MediaRef]
     tools: list[dict[str, Any]] | None
+    chat_template_preapplied: bool = False
 
 
 @edataclass
@@ -72,11 +77,22 @@ class EncodedSFTSample(Sample):
     pending_sample: CanonicalSFTSample | None = None
 
 
+@edataclass
+class PackedSFTSample(Sample):
+    """One physical pack of compatible encoded conversations."""
+
+    samples: list[EncodedSFTSample]
+    source_padded_lengths: list[int]
+    group_key: tuple[Any, ...]
+    pack_capacity: int
+
+
 __all__ = [
     "CanonicalSFTSample",
     "EncodedSFTSample",
     "FrozenMediaMetadata",
     "MediaRef",
     "MediaMetadataValue",
+    "PackedSFTSample",
     "freeze_media_metadata",
 ]

@@ -1,3 +1,5 @@
+defaults: ../legacy_environment_servers/super_rlvr.yaml
+
 checkpointing:
   enabled: true
   checkpoint_dir: "results/super_v3_prod_stage1"
@@ -6,8 +8,6 @@ checkpointing:
   keep_top_k: 1000000
   save_period: 10
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 grpo:
@@ -98,9 +98,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
     cpu_offload: False
     sequence_parallel: false
@@ -196,6 +197,7 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
+    speculator_type: "eagle3"
     num_layers: null
     aux_layer_indices: null
 

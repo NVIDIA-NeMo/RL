@@ -47,7 +47,75 @@ the async replay buffer and avoids uploading them to W&B. Numeric per-agent
 rollout metrics are unaffected. Set the flag to `true` only when the complete
 Gym result payloads are needed for a short debugging run.
 
+The exposed vLLM HTTP server binds every interface of its node and, by default,
+checks no credential on its OpenAI routes; the NeMo Gym model server sends the
+placeholder key `dummy_key`. Set `policy.generation.vllm_cfg.http_server_api_key_required: true`
+to require a bearer token instead (the setting needs `expose_http_server: true`
+and is refused at setup without it): NeMo RL generates one random key per job,
+every vLLM worker refuses a `/v1/*` or `/tokenize` request without
+`Authorization: Bearer <key>` (HTTP 401), and the same key reaches the NeMo Gym
+model server as `policy_api_key`. The saved and logged job configuration never
+carries the key: the vLLM workers receive it in their own configuration copy,
+and the Gym servers receive it as an environment variable
+(`NEMO_RL_POLICY_API_KEY`) that each server resolves in its own process, so
+Gym's serialized global config, its head server's `/global_config_dict_yaml`
+endpoint and the server command lines carry only the variable name. The
+residual exposure is the server processes' environment and the Gym actor's
+constructor arguments, the same as for the token-capture secret. The setting
+covers the vLLM backend only: the Megatron, TRT-LLM and Dynamo exposed servers
+check no credential and their Gym actors keep `dummy_key` (Dynamo rejects the
+setting at configuration time rather than ignoring it).
+
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
+
+### Shard NeMo Gym across nodes
+
+NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.
+
+Each shard defines a self-contained Gym configuration. NeMo RL starts one actor for each shard replica and routes every prompt group to the shard that hosts its agent or task source.
+
+```yaml
+env:
+  nemo_gym:
+    config_paths: null
+    shards:
+      - name: tools
+        port_range_low: 5000
+        port_range_high: 5499
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+      - name: math
+        port_range_low: 5500
+        port_range_high: 5999
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    common_inherited_overlays:
+      - policy_model
+    allowed_duplicate_entries:
+      - policy_model
+```
+
+Set the inherited top-level `config_paths` to `null` when the shard list replaces it. Each shard can also set `inherited_overlays` to claim inherited Gym entries, `overrides` to add shard-specific configuration, `replicas` to start identical actor instances, `actor_cpus` to reserve CPU capacity, and a non-overlapping port range.
+
+Use `common_inherited_overlays` for inherited entries that every shard needs. List an entry in `allowed_duplicate_entries` when it may appear in more than one shard. NeMo RL rejects unclaimed inherited entries, duplicate routable entries, and overlapping port ranges during setup.
+
+#### Choose actor placement
+
+The default `placement_strategy` is `STRICT_SPREAD`, which requires Ray to place each actor on a different node. This provides the capacity isolation that sharding is designed for.
+
+For a single-node test, set:
+
+```yaml
+env:
+  nemo_gym:
+    placement_strategy: PACK
+```
+
+`PACK` validates configuration, routing, and teardown on one machine, but it does not provide node-level capacity isolation. The other supported Ray strategies are `SPREAD` and `STRICT_PACK`. Shards with `replicas > 1` require the default `STRICT_SPREAD`; replicas share one merged configuration and port range, so any other strategy could place them on the same node.
+
+See `examples/nemo_gym/grpo_sharded_gym_smoke.yaml` for a complete manual smoke configuration.
 
 ### Version Requirements
 

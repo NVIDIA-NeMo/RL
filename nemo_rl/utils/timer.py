@@ -13,9 +13,11 @@
 # limitations under the License.
 import datetime
 import logging
+import os
 import sys
 import threading
 import time
+import warnings
 from contextlib import contextmanager
 from typing import Callable, Generator, Optional, Sequence, Union
 
@@ -136,7 +138,7 @@ class Timer:
             logger.debug(self._fmt(label, f"end elapsed={elapsed:.4f}s"))
         return elapsed
 
-    def record(self, label: str, elapsed: float) -> None:
+    def record(self, label: str, elapsed: float, should_log: bool = True) -> None:
         """Append a pre-measured duration without start/stop.
 
         Useful when the caller has already measured the elapsed time
@@ -145,11 +147,25 @@ class Timer:
         Args:
             label: The timing label to record under
             elapsed: The elapsed time in seconds
+            should_log: Emit the debug line. ``_fmt`` builds a timestamp and
+                joins the context on every call, which dominates the cost of
+                ``record`` itself -- pass ``False`` on a hot path.
         """
         if label not in self._timers:
             self._timers[label] = []
         self._timers[label].append(elapsed)
-        logger.debug(self._fmt(label, f"record elapsed={elapsed:.4f}s"))
+        if should_log:
+            logger.debug(self._fmt(label, f"record elapsed={elapsed:.4f}s"))
+
+    def drain(self, label: str) -> float:
+        """Sum and clear ``label`` in one step. Returns 0.0 if it never ran.
+
+        ``reduce`` then ``reset`` is two acquisitions on
+        :class:`ThreadSafeTimer`, so a concurrent ``record`` between them is
+        lost. Callers that consume-and-forget want this instead.
+        """
+        samples = self._timers.pop(label, None)
+        return float(sum(samples)) if samples else 0.0
 
     def mark(self, label: str, metadata: Optional[dict] = None) -> float:
         """Record a point-in-time event at the current Unix epoch.
@@ -356,9 +372,13 @@ class ThreadSafeTimer(Timer):
         with self._lock:
             return super().stop(label, should_log)
 
-    def record(self, label: str, elapsed: float) -> None:
+    def record(self, label: str, elapsed: float, should_log: bool = True) -> None:
         with self._lock:
-            super().record(label, elapsed)
+            super().record(label, elapsed, should_log)
+
+    def drain(self, label: str) -> float:
+        with self._lock:
+            return super().drain(label)
 
     def mark(self, label: str, metadata: Optional[dict] = None) -> float:
         with self._lock:
@@ -430,7 +450,15 @@ class TimeoutChecker:
         self.last_save_time = (
             float("inf") if timeout is None else convert_to_seconds(timeout)
         )
-        self.start_time = time.time()
+        # Start the clock at job start (NRL_JOB_START_EPOCH is set by ray.sub).
+        if "NRL_JOB_START_EPOCH" in os.environ:
+            self.start_time = float(os.environ["NRL_JOB_START_EPOCH"])
+        else:
+            warnings.warn(
+                "NRL_JOB_START_EPOCH is not set; timeout is measured from now",
+                stacklevel=2,
+            )
+            self.start_time = time.time()
         self.last_saved = False
         self.iteration_times = []
         self.previous_iteration_time: Optional[float] = None

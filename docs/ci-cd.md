@@ -8,11 +8,11 @@ Tests are organized into levels of increasing scope and cost:
 
 | Level | What runs | When |
 |-------|-----------|------|
-| **docs** | Doctests only | `CI:docs` label |
+| **docs** | Doctests only, reuses pre-built main container (skips build); PRs to a release branch (e.g. `r0.8.0`) reuse that branch's container, same as Lfast | `CI:docs` label |
 | **L0** | Doctests + unit tests (3 parallel suites: Generation, Policy, Other) | `CI:L0` label |
 | **L1** | Doctests + unit tests + functional tests (GPU) | `CI:L1` label, push to main/merge-group |
-| **L2** | Full suite including convergence tests | `CI:L2` label |
-| **Lfast** | Fast unit + functional tests, reuses pre-built main container (skips build) | `CI:Lfast` label |
+| **L2** | Same as L1 today (plan to add convergence tests) | `CI:L2` label |
+| **Lfast** | Fast unit + functional tests, reuses pre-built main container (skips build); PRs to a release branch (e.g. `r0.8.0`) reuse that branch's container, which is published only by builds of the release branch itself (pushes after merges), never by PR builds; until the first such build exists, Lfast on that branch cannot pull its image | `CI:Lfast` label |
 
 **Defaults:**
 - PRs do not run tests unless a CI label is applied.
@@ -20,9 +20,22 @@ Tests are organized into levels of increasing scope and cost:
 - Nightly scheduled runs (09:00 UTC) run the full suite.
 - Doc-only changes are auto-detected and skip unnecessary tests.
 
+### When Lfast missed a failure
+
+`CI:Lfast` runs a subset of `CI:L1`. If L1 catches a failure that Lfast missed, promote the test that caught it into Lfast so the next PR sees it earlier:
+
+- Unit test: narrow or remove the entry that excludes it in `tests/unit/excluded_unit_tests.sh`. Tests under `research/*/tests/unit` never run in Lfast.
+- Functional test: change its `run_test <cmd>` line in `tests/functional/L1_Functional_Tests_*.sh` to `run_test fast <cmd>`. Lfast runs only the H100 scripts, so a test in an `L1_Functional_Tests_GB200_*.sh` script, or a failure that reproduces only on GB200, cannot be promoted this way.
+
+## Shared Build Caches
+
+- The prebuilt `main` container and the TRT-LLM ccache/wheel cache images are written only by builds of `main` itself. PR builds read them but never push to them.
+- Release branches (`r<major>.<minor>.<patch>`) get their own container tag (`:<branch>`), `<branch>-buildcache` and branch-scoped TRT-LLM caches, written only by pushes to that branch (manual dispatches on a release branch publish nothing shared). They never write `main`'s caches or the `uv-cache` image.
+- A PR's own image is tagged with its run ID and PR number only.
+
 ## Triggering CI on Pull Requests
 
-1. **Apply a CI label** to your PR: `CI:docs`, `CI:L0`, `CI:L1`, `CI:L2`, or `CI:Lfast`.
+1. **Apply a CI label** to your PR: `CI:docs`, `CI:L0`, `CI:L1`, `CI:L2`, or `CI:Lfast`. Use `CI:docs` for docs-only changes. Otherwise use `CI:Lfast` by default, including for new features and bug fixes; use `CI:L1` only for a large refactor, broad changes to core code, or dependency changes.
 2. **Comment** `/ok to test <commit-sha>` — a bot will acknowledge with a thumbs-up and start CI.
    - If you are an external contributor, you will need an internal NVIDIA developer to comment this on your PR to trigger CI.
 3. The **`Skip CICD`** label bypasses tests entirely (except on `main`/merge-group).

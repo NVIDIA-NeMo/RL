@@ -6,8 +6,6 @@ checkpointing:
   keep_top_k: 100
   save_period: 5
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 grpo:
@@ -98,9 +96,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
     cpu_offload: False
     sequence_parallel: false
@@ -196,6 +195,7 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
+    speculator_type: "eagle3"
     num_layers: null
     aux_layer_indices: null
 
@@ -311,6 +311,13 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+    swe_pivot_single_step_tool_use_with_argument_comparison_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_pivot_single_step_tool_use_with_argument_comparison_agent
 
 logger:
   log_dir: "logs"

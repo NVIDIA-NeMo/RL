@@ -19,7 +19,8 @@ from __future__ import annotations
 import asyncio
 import io
 import threading
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
@@ -29,11 +30,13 @@ import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     REPLAY_BUFFER_METADATA_STORAGE,
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
     TQReplayBuffer,
     replay_manifest_digest,
 )
+from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -45,6 +48,7 @@ from nemo_rl.experience.route_plan import (
     RouteSpan,
     encode_route_plan,
 )
+from tests.unit.single_controller.test_logical_advantage import _batch as _logical_batch
 
 # Each record yields _N_GENS training rows.
 _N_GENS = 2
@@ -55,8 +59,14 @@ def _stub_record_to_train_batch(
     *,
     pad_value_dict: Any,
     include_message_violation_fields: bool,
+    per_token_multimodal_fields: tuple[str, ...] = (),
 ) -> BatchedDataDict[Any]:
-    del record, pad_value_dict, include_message_violation_fields
+    del (
+        record,
+        pad_value_dict,
+        include_message_violation_fields,
+        per_token_multimodal_fields,
+    )
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((_N_GENS, 3), dtype=torch.long),
@@ -448,6 +458,54 @@ class TestDataPlaneCheckpointBarrier:
 
         asyncio.run(exercise())
 
+    def test_reports_mutations_blocked_by_checkpoint(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+
+            async def mutate(kind: CheckpointMutationKind) -> None:
+                async with barrier.mutation(kind):
+                    pass
+
+            async with barrier.checkpoint():
+                commit_task = asyncio.create_task(mutate("group_commits"))
+                seal_task = asyncio.create_task(mutate("sibling_seals"))
+                await asyncio.sleep(0)
+                active = await barrier.drain_telemetry()
+                assert active.checkpoint_active
+                assert active.waiting_mutations == 2
+                assert active.max_waiting_mutations == 2
+                assert sum(active.blocked_by_kind.values()) == 0
+
+            await asyncio.gather(commit_task, seal_task)
+            completed = await barrier.drain_telemetry()
+            assert not completed.checkpoint_active
+            assert completed.waiting_mutations == 0
+            assert completed.max_waiting_mutations == 2
+            assert completed.blocked_by_kind["group_commits"] == 1
+            assert completed.blocked_by_kind["sibling_seals"] == 1
+            assert len(completed.wait_durations_s) == 2
+            assert all(duration >= 0 for duration in completed.wait_durations_s)
+
+            drained = await barrier.drain_telemetry()
+            assert sum(drained.blocked_by_kind.values()) == 0
+            assert drained.wait_durations_s == ()
+            assert drained.max_waiting_mutations == 0
+
+        asyncio.run(exercise())
+
+    def test_rejects_unknown_mutation_kind(self) -> None:
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            unknown = cast(CheckpointMutationKind, "group_commit")
+
+            with pytest.raises(
+                ValueError, match="unknown checkpoint mutation kind 'group_commit'"
+            ):
+                async with barrier.mutation(unknown):
+                    pytest.fail("unknown mutation kind unexpectedly admitted")
+
+        asyncio.run(exercise())
+
 
 class TestTQReplayBufferReserveCommit:
     def test_reserve_rejects_duplicate_live_group_id(self):
@@ -488,13 +546,16 @@ class TestTQReplayBufferReserveCommit:
         buf = _make_buffer(dp)
         observations = []
 
-        async def enrich(meta, record):
-            del record
+        async def enrich(meta, extra_env_info):
+            assert extra_env_info == {"agent_ref": {"name": "image_agent"}}
             observations.append((dp.depth(), list(buf.ready_list)))
             return meta.with_fields(["teacher_reference_logprobs"])
 
         buf.set_post_write_enricher(enrich)
-        meta = _add_group(buf, weight=3)
+        record = _make_record()
+        record.extra_env_info = {"agent_ref": {"name": "image_agent"}}
+        group_id = buf.reserve(weight_version=3)
+        meta = _run(buf.commit(group_id, record, 3, 3))
 
         assert observations == [(_N_GENS, [False])]
         assert "teacher_reference_logprobs" in meta.fields
@@ -637,8 +698,13 @@ class TestTQReplayBufferReserveCommit:
         assert buf.end_weight_list == [4]
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
-        # TQ tags preserve both dispatch-time weight and dataset identity.
-        assert meta.tags == [{"weight_version": 3, "prompt_idx": 418}] * _N_GENS
+        # TQ tags preserve dispatch-time weight, dataset identity, and the
+        # prompt-group key the advantage stage reduces over.
+        assert (
+            meta.tags
+            == [{"weight_version": 3, "prompt_idx": 418, "group_id": group_id}]
+            * _N_GENS
+        )
         assert len(dp.put_calls) == 1
         assert len(trace_calls) == 1
         assert trace_calls[0]["keys"] == meta.sample_ids
@@ -1080,6 +1146,20 @@ def _make_metadata_envelope(
     }
 
 
+def _make_forest_group_entry(
+    group_id: str, segments: list[int], *, padding: bool = True
+) -> dict[str, Any]:
+    meta, _ = _logical_batch(
+        [(group_id, [(float(slot), count) for slot, count in enumerate(segments)])],
+        padding=padding,
+    )
+    group = _make_group_entry(group_id, weight=3, target_step=4)
+    meta.partition_id = "rollout_data"
+    meta.sequence_lengths = [3] * meta.size
+    group["meta"] = meta
+    return group
+
+
 def _load(
     buf: TQReplayBuffer,
     state: dict[str, Any],
@@ -1135,6 +1215,69 @@ class TestReplayManifestDigest:
 
 
 class TestTQReplayBufferStateDict:
+    def test_borrow_and_repayment_remain_selectable_after_restore(self) -> None:
+        async def exercise() -> None:
+            dp = FakeDataPlaneClient()
+            original = _make_buffer(dp)
+            lender_id = original.reserve(
+                weight_version=0,
+                target_step=1,
+                group_id="lender",
+            )
+            await original.commit(
+                lender_id,
+                _make_record(),
+                start_weight_version=0,
+                end_weight_version=0,
+            )
+
+            assert original.promote_ready_group(to_target_step=0) == 1
+
+            repayment_id = original.reserve(
+                weight_version=0,
+                target_step=1,
+                group_id="repayment",
+            )
+            await original.commit(
+                repayment_id,
+                _make_record(),
+                start_weight_version=0,
+                end_weight_version=0,
+            )
+            state = original.metadata_state_dict(saved_capacity=8)
+
+            restored = _make_buffer(dp)
+            await restored.load_state_dict(
+                state,
+                max_groups=8,
+                expected_partition_id="rollout_data",
+                expected_group_size=_N_GENS,
+                expected_manifest_digest=state["manifest_digest"],
+            )
+            sampler = InOrderSampler(restored, max_lookahead_versions=1)
+            sampler.restore_dispatch_index(1)
+
+            borrowed, borrowed_count = await sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=1,
+                max_prompt_groups=1,
+            )
+            repaid, repaid_count = await sampler.select(
+                current_train_weight=1,
+                min_prompt_groups=1,
+                max_prompt_groups=1,
+            )
+
+            assert borrowed is not None
+            assert borrowed.sample_ids == ["lender_g0", "lender_g1"]
+            assert borrowed_count == 1
+            assert repaid is not None
+            assert repaid.sample_ids == ["repayment_g0", "repayment_g1"]
+            assert repaid_count == 1
+            assert restored.group_ids == ()
+
+        asyncio.run(exercise())
+
     def test_training_claim_is_reindexed_only_for_periodic_snapshot(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
@@ -1574,6 +1717,133 @@ class TestTQReplayBufferLoadPreflight:
         assert buf.target_step_list == [1, 2]
 
 
+class TestForestReplayRestore:
+    @pytest.mark.parametrize("segments", [[1], [3], [1, 1], [3, 1], [2, 1, 3]])
+    @pytest.mark.parametrize("padding", [False, True])
+    def test_serialized_round_trip_preserves_physical_rows_and_group_capacity(
+        self, segments: list[int], padding: bool, tmp_path: Path
+    ) -> None:
+        groups = [
+            _make_forest_group_entry(name, segments, padding=padding)
+            for name in ("first", "second")
+        ]
+        # Exercise physical order independently of logical slot/segment order.
+        groups[0]["meta"] = groups[0]["meta"].subset(
+            list(reversed(range(groups[0]["meta"].size)))
+        )
+        state = _make_metadata_envelope(groups, saved_capacity=2)
+        source = _make_buffer(FakeDataPlaneClient())
+        assert (
+            _load(source, state, max_groups=2, expected_group_size=len(segments)) == 2
+        )
+        path = tmp_path / "replay.pt"
+        torch.save(source.metadata_state_dict(saved_capacity=2), path)
+        restored_state = torch.load(path, weights_only=False)  # Trusted test bytes.
+        dp = FakeDataPlaneClient()
+        restored = _make_buffer(dp)
+        assert (
+            _load(
+                restored,
+                restored_state,
+                max_groups=2,
+                expected_group_size=len(segments),
+            )
+            == 2
+        )
+        assert restored.size() == 2  # Not the number of segments/padding rows.
+        assert restored.start_weight_list == [3, 3]
+        assert restored.end_weight_list == [3, 3]
+        assert restored.target_step_list == [4, 4]
+        assert restored.count_for_target_step(4) == 2
+        assert restored.meta_list == [group["meta"] for group in groups]
+        assert restored.metadata_state_dict(saved_capacity=2) == state
+        assert dp.put_calls == dp.get_calls == dp.clear_calls == []
+
+    @pytest.mark.parametrize(
+        "corruption",
+        [
+            "partial_tags",
+            "missing_owner",
+            "missing_segment",
+            "duplicate_segment",
+            "wrong_owner",
+            "wrong_row_id",
+            "wrong_group_size",
+            "wrong_group_id",
+            "segment_count",
+            "padding_owner",
+            "padding_segment",
+            "padding_count",
+            "padding_only",
+            "boolean_segment",
+            "boolean_group_size",
+            "duplicate_row_id",
+        ],
+    )
+    def test_invalid_metadata_is_rejected_before_index_mutation(
+        self, corruption: str
+    ) -> None:
+        group = _make_forest_group_entry("broken", [2, 1])
+        meta = group["meta"]
+        if corruption == "partial_tags":
+            del meta.tags[0]["segment_count"]
+        elif corruption == "missing_owner":
+            group["meta"] = meta.subset([0, 1, 3])
+        elif corruption == "missing_segment":
+            group["meta"] = meta.subset([0, 2, 3])
+        elif corruption == "duplicate_segment":
+            meta.tags[1]["segment_index"] = 0
+        elif corruption == "wrong_owner":
+            meta.tags[0]["logical_rollout_id"] = "foreign_g0"
+        elif corruption == "wrong_row_id":
+            meta.sample_ids[0] = "foreign_g0_s0"
+        elif corruption == "wrong_group_size":
+            meta.tags[0]["logical_group_size"] = 3
+        elif corruption == "wrong_group_id":
+            group["group_id"] = "foreign"
+        elif corruption == "segment_count":
+            meta.tags[0]["segment_count"] = 3
+        elif corruption == "padding_owner":
+            meta.tags[-1]["logical_rollout_id"] = "broken_g0"
+        elif corruption == "padding_segment":
+            meta.tags[-1]["segment_index"] = 0
+        elif corruption == "padding_count":
+            meta.tags[-1]["segment_count"] = 1
+        elif corruption == "padding_only":
+            group["meta"] = meta.subset([3])
+        elif corruption == "boolean_segment":
+            meta.tags[0]["segment_index"] = False
+        elif corruption == "boolean_group_size":
+            meta.tags[0]["logical_group_size"] = True
+        elif corruption == "duplicate_row_id":
+            meta.sample_ids[1] = meta.sample_ids[0]
+        # Recompute the digest so structural validation, not integrity mismatch,
+        # rejects the bad group, even after an earlier sound group was validated.
+        state = _make_metadata_envelope(
+            [_make_forest_group_entry("sound", [1, 1]), group]
+        )
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        with pytest.raises(ValueError, match="Forest"):
+            _load(buf, state)
+        assert buf.size() == 0 and buf.meta_list == []
+        assert dp.put_calls == dp.get_calls == dp.clear_calls == []
+
+    def test_forest_restore_preserves_digest_and_capacity_checks(self) -> None:
+        state = _make_metadata_envelope([_make_forest_group_entry("g", [3, 1])])
+        for kwargs, message in [
+            ({"max_groups": 0}, "more replay groups"),
+            ({"expected_manifest_digest": "wrong"}, "loaded TQ checkpoint"),
+        ]:
+            buf = _make_buffer(FakeDataPlaneClient())
+            with pytest.raises(ValueError, match=message):
+                _load(buf, state, **kwargs)
+            assert buf.size() == 0
+        state["groups"][0]["meta"].sequence_lengths[0] += 1
+        with pytest.raises(ValueError, match="digest does not match its contents"):
+            _load(_make_buffer(FakeDataPlaneClient()), state)
+
+
 class MultiPartitionFakeDataPlaneClient(FakeDataPlaneClient):
     """Fake DP client that tracks rows per partition (token-capture mode)."""
 
@@ -1695,6 +1965,47 @@ class TestTQReplayBufferTokenCaptureMode:
         )
         with pytest.raises(ValueError, match="no live slot"):
             _run(_commit_finalized(buf, "ghost", meta, 0, 0))
+
+    @pytest.mark.parametrize("evict_target", [False, True])
+    def test_commit_finalized_rechecks_slot_after_enrichment(self, evict_target):
+        async def exercise():
+            buf = self._make_capture_buffer(MultiPartitionFakeDataPlaneClient())
+            previous = buf.reserve(weight_version=1)
+            target = buf.reserve(weight_version=2)
+            meta = KVBatchMeta(
+                partition_id="rollout_data",
+                task_name="train",
+                sample_ids=[f"{target}_g0"],
+                fields=["input_ids"],
+            )
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def enrich(meta, extra_env_info):
+                started.set()
+                await release.wait()
+                return meta.with_fields(["teacher_reference_logprobs"])
+
+            buf.set_post_write_enricher(enrich)
+            task = asyncio.create_task(_commit_finalized(buf, target, meta, 2, 3))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            assert buf.ready_list == [False, False]
+            assert buf.abort(target if evict_target else previous)
+            release.set()
+            if evict_target:
+                with pytest.raises(ValueError, match="evicted during enrichment"):
+                    await task
+                assert buf.group_ids == (previous,)
+                assert buf.ready_list == [False]
+                assert buf.meta_list == [None]
+            else:
+                enriched = await task
+                assert buf.group_ids == (target,)
+                assert buf.meta_list == [enriched]
+                assert "teacher_reference_logprobs" in enriched.fields
+                assert buf.ready_list == [True]
+
+        _run(exercise())
 
     def test_commit_finalized_verifies_full_plan_manifest_ownership(self):
         dp = MultiPartitionFakeDataPlaneClient()

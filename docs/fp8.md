@@ -73,6 +73,43 @@ attention, the router, and the language-model head in BF16:
                     - model.layers.*.mlp.gate
 ```
 
+`num_first_layers_in_bf16` and `num_last_layers_in_bf16` keep complete
+transformer layers in BF16. NeMo RL reads the model configuration and parameter
+names, so these options do not require a model-specific `model.layers` or
+`backbone.layers` prefix. The patterns above still apply to every middle layer.
+
+For example, this Nemotron 3.5 Lightning scope keeps the first two and last six
+layers in BF16. In the middle layers it quantizes only the non-shared routed
+experts. Attention, Mamba projections, routers, shared experts, latent
+projections, and MTP remain in BF16:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      precision: fp8
+      is_mx: true
+      num_first_layers_in_bf16: 2
+      num_last_layers_in_bf16: 6
+      quantization_ignore_patterns:
+        - "*layers.*.mixer.qkv_proj"
+        - "*layers.*.mixer.o_proj"
+        - "*layers.*.mixer.in_proj"
+        - "*layers.*.mixer.out_proj"
+        - "*layers.*.mixer.up_proj"
+        - "*layers.*.mixer.down_proj"
+        - "*layers.*.mixer.gate"
+        - "*layers.*.mixer.shared_experts.*"
+        - "*layers.*.mixer.fc1_latent_proj"
+        - "*layers.*.mixer.fc2_latent_proj"
+        - "*mtp.*"
+```
+
+To quantize QKVO as well as the routed experts, remove the `qkv_proj` and
+`o_proj` entries. The first two and last six layers still remain entirely in
+BF16. Check the logged effective ignore list when adding a new model family;
+an ignore pattern that matches no module is usually a naming error.
+
 `lm_head` is always excluded from FP8 and MXFP8 quantization, even when it is
 not listed in `quantization_ignore_patterns` in the YAML configuration.
 Models with MTP layers must list their MTP module names explicitly, for example
@@ -84,6 +121,43 @@ MXFP8 configurations should use `quantization_ignore_patterns` instead.
 `quantization_ignore_patterns` requires `is_mx: true`. Non-MX FP8
 (`precision: "fp8"` without `is_mx`) has no pattern-based replacement yet and
 must continue to use `quantization_ignored_layer_kws`.
+
+### Optional trainer-side MXFP8 refit
+
+By default, the rollout worker receives BF16 weights and quantizes them.
+To reduce the transfer size, enable trainer-side quantization:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+  generation:
+    backend: vllm
+    vllm_cfg:
+      precision: fp8
+      is_mx: true
+      refit_prequantize: true
+```
+
+Use this option only with a Megatron policy and an MXFP8 vLLM rollout.
+The policy worker quantizes supported BF16 weights and sends E4M3 values with
+E8M0 scales. Other weights use their normal refit path.
+
+For each block of 32 supported weight values, the weight payload changes from
+64 BF16 bytes to 32 E4M3 bytes plus one scale byte. This count excludes
+transport metadata, padding, and weights that are not eligible for this option.
+It does not predict the end-to-end speedup.
+
+On Blackwell, the policy worker uses FlashInfer when it is available.
+Otherwise, it uses the PyTorch reference quantizer. Both paths
+store scales in `*_scale_from_checkpoint`. NeMo RL checks the value and scale
+shapes and normalizes zero scales before loading the weights.
+
+Do not use `refit_prequantize` with blockwise FP8, BF16, NVFP4, sparse-delta
+refit, NCCL Reshard, or the vLLM reload API. NVFP4 real-quant rollout uses a
+different packed-weight refit protocol. GB200 tests check quantized-value
+parity with the installed vLLM quantizer. Functional GRPO tests also check
+refit in separate policy and rollout worker environments.
 
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
@@ -135,9 +209,11 @@ does not enable FP8 compute in the usual training path, so keep
 When both `fp8_cfg` and `te_precision_config_file` are set, matched modules use
 the recipe's per-module quantization config. NeMo RL still derives sequence
 padding and FP8 refit behavior from `fp8_cfg`, so matched FP8 recipes must use
-the same `fp8_quantization_recipe` as `fp8_cfg.fp8_recipe`. Recipe
-`training_recipe` and `evaluation_recipe` fields `fp8_param` and `fp4_param`
-are rejected; use `fp8_cfg.fp8_param` for supported FP8 parameter storage.
+the same `fp8_quantization_recipe` as `fp8_cfg.fp8_recipe`. Per-module
+`fp8_param: true` is supported only with `megatron_cfg.zero_train_gen_mismatch: true`
+and both `fp8_cfg.enabled` and `fp8_cfg.fp8_param` true; otherwise use
+`fp8_cfg.fp8_param`. Per-module `fp4_param: true` remains unsupported.
+Matched BF16 blocks may leave both parameter-storage flags unset.
 
 ## Compatibility Note for DeepSeek-Style FP8 Training
 

@@ -12,8 +12,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+
+
+def test_policy_waits_for_param_sync_before_refit(monkeypatch):
+    calls = []
+    waited_for = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+    monkeypatch.setattr("nemo_rl.models.policy.lm_policy.ray.get", waited_for.append)
+    policy = Policy.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+
+    policy.sync_params_before_refit()
+
+    assert calls == [("sync_params_before_refit", {})]
+    assert waited_for == [["future"]]
+
+
+def _poll_policy(monkeypatch, worker_results):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return worker_results
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
+    )
+    policy = Policy.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+    return policy, calls
+
+
+def test_policy_poll_async_save_returns_the_workers_shared_answer(monkeypatch):
+    for answer in (True, False):
+        policy, calls = _poll_policy(monkeypatch, [answer, answer, answer])
+        assert policy.poll_async_save() is answer
+        assert calls == [("poll_async_save", {})]
+
+
+def test_policy_poll_async_save_rejects_disagreeing_workers(monkeypatch):
+    policy, _ = _poll_policy(monkeypatch, [True, False])
+    with pytest.raises(RuntimeError, match="disagree"):
+        policy.poll_async_save()
 
 
 def test_policy_forwards_nccl_peer_to_workers():
@@ -47,7 +97,160 @@ def test_policy_forwards_nccl_peer_to_workers():
                 "port": 1234,
                 "world_size": 4,
                 "train_world_size": 2,
+                "rank_offset": 0,
                 "nccl_peer": "vllm",
+            },
+        )
+    ]
+
+
+def test_policy_forwards_rank_offset_to_workers():
+    """Megatron M-to-N generation ranks join the group after the training ranks."""
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    policy = Policy.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+
+    policy.init_collective(
+        "127.0.0.1",
+        1234,
+        6,
+        train_world_size=4,
+        rank_offset=4,
+        nccl_peer="nemo",
+    )
+
+    assert calls == [
+        (
+            "init_collective",
+            {
+                "ip": "127.0.0.1",
+                "port": 1234,
+                "world_size": 6,
+                "train_world_size": 4,
+                "rank_offset": 4,
+                "nccl_peer": "nemo",
+            },
+        )
+    ]
+
+
+def test_policy_worker_offsets_its_rank_in_the_collective(monkeypatch):
+    """A non-zero rank_offset shifts the worker's rank within the shared group."""
+    calls = []
+
+    class ProcessGroup:
+        def __init__(self, **kwargs):
+            calls.append(("create", kwargs))
+
+        def init_nccl_communicator(self, **kwargs):
+            calls.append(("init", kwargs))
+
+    monkeypatch.setattr(
+        "nemo_rl.distributed.stateless_process_group.StatelessProcessGroup",
+        ProcessGroup,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.base_policy_worker.torch.cuda.current_device",
+        lambda: 0,
+    )
+
+    worker = AbstractPolicyWorker.__new__(AbstractPolicyWorker)
+    worker.rank = 1
+    worker.init_collective(
+        "127.0.0.1",
+        1234,
+        6,
+        train_world_size=4,
+        rank_offset=4,
+    )
+
+    assert calls[0] == (
+        "create",
+        {
+            "master_address": "127.0.0.1",
+            "port": 1234,
+            "rank": 5,
+            "world_size": 6,
+        },
+    )
+
+
+def test_policy_forwards_final_checkpoint_marker_to_automodel(monkeypatch):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
+    )
+    policy = Policy.__new__(Policy)
+    policy.cfg = {"automodel_cfg": {"enabled": True}}
+    policy.worker_group = WorkerGroup()
+
+    policy.save_checkpoint(
+        weights_path="checkpoint/weights",
+        is_final_checkpoint=True,
+    )
+
+    assert calls == [
+        (
+            "save_checkpoint",
+            {
+                "weights_path": "checkpoint/weights",
+                "optimizer_path": None,
+                "tokenizer_path": None,
+                "is_final_checkpoint": True,
+            },
+        )
+    ]
+
+
+def test_policy_uses_megatron_save_path_when_automodel_is_disabled(monkeypatch):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
+    )
+    policy = Policy.__new__(Policy)
+    policy.cfg = {
+        # Disabled Automodel settings must not select the Automodel save path.
+        "automodel_cfg": {"enabled": False},
+        "megatron_cfg": {"enabled": True},
+    }
+    policy.worker_group = WorkerGroup()
+
+    policy.save_checkpoint(
+        weights_path="checkpoint/weights",
+        is_final_checkpoint=False,
+    )
+
+    assert calls == [
+        (
+            "save_checkpoint",
+            {
+                "weights_path": "checkpoint/weights",
+                "optimizer_path": None,
+                "tokenizer_path": None,
             },
         )
     ]
@@ -129,6 +332,7 @@ def test_policy_forwards_packed_collective_options_to_workers():
                 "refit_timeout_s": None,
                 "buffer_size_bytes": 1024**3,
                 "num_buffers": 2,
+                "use_legacy_packing": False,
             },
         )
     ]

@@ -18,6 +18,7 @@ import sys
 import time
 import traceback
 import unittest.mock
+import warnings
 import weakref
 
 import pytest
@@ -25,83 +26,17 @@ import torch
 import zmq
 
 from nemo_rl.models.policy.utils import (
+    DETERMINISTIC_ENV_VARS,
     IPCProtocol,
     aggregate_per_sample_handles,
     calculate_aligned_size,
+    enable_deterministic_algorithms,
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
+    make_empty_cache_best_effort_under_expandable_segments,
     rebuild_cuda_tensor_from_ipc,
-    resolve_model_class,
     stream_weights_via_ipc_zmq_impl,
 )
-
-
-@pytest.mark.parametrize(
-    ("model_type", "hf_class_name", "nemo_class_name"),
-    [
-        ("qwen2_5_vl", "hf_image_text", "nemo_image_text"),
-        ("qwen2_5_omni", "hf_text_waveform", "nemo_text_waveform"),
-        ("unknown_model", "hf_causal_lm", "nemo_causal_lm"),
-    ],
-)
-@pytest.mark.parametrize("nemo_available", [False, True])
-def test_resolve_model_class_selects_requested_loader(
-    monkeypatch: pytest.MonkeyPatch,
-    model_type: str,
-    hf_class_name: str,
-    nemo_class_name: str,
-    nemo_available: bool,
-) -> None:
-    """The caller chooses plain Transformers or NeMo AutoModel classes."""
-    hf_classes = {
-        "hf_image_text": object(),
-        "hf_text_waveform": object(),
-        "hf_causal_lm": object(),
-    }
-    nemo_classes = {
-        "nemo_image_text": object(),
-        "nemo_text_waveform": object(),
-        "nemo_causal_lm": object(),
-    }
-
-    monkeypatch.setattr(
-        "nemo_rl.models.policy.utils.HF_AUTOMODEL_FACTORY",
-        {
-            "qwen2_5_vl": hf_classes["hf_image_text"],
-            "qwen2_5_omni": hf_classes["hf_text_waveform"],
-        },
-    )
-    monkeypatch.setattr(
-        "nemo_rl.models.policy.utils.AUTOMODEL_FACTORY",
-        {
-            "qwen2_5_vl": nemo_classes["nemo_image_text"],
-            "qwen2_5_omni": nemo_classes["nemo_text_waveform"],
-        },
-    )
-    monkeypatch.setattr(
-        "nemo_rl.models.policy.utils.AutoModelForCausalLM",
-        hf_classes["hf_causal_lm"],
-    )
-    monkeypatch.setattr(
-        "nemo_rl.models.policy.utils.NeMoAutoModelForCausalLM",
-        nemo_classes["nemo_causal_lm"],
-    )
-    monkeypatch.setattr(
-        "nemo_rl.models.policy.utils.NEMO_AUTOMODEL_AVAILABLE", nemo_available
-    )
-
-    assert (
-        resolve_model_class(model_type, use_nemo_automodel=False)
-        is hf_classes[hf_class_name]
-    )
-    expected_default = (
-        nemo_classes[nemo_class_name] if nemo_available else hf_classes[hf_class_name]
-    )
-    assert resolve_model_class(model_type) is expected_default
-
-
-def test_resolve_model_class_routes_gemma4_unified_to_image_text_model():
-    assert "ImageTextToText" in resolve_model_class("gemma4_unified").__name__
 
 
 class TestGetMegatronCheckpointDir:
@@ -692,3 +627,98 @@ class TestEnsureTeacherIpcBuffer:
         assert s2 is s and h2 is h
         s3, _ = ensure_teacher_ipc_buffer(s, h, 3, 1, 4, 8, torch.float32, dev)
         assert s3 is not s and s3.shape == (3, 1, 4, 8)
+
+
+def test_enable_deterministic_algorithms_sets_torch_flags():
+    prev = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+    )
+    try:
+        enable_deterministic_algorithms()
+        assert torch.are_deterministic_algorithms_enabled()
+        assert torch.is_deterministic_algorithms_warn_only_enabled()
+        assert torch.backends.cudnn.deterministic
+        assert not torch.backends.cudnn.benchmark
+    finally:
+        torch.use_deterministic_algorithms(prev[0], warn_only=prev[1])
+        torch.backends.cudnn.deterministic = prev[2]
+        torch.backends.cudnn.benchmark = prev[3]
+
+
+def test_deterministic_env_vars_pin_cublas_and_transformer_engine():
+    assert DETERMINISTIC_ENV_VARS == {
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+    }
+
+
+def test_empty_cache_guard_noops_without_expandable_segments(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+    try:
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is original
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_skips_flush_entirely_under_es(monkeypatch):
+    """The guard must warn and skip, never call the real empty_cache: the
+    failing allocator call corrupts CUDA state even when its exception is
+    caught."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+    calls = []
+
+    def _records():
+        calls.append(1)
+
+    try:
+        torch.cuda.empty_cache = _records
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is not _records
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.empty_cache()  # must not raise, must not call through
+        assert calls == []
+        assert any("expandable_segments" in str(w.message) for w in caught)
+        # idempotent: re-applying must not double-wrap
+        wrapped = torch.cuda.empty_cache
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is wrapped
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_never_touches_broken_allocator(monkeypatch):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+
+    def _raises_other():
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    try:
+        torch.cuda.empty_cache = _raises_other
+        make_empty_cache_best_effort_under_expandable_segments()
+        torch.cuda.empty_cache()  # must not raise because it must not call through
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_requires_opt_in_env(monkeypatch):
+    """Patching a global torch API is opt-in: without NRL_BEST_EFFORT_EMPTY_CACHE=1
+    the guard leaves empty_cache alone even under expandable_segments."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.delenv("NRL_BEST_EFFORT_EMPTY_CACHE", raising=False)
+    original = torch.cuda.empty_cache
+    try:
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is original
+    finally:
+        torch.cuda.empty_cache = original

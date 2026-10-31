@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypeVar, cast
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -84,6 +85,12 @@ def _with_mutation_cut(callback: Callable[[DataPlaneMutationCut], _T]) -> _T:
             return callback(cut)
 
     return asyncio.run(apply())
+
+
+def _init_recovery_telemetry(controller: Any, *, train_steps: int = 0) -> None:
+    """Initialize constructor-owned telemetry state for hand-built controllers."""
+    controller._train_steps = train_steps
+    controller._logger = MagicMock()
 
 
 async def _wait_for_event_or_pump(
@@ -204,6 +211,16 @@ class _PendingLedger:
         self._groups = [group for group in self._groups if group.group_id != group_id]
 
 
+def _sidecar_state(ledger: RolloutRecoveryLedger) -> dict[str, Any]:
+    """Ledger state plus the controller-owned keys every sidecar must carry."""
+    return {
+        **ledger.state_dict(),
+        "reward_settings": None,
+        "finalizer_metrics_by_group": {},
+        "finalizer_rewards_by_group": {},
+    }
+
+
 class _RecoveryRolloutManager:
     def __init__(self, ledger: RolloutRecoveryLedger) -> None:
         self.recovery_ledger = ledger
@@ -239,6 +256,9 @@ class _RecoveryRolloutManager:
     ) -> None:
         self.recovery_ledger.discard_group(cut, group_id)
 
+    def record_recovery_siblings(self, *, reused: int, redispatched: int) -> None:
+        del reused, redispatched
+
 
 class _BlockingRolloutManager:
     """Hold one admitted rollout unfinished while the checkpoint is written."""
@@ -248,9 +268,16 @@ class _BlockingRolloutManager:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.weight_version = 0
+        self.next_nemo_gym_task_index = 0
 
     def set_weight_version(self, version: int) -> None:
         self.weight_version = version
+
+    def get_next_nemo_gym_task_index(self) -> int:
+        return self.next_nemo_gym_task_index
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        self.next_nemo_gym_task_index = value
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -575,6 +602,7 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
             await controller._save_checkpoint(
                 {"loss": 1.0},
                 is_policy_training_step=True,
+                is_final_checkpoint=False,
             )
         finally:
             sampler.release_admission.set()
@@ -649,6 +677,7 @@ def test_checkpoint_owns_batch_7_while_its_rollout_is_unfinished(tmp_path) -> No
             await controller._save_checkpoint(
                 {"loss": 1.0},
                 is_policy_training_step=True,
+                is_final_checkpoint=False,
             )
         finally:
             rollout_manager.release.set()
@@ -730,6 +759,7 @@ def test_commit_contending_with_checkpoint_has_exactly_one_saved_owner(
             controller._save_checkpoint(
                 {"loss": 1.0},
                 is_policy_training_step=True,
+                is_final_checkpoint=False,
             )
         )
         save_started = await asyncio.to_thread(dp_client.save_started.wait, 5.0)
@@ -845,6 +875,7 @@ def test_canonical_replay_wins_over_stale_ledger_entry(
             await controller._save_checkpoint(
                 {"loss": 1.0},
                 is_policy_training_step=True,
+                is_final_checkpoint=False,
             )
         finally:
             controller._checkpointer.shutdown()
@@ -868,7 +899,10 @@ def test_canonical_replay_wins_over_stale_ledger_entry(
     asyncio.run(exercise())
 
 
-def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None:
+@pytest.mark.parametrize("schema_version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+def test_recovery_replays_step_7_without_readmitting_the_batch(
+    tmp_path, schema_version: int
+) -> None:
     """An admitted batch keeps target_step=7 across a process restart."""
 
     async def exercise() -> None:
@@ -904,6 +938,21 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
             batch_shortfall={6: 1},
             sampler_stamps_target_steps=True,
         )
+        saved_state["schema_version"] = schema_version
+        if schema_version == 2:
+            for key in (
+                "reward_settings",
+                "finalizer_metrics_by_group",
+                "finalizer_rewards_by_group",
+            ):
+                saved_state.pop(key)
+            for group in saved_state["groups"]:
+                group.pop("resolved_agent_name", None)
+                for sibling in group["siblings"]:
+                    for attempt in sibling["attempts"]:
+                        attempt.pop("reward_checks", None)
+                        attempt.pop("reward_log_context", None)
+                        attempt.pop("logical_selection", None)
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
         torch.save(saved_state, recovery_path)
         payload_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()
@@ -913,14 +962,18 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller, train_steps=7)
+        controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(enabled=False)
+            token_capture=SimpleNamespace(enabled=False, forest_training=False)
         )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
-            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "forest_training": False,
+            "forest_execution_row_multiple": None,
+            "rollout_recovery_schema_version": schema_version,
             "rollout_recovery_payload_sha256": payload_sha256,
             "rollout_recovery_group_count": 1,
         }
@@ -960,6 +1013,11 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         assert sampler.dispatch_index == 7
         assert controller._batch_shortfall == {6: 1}
         assert controller._sampler_stamps_target_steps is True
+        recovery_metrics = controller._logger.log_metrics.call_args.args[0]
+        assert recovery_metrics["groups_unfinished_found"] == 1.0
+        assert recovery_metrics["siblings_reused"] == 0.0
+        assert recovery_metrics["siblings_rerun"] == 2.0
+        assert "groups_redispatched" not in recovery_metrics
 
     asyncio.run(exercise())
 
@@ -975,6 +1033,7 @@ def test_recovery_rejects_an_unhandled_phase_before_redispatch() -> None:
         )
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller)
         controller._rollout_manager = SimpleNamespace(recovery_ledger=recovery_ledger)
         launched = False
 
@@ -1016,20 +1075,24 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
                     admitted=False,
                 )
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
-        torch.save(saved_ledger.state_dict(), recovery_path)
+        torch.save(_sidecar_state(saved_ledger), recovery_path)
 
         sampler = _CountingInOrderSampler()
         sampler.restore_dispatch_index(6)
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller, train_steps=7)
+        controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(enabled=False)
+            token_capture=SimpleNamespace(enabled=False, forest_training=False)
         )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
+            "forest_training": False,
+            "forest_execution_row_multiple": None,
             "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "rollout_recovery_payload_sha256": hashlib.sha256(
                 recovery_path.read_bytes()
@@ -1114,6 +1177,7 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller, train_steps=6)
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._trainer_version = 6
@@ -1174,18 +1238,21 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
                     admitted=True,
                 )
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
-        torch.save(saved_ledger.state_dict(), recovery_path)
+        torch.save(_sidecar_state(saved_ledger), recovery_path)
 
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        controller._restored_replay_groups_to_regenerate = []
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(enabled=False)
+            token_capture=SimpleNamespace(enabled=False, forest_training=False)
         )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
+            "forest_training": False,
+            "forest_execution_row_multiple": None,
             "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "rollout_recovery_payload_sha256": hashlib.sha256(
                 recovery_path.read_bytes()
@@ -1328,7 +1395,7 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
 
         async def block_admission(
             group_ids: list[str],
-        ) -> tuple[int, list[str], int]:
+        ) -> int:
             admission_started.set()
             await release_admission.wait()
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
@@ -1338,7 +1405,7 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
                         group_id,
                         target_step=7,
                     )
-            return 7, group_ids, 0
+            return 7
 
         async def launch(
             prompt: DatumSpec,
@@ -1374,8 +1441,13 @@ def test_recovery_rejects_a_corrupt_ledger_sidecar(tmp_path) -> None:
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._master_config = SimpleNamespace(
+        token_capture=SimpleNamespace(forest_training=False)
+    )
     controller._last_checkpoint_path = str(tmp_path)
     controller._data_plane_checkpoint_metadata = {
+        "forest_training": False,
+        "forest_execution_row_multiple": None,
         "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
         "rollout_recovery_payload_sha256": "0" * 64,
         "rollout_recovery_group_count": 1,
@@ -1392,8 +1464,13 @@ def test_recovery_rejects_a_missing_advertised_ledger_sidecar(tmp_path) -> None:
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._master_config = SimpleNamespace(
+        token_capture=SimpleNamespace(forest_training=False)
+    )
     controller._last_checkpoint_path = str(tmp_path)
     controller._data_plane_checkpoint_metadata = {
+        "forest_training": False,
+        "forest_execution_row_multiple": None,
         "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
         "rollout_recovery_payload_sha256": "0" * 64,
         "rollout_recovery_group_count": 1,

@@ -18,11 +18,32 @@ from typing import Any, Callable, Optional, TypeVar
 import torch
 import torch.distributed
 
+from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
+
+# Metrics combined across the sequences of one packed bin by extremum, not sum.
+# Keep in sync with _MB_METRIC_MIN / _MB_METRIC_MAX in
+# single_controller_utils/utils.py, grpo.py, grpo_sync.py and ppo.py.
+#
+# TODO: duplicated across seven sites. Omitting one silently sums extrema instead
+# of reducing them, reporting a "min" larger than any individual value. Hoist
+# into a single shared definition in loss/interfaces.py.
+_SEQ_METRIC_MIN: frozenset[str] = frozenset(
+    {"probs_ratio_min", "probs_ratio_clamped_min", "opd_full_reverse_kl_min"}
+)
+_SEQ_METRIC_MAX: frozenset[str] = frozenset(
+    {
+        "probs_ratio_max",
+        "probs_ratio_clamped_max",
+        "opd_full_reverse_kl_max",
+        "opd_full_decomposition_error",
+    }
+)
 
 
 class SequencePackingLossWrapper:
@@ -30,8 +51,8 @@ class SequencePackingLossWrapper:
         self,
         loss_fn: LossFunction,
         prepare_fn: Callable[Any, Any],
-        cu_seqlens_q: Tensor,
-        cu_seqlens_q_padded: Optional[Tensor] = None,
+        cu_seqlens_q: CpuIntTuple,
+        cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -47,7 +68,8 @@ class SequencePackingLossWrapper:
             vocab_parallel_group: Vocab parallel group.
             context_parallel_group: Context parallel group.
 
-            vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
+            Parallel groups are supplied by Megatron and Automodel workers.
+            Automodel uses a singleton vocabulary group for chunked local logprobs.
 
         Returns:
             Sequence packing loss wrapper.
@@ -55,7 +77,9 @@ class SequencePackingLossWrapper:
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
         self.cu_seqlens_q = cu_seqlens_q
-        self.cu_seqlens_q_padded = cu_seqlens_q_padded
+        self.cu_seqlens_q_padded = (
+            cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+        )
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
@@ -69,23 +93,19 @@ class SequencePackingLossWrapper:
     ) -> tuple[Tensor, dict[str, Any]]:
         """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
         unpadded_cu_seqlens = self.cu_seqlens_q
-        unpadded_seq_lengths = self.cu_seqlens_q[1:] - self.cu_seqlens_q[:-1]
-        if self.cu_seqlens_q_padded is not None:
-            padded_cu_seqlens = self.cu_seqlens_q_padded
-            padded_seq_lengths = (
-                self.cu_seqlens_q_padded[1:] - self.cu_seqlens_q_padded[:-1]
-            )
-        else:
-            padded_cu_seqlens = unpadded_cu_seqlens
-            padded_seq_lengths = unpadded_seq_lengths
+        unpadded_seq_lengths = tuple(
+            end - start
+            for start, end in zip(unpadded_cu_seqlens[:-1], unpadded_cu_seqlens[1:])
+        )
+        padded_cu_seqlens = self.cu_seqlens_q_padded
         seq_starts = padded_cu_seqlens[:-1]
         seq_ends = padded_cu_seqlens[1:]
 
         loss_accum = 0
         metrics_accum = {}
         for seq_idx in range(len(seq_starts)):
-            seq_start = seq_starts[seq_idx].item()
-            seq_end = seq_ends[seq_idx].item()
+            seq_start = seq_starts[seq_idx]
+            seq_end = seq_ends[seq_idx]
 
             # get sequence and unpad all 'data' tensors. The data dict is a BatchedDataDict of unpacked tensors
             seq_data = data.slice(seq_idx, seq_idx + 1)
@@ -111,14 +131,14 @@ class SequencePackingLossWrapper:
                 # Use slicing (clamped end) to avoid narrow() OOB on packed tails.
                 logit_start = seq_start // cp_size
                 logit_end = min(
-                    (seq_start + padded_seq_lengths[seq_idx]) // cp_size,
+                    seq_end // cp_size,
                     next_token_logits.shape[1],
                 )
                 logit_slice_idxs = slice(logit_start, logit_end)
                 next_token_logits_slice = next_token_logits[:, logit_slice_idxs]
             else:
                 logit_start = seq_start // cp_size
-                logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
+                logit_end = seq_end // cp_size
                 logit_length = logit_end - logit_start
                 next_token_logits_slice = next_token_logits.narrow(
                     1, logit_start, logit_length
@@ -144,9 +164,9 @@ class SequencePackingLossWrapper:
             loss_accum += loss
             for k, v in metrics.items():
                 if k not in metrics_accum:
-                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                    if k in _SEQ_METRIC_MIN:
                         metrics_accum[k] = float("inf")
-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    elif k in _SEQ_METRIC_MAX:
                         metrics_accum[k] = float("-inf")
                     else:
                         metrics_accum[k] = 0
@@ -154,10 +174,10 @@ class SequencePackingLossWrapper:
                 val = v.item() if isinstance(v, torch.Tensor) and v.ndim == 0 else v
 
                 # Skip inf/-inf sentinel values (from sequences with no valid tokens)
-                if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                if k in _SEQ_METRIC_MIN:
                     if not math.isinf(val):
                         metrics_accum[k] = min(metrics_accum[k], val)
-                elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                elif k in _SEQ_METRIC_MAX:
                     if not math.isinf(val):
                         metrics_accum[k] = max(metrics_accum[k], val)
                 else:
@@ -177,16 +197,17 @@ class SequencePackingFusionLossWrapper:
     This avoids per-sequence kernel launches and TP/CP communication overhead while
     producing numerically identical results.
 
-    The prepare_fn should be prepare_packed_loss_input (from nemo_rl.algorithms.loss.utils),
-    which currently only supports LossInputType.LOGPROB.
+    The prepare_fn should be prepare_packed_loss_input (from
+    nemo_rl.algorithms.loss.loss_input), which currently only supports
+    LossInputType.LOGPROB.
     """
 
     def __init__(
         self,
         loss_fn: LossFunction,
         prepare_fn: Callable[..., Any],
-        cu_seqlens_q: Tensor,
-        cu_seqlens_q_padded: Optional[Tensor] = None,
+        cu_seqlens_q: CpuIntTuple,
+        cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -254,10 +275,12 @@ class DraftLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        defer_normalization: bool = False,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_q_padded: Optional[torch.Tensor] = None,
         d2t: Optional[torch.Tensor] = None,
         student_logits: Optional[torch.Tensor] = None,
+        token_chunk_size: int = DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
@@ -266,6 +289,7 @@ class DraftLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
+        self.defer_normalization = defer_normalization
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_q_padded = (
             cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
@@ -274,10 +298,18 @@ class DraftLossWrapper:
         self.student_logits = student_logits
         if cu_seqlens_q is not None and student_logits is None:
             raise ValueError("student_logits must be passed explicitly in packed mode.")
+        if cu_seqlens_q is not None and defer_normalization:
+            # The packed path normalizes inside _packed_draft_loss and emits no
+            # step payload, so a deferred caller would silently keep the policy
+            # denominator on the draft gradients. Fail loudly instead.
+            raise ValueError(
+                "deferred draft normalization is not supported in packed mode."
+            )
         if cu_seqlens_q is None and prepare_fn is None:
             raise ValueError("prepare_fn is required in unpacked mode.")
         self.draft_loss_fn = DraftCrossEntropyLossFn(
             vocab_parallel_group=vocab_parallel_group,
+            token_chunk_size=token_chunk_size,
         )
 
     def _packed_draft_loss(
@@ -339,6 +371,14 @@ class DraftLossWrapper:
             **kwargs,
         )
 
+        # Function-local import: step_state lives under models.megatron.draft,
+        # whose package import pulls the modelopt chain non-megatron users avoid.
+        from nemo_rl.models.megatron.draft.step_state import (
+            DRAFT_LOSS_METRIC_KEY,
+            DRAFT_STEP_PAYLOAD_KEY,
+            DraftStepState,
+        )
+
         if self.cu_seqlens_q is not None:
             draft_loss = self._packed_draft_loss(
                 next_token_logits, data, global_valid_seqs, global_valid_toks
@@ -352,14 +392,27 @@ class DraftLossWrapper:
                 vocab_parallel_group=self.vocab_parallel_group,
                 context_parallel_group=self.context_parallel_group,
             )
-            draft_loss = self.draft_loss_fn(
-                data=data,
-                global_valid_seqs=global_valid_seqs,
-                global_valid_toks=global_valid_toks,
-                **loss_input,
-            )
+            if self.defer_normalization:
+                stats = self.draft_loss_fn.loss_stats(data=data, **loss_input)
+                draft_loss = stats.normalized(
+                    normalization_counts=torch.ones_like(stats.counts),
+                )
+                # Deferred payloads are only consumed by the Megatron split API.
+                metrics[DRAFT_STEP_PAYLOAD_KEY] = DraftStepState.metric_payload(stats)
+            else:
+                draft_loss = self.draft_loss_fn(
+                    data=data,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    **loss_input,
+                )
         combined_loss = policy_loss + self.loss_weight * draft_loss
-        metrics["draft_loss"] = float(draft_loss.detach().item())
+        draft_loss_value = float(draft_loss.detach().item())
+        if not self.defer_normalization:
+            metrics["total_loss"] = (
+                metrics["loss"] + self.loss_weight * draft_loss_value
+            )
+        metrics[DRAFT_LOSS_METRIC_KEY] = draft_loss_value
         return combined_loss, metrics
 
 
@@ -394,3 +447,67 @@ def wrap_loss_fn_with_input_preparation(
     )
 
     return loss, loss_metrics
+
+
+class DraftRuntimeLossWrapper:
+    """Combine policy loss with a co-trained drafter loss (automodel path).
+
+    Structural sibling of DraftLossWrapper: the policy loss is computed exactly
+    as without a draft, then the draft runtime (dspark/dflash block drafter or
+    eagle3 TTT drafter) runs the draft forward on the hidden states and raw
+    teacher logits captured during the policy forward (both detached, so the
+    policy trunk's gradients are unchanged).
+
+    No context-parallel correction is needed here: the trainer's outer
+    backward multiplier (``dp*cp/cp_gradient_fanout``, see
+    ``LossPostProcessor``) is applied uniformly to the whole combined loss,
+    and that multiplier is calibrated for a loss that's *replicated* across
+    CP ranks (each local model contributes to cp_size loss consumers, hence
+    the ``/cp_gradient_fanout`` correction). The draft loss shares that same
+    replicated shape under CP -- its teacher/hidden inputs are allgathered
+    and computed identically on every CP rank -- so the policy-calibrated
+    outer multiplier already gives it the correct per-replica gradient scale
+    with no further adjustment.
+    """
+
+    def __init__(
+        self,
+        loss_fn: Callable[..., tuple[torch.Tensor, dict[str, Any]]],
+        prepare_fn: Callable[..., Any],
+        draft_runtime: Any,
+    ):
+        self.loss_fn = loss_fn
+        self.prepare_fn = prepare_fn
+        self.draft_runtime = draft_runtime
+
+    def __call__(
+        self,
+        next_token_logits: torch.Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: torch.Tensor | None,
+        global_valid_toks: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        loss_input, prepared_data = self.prepare_fn(
+            next_token_logits,
+            data,
+            self.loss_fn,
+        )
+        policy_loss, metrics = self.loss_fn(
+            data=prepared_data,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            **loss_input,
+        )
+
+        draft_loss, draft_metrics = self.draft_runtime.compute_loss(prepared_data)
+        combined_loss = policy_loss + self.draft_runtime.loss_weight * draft_loss
+        metrics.update(draft_metrics)
+        # Mirrors DraftLossWrapper (Megatron path): draft_metrics["draft_loss"]
+        # is already divided to match the backward value (see
+        # DSparkRuntime/Eagle3Runtime.compute_loss), so this sums cleanly with
+        # the policy's own "loss" metric.
+        metrics["total_loss"] = (
+            metrics["loss"]
+            + self.draft_runtime.loss_weight * draft_metrics["draft_loss"]
+        )
+        return combined_loss, metrics

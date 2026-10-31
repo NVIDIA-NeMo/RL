@@ -22,12 +22,14 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     DataPlaneMutationCut,
     TQReplayBuffer,
@@ -50,10 +52,12 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutRecoveryState,
 )
+from nemo_rl.utils.logger import LoggerConfig
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollout_manager import (
@@ -105,6 +109,11 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._finalizer_actors = []
     ctrl._replacement_reserve = deque()
     ctrl._rollout_recovery_enabled = False
+    ctrl._rollout_slot_waiters = 0
+    ctrl._rollout_permitted_waiters = 0
+    ctrl._buffer_capacity_waiters = 0
+    ctrl._rollout_completion_durations_s = deque(maxlen=10_000)
+    ctrl._rollout_queue_wait_durations_s = deque(maxlen=10_000)
 
 
 class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
@@ -116,8 +125,10 @@ class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
         self.release_mutation = asyncio.Event()
 
     @asynccontextmanager
-    async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
-        async with super().mutation() as cut:
+    async def mutation(
+        self, kind: CheckpointMutationKind = "other"
+    ) -> AsyncIterator[DataPlaneMutationCut]:
+        async with super().mutation(kind) as cut:
             yield cut
             self.mutation_applied.set()
             await self.release_mutation.wait()
@@ -280,71 +291,49 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     assert ctrl._inflight_rollouts == 0
 
 
-@pytest.mark.parametrize(
-    ("restored", "expected_new_dispatches"),
-    [
-        # Room left for a partial top-up.
-        (1, 1),
-        # Target step already full: the whole batch is dropped.
-        (2, 0),
-        # More restored than a batch: still zero, never negative.
-        (3, 0),
-    ],
-)
-def test_rollout_pump_tops_up_restored_target_step(
-    restored: int,
-    expected_new_dispatches: int,
-) -> None:
-    # On resume the buffer holds groups still stamped for the next target
-    # step. In-order selection consumes a target step as one fixed-size batch,
-    # so the pump must dispatch only the shortfall — a full batch on top would
-    # leave surplus groups that are never selected and whose capacity permits
-    # are held until evict.
-    buffer = _RecordingBuffer([0] * restored)
+def test_reserved_admission_rejects_an_occupied_target_step() -> None:
+    """A stale sampler cursor must not silently discard newly yielded prompts."""
+    buffer = _RecordingBuffer([0])
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._buffer = buffer
-    ctrl._async_cfg = SimpleNamespace(
-        max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
+    ctrl._rollout_manager = SimpleNamespace(
+        mark_prompt_group_admitted=MagicMock(),
+        discard_prompt_group=MagicMock(),
     )
-    ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig.model_construct(max_num_epochs=1)
-    )
-    ctrl._algo_cfg = ctrl._master_config.grpo
-    ctrl._rollout_manager = _RecordingRolloutManager(buffer)
-    # lookahead=0 keeps the single batch on target_step 0.
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
-    ctrl._dataloader = [
-        BatchedDataDict(
-            {
-                "message_log": [
-                    [{"role": "user", "content": "p0"}],
-                    [{"role": "user", "content": "p1"}],
-                ]
-            }
-        )
-    ]
-    ctrl._rollout_permitted = asyncio.Event()
-    ctrl._rollout_permitted.set()
-    ctrl._rollout_exhausted = asyncio.Event()
-    ctrl._buffer_capacity = asyncio.Semaphore(4)
-    ctrl._inflight_rollouts = 0
-    ctrl._inflight_by_group_id = {}
-    ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
-    ctrl._current_epoch = 0
-    _init_pump_ledgers(ctrl)
+    ctrl._sampler_stamps_target_steps = False
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
 
-    asyncio.run(ctrl._rollout_pump())
+    with pytest.raises(RuntimeError, match="already contains 1 group"):
+        asyncio.run(ctrl._admit_reserved_prompt_groups(["new-group"]))
 
-    # Only the shortfall was dispatched on top of the restored groups.
-    assert buffer.target_step_list == [0] * (restored + expected_new_dispatches)
-    # A dispatched prompt keeps its permit (the train pump releases it after
-    # consuming the group), so exactly one permit per dispatch is held and the
-    # dropped prompts consume none.
-    assert ctrl._buffer_capacity._value == 4 - expected_new_dispatches
-    assert ctrl._inflight_rollouts == 0
-    assert ctrl._rollout_exhausted.is_set()
+    assert buffer.target_step_list == [0]
+    ctrl._rollout_manager.mark_prompt_group_admitted.assert_not_called()
+    ctrl._rollout_manager.discard_prompt_group.assert_not_called()
+
+
+def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
+    """The ordinary spare-pool admission enforces the same cursor invariant."""
+    buffer = _RecordingBuffer([0])
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=1)
+    ctrl._buffer = buffer
+    ctrl._replacement_reserve = deque([{"idx": 0}])
+    ctrl._rollout_recovery_enabled = False
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
+    ctrl._trainer_version = 0
+    launched: list[Any] = []
+
+    async def launch(*args: Any) -> None:
+        launched.append(args)
+
+    with pytest.raises(RuntimeError, match="already contains 1 group"):
+        asyncio.run(ctrl._drain_reserve_into_steps(launch))
+
+    assert launched == []
 
 
 class _SkippingRolloutManager:
@@ -1138,6 +1127,91 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
     asyncio.run(_main())
 
 
+@pytest.mark.parametrize("row_counts", [(3, 4), (7, 8), (3, 8)])
+@pytest.mark.parametrize("threshold", [None, 0.75, 0.8])
+@pytest.mark.parametrize("forest_training", [False, True])
+def test_min_valid_fraction_counts_rollouts_independently_of_segments(
+    row_counts: tuple[int, int],
+    threshold: float | None,
+    forest_training: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    valid_rows, total_rows = row_counts
+    # Three of four owners verified, regardless of how many rows they produced.
+    # Ordinary capture has one row per owner and needs no forest metrics.
+    finalized = FinalizedGroup(
+        meta=None,
+        group_min_wv=0,
+        group_max_wv=0,
+        staging_keys=[],
+        valid_row_count=valid_rows,
+        total_row_count=total_rows,
+        metrics=(
+            {
+                "finalize/logical_owner_count": 4.0,
+                "finalize/valid_logical_owner_count": 3.0,
+            }
+            if forest_training
+            else {}
+        ),
+    )
+    fraction = 0.75 if forest_training else valid_rows / total_rows
+    dropped = threshold is not None and fraction < threshold
+
+    async def run() -> None:
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(
+                min_valid_fraction_per_group=threshold, forest_training=forest_training
+            ),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        request = SimpleNamespace(group_id="group")
+        ctrl._rollout_manager = SimpleNamespace(
+            generate_for_finalization=AsyncMock(return_value=request),
+            record_finalizer_dropped_prompt=MagicMock(),
+            stats=SimpleNamespace(committed=0),
+        )
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = AsyncMock(return_value=finalized)
+        ctrl._discard_committed_group = AsyncMock()
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await ctrl._rollout_pump()
+
+        assert ctrl._rollout_manager.stats.committed == int(not dropped)
+        assert ctrl._buffer_capacity._value == int(dropped)
+        assert ctrl._inflight_rollouts == 0
+        assert ctrl._rollout_exhausted.is_set()
+        if dropped:
+            ctrl._discard_committed_group.assert_awaited_once_with(request)
+            ctrl._rollout_manager.record_finalizer_dropped_prompt.assert_called_once()
+        else:
+            ctrl._discard_committed_group.assert_not_awaited()
+            ctrl._rollout_manager.record_finalizer_dropped_prompt.assert_not_called()
+
+    asyncio.run(run())
+    if dropped and forest_training:
+        assert "(3/4 < 0.8)" in capsys.readouterr().out
+
+
 def test_actor_path_releases_generation_permit_before_finalization() -> None:
     class _SplitRolloutManager:
         def __init__(self) -> None:
@@ -1377,9 +1451,18 @@ def test_rollout_pump_writes_expected_tq_data(
     dp_adapter = _SyncDPAdapter(tq_actor)
 
     master_config = MasterConfig.model_construct(
+        data_plane={
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+        },
         policy={
             "train_global_batch_size": expected_samples,
-            "generation": {"colocated": {"enabled": False}},
+            "generation": {
+                "top_k": None,
+                "top_p": 1.0,
+                "colocated": {"enabled": False},
+            },
         },
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=num_prompts,
@@ -1394,14 +1477,7 @@ def test_rollout_pump_writes_expected_tq_data(
             max_inflight_prompts=num_prompts,
             max_buffered_rollouts=num_prompts,
         ),
-        logger={
-            "log_dir": str(tmp_path / "logs"),
-            "wandb_enabled": False,
-            "swanlab_enabled": False,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "monitor_gpus": False,
-        },
+        logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         # Actor __init__ builds a CheckpointManager + TimeoutChecker from
         # this block; enabled=False keeps the run write-free.
         checkpointing={
@@ -1453,6 +1529,7 @@ def test_rollout_pump_writes_expected_tq_data(
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         finalizer_actors=[],
+        advantage_actors=[],
     )
     ctrl = SingleControllerActor.remote(
         master_config=master_config,
@@ -1525,10 +1602,12 @@ def test_rollout_pump_writes_expected_tq_data(
     for tag in tags:
         assert tag["weight_version"] == 0
         assert tag["prompt_idx"] == input_sample["idx"]
-        # Tag schema: recovery identity plus per-row violation counts.
+        # Tag schema: recovery identity, the prompt-group key the advantage
+        # stage reduces over, and per-row violation counts.
         assert set(tag) == {
             "weight_version",
             "prompt_idx",
+            "group_id",
             "num_invalid_tool_calls",
             "num_malformed_thinking",
             "num_assistant_messages",

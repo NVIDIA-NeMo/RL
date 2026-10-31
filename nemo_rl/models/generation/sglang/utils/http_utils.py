@@ -20,7 +20,10 @@ import httpx
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.config import (
+    SGLangConfig,
+    SGLangHttpClientConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +37,7 @@ class _HttpPosterActor:
             timeout=httpx.Timeout(None),
         )
 
-    async def do_post(self, url, payload, max_retries=3, action="post"):
+    async def do_post(self, url, payload, max_retries: int, action="post"):
         retry_count = 0
         while retry_count < max_retries:
             try:
@@ -85,10 +88,15 @@ class HttpClient:
 
         if args is not None:
             self.init(args)
+        else:
+            self._max_retries = SGLangHttpClientConfig().max_retries
 
     def init(self, args: SGLangConfig) -> None:
         """Configure HTTP client limits and optional distributed POST actors."""
         sglang_cfg = args.get("sglang_cfg") or {}
+        self._max_retries = SGLangHttpClientConfig.model_validate(
+            sglang_cfg.get("sglang_http_client_config", {})
+        ).max_retries
         server_cfg = sglang_cfg.get("sglang_server_config") or {}
         if not server_cfg.get("num_gpus"):
             return
@@ -157,7 +165,17 @@ class HttpClient:
 
         self._post_actors = created
 
-    async def post(self, url, payload, max_retries=3, action="post"):
+    async def post(self, url, payload, max_retries: int | None = None, action="post"):
+        """Send with a bounded total attempt count per dispatch path.
+
+        An explicit ``max_retries`` overrides the configured client budget.
+        Distributed dispatch retains its local fallback with a fresh budget.
+        """
+        if max_retries is None:
+            max_retries = self._max_retries
+        else:
+            max_retries = SGLangHttpClientConfig(max_retries=max_retries).max_retries
+
         if self._distributed_post_enabled and self._post_actors:
             try:
                 actor = self._next_actor()
@@ -175,7 +193,7 @@ class HttpClient:
 
         return await self._post_local(url, payload, max_retries, action=action)
 
-    async def _post_local(self, url, payload, max_retries=3, action="post"):
+    async def _post_local(self, url, payload, max_retries: int, action="post"):
         client = self._get_client()
         retry_count = 0
         while retry_count < max_retries:

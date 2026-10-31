@@ -12,7 +12,7 @@ policy:
     enabled: true
     scheduler:
       lr_warmup_iters: 50
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   dynamic_batching:
     enabled: true

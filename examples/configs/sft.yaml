@@ -13,6 +13,9 @@ sft:
   val_at_end: false
   seed: 42
   only_unmask_final: false
+  # SFT v2 + policy.megatron_cfg.checkpoint.async_save only: finalize async checkpoints
+  # at a later step boundary so the disk write overlaps training (see SFTConfig).
+  defer_async_checkpoint_finalize: false
 
 checkpointing:
   enabled: true
@@ -42,17 +45,25 @@ policy:
   precision: "bfloat16"
 
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     env_vars: {}
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
-    # HSDP replicate dimension size for Automodel DTensor v2.
+    # HSDP replicate dimension size for Automodel.
     # Typically set to the number of nodes; set to 1 to disable HSDP.
     dp_replicate_size: 1
     custom_parallel_plan: null
@@ -76,6 +87,7 @@ policy:
       dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
       lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
       use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   dynamic_batching:
     enabled: false
@@ -91,7 +103,7 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -101,7 +113,7 @@ policy:
       weight_decay: 0.1
       betas: [0.9, 0.98]
       eps: 1e-5
-      # when using Dtensor, we need to set foreach
+      # when using Automodel, we need to set foreach
       # and fused to False
       foreach: False
       fused: False
@@ -117,6 +129,10 @@ policy:
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     env_vars: {}
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
     cuda_graph_impl: "none"
@@ -161,14 +177,19 @@ policy:
     moe_permute_fusion: true
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
+    flash_attention_version: 2
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    fp32_lm_head: false # Emit fp32 logits from Megatron's LM head.
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
 
@@ -184,6 +205,7 @@ policy:
       lora_B_init_method: "zero"
       a2a_experimental: false
       lora_dtype: None
+      restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
 
 
     optimizer:
@@ -249,6 +271,10 @@ data:
   train:
     dataset_name: "squad"
     split: "train"
+    # For megatron_sft_packed, set on each packed dataset entry:
+    # megatron_sft:
+    #   prompt_format: identity
+    #   override_pad_token: null
   validation:
     dataset_name: "squad"
     split: "validation"
@@ -257,6 +283,7 @@ data:
     prompt_file: null
     system_prompt_file: null
     processor: "sft_processor"
+    chat_key: "messages" # Key containing the ordered conversation messages.
 
   # You can also use multiple datasets by using a list of datasets.
   # See `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example.
@@ -290,6 +317,7 @@ data:
 
 logger:
   log_dir: "logs"  # Base directory for all logs
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
   mlflow_enabled: false

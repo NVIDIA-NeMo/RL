@@ -14,8 +14,47 @@
 
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
+from pydantic import BaseModel, ConfigDict
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy import Fp8Config, PolicyConfig
+from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
+
+
+def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
+    """Resolve native MCore staging bytes using NeMo-RL's collective default."""
+    if configured_bytes is None:
+        return get_target_packed_tensor_size()
+    if configured_bytes <= 0:
+        raise ValueError(
+            "policy.generation.mcore_generation_config."
+            "refit_execution_batch_bytes must be positive or null."
+        )
+    return configured_bytes
+
+
+class MediaPromptSpecOverrides(BaseModel):
+    """Partial MCore `MediaPromptSpec`. Omitted fields keep the wrapper's defaults."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_token: Optional[str] = None
+    prefix: Optional[str] = None
+    suffix: Optional[str] = None
+    input_marker: Optional[str] = None
+    content_part_separator: Optional[str] = None
+    expansion_mode: Optional[Literal["single", "temporal_patch"]] = None
+    include_frame_timestamps_for_nemotron_vl: Optional[bool] = None
+
+
+class MultimodalPromptConfigOverrides(BaseModel):
+    """Partial MCore `MultimodalPromptConfig`. Omitted fields keep the wrapper's defaults."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image_spec: Optional[MediaPromptSpecOverrides] = None
+    video_spec: Optional[MediaPromptSpecOverrides] = None
+    content_part_order: Optional[Literal["preserve", "media_first"]] = None
 
 
 class MCoreGenerationSpecificArgs(TypedDict):
@@ -27,10 +66,13 @@ class MCoreGenerationSpecificArgs(TypedDict):
     """
 
     expose_http_server: bool
+    http_server_num_replicas: NotRequired[int]
     parsers: list[str]
     buffer_size_gb: int
     block_size_tokens: int
     max_tokens: int
+    # Optional cap on concurrent requests; MCore derives it from the KV pool when unset.
+    max_requests: NotRequired[int]
     max_model_len: int
 
     # None disables CUDA-graph bucket construction; -1 selects automatic
@@ -38,6 +80,15 @@ class MCoreGenerationSpecificArgs(TypedDict):
     num_cuda_graphs: int | None
     use_cuda_graphs_for_non_decode_steps: bool
     cuda_graph_impl: str
+    # How the captured CUDA-graph token-count sizes are spaced. Options:
+    # - 'exponential': log-spaced graphs for all request types.
+    # - 'linear': densely spaced graphs for all request types.
+    # - 'hybrid': exponential prefill/mixed graphs and linear decode graphs (MCore default).
+    cuda_graph_sizing_distribution: NotRequired[
+        Literal["exponential", "linear", "hybrid"]
+    ]
+    # Token ceiling for captured prefill/mixed CUDA graphs. MCore default: 512.
+    cuda_graph_max_tokens: NotRequired[int]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
@@ -51,21 +102,58 @@ class MCoreGenerationSpecificArgs(TypedDict):
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
+
+    # Dynamic-batching scheduler mode. Options:
+    # - 'legacy': resolve the previous forward pass before preparing the next one.
+    # - 'async': overlap the scheduling phases by preparing the next forward pass
+    #   before resolving the previous one, hiding scheduler CPU time behind GPU
+    #   compute. For any step it cannot overlap (prefill, paused requests,
+    #   KV-cache pressure) mcore drops to a non-overlapped async ordering --
+    #   not to legacy.
     async_sched_mode: NotRequired[Literal["legacy", "async"]]
+
     vision_embedding_cache_max_bytes: NotRequired[int]
     allow_stale_multimodal_embeddings: NotRequired[bool]
 
-    refit_backend: Literal["gloo", "nccl", "nvshmem"]
+    # Copy-service backend used only when refit_transport="mcore".
+    refit_backend: NotRequired[Literal["gloo", "nccl", "nccl_m2n", "nvshmem"] | None]
+    # Soft per-rank staging limit for native MCore refit. None uses the same
+    # dynamic packed-buffer target as NeMo-RL's existing collective refit.
+    refit_execution_batch_bytes: int | None
     num_speculative_tokens: int
 
-    mamba_inference_ssm_states_dtype: NotRequired[str]
-    mamba_inference_conv_states_dtype: NotRequired[str]
+    # Hybrid (Mamba) inference state dtypes; None keeps the model dtype.
+    mamba_inference_ssm_states_dtype: NotRequired[str | None]
+    mamba_inference_conv_states_dtype: NotRequired[str | None]
+    # GPU budget for cached Mamba states; null disables it (MCore default).
+    prefix_caching_mamba_gb: NotRequired[float | None]
+
+    # Prefix-cache block eviction policy. MCore default: 'lru'.
+    prefix_caching_eviction_policy: NotRequired[Literal["ref_zero", "lru"]]
+    # DP coordinator routing policy. MCore default: 'longest_prefix'.
+    prefix_caching_coordinator_policy: NotRequired[
+        Literal["load_balanced", "longest_prefix", "first_prefix_block"]
+    ]
+    # Coordinator cache-entry lifetime in seconds. MCore default: 300.0.
+    prefix_cache_ttl_seconds: NotRequired[float]
+    # Prefix-affinity versus load routing penalty. MCore default: 1.0.
+    prefix_caching_routing_alpha: NotRequired[float]
 
     # Raw media preprocessing corresponding with Megatron's
     # ImageProcessingConfig / VideoProcessingConfig.
     # `video_num_frames` is required for video.
     vision_model_type: NotRequired[str]
     image_dynamic_resolution: NotRequired[bool]
+    # Image token budget; overrides the HF processor's `max_model_len`.
+    image_dynamic_resolution_model_length: NotRequired[int]
+    # MCore default: 'ceil'. HF processors use 'round_plus_half'.
+    image_dynamic_resolution_rounding_mode: NotRequired[
+        Literal["ceil", "round_plus_half"]
+    ]
+    # MCore default: 'pil'. Torch-based HF processors use 'torch_bicubic_antialias'.
+    image_dynamic_resolution_resize_mode: NotRequired[
+        Literal["pil", "torch_bicubic_antialias"]
+    ]
     video_num_frames: NotRequired[int]  # Frames sampled per video.
     video_temporal_patch_size: NotRequired[int]  # Frames per temporal patch.
     video_target_num_patches: NotRequired[int]  # Overrides the image max-patch budget.
@@ -78,11 +166,14 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # attributes gate which modalities are preprocessed. Not media preprocessing
     # itself, and used on the direct generate path as well as the HTTP endpoint.
     megatron_inference_wrapper: NotRequired[str]
+    # Partial MultimodalPromptConfig overrides applied on top of the wrapper's
+    # default image/video prompt contracts.
+    multimodal_prompt_config: NotRequired[MultimodalPromptConfigOverrides]
 
     # KV cache lifecycle across suspend/resume:
-    # - "persist": cache stays allocated; CUDA graphs remain valid (default)
+    # - "persist": cache stays allocated; CUDA graphs remain valid
     # - "offload": cache is moved off-GPU between iterations
-    # - "recompute": cache is dropped and rebuilt on resume
+    # - "recompute": cache is dropped and rebuilt on resume (default)
     kv_cache_management_mode: Literal["persist", "offload", "recompute"]
 
     logging_step_interval: NotRequired[int]
@@ -94,11 +185,16 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
     fp8_cfg: NotRequired[Fp8Config]
+    # Megatron Bridge provider fields without a first-class NeMo-RL setting.
+    model_overrides: NotRequired[dict[str, Any]]
 
 
 class MCoreGenerationConfig(GenerationConfig):
     """Generation config for Megatron Inference."""
 
+    # None uses NeMo-RL's packed collective, mcore uses Megatron Core's native
+    # refit, and nccl_reshard selects the non-colocated NCCL M-to-N transport.
+    refit_transport: NotRequired[Literal["mcore", "nccl_reshard"] | None]
     mcore_generation_config: MCoreGenerationSpecificArgs
 
 
@@ -132,6 +228,28 @@ def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]
             "with TP>1 on the generation model: set "
             "policy.generation.mcore_generation_config.sequence_parallel=true."
         )
+
+    # inference_optimized MoE layers do not implement expert tensor parallelism:
+    # MCore raises whenever the *resolved* ETP exceeds 1, and an omitted ETP
+    # resolves to TP. Pin the generation-side ETP to 1 so that TP>1 generation
+    # keeps working without the caller having to know that rule (ETP is inert
+    # for dense models). An explicitly requested gen-side ETP>1 is unsatisfiable,
+    # so name the config key rather than letting MCore assert at model build.
+    if merged.get("transformer_impl") == "inference_optimized":
+        gen_overrides = cast(
+            dict[str, Any], generation_config.get("mcore_generation_config") or {}
+        )
+        explicit_etp = cast(
+            Optional[int], gen_overrides.get("expert_tensor_parallel_size")
+        )
+        if explicit_etp is not None and explicit_etp > 1:
+            raise ValueError(
+                "transformer_impl=inference_optimized does not support expert "
+                "tensor parallelism on the generation model: set "
+                "policy.generation.mcore_generation_config."
+                f"expert_tensor_parallel_size=1 (got {explicit_etp})."
+            )
+        merged["expert_tensor_parallel_size"] = 1
     return merged
 
 

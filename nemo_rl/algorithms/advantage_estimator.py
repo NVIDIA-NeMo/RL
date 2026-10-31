@@ -22,10 +22,17 @@ This module provides different advantage estimation strategies:
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
 
-Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts ``valid_mask``
-and must honor it: the SingleController always passes ``final_sample_mask`` as
-``valid_mask`` so token-capture placeholder rows (and sequence-logprob-error
-masked rows) do not vote in their siblings' baselines.
+Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts a binary
+``valid_mask`` and must honor it. GRPO training selects this mask with
+``grpo.masked_reward_policy`` independently of the sample loss mask: ``include``
+(the default) lets every row with a nonzero dataset weight vote in the group
+statistics and the batch normalization, masked rewards too; ``exclude`` lets
+only rows with a nonzero loss weight vote. Token-capture placeholder rows and
+over-length prompts (dataset weight 0) never vote. Reinforce++ also
+receives a ``normalization_mask`` for its token-level statistics; the loss mask
+is unchanged.
+Forest deduplicates segments before estimation so each logical rollout contributes
+at most one reward, using the same participation rule as ordinary rollouts.
 
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
@@ -34,10 +41,11 @@ Reference papers:
 - MOPD: https://arxiv.org/abs/2601.02780
 """
 
-from typing import Literal, Optional
+import math
+from typing import Annotated, Literal, Optional
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -60,6 +68,13 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     reward_weights: list[float] | None = None
     # Reinforce++ specific
     minus_baseline: bool = True
+    # OPD specific: TROPD proximal-teacher weight alpha in (0, 1]. The advantage
+    # targets the mixture log(alpha * p_teacher + (1 - alpha) * p_student)
+    # instead of the teacher itself; 1.0 is plain MOPD.
+    proximal_teacher_alpha: Annotated[float, Field(gt=0.0, le=1.0)] = 1.0
+    # OPD specific: subtract the mean advantage over every valid token in the
+    # batch the estimator sees (a whole step; see OPDAdvantageEstimator).
+    subtract_global_baseline: bool = False
 
 
 class GAEConfig(BaseModel, extra="allow"):
@@ -92,7 +107,8 @@ class GRPOAdvantageEstimator:
         """Compute GRPO advantages.
 
         Args:
-            prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
+            prompt_ids: Row equality keys of shape [batch_size, k] identifying
+                rollout groups; GRPO callers supply explicit ids with k=1.
             rewards: Tensor of shape [batch_size] containing reward for each sample.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
                   Used only for expanding advantages to token-level shape.
@@ -106,7 +122,11 @@ class GRPOAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
-        baseline, std = calculate_baseline_and_std_per_prompt(
+        (
+            baseline,
+            std,
+            is_trivial_distribution,
+        ) = calculate_baseline_and_std_per_prompt(
             prompt_ids,
             rewards,
             torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
@@ -117,9 +137,9 @@ class GRPOAdvantageEstimator:
         if self.normalize_rewards:
             # don't sharpen the ones with no variation
             epsilon = 1e-6
-            non_zero_std_mask = std > 0
-            advantages[non_zero_std_mask] = advantages[non_zero_std_mask] / (
-                std.unsqueeze(-1)[non_zero_std_mask] + epsilon
+            normalize_mask = (std > 0) & ~is_trivial_distribution
+            advantages[normalize_mask] = advantages[normalize_mask] / (
+                std.unsqueeze(-1)[normalize_mask] + epsilon
             )
 
         return advantages.expand(mask.shape)
@@ -157,10 +177,8 @@ class GDPOAdvantageEstimator:
             repeated_batch: Batch containing named reward component keys (e.g. reward/correctness, reward/format).
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
             valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
-                  reward components should participate in the per-prompt baseline/std.
-                  Token-capture placeholder rows carry 0.0 (their sample_mask already
-                  excludes them from the loss; excluding them here keeps siblings'
-                  baselines unbiased). None keeps the legacy all-valid behavior.
+                  reward components should participate in the per-prompt baseline/std
+                  and final batch normalization. None keeps the all-valid behavior.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -195,7 +213,11 @@ class GDPOAdvantageEstimator:
         advantage_parts = []
         for key in reward_component_keys:
             r = repeated_batch[key]
-            base, std_k = calculate_baseline_and_std_per_prompt(
+            (
+                base,
+                std_k,
+                is_trivial_distribution,
+            ) = calculate_baseline_and_std_per_prompt(
                 prompt_ids,
                 r,
                 valid,
@@ -204,22 +226,26 @@ class GDPOAdvantageEstimator:
             adv_k = (r - base).unsqueeze(-1)
             if self.normalize_rewards:
                 epsilon = 1e-6
-                non_zero_std_mask = std_k > 0
-                adv_k[non_zero_std_mask] = adv_k[non_zero_std_mask] / (
-                    std_k.unsqueeze(-1)[non_zero_std_mask] + epsilon
+                normalize_mask = (std_k > 0) & ~is_trivial_distribution
+                adv_k[normalize_mask] = adv_k[normalize_mask] / (
+                    std_k.unsqueeze(-1)[normalize_mask] + epsilon
                 )
 
             advantage_parts.append(adv_k)
 
-        advantages = sum(
-            weight * adv_k for weight, adv_k in zip(weights, advantage_parts)
-        )
-        # Normalize combined advantage to zero mean and unit std
-        adv_std = advantages.std()
+        advantages = torch.stack(
+            [weight * adv_k for weight, adv_k in zip(weights, advantage_parts)]
+        ).sum(dim=0)
+        # Use the same participants for the final normalization as for each
+        # reward component; otherwise excluded rewards still rescale valid rows.
+        if valid.sum() <= 1:
+            return torch.zeros_like(advantages).expand(mask.shape)
+        batch_mask = valid.unsqueeze(-1)
+        adv_mean = masked_mean(advantages, batch_mask)
+        adv_std = masked_var(advantages, batch_mask, mean=adv_mean).sqrt()
+        advantages = advantages - adv_mean
         if adv_std > 0:
-            advantages = (advantages - advantages.mean()) / adv_std
-        else:
-            advantages = advantages - advantages.mean()
+            advantages = advantages / adv_std
 
         return advantages.expand(mask.shape)
 
@@ -249,6 +275,7 @@ class ReinforcePlusPlusAdvantageEstimator:
         logprobs_policy=None,
         logprobs_reference=None,
         valid_mask=None,
+        normalization_mask: torch.Tensor | None = None,
         **kwargs,
     ):
         """Compute Reinforce++ advantages with optional KL penalty.
@@ -266,14 +293,18 @@ class ReinforcePlusPlusAdvantageEstimator:
                   placeholder rows carry 0.0 (their sample_mask already excludes them from
                   the loss; excluding them here keeps siblings' baselines unbiased).
                   None keeps the legacy all-valid behavior.
+            normalization_mask: Optional token-level statistics mask of shape
+                  [batch_size, seq_len]. May include loss-masked responses, but must
+                  exclude prompt and padding tokens. None uses mask for backward
+                  compatibility. This does not change the training loss mask.
             **kwargs: Additional arguments (unused).
 
         Returns:
-            Advantages tensor of shape [batch_size, seq_len], globally normalized across valid tokens.
+            Advantages tensor of shape [batch_size, seq_len], globally normalized across participating tokens.
         """
         # minus baseline
         if self.minus_baseline:
-            mean, _ = calculate_baseline_and_std_per_prompt(
+            mean, _, _ = calculate_baseline_and_std_per_prompt(
                 prompt_ids,
                 rewards,
                 torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
@@ -297,11 +328,18 @@ class ReinforcePlusPlusAdvantageEstimator:
                 logprobs_reference,
                 kl_type=self.kl_type,
             )
+            # Tokens outside the filtered policy support are excluded from the
+            # actor loss; keep their -inf logprobs from poisoning the batch.
+            kl = torch.where(~torch.isneginf(logprobs_policy), kl, 0.0)
             adv = adv - self.kl_coef * kl
 
-        # global normalization across the batch
-        adv_mean = (adv * mask).sum() / mask.sum()
-        adv_var = ((adv - adv_mean).pow(2) * mask).sum() / mask.sum()
+        # Statistics participation is independent of loss participation.
+        stats_mask = mask if normalization_mask is None else normalization_mask
+        num_tokens = stats_mask.sum()
+        if num_tokens == 0:
+            return torch.zeros_like(adv)
+        adv_mean = (adv * stats_mask).sum() / num_tokens
+        adv_var = ((adv - adv_mean).pow(2) * stats_mask).sum() / num_tokens
         adv_rstd = adv_var.clamp(min=1e-8).rsqrt()
         adv = (adv - adv_mean) * adv_rstd
 
@@ -432,6 +470,9 @@ class GeneralizedAdvantageEstimator:
             and logprobs_reference is not None
         ):
             kl = calculate_kl(logprobs_policy, logprobs_reference, self.kl_type)
+            # Tokens outside the filtered policy support are excluded from the
+            # actor loss; keep their -inf logprobs from poisoning the rewards.
+            kl = torch.where(~torch.isneginf(logprobs_policy), kl, 0.0)
             token_level_rewards = token_level_rewards - self.kl_coef * kl
 
         # Place terminal reward at the last response token (last mask=1
@@ -505,11 +546,10 @@ class GeneralizedAdvantageEstimator:
         lam_value = self._resolve_lambda_value()
         lam_policy = self._resolve_lambda_policy(mask)
 
-        # If lambdas differ, compute GAE twice (decoupled); otherwise once.
-        need_decouple = (
-            self.gae_lambda_value is not None
-            or self.gae_lambda_policy is not None
-            or self.length_adaptive_alpha > 0
+        # A tensor policy lambda is length-adaptive and may differ per sample.
+        # Scalar overrides only need separate passes when their resolved values differ.
+        need_decouple = isinstance(lam_policy, torch.Tensor) or (
+            lam_value != lam_policy
         )
         if need_decouple:
             _, returns = self._compute_gae(
@@ -529,6 +569,7 @@ class GeneralizedAdvantageEstimator:
                 token_level_rewards,
                 values,
                 mask,
+                gae_lambda=lam_value,
             )
 
         # Whiten advantages (optional) and zero out masked positions (always)
@@ -565,6 +606,38 @@ class GeneralizedAdvantageEstimator:
         lam = gae_lambda if gae_lambda is not None else self.gae_lambda
 
         gen_len = token_level_rewards.shape[-1]
+        if self.gae_gamma == 1.0 and not isinstance(lam, torch.Tensor) and lam == 1.0:
+            print(
+                f"Fast GAE compute activated for lambda={lam}, gamma={self.gae_gamma}",
+                flush=True,
+            )
+
+            # With zero terminal bootstrap, the TD value terms telescope:
+            # A_t = sum_{k=t}^T r_k - V_t. Scan rewards instead of running
+            # one Python/PyTorch iteration per token. Keep tensor-valued lambda
+            # on the general path.
+            masked_rewards = token_level_rewards * mask
+            reward_to_go = (
+                masked_rewards.to(
+                    torch.promote_types(masked_rewards.dtype, values.dtype)
+                )
+                .flip(-1)
+                .cumsum(-1)
+                .flip(-1)
+            )
+
+            # At masked positions, the loop carries the next valid token's
+            # advantage. Gather that token's value to preserve this behavior
+            # for both advantages and returns, including fully masked rows.
+            indices = torch.arange(gen_len, device=values.device)
+            next_valid = torch.where(mask.bool(), indices, gen_len)
+            next_valid = next_valid.flip(-1)
+            next_valid = next_valid.cummin(-1).values
+            next_valid = next_valid.flip(-1)
+            padded_values = torch.nn.functional.pad(values, (0, 1))
+            advantages = reward_to_go - padded_values.gather(-1, next_valid)
+            return advantages, advantages + values
+
         next_values: torch.Tensor = torch.zeros(
             values.shape[0], device=values.device, dtype=values.dtype
         )
@@ -600,6 +673,18 @@ class OPDAdvantageEstimator:
     hard gate on the training-to-inference ratio) is handled separately by
     ICE-POP mode in ClippedPGLoss — not here.
 
+    With ``proximal_teacher_alpha < 1`` (TROPD) the student is pulled toward a
+    proximal teacher that stays within a trust region of the student:
+        log π_prox = log(α · π_teacher + (1 − α) · π_student)
+        Â_TROPD,t = sg[log π_prox − log π_student]
+    The advantage is bounded below by log(1 − α), so tokens the teacher
+    strongly rejects cannot dominate the update. α = 1 recovers Â_MOPD exactly.
+
+    ``subtract_global_baseline`` then centers the advantage on the mean over
+    every valid token passed to one ``compute_advantage`` call. That call
+    covers a whole training step on ``run_grpo.py``; the SingleController
+    calls it once per streaming chunk and so requires one chunk per step.
+
     The loss function should be configured with:
         disable_ppo_ratio: true               (REINFORCE, no PPO ratio)
         use_importance_sampling_correction: true
@@ -612,7 +697,11 @@ class OPDAdvantageEstimator:
         prev_logprobs: [B, S] student training-engine log probabilities
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        self.proximal_teacher_alpha = estimator_config.proximal_teacher_alpha
+        self.subtract_global_baseline = estimator_config.subtract_global_baseline
         self.last_metrics: dict[str, float] = {}
 
     def compute_advantage(
@@ -641,21 +730,45 @@ class OPDAdvantageEstimator:
         if prev_logprobs is None:
             raise ValueError("OPD requires prev_logprobs")
 
-        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
-        distill_advantages = (teacher_logprobs - prev_logprobs).detach()
+        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8). Metrics
+        # report this raw gap even when TROPD changes the training signal.
+        teacher_student_gap = (teacher_logprobs - prev_logprobs).detach()
+
+        if self.proximal_teacher_alpha == 1.0:
+            distill_advantages = teacher_student_gap
+        else:
+            # TROPD: log(α · π_teacher + (1 − α) · π_student), in log space.
+            alpha = self.proximal_teacher_alpha
+            proximal_teacher_logprobs = torch.logaddexp(
+                teacher_logprobs + math.log(alpha),
+                prev_logprobs + math.log1p(-alpha),
+            )
+            distill_advantages = (proximal_teacher_logprobs - prev_logprobs).detach()
+
+        # Exclude unsupported student tokens from the baseline and metrics as
+        # well as the actor signal, including when using a proximal teacher.
+        student_support = ~torch.isneginf(prev_logprobs)
+        mask = mask * student_support.to(mask.dtype)
+        teacher_student_gap = torch.where(student_support, teacher_student_gap, 0.0)
+        distill_advantages = torch.where(student_support, distill_advantages, 0.0)
+
+        if self.subtract_global_baseline:
+            valid_advantages = torch.masked_select(distill_advantages, mask.bool())
+            if valid_advantages.numel() > 0:
+                distill_advantages = distill_advantages - valid_advantages.mean()
 
         # Apply mask
         advantages = distill_advantages * mask
 
         # Metrics
-        self._compute_metrics(distill_advantages, advantages, mask)
+        self._compute_metrics(teacher_student_gap, advantages, mask)
 
         return advantages
 
-    def _compute_metrics(self, distill_advantages, advantages, mask):
+    def _compute_metrics(self, teacher_student_gap, advantages, mask):
         """Compute OPD logging metrics and store in self.last_metrics."""
         valid_bool = mask.bool()
-        distill_valid = torch.masked_select(distill_advantages, valid_bool)
+        distill_valid = torch.masked_select(teacher_student_gap, valid_bool)
         adv_valid = torch.masked_select(advantages, valid_bool)
 
         distill_mean = distill_valid.mean().item() if distill_valid.numel() > 0 else 0.0

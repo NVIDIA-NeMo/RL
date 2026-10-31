@@ -33,12 +33,13 @@ from typing_extensions import Self
 
 from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
-    NATIVE_MULTIMODAL_KEYS,
     PACKED_MULTIMODAL_FIELDS,
     PER_TOKEN_MULTIMODAL_FIELDS,
+    VLLM_PROMPT_KEYS,
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
+from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
 from nemo_rl.distributed.collectives import (
     gather_jagged_object_lists,
     rebalance_nd_tensor,
@@ -61,7 +62,7 @@ def _prepare_multimodal_sharing(
 ) -> dict[int, Any]:
     """Enable PackedTensor provenance and return deepcopy memo entries.
 
-    PackedTensor is an explicit multimodal type. Raw native-vLLM payloads are
+    PackedTensor is an explicit multimodal type. Raw vLLM-ready payloads are
     shared only under named media keys or typed content parts. Containers are
     still deep-copied so rollout rows may diverge safely.
     """
@@ -73,11 +74,17 @@ def _prepare_multimodal_sharing(
             return
         if isinstance(item, dict):
             content_type = item.get("type")
-            typed_media = content_type in MULTIMODAL_CONTENT_TYPES
+            # "type" is not always a content-type string: text rows carry tool
+            # / JSON-schema dicts where item["type"] is itself a dict, which is
+            # unhashable and would crash the set-membership test.
+            typed_media = (
+                isinstance(content_type, str)
+                and content_type in MULTIMODAL_CONTENT_TYPES
+            )
             for key, child in item.items():
                 visit(
                     child,
-                    in_media_context or typed_media or key in NATIVE_MULTIMODAL_KEYS,
+                    in_media_context or typed_media or key in VLLM_PROMPT_KEYS,
                 )
             return
         if isinstance(item, (list, tuple)):
@@ -126,6 +133,22 @@ class DynamicBatchingArgs(TypedDict):
     )
 
 
+def _select_nested_rows(
+    tensor: torch.Tensor, indices: Union[range, list[int], torch.Tensor]
+) -> torch.Tensor:
+    if len(indices) == 0:
+        indices = range(0)
+    if isinstance(indices, range):
+        offsets = tensor.offsets()[indices.start : indices.stop + 1]
+        return torch.nested.nested_tensor_from_jagged(
+            tensor.values()[offsets[0] : offsets[-1]], offsets - offsets[0]
+        )
+    rows = tensor.unbind()
+    return torch.nested.as_nested_tensor(
+        [rows[i] for i in indices], layout=torch.jagged
+    )
+
+
 class BatchedDataDict(UserDict, Generic[DictT]):
     _PIXEL_DTYPE_CAST_KEYS = frozenset({"pixel_values", "pixel_values_videos"})
 
@@ -141,6 +164,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         as_tensors: bool = False,
         device: Optional[torch.device] = None,
         pixel_dtype: Optional[torch.dtype] = None,
+        pixel_preprocess_mode: Optional[str] = None,
     ) -> dict[str, Any]:
         """Return the multimodal fields as a dict.
 
@@ -191,7 +215,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 # unwrapping via as_tensor).
                 if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
                     v = v.to_dtype(pixel_dtype)
-                result[k] = v.as_tensor(device=device) if as_tensors else v
+                preprocess_mode = pixel_preprocess_mode if k == "pixel_values" else None
+                result[k] = v.as_tensor(device, preprocess_mode) if as_tensors else v
             elif k in PER_TOKEN_MULTIMODAL_FIELDS:
                 # Plain per-token tensor: emit as-is.
                 result[k] = v
@@ -321,6 +346,11 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 ]
             elif isinstance(list_of_tensors[0], PackedTensor):
                 tensor_or_list = PackedTensor.concat(list_of_tensors)
+            elif torch.is_tensor(list_of_tensors[0]) and list_of_tensors[0].is_nested:
+                tensor_or_list = torch.nested.as_nested_tensor(
+                    [row for tensor in list_of_tensors for row in tensor.unbind()],
+                    layout=torch.jagged,
+                )
             elif all(x.ndim == 1 for x in list_of_tensors):
                 tensor_or_list = torch.cat(list_of_tensors)
             elif isinstance(list_of_tensors[0], torch.Tensor):
@@ -415,7 +445,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         indices = torch.arange(B).tensor_split(chunks)[rank]
 
         for k in self.data:
-            if torch.is_tensor(self.data[k]):
+            if torch.is_tensor(self.data[k]) and self.data[k].is_nested:
+                chunked_batch[k] = _select_nested_rows(self.data[k], indices.tolist())
+            elif torch.is_tensor(self.data[k]):
                 chunked_batch[k] = self.data[k][indices].clone()
             elif isinstance(self.data[k], PackedTensor):
                 chunked_batch[k] = self.data[k].slice(indices)
@@ -444,7 +476,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         for k, v in self.data.items():
             sorted_v: torch.Tensor | list[Any]
-            if torch.is_tensor(v):
+            if torch.is_tensor(v) and v.is_nested:
+                sorted_v = _select_nested_rows(v, reordered_indices)
+            elif torch.is_tensor(v):
                 sorted_v = v.index_select(
                     dim=0, index=torch.IntTensor(reordered_indices)
                 )
@@ -605,7 +639,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             # finally reorder the data along the sorted sequence len indices
             for k, v in self.data.items():
                 sorted_v: torch.Tensor | list[Any] | PackedTensor
-                if torch.is_tensor(v):
+                if torch.is_tensor(v) and v.is_nested:
+                    sorted_v = _select_nested_rows(v, batch_sorted_indices)
+                elif torch.is_tensor(v):
                     sorted_v = v.index_select(
                         dim=0, index=torch.IntTensor(batch_sorted_indices)
                     )
@@ -863,7 +899,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 for shard_indice in range(shard_size):
                     # use the max seqlen of all shards to calculate the total number of tokens in the mb
                     # this ensures each DP rank has the same batch size each iteration which is
-                    # required for FSDP2 and megatron policies.
+                    # required for Automodel and megatron policies.
                     max_seqlen_this_shard_indice = 0
                     chunk_start = chunk_idx * shard_size
                     chunk_end = (chunk_idx + 1) * shard_size
@@ -979,7 +1015,12 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 assert end <= self.data[k].shape[0], (
                     f"end: {end} is greater than the shape of the tensor: {self.data[k].shape[0]} for key: {k}"
                 )
-            sliced_batch[k] = self.data[k][start:end]
+            v = self.data[k]
+            sliced_batch[k] = (
+                _select_nested_rows(v, range(start, end))
+                if isinstance(v, torch.Tensor) and v.is_nested
+                else v[start:end]
+            )
         return sliced_batch
 
     def repeat_interleave(
@@ -1014,7 +1055,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     shared_leaves = (
                         _prepare_multimodal_sharing(
                             item,
-                            media_context=k in NATIVE_MULTIMODAL_KEYS,
+                            media_context=k in VLLM_PROMPT_KEYS,
                         )
                         if share_immutable_media
                         else {}
@@ -1037,8 +1078,15 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             # name it here.
             if k in PACKED_MULTIMODAL_FIELDS:
                 continue
+            if torch.is_tensor(v) and v.is_nested:
+                continue
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
-                self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
+                length = truncated_len
+                if k in OPD_FULL_FIELDS:
+                    # materialize() leaves the payload at its natural width,
+                    # which can already be shorter than this microbatch's seqlen.
+                    length = min(truncated_len, int(v.shape[dim]))
+                self.data[k] = torch.narrow(v, dim=dim, start=0, length=length)
 
     def make_microbatch_iterator_with_dynamic_shapes(
         self,
@@ -1132,7 +1180,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """
         selected_batch: Self = type(self)()
         for k, v in self.data.items():
-            if torch.is_tensor(v):
+            if torch.is_tensor(v) and v.is_nested:
+                selected_batch[k] = _select_nested_rows(v, indices)
+            elif torch.is_tensor(v):
                 selected_batch[k] = v[indices]
             elif isinstance(v, PackedTensor):
                 selected_batch[k] = v.slice(indices)

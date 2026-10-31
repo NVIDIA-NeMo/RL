@@ -100,8 +100,8 @@ class NemotronNanoVLV2Processor:
 
 def _batch_with_two_differently_sized_images() -> BatchedDataDict:
     urls = [
-        image_to_data_url(Image.new("RGB", (2, 3), color="red")),
-        image_to_data_url(Image.new("RGB", (4, 5), color="blue")),
+        image_to_data_url(Image.new("RGB", (16, 32), color="red")),
+        image_to_data_url(Image.new("RGB", (32, 64), color="blue")),
     ]
     return BatchedDataDict(
         {
@@ -183,7 +183,7 @@ def test_equal_resolution_multi_image_is_unchanged_by_the_flag():
                                         {
                                             "type": "input_image",
                                             "image_url": image_to_data_url(
-                                                Image.new("RGB", (4, 4), color=colour)
+                                                Image.new("RGB", (16, 16), color=colour)
                                             ),
                                         }
                                         for colour in ("red", "blue")
@@ -208,11 +208,11 @@ def test_equal_resolution_multi_image_is_unchanged_by_the_flag():
         assert torch.equal(off[key].as_tensor(), on[key].as_tensor()), key
 
 
-def test_with_the_flag_the_prompt_is_padded_and_keeps_its_true_sizes():
-    """The padded tensor is one shape, but imgs_sizes stays per-image.
+def test_with_the_flag_the_prompt_supports_patchify_and_padding():
+    """Both materializations preserve the native per-image geometry.
 
-    Padding is a batching convenience; the model needs the unpadded extents to
-    crop each image back out, so they must be read before the pad.
+    Megatron consumes patchified pixels, while AutoModel requests padded pixels.
+    Both paths share ``imgs_sizes``, which must retain the unpadded extents.
     """
     batch = _batch_with_two_differently_sized_images()
 
@@ -223,13 +223,10 @@ def test_with_the_flag_the_prompt_is_padded_and_keeps_its_true_sizes():
     )
 
     user_message = batch["message_log"][0][0]
-    pixel_values = user_message["pixel_values"].as_tensor()
-    # Padded up to the larger image, one row per image.
-    assert pixel_values.shape[0] == 2
-    assert pixel_values.shape[-2:] == torch.Size([5, 4])
-    # The true per-image extents survive the pad: (height, width). Read off the
-    # unpadded tiles, so the smaller image still reports 3x2 rather than 5x4.
-    assert user_message["imgs_sizes"].as_tensor().tolist() == [[3, 2], [5, 4]]
+    pixel_values = user_message["pixel_values"]
+    assert pixel_values.as_tensor(mode="patchify").shape == (1, 10, 768)
+    assert pixel_values.as_tensor(mode="pad_to_max_shape").shape == (2, 3, 64, 32)
+    assert user_message["imgs_sizes"].as_tensor().tolist() == [[32, 16], [64, 32]]
 
 
 # --------------------------------------------------------------------------

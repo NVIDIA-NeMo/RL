@@ -1,6 +1,6 @@
 # Reward Model Training in NeMo RL
 
-This document explains how to train reward models (RM) within NeMo RL. Currently, only Bradley-Terry reward models are supported on the DTensor backend. Megatron backend support is tracked [here](https://github.com/NVIDIA-NeMo/RL/issues/720).
+This document explains how to train reward models (RM) within NeMo RL. Currently, only Bradley-Terry reward models are supported on the Automodel backend. Megatron backend support is tracked [here](https://github.com/NVIDIA-NeMo/RL/issues/720).
 
 ## Launch a Training Job
 
@@ -17,7 +17,7 @@ uv run examples/run_rm.py --config examples/configs/rm.yaml policy.model_name=Qw
 
 The default YAML config shares the same base template as the SFT config but includes a new `reward_model_cfg` section with `enabled: true` to load the model as a Reward Model. You can find an example RM config file at [examples/configs/rm.yaml](../../examples/configs/rm.yaml).
 
-**Reminder**: Set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). Make sure to log in using `huggingface-cli` if you're working with Llama models.
+**Reminder**: Set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). Make sure to log in using `hf auth login` if you're working with Llama models.
 
 ## Datasets
 
@@ -188,7 +188,7 @@ parent directory to `PYTHONPATH` before launching training.
 
 Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
-- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
+- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `val:validation-<NameOfValidationDataset1>_loss`.
 
 ## Using Reward Models as Environments
 

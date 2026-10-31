@@ -19,8 +19,12 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.models.generation.interfaces import CheckpointEngineConfig
+from nemo_rl.models.generation.vllm.worker_utils import resolve_vllm_rank_prefixes
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    WeightSynchronizer,
+    initialize_refit_metadata,
+)
 
 _MEBIBYTE = 1024 * 1024
 
@@ -67,7 +71,7 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     _bucket_size_bytes: int | None = None
 
     def init_communicator(self) -> None:
-        self._generation.prepare_refit_info(self._policy.prepare_refit_info())
+        initialize_refit_metadata(self._policy, self._generation)
         self._ensure_checkpoint_engine_ready()
 
     @property
@@ -184,7 +188,9 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
             "rollout_world_size": len(generation_metadata),
         }
         worker_count = len(self._generation.worker_group.workers)
-        workers_per_group = worker_count // self._generation.dp_size
+        rank_prefixes = resolve_vllm_rank_prefixes(
+            worker_count, self._generation.dp_size, self._generation.vllm_dp_size
+        )
         ray.get(
             self._run_policy("init_checkpoint_engine_process_group", **topology)
             + self._generation.worker_group.run_all_workers_multiple_data(
@@ -196,7 +202,7 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
                         topology["rollout_world_size"],
                         topology["metadata"],
                     )
-                    for rank_prefix in range(0, worker_count, workers_per_group)
+                    for rank_prefix in rank_prefixes
                 ],
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
                 common_kwargs={

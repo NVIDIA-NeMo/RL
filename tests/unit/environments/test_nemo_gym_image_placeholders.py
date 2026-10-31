@@ -16,7 +16,11 @@ import pytest
 import torch
 from PIL import Image
 
-from nemo_rl.data.multimodal_utils import attach_image_model_inputs_to_message
+from nemo_rl.data.multimodal_utils import (
+    attach_image_model_inputs_to_message,
+    uses_image_placeholder,
+)
+from nemo_rl.environments.nemotron_utils import NEMOTRON_VIDEO_PROCESSOR_NAMES
 
 # --------------------------------------------------------------------------
 # ragged pixel_values path in attach_image_model_inputs_to_message
@@ -57,10 +61,19 @@ class NemotronNanoVLV2Processor:
         return processed
 
 
+def test_super_omni_processor_alias_is_registered_for_image_and_video():
+    processor = type("NemotronH_Super_Omni_Reasoning_V3Processor", (), {})()
+
+    assert uses_image_placeholder(processor)
+    assert type(processor).__name__ in NEMOTRON_VIDEO_PROCESSOR_NAMES
+
+
 def _ragged(*shapes: tuple[int, ...]) -> NemotronNanoVLV2Processor:
     return NemotronNanoVLV2Processor(
         [torch.ones(*shape) for shape in shapes],
-        imgs_sizes=torch.tensor([[4, 4]] * len(shapes), dtype=torch.long),
+        imgs_sizes=torch.tensor(
+            [[shape[-2], shape[-1]] for shape in shapes], dtype=torch.long
+        ),
     )
 
 
@@ -83,9 +96,9 @@ def test_ragged_output_requested_only_for_multi_image_turns():
         )
 
 
-def test_ragged_pixel_values_are_padded_to_one_tensor():
-    """Heterogeneous CHW tensors become a single padded tensor for the message."""
-    processor = _ragged((3, 2, 4), (3, 6, 4))
+def test_ragged_pixel_values_are_patchified_to_one_tensor():
+    """Heterogeneous CHW tensors become one packed patch sequence."""
+    processor = _ragged((3, 16, 32), (3, 32, 16))
     user_message: dict = {}
     attach_image_model_inputs_to_message(
         user_message,
@@ -94,10 +107,7 @@ def test_ragged_pixel_values_are_padded_to_one_tensor():
         pad_dynamic_image_shapes=True,
     )
     packed = user_message["pixel_values"].as_tensor()
-    # Two images, padded up to the tallest, channels preserved.
-    assert packed.shape[0] == 2
-    assert packed.shape[-3] == 3
-    assert packed.shape[-2] == 6
+    assert packed.shape == (1, 4, 768)
 
 
 def test_ragged_pixel_values_reject_non_chw_entries():

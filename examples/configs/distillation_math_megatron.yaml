@@ -15,7 +15,7 @@ policy: &POLICY_BASE
     precision: "bfloat16"
     logprob_chunk_size: null
 
-    dtensor_cfg:
+    automodel_cfg:
         enabled: false
 
     dynamic_batching:
@@ -90,6 +90,9 @@ policy: &POLICY_BASE
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
         use_gloo_process_groups: false
+        # Collective timeout (minutes) for default, Megatron model-parallel, and
+        # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+        distributed_timeout_minutes: null
         peft:
             enabled: false
             target_modules: []
@@ -102,6 +105,7 @@ policy: &POLICY_BASE
             lora_B_init_method: "zero"
             a2a_experimental: false
             lora_dtype: null
+            restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
 
         optimizer:
             optimizer: "adam"
@@ -161,6 +165,8 @@ policy: &POLICY_BASE
         top_k: null
         stop_token_ids: null
         stop_strings: null
+        # LoRA defaults to native refit; Megatron LoRA recipes override this to merged.
+        lora_refit_mode: native
         vllm_cfg:
             async_engine: false
             precision: ${...precision}

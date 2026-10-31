@@ -13,12 +13,15 @@
 # limitations under the License.
 
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.evals.eval import (
+    _run_env_eval_impl,
     eval_cons_k,
     eval_pass_k,
     run_env_eval,
@@ -184,3 +187,103 @@ def test_eval_cons_k_multiple_groups():
     expected = 11 / 20
     assert isinstance(average_score, float)
     assert average_score == pytest.approx(expected, rel=1e-6)
+
+
+def test_run_env_eval_impl_builds_vllm_multi_modal_prompts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The eval prompt loop must forward per-row ``multi_modal_data`` to vLLM.
+
+    Row 0 is a VLM row: ``vlm_hf_data_processor`` leaves ``content`` as a list of
+    typed parts, so anything that unconditionally joins it raises ``TypeError``.
+    Row 1 is text-only and must fall back to the joined message_log text.
+    Rows 2 and 3 cover placeholder-style and truncated VLM prompts.
+    """
+    image = "test-image"
+    truncated_content = [{"type": "image", "image": image}]
+    batch = BatchedDataDict(
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image},
+                            {"type": "text", "text": "describe the image"},
+                        ],
+                    }
+                ],
+                [{"role": "user", "content": "plain"}],
+                [
+                    {"role": "system", "content": "describe", "token_ids": [7, 8]},
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": image}],
+                        "token_ids": torch.tensor([9, 10]),
+                    },
+                ],
+                [
+                    {
+                        "role": "user",
+                        "content": truncated_content,
+                        "token_ids": torch.tensor([1, 2]),
+                    }
+                ],
+            ],
+            "extra_env_info": [{"ground_truth": answer} for answer in "abcd"],
+            "vllm_content": ["<image> describe the image", None, None, None],
+            "vllm_multi_modal_data": [{"image": image}, {}, {"image": image}, {}],
+        }
+    )
+
+    captured = {}
+
+    async def fake_generate_texts(vllm_generation, inputs, use_async):
+        captured["prompts"] = list(inputs["prompts"])
+        return [f"out-{i}" for i in range(4)]
+
+    monkeypatch.setattr("nemo_rl.evals.eval._generate_texts", fake_generate_texts)
+    monkeypatch.setattr("nemo_rl.evals.eval._print_results", lambda *a, **k: None)
+    monkeypatch.setattr("nemo_rl.evals.eval.ray.get", lambda value: value)
+
+    env = SimpleNamespace(
+        step=SimpleNamespace(
+            remote=lambda *args: SimpleNamespace(
+                rewards=torch.tensor([1.0, 0.0, 1.0, 0.0])
+            )
+        ),
+        shutdown=SimpleNamespace(remote=lambda: None),
+    )
+    master_config = SimpleNamespace(
+        generation={"backend": "vllm"},
+        eval={
+            "metric": "pass@k",
+            "num_tests_per_prompt": 1,
+            "k_value": 1,
+            "save_path": None,
+        },
+    )
+
+    class _SingleBatchDataloader(list):
+        dataset = [0, 1, 2, 3]
+
+    asyncio.run(
+        _run_env_eval_impl(
+            vllm_generation=SimpleNamespace(shutdown=lambda: None),
+            dataloader=_SingleBatchDataloader([batch]),
+            env=env,
+            master_config=master_config,
+        )
+    )
+
+    prompts = captured["prompts"]
+    assert prompts[0] == {
+        "prompt": "<image> describe the image",
+        "multi_modal_data": {"image": image},
+    }
+    assert prompts[1] == "plain"
+    assert prompts[2] == {
+        "prompt_token_ids": [7, 8, 9, 10],
+        "multi_modal_data": {"image": image},
+    }
+    assert prompts[3] == str(truncated_content)

@@ -17,6 +17,7 @@ import multiprocessing
 import os
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import ray
 import requests
@@ -26,11 +27,33 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_LOW,
     _get_free_consecutive_ports_local,
 )
+from nemo_rl.models.generation.sglang.config import SGLangOutlinesCachePolicy
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _format_v6_uri
 from nemo_rl.models.generation.sglang.utils.patches import _apply_sglang_compat_patches
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_current_node_ip
 
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
 logger = logging.getLogger(__name__)
+
+
+def _launch_server_with_parent_guard(
+    server_args: "ServerArgs", parent_pid: int
+) -> None:
+    """Terminate the server process tree if its owning Ray actor dies."""
+    # SGLang is optional in the driver environment; load it in the server child.
+    from sglang.srt.entrypoints.http_server import launch_server
+    from sglang.srt.utils import kill_itself_when_parent_died
+
+    # SGLang already arms this guard in scheduler and detokenizer children.
+    # Complete the actor -> HTTP server -> GPU worker chain here.
+    kill_itself_when_parent_died()
+    if os.getppid() != parent_pid:
+        # The actor may have died before the guard was installed. No server or
+        # GPU child has started yet, so returning closes that startup race.
+        return
+    launch_server(server_args)
 
 
 @ray.remote  # pragma: no cover
@@ -81,7 +104,6 @@ class SGLangGenerationWorker:
         self._launch_server_process(server_args_dict)
 
     def _launch_server_process(self, server_args_dict):
-        from sglang.srt.entrypoints.http_server import launch_server
         from sglang.srt.server_args import ServerArgs
 
         logger.info(
@@ -91,7 +113,10 @@ class SGLangGenerationWorker:
         server_args = ServerArgs(**server_args_dict)
         multiprocessing.set_start_method("spawn", force=True)
         server_args.host = server_args.host.strip("[]")
-        p = multiprocessing.Process(target=launch_server, args=(server_args,))
+        p = multiprocessing.Process(
+            target=_launch_server_with_parent_guard,
+            args=(server_args, os.getpid()),
+        )
         p.start()
 
         if server_args.node_rank == 0:
@@ -202,6 +227,14 @@ class SGLangGenerationWorker:
         )
         response.raise_for_status()
         return True
+
+    def is_alive(self) -> bool:
+        """Check the actor and its server process without requiring loaded weights.
+
+        The Ray call detects actor death; the process check also detects a dead
+        server whose owning actor is still alive, including nonzero node ranks.
+        """
+        return self.process.is_alive()
 
     def update_weights_from_tensor(
         self,
@@ -451,6 +484,15 @@ class SGLangGenerationWorker:
         nnodes = max(1, _gpus_per_engine // self.gpus_per_node)
         node_rank = self.rank % nnodes
         local_gpu_id = self._to_local_gpu_id(self.base_gpu_id)
+        cache_policy = SGLangOutlinesCachePolicy.model_validate(
+            {
+                "disable_outlines_disk_cache": sglang_cfg_inner[
+                    "disable_outlines_disk_cache"
+                ]
+            }
+            if "disable_outlines_disk_cache" in sglang_cfg_inner
+            else {}
+        )
         kwargs = {
             "model_path": sglang_cfg_inner["model_path"],
             "trust_remote_code": True,
@@ -458,6 +500,8 @@ class SGLangGenerationWorker:
             # memory
             "enable_memory_saver": sglang_server_cfg["needs_offload"],
             "enable_weights_cpu_backup": sglang_server_cfg["cpu_weight_backup"],
+            # Avoid the legacy pickle-based cache unless explicitly enabled.
+            "disable_outlines_disk_cache": cache_policy.disable_outlines_disk_cache,
             # distributed
             "host": host,
             "port": port,

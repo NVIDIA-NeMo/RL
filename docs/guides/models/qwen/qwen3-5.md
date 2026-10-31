@@ -23,7 +23,7 @@ Model support is tracked in two stages:
 | **Functionally Ready** | Runnable end-to-end and numerically validated with an initial training run. |
 | **Long-Run Convergence Validated** | Trains stably over a full-length run with a healthy, reproducible reward curve. |
 
-The Qwen3.5 family is supported on both the Megatron (MCore) and AutoModel (DTensor)
+The Qwen3.5 family is supported on both the Megatron (MCore) and Automodel
 backends. The specific configurations shipped as [example recipes](#example-recipes)
 below are the ones that have been **Long-Run Convergence Validated**. Other variants
 and configurations are runnable but have not all been validated for long-run
@@ -35,9 +35,9 @@ convergence.
 | --- | --- | --- | --- | --- |
 | `Qwen/Qwen3.5-9B-Base` | LLM (dense) | Megatron | TP | vLLM |
 | `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | Megatron | TP + EP + PP + CP | vLLM |
-| `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | AutoModel (DTensor) | EP + CP | vLLM |
+| `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | Automodel | EP + CP | vLLM |
 | `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | Megatron | TP + EP + PP + CP | vLLM |
-| `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | AutoModel (DTensor) | EP | vLLM |
+| `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | Automodel | EP | vLLM |
 | `Qwen/Qwen3.5-397B-A17B` | LLM (MoE) | Megatron | TP + EP + PP + CP | vLLM |
 
 Notes on backends and parallelism:
@@ -46,7 +46,7 @@ Notes on backends and parallelism:
   Parallel (TP), Expert Parallel (EP), Pipeline Parallel (PP), and Context Parallel
   (CP) for longer sequences — on both the LLM and the VLM (see
   [#2312](https://github.com/NVIDIA-NeMo/RL/pull/2312) for CP).
-- **AutoModel (DTensor)** supports Expert Parallel (EP), and Context Parallel for
+- **Automodel** supports Expert Parallel (EP), and Context Parallel for
   the MoE **LLM** only; CP on AutoModel requires the TE backend and
   `flash-linear-attention`. **Dense Qwen3.5 and the VLM do not support Context
   Parallel on AutoModel** (set `cp_size = 1`). See
@@ -64,8 +64,10 @@ authoritative settings.
 | Qwen3.5-9B-Base | LLM | GRPO | Megatron | 1n8g | [`grpo-qwen3.5-9b-1n8g-megatron-fp8.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron-fp8.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml) |
+| Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 4n4g | [`grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.yaml) |
+| Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 6n4g | [`grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml) |
-| Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 4n8g | [`grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml) |
+| Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 4n8g | [`grpo-qwen3.5-35ba3b-dapo-4n8g-automodel-ep32.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel-ep32.yaml) |
 | Qwen3.5-397B-A17B | LLM | GRPO | Megatron | 32n8g | [`grpo-qwen3.5-397ba17b-32n8g-megatron.v2.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.yaml) |
 | Qwen3.5-35B-A3B-Base | VLM | GRPO | Megatron | 2n8g | [`vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml) |
 | Qwen3.5-35B-A3B-Base | VLM | GRPO | AutoModel | 2n8g | [`vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.yaml) |
@@ -117,13 +119,13 @@ uv run examples/run_grpo.py \
 
 ### Long-Reasoning GRPO (Ready Out of the Box)
 
-The 4n8g `grpo-qwen3.5-35ba3b-dapo-4n8g-automodel` recipe already sets
+The 4n8g `grpo-qwen3.5-35ba3b-dapo-4n8g-automodel-ep32` recipe already sets
 `max_new_tokens: 8192` and `max_total_sequence_length: 9216`, and serves as a
 suitable starting point for long-reasoning runs.
 
 ```sh
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml \
+  --config examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel-ep32.yaml \
   grpo.use_dynamic_sampling=true \
   grpo.batch_multiplier=3 \
   grpo.max_val_samples=960 \
@@ -152,7 +154,7 @@ The run shows healthy convergence behavior:
 - **Approximate entropy** declines gradually without collapsing, and **generation KL
   error** and **gradient norm** stay low and stable throughout.
 
-![100-step training curves for grpo-qwen3.5-35ba3b-dapo-4n8g-automodel: validation accuracy, training reward, mean generated tokens per sample, approximate entropy, generation KL error, and gradient norm](../../../assets/qwen3-5/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel-100steps.png)
+![100-step training curves for grpo-qwen3.5-35ba3b-dapo-4n8g-automodel-ep32: validation accuracy, training reward, mean generated tokens per sample, approximate entropy, generation KL error, and gradient norm](../../../assets/qwen3-5/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel-100steps.png)
 
 ### Large MoE (397B-A17B)
 
@@ -183,6 +185,12 @@ and
 [`grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml).
 General FP8 background lives in [FP8 Quantization](../../../fp8.md); the notes
 below are the Qwen3.5-specific sharp edges.
+
+For BF16 Megatron training with grouped-MoE MXFP8 rollouts and the FlashInfer
+TRTLLM MoE backend, use
+[`grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.yaml).
+The recurring 20-step GB200 test checks reward, finite loss, and rollout-versus-
+training log-prob parity after each refit.
 
 ### Block Layout and Shape Constraints
 
@@ -246,15 +254,15 @@ FP8 noise.
 
 ### Limitations
 
-- MXFP8 is not yet supported; tracked in
-  [#3694](https://github.com/NVIDIA-NeMo/RL/issues/3694).
+- Dense Qwen3.5 MXFP8 rollout has not yet completed recurring end-to-end
+  validation.
 
 ## `flash-linear-attention` Performance
 
 Qwen3.5 relies on `flash-linear-attention` (FLA) and `causal-conv1d` kernels for
 full speed. There are two distinct cases:
 
-- **Performance fallback on AutoModel and DTensor.** Several `nemo-automodel` kernels
+- **Performance fallback on Automodel.** Several `nemo-automodel` kernels
   dispatch to FLA if it is importable and otherwise fall back to slower PyTorch
   implementations. Without FLA, Qwen3.5 (dense or MoE) trains roughly **two times
   slower** on the AutoModel path, without raising an error. The `-megatron` recipes use Megatron Core

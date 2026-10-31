@@ -11,17 +11,74 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import warnings
 from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
-from nemo_rl.models.generation.trtllm import TrtllmConfig
+from nemo_rl.models.generation.trtllm.config import (
+    TrtllmConfig,
+    resolve_role_overrides,
+)
 from nemo_rl.models.generation.vllm import VllmConfig
-from nemo_rl.models.generation.vllm.config import VLLM_SPARSE_REFIT_TRANSPORTS
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    validate_nvfp4_pertoken_generation,
+    validate_vllm_quantization_config,
+)
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+def maybe_configure_engine_reaping_env(enabled: bool) -> None:
+    """Let the raylet reap a dead generation worker's EngineCore, on runs the driver owns.
+
+    A vLLM generation worker spawns its EngineCore as a plain multiprocessing child --
+    ``context.Process(target=EngineCoreProc.run_engine_core)``, no ``setsid``, not a
+    daemon -- and that child owns the CUDA context and the KV cache. Every cleanup path
+    that exists runs INSIDE the dying process, so SIGKILL defeats all of them: vLLM's
+    ``weakref.finalize`` never fires, a non-daemon multiprocessing child is designed to
+    outlive its parent, and Ray's default ``RAY_kill_child_processes_on_worker_exit`` is
+    the worker's own exit handler. The orphan then holds its GPU for the life of the job:
+    measured on 4xGB200, one SIGKILLed shard left 114.95 GiB of a 184.31 GiB device still
+    held, and it did not come back across five restart attempts -- the replacement could
+    not fit, so re-admission failed while the survivors carried on. Because the EngineCore
+    never calls ``setsid`` it stays in the worker's process group, which is exactly what
+    per-worker process-group cleanup reaches.
+
+    **The raylet is the only reader, and this only reaches the raylet on runs where the
+    driver starts it.** Ray reads ``process_group_cleanup_enabled`` in the raylet, at the
+    raylet's own startup. Call this **before** ``init_ray()``, like
+    :func:`~nemo_rl.data_plane.factory.maybe_configure_data_plane_env`, and on a
+    local/single-node run ``ray.init`` forks a raylet that inherits this environment, so it
+    lands. On a Slurm or k8s cluster it does NOT: ``ray start`` has already run on every
+    node before the driver process exists, and ``init_ray()`` then attaches to it with
+    ``address="auto"``. Nothing the driver sets afterwards can change a raylet that is
+    already up. Those deployments set the flag where the raylet is actually launched --
+    see the ``RAY_process_group_cleanup_enabled`` export in ``ray.sub`` -- which means it
+    is unconditional there, not scoped to fleet health.
+
+    So the gate below buys scoping on exactly one deployment shape. It is still worth
+    having: a raylet-wide behaviour change should not follow from ``import nemo_rl``, and a
+    plain SFT, DPO or distillation run has no EngineCore to reap. But it is not a property
+    of the flag, it is a property of who started the raylet.
+
+    ``setdefault``, not assignment: an operator debugging a wedged engine may want the
+    corpse, and an explicit ``RAY_process_group_cleanup_enabled=0`` stays honoured.
+
+    Args:
+        enabled: Whether this run can lose a generation worker and keep going. A ``bool``
+            rather than the fleet-health config, so any entrypoint that builds vLLM
+            generation can call it -- the leak is not specific to fleet health, it just
+            takes a run that survives the loss to leave the orphan behind. Note this is
+            ``fleet_health.enabled``, not ``restart_dead_shards``: any shard loss leaks
+            that GPU, restarting is only what makes the loss survivable.
+    """
+    if not enabled:
+        return
+    os.environ.setdefault("RAY_process_group_cleanup_enabled", "1")
 
 
 def resolve_generation_class(
@@ -56,14 +113,46 @@ def resolve_generation_class(
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
+def draft_full_refit_enabled(policy_cfg: dict) -> bool:
+    """Whether the trainer streams the drafter's FULL weight set on refit.
+
+    True for Automodel draft co-training (dspark/dflash/eagle3), which
+    exports the drafter's entire state_dict under the ``draft.`` prefix; the
+    megatron eagle3 path streams a partial set instead. Feeds the
+    ``draft_full_refit`` argument of :func:`configure_generation_config`.
+
+    automodel_cfg.enabled alone identifies the Automodel path.
+    """
+    from nemo_rl.models.policy.draft_config import coerce_draft_config
+
+    draft_config = coerce_draft_config(policy_cfg.get("draft"))
+    automodel_cfg = policy_cfg.get("automodel_cfg") or {}
+    return (
+        draft_config is not None
+        and bool(draft_config.enabled)
+        and bool(automodel_cfg.get("enabled", False))
+    )
+
+
 def configure_generation_config(
     config: GenerationConfig,
     tokenizer: TokenizerType,
     is_eval: bool = False,
     has_refit_draft_weights: bool = False,
     trains_mtp: bool = False,
+    draft_full_refit: bool = False,
 ) -> GenerationConfig:
     """Apply specific configurations to generation config."""
+    if (
+        config["backend"] != "vllm"
+        and config.get("worker_extension_cls_fqn") is not None
+    ):
+        raise ValueError(
+            "generation.worker_extension_cls_fqn is only supported by the vLLM backend, "
+            f"got backend={config['backend']!r}. Use policy.worker_extension_cls_fqn to "
+            "extend the training worker instead."
+        )
+
     # tokenizer setting
     if "_pad_token_id" in config:
         warnings.warn(
@@ -78,10 +167,17 @@ def configure_generation_config(
     # vLLM setting shared by the standard and managed Dynamo backends.
     if config["backend"] in ("vllm", "dynamo"):
         vllm_backed_config = cast(VllmConfig, config)
-        vllm_backed_config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+        # Respect explicit checkpoint-loading overrides. Dummy loading relies
+        # on startup refit to initialize all generator weights, including frozen
+        # vision parameters; freezing alone does not exclude them from refit.
+        vllm_backed_config["vllm_cfg"].setdefault(
+            "load_format", "auto" if is_eval else "dummy"
+        )
 
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
+        validate_vllm_quantization_config(config)
+        validate_nvfp4_pertoken_generation(config, is_eval=is_eval)
         if config.get("real_quant"):
             export_cpu_offload = config.get("real_quant_export_cpu_offload")
             if not isinstance(export_cpu_offload, bool):
@@ -122,6 +218,12 @@ def configure_generation_config(
         config["_draft_weights_from_refit"] = has_refit_draft_weights
         config["_mtp_weights_from_refit"] = trains_mtp
 
+        # Whether the trainer streams the drafter's FULL weight set (incl.
+        # embed_tokens/lm_head) on every refit — true for Automodel draft
+        # co-training. The megatron eagle3 path streams a partial set and
+        # relies on drafter module sharing instead.
+        config["_draft_full_refit"] = draft_full_refit
+
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
         if "skip_tokenizer_init" not in config["vllm_cfg"]:
             # set skip_tokenizer_init
@@ -135,6 +237,6 @@ def configure_generation_config(
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
 
     elif config["backend"] == "trtllm":
-        config = cast(TrtllmConfig, config)
+        config = resolve_role_overrides(cast(TrtllmConfig, config))
 
     return config

@@ -44,6 +44,7 @@ from nemo_rl.experience.failures import (
     RolloutTimeout,
     classify_rollout_failure,
 )
+from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollout_manager import (
     AsyncRolloutImpl,
     RequestDeadlineRegistry,
@@ -152,6 +153,7 @@ def _make_impl(
     impl._policy_generation = generation
     impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
     impl._deadline_registry = None
+    impl._forest_training = False
     return impl
 
 
@@ -181,6 +183,11 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
         else RolloutRetryPolicy.single_attempt()
     )
     manager._stats = RolloutStats()
+    manager._forest_training = False
+    manager._canonical_groups_finalized = 0
+    manager._canonical_output_tokens = 0
+    manager._recovery_siblings_reused = 0
+    manager._recovery_siblings_redispatched = 0
     manager._skipped_prompts = 0
     manager._consecutive_infra_drops = 0
     return manager
@@ -461,14 +468,18 @@ class _PartialGymMethod:
         self._failures_before_success = failures_before_success
         self.attempts = 0
         self.dispatched: list[list[int]] = []
+        self.dispatched_task_indices: list[list[int | None]] = []
 
     def options(self, **kwargs):
         del kwargs
         return self
 
-    def remote(self, inputs, timer_prefix):
-        del timer_prefix
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
         self.dispatched.append([row["_rowidx"] for row in inputs])
+        self.dispatched_task_indices.append(
+            [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in inputs]
+        )
         attempt = self.attempts
         self.attempts += 1
         return self._stream(inputs, attempt)
@@ -507,8 +518,8 @@ class _FakeGymMethod:
         del kwargs
         return self
 
-    def remote(self, inputs, timer_prefix):
-        del timer_prefix
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
         return self._stream(len(inputs))
 
     async def _stream(self, num_inputs):
@@ -536,14 +547,22 @@ def _make_gym_impl(
     from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 
     impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._forest_training = False
     impl._tokenizer = _FakeTokenizer()
     impl._task_to_env = {"nemo_gym": type("Env", (), {"run_rollouts": gym_method})()}
     impl._num_generations_per_prompt = num_generations
     impl._max_seq_len = 128
     impl._max_rollout_turns = 1
+    impl._generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 128,
+    }
+    impl.set_next_nemo_gym_task_index(0)
     impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
     impl._deadline_registry = None
     impl._max_gym_row_attempts = row_attempts
+    impl._forest_training = False
     # Real counters by default so row-level re-dispatches are observable; production
     # shares the owning RolloutManager's instance.
     impl._stats = stats if stats is not None else RolloutStats()
@@ -611,13 +630,25 @@ class TestPartialGymRedispatch:
         # Rows 0-1 land, then the stream dies; the retry should carry rows 2-3 only.
         method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
         impl = _make_gym_impl(method, num_generations=4, row_attempts=3)
+        impl.set_next_nemo_gym_task_index(17)
 
-        completions, _, _ = asyncio.run(
-            impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout")
+        record = asyncio.run(
+            impl.run_rollout(
+                {
+                    "idx": 0,
+                    "message_log": [],
+                    "extra_env_info": {
+                        "task_source": "workplace_assistant",
+                        "responses_create_params": {},
+                    },
+                }
+            )
         )
 
         assert method.dispatched == [[0, 1, 2, 3], [2, 3]]
-        assert len(completions) == 4
+        assert method.dispatched_task_indices == [[17, 17, 17, 17], [17, 17]]
+        assert impl.get_next_nemo_gym_task_index() == 18
+        assert len(record.completions) == 4
 
     def test_completed_rows_survive_across_attempts(self):
         """The point of the exercise: work already done is not thrown away.
@@ -723,9 +754,12 @@ class TestPartialGymRedispatch:
         method = _PartialGymMethod(fail_after_rows=1, failures_before_success=99)
         impl = _make_gym_impl(method, num_generations=4, row_attempts=2)
 
-        with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError) as exc_info:
             asyncio.run(impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout"))
         assert method.attempts == 2, "the budget bounds the re-dispatches"
+        assert exc_info.value.__notes__ == [
+            "NeMo-Gym instance 'nemo_gym' failed during rollout collection"
+        ]
 
     def test_a_data_failure_is_not_re_dispatched(self):
         """Another dispatch cannot help a prompt NeMo-Gym is unable to serve."""

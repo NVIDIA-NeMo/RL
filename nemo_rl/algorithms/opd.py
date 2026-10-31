@@ -24,20 +24,32 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from typing import Any, Optional
+from collections.abc import Iterable
+from copy import deepcopy
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import ray
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from tensordict import TensorDict
 
-from nemo_rl.data_plane.column_io import read_columns, write_columns
+from nemo_rl.data.multimodal_utils import teacher_multimodal_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
-from nemo_rl.data_plane.schema import TEACHER_LP_FIELDS
+from nemo_rl.data_plane.schema import (
+    OPD_FULL_HIDDEN_STATES_FIELD,
+    OPD_FULL_LOGITS_FIELD,
+    OPD_FULL_TEACHER_INDEX_FIELD,
+    TEACHER_LP_FIELDS,
+)
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
 )
-from nemo_rl.experience.interfaces import PromptGroupRecord
+
+if TYPE_CHECKING:
+    # Imported for typing only: teacher_worker_group imports this module's
+    # config schemas at runtime.
+    from nemo_rl.models.policy.teacher_worker_group import TeacherConfig
 
 # ---------------------------------------------------------------------------
 # Config schemas
@@ -62,14 +74,84 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
+class TeacherResourceOverrides(BaseModel, extra="allow"):
+    """Partial ``TeacherResourceConfig`` whose fields all default to ``None``.
+
+    An omitted field therefore never clobbers ``default_teacher_cfg`` in the
+    defaults<-override merge (these blocks reach the merge via
+    ``model_dump(exclude_none=True)`` in ``_opd_cfg``, which strips unset
+    fields). The merged result is validated as ``TeacherResourceConfig`` in
+    ``create_teacher_configs_from_opd_config``.
+    """
+
+    tensor_model_parallel_size: Optional[int] = None
+    pipeline_model_parallel_size: Optional[int] = None
+    context_parallel_size: Optional[int] = None
+    expert_model_parallel_size: Optional[int] = None
+    num_nodes: Optional[int] = None
+    gpus_per_node: Optional[int] = None
+    precision: Optional[str] = None
+    micro_batch_size: Optional[int] = None
+    megatron_cfg_overrides: Optional[dict[str, Any]] = None
+
+
 class NonColocatedTeachersConfig(BaseModel, extra="allow"):
-    """Non-colocated (separate-GPU) teacher resourcing for on-policy distillation."""
+    """Non-colocated (separate-GPU) teacher resourcing for on-policy distillation.
+
+    Per-alias overrides merge shallowly with defaults: ``megatron_cfg_overrides``
+    replaces the default dictionary, while extra top-level keys merge individually.
+    """
 
     enabled: bool = False
     default_teacher_cfg: TeacherResourceConfig = Field(
         default_factory=TeacherResourceConfig
     )
-    teacher_overrides: dict[str, TeacherResourceConfig] = Field(default_factory=dict)
+    teacher_overrides: dict[str, TeacherResourceOverrides] = Field(default_factory=dict)
+
+
+class OnPolicyDistillationFullConfig(BaseModel, extra="allow"):
+    """Full-vocabulary MOPD (``opd_full``).
+
+    The student matches the teacher's entire next-token distribution through an
+    exact reverse KL instead of the sampled-token log-probability gap -- the
+    K=V limit of the top-k estimator, with no score-function tail term.
+
+    The policy-gradient knobs on ``ClippedPGLossConfig`` (ratio clipping, CISPO,
+    importance-sampling correction, truncated IS) have no code path here and are
+    rejected at construction. The OPD advantage estimator still runs: its output
+    is unused, but ``advantages`` is a required training column.
+    """
+
+    enabled: bool = False
+    # "hidden_states": teacher ships pre-LM-head hidden states, student projects
+    #   them with an LM-head shard from the teacher checkpoint. `hidden_size`
+    #   wide, so teacher/student parallelism stay decoupled. Production path.
+    # "logits": teacher ships full-vocabulary logits, no student-side LM head.
+    #   `vocab_size` wide (~74x larger at 2k hidden / 152k vocab), so this is a
+    #   numerical reference and fallback, not a production configuration.
+    teacher_payload: Literal["hidden_states", "logits"] = "hidden_states"
+    divergence: Literal["reverse_kl"] = "reverse_kl"
+    payload_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
+    # Sequence-dimension chunk for the distributed divergence kernels, bounding
+    # the live fp32 vocabulary working set. None processes the sequence at once.
+    chunk_size: Optional[int] = None
+    # Student-side cache policy for the teacher LM-head shard (hidden path only).
+    #   none    -- keep resident on GPU for the whole run
+    #   offload -- park on CPU between train steps, stage back in per step
+    #   evict   -- free after every train step and reload from the checkpoint
+    teacher_lm_head_lifecycle: Literal["none", "offload", "evict"] = "offload"
+    # Report the entropy/cross-entropy residual against the reverse KL. Roughly
+    # doubles the divergence cost; diagnostics only.
+    validate_decomposition: bool = False
+
+    @model_validator(mode="after")
+    def validate_positive_sizes(self) -> "OnPolicyDistillationFullConfig":
+        """Reject a chunk size that would make the divergence kernels useless."""
+        if self.chunk_size is not None and self.chunk_size < 1:
+            raise ValueError(
+                f"on_policy_distillation.full.chunk_size must be >= 1, got {self.chunk_size}."
+            )
+        return self
 
 
 class OnPolicyDistillationConfig(BaseModel, extra="allow"):
@@ -81,6 +163,7 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     strict_agent_name_match: bool = False
     deduplicate_shared_teacher_checkpoints: bool = True
     non_colocated_teachers: Optional[NonColocatedTeachersConfig] = None
+    full: Optional[OnPolicyDistillationFullConfig] = None
 
 
 # ---------------------------------------------------------------------------
@@ -120,15 +203,92 @@ def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
     )
 
 
+def get_opd_full_config(master_config: Any) -> Optional[OnPolicyDistillationFullConfig]:
+    """Return the validated ``opd_full`` sub-config when the feature is enabled.
+
+    Args:
+        master_config: Full training configuration, a plain dict, or any object
+            without the field (non-OPD recipes).
+
+    Returns:
+        The full-vocabulary config when both OPD and ``full.enabled`` are on,
+        otherwise ``None``.
+    """
+    if not is_opd_enabled(master_config):
+        return None
+    full_cfg = _opd_cfg(master_config).get("full")
+    if full_cfg is None:
+        return None
+    if not isinstance(full_cfg, OnPolicyDistillationFullConfig):
+        full_cfg = OnPolicyDistillationFullConfig(**full_cfg)
+    return full_cfg if full_cfg.enabled else None
+
+
+def opd_full_payload_field(full_cfg: OnPolicyDistillationFullConfig) -> str:
+    """Return the data-plane column name carrying this run's teacher payload."""
+    if full_cfg.teacher_payload == "hidden_states":
+        return OPD_FULL_HIDDEN_STATES_FIELD
+    return OPD_FULL_LOGITS_FIELD
+
+
+def opd_full_teacher_index_field(
+    full_cfg: OnPolicyDistillationFullConfig,
+) -> Optional[str]:
+    """Return the per-sample teacher-identity column, or ``None`` if unneeded.
+
+    Only the ``hidden_states`` payload needs it: the student loads a teacher
+    LM-head shard per unique checkpoint and must know which one projects each
+    row. The ``logits`` payload ships an already-projected distribution, so no
+    per-sample routing is needed at training time.
+    """
+    if full_cfg.teacher_payload == "hidden_states":
+        return OPD_FULL_TEACHER_INDEX_FIELD
+    return None
+
+
+def teacher_configs_by_index(
+    teacher_configs: Iterable["TeacherConfig"],
+) -> list["TeacherConfig"]:
+    """Deduplicated teacher configs in ``teacher_index`` order."""
+    return sorted(teacher_configs, key=lambda cfg: (cfg.model_name, cfg.alias))
+
+
+def opd_full_teacher_checkpoints_by_index(
+    master_config: Any,
+) -> Optional[list[str]]:
+    """Checkpoint path per ``teacher_index``, or None when rows carry no tag.
+
+    A list, not a map: the metadata round trips through JSON.
+    """
+    full_cfg = get_opd_full_config(master_config)
+    if full_cfg is None or opd_full_teacher_index_field(full_cfg) is None:
+        return None
+    # Imported lazily to break the cycle: teacher_worker_group imports the OPD
+    # config schemas defined in this module.
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    teacher_configs = create_teacher_configs_from_opd_config(_opd_cfg(master_config))
+    return [cfg.model_name for cfg in teacher_configs_by_index(teacher_configs)]
+
+
 def _skip_prev_logprobs(master_config: Any) -> bool:
     """Whether the training loop will zero ``prev_logprobs`` instead of computing it.
 
     Mirrors the predicate in ``grpo_train``: ``force_on_policy_ratio`` with no
-    ``seq_logprob_error_threshold`` skips the student logprob pass.
+    ``seq_logprob_error_threshold`` skips the student logprob pass. GRPO can
+    also evaluate that threshold in the training loss without this pass.
     """
     force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
     seq_logprob_error_threshold = master_config.grpo.seq_logprob_error_threshold
-    return bool(force_on_policy_ratio and seq_logprob_error_threshold is None)
+    return bool(
+        force_on_policy_ratio
+        and (
+            seq_logprob_error_threshold is None
+            or master_config.loss_fn.seq_logprob_error_in_loss
+        )
+    )
 
 
 def assert_prev_logprobs_available(master_config: Any) -> None:
@@ -140,8 +300,30 @@ def assert_prev_logprobs_available(master_config: Any) -> None:
     if is_opd_enabled(master_config) and _skip_prev_logprobs(master_config):
         raise ValueError(
             "adv_estimator='opd' requires real prev_logprobs, but the config zeros them "
-            "(loss_fn.force_on_policy_ratio=True with grpo.seq_logprob_error_threshold unset). "
-            "Set seq_logprob_error_threshold or disable force_on_policy_ratio."
+            "(loss_fn.force_on_policy_ratio=True with either "
+            "grpo.seq_logprob_error_threshold unset or loss_fn.seq_logprob_error_in_loss=True). "
+            "Set seq_logprob_error_threshold and disable seq_logprob_error_in_loss, "
+            "or disable force_on_policy_ratio."
+        )
+
+
+def assert_trust_region_supported(master_config: Any) -> None:
+    """Raise if TROPD knobs are set on a path that never reads the advantage.
+
+    Full-vocabulary MOPD replaces the policy-gradient objective with an exact
+    reverse KL and ignores ``advantages``, so a proximal teacher or a global
+    baseline would be silently dropped there.
+    """
+    adv_cfg = master_config.grpo.adv_estimator
+    if adv_cfg.proximal_teacher_alpha == 1.0 and not adv_cfg.subtract_global_baseline:
+        return
+    if get_opd_full_config(master_config) is not None:
+        raise ValueError(
+            "grpo.adv_estimator.proximal_teacher_alpha < 1 and "
+            "grpo.adv_estimator.subtract_global_baseline have no effect with "
+            "on_policy_distillation.full.enabled=true: the full-vocabulary loss "
+            "ignores advantages. Set proximal_teacher_alpha=1.0 and "
+            "subtract_global_baseline=false."
         )
 
 
@@ -239,6 +421,18 @@ class TQTeacherLogprobCoordinator:
         self._teacher_worker_groups = dict(teacher_worker_groups)
         self._alias_to_group_alias = dict(alias_to_group_alias)
         self._opd_cfg = dict(on_policy_distillation_cfg)
+        # Set when full-vocabulary MOPD is on: the teacher then writes a second,
+        # per-token payload column the training fetch must also see.
+        full_cfg = self._opd_cfg.get("full")
+        self._opd_full_field: Optional[str] = None
+        self._opd_full_teacher_index_field: Optional[str] = None
+        if full_cfg and full_cfg.get("enabled"):
+            resolved_full_cfg = OnPolicyDistillationFullConfig(**full_cfg)
+            self._opd_full_field = opd_full_payload_field(resolved_full_cfg)
+            self._opd_full_teacher_index_field = opd_full_teacher_index_field(
+                resolved_full_cfg
+            )
+        self._teacher_full_payload_tokens = 0
         # Physical (deduplicated) groups own locks, not routing aliases. Two
         # aliases sharing one checkpoint therefore share one collective FIFO.
         self._teacher_locks = {
@@ -251,8 +445,9 @@ class TQTeacherLogprobCoordinator:
         self._teacher_lock_wait_time_s = 0.0
         self._aliases_seen: set[str] = set()
 
-    def _resolve_teacher(self, record: PromptGroupRecord) -> tuple[str, str]:
-        extra_env_info = record.extra_env_info
+    def _resolve_teacher(
+        self, extra_env_info: Optional[dict[str, Any]]
+    ) -> tuple[str, str]:
         agent_ref = (
             extra_env_info.get("agent_ref")
             if isinstance(extra_env_info, dict)
@@ -309,18 +504,14 @@ class TQTeacherLogprobCoordinator:
             if remainder:
                 pad_count = dp_size - remainder
                 source_meta = meta.slice(actual_batch_size - 1, actual_batch_size)
-                source_data = read_columns(
-                    self._dp_client,
-                    source_meta,
-                    select_fields=TEACHER_LP_FIELDS,
-                    pad_value_dict={"input_ids": 0},
+                teacher_fields = [*TEACHER_LP_FIELDS, *teacher_multimodal_fields(meta)]
+                # Clone the wire row directly: decoding/re-encoding packed media
+                # would omit empty columns when the last row is text-only.
+                source_data = self._dp_client.get_samples(
+                    sample_ids=source_meta.sample_ids,
+                    partition_id=source_meta.partition_id,
+                    select_fields=teacher_fields,
                 )
-                input_ids = source_data["input_ids"]
-                input_lengths = source_data["input_lengths"]
-                if not isinstance(input_ids, torch.Tensor) or not isinstance(
-                    input_lengths, torch.Tensor
-                ):
-                    raise TypeError("MOPD teacher padding inputs must be tensors")
                 temporary_prefix = uuid.uuid4().hex
                 temporary_sample_ids = [
                     f"{meta.sample_ids[-1]}__teacher_pad_{temporary_prefix}_{index}"
@@ -330,20 +521,35 @@ class TQTeacherLogprobCoordinator:
                     partition_id=meta.partition_id,
                     task_name=meta.task_name,
                     sample_ids=temporary_sample_ids,
-                    fields=list(TEACHER_LP_FIELDS),
+                    fields=teacher_fields,
                     sequence_lengths=[meta.sequence_lengths[-1]] * pad_count,
+                    tags=(
+                        [deepcopy(source_meta.tags[0]) for _ in range(pad_count)]
+                        if source_meta.tags is not None
+                        else None
+                    ),
                 )
+                padding_fields: dict[str, torch.Tensor] = {}
+                for field in teacher_fields:
+                    value = source_data[field]
+                    if not isinstance(value, torch.Tensor):
+                        raise TypeError(
+                            f"MOPD teacher padding field {field!r} must be a tensor"
+                        )
+                    padding_fields[field] = (
+                        torch.nested.as_nested_tensor(
+                            [value.unbind()[0]] * pad_count, layout=value.layout
+                        )
+                        if value.is_nested
+                        else value.expand(pad_count, *value.shape[1:])
+                    )
                 # Keep this write inside the cleanup lifetime. A backend may
                 # write only some rows before reporting failure.
-                write_columns(
-                    self._dp_client,
-                    pad_meta,
-                    fields={
-                        "input_ids": input_ids.expand(pad_count, *input_ids.shape[1:]),
-                        "input_lengths": input_lengths.expand(
-                            pad_count, *input_lengths.shape[1:]
-                        ),
-                    },
+                self._dp_client.put_samples(
+                    sample_ids=temporary_sample_ids,
+                    partition_id=meta.partition_id,
+                    fields=TensorDict(padding_fields, batch_size=[pad_count]),
+                    tags=pad_meta.tags,
                 )
                 padded_meta = meta.concat(pad_meta)
 
@@ -374,10 +580,10 @@ class TQTeacherLogprobCoordinator:
     async def enrich(
         self,
         meta: KVBatchMeta,
-        record: PromptGroupRecord,
+        extra_env_info: Optional[dict[str, Any]],
     ) -> KVBatchMeta:
         """Write teacher logprobs before the replay-buffer slot becomes ready."""
-        alias, group_alias = self._resolve_teacher(record)
+        alias, group_alias = self._resolve_teacher(extra_env_info)
         started_at = time.perf_counter()
         lock_started_at = time.perf_counter()
         # Wait for a physical teacher without occupying a default-executor
@@ -407,6 +613,10 @@ class TQTeacherLogprobCoordinator:
         self._teacher_logprob_time_s += total_time_s
         self._teacher_inference_time_s += inference_time_s
         self._teacher_lock_wait_time_s += lock_wait_s
+        if self._opd_full_field is not None:
+            self._teacher_full_payload_tokens += meta.size * max(
+                meta.sequence_lengths or [0]
+            )
         self._aliases_seen.add(alias)
         print(
             f"[teacher_logprob] group={group_alias} samples={meta.size} "
@@ -414,7 +624,12 @@ class TQTeacherLogprobCoordinator:
             f"total={total_time_s:.2f}s",
             flush=True,
         )
-        return meta.with_fields([self.teacher_logprobs_field])
+        enriched_fields = [self.teacher_logprobs_field]
+        if self._opd_full_field is not None:
+            enriched_fields.append(self._opd_full_field)
+        if self._opd_full_teacher_index_field is not None:
+            enriched_fields.append(self._opd_full_teacher_index_field)
+        return meta.with_fields(enriched_fields)
 
     def drain_metrics(self) -> dict[str, float]:
         """Return and reset teacher activity accumulated since the last drain."""
@@ -425,6 +640,12 @@ class TQTeacherLogprobCoordinator:
             "on_policy_distillation/teacher_inference_time_s": self._teacher_inference_time_s,
             "on_policy_distillation/teacher_lock_wait_time_s": self._teacher_lock_wait_time_s,
         }
+        if self._opd_full_field is not None:
+            # Tokens, not bytes: the coordinator does not know the payload width.
+            # For bytes, multiply by hidden_size (or vocab_size) x dtype itemsize.
+            metrics["on_policy_distillation/teacher_full_payload_tokens"] = float(
+                self._teacher_full_payload_tokens
+            )
         if self._teacher_batches:
             # Cardinality describes what ran. On an idle step, zero reads as
             # "zero teacher models" rather than "no teacher activity."
@@ -439,8 +660,23 @@ class TQTeacherLogprobCoordinator:
         self._teacher_logprob_time_s = 0.0
         self._teacher_inference_time_s = 0.0
         self._teacher_lock_wait_time_s = 0.0
+        self._teacher_full_payload_tokens = 0
         self._aliases_seen.clear()
         return metrics
+
+    def teacher_checkpoints_by_index(self) -> Optional[list[str]]:
+        """Checkpoint path per ``teacher_index``, or None when rows carry no tag.
+
+        Read off the live worker groups, so it records what actually tagged the
+        rows rather than what the config would produce now.
+        """
+        if self._opd_full_teacher_index_field is None:
+            return None
+        by_index = {
+            group.teacher_index: group.model_name
+            for group in self._teacher_worker_groups.values()
+        }
+        return [by_index[index] for index in sorted(by_index)]
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +872,16 @@ def create_teacher_worker_groups(
             f"got {sorted(teacher_clusters)}."
         )
 
+    # Stable, config-derived index for each physical (deduplicated) teacher.
+    # This is the single source of truth for "which teacher wrote this row":
+    # the same index is what TeacherWorkerGroup tags every payload row with
+    # (see OPD_FULL_TEACHER_INDEX_FIELD) and what setup.py's opd_full teacher
+    # LM-head loading uses to key the student's per-teacher weight dict.
+    # Numbered by the deduplicated checkpoint, not by alias: the index outlives
+    # a run inside a data-plane checkpoint, so an alias edit must not renumber.
+    ordered = teacher_configs_by_index(teacher_configs)
+    alias_to_teacher_index = {cfg.alias: idx for idx, cfg in enumerate(ordered)}
+
     teacher_worker_groups: dict[str, Any] = {}
     for teacher_config in teacher_configs:
         alias = teacher_config.alias
@@ -644,6 +890,7 @@ def create_teacher_worker_groups(
             cluster=teacher_clusters[alias],
             policy_config=policy_config,
             tokenizer=tokenizer,
+            teacher_index=alias_to_teacher_index[alias],
         )
         teacher_worker_groups[alias] = twg
         print(
