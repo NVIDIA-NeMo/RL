@@ -165,6 +165,8 @@ def _manager(
         max_skipped_prompts=8,
     )
     manager._stats = RolloutStats()
+    manager._filter_zero_variance_groups = False
+    manager._step_rewards = {}
     manager._canonical_groups_finalized = 0
     manager._canonical_output_tokens = 0
     manager._recovery_siblings_reused = 0
@@ -243,6 +245,9 @@ def _controller(
     controller._current_epoch = 0
     controller._sampler_stamps_target_steps = False
     controller._rollout_recovery_enabled = True
+    # Dynamic sampling off: these fixtures exercise the fault-tolerance path.
+    controller._dynamic_sampling_enabled = False
+    controller._dynamic_sampling_max_replacements = 0
     controller._restored_replay_groups_to_regenerate = []
     controller._batch_shortfall = {}
     controller._batch_replacements = {}

@@ -190,6 +190,8 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
     manager._recovery_siblings_redispatched = 0
     manager._skipped_prompts = 0
     manager._consecutive_infra_drops = 0
+    manager._filter_zero_variance_groups = False
+    manager._step_rewards = {}
     return manager
 
 

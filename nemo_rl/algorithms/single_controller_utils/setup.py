@@ -2298,6 +2298,7 @@ def setup_single_controller(
             else 1
         ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
+        filter_zero_variance_groups=algo_cfg.use_dynamic_sampling,
     )
 
     # Print setup timing metrics
