@@ -255,7 +255,9 @@ def test_get_values_passes_multimodal_batch_to_model_forward(
         _policy_like_cfg={},
         mcore_state=SimpleNamespace(straggler_timer=None),
         defer_fp32_logits=False,
-        media_placeholder_token_id=None,
+        # Exercise the explicit-mask critic path. The None case intentionally
+        # removes it, as covered by the multimodal-utils mask tests.
+        media_placeholder_token_id=1,
         model_slices_context_parallel_inputs=True,
     )
 
@@ -294,9 +296,6 @@ def test_get_values_passes_multimodal_batch_to_model_forward(
 
     assert model_forward.call_args.kwargs["data_dict"] is batch
     assert "pixel_values" in model_forward.call_args.kwargs["data_dict"]
-    assert (
-        "media_token_validity_mask" not in model_forward.call_args.kwargs["data_dict"]
-    )
     assert (
         model_forward.call_args.kwargs["media_token_validity_mask"]
         is batch["media_token_validity_mask"]
