@@ -251,3 +251,70 @@ class TestPadTargetIsolation:
         assert dispatched.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] != 4096
         # The caller's value survives for whoever minted it.
         assert meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == 4096
+
+
+class TestTQValueSplitFanout:
+    def test_lifecycle_and_replica_dedup(self):
+        value, wg = _make_tq_value()
+        loss_fn = object()
+        leader = {
+            "global_loss": 2.0,
+            "grad_norm": 0.5,
+            "all_mb_metrics": {"loss": [1.0]},
+            "is_replica_leader": True,
+        }
+        twin = {**leader, "is_replica_leader": False}
+        trace_kwargs = {"_otel_carrier": {"traceparent": "test"}}
+        with (
+            patch(
+                "nemo_rl.models.value.tq_value.ray.get",
+                return_value=[leader, twin, leader],
+            ),
+            patch(
+                "nemo_rl.models.value.tq_value.trace_context_kwargs",
+                return_value=trace_kwargs,
+            ),
+        ):
+            value.begin_train_step(loss_fn, gbs=16, mbs=1)
+            wg.run_all_workers_single_data.assert_called_with(
+                "begin_train_step_presharded",
+                loss_fn=loss_fn,
+                gbs=16,
+                mbs=1,
+                **trace_kwargs,
+            )
+            result = value.finish_train_step()
+            assert result["all_mb_metrics"]["loss"] == [1.0, 1.0]
+            wg.run_all_workers_single_data.assert_called_with(
+                "finish_train_step_presharded", **trace_kwargs
+            )
+            value.abort_train_step()
+            wg.run_all_workers_single_data.assert_called_with(
+                "abort_train_step_presharded", **trace_kwargs
+            )
+
+    def test_chunk_sharding_has_no_global_batch_constraint(self):
+        value, wg = _make_tq_value()
+        meta = _meta()
+        with (
+            patch.object(TQValue, "_stamp_pad_seqlen"),
+            patch.object(TQValue, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as shard,
+            patch(
+                "nemo_rl.models.value.tq_value.trace_context_kwargs",
+                return_value={"_otel_carrier": {"traceparent": "test"}},
+            ),
+        ):
+            value.train_microbatches_from_meta(meta)
+        assert shard.call_args.kwargs["batch_size"] is None
+        assert shard.call_args.args[0].fields == list(DP_VALUE_TRAIN_FIELDS)
+        assert wg.run_all_workers_sharded_data.call_args.args == (
+            "train_microbatch_presharded",
+        )
+        assert wg.run_all_workers_sharded_data.call_args.kwargs["common_kwargs"] == {
+            "_otel_carrier": {"traceparent": "test"}
+        }
+        wg.get_all_worker_results.assert_called_once()

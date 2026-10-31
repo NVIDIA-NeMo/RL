@@ -103,6 +103,7 @@ from nemo_rl.algorithms.grpo import (
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
 )
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
     ROLLOUT_CHECKPOINT_ATTEMPT_DURATION_KEY,
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
@@ -432,6 +433,8 @@ class SingleControllerActor:
             and self._async_cfg.min_groups_for_streaming_train
             < self._algo_cfg.num_prompts_per_step
         )
+        self._ppo_group_multiple = actor_args.ppo_group_multiple
+        self._ppo_min_remaining_groups = actor_args.ppo_min_remaining_groups
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -538,7 +541,9 @@ class SingleControllerActor:
             advantage_estimator=self._advantage_estimator,
         )
         self._loss_fn = actor_args.loss_fn
-        self._value_loss_fn = getattr(actor_args, "value_loss_fn", None)
+        self._value_loss_fn: LossFunction | None = getattr(
+            actor_args, "value_loss_fn", None
+        )
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
         self._rollout_manager.set_next_nemo_gym_task_index(
@@ -657,7 +662,6 @@ class SingleControllerActor:
             if actor_args.save_state.trainer_version is not None
             else actor_args.save_state.current_step
         )
-        num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         self._sampler = create_sampler(
             self._buffer,
             self._async_cfg.sampler,
@@ -2935,68 +2939,6 @@ class SingleControllerActor:
             )
         return target
 
-    def _streaming_ppo_selection_kwargs(self) -> dict[str, int]:
-        """Derive aligned chunks and the tail floor without changing other samplers.
-
-        Both models must accept every selected row. Packed execution requires
-        complete data-parallel shards; static execution also requires complete
-        local microbatches. Reject an incompatible full batch before claiming it.
-        """
-        if not self._streaming_ppo:
-            return {}
-        assert self._value is not None
-        # Both forward paths shard by sample count before packing. Keep
-        # whole prompt groups and leave any unaligned ready tail in the
-        # sampler instead of padding canonical data-plane rows.
-        policy_cfg = self._master_config.policy
-        value_cfg = self._master_config.value
-        assert value_cfg is not None
-        policy_dp_size = self._trainer.sharding_annotations.get_axis_size(
-            "data_parallel"
-        )
-        value_dp_size = self._value.sharding_annotations.get_axis_size("data_parallel")
-
-        # Packed/dynamic batching only needs complete DP shards. Static
-        # batching also needs complete local microbatches to avoid dropping rows.
-        policy_training_mbs = policy_logprob_mbs = 1
-        if not (
-            policy_cfg.get("dynamic_batching", {}).get("enabled", False)
-            or policy_cfg.get("sequence_packing", {}).get("enabled", False)
-        ):
-            policy_training_mbs = policy_cfg["train_micro_batch_size"]
-            policy_logprob_mbs = policy_cfg.get(
-                "logprob_batch_size", policy_training_mbs
-            )
-        value_logprob_mbs = 1
-        if not (
-            value_cfg.get("dynamic_batching", {}).get("enabled", False)
-            or value_cfg.get("sequence_packing", {}).get("enabled", False)
-        ):
-            value_logprob_mbs = value_cfg.get(
-                "logprob_batch_size", value_cfg["train_micro_batch_size"]
-            )
-
-        policy_sample_multiple = policy_dp_size * math.lcm(
-            policy_training_mbs, policy_logprob_mbs
-        )
-        value_sample_multiple = value_dp_size * value_logprob_mbs
-        sample_multiple = math.lcm(policy_sample_multiple, value_sample_multiple)
-        group_multiple = sample_multiple // math.gcd(
-            sample_multiple, self._algo_cfg.num_generations_per_prompt
-        )
-        if self._algo_cfg.num_prompts_per_step % group_multiple:
-            raise ValueError(
-                "Streaming PPO requires ppo.num_prompts_per_step to be a "
-                f"multiple of {group_multiple} prompt groups for the policy "
-                "and value data-parallel layouts."
-            )
-        return {
-            "group_multiple": group_multiple,
-            # Heuristic: half the minimum streaming chunk size, rounded up.
-            "min_remaining_groups": (self._async_cfg.min_groups_for_streaming_train + 1)
-            // 2,
-        }
-
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
 
@@ -3046,7 +2988,14 @@ class SingleControllerActor:
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
         forest_training = self._master_config.token_capture.forest_training
-        selection_kwargs = self._streaming_ppo_selection_kwargs()
+        selection_kwargs = (
+            {
+                "group_multiple": self._ppo_group_multiple,
+                "min_remaining_groups": self._ppo_min_remaining_groups,
+            }
+            if self._streaming_ppo
+            else {}
+        )
 
         while self._train_steps < self._algo_cfg.max_num_steps:
             maybe_gpu_profile_step(self._trainer, self._train_steps + 1)
@@ -3685,14 +3634,11 @@ class SingleControllerActor:
                         if self._gen.blocks_training():
                             await asyncio.to_thread(self._trainer.finish_inference)
                     # GAE has produced the frozen predictions and targets for
-                    # every row. Critic epochs always see the full original batch.
-                    value_train_meta = value_train_metas[0].concat(
-                        *value_train_metas[1:]
-                    )
+                    # every row. Critic epochs replay every selected chunk.
                     log.info(
-                        "PPO: step %d critic train: %d samples, %d full-batch epochs",
+                        "PPO: step %d critic train: %d samples, %d epochs",
                         version_during_step,
-                        value_train_meta.size,
+                        sum(meta.size for meta in value_train_metas),
                         self._critic_ppo_epochs,
                     )
                     with (
@@ -3705,7 +3651,7 @@ class SingleControllerActor:
                         ),
                     ):
                         value_result = await self._value_train_epochs(
-                            value_train_meta,
+                            value_train_metas,
                             num_epochs=self._critic_ppo_epochs,
                         )
                 else:
@@ -5862,22 +5808,30 @@ class SingleControllerActor:
         return meta.with_fields([self._advantage_cfg.values_field])
 
     async def _value_train_epochs(
-        self, meta: KVBatchMeta, *, num_epochs: int
+        self, metas: list[KVBatchMeta], *, num_epochs: int
     ) -> dict[str, Any]:
-        """Run consecutive critic epochs under one model onload/offload cycle.
-
-        Returns:
-            The final epoch's ``train_from_meta`` output; earlier epochs'
-            results are discarded.
-        """
+        """Replay all step chunks per critic epoch under one residency cycle."""
+        value_loss_fn = self._value_loss_fn
+        if value_loss_fn is None:
+            raise RuntimeError("PPO value training requires a value loss function")
         await asyncio.to_thread(self._value.prepare_for_training)
         result: dict[str, Any] | None = None
-        for _ in range(num_epochs):
-            result = await asyncio.to_thread(
-                self._value.train_from_meta,
-                meta,
-                self._value_loss_fn,  # pyrefly: ignore
-            )
+        if self._algo_cfg.value_training_mode == "whole_batch":
+            full_meta = metas[0].concat(*metas[1:])
+            for _ in range(num_epochs):
+                result = await asyncio.to_thread(
+                    self._value.train_from_meta, full_meta, value_loss_fn
+                )
+        else:
+            # Split prepares the API for per-chunk value streaming in a later PR;
+            # this controller still trains the critic after policy refit.
+            for _ in range(num_epochs):
+                await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
+                for meta in metas:
+                    await asyncio.to_thread(
+                        self._value.train_microbatches_from_meta, meta
+                    )
+                result = await asyncio.to_thread(self._value.finish_train_step)
         await asyncio.to_thread(self._value.finish_training)
         assert result is not None
         return result

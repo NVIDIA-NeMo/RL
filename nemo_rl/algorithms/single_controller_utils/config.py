@@ -1412,10 +1412,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "PPO on the SingleController path requires "
             "async_rl.rollout_failure.max_skipped_prompts=0 and "
             "max_consecutive_dropped_prompts=0, but they sum to "
-            f"{drop_budget}. A drop shortens the step, and the critic shards that "
-            "step against the configured value.train_global_batch_size rather than "
-            "its actual size, so the first short step fails a divisibility assert "
-            "inside the value workers (#2625)."
+            f"{drop_budget}. A drop shortens the step, but the critic split API "
+            "requires each epoch to contain exactly value.train_global_batch_size "
+            "samples, whether replayed as chunks or one full batch. "
+            "Shortened PPO steps are not supported yet."
         )
 
     if (
@@ -1455,6 +1455,52 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             f"({value_global_batch_size}) so that each critic epoch consumes one "
             "complete RL batch."
         )
+
+
+def resolve_ppo_chunk_alignment(
+    master_config: MasterConfig, policy_dp: int, value_dp: int
+) -> tuple[int, int]:
+    """Validate PPO batch alignment and return sampler group and tail multiples."""
+    if not is_ppo_run(master_config):
+        return 1, 0
+    value_config = master_config.value
+    if value_config is None:
+        raise ValueError("PPO requires a value model configuration")
+
+    def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
+        if config["dynamic_batching"]["enabled"] or (
+            config.get("sequence_packing") and config["sequence_packing"]["enabled"]
+        ):
+            return dp_size
+        train_micro_batch_size = config["train_micro_batch_size"]
+        logprob_batch_size = config.get("logprob_batch_size") or train_micro_batch_size
+        return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
+
+    sample_alignment = math.lcm(
+        sample_multiple(master_config.policy, policy_dp),
+        sample_multiple(value_config, value_dp),
+    )
+    ppo_config = master_config.ppo
+    assert ppo_config is not None
+    group_multiple = sample_alignment // math.gcd(
+        sample_alignment, ppo_config.num_generations_per_prompt
+    )
+    if ppo_config.num_prompts_per_step % group_multiple:
+        raise ValueError(
+            "PPO num_prompts_per_step must be divisible by the policy/value "
+            f"group multiple ({group_multiple}) to avoid an incomplete final chunk"
+        )
+    min_groups = master_config.async_rl.min_groups_for_streaming_train
+    if min_groups < group_multiple:
+        raise ValueError(
+            "PPO min_groups_for_streaming_train must be at least the "
+            f"policy/value group multiple ({group_multiple}) so each chunk "
+            "contains complete microbatches on every DP rank"
+        )
+    min_remaining_groups = (
+        (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
+    )
+    return group_multiple, min_remaining_groups
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
