@@ -79,6 +79,7 @@ def _flatten_rollout_message_log_for_tq(
     *,
     pad_token_id: int,
     make_sequence_length_divisible_by: int,
+    per_token_multimodal_fields: tuple[str, ...] = (),
 ) -> tuple[BatchedDataDict[Any], torch.Tensor]:
     """Prepare rollout message logs for the TQ payload and driver carry."""
     # Deferred to avoid the grpo -> sync_rollout_actor import cycle.
@@ -91,7 +92,9 @@ def _flatten_rollout_message_log_for_tq(
     pad = {"pad_value_dict": {"token_ids": pad_token_id}}
     backfill_missing_routed_experts(message_logs)
 
-    add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
+    add_grpo_token_loss_masks_and_generation_logprobs(
+        message_logs, per_token_multimodal_fields
+    )
     flat, input_lengths = batched_message_log_to_flat_message(
         message_logs,
         **pad,
@@ -121,7 +124,9 @@ class SyncRolloutActor:
         task_to_env: dict[str, EnvironmentInterface],
         master_config: Any,
         dp_cfg: dict[str, Any],
+        per_token_multimodal_fields: tuple[str, ...] = (),
     ) -> None:
+        self.per_token_multimodal_fields = per_token_multimodal_fields
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
         self.task_to_env = task_to_env
@@ -300,6 +305,7 @@ class SyncRolloutActor:
             make_sequence_length_divisible_by=cfg.policy[
                 "make_sequence_length_divisible_by"
             ],
+            per_token_multimodal_fields=self.per_token_multimodal_fields,
         )
 
         router_replay_enabled = bool(

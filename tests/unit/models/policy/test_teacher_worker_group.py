@@ -65,13 +65,18 @@ def test_create_teacher_configs_heterogeneous_override():
         {
             "teacher_model_by_agent_name": {"math": "/ckpt/math", "code": "/ckpt/code"},
             "non_colocated_teachers": {
-                "default_teacher_cfg": {"tensor_model_parallel_size": 4},
+                "default_teacher_cfg": {
+                    "tensor_model_parallel_size": 4,
+                    "gpus_per_node": 4,
+                },
                 "teacher_overrides": {"code": {"tensor_model_parallel_size": 8}},
             },
         }
     )
     code_cfg = [c for c in configs if c.alias == "code"][0]
     assert code_cfg.tensor_model_parallel_size == 8
+    # A partial per-alias block keeps every other default_teacher_cfg value.
+    assert code_cfg.gpus_per_node == 4
 
 
 def test_create_teacher_configs_deduplicates():
@@ -95,8 +100,20 @@ def test_create_teacher_configs_deduplicates():
     assert len(configs) == 2
 
 
-def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
-    """Frozen teachers do not require rollout-to-training route consistency."""
+@pytest.mark.parametrize("student_mtp_layers", [0, 5])
+@pytest.mark.parametrize(
+    "teacher_overrides,expected_mtp_layers",
+    [
+        ({}, 0),
+        ({"mtp_num_layers": 0}, 0),
+        ({"mtp_num_layers": 2}, 2),
+        ({"freeze_vision_model": False}, 0),
+    ],
+)
+def test_teacher_worker_group_isolates_student_inference_settings(
+    monkeypatch, student_mtp_layers, teacher_overrides, expected_mtp_layers
+):
+    """Scoring disables router replay and defaults MTP off independently of training."""
     import nemo_rl.distributed.worker_groups as worker_groups
     from nemo_rl.models.policy.teacher_worker_group import (
         TeacherConfig,
@@ -120,7 +137,12 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
     cluster.world_size.return_value = 1
     policy_config = {
         "model_name": "/ckpt/student",
-        "megatron_cfg": {"enabled": True},
+        "megatron_cfg": {
+            "enabled": True,
+            "mtp_num_layers": student_mtp_layers,
+            "mtp_use_repeated_layer": True,
+            "freeze_vision_model": True,
+        },
         "automodel_cfg": {"enabled": False},
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
@@ -137,7 +159,7 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
         gpus_per_node=1,
         precision="bf16",
         micro_batch_size=1,
-        megatron_cfg_overrides={},
+        megatron_cfg_overrides=teacher_overrides,
     )
 
     teacher = TeacherWorkerGroup(
@@ -151,6 +173,86 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
     assert captured["cfg"]["router_replay"]["enabled"] is False
     assert teacher.cfg["router_replay"]["enabled"] is False
     assert policy_config["router_replay"]["enabled"] is True
+    megatron_cfg = captured["cfg"]["megatron_cfg"]
+    assert megatron_cfg["mtp_num_layers"] == expected_mtp_layers
+    assert megatron_cfg["_provider_override_allowlist"] == sorted(
+        {"mtp_num_layers", *teacher_overrides}
+    )
+    assert policy_config["megatron_cfg"]["mtp_num_layers"] == student_mtp_layers
+    assert teacher_config.megatron_cfg_overrides == teacher_overrides
+
+
+def _build_teacher_cfg(monkeypatch, policy_config, megatron_cfg_overrides):
+    """Build a TeacherWorkerGroup with fake Ray builders; return the teacher cfg."""
+    import nemo_rl.distributed.worker_groups as worker_groups
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherConfig,
+        TeacherWorkerGroup,
+    )
+
+    class FakeWorkerBuilder:
+        def __init__(self, worker_path, cfg, **kwargs):
+            del worker_path, cfg, kwargs
+
+    class FakeWorkerGroup:
+        def __init__(self, cluster, worker_builder, **kwargs):
+            del cluster, worker_builder, kwargs
+
+    monkeypatch.setattr(worker_groups, "RayWorkerBuilder", FakeWorkerBuilder)
+    monkeypatch.setattr(worker_groups, "RayWorkerGroup", FakeWorkerGroup)
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    teacher_config = TeacherConfig(
+        alias="teacher",
+        model_name="/ckpt/teacher",
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        num_nodes=1,
+        gpus_per_node=1,
+        precision="bf16",
+        micro_batch_size=1,
+        megatron_cfg_overrides=megatron_cfg_overrides,
+    )
+    teacher = TeacherWorkerGroup(
+        teacher_config, cluster, policy_config, MagicMock(), teacher_index=0
+    )
+    return teacher.cfg
+
+
+def _student_policy_config_with_manual_gc():
+    return {
+        "model_name": "/ckpt/student",
+        "megatron_cfg": {
+            "enabled": True,
+            "manual_gc": True,
+            "manual_gc_interval": 10,
+        },
+        "automodel_cfg": {"enabled": False},
+        "sequence_packing": {"enabled": False},
+        "dynamic_batching": {"enabled": False},
+    }
+
+
+def test_teacher_worker_group_turns_off_the_student_manual_gc(monkeypatch):
+    """A teacher never trains, so it would never collect with GC disabled."""
+    policy_config = _student_policy_config_with_manual_gc()
+
+    cfg = _build_teacher_cfg(monkeypatch, policy_config, megatron_cfg_overrides={})
+
+    assert cfg["megatron_cfg"]["manual_gc"] is False
+    # The student's own config is untouched.
+    assert policy_config["megatron_cfg"]["manual_gc"] is True
+
+
+def test_teacher_worker_group_rejects_manual_gc_on_a_teacher(monkeypatch):
+    with pytest.raises(ValueError, match="manual_gc is not supported on teachers"):
+        _build_teacher_cfg(
+            monkeypatch,
+            _student_policy_config_with_manual_gc(),
+            megatron_cfg_overrides={"manual_gc": True},
+        )
 
 
 def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatch):
@@ -754,3 +856,110 @@ def test_teacher_worker_presharded_entrypoint_skips_the_payload_off_the_last_sta
 
     assert worker.stage_local_writes == []
     assert worker.written is not None
+
+
+def test_typed_override_blocks_round_trip_without_schema_fill():
+    """The override blocks are typed as partial models (all fields None); after
+    the ``model_dump(exclude_none=True)`` in ``_opd_cfg``, unset fields must not
+    reappear as schema defaults and clobber default_teacher_cfg in the merge."""
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    opd = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"general": "/ckpt/general"},
+        non_colocated_teachers={
+            "enabled": True,
+            "default_teacher_cfg": {"gpus_per_node": 4, "num_nodes": 2},
+            "teacher_overrides": {"general": {"micro_batch_size": 1}},
+        },
+    )
+    (cfg,) = create_teacher_configs_from_opd_config(
+        _opd_cfg({"on_policy_distillation": opd})
+    )
+    assert cfg.gpus_per_node == 4  # not the schema default 8
+    assert cfg.num_nodes == 2
+    assert cfg.micro_batch_size == 1
+    logged = opd.model_dump()["non_colocated_teachers"]
+    assert logged["default_teacher_cfg"]["precision"] == cfg.precision == "bf16"
+    assert (
+        logged["default_teacher_cfg"]["tensor_model_parallel_size"]
+        == cfg.tensor_model_parallel_size
+        == 1
+    )
+
+
+def test_teacher_megatron_override_dictionary_replaces_default():
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    opd = OnPolicyDistillationConfig(
+        teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+        non_colocated_teachers={
+            "default_teacher_cfg": {
+                "megatron_cfg_overrides": {
+                    "mtp_num_layers": 5,
+                    "mtp_detach_heads": True,
+                },
+                "freeze_vision_model": True,
+                "freeze_language_model": True,
+            },
+            "teacher_overrides": {
+                "teacher": {
+                    "megatron_cfg_overrides": {"mtp_num_layers": 0},
+                    "freeze_vision_model": False,
+                }
+            },
+        },
+    )
+    (cfg,) = create_teacher_configs_from_opd_config(
+        _opd_cfg({"on_policy_distillation": opd})
+    )
+    assert cfg.megatron_cfg_overrides == {
+        "mtp_num_layers": 0,
+        "freeze_vision_model": False,
+        "freeze_language_model": True,
+    }
+
+
+def test_provider_override_allowlist_is_explicit_keys_only():
+    """Only explicitly-set teacher override keys may reach the model provider;
+    architecture keys inherited from the student config must be blocked, while
+    student configs (no allowlist) keep the status-quo behavior."""
+    from nemo_rl.models.policy import provider_override_allowed
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    (teacher_cfg,) = create_teacher_configs_from_opd_config(
+        {
+            "teacher_model_by_agent_name": {"general": "/ckpt/general"},
+            "non_colocated_teachers": {
+                "default_teacher_cfg": {"gpus_per_node": 4},
+                "teacher_overrides": {"general": {"mtp_num_layers": 1}},
+            },
+        }
+    )
+    allowlist = sorted(teacher_cfg.megatron_cfg_overrides.keys())
+    assert allowlist == ["mtp_num_layers"]
+
+    # teacher megatron_cfg: cloned student keys + explicit override + allowlist
+    teacher_megatron_cfg = {
+        "mtp_num_layers": 1,  # explicit for this teacher
+        "radio_force_cpe_eval_mode": True,  # inherited from the VLM student
+        "freeze_vision_model": False,  # inherited from the VLM student
+        "_provider_override_allowlist": allowlist,
+    }
+    assert provider_override_allowed(teacher_megatron_cfg, "mtp_num_layers")
+    assert not provider_override_allowed(
+        teacher_megatron_cfg, "radio_force_cpe_eval_mode"
+    )
+    assert not provider_override_allowed(teacher_megatron_cfg, "freeze_vision_model")
+
+    # student configs carry no allowlist: every key applies as before
+    student_megatron_cfg = {"radio_force_cpe_eval_mode": True}
+    assert provider_override_allowed(student_megatron_cfg, "radio_force_cpe_eval_mode")

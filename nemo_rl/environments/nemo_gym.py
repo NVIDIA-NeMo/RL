@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import errno
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -70,6 +72,7 @@ from nemo_rl.environments.nemo_gym_multimodal import (
 )
 from nemo_rl.environments.nemo_gym_shards import (
     DEFAULT_PLACEMENT_STRATEGY,
+    GYM_LOG_DIR_KEY,
     SHARDING_CONFIG_KEYS,
     ShardConfigError,
     ShardPlan,
@@ -86,7 +89,10 @@ from nemo_rl.environments.nemotron_utils import (
     predicted_static_image_num_tokens,
     supports_image_placeholder_run_parity,
 )
-from nemo_rl.environments.utils import shutdown_environments
+from nemo_rl.environments.utils import (
+    DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS,
+    shutdown_environments,
+)
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -108,12 +114,23 @@ from nemo_rl.telemetry.setup import (
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+from nemo_rl.utils.config import warn_if_config_path_overridden
+from nemo_rl.utils.routed_experts_codec import (
+    decode_routed_experts,
+    slice_routed_experts,
+)
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
+# How long the Gym servers get to exit, from the SIGINT NemoGym.shutdown() sends
+# them, before whatever is still running is killed. At the end of a run
+# shutdown_environments() gives the whole actor shutdown
+# DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS and then kills the actor. Gym's own
+# shutdown runs inside this window; the rest of the budget is for the kills and
+# the telemetry flush that follow.
+NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S = DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS / 2
 
 # The three server-type keys Gym nests under a top-level config entry. Gym's
 # constant is private (nemo_gym.discovery._SERVER_GROUP_KEYS), and the literal
@@ -160,6 +177,15 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+def _normalize_gym_validity(result: dict) -> dict:
+    """Project Forest verifier masks into the existing downstream masking contract."""
+    normalized = dict(result)
+    config = dict(result.get("instance_config") or {})
+    config["mask_sample"] = bool(result.get("mask_sample") or config.get("mask_sample"))
+    normalized["instance_config"] = config
+    return normalized
 
 
 def _count_structured_response_tokens(
@@ -314,6 +340,32 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     return True
 
 
+def set_nemo_gym_log_dir(env_config: dict[str, Any], log_dir: str) -> None:
+    """Point NeMo Gym's server logs at ``<log_dir>/nemo_gym``.
+
+    Gym writes server log files only when ``nemo_gym_log_dir`` is set, so call
+    this before building the Gym actors. Any configured value is replaced, with
+    a warning, so the Gym logs stay with the rest of this run's logs.
+
+    The path is made absolute here, on the driver. Gym resolves a relative path
+    against the Gym actor's working directory, which is the raylet's and differs
+    from the driver's when the driver attaches to a cluster started elsewhere.
+
+    Args:
+        env_config: The ``env`` section of the master config; updated in place.
+        log_dir: This run's log directory.
+    """
+    nemo_gym_config = env_config.setdefault("nemo_gym", {})
+    nemo_gym_log_dir = os.path.abspath(os.path.join(log_dir, "nemo_gym"))
+    warn_if_config_path_overridden(
+        f"env.nemo_gym.{GYM_LOG_DIR_KEY}",
+        configured=nemo_gym_config.get(GYM_LOG_DIR_KEY),
+        effective=nemo_gym_log_dir,
+        reason="NeMo Gym server logs always go under this run's log directory",
+    )
+    nemo_gym_config[GYM_LOG_DIR_KEY] = nemo_gym_log_dir
+
+
 def _has_nan_generation_logprobs(result: dict) -> bool:
     """Return whether a postprocessed rollout contains NaN policy logprobs."""
     return any(
@@ -433,6 +485,27 @@ _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
+# How long a terminal manifest read waits for an in-flight capture call to
+# resolve, and the poll interval. The bound must cover one full generation
+# (the engine finishes a disconnected call before its ledger row lands).
+_CAPTURE_DRAIN_TIMEOUT_S = 300.0
+_CAPTURE_DRAIN_POLL_S = 5.0
+
+
+def _mask_undrained_receipt(receipt: dict) -> dict:
+    """Mask incomplete capture without claiming its pending writes stopped.
+
+    The seal accepts poisoned receipts with pending IDs and excludes those
+    IDs from cleanup. A timeout or failure row is not a write acknowledgement.
+    """
+    if receipt.get("pending_call_ids"):
+        receipt.update(
+            capture_poisoned=True,
+            failure_reason=receipt.get("failure_reason") or "capture_incomplete",
+        )
+    return receipt
+
+
 # The generation server's bearer token travels to Gym's servers the same way as
 # the token-capture secret: as an environment interpolation each server
 # resolves in its own process, never as a value in the serialized config.
@@ -655,6 +728,102 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
 
 
+def _shut_down_gym_servers(run_helper: Any) -> None:
+    """Interrupt Gym's servers, run ``RunHelper.shutdown()``, then stop what is left.
+
+    With ``nemo_gym_log_dir`` set, Gym launches each server as
+    ``set -o pipefail; (<server command>) 2>&1 | tee -a <log>`` under bash, and
+    ``RunHelper.shutdown()`` signals only that bash process. The server never
+    sees the signal, so Gym waits out its one-second grace period on each
+    command in turn, then kills the bash process and leaves the server running.
+    Ten such servers use up the DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS that
+    shutdown_environments() gives this actor at the end of a run, and the actor
+    is killed with its servers still up. Ray's process-group cleanup, on by
+    default since Ray 2.57, then kills them without a graceful shutdown. Where it
+    is off they keep running, along with any placement group they hold as Ray
+    drivers, such as a local vLLM judge's GPUs.
+
+    So the servers are interrupted first: every process below a command Gym
+    launched, except ``tee``, which exits at EOF and so still logs the servers'
+    shutdown. Each command then exits as soon as its server has, and Gym's
+    waits return at once. The commands themselves are left for Gym to signal:
+    without ``nemo_gym_log_dir`` a command is the server, and a second SIGINT
+    makes uvicorn skip the application's shutdown. Whatever is still running
+    once Gym's shutdown has returned, or failed, is interrupted if Gym did not
+    get to it, given until NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S after the first
+    SIGINT, and then killed.
+
+    A command that has already exited is skipped. Gym's ``poll()``, which
+    NemoGym.health_check() runs, reaps a command that died, so its pid may have
+    gone to an unrelated process since.
+
+    Args:
+        run_helper: The Gym ``RunHelper`` that started the servers.
+    """
+    # Deferred: psutil comes with nemo_gym, which only the Gym actor's venv is
+    # guaranteed to have.
+    import psutil
+
+    # Gym has no public accessor for the processes it launched.
+    # TODO: switch to a public RunHelper accessor once Gym provides one.
+    commands: list[psutil.Process] = []
+    for popen in run_helper._processes.values():
+        # Skip a command that has exited: once reaped, its pid may be reused.
+        if popen.poll() is not None:
+            continue
+        try:
+            commands.append(psutil.Process(popen.pid))
+        except psutil.NoSuchProcess:
+            continue
+
+    # Everything below the commands: the servers, their own children, and tee.
+    # One pass over the process table, as Process.children() makes its own on
+    # every call, which adds up to seconds with dozens of servers on a busy node.
+    descendants: list[psutil.Process] = []
+    if commands:
+        children_by_ppid: dict[int, list[psutil.Process]] = {}
+        for process in psutil.process_iter(["ppid"]):
+            children_by_ppid.setdefault(process.info["ppid"], []).append(process)
+        pending = [command.pid for command in commands]
+        while pending:
+            for child in children_by_ppid.get(pending.pop(), []):
+                descendants.append(child)
+                pending.append(child.pid)
+
+    for process in descendants:
+        try:
+            if process.name() != "tee":
+                process.send_signal(signal.SIGINT)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    deadline = monotonic() + NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S
+    try:
+        run_helper.shutdown()
+    finally:
+        # Still running only if RunHelper.shutdown() failed before stopping them.
+        for command in commands:
+            try:
+                command.send_signal(signal.SIGINT)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        for process in commands + descendants:
+            try:
+                if process.is_running():
+                    process.wait(timeout=max(0.0, deadline - monotonic()))
+            except psutil.TimeoutExpired:
+                try:
+                    process.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            except OSError as error:
+                # psutil 7.2.2 waits with pidfd_open(), which fails with EINVAL
+                # rather than ESRCH for a process that is gone while its pid is
+                # still held, e.g. as its session's ID (giampaolo/psutil#2715,
+                # fixed after 7.2.2). A process that is gone needs nothing more.
+                if error.errno != errno.EINVAL:
+                    raise
+
+
 # Fail fast rather than restart. The servers this actor owns are started in
 # _spinup, which Ray does not re-run after a restart, so a restarted actor is
 # permanently broken: _require_spinup() rejects every later rollout call, and
@@ -672,6 +841,16 @@ class NemoGym(EnvironmentInterface):
         if is_span_group_enabled(RLSpanGroup.PER_PROMPT):
             instrument_aiohttp_client()
         self.cfg = cfg
+        capture_config = cfg.get("token_capture")
+        self._forest_training = bool(
+            capture_config and capture_config.get("forest_training")
+        )
+        if self._forest_training and not capture_config.get("enabled"):
+            raise ValueError("forest training requires external token capture")
+        # Setup passes the schema-resolved config; defaults live on that schema.
+        self._selection_policy = (
+            capture_config["selection_policy"] if self._forest_training else None
+        )
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -855,6 +1034,9 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
                 "external_staging_backend": _external_staging_backend(token_capture),
+                "parent_resolution": "source_history"
+                if self._forest_training
+                else "fingerprint",
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -1039,6 +1221,8 @@ Depending on your data shape, you may want to change these values."""
         Yields:
             One ``(rowidx, resolved_agent_ref, result, timing_metrics)`` tuple
             per completed task, in completion order rather than input order.
+            In capture mode, completion includes receipt checks; ready siblings
+            can be yielded while another rollout drains pending captures.
             ``rowidx`` echoes back the ``_rowidx`` the caller stamped on the
             example, which is how the caller maps a result to its slot.
             ``timing_metrics`` is ``None`` on every tuple but the last, which
@@ -1100,88 +1284,176 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
+            examples=nemo_gym_examples,
+            head_server_config=self.head_server_config,
+            **({"retry_requests": False} if self._forest_training else {}),
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
         _require_resolved_agent_refs(nemo_gym_examples)
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
+        async def await_gym_result(
+            task: Awaitable[tuple[dict, dict]],
+        ) -> tuple[dict, dict]:
+            try:
+                return await task
+            except Exception as error:
+                if hasattr(error, "response_content"):
+                    print(
+                        "EXCEPTION RESULT",
+                        error.response_content,
+                        file=sys.stderr,
+                    )
+                typed = _typed_gym_failure(error)
+                if typed is not None:
+                    # `from None`, deliberately: chaining the original would put the
+                    # unpicklable exception back on the wire as __cause__ and undo
+                    # the whole point. The status and message are already in `detail`.
+                    raise typed from None
+                raise
+
+        capture_mode = self._forest_training or self._token_capture_enabled
+        active_postprocessors = 0
+
+        async def finish_capture(
+            task: Awaitable[tuple[dict, dict]],
+        ) -> tuple[dict, dict]:
+            nonlocal active_postprocessors
+            row, result = await task
+            # Measure wall time with any receipt in flight, not the sum of
+            # overlapping drain waits (which could exceed the batch duration).
+            if active_postprocessors == 0:
+                timer.start(f"{timer_prefix}/postprocess_results")
+            active_postprocessors += 1
+            try:
+                return row, await self._postprocess_receipt_mode(row, result)
+            finally:
+                active_postprocessors -= 1
+                if active_postprocessors == 0:
+                    timer.stop(f"{timer_prefix}/postprocess_results")
+
+        capture_tasks: list[asyncio.Task[tuple[dict, dict]]] = []
         num_results = 0
-        for task in nemo_gym_result_iterator:
-            with timer.time(label=f"{timer_prefix}/await_results"):
-                try:
-                    nemo_gym_row, nemo_gym_result = await task
-                except Exception as error:
-                    if hasattr(error, "response_content"):
-                        print(
-                            "EXCEPTION RESULT",
-                            error.response_content,
-                            file=sys.stderr,
-                        )
-                    typed = _typed_gym_failure(error)
-                    if typed is not None:
-                        # `from None`, deliberately: chaining the original would put the
-                        # unpicklable exception back on the wire as __cause__ and undo
-                        # the whole point. The status and message are already in `detail`.
-                        raise typed from None
-                    raise
-
-            with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if self._token_capture_enabled:
-                    # Receipt mode: fetch the ledger manifest and assemble the
-                    # receipt locally; token-free result. The canonical row is
-                    # rebuilt by the finalizer, so no message_log walk (and no
-                    # NaN check) applies here.
-                    nemo_rl_result = await self._postprocess_receipt_mode(
-                        nemo_gym_row, nemo_gym_result
-                    )
-                else:
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_row,
-                        nemo_gym_result,
-                        tokenizer,
-                        include_initial_multimodal_data=not deduplicate_multimodal_data,
-                    )
-                    if _has_nan_generation_logprobs(nemo_rl_result):
-                        raise RuntimeError("Generation logprobs contain NaN")
-            num_results += 1
-            timing_metrics = None
-            if num_results == len(nemo_gym_examples):
-                timer.stop("_run_rollouts_total")
-                timing_metrics = timer.get_timing_metrics("sum")
-                total_time = timing_metrics.pop("_run_rollouts_total")
-                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100
-                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
-                    / total_time
-                )
-
-            agent_name = nemo_gym_row["agent_ref"]["name"]
-            counts_left[agent_name] -= 1
-            if counts_left[agent_name] <= 0:
-                counts_left.pop(agent_name)
-            if num_results % 10 == 0 and counts_left:
-                top_left = counts_left.most_common(5)
-                top_left_str = "\n".join(
-                    f"{index + 1}. {name}: {count}"
-                    for index, (name, count) in enumerate(top_left)
-                )
-                print(
-                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
-                    f"{top_left_str}",
-                    file=sys.stderr,
-                )
-
-            # task_source is resolved to agent_ref inside this Ray actor, after
-            # the caller's row was serialized. Return the resolved ref explicitly
-            # so the caller can hydrate its own row copy before postprocessing.
-            yield (
-                nemo_gym_row["_rowidx"],
-                nemo_gym_row["agent_ref"],
-                nemo_rl_result,
-                timing_metrics,
+        try:
+            result_iterator: Iterator[Awaitable[tuple[dict, dict]]] = (
+                await_gym_result(task) for task in nemo_gym_result_iterator
             )
+            if capture_mode:
+                # The batch already bounds the number of dispatched rollouts.
+                # Give each receipt its own wait so one drain cannot hold its
+                # ready siblings behind it in this stream.
+                for task in result_iterator:
+                    capture_tasks.append(asyncio.create_task(finish_capture(task)))
+                result_iterator = asyncio.as_completed(capture_tasks)
+            for task in result_iterator:
+                with timer.time(label=f"{timer_prefix}/await_results"):
+                    nemo_gym_row, nemo_rl_result = await task
+                if not capture_mode:
+                    with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_row,
+                            nemo_rl_result,
+                            tokenizer,
+                            include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        )
+                        if _has_nan_generation_logprobs(nemo_rl_result):
+                            raise RuntimeError("Generation logprobs contain NaN")
+                num_results += 1
+                timing_metrics = None
+                if num_results == len(nemo_gym_examples):
+                    timer.stop("_run_rollouts_total")
+                    timing_metrics = timer.get_timing_metrics("sum")
+                    total_time = timing_metrics.pop("_run_rollouts_total")
+                    timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+                        100
+                        * timing_metrics[f"{timer_prefix}/postprocess_results"]
+                        / total_time
+                    )
+
+                agent_name = nemo_gym_row["agent_ref"]["name"]
+                counts_left[agent_name] -= 1
+                if counts_left[agent_name] <= 0:
+                    counts_left.pop(agent_name)
+                if num_results % 10 == 0 and counts_left:
+                    top_left = counts_left.most_common(5)
+                    top_left_str = "\n".join(
+                        f"{index + 1}. {name}: {count}"
+                        for index, (name, count) in enumerate(top_left)
+                    )
+                    print(
+                        "Top 5 NeMo Gym agent refs left in this rollout batch: "
+                        f"{top_left_str}",
+                        file=sys.stderr,
+                    )
+
+                # task_source is resolved to agent_ref inside this Ray actor, after
+                # the caller's row was serialized. Return the resolved ref explicitly
+                # so the caller can hydrate its own row copy before postprocessing.
+                yield (
+                    nemo_gym_row["_rowidx"],
+                    nemo_gym_row["agent_ref"],
+                    nemo_rl_result,
+                    timing_metrics,
+                )
+        finally:
+            for task in capture_tasks:
+                task.cancel()
+            if capture_tasks:
+                await asyncio.gather(*capture_tasks, return_exceptions=True)
+                # Older Gym returns a plain iterator; newer versions expose
+                # client-task cleanup. Neither acknowledges server-side writes.
+                close = getattr(nemo_gym_result_iterator, "aclose", None)
+                if close is not None:
+                    await close()
+
+    async def _drained_manifest(self, rollout_id: str) -> dict:
+        """Fetch the terminal ledger manifest, draining in-flight capture calls.
+
+        Ending a session at its budget can leave its final call still
+        executing: the streaming dispatch makes one non-streaming engine
+        call, so the client's disconnect is not observed until the
+        synthesized stream is written, and the engine call runs to
+        completion after the harness declared the rollout terminal. Such a
+        call is an intent with no commit and no failure row, and a receipt
+        that still carries it must be masked. Poll until outstanding calls
+        resolve, a failure is recorded for each, or the drain budget lapses.
+        Preserve pending IDs even when a failure ends the wait: the worker
+        may still stage data, so those IDs cannot transfer to cleanup.
+        """
+        deadline = monotonic() + _CAPTURE_DRAIN_TIMEOUT_S
+        # Close before the first snapshot: an empty pending set alone does not
+        # prevent a queued request from starting after finalization/cleanup.
+        method, operation = (
+            ("POST", "close-admission")
+            if self._forest_training
+            else ("GET", "manifest")
+        )
+        while True:
+            manifest = await self._control(
+                method,
+                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/{operation}",
+            )
+            method, operation = "GET", "manifest"
+            failed = {
+                failure.get("model_call_id")
+                for failure in manifest.get("failures") or []
+            }
+            unresolved = [
+                call_id
+                for call_id in manifest.get("pending_call_ids") or []
+                if call_id not in failed
+            ]
+            if not unresolved:
+                return manifest
+            if monotonic() >= deadline:
+                print(
+                    f"capture drain for {rollout_id} timed out; "
+                    f"unresolved calls: {unresolved}",
+                    flush=True,
+                )
+                return manifest
+            await asyncio.sleep(_CAPTURE_DRAIN_POLL_S)
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict
@@ -1197,6 +1469,10 @@ Depending on your data shape, you may want to change these values."""
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
+        if self._forest_training:
+            return await self._postprocess_captured_history(
+                nemo_gym_row, _normalize_gym_validity(nemo_gym_result)
+            )
         rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
         # Gym's TERMINAL_RESPONSE_ID_KEY: the served response envelope id the
         # harness kept (``response.id``), not the logical-request header.
@@ -1211,16 +1487,15 @@ Depending on your data shape, you may want to change these values."""
             scored_response = None
         receipt = None
         try:
-            manifest = await self._control(
-                "GET",
-                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/manifest",
-            )
-            receipt = self._assemble_receipt(
-                rollout_id,
-                manifest,
-                terminal_response_id=terminal_response_id,
-                scored_response=scored_response,
-                reward=float(nemo_gym_result.get("reward") or 0.0),
+            manifest = await self._drained_manifest(rollout_id)
+            receipt = _mask_undrained_receipt(
+                self._assemble_receipt(
+                    rollout_id,
+                    manifest,
+                    terminal_response_id=terminal_response_id,
+                    scored_response=scored_response,
+                    reward=float(nemo_gym_result.get("reward") or 0.0),
+                )
             )
         except (RuntimeError, OSError) as error:
             # An unfetchable manifest finalizes as a placeholder row.
@@ -1231,6 +1506,147 @@ Depending on your data shape, you may want to change these values."""
             "full_result": nemo_gym_result,
             "rollout_id": rollout_id,
             "receipt": receipt,
+        }
+
+    async def _postprocess_captured_history(self, row: dict, result: dict) -> dict:
+        """Select capture paths while retaining the scored terminal's identity."""
+        # Optional Gym dependencies remain confined to the Gym adapter.
+        from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
+        from nemo_gym.token_id_capture.staging.records import RolloutManifest
+
+        from nemo_rl.environments.call_selection import resolve_selection_policy
+        from nemo_rl.experience.rollout_reassembler import (
+            ActionOutputFlags,
+            RolloutSelection,
+        )
+
+        owner = row[_NG_ROLLOUT_ID_BODY_KEY]
+        reward = result.get("reward")
+        if (
+            isinstance(reward, bool)
+            or not isinstance(reward, (int, float))
+            or not math.isfinite(reward)
+        ):
+            raise ValueError(
+                "Captured history requires an explicit finite verifier reward"
+            )
+        manifest = await self._drained_manifest(owner)
+        parsed = RolloutManifest.model_validate(manifest)
+        if parsed.capture_key != owner:
+            raise ValueError("Capture manifest belongs to another dispatched attempt")
+        by_call = {r.model_call_id: r for r in parsed.records}
+        # Cancellation can follow a durable commit. Only that settled failure
+        # may reach selection; pending writes and missing custody still mask.
+        capture_failed = bool(
+            parsed.pending_call_ids
+            or any(
+                f.reason != UNCOMMITTED_CALL_REASON or f.model_call_id not in by_call
+                for f in parsed.failures
+            )
+        )
+        selected = []
+        terminal_response_id = None
+        if not capture_failed:
+            try:
+                assert self._selection_policy is not None
+                select = resolve_selection_policy(self._selection_policy)
+                selected, terminal_response_id = select(
+                    [r.model_copy(deep=True) for r in parsed.records], result
+                )
+                selected_call_ids = {r.model_call_id for r in selected}
+                if not selected or len(selected_call_ids) != len(selected):
+                    raise ValueError("Selection must contain unique captured calls")
+                if any(by_call.get(r.model_call_id) != r for r in selected):
+                    raise ValueError(
+                        "Selection must contain unchanged records from this attempt"
+                    )
+                if terminal_response_id not in {r.response_id for r in selected}:
+                    raise ValueError("Selection must identify its scored terminal")
+                if any(f.model_call_id in selected_call_ids for f in parsed.failures):
+                    capture_failed = True
+                    selected = []
+            except ValueError as error:
+                raise ValueError(f"Rollout {owner!r}: {error}") from error
+        if any(r.response_status is None for r in selected):
+            raise ValueError("Selected capture is missing completion metadata")
+        if any(
+            r.response_status == "incomplete" and not r.finish_reason for r in selected
+        ):
+            raise ValueError("Incomplete capture is missing its finish reason")
+        if any(
+            r.last_output_item is None
+            and (
+                r.response_status == "completed"
+                or (
+                    r.response_status == "incomplete"
+                    and r.finish_reason in ("length", "max_tokens", "max_output_tokens")
+                )
+            )
+            for r in selected
+        ):
+            raise ValueError("Selected capture is missing output validation evidence")
+        truncated = any(
+            r.finish_reason in ("length", "max_tokens", "max_output_tokens")
+            for r in selected
+        )
+        receipt = self._assemble_receipt(
+            owner,
+            manifest,
+            terminal_response_id=terminal_response_id,
+            reward=float(reward),
+        )
+        selected_call_ids = {r.model_call_id for r in selected}
+        if capture_failed:
+            receipt.update(capture_poisoned=True, failure_reason="capture_incomplete")
+        elif any(
+            r.response_status in ("failed", "unknown")
+            or (
+                r.response_status == "incomplete"
+                and r.finish_reason not in ("length", "max_tokens", "max_output_tokens")
+            )
+            for r in selected
+        ):
+            receipt.update(
+                capture_poisoned=True, failure_reason="logical_execution_failure"
+            )
+        elif any(
+            r.parent_call_id is not None and r.parent_call_id not in selected_call_ids
+            for r in selected
+        ):
+            # Preserve selection membership; reject this owner before row planning.
+            receipt.update(capture_poisoned=True, failure_reason="selection_not_closed")
+        selection = RolloutSelection(
+            response_ids=tuple(r.response_id for r in selected),
+            action_flags=tuple(
+                ActionOutputFlags(
+                    *_detect_invalid_tool_call_and_malformed_thinking(
+                        r.last_output_item or {},
+                        invalid_tool_call_patterns=self.cfg.get(
+                            "invalid_tool_call_patterns"
+                        ),
+                        thinking_tags=self.cfg.get("thinking_tags"),
+                    )
+                )
+                for r in selected
+            ),
+            truncated=truncated,
+        )
+        full_result: dict[str, Any] = {
+            key: value
+            for key, value in result.items()
+            if isinstance(value, (str, int, float, bool))
+        }
+        full_result["instance_config"] = {
+            "mask_sample": result["instance_config"]["mask_sample"]
+        }
+        return {
+            "message_log": [],
+            "input_message_log": [],
+            "full_result": full_result,
+            "rollout_id": owner,
+            "receipt": receipt,
+            "logical_selection": selection,
+            "truncated": truncated,
         }
 
     @staticmethod
@@ -1280,14 +1696,20 @@ Depending on your data shape, you may want to change these values."""
         that never returned a completion (the ledger commit precedes the
         response leaving the server) and can never be a lineage parent (an
         uncommitted call has no row to resolve against) — e.g. the doomed
-        final call of a rollout that exhausted the model's context window.
-        Such rows are structurally off-chain and do not poison; if the
-        *terminal* request itself died this way, the missing-terminal-row
-        check below still masks the rollout. Every other failure reason
-        (for example ``worker_capture_failed``,
+        final call of a rollout that exhausted the model's context window,
+        or a call cancelled mid-flight when the harness ends the session at
+        its budget. Such rows are structurally off-chain and do not poison;
+        if the *terminal* request itself died this way, the
+        missing-terminal-row check below still masks the rollout. Every
+        other failure reason (for example ``worker_capture_failed``,
         ``invalid_worker_commit_coordinates``, or ``unresolved_parent``; a
         reason-less failure row poisons as ``capture_failed``) marks a call
         whose completion WAS served — a hole in the chain — and poisons.
+
+        Pending IDs remain authoritative even beside a failure row: a
+        worker may still write or its acknowledgement may have been lost.
+        The caller masks such receipts; sealing excludes unresolved writes
+        from cleanup ownership.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
@@ -1352,8 +1774,10 @@ Depending on your data shape, you may want to change these values."""
         elif terminal_record is None:
             failure_reason = selection_reason or "missing_terminal_row"
         return {
-            "rollout_id": rollout_id,
+            "capture_key": rollout_id,
             "reward": reward,
+            "attempted_call_ids": manifest.get("attempted_call_ids", []),
+            "pending_call_ids": manifest.get("pending_call_ids", []),
             "terminal_model_call_id": (
                 terminal_record.get("model_call_id")
                 if terminal_record is not None
@@ -1602,7 +2026,9 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 "token_ids": torch.tensor(new_prompt_token_ids),
             }
             if routed_experts is not None:
-                user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
+                user_message["routed_experts"] = slice_routed_experts(
+                    routed_experts, prompt_start, prompt_end
+                )
             nemo_rl_message_log.append(user_message)
 
             if processor is not None and not media_geometry_failed:
@@ -1669,10 +2095,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 "has_malformed_thinking": has_malformed_thinking,
             }
             if routed_experts is not None:
-                assistant_message["routed_experts"] = routed_experts[
-                    generation_start:generation_end
-                ]
+                assistant_message["routed_experts"] = slice_routed_experts(
+                    routed_experts, generation_start, generation_end
+                )
             nemo_rl_message_log.append(assistant_message)
+            # Release the full decoded turn before decoding the next one.
+            del routed_experts, routed_experts_raw
 
             seen_token_ids.extend(new_prompt_token_ids)
             seen_token_ids.extend(generation_token_ids)
@@ -1772,11 +2200,14 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         RunHelper.shutdown() is not idempotent, so the handle is cleared before
         it is used. A failure therefore cannot leave a live handle that a later
         cleanup attempt invokes again.
+
+        The servers are interrupted before RunHelper.shutdown() runs, and
+        whatever it leaves running is stopped too; see _shut_down_gym_servers.
         """
         try:
             rh, self.rh = self.rh, None
             if rh is not None:
-                rh.shutdown()
+                _shut_down_gym_servers(rh)
         finally:
             # Ray reaps this actor, so no atexit handler runs: whatever the span
             # processor is still holding is dropped unless it is flushed here.
@@ -1867,6 +2298,20 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
+    # Validate before starting any workers. Capture preserves the generated
+    # media tensors but does not make the dynamic tiler honor this option.
+    for section in ("default", "train", "validation"):
+        datasets = config.data.get(section)
+        if datasets is None:
+            continue
+        for dataset in datasets if isinstance(datasets, list) else [datasets]:
+            if dataset.get("image_max_num_tiles") is not None:
+                raise ValueError(
+                    f"data.{section}.image_max_num_tiles is not supported by "
+                    "NeMo Gym, with or without token capture. Remove this "
+                    "setting; per-dataset image tile caps are not implemented."
+                )
+
     generation_config = config.policy["generation"]
 
     # Enable the backend's OpenAI-compatible server.
