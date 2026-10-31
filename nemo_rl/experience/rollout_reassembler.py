@@ -904,19 +904,6 @@ class RolloutReassembler:
             metrics["finalize/valid_logical_owner_count"] = float(
                 logical.valid_owner_count
             )
-        # Valid rows hitting max_seq_len (the TRUNCATED predicate below), pooled
-        # into termination rates like the penalty counts; receipt-side rates
-        # only saw a placeholder truncated=False. Forest rows are not one per
-        # rollout, so Forest groups report no termination rates yet.
-        if logical is None:
-            metrics["finalize/truncated_count"] = 0.0
-            for row, context in zip(rows, log_contexts):
-                if row.valid:
-                    truncated = float(len(row.token_ids) == self._max_seq_len)
-                    metrics["finalize/truncated_count"] += truncated
-                    if context is not None:
-                        key = f"finalize/truncated_count/{context.agent_name}"
-                        metrics[key] = metrics.get(key, 0.0) + truncated
         # Per-row counts are pooled by the consuming controller once per
         # committed group, alongside the retained reward observations;
         # rejected placeholders never enter this population.
@@ -1028,12 +1015,13 @@ class RolloutReassembler:
                 count
             )
 
+        # (row index, logical slot, row): one entry per rollout.
         if logical is None:
-            reward_rows = list(enumerate(rows))
+            reward_rows = [(index, index, row) for index, row in enumerate(rows)]
         else:
             reward_rows = [
-                (tag["logical_slot"], row)
-                for tag, row in zip(logical.tags, rows, strict=True)
+                (index, tag["logical_slot"], row)
+                for index, (tag, row) in enumerate(zip(logical.tags, rows, strict=True))
                 if tag["segment_index"] == 0
             ]
         reward_observations = [
@@ -1043,9 +1031,22 @@ class RolloutReassembler:
                 row.reward,
                 log_contexts[slot],
             )
-            for slot, row in reward_rows
+            for _, slot, row in reward_rows
             if row.valid
         ]
+        # Truncated rollouts among the reward observations, pooled into
+        # termination rates like the penalty counts; receipt-side rates only
+        # saw a placeholder truncated=False.
+        truncated_flags = self._truncated_flags(rows, logical)
+        metrics["finalize/truncated_count"] = 0.0
+        for index, slot, row in reward_rows:
+            if row.valid:
+                truncated = float(truncated_flags[index])
+                metrics["finalize/truncated_count"] += truncated
+                context = log_contexts[slot]
+                if context is not None:
+                    key = f"finalize/truncated_count/{context.agent_name}"
+                    metrics[key] = metrics.get(key, 0.0) + truncated
 
         # Reuse the ordinary replay metric channel; finalizer timing counters stay
         # scalar-only. Compute before _publish_rows appends execution padding.
@@ -1075,6 +1076,18 @@ class RolloutReassembler:
         if finalized.meta is not None:
             finalized.meta.extra_info[ROLLOUT_METRICS] = [token_metrics]
         return finalized
+
+    def _truncated_flags(
+        self, rows: Sequence[FinalizedRollout], logical: Optional[_LogicalRows]
+    ) -> list[bool]:
+        """Per-row truncation, shared by the TRUNCATED column and termination rates.
+
+        Forest rows carry their rollout's Gym-reported truncation; ordinary rows
+        count as truncated when they fill ``max_seq_len``.
+        """
+        if logical is not None:
+            return list(logical.truncated)
+        return [len(row.token_ids) == self._max_seq_len for row in rows]
 
     def _publish_rows(
         self,
@@ -1221,10 +1234,7 @@ class RolloutReassembler:
             "total_reward": rewards_t,
             MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
             TRUNCATED: torch.tensor(
-                logical.truncated
-                if logical is not None
-                else [seq_len == self._max_seq_len for seq_len in seq_lens],
-                dtype=torch.bool,
+                self._truncated_flags(rows, logical), dtype=torch.bool
             ),
         }
         if logical is not None:
