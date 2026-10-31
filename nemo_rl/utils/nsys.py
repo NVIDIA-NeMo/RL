@@ -28,6 +28,8 @@ def _parse_extra_options(raw: str) -> dict[str, Any]:
 
     Empty string parses to an empty dict. Invalid JSON or non-object payloads raise
     so misconfiguration surfaces immediately rather than silently being ignored.
+    A ``null`` value removes that flag from the built-in defaults
+    (see ``apply_nsys_extra_options``).
     """
     if not raw:
         return {}
@@ -51,6 +53,46 @@ def _parse_extra_options(raw: str) -> dict[str, Any]:
 NRL_NSYS_EXTRA_OPTIONS: dict[str, Any] = _parse_extra_options(
     os.environ.get("NRL_NSYS_EXTRA_OPTIONS", "")
 )
+
+
+def apply_nsys_extra_options(
+    nsight_config: dict[str, Any], extra_options: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge user nsys flags into ``nsight_config`` in place and return it.
+
+    User keys override the built-in defaults; a ``None`` value (JSON ``null``) removes
+    the key instead, e.g. ``{"cuda-graph-trace": null}`` drops that default flag.
+    """
+    for key, value in extra_options.items():
+        if value is None:
+            nsight_config.pop(key, None)
+        else:
+            nsight_config[key] = value
+    return nsight_config
+
+
+def build_inner_nsight_config(
+    capture_range_end: str, wait: str | None = None
+) -> dict[str, Any]:
+    """Deferred-capture nsight config for vLLM's internal TP workers.
+
+    Shared by the v1 executor patch (``vllm_worker.py``) and the v2 executor plugin
+    (``vllm_nsight_plugin.py``); each passes its executor-specific
+    ``capture_range_end`` and ``wait``. Tracing starts/stops on the
+    cudaProfilerStart/Stop that ``start/stop_gpu_profiling`` send to every inner worker.
+    """
+    nsight_config: dict[str, Any] = {
+        "t": "cuda,cudnn,cublas,nvtx",
+        "o": f"'vllm_tp_worker_{NRL_NSYS_PROFILE_STEP_RANGE}_%p'",
+        "stop-on-exit": "true",
+        "s": "none",
+        "capture-range": "cudaProfilerApi",
+        "capture-range-end": capture_range_end,
+        "cuda-graph-trace": "node",
+    }
+    if wait is not None:
+        nsight_config["wait"] = wait
+    return apply_nsys_extra_options(nsight_config, NRL_NSYS_EXTRA_OPTIONS)
 
 
 class ProfilablePolicy(Protocol):

@@ -45,6 +45,14 @@ Common additions:
 - `cuda-memory-usage`: track host/device memory allocations (`"true"`).
 - `cpuctxsw`: control CPU context-switch sampling (`"none"`, `"process-tree"`).
 
+Set a key to `null` to remove a built-in default. The same options also apply to the
+vLLM internal TP workers. For example, on platforms where the hardware `cuda` trace
+crashes at `cudaProfilerStart`, use the software CUDA trace and drop CUDA-graph node tracing:
+
+```bash
+export NRL_NSYS_EXTRA_OPTIONS='{"t": "cuda-sw,nvtx", "cuda-graph-trace": null}'
+```
+
 Empty or unset means no extras — defaults apply unchanged. Invalid JSON or a non-object
 payload raises at startup so misconfiguration surfaces immediately.
 
@@ -116,7 +124,7 @@ When profiling is enabled, it generates the following logs and files:
    trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    worker_process_<PID>.nsys-rep
    ```
-For TensorRT-LLM, the meaningful generation profiles are the per-internal-GPU-worker files (`trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep`), one per GPU (replicas × TP). If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, nsight is NOT applied to the outer `VllmGenerationWorker` to avoid interfering with Ray's compiled DAG. Instead, `ray_workers_use_nsight` is enabled and vLLM's default nsight config is monkey-patched to use `capture-range=cudaProfilerApi` (deferred capture). This means the internal TP workers run under nsys with near-zero overhead until `start_gpu_profiling()` triggers `cudaProfilerStart()` on each worker via `collective_rpc`. The `vllm_tp_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` files are the nsight profiles from the internal TP workers. (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).
+For TensorRT-LLM, the meaningful generation profiles are the per-internal-GPU-worker files (`trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep`), one per GPU (replicas × TP). If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, nsight is NOT applied to the outer `VllmGenerationWorker` to avoid interfering with Ray's compiled DAG. Instead, `ray_workers_use_nsight` is enabled and vLLM's default nsight config is monkey-patched to use `capture-range=cudaProfilerApi` (deferred capture). This means the internal TP workers run under nsys with near-zero overhead until `start_gpu_profiling()` triggers `cudaProfilerStart()` on each worker via `collective_rpc`. The `vllm_tp_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` files are the nsight profiles from the internal TP workers. (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information). With vLLM's v2 Ray executor (the default), the executor is built inside vLLM's EngineCore (a separate process with the async engine), so this config is installed there by the `vllm.general_plugins` entry point `nemo_rl_nsight_inner`, which is registered when NeMo RL is installed in the vLLM environment. Worker environments built before this entry point existed, such as a prebuilt container with newer NeMo RL source mounted over `/opt/nemo-rl` or existing `venvs/` on bare metal, do not load it, and the inner TP workers fall back to vLLM's default `worker_process_<PID>` profiles. Rebuild them once with `NRL_FORCE_REBUILD_VENVS=true`. If you set `VLLM_PLUGINS`, include `nemo_rl_nsight_inner`. When `NRL_NSYS_WORKER_PATTERNS` is set and the plugin cannot import vLLM's `RayExecutorV2`, vLLM startup fails with that `ImportError` instead of silently running without inner reports. Inner reports are written after the profile window ends, while the workers keep running, so keep the run going for a few steps past the window. `tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-megatron-nsys.sh` checks the per-worker reports end to end.
 
 3. **File Location**: Profile files are saved in `/tmp/ray/session*/logs/nsight/` directory on each worker node. Ensure you check both `ls /tmp/ray/session_[0-9]*/logs/nsight` and `ls /tmp/ray/session_latest/logs/nsight` for the profiles, since the "latest" pointer may be stale.
 

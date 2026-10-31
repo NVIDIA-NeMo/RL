@@ -1231,6 +1231,32 @@ def test_get_nsight_config_extra_options():
         }
 
 
+def test_get_nsight_config_extra_options_null_removes_default():
+    """A null value in NRL_NSYS_EXTRA_OPTIONS removes that built-in default."""
+    from unittest.mock import patch
+
+    from nemo_rl.distributed.worker_group_utils import (
+        get_nsight_config_if_pattern_matches,
+    )
+
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:2"
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_EXTRA_OPTIONS",
+            {"cuda-graph-trace": None},
+        ),
+    ):
+        nsight = get_nsight_config_if_pattern_matches("policy_worker")["nsight"]
+    assert "cuda-graph-trace" not in nsight
+    assert nsight["capture-range"] == "cudaProfilerApi"
+
+
 def test_nrl_nsys_extra_options_parsing():
     """_parse_extra_options accepts an empty string, rejects non-JSON and non-dict payloads."""
     import pytest

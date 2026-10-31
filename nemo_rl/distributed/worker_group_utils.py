@@ -21,6 +21,7 @@ from nemo_rl.utils.nsys import (
     NRL_NSYS_EXTRA_OPTIONS,
     NRL_NSYS_PROFILE_STEP_RANGE,
     NRL_NSYS_WORKER_PATTERNS,
+    apply_nsys_extra_options,
 )
 
 
@@ -33,7 +34,8 @@ def get_nsight_config_if_pattern_matches(worker_name: str) -> dict[str, Any]:
     Returns:
         Dictionary containing {"nsight": config} if pattern matches, empty dict otherwise.
         When NRL_NSYS_EXTRA_OPTIONS is set, its key/value pairs are merged into the
-        nsight config (user-supplied keys override the built-in defaults).
+        nsight config (user-supplied keys override the built-in defaults; a null value
+        removes that default).
     """
     assert not (bool(NRL_NSYS_WORKER_PATTERNS) ^ bool(NRL_NSYS_PROFILE_STEP_RANGE)), (
         "Either both NRL_NSYS_WORKER_PATTERNS and NRL_NSYS_PROFILE_STEP_RANGE must be set, or neither. See https://github.com/NVIDIA/NeMo-RL/tree/main/docs/nsys-profiling.md for more details."
@@ -63,16 +65,18 @@ def get_nsight_config_if_pattern_matches(worker_name: str) -> dict[str, Any]:
                 # Profile will only start/stop when torch.cuda.profiler.start()/stop() is called
                 "capture-range": "cudaProfilerApi",
                 "capture-range-end": "stop",
+                "cuda-graph-trace": "node",
             }
             # User-supplied flags from NRL_NSYS_EXTRA_OPTIONS override the defaults
             # above. Use this to add flags like gpu-metrics-device, cuda-memory-usage,
             # cpuctxsw, or to swap capture-range for a non-cudaProfilerApi mode.
+            # A null value removes a default, e.g. {"cuda-graph-trace": null}.
             if NRL_NSYS_EXTRA_OPTIONS:
                 logging.info(
                     f"Merging NRL_NSYS_EXTRA_OPTIONS into nsight config for worker "
                     f"'{worker_name}': {NRL_NSYS_EXTRA_OPTIONS}"
                 )
-                nsight_config.update(NRL_NSYS_EXTRA_OPTIONS)
+                apply_nsys_extra_options(nsight_config, NRL_NSYS_EXTRA_OPTIONS)
             return {"nsight": nsight_config}
 
     return {}

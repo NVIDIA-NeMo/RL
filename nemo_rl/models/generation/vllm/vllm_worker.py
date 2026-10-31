@@ -832,23 +832,11 @@ class BaseVllmGenerationWorker:
         tracing until start_gpu_profiling() triggers cudaProfilerStart() on each
         internal worker via collective_rpc.
         """
-        from nemo_rl.utils.nsys import (
-            NRL_NSYS_EXTRA_OPTIONS,
-            NRL_NSYS_PROFILE_STEP_RANGE,
-        )
+        from nemo_rl.utils.nsys import build_inner_nsight_config
 
-        nsight_config = {
-            "t": "cuda,cudnn,cublas,nvtx",
-            "o": f"'vllm_tp_worker_{NRL_NSYS_PROFILE_STEP_RANGE}_%p'",
-            "stop-on-exit": "true",
-            "s": "none",
-            "capture-range": "cudaProfilerApi",
-            "capture-range-end": "repeat",
-        }
-        # User-supplied flags from NRL_NSYS_EXTRA_OPTIONS override the defaults (e.g.
-        # t=cuda-sw,nvtx on platforms where the HW cuda target crashes at cudaProfilerStart).
-        if NRL_NSYS_EXTRA_OPTIONS:
-            nsight_config.update(NRL_NSYS_EXTRA_OPTIONS)
+        # NRL_NSYS_EXTRA_OPTIONS is merged in (e.g. t=cuda-sw,nvtx on platforms where
+        # the HW cuda target crashes at cudaProfilerStart).
+        nsight_config = build_inner_nsight_config(capture_range_end="repeat")
 
         # vLLM v1 Ray executor (VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0).
         try:
