@@ -57,9 +57,9 @@ dependencies = [
   "torchvision>=0.26,<0.29",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.28 <-> 2.13)
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
-  # Keep the base range compatible with every backend-specific pin (5.5.4 through
-  # 5.16.1). Environments without a backend extra resolve to the upper bound.
-  "transformers>=5.5.0,<=5.16.1",
+  # Backend environments pin independently: Megatron-Bridge requires >=5.15,
+  # while the vLLM and Automodel environments retain their 5.12.1 pins.
+  "transformers>=5.5.0,<5.21",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -136,10 +136,13 @@ dependencies = [
 
 
 [project.optional-dependencies]
+# Megatron-Core requires cuDNN frontend 1.32; other backends retain 1.25.
+# Keep these pins per backend so the existing conflicting extras resolve separately.
 automodel = [
   # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
   "torch==2.13.0",
   "torchvision==0.28.0",
+  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "nemo-automodel[moe]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
   # Keep this scoped to the automodel fork; sglang intentionally pins TileLang 0.1.8.
@@ -161,6 +164,7 @@ vllm = [
   # ABI of the vLLM 0.29.0 cu130 wheels.
   "torch==2.13.0",
   "torchvision==0.28.0",
+  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "transformers==5.12.1",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
@@ -183,6 +187,7 @@ sglang = [
   # on 2.13 sgl_kernel fails with `undefined symbol: _ZNK2at10TensorBase14const_data_ptr…`.
   "torch==2.11.0",
   "torchvision==0.26.0",
+  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
   # begin_weight_update / end_weight_update refit session: quantized weights
   # carry derived scales (swizzled blockscales, g1/g2 alphas) that have to be
@@ -218,8 +223,7 @@ mcore = [
   # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
   "torch==2.13.0",
   "torchvision==0.28.0",
-  # Within Megatron-Bridge's supported range (>=5.15,<5.20); Megatron-Bridge itself locks 5.19.0.
-  "transformers==5.16.1",
+  "transformers==5.20.1",
   "tilelang==0.1.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
@@ -229,6 +233,9 @@ mcore = [
   # zero_train_gen_mismatch / batch_invariant_mode pins on both train and generation.
   # Pinned to b19: b20+ need apache-tvm-ffi>=0.1.12, but the shared override keeps 0.1.11.
   "flash-attn-4==4.0.0b19 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # Core's tool.uv constraint is not inherited by downstream projects. Older
+  # Quack releases use CuTe APIs moved by the required CUTLASS 4.8 runtime.
+  "quack-kernels>=0.6.5 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
   # conflicting extras resolve in separate forks — without these direct deps the mcore fork
@@ -236,11 +243,11 @@ mcore = [
   "mamba-ssm",
   "causal-conv1d",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  "flashinfer-python==0.6.18.post1",
-  "flashinfer-cubin==0.6.18.post1",
-  "flashinfer-jit-cache==0.6.18.post1",
+  "flashinfer-python==0.7.2.post1",
+  "flashinfer-cubin==0.7.2.post1",
+  "flashinfer-jit-cache==0.7.2.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "nvidia-cutlass-dsl[cu13]==4.6.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cutlass-dsl[cu13]==4.8.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
@@ -259,6 +266,7 @@ trtllm = [
   # feat/rl_rc's requirements.txt needs torch>=2.13.0,<=2.14.0a0.
   "torch==2.13.0",
   "torchvision==0.28.0",
+  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "tensorrt-llm==1.3.0rc28",
   # tensorrt-llm pins nvidia-cutlass-dsl[cu13]==4.8.0.dev0; uv only admits pre-releases
   # that are requested explicitly, so name its pre-release sub-packages here too.
@@ -409,7 +417,9 @@ explicit = true
 [[tool.uv.index]]
 name = "flashinfer-cu130"
 url = "https://flashinfer.ai/whl/cu130"
-explicit = true
+# FlashInfer 0.7 splits its JIT cache into transitive SM-specific packages.
+# This index serves only the CUDA 13.0 JIT-cache family.
+explicit = false
 
 [tool.uv]
 managed = true
@@ -447,10 +457,19 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
+  # The JIT-cache shim's CPU-specific wheels declare different providers.
+  # Unify their metadata for uv's universal lock; these two ship only on ARM.
+  { package = { name = "flashinfer-jit-cache", version = "0.7.2.post1+cu130" }, dependencies = [
+    "flashinfer-jit-cache-sm110a==0.7.2.post1+cu130; platform_machine == 'aarch64'",
+    "flashinfer-jit-cache-sm121a==0.7.2.post1+cu130; platform_machine == 'aarch64'",
+  ] },
+  # Preserve TRT-LLM's existing frontend override without constraining Megatron.
+  { package = { name = "tensorrt-llm" }, dependencies = [
+    "nvidia-cudnn-frontend==1.25.0",
+  ] },
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
