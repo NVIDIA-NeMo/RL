@@ -105,7 +105,7 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
-# Every shipped config tree. Only the outdated-config guard uses it -- most of examples/nemo_gym
+# Every shipped config tree. Only the outdated-config and local-path guards use it -- most of examples/nemo_gym
 # cannot satisfy the schema test by design (env manifests, launcher templates, unset env
 # interpolations).
 repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
@@ -113,6 +113,11 @@ full_config_files = config_files + [
     path
     for extra in ("examples/nemo_gym", "research")
     for path in glob.glob(str(repo_root / extra / "**/*.yaml"), recursive=True)
+]
+suite_scripts = [
+    path
+    for pattern in ("tests/test_suites/**/*.sh", "research/*/tests/test_suites/**/*.sh")
+    for path in glob.glob(str(repo_root / pattern), recursive=True)
 ]
 
 
@@ -438,3 +443,12 @@ def test_base_exemplars_pin_flash_attention_to_fa2():
             )
             if isinstance(megatron_cfg, dict) and "apply_rope_fusion" in megatron_cfg:
                 assert megatron_cfg.get("flash_attention_version") == 2, path.name
+
+
+@pytest.mark.parametrize("path", full_config_files + suite_scripts)
+def test_shipped_configs_and_suite_scripts_have_no_local_paths(path):
+    text = Path(path).read_text().lower()
+    for local_prefix in ("/lustre/", "/home/"):
+        assert local_prefix not in text, (
+            f"{path} contains a local path ({local_prefix})"
+        )
