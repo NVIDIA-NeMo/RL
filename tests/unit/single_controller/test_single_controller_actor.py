@@ -98,7 +98,7 @@ from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangDisaggregatedWeightSynchronizer,
 )
 from tests.unit.single_controller._rollout_checkpoints import (
-    bare_rollout_snapshotter,
+    attach_rollout_checkpointing,
 )
 
 
@@ -2315,7 +2315,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._buffer = _EmptyBuffer()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._rollout_exhausted = asyncio.Event()
-    ctrl._rollout_snapshots = bare_rollout_snapshotter()
+    attach_rollout_checkpointing(ctrl)
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
     ctrl._is_ppo = False
@@ -2341,7 +2341,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
-    ctrl._rollout_snapshots = bare_rollout_snapshotter()
+    attach_rollout_checkpointing(ctrl)
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}

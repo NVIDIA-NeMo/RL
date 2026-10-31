@@ -16,7 +16,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any
 
 from nemo_rl.algorithms.rollout_checkpointing.restore import RolloutRestorer
 from nemo_rl.algorithms.rollout_checkpointing.snapshots import RolloutSnapshotter
@@ -27,33 +27,6 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
     TrainingProgress,
 )
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
-
-
-def bare_rollout_snapshotter(
-    environment_checkpoint: Optional[Any] = None,
-) -> RolloutSnapshotter:
-    """The commit window, save lock and pump state, with nothing to save."""
-    return RolloutSnapshotter(
-        RolloutParts(
-            master_config=SimpleNamespace(async_rl=None),  # type: ignore[arg-type]
-            dp_client=None,
-            partition_id="",
-            buffer=None,  # type: ignore[arg-type]
-            dataloader=None,
-            sampler=None,  # type: ignore[arg-type]
-            rollout_manager=SimpleNamespace(recovery_ledger=None),  # type: ignore[arg-type]
-            data_plane_barrier=None,  # type: ignore[arg-type]
-            environment_checkpoint=environment_checkpoint or NoEnvironmentCheckpoint(),
-            runtime_state=RolloutRuntimeState(),
-            read_progress=lambda: TrainingProgress(0, 0, 0),
-            log_metrics=lambda *args, **kwargs: None,
-        ),
-        checkpointer=None,  # type: ignore[arg-type]
-        timeout=None,  # type: ignore[arg-type]
-        bootstrap_identity=None,
-        teacher_coordinator=None,
-        records_prompt_groups=lambda: False,
-    )
 
 
 def attach_rollout_checkpointing(controller: Any) -> None:
@@ -81,8 +54,9 @@ def attach_rollout_checkpointing(controller: Any) -> None:
         buffer=getattr(controller, "_buffer", None),
         dataloader=getattr(controller, "_dataloader", None),
         sampler=getattr(controller, "_sampler", None),
+        # A stand-in without a ledger only needs the commit window and lock.
         rollout_manager=rollout_manager
-        if rollout_manager is not None
+        if hasattr(rollout_manager, "recovery_ledger")
         else SimpleNamespace(recovery_ledger=None),
         data_plane_barrier=getattr(controller, "_data_plane_checkpoint_barrier", None),
         environment_checkpoint=getattr(
