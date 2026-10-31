@@ -94,7 +94,6 @@ from tests.unit.single_controller._checkpoint_scenarios import (
 )
 from tests.unit.single_controller._rollout_checkpoints import (
     attach_rollout_checkpointing,
-    bare_rollout_snapshotter,
 )
 from tests.unit.single_controller.test_checkpointing import (
     _actor_master_config,
@@ -787,7 +786,7 @@ def test_gym_phase_stops_when_a_train_step_starts_committing(
     async def exercise() -> None:
         actor = FakeGymActor(exported_episodes=(), block_commit=True)
         controller = _controller_for(gym_coordinator(actor))
-        controller._rollout_snapshots = bare_rollout_snapshotter()
+        attach_rollout_checkpointing(controller)
         async with contextlib.AsyncExitStack() as stack:
             phase = asyncio.create_task(
                 controller._rollout_snapshots._enter_environment_phase_unless_a_step_commits(

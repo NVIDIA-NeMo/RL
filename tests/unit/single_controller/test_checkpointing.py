@@ -142,7 +142,6 @@ from tests.unit.environments.gym_checkpoint_fakes import FakeGymActor, gym_coord
 from tests.unit.experience.test_rollout_recovery import _forest_sealed_ledger
 from tests.unit.single_controller._rollout_checkpoints import (
     attach_rollout_checkpointing,
-    bare_rollout_snapshotter,
 )
 from tests.unit.single_controller.test_setup import (
     _native_tq_metadata,
@@ -544,6 +543,26 @@ class _StagingInventoryDPClient:
         self.clear_calls.append((list(sample_ids), partition_id))
         cleared = set(sample_ids)
         self.sample_ids = [key for key in self.sample_ids if key not in cleared]
+
+
+_STAGING = "rollout_staging"
+
+
+def _validate_staging(dp_client: Any, **kwargs: Any) -> int:
+    """Run the staging-inventory check over a ledger that owns ``sealed-key``."""
+    ledger = _sealed_recovery_ledger("sealed-key")
+
+    async def validate() -> int:
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            return await validate_rollout_recovery_inventory(
+                cut,
+                dp_client=dp_client,
+                recovery_ledger=ledger,
+                staging_partition=_STAGING,
+                **kwargs,
+            )
+
+    return asyncio.run(validate())
 
 
 class _BlockingDPClient(_FakeDPClient):
@@ -3278,35 +3297,17 @@ class TestDataPlaneCheckpoint:
         assert not (tmp_path / "checkpoints" / "step_1").exists()
 
     def test_rollout_recovery_inventory_rejects_missing_staging_rows(self):
-        staging_partition = "rollout_staging"
-        actor = object.__new__(_ACTOR_CLS)
-        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
-        actor._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(staging_partition=staging_partition)
-        )
-        actor._dp_client = _StagingInventoryDPClient([], partition_id=staging_partition)
-
-        async def validate_inventory() -> None:
-            async with DataPlaneCheckpointBarrier().mutation() as cut:
-                await validate_rollout_recovery_inventory(
-                    cut,
-                    dp_client=actor._dp_client,
-                    recovery_ledger=actor._rollout_recovery_ledger,
-                    staging_partition=staging_partition,
-                    replay_metadata=None,
-                    clear_unreferenced=False,
-                )
+        dp_client = _StagingInventoryDPClient([], partition_id=_STAGING)
 
         with pytest.raises(RuntimeError, match=r"missing=\['sealed-key'\]"):
-            asyncio.run(validate_inventory())
+            _validate_staging(dp_client, replay_metadata=None, clear_unreferenced=False)
 
     def test_rollout_recovery_inventory_merges_routes_and_clears_orphans(self):
-        staging_partition = "rollout_staging"
         route_key = "canonical-route-key"
         route_plan = encode_route_plan(
             RouteAssemblyPlan(
                 schema_version=ROUTE_PLAN_SCHEMA_VERSION,
-                staging_partition=staging_partition,
+                staging_partition=_STAGING,
                 spans=(),
                 cleanup_staging_keys=(route_key,),
                 expected_token_length=0,
@@ -3325,88 +3326,43 @@ class TestDataPlaneCheckpoint:
             ]
         }
         dp_client = _StagingInventoryDPClient(
-            ["sealed-key", route_key, "orphan-key"],
-            partition_id=staging_partition,
+            ["sealed-key", route_key, "orphan-key"], partition_id=_STAGING
         )
-        actor = object.__new__(_ACTOR_CLS)
-        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
-        actor._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(staging_partition=staging_partition)
+
+        referenced = _validate_staging(
+            dp_client, replay_metadata=replay_metadata, clear_unreferenced=True
         )
-        actor._dp_client = dp_client
 
-        async def validate_inventory() -> int:
-            async with DataPlaneCheckpointBarrier().mutation() as cut:
-                return await validate_rollout_recovery_inventory(
-                    cut,
-                    dp_client=actor._dp_client,
-                    recovery_ledger=actor._rollout_recovery_ledger,
-                    staging_partition=staging_partition,
-                    replay_metadata=replay_metadata,  # type: ignore[arg-type]
-                    clear_unreferenced=True,
-                )
-
-        assert asyncio.run(validate_inventory()) == 2
-
-        assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
+        assert referenced == 2
+        assert dp_client.clear_calls == [(["orphan-key"], _STAGING)]
         assert sorted(dp_client.sample_ids) == [route_key, "sealed-key"]
 
     def test_rollout_recovery_inventory_preserves_gym_manifest_staging_keys(self):
-        staging_partition = "rollout_staging"
         dp_client = _StagingInventoryDPClient(
-            ["sealed-key", "gym-owned-key", "orphan-key"],
-            partition_id=staging_partition,
+            ["sealed-key", "gym-owned-key", "orphan-key"], partition_id=_STAGING
         )
-        actor = object.__new__(_ACTOR_CLS)
-        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
-        actor._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(staging_partition=staging_partition)
+
+        referenced = _validate_staging(
+            dp_client,
+            replay_metadata=None,
+            clear_unreferenced=True,
+            additional_expected_staging_keys={"gym-owned-key"},
         )
-        actor._dp_client = dp_client
 
-        async def validate_inventory() -> int:
-            async with DataPlaneCheckpointBarrier().mutation() as cut:
-                return await validate_rollout_recovery_inventory(
-                    cut,
-                    dp_client=actor._dp_client,
-                    recovery_ledger=actor._rollout_recovery_ledger,
-                    staging_partition=staging_partition,
-                    replay_metadata=None,
-                    clear_unreferenced=True,
-                    additional_expected_staging_keys={"gym-owned-key"},
-                )
-
-        assert asyncio.run(validate_inventory()) == 2
-        assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
+        assert referenced == 2
+        assert dp_client.clear_calls == [(["orphan-key"], _STAGING)]
         assert sorted(dp_client.sample_ids) == ["gym-owned-key", "sealed-key"]
 
     def test_rollout_recovery_inventory_rejects_missing_gym_staging_key(self):
-        staging_partition = "rollout_staging"
-        dp_client = _StagingInventoryDPClient(
-            ["sealed-key"],
-            partition_id=staging_partition,
-        )
-        actor = object.__new__(_ACTOR_CLS)
-        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
-        actor._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(staging_partition=staging_partition)
-        )
-        actor._dp_client = dp_client
-
-        async def validate_inventory() -> None:
-            async with DataPlaneCheckpointBarrier().mutation() as cut:
-                await validate_rollout_recovery_inventory(
-                    cut,
-                    dp_client=actor._dp_client,
-                    recovery_ledger=actor._rollout_recovery_ledger,
-                    staging_partition=staging_partition,
-                    replay_metadata=None,
-                    clear_unreferenced=True,
-                    additional_expected_staging_keys={"missing-gym-key"},
-                )
+        dp_client = _StagingInventoryDPClient(["sealed-key"], partition_id=_STAGING)
 
         with pytest.raises(RuntimeError, match="staging rows missing"):
-            asyncio.run(validate_inventory())
+            _validate_staging(
+                dp_client,
+                replay_metadata=None,
+                clear_unreferenced=True,
+                additional_expected_staging_keys={"missing-gym-key"},
+            )
 
         assert dp_client.clear_calls == []
         assert dp_client.sample_ids == ["sealed-key"]
@@ -3630,7 +3586,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
     actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
-    actor._rollout_snapshots = bare_rollout_snapshotter()
+    attach_rollout_checkpointing(actor)
     actor._save_state = SimpleNamespace()
     actor._rollout_manager = _FakeRolloutManager()
     actor._train_steps = 1
