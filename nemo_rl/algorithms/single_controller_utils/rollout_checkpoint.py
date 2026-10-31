@@ -24,7 +24,7 @@ import shutil
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any, Literal, Mapping, Optional, get_args
+from typing import Any, Mapping, Optional
 
 from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -37,25 +37,6 @@ BOOTSTRAP_DIRNAME = "bootstrap"
 BOOTSTRAP_MANIFEST_FILENAME = "manifest.json"
 ROLLOUT_SNAPSHOTS_DIRNAME = "rollout_snapshots"
 ROLLOUT_SNAPSHOT_MANIFEST_FILENAME = "manifest.json"
-
-RolloutCheckpointAttemptOutcome = Literal["completed", "failed", "skipped"]
-ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES: tuple[RolloutCheckpointAttemptOutcome, ...] = (
-    get_args(RolloutCheckpointAttemptOutcome)
-)
-
-RolloutCheckpointAttemptReason = Literal[
-    "completed",
-    "invariant_error",
-    "io_error",
-    "missing_trainer_anchor",
-    "no_data_plane_mutations",
-    "optimizer_commit_in_progress",
-    "timeout",
-    "trainer_state_changed",
-]
-ROLLOUT_CHECKPOINT_ATTEMPT_REASONS: tuple[RolloutCheckpointAttemptReason, ...] = (
-    get_args(RolloutCheckpointAttemptReason)
-)
 
 _SNAPSHOT_RE = re.compile(r"snapshot_(\d+)")
 _TMP_SNAPSHOT_RE = re.compile(r"tmp_snapshot_(\d+)")
@@ -250,6 +231,8 @@ class RolloutSnapshotManifest:
     mutation_version: int
     rolled_back_train_group_count: int
     bootstrap_fingerprint: Optional[str]
+    # None preserves the trainer counter when loading an older snapshot.
+    next_nemo_gym_task_index: Optional[int] = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> RolloutSnapshotManifest:
@@ -274,6 +257,15 @@ class RolloutSnapshotManifest:
             raise ValueError(
                 "rollout snapshot bootstrap_fingerprint must be a string or null"
             )
+        next_nemo_gym_task_index = raw.get("next_nemo_gym_task_index")
+        if next_nemo_gym_task_index is not None and (
+            not isinstance(next_nemo_gym_task_index, int)
+            or isinstance(next_nemo_gym_task_index, bool)
+            or next_nemo_gym_task_index < 0
+        ):
+            raise ValueError(
+                "rollout snapshot next_nemo_gym_task_index must be a non-negative integer"
+            )
         manifest = cls(
             schema_version=raw["schema_version"],
             base_train_step=raw["base_train_step"],
@@ -283,6 +275,7 @@ class RolloutSnapshotManifest:
             mutation_version=raw["mutation_version"],
             rolled_back_train_group_count=raw["rolled_back_train_group_count"],
             bootstrap_fingerprint=fingerprint,
+            next_nemo_gym_task_index=next_nemo_gym_task_index,
         )
         if manifest.schema_version != ROLLOUT_SNAPSHOT_SCHEMA_VERSION:
             raise ValueError(

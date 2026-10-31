@@ -29,6 +29,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
 )
+from nemo_rl.models.generation.vllm.lora_utils import LoraRefitMode
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
     MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
@@ -98,6 +99,19 @@ class VllmSpecificArgs(TypedDict):
     # Collect vLLM request, cache, and cumulative token counters in a model-owner
     # background thread for performance diagnostics.
     enable_vllm_metrics_logger: NotRequired[bool]
+    # Store each request's logprobs in vLLM's FlatLogprobs (a few flat lists per
+    # request) instead of a dict plus one Logprob object per generated token. Same
+    # values; avoids long full GC pauses on the generation actor when many requests
+    # with logprobs are in flight. Applies to requests through the exposed HTTP
+    # server that ask for logprobs but not prompt logprobs, so it requires
+    # async_engine: true and expose_http_server: true. Default false.
+    flat_logprobs: NotRequired[bool]
+    # Bound how long vLLM's front-end output loops may hold the generation actor's
+    # event loop under a backlog: output_handler yields once per engine step and the
+    # output-socket reader after this many ms of continuous work (20 is a good value).
+    # Keeps refit and other control calls responsive. Requires async_engine: true.
+    # None (default) disables it.
+    output_loop_yield_budget_ms: NotRequired[float | None]
     # Sampling cadence for the optional vLLM metrics logger.
     vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
@@ -228,6 +242,9 @@ class VllmConfig(GenerationConfig):
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
     refit_transport: NotRequired[VllmRefitSelector | str | None]
     refit_cfg: NotRequired[VllmRefitConfig | None]
+    # LoRA policies use vLLM's factorized adapter runtime by default. Set to
+    # ``merged`` to opt into materializing and refitting full ``W + BA`` weights.
+    lora_refit_mode: NotRequired[LoraRefitMode]
 
     # quantization config
     quant_cfg: NotRequired[str | None]
@@ -274,6 +291,34 @@ def validate_vllm_quantization_config(config: VllmConfig) -> None:
             "policy.generation.vllm_cfg.refit_prequantize is not supported with "
             "refit_with_reload_api; prequantized refit uses receiver scale names "
             "that are not accepted by vLLM's native reload path."
+        )
+
+
+def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
+    """Reject async-actor options that would otherwise be silently ignored."""
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    if vllm_cfg.get("flat_logprobs") and not (
+        vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.flat_logprobs only applies to requests "
+            "through the async engine's HTTP server; it requires async_engine: true "
+            "and expose_http_server: true."
+        )
+    budget_ms = vllm_cfg.get("output_loop_yield_budget_ms")
+    if budget_ms is None:
+        return
+    if not vllm_cfg.get("async_engine"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.output_loop_yield_budget_ms requires "
+            "async_engine: true."
+        )
+    if budget_ms <= 0:
+        raise ValueError(
+            "policy.generation.vllm_cfg.output_loop_yield_budget_ms must be positive "
+            f"(or null to disable), got {budget_ms}."
         )
 
 

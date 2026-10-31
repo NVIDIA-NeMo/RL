@@ -112,7 +112,7 @@ STAGING_FIELDS = [
     "schema_version",
     "digest_version",
     "extras_digest_version",
-    "rollout_id_utf8",
+    "capture_key_utf8",
     "model_call_id_utf8",
     "parent_call_id_utf8",
     "parent_call_id_present",
@@ -499,7 +499,7 @@ class TQTokenSink:
                 "extras_digest_version": torch.tensor(
                     [record.extras_digest_version], dtype=torch.int64
                 ),
-                "rollout_id_utf8": _bytes_tensor(record.rollout_id.encode("utf-8")),
+                "capture_key_utf8": _bytes_tensor(record.capture_key.encode("utf-8")),
                 "model_call_id_utf8": _bytes_tensor(
                     record.model_call_id.encode("utf-8")
                 ),
@@ -596,7 +596,7 @@ class TQTokenSink:
                 field_dict.update(media_columns)
             tags = [
                 {
-                    "rollout_id": record.rollout_id,
+                    "capture_key": record.capture_key,
                     "model_call_id": record.model_call_id,
                     "parent_call_id": record.parent_call_id,
                     "prev_len": record.prev_len,
@@ -1092,7 +1092,7 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
         schema_version=int(_row_leaf(row, "schema_version")[0].item()),
         digest_version=int(_row_leaf(row, "digest_version")[0].item()),
         extras_digest_version=int(_row_leaf(row, "extras_digest_version")[0].item()),
-        rollout_id=_row_text(row, "rollout_id_utf8"),
+        capture_key=_row_text(row, "capture_key_utf8"),
         model_call_id=_row_text(row, "model_call_id_utf8"),
         parent_call_id=parent_call_id,
         mode=mode,

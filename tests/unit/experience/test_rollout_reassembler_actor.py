@@ -48,7 +48,7 @@ def _request() -> ReassemblyRequest:
         canonical_sample_ids=("group_g0",),
         receipts=(
             {
-                "rollout_id": "group_g0",
+                "capture_key": "group_g0",
                 "manifest": [
                     {
                         "call_id": "call",
@@ -109,6 +109,8 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         prompt_idx=17,
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
+        logical_selections=None,
+        execution_row_multiple=1,
         reward_checks=None,
         reward_log_contexts=None,
     )
@@ -192,6 +194,9 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        "logical_selections",
+        "execution_row_multiple",
+        "resolved_agent_name",
         "reward_checks",
         "reward_log_contexts",
     }

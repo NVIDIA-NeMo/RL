@@ -6,7 +6,9 @@
 #
 # Covered: the SingleController (SC) path saves and restores a full
 # checkpoint across a training restart: model weights/optimizer + training
-# state, dataloader position, and the replay buffer. Two runs share one
+# state, dataloader position, and the replay buffer. Deferred finalize
+# (async_rl.defer_async_checkpoint_finalize) is on, so saves are published at a
+# later step boundary, the next save, or exit. Two runs share one
 # checkpoint_dir and one config (same max_num_steps, so Megatron train_iters
 # stays consistent across the restart):
 #   Run 1 sets a tiny checkpointing.checkpoint_must_save_by so the timeout
@@ -60,6 +62,7 @@ TRAIN_CMD=(
     async_rl.min_groups_for_streaming_train=2
     async_rl.max_inflight_prompts=4
     async_rl.max_buffered_rollouts=4
+    async_rl.defer_async_checkpoint_finalize=true
 )
 
 cd $PROJECT_ROOT
@@ -134,6 +137,13 @@ if ! grep -qF "replay group(s) from checkpoint" $EXP_DIR/run2.log; then
     exit 1
 fi
 echo "✅ dataloader and replay buffer restored from checkpoint"
+
+# With deferred finalize, step_2 is published at a later step boundary
+# (keep_top_k: 3 keeps steps 1, 2 and 4).
+if [[ ! -d "$CKPT_DIR/step_2" ]]; then
+    echo "FAIL: run2 did not publish the deferred step_2 checkpoint"
+    exit 1
+fi
 
 STEP4=$CKPT_DIR/step_4
 if [[ ! -e "$STEP4/training_info.json" ]]; then

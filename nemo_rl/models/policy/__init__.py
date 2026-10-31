@@ -357,6 +357,20 @@ class Fp4Config(BaseModel, extra="forbid"):
     fp4_param: bool = False
 
 
+def provider_override_allowed(megatron_cfg: Any, key: str) -> bool:
+    """Whether a megatron_cfg key may be applied onto the model provider.
+
+    Student configs carry no allowlist and every key applies (status quo).
+    Teacher configs allow only explicit teacher overrides plus ``mtp_num_layers``,
+    which defaults to zero because scoring does not use MTP outputs. Other
+    architecture settings come from the teacher checkpoint; inherited student
+    keys must not reach its provider (for example, VLM tower keys on a text
+    teacher).
+    """
+    allowlist = megatron_cfg.get("_provider_override_allowlist")
+    return allowlist is None or key in allowlist
+
+
 # Type exists to be lax if not specified
 class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
@@ -387,6 +401,19 @@ class MegatronConfig(TypedDict):
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
+    # Megatron-style manual garbage collection. An automatic full Python GC lands on
+    # whichever rank crosses its threshold, and every other rank then waits for it
+    # in the next collective. When True, the Megatron policy workers (and, under
+    # value.megatron_cfg, the PPO Megatron value workers) disable automatic GC
+    # (from the end of worker setup) and collect on every rank after every
+    # manual_gc_interval-th optimizer step, on both the monolithic train() and
+    # split-step (finish_train_step) paths. Not supported on distillation teachers,
+    # which never train: the student's value is reset for them. Recommended: false;
+    # see docs/design-docs/training-backends.md for when to enable it.
+    manual_gc: NotRequired[bool]
+    # Optimizer steps between manual collections; must be a positive integer when
+    # manual_gc is True (validated at worker setup).
+    manual_gc_interval: NotRequired[int]
     # When True, offload_after_refit skips rerunning the full offload_before_refit
     # pass (grad-buffer moves, cache clears, and a second gc.collect/empty_cache)
     # and only re-offloads the optimizer with a single allocator cleanup.

@@ -11,6 +11,8 @@
 
 ## 📣 News
 
+* [10/22/2026] MiniMax-M3.1-Flash BF16 GRPO training is supported on the [minimax-m3-1-flash branch](https://github.com/NVIDIA-NeMo/RL/tree/minimax-m3-1-flash) with the AutoModel backend and vLLM generation! See the [model guide](https://github.com/NVIDIA-NeMo/RL/blob/minimax-m3-1-flash/docs/guides/models/minimax/minimax-m3-1-flash.md) for setup, the validated recipe, and known limitations.
+* [10/22/2026] Nemotron 3.5 Super VL (120B-A12B) is now supported in NeMo RL with text DAPO, image GRPO, and NeMo Gym agentic training on the Automodel backend with vLLM generation! See the [model guide](docs/guides/models/nemotron/nemotron-3.5-super-vl.md) for recipes and training results.
 * [10/16/2026] Beam 1.0 Day 0 support by NeMo RL with SFT and RL recipes! See the [beam-support branch](https://github.com/NVIDIA-NeMo/RL/tree/beam-support) and [doc](https://github.com/NVIDIA-NeMo/RL/blob/beam-support/docs/guides/models/reflection/beam.md).
 * [10/07/2026] We shared the [NeMo-DCR preprint](https://huggingface.co/papers/2610.08430), which presents the delta-compressed refit method used in NeMo RL for fast, bitwise-exact sparse weight synchronization between training and rollout clusters.
 * [09/21/2026] DeepSeek V4.1 Flash RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/deepseek-v4.1-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/deepseek-v4.1-support/docs/guides/models/deepseek/deepseek-v4.1-flash.md).
@@ -108,7 +110,7 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ## Features
 
-✅ _Available now_ | 🔜 _Coming in v0.7_
+✅ _Available now_ | 🔜 _Coming in a future release_
 
 - 🔜 **Improved Native Performance** - Improve training time for native PyTorch models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance.
@@ -314,7 +316,7 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 >   This ensures consistent environment usage across different shells and sessions. Example: `uv run python examples/run_grpo.py`
 > - Ensure your system has the appropriate CUDA drivers installed, and that your PyTorch version is compatible with both your CUDA setup and hardware.
 > - If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
-> - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+> - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `hf auth login` as well for Llama models.
 
 
 ## GRPO
@@ -396,7 +398,7 @@ This section outlines how to run GRPO for Qwen2.5-32B with a 16k sequence length
 NUM_ACTOR_NODES=32
 
 # Download Qwen before the job starts to avoid spending time downloading during the training loop
-HF_HOME=/path/to/hf_home huggingface-cli download Qwen/Qwen2.5-32B
+HF_HOME=/path/to/hf_home hf download Qwen/Qwen2.5-32B
 
 # Ensure HF_HOME is included in your MOUNTS
 HF_HOME=/path/to/hf_home \

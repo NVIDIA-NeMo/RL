@@ -51,6 +51,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
     Completion,
     PromptGroupRecord,
 )
@@ -1057,7 +1058,7 @@ def test_gate_off_keeps_the_mask_flag_in_the_per_agent_metrics():
 def _mask_gate_receipt_result():
     return {
         "message_log": [],
-        "receipt": {"rollout_id": "r0", "manifest": []},
+        "receipt": {"capture_key": "r0", "manifest": []},
         "rollout_id": "r0",
         "full_result": {
             "reward": 1.0,
@@ -1165,6 +1166,7 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     generation_index, completion = streamed[0]
     assert generation_index == 0
     assert completion.env_extras["ng_rollout_id"] == "r0"
+    assert completion.env_extras["agent_ref"] == {"name": "resolved-agent"}
     assert "mask_sample" not in completion.env_extras["instance_config"]
     context = completion.env_extras["ng_reward_log_context"]
     assert context.agent_name == "resolved-agent"
@@ -1240,13 +1242,20 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
     assert "agent/reward_score_raw/mean" not in metrics
 
 
-def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():
+@pytest.mark.parametrize("forest_training", [False, True])
+def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics(
+    forest_training,
+):
     def _receipt_completion(manifest, truncated):
+        manifest = [dict(entry, response_id=str(i)) for i, entry in enumerate(manifest)]
         return Completion(
             message_log=[],
             env_extras={
                 "reward": 0.5,
-                "ng_receipt": {"rollout_id": "r", "manifest": manifest},
+                "ng_receipt": {"capture_key": "r", "manifest": manifest},
+                "ng_logical_selection": SimpleNamespace(
+                    response_ids=tuple(str(i) for i in range(len(manifest)))
+                ),
             },
             truncated=truncated,
             reward=0.5,
@@ -1260,13 +1269,15 @@ def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():
         _receipt_completion([{"cum_len": 4, "delta_len": 4}], truncated=True),
     ]
 
-    metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
+    impl = _nemo_gym_impl(True)
+    impl._forest_training = forest_training
+    metrics = impl._compute_rollout_metrics(completions, "agent")
 
     assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
     assert metrics["agent/total_tokens_per_sample/histogram"] == [9, 4]
     assert metrics["agent/total_tokens_per_sample/mean"] == pytest.approx(6.5)
-    assert metrics["agent/gen_tokens_per_sample/histogram"] == [5, 4]
-    assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(4.5)
+    # Receipts cannot distinguish generated tokens from inputs; no proxy escapes.
+    assert not any("gen_tokens" in key for key in metrics)
 
 
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
@@ -1382,8 +1393,9 @@ def test_nemo_gym_build_inputs_stamps_logical_group_coordinates():
     impl._num_generations_per_prompt = 3
     input_sample = {"extra_env_info": {"responses_create_params": {}}}
 
-    rows = impl._build_inputs(input_sample)
+    rows = impl._build_inputs(input_sample, task_index=7)
 
+    assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in rows] == [7, 7, 7]
     assert len({row[NEMO_GYM_GROUP_ID_KEY] for row in rows}) == 1
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
@@ -1401,7 +1413,7 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
         }
     }
 
-    rows = impl._build_inputs(input_sample)
+    rows = impl._build_inputs(input_sample, task_index=8)
 
     assert [row[NEMO_GYM_GROUP_ID_KEY] for row in rows] == [
         "stable-group",
@@ -1409,6 +1421,85 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
     ]
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [2, 2]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
+
+
+@pytest.mark.parametrize("dataset_task_index", [None, 99])
+def test_nemo_gym_attempt_ids_are_fresh_and_resume_from_counter(
+    monkeypatch: pytest.MonkeyPatch, dataset_task_index: int | None
+) -> None:
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 3
+    sample = {
+        "extra_env_info": {
+            "responses_create_params": {},
+            NEMO_GYM_GROUP_ID_KEY: "stable-group",
+            NEMO_GYM_GROUP_ATTEMPT_KEY: 2,
+        }
+    }
+    if dataset_task_index is not None:
+        sample["extra_env_info"][NEMO_GYM_TASK_INDEX_KEY] = dataset_task_index
+    original = deepcopy(sample)
+    dispatched = []
+
+    async def fail_rollouts(rows: list[dict], *args: object, **kwargs: object) -> None:
+        dispatched.append(deepcopy(rows))
+        raise RuntimeError("simulated attempt failure")
+
+    monkeypatch.setattr(impl, "_run_rollouts", fail_rollouts)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="simulated attempt failure"):
+            asyncio.run(impl.run_rollout(sample))
+
+    assert impl.get_next_nemo_gym_task_index() == 2
+    assert [[row[NEMO_GYM_TASK_INDEX_KEY] for row in rows] for rows in dispatched] == [
+        [0, 0, 0],
+        [1, 1, 1],
+    ]
+
+    restored = _nemo_gym_impl(True)
+    restored._num_generations_per_prompt = 3
+    restored.set_next_nemo_gym_task_index(impl.get_next_nemo_gym_task_index())
+    monkeypatch.setattr(restored, "_run_rollouts", fail_rollouts)
+    with pytest.raises(RuntimeError, match="simulated attempt failure"):
+        asyncio.run(
+            restored.run_rollout(
+                sample, rollout_ids=["r0", "r1", "r2"], generation_indices=[1, 2]
+            )
+        )
+    assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in dispatched[-1]] == [2, 2]
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in dispatched[-1]] == [1, 2]
+    assert [row["_ng_rollout_id"] for row in dispatched[-1]] == ["r1", "r2"]
+    assert all(
+        row[NEMO_GYM_GROUP_ID_KEY] == "stable-group"
+        and row[NEMO_GYM_GROUP_ATTEMPT_KEY] == 2
+        for rows in dispatched
+        for row in rows
+    )
+    assert restored.get_next_nemo_gym_task_index() == 3
+    assert sample == original
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "1"])
+def test_nemo_gym_task_counter_rejects_invalid_restore(value: object) -> None:
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _nemo_gym_impl(True).set_next_nemo_gym_task_index(value)
+
+
+@pytest.mark.parametrize("use_nemo_gym", [False, True])
+def test_rollout_manager_task_counter_only_applies_to_gym(use_nemo_gym: bool) -> None:
+    manager = RolloutManager(
+        tokenizer=None,
+        task_to_env={},
+        num_generations_per_prompt=1,
+        max_seq_len=1,
+        rollout_recovery_config=RolloutRecoveryConfig(),
+        policy_generation=object(),
+        generation_config={"stop_strings": None, "stop_token_ids": None, "top_k": None},
+        use_nemo_gym=use_nemo_gym,
+    )
+    assert manager.get_next_nemo_gym_task_index() == 0
+    manager.set_next_nemo_gym_task_index(42)
+    assert manager.get_next_nemo_gym_task_index() == (42 if use_nemo_gym else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1998,6 +2089,7 @@ def _receipt_record(
                 "reward": 0.5,
                 "ng_receipt": receipt,
                 "ng_rollout_id": rid,
+                "agent_ref": {"name": "resolved-agent"},
                 **({"instance_config": cfg} if cfg is not None else {}),
                 **fields,
             },
@@ -2030,6 +2122,8 @@ def _make_capture_manager(
     recovery_config: RolloutRecoveryConfig | None = None,
 ):
     mgr = object.__new__(RolloutManager)
+    mgr._forest_training = False
+    mgr._execution_row_multiple = 1
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
     mgr._rollout_recovery_config = recovery_config or RolloutRecoveryConfig()
@@ -2084,7 +2178,7 @@ def _make_capture_manager(
             )
             receipts = [
                 {
-                    "rollout_id": rollout_id,
+                    "capture_key": rollout_id,
                     "manifest": [{"staging_key": f"{rollout_id}/call"}],
                 }
                 for rollout_id in selected_ids
@@ -2106,6 +2200,46 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+    def test_resolved_route_survives_all_sealed_restore(self, granularity):
+        prompt = {
+            "prompt": "p",
+            "idx": 9,
+            "extra_env_info": {"task_source": "source-not-agent-name"},
+        }
+        first = _make_capture_manager(
+            _FakeCaptureBuffer(),
+            recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+        )
+        request = _run(first.generate_for_finalization(prompt))
+        assert request.resolved_agent_name == "resolved-agent"
+        assert "agent_ref" not in prompt["extra_env_info"]
+
+        async def unexpected_rollout(_sample):
+            pytest.fail("all-sealed recovery must not regenerate to resolve routing")
+
+        restored = _make_capture_manager(
+            _FakeCaptureBuffer(), on_run=unexpected_rollout
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.load_state_dict(
+                cut, first.recovery_ledger.state_dict()
+            ),
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
+        )
+        recovered = _run(
+            restored.generate_for_finalization(
+                prompt, lineage_group_id=request.group_id
+            )
+        )
+        assert recovered.resolved_agent_name == "resolved-agent"
+        assert recovered.receipts == request.receipts
+        assert restored._impl.seen_generation_indices is None
+
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(
@@ -2157,7 +2291,7 @@ class TestGenerateForFinalizationFlow:
         assert request.prompt_idx == 0
         assert request.rollout_ids == tuple(attempt_ids)
         assert request.canonical_sample_ids == tuple(canonical_ids)
-        assert [r["rollout_id"] for r in request.receipts] == attempt_ids
+        assert [r["capture_key"] for r in request.receipts] == attempt_ids
         assert request.rewards == (0.5, 0.5)
         assert request.mask_sample == (False, False)
         assert request.loss_multiplier == 0.25
@@ -2198,7 +2332,7 @@ class TestGenerateForFinalizationFlow:
                 generation_index = generation_indices[0]
                 rollout_id = rollout_ids[generation_index]
                 receipt = {
-                    "rollout_id": rollout_id,
+                    "capture_key": rollout_id,
                     "manifest": [{"staging_key": f"{rollout_id}/call"}],
                 }
                 completion = _receipt_record([rollout_id], [receipt]).completions[0]
@@ -2314,7 +2448,7 @@ class TestGenerateForFinalizationFlow:
                 for generation_index in indices:
                     rollout_id = rollout_ids[generation_index]
                     receipt = {
-                        "rollout_id": rollout_id,
+                        "capture_key": rollout_id,
                         "manifest": [{"staging_key": f"{rollout_id}/call"}],
                     }
                     completion = _receipt_record([rollout_id], [receipt]).completions[0]
@@ -2409,7 +2543,7 @@ def test_capture_completion_preserves_checks_and_raw_reward_until_finalization()
     checks = RewardChecks(False, True, True)
     result = {
         "rollout_id": "r",
-        "receipt": {"rollout_id": "r", "manifest": []},
+        "receipt": {"capture_key": "r", "manifest": []},
         "reward_checks": checks,
         "message_log": [],
         "input_message_log": [],
@@ -2459,3 +2593,19 @@ def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
         tuple(restored.finalization_inputs(request.group_id)[6])
         == request.reward_log_contexts
     )
+
+
+@pytest.mark.parametrize("honor_mask", [False, True])
+def test_receipt_raw_metrics_preserve_mask_but_defer_reward(honor_mask: bool) -> None:
+    impl = _nemo_gym_impl(honor_mask)
+    result = _mask_gate_receipt_result()
+    completions, _ = impl._results_to_completions([result])
+    metrics = impl._compute_rollout_metrics(
+        completions, "agent", full_results=[result["full_result"]]
+    )
+    assert metrics["agent/mask_sample/mean"] == 1.0
+    assert not any("reward" in key for key in metrics)
+    assert not any(
+        "ng_receipt" in key or "ng_logical_selection" in key for key in metrics
+    )
+    assert ("mask_sample" in completions[0].env_extras) is honor_mask

@@ -48,6 +48,7 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
     StagingSource as TokenSourceProtocol,
 )
 
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     MEDIA_METADATA_FIELDS,
     MEDIA_STAGING_FIELDS,
@@ -67,6 +68,7 @@ from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
     MINF_CAPTURE_PARAMS_FIELD,
     TQMegatronPromptPreparer,
     TQMegatronTokenStager,
+    _delta_align_minf_routing_indices,
     _new_media_tensors,
     slice_media_tensors,
 )
@@ -183,13 +185,19 @@ def test_media_rows_round_trip_in_a_single_put(tq_client, media_partition):
     # TQ keeps one dtype per field across live rows (a mismatch is swallowed by
     # the controller and drops the row's shape metadata), so the text call's
     # sentinels must share each column's dtype with the real rows.
-    raw = tq_client.get_samples(
-        partition_id=media_partition,
-        sample_ids=[record.staging_key for record in records],
-        select_fields=list(MEDIA_TENSOR_COLUMNS.values()),
-    )
+    # Read rows separately: real patches [N, 3*P*P] and empty [1, 1]
+    # sentinels cannot share one jagged tensor. Production fetch_media also
+    # excludes empty rows before batching real media.
+    raw_rows = [
+        tq_client.get_samples(
+            partition_id=media_partition,
+            sample_ids=[record.staging_key],
+            select_fields=list(MEDIA_TENSOR_COLUMNS.values()),
+        )
+        for record in records
+    ]
     for column in MEDIA_TENSOR_COLUMNS.values():
-        dtypes = {raw[column][i].dtype for i in range(3)}
+        dtypes = {row[column].dtype for row in raw_rows}
         assert len(dtypes) == 1, (column, dtypes)
     # One put per call, each carrying token, flag, and tensor columns.
     assert len(client.puts) == 3
@@ -373,7 +381,7 @@ def test_tq_sink_source_passes_gym_golden_vectors():
 def staging_partition(tq_client):
     tq_client.register_partition(
         partition_id=STAGING_PARTITION,
-        fields=list(STAGING_FIELDS),
+        fields=list(STAGING_FIELDS) + [ROUTED_EXPERTS_FIELD],
         num_samples=64,
         consumer_tasks=["finalize"],
     )
@@ -584,7 +592,7 @@ def _stage_root(
 ):
     stager = TQMegatronTokenStager(_megatron_sink(tq_client, partition, media=media))
     root = nemo_gym.CaptureAdmission(
-        rollout_id=rollout_id, model_call_id=model_call_id, mode="text"
+        capture_key=rollout_id, model_call_id=model_call_id, mode="text"
     )
     result = stager.stage(
         "minf-response-1",
@@ -677,7 +685,7 @@ def test_megatron_stager_passes_media_tensors_as_attachments(media_tensors):
     sink.media_pixel_dtype = torch.bfloat16
     stager = TQMegatronTokenStager(sink)
     capture = MagicMock()
-    capture.complete_call_from_response.return_value = MagicMock(
+    capture.complete_call.return_value = MagicMock(
         model_dump=lambda mode: {"disposition": "staged"}
     )
     stager._capture = capture
@@ -686,17 +694,13 @@ def test_megatron_stager_passes_media_tensors_as_attachments(media_tensors):
         if media_tensors is None
         else _minf_payload(multimodal=True, media_tensors=media_tensors)
     )
-    admission = nemo_gym.CaptureAdmission(
-        rollout_id="r0", model_call_id="c1", mode="text"
-    ).model_dump(mode="json")
     result = stager._stage_admitted(
         payload,
-        capture_payload=admission,
-        finished_metadata=SimpleNamespace(policy_epoch=[(0, 0)]),
+        call=SimpleNamespace(admission=SimpleNamespace(prev_len=0)),
         minf_params={MEDIA_PREV_COUNT_KEY: 0, MEDIA_PREV_SIZES_KEY: []},
     )
     assert result.response_metadata == {"ng_commit_coords": {"disposition": "staged"}}
-    attachments = capture.complete_call_from_response.call_args.kwargs["attachments"]
+    attachments = capture.complete_call.call_args.kwargs["attachments"]
     if not media_tensors:
         assert attachments is None
         return
@@ -726,12 +730,12 @@ def _example_admission(record, parent_coords=None):
     """The Gym admission for a fixture record; a child chains off its parent's coords."""
     if parent_coords is None:
         return nemo_gym.CaptureAdmission(
-            rollout_id=record.rollout_id,
+            capture_key=record.capture_key,
             model_call_id=record.model_call_id,
             mode="text",
         )
     return nemo_gym.CaptureAdmission(
-        rollout_id=record.rollout_id,
+        capture_key=record.capture_key,
         model_call_id=record.model_call_id,
         parent_call_id=record.parent_call_id,
         prev_len=record.prev_len,
@@ -919,6 +923,252 @@ def test_backend_capture_glue_reproduces_the_gym_worked_example(
     ]
 
 
+def test_megatron_stager_writes_routed_experts_with_the_canonical_row(
+    tq_client, staging_partition
+):
+    """MInf routes ride the staged row as a delta-aligned ``routed_experts`` extra.
+
+    The worked-example test above pins the token columns for both backends; this
+    pins the Megatron-only route column, including the all ``-1`` terminal row
+    MInf never records (routes exist for every token but the last).
+    """
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition)
+    )
+    payload = SimpleNamespace(
+        prompt_token_ids=[10, 11],
+        generated_token_ids=[12, 13],
+        generated_log_probs=[-0.25, -0.5],
+        routing_indices=torch.tensor(
+            [
+                [[1, 2], [3, 4]],
+                [[5, 6], [7, 8]],
+                [[9, 10], [11, 12]],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    admission = nemo_gym.CaptureAdmission(
+        capture_key="minf-r0",
+        model_call_id="c1",
+        mode="text",
+    )
+
+    result = stager.stage(
+        "minf-response-1",
+        payload,
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        offload_params={"ng_capture": admission.model_dump(mode="json")},
+    )
+
+    assert result is not None
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["staging_key"] == "minf-r0/c1"
+    assert coords["weight_version"] == 7
+    assert coords["disposition"] == "staged"
+    [snapshot] = TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
+        ["minf-r0/c1"]
+    )
+    assert snapshot.token_ids_delta == [10, 11, 12, 13]
+    assert snapshot.token_mask_delta == [0.0, 0.0, 1.0, 1.0]
+    assert snapshot.generation_log_probs_delta == [0.0, 0.0, -0.25, -0.5]
+    [fetched] = TQTokenSource(
+        tq_client, staging_partition=staging_partition
+    ).fetch_for_finalization(["minf-r0/c1"], include_route_fragments=True)
+    assert fetched.routed_len == 4
+    assert fetched.fragment is not None
+    assert fetched.fragment.routes.tolist() == [
+        [[1, 2], [3, 4]],
+        [[5, 6], [7, 8]],
+        [[9, 10], [11, 12]],
+        [[-1, -1], [-1, -1]],
+    ]
+    [without_routes] = TQTokenSource(
+        tq_client, staging_partition=staging_partition
+    ).fetch_for_finalization(["minf-r0/c1"])
+    # routed_len is transport metadata carried even when the route payload is
+    # left in TQ (deferred finalization); only the fragment is omitted.
+    assert without_routes.routed_len == 4
+    assert without_routes.fragment is None
+
+
+@pytest.mark.parametrize(
+    ("routes", "total_tokens", "prev_len", "match"),
+    [
+        pytest.param(
+            torch.zeros((2, 2), dtype=torch.int32),
+            3,
+            0,
+            r"shape \[tokens, layers, topk\]",
+            id="rank",
+        ),
+        pytest.param(
+            torch.zeros((1, 1, 2), dtype=torch.int32),
+            3,
+            0,
+            "one row for every non-final token",
+            id="row-count",
+        ),
+        pytest.param(
+            torch.zeros((2, 0, 2), dtype=torch.int32),
+            3,
+            0,
+            "dimensions must be positive",
+            id="zero-layers",
+        ),
+        pytest.param(
+            torch.zeros((2, 1, 0), dtype=torch.int32),
+            3,
+            0,
+            "dimensions must be positive",
+            id="zero-topk",
+        ),
+        pytest.param(
+            torch.zeros((2, 1, 2), dtype=torch.int32),
+            3,
+            4,
+            "prev_len must be in",
+            id="prev-len",
+        ),
+    ],
+)
+def test_delta_align_minf_routing_indices_rejects_malformed_routes(
+    routes, total_tokens, prev_len, match
+):
+    with pytest.raises(ValueError, match=match):
+        _delta_align_minf_routing_indices(
+            routes,
+            total_tokens=total_tokens,
+            prev_len=prev_len,
+        )
+
+
+def test_delta_align_minf_routing_indices_checks_model_route_dims():
+    routes = torch.zeros((3, 4, 2), dtype=torch.int32)
+
+    aligned = _delta_align_minf_routing_indices(
+        routes, total_tokens=4, prev_len=0, expected_route_dims=(4, 2)
+    )
+    assert tuple(aligned.shape) == (4, 4, 2)
+
+    # One pipeline stage's worth of layers instead of the whole model's.
+    with pytest.raises(ValueError, match=r"got \(4, 2\), expected \(8, 2\)"):
+        _delta_align_minf_routing_indices(
+            routes, total_tokens=4, prev_len=0, expected_route_dims=(8, 2)
+        )
+
+
+def test_megatron_stager_rejects_misaligned_routes(tq_client, staging_partition):
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition)
+    )
+    admission = nemo_gym.CaptureAdmission(
+        capture_key="minf-r0",
+        model_call_id="c1",
+        mode="text",
+    )
+
+    result = stager.stage(
+        "minf-response-1",
+        SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            generated_token_ids=[12],
+            generated_log_probs=[-0.25],
+            routing_indices=torch.tensor([[[1, 2]]], dtype=torch.int32),
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        offload_params={"ng_capture": admission.model_dump(mode="json")},
+    )
+
+    assert result is not None
+    assert (
+        result.response_metadata["ng_commit_coords"]["disposition"] == "capture_failed"
+    )
+
+
+def test_megatron_stager_delta_aligns_token_in_routes(tq_client, staging_partition):
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition),
+        require_routed_experts=True,
+    )
+    admission = nemo_gym.CaptureAdmission(
+        capture_key="minf-r0",
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=3,
+        mode="token_in",
+        required_prefix_token_ids=[10, 11, 12],
+        parent_chain_hash="00" * 32,
+    )
+    routes = torch.arange(5 * 2 * 2, dtype=torch.int32).reshape(5, 2, 2)
+
+    result = stager.stage(
+        "minf-response-2",
+        SimpleNamespace(
+            prompt_token_ids=[10, 11, 12, 13],
+            generated_token_ids=[14, 15],
+            generated_log_probs=[-0.25, -0.5],
+            routing_indices=routes,
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        offload_params={"ng_capture": admission.model_dump(mode="json")},
+    )
+
+    assert result is not None
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["disposition"] == "staged"
+    [fetched] = TQTokenSource(
+        tq_client, staging_partition=staging_partition
+    ).fetch_for_finalization(["minf-r0/c2"], include_route_fragments=True)
+    assert fetched.snapshot.token_ids_delta == [13, 14, 15]
+    # One leading boundary row: the parent's last token (12), routed only by
+    # this call's prefill.
+    assert fetched.routed_len == 4
+    assert fetched.fragment is not None
+    assert fetched.fragment.routes.tolist() == [
+        routes[2].tolist(),
+        routes[3].tolist(),
+        routes[4].tolist(),
+        [[-1, -1], [-1, -1]],
+    ]
+
+
+def test_megatron_stager_requires_routes_when_router_replay_is_enabled(
+    tq_client, staging_partition, caplog
+):
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition),
+        require_routed_experts=True,
+    )
+    admission = nemo_gym.CaptureAdmission(
+        capture_key="minf-r0",
+        model_call_id="c1",
+        mode="text",
+    )
+
+    with caplog.at_level(
+        "ERROR", logger="nemo_rl.models.generation.megatron.token_capture"
+    ):
+        result = stager.stage(
+            "minf-response-1",
+            SimpleNamespace(
+                prompt_token_ids=[10],
+                generated_token_ids=[11],
+                generated_log_probs=[-0.1],
+                routing_indices=None,
+            ),
+            finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+            offload_params={"ng_capture": admission.model_dump(mode="json")},
+        )
+
+    assert result is not None
+    assert (
+        result.response_metadata["ng_commit_coords"]["disposition"] == "capture_failed"
+    )
+    # Any exception inside stage() poisons the call identically; pin the cause.
+    assert "carries no routing_indices" in caplog.text
+
+
 def test_fetch_prefix_chains_counts_media_items_from_columns(
     tq_client, media_partition
 ):
@@ -945,7 +1195,7 @@ def test_fetch_prefix_chains_counts_media_items_from_columns(
     for call_id, media in (("c1", still), ("c2", None), ("c3", video)):
         call = capture.begin_call(
             nemo_gym.CaptureAdmission(
-                rollout_id="r0", model_call_id=call_id, mode="text"
+                capture_key="r0", model_call_id=call_id, mode="text"
             )
         )
         coords = capture.complete_call(
@@ -1054,7 +1304,7 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         }
 
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=prev_len,
@@ -1131,7 +1381,7 @@ def test_megatron_stager_rejects_a_resized_retained_image(tq_client, media_parti
         tq_client, media_partition, _minf_payload(multimodal=True), media=True
     )
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=7,
@@ -1198,7 +1448,7 @@ def test_megatron_prompt_preparer_rejects_inconsistent_media_prefix(
         tq_client, media_partition, _minf_payload(multimodal=True), media=True
     )
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=7,
@@ -1229,7 +1479,7 @@ def test_megatron_prompt_preparer_rejects_inconsistent_media_prefix(
 def test_megatron_prompt_preparer_rejects_malformed_eos_ids(eos):
     """Only an int or a non-empty list of ints is a usable EOS set."""
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=2,
@@ -1266,7 +1516,7 @@ def test_megatron_prompt_preparer_text_mode_drops_endpoint_media_count(
     a reported count the params pass through unchanged.
     """
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0", model_call_id="c1", mode="text"
+        capture_key="minf-r0", model_call_id="c1", mode="text"
     )
     prompt = [80, 99, 81, 13, 2, 20, 99, 21]
     offload_params = {
@@ -1300,7 +1550,7 @@ def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
     """
     stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c1",
         mode="text",
     )
@@ -1412,7 +1662,7 @@ def test_megatron_stager_poisons_malformed_payloads_with_capture_failed(
             _new_media_tensors(payload, minf_params)
     stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c1",
         mode="text",
     )
@@ -1451,7 +1701,7 @@ def test_megatron_stager_declines_ineligible_requests(
 ):
     stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c1",
         mode="text",
     )
@@ -1566,7 +1816,7 @@ def test_megatron_preparer_resolves_chains_through_the_shared_cache():
     assert isinstance(preparer._chain_prefix, ChainPrefixCache)
 
     child = nemo_gym.CaptureAdmission(
-        rollout_id="r0",
+        capture_key="r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=2,
@@ -1575,7 +1825,7 @@ def test_megatron_preparer_resolves_chains_through_the_shared_cache():
         parent_chain_hash="a" * 64,
     )
     grandchild = nemo_gym.CaptureAdmission(
-        rollout_id="r0",
+        capture_key="r0",
         model_call_id="c3",
         parent_call_id="c2",
         prev_len=4,
