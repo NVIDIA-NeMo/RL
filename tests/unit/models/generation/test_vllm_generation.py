@@ -1133,6 +1133,7 @@ def _setup_fake_vllm_chat_handler(
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
     worker._http_engine_client = worker.llm
     worker._capture_calls = {}
+    worker._capture_top_logprobs = 0
     worker.token_capture = None
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
