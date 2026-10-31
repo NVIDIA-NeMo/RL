@@ -43,7 +43,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     LEGACY_REPLAY_BUFFER_FILENAME,
     REPLACEMENT_RESERVE_FILENAME,
     REPLAY_BUFFER_METADATA_FILENAME,
-    DataPlaneCheckpointMetadata,
     DataPlaneMutationCut,
     TQReplayGroupMetadata,
     validate_forest_checkpoint_metadata,
@@ -54,6 +53,7 @@ from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     validate_rollout_recovery_inventory,
 )
 from nemo_rl.algorithms.rollout_checkpointing.state import (
+    ResumeSource,
     RolloutParts,
     _UsesRolloutParts,
 )
@@ -167,10 +167,7 @@ class RolloutRestorer(_UsesRolloutParts):
         *,
         algo_cfg: Any,
         buffer_capacity: asyncio.Semaphore,
-        last_checkpoint_path: Optional[str],
-        restored_from_rollout_snapshot: bool,
-        data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata],
-        rollout_checkpoint_load_metrics: Optional[dict[str, float]],
+        resume: ResumeSource,
     ) -> None:
         """Store the parts restore reads and rebuilds.
 
@@ -179,19 +176,12 @@ class RolloutRestorer(_UsesRolloutParts):
             algo_cfg: The algorithm config; restore reads its prompt-group shape.
             buffer_capacity: Replay-capacity permits; restore takes one per
                 restored group.
-            last_checkpoint_path: The checkpoint this run resumed from, if any.
-            restored_from_rollout_snapshot: Whether it is a rollout snapshot.
-            data_plane_checkpoint_metadata: Its native TQ checkpoint metadata.
-            rollout_checkpoint_load_metrics: Setup's load timings, logged with
-                the restore timings.
+            resume: What setup restored from, which restore continues.
         """
         super().__init__(parts)
         self._algo_cfg = algo_cfg
         self._buffer_capacity = buffer_capacity
-        self._last_checkpoint_path = last_checkpoint_path
-        self._restored_from_rollout_snapshot = restored_from_rollout_snapshot
-        self._data_plane_checkpoint_metadata = data_plane_checkpoint_metadata
-        self._rollout_checkpoint_load_metrics = rollout_checkpoint_load_metrics
+        self._resume = resume
         # Restore fills these: replay groups it discarded and queued for fresh
         # generation, and whether only ledger-recorded dispatch can launch them.
         self._groups_to_regenerate: list[TQReplayGroupMetadata] = []
@@ -234,9 +224,9 @@ class RolloutRestorer(_UsesRolloutParts):
         restored_replay_groups: int,
     ) -> None:
         """Log rollout restore phases after the controller is ready to dispatch."""
-        if self._rollout_checkpoint_load_metrics is None:
+        if self._resume.load_metrics is None:
             return
-        load_metrics = dict(self._rollout_checkpoint_load_metrics)
+        load_metrics = dict(self._resume.load_metrics)
         load_metrics["replay_metadata_load_seconds"] = replay_metadata_load_seconds
         load_metrics["recovery_prepare_seconds"] = recovery_prepare_seconds
         # At this point, load_metrics contains restore-phase timers only. Sum by
@@ -258,9 +248,9 @@ class RolloutRestorer(_UsesRolloutParts):
 
     def _validate_forest_checkpoint_metadata(self) -> None:
         """Validate checkpoint row semantics before replay or custody changes."""
-        if self._data_plane_checkpoint_metadata is not None:
+        if self._resume.data_plane_metadata is not None:
             validate_forest_checkpoint_metadata(
-                self._data_plane_checkpoint_metadata,
+                self._resume.data_plane_metadata,
                 forest_training=self._master_config.token_capture.forest_training,
                 execution_row_multiple=(
                     self._rollout_manager.execution_row_multiple
@@ -276,12 +266,10 @@ class RolloutRestorer(_UsesRolloutParts):
         buffered-group restoration. The native snapshot and replay metadata file
         must both be present and agree on their manifest and group count.
         """
-        if self._last_checkpoint_path is None:
+        if self._resume.path is None:
             return 0
         self._validate_forest_checkpoint_metadata()
-        metadata_path = os.path.join(
-            self._last_checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME
-        )
+        metadata_path = os.path.join(self._resume.path, REPLAY_BUFFER_METADATA_FILENAME)
         if (
             os.path.exists(metadata_path)
             and not self._sampler.supports_buffer_checkpoint
@@ -294,9 +282,7 @@ class RolloutRestorer(_UsesRolloutParts):
         if not self._sampler.supports_buffer_checkpoint:
             return 0
         if not os.path.exists(metadata_path):
-            legacy_path = os.path.join(
-                self._last_checkpoint_path, LEGACY_REPLAY_BUFFER_FILENAME
-            )
+            legacy_path = os.path.join(self._resume.path, LEGACY_REPLAY_BUFFER_FILENAME)
             if os.path.exists(legacy_path):
                 raise RuntimeError(
                     "Checkpoint contains legacy replay_buffer.pt state, which "
@@ -316,19 +302,19 @@ class RolloutRestorer(_UsesRolloutParts):
         buffer_state = await asyncio.to_thread(
             torch.load, metadata_path, weights_only=False
         )
-        if self._data_plane_checkpoint_metadata is None:
+        if self._resume.data_plane_metadata is None:
             raise RuntimeError(
                 "Found metadata-only replay checkpoint, but the matching "
                 "native TQ checkpoint was not restored during setup"
             )
-        expected_manifest_digest_value = self._data_plane_checkpoint_metadata.get(
+        expected_manifest_digest_value = self._resume.data_plane_metadata.get(
             "replay_manifest_digest"
         )
         if not isinstance(expected_manifest_digest_value, str):
             raise ValueError(
                 "Restored TQ checkpoint metadata is missing a replay manifest digest"
             )
-        expected_group_count = self._data_plane_checkpoint_metadata.get(
+        expected_group_count = self._resume.data_plane_metadata.get(
             "replay_group_count"
         )
         groups = buffer_state.get("groups")
@@ -387,14 +373,14 @@ class RolloutRestorer(_UsesRolloutParts):
         restored_replay_groups: int,
     ) -> None:
         """Restore unfinished ownership for prioritized rollout-pump redispatch."""
-        if self._last_checkpoint_path is None:
+        if self._resume.path is None:
             return
         self._validate_forest_checkpoint_metadata()
         recovery_path = Path(
-            self._last_checkpoint_path,
+            self._resume.path,
             ROLLOUT_RECOVERY_STATE_FILENAME,
         )
-        metadata = self._data_plane_checkpoint_metadata or {}
+        metadata = self._resume.data_plane_metadata or {}
         expected_payload_sha256 = metadata.get("rollout_recovery_payload_sha256")
         if expected_payload_sha256 is None:
             if recovery_path.is_file():
@@ -425,7 +411,7 @@ class RolloutRestorer(_UsesRolloutParts):
             # The environment stays restored until the rest of this restore
             # succeeds; on any failure it drops what it restored before it reopens.
             async with contextlib.AsyncExitStack() as environment_restore:
-                if turn_groups and not self._restored_from_rollout_snapshot:
+                if turn_groups and not self._resume.from_rollout_snapshot:
                     # A trainer checkpoint never holds environment state; with no
                     # later rollout snapshot, its unfinished turns start over below.
                     print(
@@ -436,9 +422,7 @@ class RolloutRestorer(_UsesRolloutParts):
                     )
                 elif turn_groups:
                     restored = await environment_restore.enter_async_context(
-                        self._environment_checkpoint.restored(
-                            Path(self._last_checkpoint_path)
-                        )
+                        self._environment_checkpoint.restored(Path(self._resume.path))
                     )
 
                 self._rollout_runtime.batch_shortfall = parsed_state.batch_shortfall
@@ -795,14 +779,12 @@ class RolloutRestorer(_UsesRolloutParts):
         since switched to ``on_dropped_prompt="shrink"``, where the pool is never drawn
         on but is still drained back into training at the end of the dataloader.
         """
-        if self._last_checkpoint_path is None:
+        if self._resume.path is None:
             return
-        reserve_path = os.path.join(
-            self._last_checkpoint_path, REPLACEMENT_RESERVE_FILENAME
-        )
+        reserve_path = os.path.join(self._resume.path, REPLACEMENT_RESERVE_FILENAME)
         # New checkpoints write even an empty reserve; legacy absence remains valid.
         if not path_exists(reserve_path):
-            if (self._data_plane_checkpoint_metadata or {}).get(
+            if (self._resume.data_plane_metadata or {}).get(
                 "rollout_recovery_schema_version", 0
             ) >= 5:
                 raise FileNotFoundError(f"checkpoint is missing {reserve_path}")
