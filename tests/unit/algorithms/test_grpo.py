@@ -4408,7 +4408,7 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
             "vllm_metrics_logger_interval": 1.0,
             "env_vars": {},
         },
-        "vllm_kwargs": {},
+        "vllm_kwargs": {"hf_overrides": {"max_position_embeddings": 8192}},
         "colocated": {
             "enabled": True,
             "resources": {"gpus_per_node": None, "num_nodes": None},
@@ -4445,10 +4445,11 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
         )
 
     mock_logger.assert_not_called()
-    assert (
-        master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"]
-        == (master_config.policy["hf_config_overrides"])
-    )
+    # Policy overrides are applied and generation-only keys survive (#3728).
+    assert master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"] == {
+        "max_position_embeddings": 8192,
+        "rope_theta": 1_000_000.0,
+    }
 
     del master_config.policy["generation"]["vllm_kwargs"]
     del master_config.policy["hf_config_overrides"]
