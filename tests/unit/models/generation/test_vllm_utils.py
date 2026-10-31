@@ -38,6 +38,7 @@ from nemo_rl.models.generation.vllm.utils import (
     encode_counter_key,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
+    off_policy_sampling_error,
     pad_and_align_routed_expert_indices,
     remap_multimodal_placeholders,
 )
@@ -1451,3 +1452,29 @@ def test_remap_multimodal_placeholders_rebuilds_real_vllm_placeholder_range():
     assert isinstance(moved, PlaceholderRange)
     assert (moved.offset, moved.length) == (3, 3)
     assert moved.is_embed is is_embed
+
+
+@pytest.mark.parametrize(
+    ("temperature", "top_p", "top_k", "error"),
+    [
+        (1.0, 1.0, None, None),  # train profile
+        (0.0, 0.9, -1, None),  # validation profile
+        (0.7, 1.0, None, "matches neither"),
+        (1.0, None, None, "top_p must be set explicitly"),
+        (1.0, 1.0, 5, "Top k sampling parameter"),
+    ],
+)
+def test_off_policy_sampling_error(temperature, top_p, top_k, error) -> None:
+    generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "val_temperature": 0.0,
+        "val_top_p": 0.9,
+    }
+    message = off_policy_sampling_error(
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        generation_config=generation_config,
+    )
+    assert (message is None) if error is None else (error in message)

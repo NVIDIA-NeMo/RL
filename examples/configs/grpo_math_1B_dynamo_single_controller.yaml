@@ -1,73 +1,44 @@
-# SingleController variant with the Ray-managed Dynamo vLLM backend.
+# grpo_math_1B_megatron_single_controller.yaml served through Dynamo.
+# `policy.generation.dynamo: true` is the whole switch: the same vLLM workers
+# register with a managed dynamo.frontend, and rollouts go through its KV-aware
+# router. Every other vLLM setting keeps its meaning; Dynamo implies
+# vllm_cfg.async_engine and needs non-colocated generation.
 #
-# Rollouts follow the native-backend path: the SingleController sends each turn
-# to the Dynamo frontend over HTTP, builds the rollout record from the response,
-# and commits it to the TransferQueue data plane. Before every weight update the
-# SingleController drains and pauses the Dynamo workers (running requests
-# finish on the old weights; queued and new requests wait and run on the new
-# weights), then resumes them afterwards.
+# dynamo_cfg is optional. The values below are its defaults
+# (nemo_rl/models/generation/dynamo/config.py).
 defaults: grpo_math_1B_megatron_single_controller.yaml
 
-async_rl:
-  generation_fleet_health:
-    # Dynamo workers cannot abort their refit collective, so no refit deadline.
-    refit_timeout_s: null
-
 policy:
-  # Training uses the Megatron backend inherited from
-  # grpo_math_1B_megatron_single_controller.yaml; the SingleController's split
-  # training API is implemented by the Megatron policy worker.
   generation:
-    backend: dynamo
+    dynamo: true
     dynamo_cfg:
-      engine: vllm
+      # Bounds etcd/NATS/frontend start-up and every engine's registration.
       startup_timeout_s: 600
-      request_timeout_s: 900
-      # Bounds the pre-refit drain, which waits for running requests to finish,
-      # so it must be at least request_timeout_s.
-      control_timeout_s: 900
-      metrics_include_prefixes: null
-      metrics_exclude_prefixes: null
+      # Deadline for one rollout through the frontend. null waits as long as
+      # generation takes, as native generate_async does; on the SingleController,
+      # async_rl.rollout_failure.native.generation_timeout_s bounds both paths.
+      # NeMo-Gym's own calls keep Gym's timeouts.
+      request_timeout_s: null
       worker_args:
+        # Dynamo's built-in parser names. null follows the native server's
+        # vllm_cfg.http_server_serving_chat_kwargs (tool_parser, reasoning_parser).
         tool_call_parser: null
         reasoning_parser: null
-        exclude_tools_when_tool_choice_none: true
+        exclude_tools_when_tool_choice_none: false
         enable_structural_tag: false
         structural_tag_scope: auto
         structural_tag_schema: auto
+        # A chat template that replaces the model's own. null follows
+        # vllm_cfg.http_server_serving_chat_kwargs.chat_template.
         custom_jinja_template: null
         endpoint_types: [chat, completions]
-        extra_cli_args: []
       frontend_args:
-        tokenizer: default
-        tokenizer_cache: false
-        tokenizer_cache_bytes: 52428800
+        # kv: route each request to the engine holding most of its prefix.
         router_mode: kv
+        # Keep a NeMo-Gym token-capture rollout on one engine while it idles up
+        # to this many seconds (null disables it).
+        session_affinity_ttl_secs: 300
         extra_cli_args: []
-    vllm_cfg:
-      async_engine: true
-      tensor_parallel_size: 1
-      pipeline_parallel_size: 1
-      expert_parallel_size: 1
-      precision: bfloat16
-      gpu_memory_utilization: 0.6
-      max_model_len: ${policy.max_total_sequence_length}
-      kv_cache_dtype: auto
-      enforce_eager: true
-      expose_http_server: false
-      # Under the SingleController the rollout telemetry pump reports these
-      # metrics, so enabling this requires rollout_checkpointing.telemetry_interval_s.
-      enable_vllm_metrics_logger: false
-      vllm_metrics_logger_interval: 1.0
-      env_vars:
-        NCCL_MNNVL_ENABLE: "0"
-    vllm_kwargs:
-      max_num_seqs: 16
-    colocated:
-      enabled: false
-      resources:
-        gpus_per_node: 1
-        num_nodes: 1
 
 logger:
   log_dir: results/grpo-math-1b-dynamo-single-controller
