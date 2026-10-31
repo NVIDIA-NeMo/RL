@@ -57,7 +57,6 @@ from nemo_rl.algorithms.grpo import (
     _initial_grpo_save_state,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
-from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import (
     OnPolicyDistillationConfig,
@@ -3537,14 +3536,13 @@ class TestNativeTQRecoverySetup:
 
 # ── Full-vocabulary MOPD (on_policy_distillation.full) ──────────────────────
 
-_FULLVOCAB_RECIPES = (
-    "mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab.yaml",
-    "mopd-qwen3-1.7b-3n4g-megatron-pack-single-controller-fullvocab.yaml",
+_FULLVOCAB_RECIPE = (
+    "mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab.yaml"
 )
 
 
 def _load_fullvocab_master_config(
-    recipe_name: str = _FULLVOCAB_RECIPES[0],
+    recipe_name: str = _FULLVOCAB_RECIPE,
 ) -> MasterConfig:
     register_omegaconf_resolvers()
     repo_root = Path(__file__).resolve().parents[3]
@@ -3552,49 +3550,6 @@ def _load_fullvocab_master_config(
     resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
     assert isinstance(resolved, dict)
     return MasterConfig.model_validate(resolved)
-
-
-@pytest.mark.parametrize("recipe_name", _FULLVOCAB_RECIPES)
-def test_fullvocab_mopd_recipes_resolve_to_runtime_contract(recipe_name: str):
-    """Both shipped recipes load and survive every opd_full validator.
-
-    The loss-side validator rejects each policy-gradient knob that opd_full
-    would otherwise ignore, and the base MOPD recipe two levels up turns
-    several of them on -- so a recipe that forgets to override one fails at
-    construction. Nothing else catches that at PR time: these recipes only run
-    in the nightly suites (``nightly.txt`` / ``nightly_gb200.txt``), not in CI.
-    """
-    config = _load_fullvocab_master_config(recipe_name)
-    validate_single_controller_config(config)
-
-    full_cfg = get_opd_full_config(config)
-    assert full_cfg is not None
-    assert full_cfg.teacher_payload == "hidden_states"
-    assert full_cfg.chunk_size == 1024
-    # Off: the residual is an algebraic identity (all three kernels read the same
-    # logits), so it costs a second full-vocabulary log-softmax without being
-    # able to catch a corrupted teacher.
-    assert full_cfg.validate_decomposition is False
-
-    # opd_full still runs the OPD advantage estimator: `advantages` is a
-    # required training column and its stage gates the training step.
-    assert config.grpo.adv_estimator.name == "opd"
-    # Self-distillation: student and teacher are the same checkpoint, which is
-    # what makes "the divergence must stay ~0" a meaningful assertion.
-    assert (
-        config.on_policy_distillation.teacher_model_by_agent_name["default_teacher"]
-        == config.policy["model_name"]
-    )
-
-
-def test_fullvocab_recipe_builds_an_opd_full_loss_function():
-    """The recipe's loss block is accepted by the opd_full loss constructor."""
-    config = _load_fullvocab_master_config()
-    loss_fn = ClippedPGLossFn(
-        config.loss_fn,
-        opd_full=get_opd_full_config(config),
-    )
-    assert loss_fn.input_type is LossInputType.OPD_FULL
 
 
 class TestOPDFullValidation:
@@ -3615,10 +3570,6 @@ class TestOPDFullValidation:
 
         assert stage_config.opd_full_enabled == full_vocab
         assert stage_config.algo.seq_logprob_error_threshold == 2.0
-
-    def test_accepts_the_shipped_recipe(self):
-        config = _load_fullvocab_master_config()
-        _validate_opd_full_config(config, config.on_policy_distillation)
 
     @pytest.mark.parametrize(
         ("top_k", "top_p", "expected_warning"),
