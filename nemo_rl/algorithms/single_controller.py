@@ -51,7 +51,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from functools import partial
 from typing import (
     TYPE_CHECKING,
@@ -60,6 +60,7 @@ from typing import (
     Callable,
     Optional,
     Union,
+    cast,
 )
 
 import ray
@@ -70,6 +71,7 @@ from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     DataPlaneMutationCut,
 )
@@ -996,6 +998,65 @@ class SingleControllerActor:
                 "reserved prompts."
             )
 
+    @contextlib.asynccontextmanager
+    async def _dispatch_reservation(
+        self, kind: CheckpointMutationKind
+    ) -> AsyncIterator[Optional[DataPlaneMutationCut]]:
+        """Hold a data-plane mutation cut for one dispatch change, when recorded.
+
+        With ledger dispatch, the change and its ledger records are one
+        checkpoint-atomic step counted as ``kind``. Without it nothing is
+        recorded, so the change takes no mutation slot and yields ``None``.
+        """
+        if not self._rollout_recovery_enabled:
+            yield None
+            return
+        async with self._data_plane_checkpoint_barrier.mutation(kind) as cut:
+            yield cut
+
+    def _reserve_prompt_group(
+        self,
+        cut: Optional[DataPlaneMutationCut],
+        prompt: DatumSpec,
+        *,
+        target_step: Optional[int],
+        admitted: bool = True,
+        admission_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Record a prompt group in the ledger, or return ``None`` when unrecorded.
+
+        Without a group ID the rollout manager mints one when it runs the group.
+        """
+        if cut is None:
+            return None
+        return self._rollout_manager.reserve_prompt_group(
+            cut,
+            prompt,
+            target_step=target_step,
+            admitted=admitted,
+            admission_id=admission_id,
+        )
+
+    def _discard_prompt_group(
+        self, cut: Optional[DataPlaneMutationCut], group_id: Optional[str]
+    ) -> None:
+        """Drop a recorded group's ledger ownership; unrecorded groups have none."""
+        if cut is not None:
+            assert group_id is not None, "a recorded prompt group has an ID"
+            self._rollout_manager.discard_prompt_group(cut, group_id)
+
+    async def _admit_step(self, group_ids: list[Optional[str]]) -> Optional[int]:
+        """Admit one step's prompts through the sampler and return its target step."""
+        if self._rollout_recovery_enabled:
+            return await self._admit_reserved_prompt_groups(cast(list[str], group_ids))
+        target_step = await self._sampler.admit(
+            trainer_version_fn=lambda: self._trainer_version
+        )
+        if target_step is not None:
+            self._rollout_runtime.sampler_stamps_target_steps = True
+        self._require_unoccupied_target_step(target_step)
+        return target_step
+
     async def _admit_reserved_prompt_groups(
         self,
         group_ids: list[str],
@@ -1474,10 +1535,7 @@ class SingleControllerActor:
                                 # committed, so the train pump will never release
                                 # this permit, and the step it was stamped for
                                 # must be allowed to close short.
-                                if (
-                                    self._rollout_recovery_enabled
-                                    and lineage_group_id is not None
-                                ):
+                                if lineage_group_id is not None:
                                     async with (
                                         self._data_plane_checkpoint_barrier.mutation(
                                             "group_removals"
@@ -1628,44 +1686,34 @@ class SingleControllerActor:
                         if outcome is not RolloutOutcome.SKIPPED:
                             break
 
-                        if self._rollout_recovery_enabled:
-                            assert lineage_group_id is not None
-                            async with self._data_plane_checkpoint_barrier.mutation(
-                                "prompt_reservations"
-                            ) as cut:
-                                replacement = self._take_replacement(
-                                    target_step, replacements
-                                )
-                                # A skipped tracked prompt remains ledger-owned until this
-                                # controller transition. Dropping the old owner, reserving
-                                # a replacement, or crediting the target step short must be
-                                # one checkpoint-atomic decision.
-                                self._rollout_manager.discard_prompt_group(
-                                    cut, lineage_group_id
-                                )
-                                if replacement is not None:
-                                    lender_step = self._promote_into_step(target_step)
-                                    if lender_step is not None:
-                                        target_step = lender_step
-                                    lineage_group_id = (
-                                        self._rollout_manager.reserve_prompt_group(
-                                            cut,
-                                            replacement,
-                                            target_step=target_step,
-                                        )
-                                    )
-                                else:
-                                    self._credit_shortfall(target_step)
-                        else:
+                        async with self._dispatch_reservation(
+                            "prompt_reservations"
+                        ) as cut:
                             replacement = self._take_replacement(
                                 target_step, replacements
                             )
+                            # A skipped tracked prompt remains ledger-owned until this
+                            # controller transition. Dropping the old owner, reserving
+                            # a replacement, or crediting the target step short must be
+                            # one checkpoint-atomic decision.
+                            self._discard_prompt_group(cut, lineage_group_id)
+                            if replacement is not None:
+                                # Attempted only now that a spare is in hand, because
+                                # the borrow is a debt and the spare is what repays it.
+                                # Borrowing without one would leave the lender short
+                                # instead: the same hole, one step later.
+                                lender_step = self._promote_into_step(target_step)
+                                if lender_step is not None:
+                                    target_step = lender_step
+                                lineage_group_id = self._reserve_prompt_group(
+                                    cut, replacement, target_step=target_step
+                                )
+                            else:
+                                self._credit_shortfall(target_step)
                         if replacement is None:
                             # Nothing was committed, so the train pump will never see this
                             # group and never release its permit on our behalf.
                             self._buffer_capacity.release()
-                            if not self._rollout_recovery_enabled:
-                                self._credit_shortfall(target_step)
                             return
 
                         replacements += 1
@@ -1677,13 +1725,6 @@ class SingleControllerActor:
                             f"{len(self._rollout_runtime.replacement_reserve)} spare(s) left)",
                             flush=True,
                         )
-                        # Attempted only now that a spare is in hand, because the borrow is a
-                        # debt and the spare is what repays it. Borrowing without one would
-                        # leave the lender short instead: the same hole, one step later.
-                        if not self._rollout_recovery_enabled:
-                            lender_step = self._promote_into_step(target_step)
-                            if lender_step is not None:
-                                target_step = lender_step
                         # A substitution is a fresh rollout, not a continuation of the one
                         # that failed, so it observes the same pause a first dispatch does
                         # instead of pushing new generation into a weight-sync window.
@@ -1784,30 +1825,10 @@ class SingleControllerActor:
                     _launch, self._admit_reserved_prompt_groups
                 )
             while max_epochs is None or self._current_epoch < max_epochs:
-                if not self._rollout_recovery_enabled:
-                    for prompt_batch in self._dataloader:
-                        if self._divert_batch_to_reserve(prompt_batch):
-                            continue
-                        target_step = await self._sampler.admit(
-                            trainer_version_fn=lambda: self._trainer_version
-                        )
-                        if target_step is not None:
-                            self._rollout_runtime.sampler_stamps_target_steps = True
-                        self._require_unoccupied_target_step(target_step)
-                        for prompt_idx in range(prompt_batch.size):
-                            prompt: DatumSpec = {  # type: ignore
-                                k: v[prompt_idx] for k, v in prompt_batch.items()
-                            }
-                            await _launch(prompt, target_step, None)
-                    self._current_epoch += 1
-                    continue
-
                 dataloader_iterator = iter(self._dataloader)
                 while True:
-                    prompt_dispatches: list[tuple[DatumSpec, str]] = []
-                    async with self._data_plane_checkpoint_barrier.mutation(
-                        "prompt_reservations"
-                    ) as cut:
+                    prompt_dispatches: list[tuple[DatumSpec, Optional[str]]] = []
+                    async with self._dispatch_reservation("prompt_reservations") as cut:
                         try:
                             prompt_batch = next(dataloader_iterator)
                         except StopIteration:
@@ -1817,10 +1838,10 @@ class SingleControllerActor:
                             continue
                         admission_id = str(uuid.uuid4())
                         for prompt_idx in range(prompt_batch.size):
-                            prompt = {  # type: ignore
+                            prompt: DatumSpec = {  # type: ignore
                                 k: v[prompt_idx] for k, v in prompt_batch.items()
                             }
-                            group_id = self._rollout_manager.reserve_prompt_group(
+                            group_id = self._reserve_prompt_group(
                                 cut,
                                 prompt,
                                 target_step=None,
@@ -1829,7 +1850,7 @@ class SingleControllerActor:
                             )
                             prompt_dispatches.append((prompt, group_id))
 
-                    target_step = await self._admit_reserved_prompt_groups(
+                    target_step = await self._admit_step(
                         [group_id for _, group_id in prompt_dispatches]
                     )
 
@@ -1923,55 +1944,36 @@ class SingleControllerActor:
         """
         num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         while len(self._rollout_runtime.replacement_reserve) >= num_prompts_per_step:
-            if self._rollout_recovery_enabled:
-                prompt_dispatches: list[tuple[DatumSpec, str]] = []
-                async with self._data_plane_checkpoint_barrier.mutation(
-                    "prompt_reservations"
-                ) as cut:
-                    step_prompts = [
-                        self._rollout_runtime.replacement_reserve.popleft()
-                        for _ in range(num_prompts_per_step)
-                    ]
-                    admission_id = str(uuid.uuid4())
-                    for prompt in step_prompts:
-                        group_id = self._rollout_manager.reserve_prompt_group(
-                            cut,
-                            prompt,
-                            target_step=None,
-                            admitted=False,
-                            admission_id=admission_id,
-                        )
-                        prompt_dispatches.append((prompt, group_id))
-                target_step = await self._admit_reserved_prompt_groups(
-                    [group_id for _, group_id in prompt_dispatches]
-                )
-                print(
-                    f"  dataloader exhausted; training on {len(prompt_dispatches)} "
-                    f"pooled spare(s) as target_step={target_step}",
-                    flush=True,
-                )
-                for prompt, group_id in prompt_dispatches:
-                    await launch(prompt, target_step, group_id)
-                continue
-
-            # Take the step's prompts out before the first await. A drop resolving
-            # concurrently draws from this same pool, and could otherwise claim one of
-            # them and leave the step it is filling one group short.
-            step_prompts = [
-                self._rollout_runtime.replacement_reserve.popleft()
-                for _ in range(num_prompts_per_step)
-            ]
-            target_step = await self._sampler.admit(
-                trainer_version_fn=lambda: self._trainer_version
+            prompt_dispatches: list[tuple[DatumSpec, Optional[str]]] = []
+            async with self._dispatch_reservation("prompt_reservations") as cut:
+                # Take the step's prompts out before the first await. A drop
+                # resolving concurrently draws from this same pool, and could
+                # otherwise claim one of them and leave the step it is filling one
+                # group short.
+                step_prompts = [
+                    self._rollout_runtime.replacement_reserve.popleft()
+                    for _ in range(num_prompts_per_step)
+                ]
+                admission_id = str(uuid.uuid4())
+                for prompt in step_prompts:
+                    group_id = self._reserve_prompt_group(
+                        cut,
+                        prompt,
+                        target_step=None,
+                        admitted=False,
+                        admission_id=admission_id,
+                    )
+                    prompt_dispatches.append((prompt, group_id))
+            target_step = await self._admit_step(
+                [group_id for _, group_id in prompt_dispatches]
             )
-            self._require_unoccupied_target_step(target_step)
             print(
-                f"  dataloader exhausted; training on {len(step_prompts)} pooled "
-                f"spare(s) as target_step={target_step}",
+                f"  dataloader exhausted; training on {len(prompt_dispatches)} "
+                f"pooled spare(s) as target_step={target_step}",
                 flush=True,
             )
-            for prompt in step_prompts:
-                await launch(prompt, target_step, None)
+            for prompt, group_id in prompt_dispatches:
+                await launch(prompt, target_step, group_id)
 
         if self._rollout_runtime.replacement_reserve:
             print(
@@ -3824,22 +3826,15 @@ class SingleControllerActor:
                     stale_groups.append((group_id, task))
             return stale_groups
 
-        if self._rollout_recovery_enabled:
-            async with self._data_plane_checkpoint_barrier.mutation(
-                "group_removals"
-            ) as cut:
-                # Re-evaluate after acquiring the cut: a rollout may have completed
-                # while a checkpoint holder delayed this mutation.
-                stale_groups = _stale_groups()
-                for group_id, _ in stale_groups:
-                    # This is an intentional live abort, not a process failure. Remove
-                    # durable ownership before cancellation cleanup removes the unready
-                    # TQ slot, so a concurrent checkpoint cannot resurrect the prompt.
-                    self._rollout_manager.discard_prompt_group(cut, group_id)
-                for _, task in stale_groups:
-                    task.cancel()
-        else:
+        async with self._dispatch_reservation("group_removals") as cut:
+            # Re-evaluate after acquiring the cut: a rollout may have completed
+            # while a checkpoint holder delayed this mutation.
             stale_groups = _stale_groups()
+            for group_id, _ in stale_groups:
+                # This is an intentional live abort, not a process failure. Remove
+                # durable ownership before cancellation cleanup removes the unready
+                # TQ slot, so a concurrent checkpoint cannot resurrect the prompt.
+                self._discard_prompt_group(cut, group_id)
             for _, task in stale_groups:
                 task.cancel()
 
