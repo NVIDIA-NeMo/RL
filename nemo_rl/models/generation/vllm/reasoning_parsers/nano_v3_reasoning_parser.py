@@ -24,11 +24,13 @@ class NanoV3ReasoningParser(DeepSeekR1ReasoningParser):
         reasoning_content, final_content = super().extract_reasoning(
             model_output, request
         )
-        chat_template_kwargs = getattr(request, "chat_template_kwargs", None)
-        if (
-            chat_template_kwargs
-            and chat_template_kwargs.get("enable_thinking") is False
-            and final_content is None
+        chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+        # A reasoning-only turn is the answer when thinking is off, or when the
+        # request forces non-empty content (as Dynamo's and Megatron's Nemotron
+        # v3 parsers treat it).
+        if final_content is None and (
+            chat_template_kwargs.get("enable_thinking") is False
+            or chat_template_kwargs.get("force_nonempty_content") is True
         ):
             return None, reasoning_content
 
