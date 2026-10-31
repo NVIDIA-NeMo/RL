@@ -69,7 +69,8 @@ class SequencePackingLossWrapper:
             vocab_parallel_group: Vocab parallel group.
             context_parallel_group: Context parallel group.
 
-            vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
+            Parallel groups are supplied by Megatron and Automodel workers.
+            Automodel uses a singleton vocabulary group for chunked local logprobs.
 
         Returns:
             Sequence packing loss wrapper.

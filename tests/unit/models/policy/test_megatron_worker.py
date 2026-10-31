@@ -11,12 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import __future__
+
 import ast
 import asyncio
 import math
 import os
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -2561,6 +2564,322 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         assert events == [("finalize", False)]
 
 
+# Both Megatron workers that train across data-parallel ranks take manual_gc.
+_MANUAL_GC_WORKERS = {
+    "policy": (
+        "nemo_rl.models.policy.workers.megatron_policy_worker",
+        "MegatronPolicyWorkerImpl",
+    ),
+    "value": (
+        "nemo_rl.models.value.workers.megatron_value_worker",
+        "MegatronValueWorkerImpl",
+    ),
+}
+
+
+@pytest.fixture(params=sorted(_MANUAL_GC_WORKERS))
+def manual_gc_worker_impl(request):
+    import importlib
+
+    module_name, class_name = _MANUAL_GC_WORKERS[request.param]
+    return getattr(importlib.import_module(module_name), class_name)
+
+
+def _manual_gc_worker(monkeypatch, megatron_cfg, worker_impl=None):
+    import nemo_rl.models.megatron.manual_gc as manual_gc_module
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    if worker_impl is None:
+        worker_impl = worker_module.MegatronPolicyWorkerImpl
+    worker = object.__new__(worker_impl)
+    worker.cfg = {"megatron_cfg": megatron_cfg}
+    events = []
+    monkeypatch.setattr(
+        manual_gc_module.gc, "disable", lambda: events.append("disable")
+    )
+    monkeypatch.setattr(
+        manual_gc_module.gc, "collect", lambda: events.append("collect")
+    )
+    monkeypatch.setattr(
+        manual_gc_module.os,
+        "register_at_fork",
+        lambda **kwargs: events.append(("register_at_fork", kwargs["after_in_child"])),
+    )
+    return worker, events
+
+
+@pytest.mark.parametrize(
+    "megatron_cfg",
+    [{}, {"manual_gc": False}, {"manual_gc": False, "manual_gc_interval": 10}],
+    ids=["no_keys", "manual_gc_false", "exemplar_defaults"],
+)
+def test_megatron_manual_gc_is_off_unless_enabled(
+    monkeypatch, megatron_cfg, manual_gc_worker_impl
+):
+    worker, events = _manual_gc_worker(monkeypatch, megatron_cfg, manual_gc_worker_impl)
+
+    assert worker._manual_gc_interval_from_cfg() is None
+    worker._maybe_enable_manual_gc()
+    for _ in range(3):
+        worker._maybe_run_manual_gc()
+
+    assert events == []
+    # Nothing was written to the instance; this is the class-level default.
+    assert "_manual_gc_interval" not in vars(worker)
+    assert "_manual_gc_steps" not in vars(worker)
+    assert worker._manual_gc_interval is None
+
+
+def test_megatron_manual_gc_collects_every_interval(monkeypatch, manual_gc_worker_impl):
+    import gc
+
+    worker, events = _manual_gc_worker(
+        monkeypatch,
+        {"manual_gc": True, "manual_gc_interval": 2},
+        manual_gc_worker_impl,
+    )
+
+    worker._maybe_enable_manual_gc()
+    # Setup garbage is collected first, then automatic GC goes off and forked
+    # children get it back.
+    assert events == ["collect", "disable", ("register_at_fork", gc.enable)]
+
+    events.clear()
+    for _ in range(5):
+        worker._maybe_run_manual_gc()
+    assert events == ["collect", "collect"]  # after steps 2 and 4
+
+
+@pytest.mark.parametrize(
+    "megatron_cfg",
+    [
+        {"manual_gc": True},
+        {"manual_gc": True, "manual_gc_interval": None},
+        {"manual_gc": True, "manual_gc_interval": 0},
+        {"manual_gc": True, "manual_gc_interval": -1},
+        {"manual_gc": True, "manual_gc_interval": True},
+        {"manual_gc": True, "manual_gc_interval": "10"},
+    ],
+    ids=["missing", "none", "zero", "negative", "bool", "str"],
+)
+def test_megatron_manual_gc_rejects_a_non_positive_interval(
+    monkeypatch, megatron_cfg, manual_gc_worker_impl
+):
+    worker, events = _manual_gc_worker(monkeypatch, megatron_cfg, manual_gc_worker_impl)
+
+    with pytest.raises(ValueError, match="manual_gc_interval must be a positive"):
+        worker._manual_gc_interval_from_cfg()
+    with pytest.raises(ValueError, match="manual_gc_interval must be a positive"):
+        worker._maybe_enable_manual_gc()
+    # GC is left untouched: the error is raised before any gc call.
+    assert events == []
+
+
+def _megatron_worker_method_ast(worker_kind, name):
+    """AST of a manual-GC worker method, parsed from the worker's module file.
+
+    Parsed from the file rather than via ``inspect.getsource`` because decorators
+    such as ``wrap_with_nvtx_name`` may hide the original function.
+    """
+    import importlib
+
+    module_name, class_name = _MANUAL_GC_WORKERS[worker_kind]
+    with open(importlib.import_module(module_name).__file__) as f:
+        module = ast.parse(f.read())
+    (cls,) = [
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    ]
+    (method,) = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    return method
+
+
+@pytest.mark.parametrize("worker_kind", sorted(_MANUAL_GC_WORKERS))
+def test_megatron_worker_init_validates_manual_gc_early_and_enables_it_last(
+    worker_kind,
+):
+    """__init__ fails on a bad config before setup and disables GC only at the end.
+
+    The worker constructor needs GPUs and a model, so this checks the call sites in
+    the source: one validation call, and enabling as the last statement.
+    """
+    init_fn = _megatron_worker_method_ast(worker_kind, "__init__")
+    calls = [
+        node.func.attr
+        for node in ast.walk(init_fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr
+        in ("_manual_gc_interval_from_cfg", "_maybe_enable_manual_gc")
+    ]
+    assert calls.count("_manual_gc_interval_from_cfg") == 1
+    assert calls.count("_maybe_enable_manual_gc") == 1
+    last = init_fn.body[-1]
+    assert (
+        isinstance(last, ast.Expr)
+        and isinstance(last.value, ast.Call)
+        and last.value.func.attr == "_maybe_enable_manual_gc"
+    ), "_maybe_enable_manual_gc must be the last statement of __init__"
+
+
+@pytest.mark.parametrize("worker_kind", sorted(_MANUAL_GC_WORKERS))
+def test_megatron_train_runs_manual_gc_after_each_optimizer_step(worker_kind):
+    """The monolithic train() (v1 SFT/RM/DPO, and the PPO value worker) must reach
+    the manual GC hook.
+
+    Checked in the source because train() needs GPUs; the GPU test
+    test_megatron_policy_training_manual_gc covers the policy worker end to end.
+    The hook must sit in the same block as optimizer.step(), so it runs once per
+    optimizer step and never in eval mode.
+    """
+    tree = _megatron_worker_method_ast(worker_kind, "train")
+
+    def calls_in(stmts, attr):
+        return [
+            node
+            for stmt in stmts
+            for node in ast.walk(stmt)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == attr
+        ]
+
+    def is_optimizer_step(stmt):
+        # `... = self.optimizer.step()` as a statement of this block itself, not
+        # of a nested one (enclosing blocks contain it too).
+        return (
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr == "step"
+            and isinstance(stmt.value.func.value, ast.Attribute)
+            and stmt.value.func.value.attr == "optimizer"
+        )
+
+    blocks_with_step = [
+        node.body
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If) and any(is_optimizer_step(s) for s in node.body)
+    ]
+    assert len(blocks_with_step) == 1, (
+        "expected one `if not eval_mode:` optimizer block"
+    )
+    assert len(calls_in(blocks_with_step[0], "_maybe_run_manual_gc")) == 1
+    assert len(calls_in(tree.body, "_maybe_run_manual_gc")) == 1
+
+
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_megatron_finish_train_step_runs_manual_gc_only_after_success(
+    monkeypatch, body_fails
+):
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    events = []
+    state = {"step": "open"}
+    worker._assert_step_open = lambda: state
+    worker._set_mtp_grad_scale_func = lambda func: events.append(("mtp_scale", func))
+    worker._restore_saved_mcore_hooks = lambda s: events.append(("restore_hooks", s))
+    worker._maybe_run_manual_gc = lambda: events.append("manual_gc")
+
+    def body(s):
+        assert s is state
+        if body_fails:
+            raise RuntimeError("finish failed")
+        return {"loss": 1.0}
+
+    worker._finish_train_step_body = body
+
+    if body_fails:
+        with pytest.raises(RuntimeError, match="finish failed"):
+            worker_module.MegatronPolicyWorkerImpl.finish_train_step(worker)
+        # The error path restores MTP scaling and the saved mcore hooks, and does
+        # not collect.
+        assert events == [("mtp_scale", None), ("restore_hooks", state)]
+    else:
+        result = worker_module.MegatronPolicyWorkerImpl.finish_train_step(worker)
+        assert result == {"loss": 1.0}
+        assert events == ["manual_gc"]
+
+
+def _poll_worker(monkeypatch, *, async_save=True, queue_sizes=(1, 1)):
+    """A Megatron worker whose async queue reports ``queue_sizes`` on successive checks."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.cfg = {"generation": None}
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(
+                async_save=async_save,
+                use_persistent_ckpt_worker=True,
+                ckpt_assume_constant_structure=True,
+                async_ckpt_use_cpu_shm=True,
+            )
+        )
+    )
+    sizes = iter(queue_sizes)
+    events = []
+    monkeypatch.setattr(
+        worker_module, "is_empty_async_queue", lambda state: next(sizes) == 0
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "maybe_finalize_async_save",
+        lambda *args, **kwargs: events.append(("finalize", kwargs["blocking"])),
+    )
+    return worker_module, worker, events
+
+
+def test_megatron_poll_async_save_is_a_no_op_without_a_pending_save(monkeypatch):
+    worker_module, worker, events = _poll_worker(monkeypatch, queue_sizes=(0,))
+    assert worker_module.MegatronPolicyWorkerImpl.poll_async_save(worker) is True
+    assert events == []
+
+    worker_module, worker, events = _poll_worker(monkeypatch, async_save=False)
+    assert worker_module.MegatronPolicyWorkerImpl.poll_async_save(worker) is True
+    assert events == []
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_megatron_poll_async_save_finalizes_without_blocking(monkeypatch, finished):
+    worker_module, worker, events = _poll_worker(
+        monkeypatch, queue_sizes=(1, 0 if finished else 1)
+    )
+
+    done = worker_module.MegatronPolicyWorkerImpl.poll_async_save(worker)
+
+    assert events == [("finalize", False)]
+    assert done is finished
+
+
+def test_megatron_poll_async_save_keeps_blocking_finalize_for_unsafe_ipc_cache(
+    monkeypatch,
+):
+    worker_module, worker, events = _poll_worker(monkeypatch, queue_sizes=(1,))
+    worker._async_checkpoint_cuda_cache_active = True
+    worker._requires_nvrx_cuda_cache_release = lambda: True
+    worker.finalize_async_save = MagicMock()
+
+    assert worker_module.MegatronPolicyWorkerImpl.poll_async_save(worker) is True
+    worker.finalize_async_save.assert_called_once_with()
+    assert events == []
+
+
+def test_megatron_poll_async_save_rejects_an_open_train_step(monkeypatch):
+    worker_module, worker, events = _poll_worker(monkeypatch, queue_sizes=(1, 0))
+    worker._train_step_state = {}
+
+    with pytest.raises(RuntimeError, match="inside an open train step"):
+        worker_module.MegatronPolicyWorkerImpl.poll_async_save(worker)
+    assert events == []
+
+
 def test_megatron_move_model_does_not_serialize_extra_state():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
@@ -3179,6 +3498,135 @@ def test_disable_forward_pre_hook_until_next_step_uses_worker_override(
     assert worker._first_train_step_forward_pre_hook_disabled is True
 
 
+@pytest.mark.parametrize("init_reference_model", [False, True])
+@pytest.mark.parametrize(
+    ("load_rng", "finetune", "optimizer_path"),
+    [
+        (False, False, None),
+        (True, False, None),
+        (True, False, "optimizer"),
+        (True, True, None),
+    ],
+    ids=["fresh", "weights-only-resume", "full-resume", "finetune"],
+)
+def test_worker_initialization_preserves_only_restored_rng(
+    monkeypatch: pytest.MonkeyPatch,
+    load_rng: bool,
+    finetune: bool,
+    optimizer_path: str | None,
+    init_reference_model: bool,
+) -> None:
+    # Execute the complete production constructor without importing the optional
+    # GPU stack, as in the method-level CPU test above. Only its boundaries are
+    # doubled; the preservation condition and reference/finalizer order are real.
+    source_path = (
+        Path(__file__).parents[4]
+        / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    method = next(
+        node
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef) and cls.name == "MegatronPolicyWorkerImpl"
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    namespace = {
+        name: MagicMock(return_value=None)
+        for name in (
+            "log_gpu_memory_diagnostics",
+            "maybe_enable_msc",
+            "make_empty_cache_best_effort_under_expandable_segments",
+            "enable_batch_invariant_mode",
+            "apply_transformer_engine_patch",
+            "init_telemetry_worker",
+            "router_replay_enabled",
+            "maybe_preinit_nixl_checkpoint_engine",
+            "Timer",
+            "setup_distributed",
+            "handle_model_import",
+            "validate_megatron_config",
+            "_model_self_packs_for_cp",
+            "_model_has_chunkwise_cp",
+            "_model_needs_router_padding_mask",
+            "_model_self_packs_mtp_loss_mask",
+            "_model_slices_context_parallel_inputs",
+            "_model_accepts_media_token_validity_mask",
+            "_reserved_http_server_port_for_rank",
+        )
+    }
+    runtime = MagicMock()
+    runtime.megatron_cfg.checkpoint = SimpleNamespace(
+        load_rng=load_rng, finetune=finetune
+    )
+    components = MagicMock(param_sync_func=None)
+
+    def reference(*_args: object, **_kwargs: object) -> dict:
+        torch.rand(3)
+        return {}
+
+    def finalize(*_args: object) -> tuple:
+        torch.rand(5)
+        return None, None, False, 1
+
+    # The existing Bridge helper is separately qualified natively. This CPU
+    # double tests whether the worker places its RNG-consuming setup inside it.
+    preserve_rng = MagicMock(side_effect=lambda: torch.random.fork_rng(devices=[]))
+    namespace.update(
+        torch=torch,
+        os=os,
+        ray=SimpleNamespace(get_gpu_ids=lambda: [0]),
+        nullcontext=nullcontext,
+        traced_worker_init=lambda *_args, **_kwargs: lambda method: method,
+        _preserve_rng_state=preserve_rng,
+        get_rank_safe=lambda: 0,
+        validate_model_paths=lambda _: ("model", "pretrained", True),
+        validate_and_set_config=MagicMock(return_value=runtime),
+        setup_model_and_optimizer=MagicMock(return_value=components),
+        setup_reference_model_state=MagicMock(side_effect=reference),
+        finalize_megatron_setup=MagicMock(side_effect=finalize),
+    )
+    exec(
+        compile(
+            ast.Module(body=[method], type_ignores=[]),
+            str(source_path),
+            "exec",
+            flags=__future__.annotations.compiler_flag,
+        ),
+        namespace,
+    )
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("NRL_DISABLE_NUMA_BINDING", "1")
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    worker = MagicMock()
+    worker._get_model_config.return_value.mtp_num_layers = None
+    with torch.random.fork_rng(devices=[]):
+        torch.set_rng_state(torch.Generator().manual_seed(123).get_state())
+        before = torch.get_rng_state().clone()
+        if init_reference_model:
+            torch.rand(3)
+        torch.rand(5)
+        consumed = torch.get_rng_state().clone()
+        torch.set_rng_state(before)
+        namespace["__init__"](
+            worker,
+            {"megatron_cfg": {}, "sequence_packing": {"enabled": False}},
+            SimpleNamespace(pad_token="pad"),
+            weights_path="weights" if load_rng else None,
+            optimizer_path=optimizer_path,
+            init_reference_model=init_reference_model,
+            worker_sharding_annotations=None,
+        )
+        restored = load_rng and not finetune
+        assert torch.equal(torch.get_rng_state(), before if restored else consumed)
+    assert preserve_rng.call_count == int(restored)
+    assert namespace["setup_reference_model_state"].call_count == int(
+        init_reference_model
+    )
+    namespace["finalize_megatron_setup"].assert_called_once()
+
+
 @pytest.mark.parametrize("update_successful", [False, True])
 def test_restore_first_train_step_param_sync(
     monkeypatch: pytest.MonkeyPatch, update_successful: bool
@@ -3672,6 +4120,88 @@ def test_megatron_policy_training(training_setup):
             assert results["theoretical_tflops"] > 0, (
                 "theoretical_tflops should be positive"
             )
+
+
+def _manual_gc_states(policy):
+    """Each worker's GC state, read on the worker actor via Ray's ``__ray_call__``."""
+
+    # Defined here, not at module level, so Ray pickles it by value: the worker
+    # processes cannot import this test module.
+    def manual_gc_state(worker):
+        import gc
+
+        return {
+            "gc_enabled": gc.isenabled(),
+            "interval": worker._manual_gc_interval,
+            "steps": worker._manual_gc_steps,
+        }
+
+    return ray.get(
+        [
+            worker.__ray_call__.remote(manual_gc_state)
+            for worker in policy.worker_group.workers
+        ]
+    )
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_policy_training_manual_gc(tiny_llama_model_path):
+    """manual_gc on the monolithic train() path (v1 SFT/RM/DPO): GC is off after
+    worker setup and the hook runs once per optimizer step, not once per call."""
+    cluster = None
+    policy = None
+    try:
+        cluster = RayVirtualCluster(
+            name="test-megatron-train-manual-gc",
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+        config = create_megatron_test_config(model_name=tiny_llama_model_path)
+        config["megatron_cfg"]["manual_gc"] = True
+        config["megatron_cfg"]["manual_gc_interval"] = 2
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        before = _manual_gc_states(policy)
+        assert before == [{"gc_enabled": False, "interval": 2, "steps": 0}] * 2
+
+        # 16 rows at train_global_batch_size 8: two optimizer steps per train().
+        assert config["train_global_batch_size"] == 8
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 32000, (16, 128))
+        attention_mask = torch.ones(16, 128)
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": attention_mask.sum(dim=1).to(torch.int32),
+                "attention_mask": attention_mask,
+                "labels": torch.randint(0, 32000, (16, 128)),
+                "sample_mask": torch.ones(16),
+            }
+        )
+        policy.prepare_for_training()
+        for _ in range(2):
+            policy.train(data, SimpleLossFn())
+        policy.finish_training()
+
+        after = _manual_gc_states(policy)
+        assert after == [{"gc_enabled": False, "interval": 2, "steps": 4}] * 2
+    finally:
+        if policy:
+            policy.shutdown()
+        if cluster:
+            cluster.shutdown()
 
 
 @pytest.fixture
@@ -4494,7 +5024,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
                 tokenizer=tokenizer,
                 weights_path=weights_path,  # This should trigger checkpoint loading
                 optimizer_path=optimizer_path,
-                init_reference_model=False,
+                init_reference_model=True,
             )
 
             # Get logprobs from restored policy (should match the saved state)
@@ -4518,58 +5048,9 @@ def test_megatron_checkpoint_save_kill_and_restore(
             ).item()
             print(f"Max difference: {max_diff}, Mean difference: {mean_diff}")
 
-            if logprobs_match:
-                print(
-                    "✓ SUCCESS: Checkpoint loading works! Model state was restored correctly."
-                )
-            else:
-                print(
-                    "⚠ WARNING: Checkpoint may not have loaded correctly. Difference too large."
-                )
-                print("This could indicate:")
-                print("1. Checkpoint loading is not implemented for runtime loading")
-                print("2. Checkpoint loading only works during initial model setup")
-                print("3. The checkpoint format or loading logic needs adjustment")
-
-                # But still verify the checkpoint structure is valid
-                iter_dirs = [
-                    d for d in os.listdir(checkpoint_dir) if d.startswith("iter_")
-                ]
-                latest_iter_dir = os.path.join(checkpoint_dir, sorted(iter_dirs)[-1])
-                iter_contents = os.listdir(latest_iter_dir)
-
-                print("\nCheckpoint structure verification:")
-                print(f"  - Checkpoint dir exists: {os.path.exists(checkpoint_dir)}")
-                print(f"  - Iteration dirs: {iter_dirs}")
-                print(f"  - Latest iter contents: {iter_contents}")
-
-                expected_checkpoint_files = ["common.pt"]
-                for expected_file in expected_checkpoint_files:
-                    file_exists = any(expected_file in f for f in iter_contents)
-                    print(f"  - Expected file '{expected_file}' exists: {file_exists}")
-                    assert file_exists, (
-                        f"Required checkpoint file {expected_file} not found"
-                    )
-
-                total_checkpoint_size = sum(
-                    os.path.getsize(os.path.join(latest_iter_dir, f))
-                    for f in iter_contents
-                    if os.path.isfile(os.path.join(latest_iter_dir, f))
-                )
-                print(f"  - Total checkpoint size: {total_checkpoint_size} bytes")
-                assert total_checkpoint_size > 1024, "Checkpoint appears too small"
-
-            print("\n=== VERIFICATION COMPLETE ===")
-            print("✓ Checkpoint save functionality works correctly")
-            print("✓ Checkpoint structure is valid for restoration")
-            print("✓ Worker shutdown and restart works")
-            print("✓ Fresh worker has different parameters (proving no auto-load)")
-            if logprobs_match:
-                print("✓ Checkpoint loading works and restores correct model state")
-            else:
-                print(
-                    "✓ Checkpoint infrastructure is in place (loading may need implementation)"
-                )
+            torch.testing.assert_close(
+                logprobs_restored, logprobs_before_save, rtol=1e-5, atol=1e-4
+            )
 
         finally:
             # Step 4: Cleanup

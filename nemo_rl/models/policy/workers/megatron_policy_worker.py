@@ -32,9 +32,11 @@ import ray
 import torch
 from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
 from megatron.bridge.training.checkpointing import (
+    is_empty_async_queue,
     maybe_finalize_async_save,
     save_checkpoint,
 )
+from megatron.bridge.training.setup import _preserve_rng_state
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
@@ -49,6 +51,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.utils import get_model_config, unwrap_model
 from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
     FileSystemWriterAsync,
@@ -111,6 +114,7 @@ from nemo_rl.models.megatron.draft.training import (
     resolve_draft_speculator,
 )
 from nemo_rl.models.megatron.hybridep import uses_hybridep_flex_dispatcher
+from nemo_rl.models.megatron.manual_gc import ManualGCMixin
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -157,6 +161,7 @@ from nemo_rl.models.policy.utils import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
     get_runtime_env_for_policy_worker,
+    make_empty_cache_best_effort_under_expandable_segments,
     send_hf_buckets_via_ipc_actor_impl,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -900,6 +905,7 @@ def _reserved_http_server_port_for_rank(
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
+    ManualGCMixin,
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
     TQWorkerMixin,
@@ -941,6 +947,35 @@ class MegatronPolicyWorkerImpl(
     def _routed_experts_layout(self) -> RouteLayout:
         """Return the route layout from the initialized Megatron model config."""
         return router_replay_layout(self._get_model_config())
+
+    def validate_forest_execution_padding(self) -> None:
+        """Reject unqualified dummy-sensitive routers in the actual loaded model.
+
+        Policy/reference logprobs and training use this same model (reference
+        inference swaps weights only). Inspect nested routers, not just the outer
+        VLM config, after checkpoint settings and provider overrides resolve.
+        """
+        # TODO: Exclude artificial inputs from expert-bias update counts; see
+        # https://github.com/NVIDIA-NeMo/RL/pull/4519. Allow configured updates
+        # meanwhile: dummy rows can affect the counts despite zero policy loss.
+        for chunk in _unwrapped_chunks(self.model):
+            for module in chunk.modules():
+                if not isinstance(module, Router):
+                    continue
+                config = module.config
+                if (
+                    not isinstance(module, TopKRouter)
+                    or module.routing_type in ("sinkhorn", "quantile_balancing")
+                    or config.moe_expert_capacity_factor is not None
+                    or config.moe_expert_rank_capacity_factor is not None
+                    or config.moe_pad_experts_for_cuda_graph_inference
+                    or config.moe_token_dropping
+                    or get_aux_loss_track_names(config)
+                ):
+                    raise ValueError(
+                        "Forest execution padding requires dropless per-token MoE routing "
+                        "without auxiliary losses"
+                    )
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
@@ -1051,6 +1086,7 @@ class MegatronPolicyWorkerImpl(
         # Resume loads from weights_path/optimizer_path during setup, before any
         # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
         maybe_enable_msc(weights_path, optimizer_path)
+        make_empty_cache_best_effort_under_expandable_segments()
         self.is_refit_destination = is_refit_destination
         self._bulk_refit_conversion_tasks: list[Any] = []
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
@@ -1099,6 +1135,9 @@ class MegatronPolicyWorkerImpl(
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
+        # Fail on a bad manual_gc config before the expensive setup below; GC itself
+        # is disabled at the end of __init__ (_maybe_enable_manual_gc).
+        self._manual_gc_interval_from_cfg()
 
         # Store the reserved HTTP server port for inference server initialization.
         # Megatron-LLM's hosts an inference server on every MP coordinator rank,
@@ -1235,36 +1274,44 @@ class MegatronPolicyWorkerImpl(
         if param_sync_func is not None:
             get_model_config(self.model).param_sync_func = param_sync_func
 
-        # Step 5: Setup reference model if needed
-        if init_reference_model:
-            self.model = self.move_model(self.model, "cpu")
-            self.reference_state_dict = setup_reference_model_state(
+        # Reference construction must not advance the restored policy RNG.
+        # Keep fresh-run RNG ordering unchanged, including PEFT warm starts.
+        checkpoint_cfg = self.megatron_cfg.checkpoint
+        with (
+            _preserve_rng_state()
+            if checkpoint_cfg.load_rng and not checkpoint_cfg.finetune
+            else nullcontext()
+        ):
+            # Step 5: Setup reference model if needed
+            if init_reference_model:
+                self.model = self.move_model(self.model, "cpu")
+                self.reference_state_dict = setup_reference_model_state(
+                    config,
+                    self.megatron_cfg,
+                    pretrained_path,
+                    pre_load_checkpoint_hook=getattr(
+                        self, "_pre_load_checkpoint_hook", None
+                    ),
+                )
+                self.model = self.move_model(self.model, "cuda")
+                log_gpu_memory_diagnostics(
+                    label="after_ref_model", worker_type="MegatronPolicyWorker"
+                )
+
+            # Step 6: Finalize setup (including the HF bridge wrapper).
+            (
+                self.megatron_tokenizer,
+                self.megatron_bridge,
+                self.should_disable_forward_pre_hook,
+                self.dp_size,
+            ) = finalize_megatron_setup(
                 config,
                 self.megatron_cfg,
-                pretrained_path,
-                pre_load_checkpoint_hook=getattr(
-                    self, "_pre_load_checkpoint_hook", None
-                ),
+                hf_model_name,
+                worker_sharding_annotations,
+                self.model,
+                self.optimizer,
             )
-            self.model = self.move_model(self.model, "cuda")
-            log_gpu_memory_diagnostics(
-                label="after_ref_model", worker_type="MegatronPolicyWorker"
-            )
-
-        # Step 6: Finalize setup
-        (
-            self.megatron_tokenizer,
-            self.megatron_bridge,
-            self.should_disable_forward_pre_hook,
-            self.dp_size,
-        ) = finalize_megatron_setup(
-            config,
-            self.megatron_cfg,
-            hf_model_name,
-            worker_sharding_annotations,
-            self.model,
-            self.optimizer,
-        )
         self._first_train_step_forward_pre_hook_disabled = False
         self._first_train_step_param_sync_func = None
         if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
@@ -1374,6 +1421,7 @@ class MegatronPolicyWorkerImpl(
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
         )
+        self._maybe_enable_manual_gc()
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -1829,6 +1877,9 @@ class MegatronPolicyWorkerImpl(
                     # policy so their large early gradients don't shrink the
                     # policy update. None when no draft model is attached.
                     draft_grad_norm = self.optimizer.grad_norms_by_group.get("draft")
+                    # Once per optimizer step, so manual_gc_interval means the same
+                    # here as on the split-step path (finish_train_step).
+                    self._maybe_run_manual_gc()
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
                     mtp_grad_norm = None
@@ -2513,7 +2564,7 @@ class MegatronPolicyWorkerImpl(
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
-            return self._finish_train_step_body(state)
+            result = self._finish_train_step_body(state)
         except Exception:
             # Mid-finish failure: state machine is in a partial state and the
             # mcore hooks may still be nulled (or restored, depending on how far
@@ -2533,6 +2584,8 @@ class MegatronPolicyWorkerImpl(
                     "failed to restore mcore hooks after finish_train_step error"
                 )
             raise
+        self._maybe_run_manual_gc()
+        return result
 
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -5693,6 +5746,32 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
             self._async_checkpoint_cuda_cache_active = False
+
+    def poll_async_save(self) -> bool:
+        """Finalize the async save if every rank's write is done, without waiting.
+
+        Returns True when no async save is left pending. NVRx agrees on completion
+        with an all-reduce over the default group, so every rank must call this at
+        the same point between steps, never concurrently with training.
+        """
+        if self._train_step_state is not None:
+            raise RuntimeError(
+                "poll_async_save must not run inside an open train step: its "
+                "finalize all-reduces on the default process group."
+            )
+        ckpt_cfg = self.mcore_state.cfg.checkpoint
+        if not ckpt_cfg.async_save or is_empty_async_queue(self.mcore_state):
+            return True
+        if (
+            self._async_checkpoint_cuda_cache_active
+            and self._requires_nvrx_cuda_cache_release()
+        ):
+            # The colocated CUDA IPC cache must be released with the write; keep
+            # the blocking path for that case.
+            self.finalize_async_save()
+            return True
+        maybe_finalize_async_save(self.mcore_state, ckpt_cfg=ckpt_cfg, blocking=False)
+        return is_empty_async_queue(self.mcore_state)
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.

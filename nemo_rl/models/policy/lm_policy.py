@@ -1597,6 +1597,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("finalize_async_save")
         ray.get(futures)
 
+    def poll_async_save(self) -> bool:
+        """Finalize the in-flight async checkpoint write if every worker finished it.
+
+        Does not wait for the write. Returns True when no async save is pending,
+        after which the checkpoint directory may be renamed from tmp_step_N/ to
+        step_N/.
+        """
+        futures = self.worker_group.run_all_workers_single_data("poll_async_save")
+        results = ray.get(futures)
+        if len(set(results)) != 1:
+            raise RuntimeError(
+                f"Workers disagree on async checkpoint completion: {results}"
+            )
+        return results[0]
+
     def shutdown(self) -> bool:
         """Shut down all HF workers and clean up resources."""
         if not hasattr(self, "worker_group"):
