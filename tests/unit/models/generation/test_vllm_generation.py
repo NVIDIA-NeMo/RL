@@ -1689,6 +1689,43 @@ def test_configure_generation_config_requires_processed_logprobs_for_filtering(
         configure_generation_config(deepcopy(vllm_config), tokenizer)
 
 
+@pytest.mark.parametrize("backend", ["vllm", "megatron"])
+def test_configure_generation_config_requires_top_k_for_top_p_replay(
+    backend: str,
+) -> None:
+    """Top-p alone is fine when the trainer recomputes it; replay needs top_k to bound S_q."""
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+    config = deepcopy(basic_vllm_test_config)
+    config.update(backend=backend, top_p=0.9, top_k=None, top_logprobs=20)
+    config["vllm_cfg"]["logprobs_mode"] = "processed_logprobs"
+    configure_generation_config(deepcopy(config), tokenizer)
+
+    config["sampler_replay"] = {"enabled": True}
+    with pytest.raises(ValueError, match="top_p < 1 requires .*top_k"):
+        configure_generation_config(deepcopy(config), tokenizer)
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"top_k": None, "top_p": 1.0, "top_logprobs": 20}, "needs top-k/top-p"),
+        ({"top_k": 20, "top_p": 0.9, "top_logprobs": 0}, "captured sampler head"),
+    ],
+)
+def test_configure_generation_config_checks_sampler_support_replay(
+    overrides: dict, match: str
+) -> None:
+    """Replaying S_q needs filtered sampling and the captured top-K head."""
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["logprobs_mode"] = "processed_logprobs"
+    config.update(sampler_replay={"enabled": True}, **overrides)
+    with pytest.raises(ValueError, match=match):
+        configure_generation_config(deepcopy(config), tokenizer)
+    config.update(top_k=20, top_p=0.9, top_logprobs=20)
+    configure_generation_config(config, tokenizer)
+
+
 def test_configure_generation_config_uses_real_startup_weights_without_draft_refit():
     """Speculative training should not start the drafter from dummy weights without refit."""
     vllm_config = deepcopy(basic_vllm_test_config)

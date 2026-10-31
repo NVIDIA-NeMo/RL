@@ -206,6 +206,7 @@ from nemo_rl.experience.rollouts import get_effort_config
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -343,7 +344,7 @@ def _train_fields_for_step(
     *,
     policy_logprobs_required: bool,
     reference_logprobs_required: bool,
-    score_centering: bool,
+    sampler_head_required: bool,
 ) -> tuple[str, ...]:
     """Return only the data-plane columns produced for this train step."""
     fields = tuple(
@@ -352,7 +353,7 @@ def _train_fields_for_step(
         if (policy_logprobs_required or field != "prev_logprobs")
         and (reference_logprobs_required or field != "reference_policy_logprobs")
     )
-    if score_centering:
+    if sampler_head_required:
         fields += SAMPLER_TOPK_FIELDS
     return fields
 
@@ -457,7 +458,9 @@ class SingleControllerActor:
         self._train_fields = _train_fields_for_step(
             policy_logprobs_required=self._policy_logprobs_required,
             reference_logprobs_required=self._reference_logprobs_required,
-            score_centering=master_config.loss_fn.score_centering,
+            # Score centering and sampler replay both read the captured head.
+            sampler_head_required=master_config.loss_fn.score_centering
+            or sampler_replay_enabled(master_config.policy["generation"]),
         )
         self._dp_client = actor_args.dp_client
         if master_config.data_plane["backend"] == "mooncake_cpu":

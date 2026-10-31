@@ -7881,6 +7881,14 @@ class TestValidateFunction:
         with pytest.raises(AssertionError, match="only supported for vLLM NeMo-Gym"):
             setup(master_config, MagicMock(), MagicMock(), None)
 
+    def test_setup_rejects_sampler_support_replay(self, mock_grpo_components):
+        """Replay reads the captured sampler head, which only SingleController stages."""
+        master_config = mock_grpo_components["master_config"]
+        master_config.policy["generation"]["sampler_replay"] = {"enabled": True}
+
+        with pytest.raises(ValueError, match="sampler_replay.*legacy GRPO"):
+            setup(master_config, MagicMock(), MagicMock(), None)
+
     @pytest.mark.parametrize(
         "val_temperature,val_top_k,rejected",
         [

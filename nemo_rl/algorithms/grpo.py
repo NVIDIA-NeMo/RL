@@ -132,6 +132,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
     GenerationSamplingParams,
+    sampler_replay_enabled,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -736,9 +737,9 @@ def setup(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     loss_config: ClippedPGLossConfig = master_config.loss_fn
-    if loss_config.score_centering:
+    if loss_config.score_centering or sampler_replay_enabled(generation_config):
         raise ValueError(
-            "Score centering requires SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
+            "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
         )
     env_configs = master_config.env
     data_config = master_config.data

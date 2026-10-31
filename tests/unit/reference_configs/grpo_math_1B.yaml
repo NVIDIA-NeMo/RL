@@ -432,7 +432,13 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
-    top_logprobs: 0  # Sampler candidates per token for score centering; 0 disables collection.
+    top_logprobs: 0  # Sampler candidates per token for score centering or replay; 0 disables collection.
+    # Sampler replay: with top-k/top-p, score the trainer's log-probs over the support
+    # the sampler drew from (the finite entries of its captured head) instead of
+    # recomputing the filters. Required by loss_fn.score_centering under top-k/top-p,
+    # and usable without it; needs top_logprobs >= top_k. See docs/guides/sampler-replay.md.
+    sampler_replay:
+      enabled: false
     val_temperature: ${.temperature}
     val_top_p: ${.top_p}
     val_top_k: ${.top_k}

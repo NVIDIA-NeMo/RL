@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import math
 import os
 from datetime import timedelta
 
@@ -19,7 +20,10 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
+)
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedCrossEntropyToFixedLogits,
     ChunkedDistributedEntropy,
@@ -39,6 +43,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
     get_policy_logprobs_at_sampler_topk,
+    sampler_support_ids,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -2131,7 +2136,15 @@ def test_student_teacher_kernels_normalize_bf16_logits_in_fp32(
     torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-5)
 
 
-def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, device):
+# Filtered score centering replays the sampler's support captured in the head.
+_SCORE_CENTERING_FILTERS = TrainingSamplingParams(
+    top_k=8, top_p=0.9, sampler_replay=True
+)
+
+
+def _run_score_centering_packed_equivalence(
+    rank, world_size, tp_size, cp_size, device, sampling_params=None
+):
     """Compare packed TP/CP values and gradients with a full-vocabulary reference."""
     from types import SimpleNamespace
 
@@ -2152,7 +2165,15 @@ def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, 
     cp_group = cp_groups[tp_rank] if cp_size > 1 else None
     torch.manual_seed(12)
     full = torch.randn(2, 8, 12, device=device, requires_grad=True)
-    ids = torch.randint(0, 12, (2, 8, 3), device=device)
+    ids = torch.stack([torch.randperm(12)[:3] for _ in range(16)]).view(2, 8, 3)
+    ids = ids.to(device)
+    sampler_logprobs = torch.zeros(2, 8, 3, device=device)
+    if sampling_params is not None:
+        # The sampler kept slots 0 and 1 (all of its mass) and filtered slot 2.
+        sampler_logprobs[..., :2] = -math.log(2)
+        sampler_logprobs[..., 2] = -float("inf")
+    # Under replay the caller marks filtered head slots with -1.
+    head_ids = sampler_support_ids(ids, sampler_logprobs) if sampling_params else ids
     lengths, padded = (0, 5, 12), (0, 8, 20)
 
     def pack_rows(tensor):
@@ -2175,7 +2196,7 @@ def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, 
     )
     local = local.detach().requires_grad_()
     actual = get_policy_logprobs_at_sampler_topk(
-        sampler_topk_token_ids=ids,
+        sampler_topk_token_ids=head_ids,
         next_token_logits=local,
         vocab_parallel_rank=tp_rank,
         vocab_parallel_group=tp_group,
@@ -2184,13 +2205,16 @@ def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, 
         cu_seqlens_q=lengths,
         cu_seqlens_q_padded=padded,
         packed_sampler_topk_token_ids=_pack_input_ids(
-            ids, lengths, padded, cp_rank=cp_rank, cp_size=cp_size, roll_shift=-1
+            head_ids, lengths, padded, cp_rank=cp_rank, cp_size=cp_size, roll_shift=-1
         ),
+        sampling_params=sampling_params,
     )
     data = {
         "input_ids": ids[..., 0],
+        "token_mask": torch.ones(2, 8, device=device),
+        "sample_mask": torch.ones(2, device=device),
         "sampler_topk_token_ids": ids,
-        "sampler_topk_logprobs": torch.zeros_like(ids, dtype=torch.float32),
+        "sampler_topk_logprobs": sampler_logprobs,
     }
     loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
     prepared, _ = prepare_packed_loss_input(
@@ -2202,6 +2226,7 @@ def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, 
         vocab_parallel_rank=tp_rank,
         vocab_parallel_group=tp_group,
         context_parallel_group=cp_group,
+        sampling_params=sampling_params,
         chunk_size=2,
     )
     torch.testing.assert_close(prepared["policy_logprobs_at_sampler_topk"], actual)
@@ -2218,24 +2243,35 @@ def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, 
             chunk_size=2,
         )
     actual = prepared["policy_logprobs_at_sampler_topk"]
-    expected = full[:, :-1].log_softmax(-1).gather(-1, ids[:, 1:])
-    mask = torch.zeros_like(expected)
-    mask[0, :4] = 1
-    mask[1, :6] = 1
+    if sampling_params is None:
+        expected = full[:, :-1].log_softmax(-1).gather(-1, ids[:, 1:])
+    else:
+        expected = _sampler_support_reference(full[:, :-1], head_ids[:, 1:])
+    mask = torch.zeros_like(expected, dtype=torch.bool)
+    mask[0, :4] = True
+    mask[1, :6] = True
+    assert torch.isneginf(expected[mask]).any() == (sampling_params is not None)
     torch.testing.assert_close(
-        prepared["next_token_logprobs"] * mask[..., 0], expected[..., 0] * mask[..., 0]
+        prepared["next_token_logprobs"].where(mask[..., 0], 0.0),
+        expected[..., 0].where(mask[..., 0], 0.0),
     )
-    torch.testing.assert_close(actual * mask, expected * mask, atol=1e-6, rtol=1e-5)
-    ((actual * mask).sum() / cp_size).backward()
-    (expected * mask).sum().backward()
+    torch.testing.assert_close(
+        actual.where(mask, 0.0), expected.where(mask, 0.0), atol=1e-6, rtol=1e-5
+    )
+    mask &= torch.isfinite(expected)
+    (actual.where(mask, 0.0).sum() / cp_size).backward()
+    expected.where(mask, 0.0).sum().backward()
     reference_grad = pack_rows(full.grad)
     if tp_size == 2:
         reference_grad = reference_grad[..., tp_rank * 6 : (tp_rank + 1) * 6]
     torch.testing.assert_close(local.grad, reference_grad, atol=1e-6, rtol=1e-5)
 
 
+@pytest.mark.parametrize("filtered", [False, True])
 @pytest.mark.parametrize("tp_size,cp_size", [(2, 1), (1, 2), (2, 2)])
-def test_score_centering_packed_tp_cp(distributed_test_runner, tp_size, cp_size):
+def test_score_centering_packed_tp_cp(
+    distributed_test_runner, tp_size, cp_size, filtered
+):
     if torch.cuda.device_count() < tp_size * cp_size:
         pytest.skip(f"Packed TP/CP gradient test requires {tp_size * cp_size} GPUs")
     distributed_test_runner(
@@ -2244,12 +2280,13 @@ def test_score_centering_packed_tp_cp(distributed_test_runner, tp_size, cp_size)
             tp_size=tp_size,
             cp_size=cp_size,
             device="cuda",
+            sampling_params=_SCORE_CENTERING_FILTERS if filtered else None,
         ),
         world_size=tp_size * cp_size,
     )
 
 
-def _run_score_centering_packed_gloo(rank, tp_size, cp_size, init_file):
+def _run_score_centering_packed_gloo(rank, tp_size, cp_size, init_file, filtered):
     """Exercise combined TP/CP collectives without requiring four GPU devices."""
     torch.set_num_threads(1)
     torch.distributed.init_process_group(
@@ -2261,18 +2298,24 @@ def _run_score_centering_packed_gloo(rank, tp_size, cp_size, init_file):
     )
     try:
         _run_score_centering_packed_equivalence(
-            rank, tp_size * cp_size, tp_size, cp_size, device="cpu"
+            rank,
+            tp_size * cp_size,
+            tp_size,
+            cp_size,
+            device="cpu",
+            sampling_params=_SCORE_CENTERING_FILTERS if filtered else None,
         )
     finally:
         torch.distributed.destroy_process_group()
 
 
+@pytest.mark.parametrize("filtered", [False, True])
 @pytest.mark.parametrize("tp_size,cp_size", [(2, 1), (1, 2), (2, 2)])
-def test_score_centering_packed_tp_cp_gloo(tmp_path, tp_size, cp_size):
+def test_score_centering_packed_tp_cp_gloo(tmp_path, tp_size, cp_size, filtered):
     """Retain combined TP=2/CP=2 value/gradient coverage on two-GPU CI runners."""
     torch.multiprocessing.spawn(
         _run_score_centering_packed_gloo,
-        args=(tp_size, cp_size, str(tmp_path / "gloo-init")),
+        args=(tp_size, cp_size, str(tmp_path / "gloo-init"), filtered),
         nprocs=tp_size * cp_size,
         join=True,
     )

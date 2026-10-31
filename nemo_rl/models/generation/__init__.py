@@ -19,9 +19,14 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
+    check_top_p_has_top_k,
     need_top_k_or_top_p_filtering,
 )
-from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    GenerationInterface,
+    sampler_replay_enabled,
+)
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
     resolve_role_overrides,
@@ -157,6 +162,23 @@ def configure_generation_config(
             f"got backend={config['backend']!r}. Use policy.worker_extension_cls_fqn to "
             "extend the training worker instead."
         )
+
+    if not is_eval and sampler_replay_enabled(config):
+        # Replaying the sampler's support needs top_k to bound it.
+        check_top_p_has_top_k(config["top_k"], config["top_p"])
+        if not need_top_k_or_top_p_filtering(
+            TrainingSamplingParams(top_k=config["top_k"], top_p=config["top_p"])
+        ):
+            raise ValueError(
+                "policy.generation.sampler_replay.enabled needs top-k/top-p "
+                "sampling (policy.generation.top_k/top_p)"
+            )
+        if not config.get("top_logprobs"):
+            raise ValueError(
+                "policy.generation.sampler_replay.enabled reads the sampler's "
+                "support from the captured sampler head: set "
+                "policy.generation.top_logprobs >= top_k"
+            )
 
     # tokenizer setting
     if "_pad_token_id" in config:

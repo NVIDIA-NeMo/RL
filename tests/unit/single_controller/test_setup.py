@@ -786,22 +786,71 @@ def test_token_capture_top_logprobs_rejects_megatron_generation():
         validate_single_controller_config(mc)
 
 
-def test_score_centering_requires_top_logprobs_and_unfiltered_sampling():
+def test_score_centering_requires_top_logprobs():
     mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
 
     with pytest.raises(ValueError, match="policy.generation.top_logprobs > 0"):
         validate_single_controller_config(mc)
 
+
+def test_score_centering_with_filtered_sampling_requires_head_covering_top_k():
+    """The captured head must be at least top_k wide to hold the sampler's kept set."""
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
     mc.token_capture.enabled = True
-    mc.policy["generation"]["top_logprobs"] = 4
-    mc.policy["generation"]["vllm_kwargs"] = {"max_logprobs": 4}
-    mc.policy["generation"]["top_p"] = 0.9
-    mc.policy["generation"]["temperature"] = 1.0
-    mc.policy["generation"]["top_k"] = None
-    with pytest.raises(ValueError, match="unfiltered sampling"):
+    generation = mc.policy["generation"]
+    generation.update(
+        top_logprobs=4,
+        vllm_kwargs={"max_logprobs": 20},
+        temperature=1.0,
+        top_p=0.9,
+        top_k=20,
+        sampler_replay={"enabled": True},
+    )
+    generation.setdefault("vllm_cfg", {})["logprobs_mode"] = "processed_logprobs"
+    for top_logprobs in (4, 19):
+        generation["top_logprobs"] = top_logprobs
+        with pytest.raises(ValueError, match="top_logprobs >= policy.generation.top_k"):
+            validate_single_controller_config(mc)
+
+    generation["top_logprobs"] = 20
+    validate_single_controller_config(mc)
+
+
+def test_score_centering_with_filtered_sampling_requires_sampler_support_replay():
+    """Centering under filters is exact only over the sampler's realized support."""
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.token_capture.enabled = True
+    generation = mc.policy["generation"]
+    generation.update(
+        top_logprobs=20,
+        vllm_kwargs={"max_logprobs": 20},
+        temperature=1.0,
+        top_p=0.9,
+        top_k=20,
+    )
+    generation.setdefault("vllm_cfg", {})["logprobs_mode"] = "processed_logprobs"
+    with pytest.raises(ValueError, match="sampler_replay.enabled=true"):
         validate_single_controller_config(mc)
 
-    mc.policy["generation"]["top_p"] = 1.0
+
+def test_sampler_support_replay_without_score_centering():
+    """Replay alone reads the captured head, which must hold the whole kept set."""
+    mc = _make_master_config()
+    mc.token_capture.enabled = True
+    generation = mc.policy["generation"]
+    generation.update(
+        top_logprobs=19,
+        vllm_kwargs={"max_logprobs": 20},
+        temperature=1.0,
+        top_p=0.9,
+        top_k=20,
+        sampler_replay={"enabled": True},
+    )
+    generation.setdefault("vllm_cfg", {})["logprobs_mode"] = "processed_logprobs"
+    with pytest.raises(ValueError, match="top_logprobs >= policy.generation.top_k"):
+        validate_single_controller_config(mc)
+
+    generation["top_logprobs"] = 20
     validate_single_controller_config(mc)
 
 
@@ -4484,7 +4533,7 @@ def test_score_centering_rejects_invalid_top_logprobs(count):
         validate_single_controller_config(mc)
 
 
-def test_generation_top_logprobs_requires_score_centering():
+def test_generation_top_logprobs_requires_score_centering_or_replay():
     mc = _make_master_config()
     mc.token_capture.enabled = True
     mc.policy["generation"]["top_logprobs"] = 4

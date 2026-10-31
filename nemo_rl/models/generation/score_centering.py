@@ -85,7 +85,8 @@ def extract_score_centering_samples(
     The current strategy takes the lowest-ranked candidates from each engine
     logprob mapping, excluding an extra sampled token outside the top-k head.
     Candidate logprobs retain their original mass rather than being normalized
-    over the selected set.
+    over the selected set. Candidates the sampler filtered out (top-k, top-p)
+    keep their ``-inf`` processed logprob.
 
     Args:
         output: One engine CompletionOutput, including per-position logprobs.
@@ -111,8 +112,8 @@ def extract_score_centering_samples(
                 or not 0 <= token_id <= max_token_id
                 or isinstance(lp, bool)
                 or not isinstance(lp, Real)
-                or not math.isfinite(lp)
-                or float(lp) < min_logprob
+                or math.isnan(lp)
+                or (float(lp) < min_logprob and lp != -math.inf)
                 or float(lp) > 1e-5
             ):
                 raise ValueError("Invalid sampler top-k token id or log probability")

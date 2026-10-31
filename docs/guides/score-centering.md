@@ -15,6 +15,9 @@ Let `p(v)` be the current training policy, `q(v)` the rollout sampler, and `H`
 the sampler's top-k token set at one generated position. The sampler supplies
 both token IDs and logprobs for `H`. The trainer computes its own logprobs at
 those same IDs, normalized over the full vocabulary rather than just `H`.
+With top-k/top-p sampling, `q` is the filtered sampler distribution and `p`
+is the trainer's distribution renormalized over the same support (see
+[Sampling filters](#sampling-filters)).
 
 The estimator models the unobserved sampler tail as a rescaled training-policy
 tail:
@@ -101,10 +104,28 @@ score centering and token capture. Requests must omit nonempty
 head, even if the list contains K IDs. Such requests are rejected.
 Use positive temperature and
 `processed_logprobs` to keep the reported sampler probabilities consistent
-with the distribution being sampled. Startup validation checks the top-p and
-top-k filters and rejects nonpositive/nonfinite temperatures. Raw/default logprobs
-are accepted only at temperature 1; non-unit temperatures require processed
-logprobs. Other sampling processors must not change the distribution when using raw logprobs.
+with the distribution being sampled. Startup validation rejects
+nonpositive/nonfinite temperatures. Raw/default logprobs are accepted only at
+temperature 1 without sampling filters; non-unit temperatures and top-k/top-p
+filtering require processed logprobs. Other sampling processors must not change
+the distribution when using raw logprobs.
+
+### Sampling filters
+
+Score centering under top-k or top-p sampling requires
+[Sampler Replay](sampler-replay.md): set
+`policy.generation.sampler_replay.enabled: true` and meet its requirements,
+including `top_logprobs >= top_k`. Score centering with a filter and replay
+disabled is rejected at setup.
+
+With replay, `p` is the trainer's distribution renormalized over the sampler's
+kept set `S_q`, the same support as `q`, and the captured head holds all of
+`S_q`:
+
+- Head slots the sampler filtered out (`-inf`) carry no coefficient.
+- The head holds all of `p`, so the estimator has no tail (`rho = 0`) and is
+  exact for every IS mode and for both token- and sequence-level loss.
+- The sampled token and the head are scored in one pass over `S_q`.
 
 To enable TIS, replace the four IS settings with:
 
@@ -180,12 +201,17 @@ sampling without replacement or change the current top-k estimator.
   logprobs, and CP shards are reconstructed separately for each padded sequence.
   Externally prepacked inputs are rejected. The example above uses the ordinary
   unpacked path; enable both packing and `fuse_loss` for the packed path.
+- With sampling filters, the sampled token and the head are scored in one pass
+  over the captured support: a gather of the `K` head logits and a logsumexp
+  over the finite ones (under tensor parallelism, one all-reduce of those `K`
+  logits per position), with no vocabulary top-k or softmax.
 - Automodel context-parallel sharding and DTensor logits are unsupported.
 - Full-vocabulary on-policy distillation and fused linear logprobs are
   rejected because this path needs ordinary vocabulary logits.
 - Extraction checks the generated-token count, candidate count, unique IDs,
-  nonnegative int32-compatible IDs, finite float32-representable logprobs, logprobs no larger
-  than `1e-5`, and head mass no larger than `1.0001`. Finite sampler logprobs
+  nonnegative int32-compatible IDs, float32-representable logprobs (`-inf` is
+  kept for candidates the sampler filtered out), logprobs no larger
+  than `1e-5`, and head mass no larger than `1.0001`. Sampler logprobs
   are preserved without flooring or renormalization. These checks apply before
   staging; ignored prompt/tool positions are still zero-filled by the finalizer.
 
