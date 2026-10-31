@@ -218,7 +218,12 @@ def get_tokenizer(
     tokenizer_kwargs = dict(tokenizer_config.get("tokenizer_kwargs") or {})
 
     if get_processor:
-        processor = AutoProcessor.from_pretrained(
+        processor_type = AutoProcessor
+        if tokenizer_config.get("processor_class") is not None:
+            from hydra.utils import get_class  # Optional native processor support.
+
+            processor_type = get_class(tokenizer_config["processor_class"])
+        processor = processor_type.from_pretrained(
             tokenizer_config["name"],
             trust_remote_code=True,
             use_fast=tokenizer_kwargs.pop("use_fast", True),
@@ -371,6 +376,18 @@ def validate_and_prepare_config(
         else ("sdpa" if cp_size_cfg > 1 else None)
     )
 
+    native_model = config.get("native_model")
+    if native_model is not None:
+        if (
+            enable_seq_packing
+            or config["automodel_cfg"].get("tensor_parallel_size", 1) != 1
+            or cp_size_cfg != 1
+        ):
+            raise ValueError("Native SpeechLM requires unpacked sequences with TP=CP=1")
+        from nemo_rl.models.automodel.speechlm import register_speechlm_config
+
+        register_speechlm_config()
+
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
@@ -420,7 +437,16 @@ def validate_and_prepare_config(
         else:
             raise ValueError(f"Unknown reward model type: {rm_type}")
     else:
-        model_class = resolve_model_class(model_config.model_type)
+        if native_model is not None:
+            if model_config.model_type != "nemo_speechlm":
+                raise ValueError(
+                    "policy.native_model requires a nemo_speechlm checkpoint"
+                )
+            from nemo_rl.models.automodel.speechlm import SpeechLMPolicy
+
+            model_class = SpeechLMPolicy
+        else:
+            model_class = resolve_model_class(model_config.model_type)
 
     # Get parallelization sizes
     tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
@@ -918,7 +944,10 @@ def setup_model_and_optimizer(
 
     # Auto-set force_hf if the custom model's adapter doesn't support per-tensor
     # HF conversion (required for weight syncing).
-    _maybe_set_force_hf(automodel_kwargs, model_config)
+    if config.get("native_model") is None:
+        _maybe_set_force_hf(automodel_kwargs, model_config)
+    else:
+        from_pretrained_kwargs["native_model"] = config["native_model"]
     if router_replay_enabled(config):
         require_automodel_moe_model(automodel_kwargs, model_config)
         enable_routing_replay_in_automodel_kwargs(automodel_kwargs)
@@ -938,7 +967,12 @@ def setup_model_and_optimizer(
 
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
-    model = model_class.from_pretrained(
+    model_factory = (
+        model_class.from_native_pretrained
+        if config.get("native_model") is not None
+        else model_class.from_pretrained
+    )
+    model = model_factory(
         model_name,
         distributed_setup=distributed_setup,
         peft_config=peft_config,
@@ -960,6 +994,8 @@ def setup_model_and_optimizer(
     )
     # Autocast is disabled for custom MoE models (non-HF) to avoid numerical issues
     autocast_enabled = not (is_moe_model and not is_hf_model)
+    if config.get("native_model") is not None:
+        is_moe_model, is_hf_model, autocast_enabled = False, False, True
 
     # Set pad token ID if needed. Some model configs (e.g. Gemma3 in transformers v5)
     # don't have pad_token_id as a direct attribute.

@@ -231,6 +231,8 @@ def _module_params_generator(
         Tuples of (fully_qualified_name, tensor) where tensors are converted to
         the refit dtype and made contiguous.
     """
+    from nemo_rl.models.automodel.refit import refit_state_dict
+
     # Key the module map by the names ``state_dict()`` uses. With activation
     # checkpointing Automodel wraps every decoder block in torch's
     # ``CheckpointWrapper``, whose ``_checkpoint_wrapped_module.`` component
@@ -242,7 +244,7 @@ def _module_params_generator(
     module_map = {
         canonical_parameter_fqn(name): module for name, module in model.named_modules()
     }
-    state_dict = model.state_dict()
+    state_dict = refit_state_dict(model)
     _assert_lora_modules_reachable(module_map, state_dict)
     for name, tensor in state_dict.items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
@@ -1313,7 +1315,9 @@ class AutomodelPolicyWorkerImpl(
                 )
             }
         state_dict_info = {}
-        for name, tensor in self.model.state_dict().items():
+        from nemo_rl.models.automodel.refit import refit_state_dict
+
+        for name, tensor in refit_state_dict(self.model).items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
                 continue
             full_tensor = (

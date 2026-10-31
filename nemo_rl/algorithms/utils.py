@@ -121,6 +121,7 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
     std_rewards: torch.Tensor | None = None,
+    full_group_std: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
@@ -139,6 +140,9 @@ def calculate_baseline_and_std_per_prompt(
                                   which needs std on the raw task metric for dynamic
                                   sampling filtering while keeping baseline on the
                                   shaped reward.
+
+    full_group_std: Use centered full-valid-group sample SD independently of the
+        leave-one-out mean. False preserves the existing estimator.
 
     Returns:
     tensor (b,), tensor (b,), bool tensor (b,) of baselines, std, and a per-sample
@@ -230,6 +234,16 @@ def calculate_baseline_and_std_per_prompt(
                 .sqrt()
                 .nan_to_num(0)
             )
+
+            if full_group_std:
+                valid_rewards = std_rewards[prompt_idx][valid_mask[prompt_idx].bool()]
+                trivial = valid_rewards.amin() == valid_rewards.amax()
+                std[prompt_idx] = torch.where(
+                    trivial,
+                    torch.zeros((), dtype=std.dtype, device=std.device),
+                    valid_rewards.std(correction=1),
+                )
+                is_trivial_distribution[prompt_idx] = trivial
 
     return baseline, std, is_trivial_distribution
 
@@ -438,7 +452,12 @@ def get_tokenizer(
     tokenizer_kwargs = dict(tokenizer_config.get("tokenizer_kwargs") or {})
 
     if get_processor:
-        processor = AutoProcessor.from_pretrained(
+        processor_type = AutoProcessor
+        if tokenizer_config.get("processor_class") is not None:
+            from hydra.utils import get_class  # Optional native processor support.
+
+            processor_type = get_class(tokenizer_config["processor_class"])
+        processor = processor_type.from_pretrained(
             tokenizer_config["name"],
             trust_remote_code=True,
             use_fast=tokenizer_kwargs.pop("use_fast", True),

@@ -331,6 +331,7 @@ guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
 guides/grpo-audio.md
+guides/gspo-speechlm.md
 guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md

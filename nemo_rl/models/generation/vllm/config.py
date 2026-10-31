@@ -55,6 +55,7 @@ class VllmVideoConfig(BaseModel):
 
 
 class VllmSpecificArgs(TypedDict):
+    native_speechlm: NotRequired[bool]
     tensor_parallel_size: int
     pipeline_parallel_size: int
     expert_parallel_size: int
