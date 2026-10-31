@@ -136,11 +136,12 @@ tool, and abandoned-branch tokens do not count. The final-function-call exceptio
 for empty answers is preserved. Token IDs, logprobs, and training masks keep their
 existing behavior.
 
-The malformed think-tag check runs on each generated span. When each tag is a single
-token, the tag counts must match the thinking mode set by the prompt; the decoded text
-must also contain no open tag and at most one close tag. Gym's message-level
-`has_malformed_thinking` flag is not used with capture. Non-finite generation logprobs
-are rejected at staging, and the rollout is masked as `capture_poisoned`.
+The malformed think-tag check runs on each generated span. When think-tag IDs are
+configured or each tag is a single token, the tag counts must match the thinking mode
+set by the prompt; the decoded text must also contain no open tag and at most one
+close tag. Gym's message-level `has_malformed_thinking` flag is not used with
+capture. Non-finite generation logprobs are rejected at staging, and the rollout is
+masked as `capture_poisoned`.
 
 Both paths share the classification, text checks, token membership check, and
 shaping formula. For low-effort prompts:

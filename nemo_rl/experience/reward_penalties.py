@@ -538,6 +538,7 @@ def aggregate_capture_reward_metrics(
     if not count:
         return {}
     result: dict[str, Any] = {"finalize/reward_count": float(count)}
+    # finalize/penalty_count/*: summed over groups, then divided by valid rows.
     for category, metric in CAPTURE_PENALTY_METRICS.items():
         key = f"finalize/penalty_count/{category}"
         if key in metrics:
@@ -556,6 +557,7 @@ def aggregate_capture_reward_metrics(
         result.update(
             calculate_single_metric(values, len(values), f"{agent_name}/reward")
         )
+    # finalize/truncated_count: pooled the same way into the termination rates.
     if "finalize/truncated_count" in metrics:
         truncated = sum(metrics["finalize/truncated_count"])
         result["truncation_rate"] = truncated / count
@@ -566,6 +568,7 @@ def aggregate_capture_reward_metrics(
                 result[f"{agent_name}/truncation_rate"] = sum(metrics[key]) / len(
                     values
                 )
+    # finalize/effort/*: per-length row counts, expanded back to per-row lengths.
     for bucket in ("low", "high"):
         lengths = [
             int(name.rsplit("/", 1)[1])
