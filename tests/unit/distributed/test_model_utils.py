@@ -29,6 +29,7 @@ from nemo_rl.distributed.model_utils import (
     ChunkedDistributedReverseKLToFixedLogits,
     DistributedLogprob,
     DistributedLogprobWithSampling,
+    SamplerSupportLogprob,
     _compute_distributed_log_softmax,
     _compute_distributed_selected_logprobs,
     _get_tokens_on_this_cp_rank,
@@ -2273,5 +2274,117 @@ def test_score_centering_packed_tp_cp_gloo(tmp_path, tp_size, cp_size):
         _run_score_centering_packed_gloo,
         args=(tp_size, cp_size, str(tmp_path / "gloo-init")),
         nprocs=tp_size * cp_size,
+        join=True,
+    )
+
+
+def _sampler_support(batch_size, seq_len, vocab_size, k, generator=None):
+    """Distinct per-position support ids ``[B, S, k]``, ``-1`` where the sampler filtered."""
+    ids = torch.stack(
+        [
+            torch.randperm(vocab_size, generator=generator)[:k]
+            for _ in range(batch_size * seq_len)
+        ]
+    ).view(batch_size, seq_len, k)
+    filtered = torch.rand(batch_size, seq_len, k, generator=generator) < 0.3
+    filtered[..., 0] = False  # the likeliest id is always kept
+    return ids.masked_fill(filtered, -1)
+
+
+def _sampler_support_reference(logits, support):
+    """Log-softmax over each position's support ids, ``-inf`` at filtered slots."""
+    valid = support >= 0
+    z = (
+        logits.float()
+        .gather(-1, support.clamp(min=0))
+        .masked_fill(~valid, -float("inf"))
+    )
+    log_norm = z.logsumexp(-1, keepdim=True)
+    return z - torch.where(torch.isneginf(log_norm), 0.0, log_norm)
+
+
+@pytest.mark.parametrize("chunk_size", [None, 2])
+def test_sampler_support_logprob_matches_the_renormalized_support(chunk_size):
+    """Exact sampler replay: renormalize over the captured S_q, no vocab top-k."""
+    torch.manual_seed(0)
+    logits = torch.randn(2, 5, 11, dtype=torch.float64).float().requires_grad_(True)
+    support = _sampler_support(2, 5, 11, 4)
+    support[1, 4] = -1  # a position without support (e.g. padding) stays finite-free
+    actual = SamplerSupportLogprob.apply(logits, support, 0, None, chunk_size, False)
+    expected = _sampler_support_reference(logits, support)
+    torch.testing.assert_close(actual, expected)
+    assert torch.isneginf(actual[1, 4]).all() and not actual.isnan().any()
+
+    finite = torch.isfinite(expected)
+    weights = torch.randn(expected.shape)
+    grad = torch.autograd.grad(actual.where(finite, 0.0).mul(weights).sum(), logits)[0]
+    reference = torch.autograd.grad(
+        expected.where(finite, 0.0).mul(weights).sum(), logits
+    )[0]
+    torch.testing.assert_close(grad, reference)
+
+
+def _run_sampler_support_tp_gloo(rank, world_size, init_file):
+    """TP=2: one all-reduce of the K gathered logits per chunk, nothing vocabulary-sized."""
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=120),
+    )
+    dist = torch.distributed
+    originals = {
+        name: getattr(dist, name)
+        for name in ("all_reduce", "all_gather", "all_to_all", "all_to_all_single")
+    }
+    calls = []
+
+    def spy(name):
+        def wrapped(*args, **kwargs):
+            calls.append((name, args[0].numel()))
+            return originals[name](*args, **kwargs)
+
+        return wrapped
+
+    for name in originals:
+        setattr(dist, name, spy(name))
+    try:
+        batch_size, seq_len, vocab_size, k = 2, 6, 16, 4
+        local_vocab = vocab_size // world_size
+        generator = torch.Generator().manual_seed(3)
+        full = torch.randn(batch_size, seq_len, vocab_size, generator=generator)
+        full = full.to(torch.bfloat16).requires_grad_(True)
+        support = _sampler_support(batch_size, seq_len, vocab_size, k, generator)
+        local = full.detach()[..., rank * local_vocab : (rank + 1) * local_vocab]
+        local = local.clone().requires_grad_(True)
+        actual = SamplerSupportLogprob.apply(
+            local, support, rank * local_vocab, dist.group.WORLD, 4, False
+        )
+        assert [name for name, _ in calls] == ["all_reduce"] * 2, calls
+        assert all(numel <= batch_size * 4 * k for _, numel in calls), calls
+
+        expected = _sampler_support_reference(full, support)
+        torch.testing.assert_close(actual, expected.detach())
+        finite = torch.isfinite(expected)
+        actual.where(finite, 0.0).sum().backward()
+        expected.where(finite, 0.0).sum().backward()
+        torch.testing.assert_close(
+            local.grad,
+            full.grad[..., rank * local_vocab : (rank + 1) * local_vocab],
+        )
+        assert [name for name, _ in calls] == ["all_reduce"] * 2, calls
+    finally:
+        for name, fn in originals.items():
+            setattr(dist, name, fn)
+        torch.distributed.destroy_process_group()
+
+
+def test_sampler_support_logprob_tp_gloo(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_sampler_support_tp_gloo,
+        args=(2, str(tmp_path / "gloo-init")),
+        nprocs=2,
         join=True,
     )
