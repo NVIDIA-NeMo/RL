@@ -1012,8 +1012,8 @@ def nemo_gym_data_processor(
                 "nor a dynamic min_num_patches/max_num_patches budget."
             )
 
-        # Send the logical tile cap with the Gym request. The vLLM processor
-        # uses max_num_tiles for both InternVL and dynamic-resolution models.
+        # Forward the processor request override. Gym setup rejects this option
+        # until generation and training can honor the same tile cap.
         from nemo_rl.environments.nemo_gym_multimodal import (
             _inject_vllm_mm_processor_kwargs,
         )

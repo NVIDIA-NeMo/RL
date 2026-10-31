@@ -52,6 +52,15 @@ async_rl:
   diagnostics: false
   # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
   log_full_train_data: false
+  # Writer used by log_full_train_data. json writes JSONL files; set target to a
+  # dotted import path of a DebugWriter defined outside this repo to store the dump
+  # elsewhere (extra keys are passed to its constructor).
+  debug_writer:
+    target: json
+  # With policy.megatron_cfg.checkpoint.async_save: finalize async checkpoints at a
+  # later step boundary so the disk write overlaps training. The overlap is shorter
+  # here than for GRPO: the critic handoff blocks on the finalize once per chunk.
+  defer_async_checkpoint_finalize: false
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are

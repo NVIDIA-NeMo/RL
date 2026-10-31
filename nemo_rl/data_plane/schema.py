@@ -13,6 +13,7 @@
 # limitations under the License.
 """Shared constants and type aliases for the data-plane meta contract."""
 
+from dataclasses import dataclass
 from typing import Literal, Optional, Sequence
 
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
@@ -203,3 +204,42 @@ def fields_with_optional_opd_full(
     if teacher_index_field is not None and teacher_index_field not in out:
         out.append(teacher_index_field)
     return out
+
+
+@dataclass(frozen=True)
+class LogicalRowTag:
+    """Required ownership metadata on real and execution-padding forest rows."""
+
+    dispatch_group_id: str
+    logical_rollout_id: str | None
+    logical_slot: int | None
+    logical_group_size: int
+    segment_index: int | None
+    segment_count: int
+    is_execution_padding: bool
+
+
+def forest_segment_id(owner_id: str, segment_index: int) -> str:
+    """Canonical identity of a physical row owned by one logical rollout."""
+    return f"{owner_id}_s{segment_index}"
+
+
+def forest_row_ids(
+    group_id: str,
+    owner_ids: Sequence[str],
+    segment_counts: Sequence[int],
+    *,
+    execution_row_multiple: int,
+) -> tuple[str, ...]:
+    """One publication/cleanup plan: owner segments followed by execution padding."""
+    if type(execution_row_multiple) is not int or execution_row_multiple < 1:
+        raise ValueError("execution_row_multiple must be a positive integer")
+    real_ids = tuple(
+        forest_segment_id(owner, index)
+        for owner, count in zip(owner_ids, segment_counts, strict=True)
+        for index in range(count)
+    )
+    return real_ids + tuple(
+        f"{group_id}_pad{index}"
+        for index in range(-len(real_ids) % execution_row_multiple)
+    )

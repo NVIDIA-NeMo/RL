@@ -46,6 +46,7 @@ class Value(ValueInterface):
         cluster: RayVirtualCluster,
         config: ValueConfig,
         tokenizer: PreTrainedTokenizerBase,
+        seed: int,
         name_prefix: str = "lm_value",
         workers_per_node: Optional[Union[int, list[int]]] = None,
         init_optimizer: bool = True,
@@ -58,6 +59,8 @@ class Value(ValueInterface):
             cluster: Ray virtual cluster for distributed training
             config: Configuration for the value model
             tokenizer: Tokenizer for the model
+            seed: Seed applied by Automodel value workers before model construction;
+                Megatron ignores it
             name_prefix: Prefix for worker names
             workers_per_node: Number of workers per node
             init_optimizer: Whether to initialize the optimizer
@@ -159,6 +162,7 @@ class Value(ValueInterface):
         pre_init_queue = RayQueue()
         worker_kwargs = {
             "tokenizer": tokenizer,
+            "seed": seed,
             "init_optimizer": init_optimizer,
             "weights_path": weights_path,
             "optimizer_path": optimizer_path,
