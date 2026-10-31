@@ -12,6 +12,5 @@ NeMo-RL CI and test facts.
 - **A functional test's real config is recipe YAML + base script overrides + wrapper overrides.** KL was 0.01, not 0 (#4507).
 - **Check that a new test's parameters exercise the feature, not its no-op case (e.g. an M-to-N feature at M=N=1).** (#2797, #3739)
 - **When a PR deletes a CI check, compare its trigger conditions with the claimed replacement.** `cicd-main.yml` jobs wait for `/ok to test` (#3235). Details: [deleted-ci-guard-verify-replacement](details/deleted-ci-guard-verify-replacement.md).
-- **To test a binary the PR installs in the image, ask for a unit test in the existing lane, not a new CI step.** (#4375) Details: [check-in-the-image-ci-already-builds](details/check-in-the-image-ci-already-builds.md).
-- **New files and tests follow their siblings' location and shape; also flag unit tests that assert nothing and YAMLs with local model, tokenizer or dataset paths.** (#3286)
+- **Flag unit tests that assert nothing and YAMLs with local model, tokenizer or dataset paths.** (#3286)
 - **Check that a test actually reaches the code it covers: a fake that bypasses the wrapper, a `spec=` mock that makes a new predicate truthy, or a skip that always fires in CI all hide it.** (#2884, #3785) Details: [test-reaches-the-code-it-covers](details/test-reaches-the-code-it-covers.md).
