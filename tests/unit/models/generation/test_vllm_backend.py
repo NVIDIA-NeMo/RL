@@ -26,10 +26,9 @@ import torch
 from safetensors.torch import save_file
 
 
-def _make_collective_update_extension(backend):
-    ext = backend.VllmInternalWorkerExtension.__new__(
-        backend.VllmInternalWorkerExtension
-    )
+def _make_collective_update_extension(backend, *, extension_cls: type | None = None):
+    extension_cls = extension_cls or backend.VllmInternalWorkerExtension
+    ext = extension_cls.__new__(extension_cls)
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
@@ -42,6 +41,7 @@ def _make_collective_update_extension(backend):
         ),
         drafter=None,
     )
+    ext.model_runner.get_model = lambda: ext.model_runner.model
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
@@ -303,13 +303,16 @@ class _DeferredReloadLayer(torch.nn.Module):
 
 
 class _DeferredReloadModel(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, shard_weight: bool = False) -> None:
         super().__init__()
         self.layer = _DeferredReloadLayer()
+        self.shard_weight = shard_weight
 
     def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         params = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            if self.shard_weight:
+                loaded_weight = loaded_weight[::2]
             param = params[name]
             weight_loader = getattr(param, "weight_loader", None)
             assert callable(weight_loader)
@@ -620,28 +623,40 @@ def test_fp8_layerwise_reload_passes_entire_quantized_generator(
     monkeypatch.setattr(
         fp8, "get_quantized_weight_iterator", get_quantized_weight_iterator
     )
-    monkeypatch.setattr(
-        vllm_backend, "_detach_pending_layerwise_weights", lambda *_args: None
-    )
-
     ext._load_hf_weights(source_weights)
 
-    assert received_weights == quantized_weights
+    assert [name for name, _ in received_weights] == [
+        name for name, _ in quantized_weights
+    ]
+    for (_, received), (_, source) in zip(received_weights, quantized_weights):
+        assert received.dtype == source.dtype
+        torch.testing.assert_close(received.float(), source.float())
+        if native_reload:
+            assert (
+                received.untyped_storage().data_ptr()
+                != source.untyped_storage().data_ptr()
+            )
+        else:
+            assert received is source
 
 
 @pytest.mark.vllm
-def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypatch):
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("shard_weight", [False, True])
+def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(
+    monkeypatch, device, shard_weight
+):
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
 
     from nemo_rl.models.generation.vllm import vllm_backend
 
-    model = _DeferredReloadModel()
+    model = _DeferredReloadModel(shard_weight=shard_weight).to(device)
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
     ext.model_config = None
-    ext.device = torch.device("cpu")
+    ext.device = torch.device(device)
     ext._uses_unquantized_flashinfer_trtllm = lambda: True
     ext._validate_native_layerwise_refit = lambda _transport=None: None
     ext._maybe_process_mtp_drafter_after_loading = MagicMock()
@@ -654,96 +669,110 @@ def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypa
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
     )
-    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    stream = torch.cuda.Stream() if device == "cuda" else None
+    if stream is not None:
+        stream.wait_stream(torch.cuda.current_stream())
+    with (
+        torch.device(device),
+        torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext(),
+    ):
+        size = 4 if shard_weight else 2
+        transport_buffer = torch.empty(size + 2, device=device)[1:-1]
+        record_metadata_for_reloading(model)
+        graph = None
+        for offset in (0, 10):
+            with ext._weight_update_lifecycle("collective") as finalize:
+                first = torch.arange(size, device=device).float() + offset
+                second = first + 6
+                transport_buffer.copy_(first)
+                ext._load_full_hf_weights([("layer.first", transport_buffer)])
+                transport_buffer.copy_(second)
+                ext._load_full_hf_weights([("layer.second", transport_buffer)])
+                transport_buffer.zero_()
+                finalize()
 
-    transport_buffer = torch.empty(2)
-    record_metadata_for_reloading(model)
-
-    with ext._weight_update_lifecycle("collective") as finalize:
-        transport_buffer.copy_(torch.tensor([1.0, 2.0]))
-        ext._load_full_hf_weights([("layer.first", transport_buffer)])
-
-        transport_buffer.copy_(torch.tensor([7.0, 8.0]))
-        ext._load_full_hf_weights([("layer.second", transport_buffer)])
-        finalize()
-
-    torch.testing.assert_close(model.layer.first, torch.tensor([1.0, 2.0]))
-    torch.testing.assert_close(model.layer.second, torch.tensor([7.0, 8.0]))
+            torch.testing.assert_close(
+                model.layer.first, first[::2] if shard_weight else first
+            )
+            torch.testing.assert_close(
+                model.layer.second, second[::2] if shard_weight else second
+            )
+            if stream is not None:
+                if graph is None:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream):
+                        output = model.layer.first + model.layer.second
+                graph.replay()
+                torch.testing.assert_close(
+                    output, model.layer.first + model.layer.second
+                )
 
 
 @pytest.mark.vllm
-def test_layerwise_reload_detaches_deferred_transport_weights(monkeypatch):
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("loaded_names", [None, {"model.weight"}])
+def test_full_hf_loader_preserves_iterable_and_result(native, loaded_names):
     from nemo_rl.models.generation.vllm import vllm_backend
 
-    source = torch.ones(4)
-    unrelated = torch.full((2,), 7.0)
-    source_args = SimpleNamespace(arguments={"loaded_weight": source[:2]})
-    unrelated_args = SimpleNamespace(arguments={"loaded_weight": unrelated})
-    model = SimpleNamespace(modules=lambda: [object()])
-    monkeypatch.setattr(
-        "vllm.model_executor.model_loader.reload.layerwise.get_layerwise_info",
-        lambda _module: SimpleNamespace(
-            loaded_weights=[("source", source_args), ("other", unrelated_args)]
-        ),
-    )
+    source = torch.ones(2)
+    consumed = []
 
-    vllm_backend._detach_pending_layerwise_weights(
-        model, {source.untyped_storage().data_ptr()}
-    )
+    def source_weights():
+        consumed.append(True)
+        yield "model.weight", source
 
-    detached = source_args.arguments["loaded_weight"]
-    assert detached.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
-    assert unrelated_args.arguments["loaded_weight"] is unrelated
-    source.zero_()
-    torch.testing.assert_close(detached, torch.ones(2))
+    policy_weights = source_weights()
+
+    def load_weights(*, weights):
+        assert not consumed
+        if not native:
+            assert weights is policy_weights
+        name, tensor = next(weights)
+        assert name == "model.weight"
+        assert (tensor is source) is (not native)
+        torch.testing.assert_close(tensor, source)
+        assert list(weights) == []
+        return loaded_names
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=SimpleNamespace(load_weights=load_weights))
+    ext._nrl_layerwise_reload_active = native
+
+    assert ext._load_full_hf_weights(policy_weights) is loaded_names
 
 
 @pytest.mark.vllm
-def test_layerwise_reload_preserves_weight_load_error(monkeypatch, caplog):
+@pytest.mark.parametrize("failure", ["loader", "iterator", "clone"])
+def test_layerwise_reload_preserves_weight_load_error(monkeypatch, failure):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     load_error = RuntimeError("load failed")
-    model = SimpleNamespace(load_weights=MagicMock(side_effect=load_error))
+
+    def source_weights():
+        yield "model.weight", torch.ones(1)
+        if failure == "iterator":
+            raise load_error
+
+    def load_weights(*, weights):
+        list(weights)
+        if failure == "loader":
+            raise load_error
+
+    model = SimpleNamespace(load_weights=load_weights)
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(model=model)
     ext._nrl_layerwise_reload_active = True
-    monkeypatch.setattr(
-        vllm_backend,
-        "_detach_pending_layerwise_weights",
-        MagicMock(side_effect=RuntimeError("detach failed")),
-    )
+    if failure == "clone":
+        monkeypatch.setattr(torch.Tensor, "clone", MagicMock(side_effect=load_error))
 
     with pytest.raises(RuntimeError, match="load failed") as exc_info:
-        ext._load_full_hf_weights([("model.weight", torch.ones(1))])
+        ext._load_full_hf_weights(source_weights())
 
     assert exc_info.value is load_error
-    assert "Failed to detach deferred weights" in caplog.text
-
-
-@pytest.mark.vllm
-def test_layerwise_reload_propagates_detach_error_after_successful_load(monkeypatch):
-    from nemo_rl.models.generation.vllm import vllm_backend
-
-    detach_error = RuntimeError("detach failed")
-    model = SimpleNamespace(load_weights=MagicMock())
-    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
-        vllm_backend.VllmInternalWorkerExtension
-    )
-    ext.model_runner = SimpleNamespace(model=model)
-    ext._nrl_layerwise_reload_active = True
-    monkeypatch.setattr(
-        vllm_backend,
-        "_detach_pending_layerwise_weights",
-        MagicMock(side_effect=detach_error),
-    )
-
-    with pytest.raises(RuntimeError, match="detach failed") as exc_info:
-        ext._load_full_hf_weights([("model.weight", torch.ones(1))])
-
-    assert exc_info.value is detach_error
-    model.load_weights.assert_called_once()
 
 
 @pytest.mark.vllm
@@ -1314,7 +1343,13 @@ def test_update_weights_from_collective_uses_native_reload_when_enabled(monkeypa
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
 
     def packed_broadcast_consumer(
-        iterator, group, src, post_unpack_func, return_iterator=False
+        iterator,
+        group,
+        src,
+        post_unpack_func,
+        return_iterator=False,
+        *,
+        num_buffers=None,
     ):
         call_order.append("broadcast")
         assert list(iterator) == [("model.weight", expected_state_info)]
@@ -1322,6 +1357,7 @@ def test_update_weights_from_collective_uses_native_reload_when_enabled(monkeypa
         assert src == 0
         assert post_unpack_func is None
         assert return_iterator is True
+        assert num_buffers is None
         return iter([("model.weight", "weight-value")])
 
     def reload_weights(*, weights_iterator):
@@ -1373,7 +1409,13 @@ def test_update_weights_from_collective_reload_closes_abandoned_iterator(monkeyp
     weight_iterator = CloseableIterator()
 
     def packed_broadcast_consumer(
-        iterator, group, src, post_unpack_func, return_iterator=False
+        iterator,
+        group,
+        src,
+        post_unpack_func,
+        return_iterator=False,
+        *,
+        num_buffers=None,
     ):
         call_order.append("broadcast")
         assert list(iterator) == [("model.weight", expected_state_info)]
@@ -1381,6 +1423,7 @@ def test_update_weights_from_collective_reload_closes_abandoned_iterator(monkeyp
         assert src == 0
         assert post_unpack_func is None
         assert return_iterator is True
+        assert num_buffers is None
         return weight_iterator
 
     def reload_weights(*, weights_iterator):
@@ -1429,7 +1472,113 @@ def test_collective_fp8_uses_native_reload_iterator(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_prepare_reload_weight_iterator_fixes_gemma3_vision_names(monkeypatch):
+def test_real_quant_mxfp8_collective_reload_preserves_canonical_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("modelopt.torch.quantization")
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+    from nemo_rl.modelopt.models.generation.vllm_quant_backend import (
+        VllmQuantInternalWorkerExtension,
+    )
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext, _ = _make_collective_update_extension(
+        vllm_backend, extension_cls=VllmQuantInternalWorkerExtension
+    )
+    ext.model_runner.vllm_config.model_config.quantization = "modelopt_mxfp8"
+    ext.model_runner.vllm_config.quant_config = ModelOptMxFp8Config.from_config(
+        {"quant_method": "modelopt", "quant_algo": "MXFP8", "ignore": []}
+    )
+    assert fp8.is_fp8_model(ext.model_runner.vllm_config)
+    monkeypatch.setattr(fp8, "global_fp8_config", None)
+    legacy_converter = MagicMock(side_effect=AssertionError("legacy FP8 conversion"))
+    monkeypatch.setattr(fp8, "get_quantized_weight_iterator", legacy_converter)
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    loaded_batches = []
+    receiver_buffer_counts = []
+    ext.model_runner.reload_weights = lambda *, weights_iterator: loaded_batches.append(
+        list(weights_iterator)
+    )
+
+    for value in (1.0, 2.0):
+        weights = [
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                torch.full((2, 32), value).to(torch.float8_e4m3fn),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight_scale",
+                torch.full((2, 1), 127, dtype=torch.uint8),
+            ),
+        ]
+        ext.state_dict_info = {
+            name: (tuple(tensor.shape), tensor.dtype) for name, tensor in weights
+        }
+        expected_values = [tensor.float().clone() for _, tensor in weights]
+
+        def consume(
+            iterator, group, src, post_unpack_func, return_iterator, *, num_buffers=None
+        ):
+            assert dict(iterator) == ext.state_dict_info
+            assert group is ext.model_update_group
+            assert src == 0
+            assert post_unpack_func is None
+            assert return_iterator is True
+            receiver_buffer_counts.append(num_buffers)
+            return iter(weights)
+
+        monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", consume)
+
+        assert ext.update_weights_from_collective(refit_with_reload_api=True) is True
+        assert len(loaded_batches) == int(value)
+        for (name, loaded), (expected_name, expected), expected_value in zip(
+            loaded_batches[-1], weights, expected_values, strict=True
+        ):
+            assert name == expected_name
+            assert loaded is expected
+            assert loaded.dtype == expected.dtype
+            torch.testing.assert_close(loaded.float(), expected_value)
+
+    assert receiver_buffer_counts == [1, 1]
+    legacy_converter.assert_not_called()
+    assert fp8.global_fp8_config is None
+
+
+@pytest.mark.vllm
+def test_fake_quant_reload_retains_legacy_fp8_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("modelopt.torch.quantization")
+    from nemo_rl.modelopt.models.generation.vllm_quant_backend import (
+        VllmQuantInternalWorkerExtension,
+    )
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext, _ = _make_collective_update_extension(
+        vllm_backend, extension_cls=VllmQuantInternalWorkerExtension
+    )
+    ext.model_runner.vllm_config.model_config.quantization = None
+    source_weights = iter([("model.weight", object())])
+    converted_weights = iter([("model.weight", object())])
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: True)
+    converter = MagicMock(return_value=converted_weights)
+    monkeypatch.setattr(fp8, "get_quantized_weight_iterator", converter)
+
+    assert ext._prepare_reload_weight_iterator(source_weights) is converted_weights
+    converter.assert_called_once_with(
+        source_weights, ext.model_runner, refit_with_reload_api=True
+    )
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("skip_fp8_conversion", [False, True])
+def test_prepare_reload_weight_iterator_fixes_gemma3_vision_names(
+    monkeypatch, skip_fp8_conversion: bool
+):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -1440,7 +1589,10 @@ def test_prepare_reload_weight_iterator_fixes_gemma3_vision_names(monkeypatch):
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: False)
 
     result = list(
-        ext._prepare_reload_weight_iterator([("vision_tower.patch_embed.w", "w")])
+        ext._prepare_reload_weight_iterator(
+            [("vision_tower.patch_embed.w", "w")],
+            skip_fp8_conversion=skip_fp8_conversion,
+        )
     )
 
     assert result == [("vision_tower.vision_model.patch_embed.w", "w")]
@@ -1837,7 +1989,10 @@ def test_install_native_lora_rejects_trainable_skipped_module(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_native_lora_ipc_clones_buffers_and_installs_adapter(monkeypatch):
+@pytest.mark.parametrize("load_after_ack", [False, True])
+def test_native_lora_ipc_clones_buffers_and_installs_adapter(
+    monkeypatch, load_after_ack
+):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.lora_utils import NATIVE_LORA_CONFIG_KEY
     from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
@@ -1897,6 +2052,7 @@ def test_native_lora_ipc_clones_buffers_and_installs_adapter(monkeypatch):
         installed.update(tensors)
 
     ext._install_native_lora = install_native_lora
+    ext._can_load_ipc_weights_after_ack = lambda: load_after_ack
     ext._synchronize_before_ipc_data_ack = lambda: events.append("sync")
     monkeypatch.setattr(
         vllm_backend,
@@ -2221,6 +2377,7 @@ def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatc
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
+    assert ext._can_load_ipc_weights_after_ack() is False
     ext.state_dict_info = {"model.weight": (torch.Size([1]), torch.float32)}
     ext.zmq_socket = FakeSocket()
     ext.maybe_init_zmq = lambda: None
@@ -2295,6 +2452,9 @@ def test_native_ipc_reload_drains_sender_after_loader_failure(monkeypatch):
     ext.model_runner = SimpleNamespace(reload_weights=reload_weights)
     ext.maybe_init_zmq = lambda: None
     ext._get_reload_weight_preparer = lambda: preparer
+    ext._can_load_ipc_weights_after_ack = lambda: pytest.fail(
+        "canonical preparers must dispatch before the legacy scheduling opt-in"
+    )
     ext._weight_update_errors_are_fatal = lambda: True
     ext._synchronize_before_ipc_data_ack = lambda: None
 
@@ -3689,7 +3849,10 @@ def test_load_weights_keeps_everything_when_vllm_reports_no_aliases(monkeypatch)
 
 
 @pytest.mark.vllm
-def test_prepare_reload_weight_iterator_drops_tied_aliases(monkeypatch):
+@pytest.mark.parametrize("skip_fp8_conversion", [False, True])
+def test_prepare_reload_weight_iterator_drops_tied_aliases(
+    monkeypatch, skip_fp8_conversion: bool
+):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -3710,7 +3873,11 @@ def test_prepare_reload_weight_iterator_drops_tied_aliases(monkeypatch):
     )
     weights = iter([("lm_head.weight", "head"), ("model.norm.weight", "norm")])
 
-    kept = list(ext._prepare_reload_weight_iterator(weights))
+    kept = list(
+        ext._prepare_reload_weight_iterator(
+            weights, skip_fp8_conversion=skip_fp8_conversion
+        )
+    )
 
     assert kept == [("model.norm.weight", "norm")]
 

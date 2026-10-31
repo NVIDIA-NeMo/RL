@@ -15,9 +15,13 @@
 """Exercise the patched vLLM model methods with CPU tensors and small towers."""
 
 import ast
+import importlib.util
 import inspect
+import json
 import logging
+import sys
 from collections.abc import Iterable
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -266,3 +270,282 @@ def test_final_norm_constructor_keeps_startup_disabled(patched_model, mtp_layers
     assert model._loaded_vision_final_layernorm_params == set()
     inputs = torch.randn(1, 2, 4)
     assert model._apply_vision_final_layernorm(inputs) is inputs
+
+
+@pytest.fixture
+def composed_radio_modules(tmp_path, monkeypatch):
+    """Import complete model sources after the normal NeMo compatibility setup."""
+    sources = {}
+    for relative in (
+        "model_executor/models/radio.py",
+        "model_executor/models/nano_nemotron_vl.py",
+        "tool_parsers/utils.py",
+        "model_executor/models/deepseek_v2.py",
+    ):
+        source = Path(patches._get_vllm_file(relative))
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source.read_text())
+        sources[relative] = target
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda relative: str(sources[relative])
+    )
+    patches.ensure_vllm_source_compat()
+    before = {name: path.read_text() for name, path in sources.items()}
+    patches.ensure_vllm_source_compat()
+    assert before == {name: path.read_text() for name, path in sources.items()}
+
+    modules = []
+    for name, relative in (
+        ("vllm.model_executor.models.radio", "model_executor/models/radio.py"),
+        (
+            "vllm.model_executor.models._nemo_radio_refit_test",
+            "model_executor/models/nano_nemotron_vl.py",
+        ),
+    ):
+        spec = importlib.util.spec_from_file_location(name, sources[relative])
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+        modules.append(module)
+    return modules, sources
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Requires the vLLM GPU runner"
+)
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    ("reload_api", "real_quant", "architecture"),
+    [
+        (False, True, "NemotronH_Nano_VL_V2"),
+        (True, True, "NemotronH_Nano_VL_V2"),
+        (True, False, "NemotronH_Nano_VL_V2"),
+        (False, True, "NemotronH_Omni_Reasoning_V3"),
+    ],
+    ids=["modelopt-chunked", "modelopt-native", "bf16-native", "super-modelopt"],
+)
+@pytest.mark.parametrize("scale_source", ["explicit", "folded", "unverified"])
+@torch.inference_mode()
+def test_composed_native_vision_refit(
+    composed_radio_modules,
+    tmp_path,
+    monkeypatch,
+    device,
+    reload_api,
+    scale_source,
+    real_quant: bool,
+    architecture,
+):
+    """Real loaders/lifecycle: late scales, folded defaults, frozen omission and graphs."""
+    from vllm.config import MultiModalConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+    from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weights
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    from nemo_rl.modelopt.models.generation.vllm_quant_backend import (
+        VllmQuantInternalWorkerExtension,
+    )
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    (radio_module, nano_module), _ = composed_radio_modules
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    config = SimpleNamespace(
+        model=str(checkpoint),
+        revision=None,
+        dtype=torch.bfloat16,
+        quantization="modelopt" if real_quant else None,
+        architectures=[architecture],
+        hf_config=SimpleNamespace(
+            vision_config=SimpleNamespace(model_type="radio", layerscale_value=1.0)
+        ),
+        multimodal_config=MultiModalConfig(),
+    )
+    with torch.device(device):
+        model = nano_module.NemotronH_Nano_VL_V2.__new__(
+            nano_module.NemotronH_Nano_VL_V2
+        )
+        nn.Module.__init__(model)
+        model.model_config = config
+        model.language_model = nn.Module()
+        model.language_model.load_weights = AutoWeightsLoader(
+            model.language_model
+        ).load_weights
+        model.sound_encoder = None
+        model.mlp1 = nn.Sequential(
+            nn.Linear(4, 8), nn.GELU(), nn.Linear(8, 4)
+        ).bfloat16()
+        model.vision_final_layernorm = nn.LayerNorm(4, eps=1e-6).float()
+        model._loaded_vision_final_layernorm_params = set()
+        model._vision_final_layernorm_enabled = False
+        radio = radio_module.RadioModel.__new__(radio_module.RadioModel)
+        nn.Module.__init__(radio)
+        radio.config = SimpleNamespace(model_type="radio", initializer_factor=1.0)
+        radio.model = nn.Module()
+        radio.model.encoder = nn.Module()
+        layer = nn.Module()
+        layer.ls1 = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+        layer.ls2 = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+        layer.attn = nn.Module()
+        layer.attn.proj = nn.Linear(4, 4).bfloat16()
+        radio.model.encoder.layers = nn.ModuleList([layer])
+        radio.model.patch_generator = nn.Module()
+        radio.model.patch_generator.video_embedder = nn.Linear(
+            4, 4, bias=False
+        ).bfloat16()
+        model.vision_model = radio
+        initialize_dummy_weights(model, config)
+        expected = {name: param.clone() for name, param in model.named_parameters()}
+        pointers = {name: param.data_ptr() for name, param in model.named_parameters()}
+        record_metadata_for_reloading(model)
+        inputs = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4) / 8
+
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner.model = model
+        runner.model_config = config
+        runner.vllm_config = VllmConfig()
+        runner.vllm_config.model_config = config
+        runner.lora_config = None
+        runner.mm_budget = None
+        runner.encoder_cache = {}
+        runner.late_interaction_runner = {}
+        runner.drafter = None
+        worker_cls = (
+            VllmQuantInternalWorkerExtension
+            if real_quant
+            else vllm_backend.VllmInternalWorkerExtension
+        )
+        ext = worker_cls.__new__(worker_cls)
+        ext.model_runner, ext.model_config = runner, config
+        ext.device = torch.device(device)
+        ext.model_update_group = object()
+        mapping = {
+            name: name for name in expected if not name.startswith("vision_model.")
+        }
+        for leaf in ("weight", "bias"):
+            mapping[f"vision_model.encoder.layer.0.attention.output.dense.{leaf}"] = (
+                f"vision_model.model.encoder.layers.0.attn.proj.{leaf}"
+            )
+        for index in (1, 2):
+            mapping[f"vision_model.encoder.layer.0.layer_scale{index}.lambda1"] = (
+                f"vision_model.model.encoder.layers.0.ls{index}"
+            )
+        mapping[
+            "vision_model.radio_model.model.patch_generator.video_embedder.weight"
+        ] = "vision_model.model.patch_generator.video_embedder.weight"
+        index_keys = {
+            name: "weights.safetensors"
+            for name in mapping
+            if scale_source != "folded" or "layer_scale" not in name
+        }
+        (checkpoint / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": index_keys})
+        )
+
+        def forward():
+            features = layer.attn.proj(inputs) * layer.ls1 + inputs * layer.ls2
+            features = features + radio.model.patch_generator.video_embedder(inputs)
+            return model.mlp1(model._apply_vision_final_layernorm(features))
+
+        def reference():
+            state = expected
+            prefix = "vision_model.model.encoder.layers.0."
+            features = nn.functional.linear(
+                inputs,
+                state[prefix + "attn.proj.weight"],
+                state[prefix + "attn.proj.bias"],
+            )
+            features = features * state[prefix + "ls1"] + inputs * state[prefix + "ls2"]
+            features = features + nn.functional.linear(
+                inputs,
+                state["vision_model.model.patch_generator.video_embedder.weight"],
+            )
+            features = nn.functional.layer_norm(
+                features.float(),
+                (4,),
+                state["vision_final_layernorm.weight"],
+                state["vision_final_layernorm.bias"],
+                1e-6,
+            ).bfloat16()
+            hidden = nn.functional.gelu(
+                nn.functional.linear(
+                    features, state["mlp1.0.weight"], state["mlp1.0.bias"]
+                )
+            )
+            return nn.functional.linear(
+                hidden, state["mlp1.2.weight"], state["mlp1.2.bias"]
+            )
+
+        graph = None
+        for step in range(4):
+            names = list(mapping)
+            if step == 0 and scale_source != "explicit":
+                names = [name for name in names if "layer_scale" not in name]
+                for index in (1, 2):
+                    expected[f"vision_model.model.encoder.layers.0.ls{index}"].fill_(1)
+            elif step == 2:
+                names = [name for name in names if name.startswith("mlp1.")]
+            elif step == 3:
+                names = ["vision_model.encoder.layer.0.layer_scale1.lambda1"]
+            payload = []
+            for name in names:
+                target = expected[mapping[name]]
+                value = (
+                    (step + 1) / 10
+                    + torch.arange(target.numel()).reshape(target.shape) / 100
+                ).bfloat16()
+                payload.append((name, value))
+                expected[mapping[name]] = value.to(target.dtype).clone()
+            ext.state_dict_info = {
+                name: (tuple(value.shape), value.dtype) for name, value in payload
+            }
+
+            def consume(*, post_unpack_func, return_iterator=False, **kwargs):
+                def stream():
+                    storage = torch.empty(
+                        max(value.numel() for _, value in payload), dtype=torch.bfloat16
+                    )
+                    for name, value in payload:
+                        view = storage[: value.numel()].view(value.shape)
+                        view.copy_(value)
+                        yield name, view
+                    storage.fill_(99)
+
+                if return_iterator:
+                    return stream()
+                for item in stream():
+                    post_unpack_func([item])
+
+            monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", consume)
+            runner.encoder_cache["stale"] = inputs
+            runner.late_interaction_runner["stale"] = inputs
+            with set_current_vllm_config(runner.vllm_config):
+                if scale_source == "unverified":
+                    if real_quant:
+                        with pytest.raises(ValueError, match="LayerScale"):
+                            ext._update_weights_from_collective(reload_api)
+                    else:
+                        assert not ext._update_weights_from_collective(reload_api)
+                    assert "load_weights" not in vars(model)
+                    return
+                assert ext._update_weights_from_collective(reload_api)
+            for name, param in model.named_parameters():
+                torch.testing.assert_close(param, expected[name], rtol=0, atol=0)
+                assert param.data_ptr() == pointers[name]
+            assert not runner.encoder_cache and not runner.late_interaction_runner
+            assert "load_weights" not in vars(model)
+            if device == "cuda":
+                if graph is None:
+                    for _ in range(3):
+                        forward()
+                    torch.accelerator.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        output = forward()
+                graph.replay()
+                actual = output
+            else:
+                actual = forward()
+            torch.testing.assert_close(actual, reference(), rtol=1e-2, atol=1e-3)

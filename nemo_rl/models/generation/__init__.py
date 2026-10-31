@@ -186,13 +186,12 @@ def configure_generation_config(
                 )
             colocated = config.get("colocated")
             if not export_cpu_offload and (
-                colocated is None
-                or not colocated["enabled"]
-                or config.get("refit_transport") is not None
+                colocated is None or config.get("refit_transport") is not None
             ):
                 raise ValueError(
                     "generation.real_quant_export_cpu_offload=false requires "
-                    "colocated CUDA-IPC refit with no explicit refit_transport"
+                    "colocated CUDA-IPC or non-colocated collective refit "
+                    "with no explicit refit_transport"
                 )
 
         # set load_format

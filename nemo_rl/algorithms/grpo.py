@@ -716,6 +716,9 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
     )
+    real_quant = generation_config["backend"] == "vllm" and bool(
+        generation_config.get("real_quant")
+    )
     if (
         router_replay_enabled(policy_config)
         and generation_config["backend"] == "megatron"
@@ -728,6 +731,10 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+        if real_quant:
+            from nemo_rl.modelopt.utils import validate_real_quant_policy_config
+
+            validate_real_quant_policy_config(policy_config)
     elif generation_config["backend"] == "dynamo":
         # Validate the complete managed-Dynamo boundary before allocating Ray
         # placement groups or starting any external services.
@@ -1785,7 +1792,17 @@ def setup(
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
         ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        vllm_kwargs["hf_overrides"] = dict(policy_config.get("hf_config_overrides", {}))
+
+        if real_quant:
+            from nemo_rl.modelopt.utils import prepare_real_quant_generation_config
+
+            policy, policy_time = init_policy()
+            setup_timing_metrics.policy_init_time_s = policy_time
+            setup_timing_metrics.parallel_init_enabled = 0.0
+            prepare_real_quant_generation_config(policy, generation_config)
+            if colocated_inference:
+                policy.offload_after_refit()
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
@@ -1822,9 +1839,10 @@ def setup(
                     policy_api_key=deferred_vllm.http_server_api_key,
                 )
 
-            # Colocated: vLLM + policy share GPUs -> sequential; otherwise parallel.
             init_tasks = {}
-            if colocated_inference:
+            if real_quant:
+                init_tasks["vllm"] = init_vllm_deferred
+            elif colocated_inference:
 
                 def init_vllm_then_policy():
                     pg, vllm_t = init_vllm_deferred()
@@ -1854,7 +1872,9 @@ def setup(
                 _shutdown_completed_nemo_gym_startup(submitted.get("nemo_gym"))
                 raise
 
-            if colocated_inference:
+            if real_quant:
+                policy_generation, vllm_load_time = results["vllm"]
+            elif colocated_inference:
                 policy_generation, vllm_load_time, policy, policy_time = results[
                     "vllm_policy"
                 ]
@@ -1870,11 +1890,18 @@ def setup(
             setup_timing_metrics.policy_init_time_s = policy_time
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
         else:
-            policy_generation, policy = initialize_generation_with_policy(
-                init_generation_fn=init_vllm,
-                colocated_inference=colocated_inference,
-                setup_timing_metrics=setup_timing_metrics,
-            )
+            if real_quant:
+                policy_generation, vllm_time = init_vllm()
+                setup_timing_metrics.generation_init_time_s = vllm_time
+            else:
+                policy_generation, policy = initialize_generation_with_policy(
+                    init_generation_fn=init_vllm,
+                    colocated_inference=colocated_inference,
+                    setup_timing_metrics=setup_timing_metrics,
+                )
+
+        if real_quant and colocated_inference:
+            policy.prepare_for_training()
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",

@@ -54,6 +54,7 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
@@ -340,20 +341,37 @@ def test_vllm_generation_selects_worker_extension(
     )
 
 
-def test_vllm_generation_rejects_worker_extension_with_quantization() -> None:
+@pytest.mark.parametrize("async_engine", [False, True])
+@pytest.mark.parametrize(("quant_cfg", "real_quant"), [("NVFP4", False), (None, True)])
+def test_vllm_generation_rejects_worker_extension_with_quantization(
+    async_engine: bool, quant_cfg: str | None, real_quant: bool
+) -> None:
     config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = async_engine
     config["worker_extension_cls_fqn"] = "tests.extensions.CustomGenerationWorker"
-    config["quant_cfg"] = "NVFP4"
+    config["quant_cfg"] = quant_cfg
+    config["real_quant"] = real_quant
     cluster = MagicMock()
     cluster.world_size.return_value = 1
     cluster.num_gpus_per_node = 1
 
-    with pytest.raises(
-        ValueError,
-        match="worker_extension_cls_fqn and quant_cfg are mutually exclusive",
+    with (
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.get_actor_python_env",
+            return_value="python",
+        ) as actor_environment,
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerBuilder",
+            side_effect=AssertionError("must reject before worker construction"),
+        ) as worker_builder,
+        pytest.raises(
+            ValueError, match="cannot be combined with ModelOpt quantization"
+        ),
     ):
         VllmGeneration(cluster, config, defer_model_load=True)
 
+    actor_environment.assert_not_called()
+    worker_builder.assert_not_called()
     cluster._init_placement_groups.assert_not_called()
 
 
@@ -1675,6 +1693,71 @@ def test_configure_generation_config_respects_explicit_training_load_format():
     assert configured["vllm_cfg"]["load_format"] == "auto"
 
 
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("real_quant", "family_matches", "requested", "expected"),
+    [
+        (True, True, "dummy", "dummy"),
+        (True, True, "auto", None),
+        (False, True, "dummy", "auto"),
+        (False, True, "auto", "auto"),
+        (True, False, "dummy", "dummy"),
+        (True, False, "auto", None),
+        (False, False, "dummy", "dummy"),
+        (False, False, "auto", "auto"),
+    ],
+)
+def test_load_model_preserves_native_quant_loader(
+    monkeypatch, real_quant, family_matches, requested, expected
+):
+    cfg = deepcopy(basic_vllm_test_config)
+    cfg["real_quant"] = real_quant
+    cfg["vllm_cfg"]["load_format"] = requested
+    cfg["vllm_kwargs"]["speculative_config"] = {
+        "method": "mtp",
+        "num_speculative_tokens": 1,
+    }
+    hf_config = types.SimpleNamespace(
+        model_type="nemotron_h_omni" if family_matches else "qwen3",
+        architectures=[],
+    )
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained", lambda *args, **kwargs: hf_config
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.log_gpu_memory_diagnostics",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.get_nsight_config_if_pattern_matches",
+        lambda pattern: [],
+    )
+    engines = []
+    worker = types.SimpleNamespace(
+        cfg=cfg,
+        model_name="test-model",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        expert_parallel_size=1,
+        enable_expert_parallel=False,
+        gpu_memory_utilization=0.7,
+        precision="bfloat16",
+        _create_engine=engines.append,
+    )
+
+    if expected is None:
+        with pytest.raises(ValueError, match="load_format='dummy'"):
+            BaseVllmGenerationWorker._load_model(worker, bundle_indices=[], seed=42)
+        assert not engines
+        return
+
+    BaseVllmGenerationWorker._load_model(worker, bundle_indices=[], seed=42)
+
+    assert len(engines) == 1
+    assert engines[0]["load_format"] == expected
+    assert worker._mtp_load_from_disk is (expected == "dummy")
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -2050,16 +2133,21 @@ def test_configure_generation_config_keeps_real_quant_export_on_cpu() -> None:
     assert configured["real_quant_export_cpu_offload"] is True
 
 
-def test_configure_generation_config_keeps_colocated_real_quant_export_on_gpu() -> None:
+@pytest.mark.parametrize("colocated", [True, False])
+def test_configure_generation_config_keeps_real_quant_export_on_gpu(
+    colocated: bool,
+) -> None:
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["real_quant"] = True
     vllm_config["real_quant_export_cpu_offload"] = False
+    vllm_config["colocated"]["enabled"] = colocated
 
     configured = configure_generation_config(
         vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
     )
 
     assert configured["real_quant_export_cpu_offload"] is False
+    assert configured["colocated"]["enabled"] is colocated
 
 
 def test_configure_generation_config_rejects_missing_real_quant_export_placement() -> (
@@ -2085,20 +2173,6 @@ def test_configure_generation_config_rejects_non_boolean_real_quant_export() -> 
         )
 
 
-def test_configure_generation_config_rejects_gpu_export_for_non_colocated_refit() -> (
-    None
-):
-    vllm_config = deepcopy(basic_vllm_test_config)
-    vllm_config["real_quant"] = True
-    vllm_config["real_quant_export_cpu_offload"] = False
-    vllm_config["colocated"]["enabled"] = False
-
-    with pytest.raises(ValueError, match="colocated CUDA-IPC refit"):
-        configure_generation_config(
-            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
-        )
-
-
 def test_configure_generation_config_rejects_gpu_export_without_colocated_config() -> (
     None
 ):
@@ -2107,22 +2181,25 @@ def test_configure_generation_config_rejects_gpu_export_without_colocated_config
     vllm_config["real_quant_export_cpu_offload"] = False
     del vllm_config["colocated"]
 
-    with pytest.raises(ValueError, match="colocated CUDA-IPC refit"):
+    with pytest.raises(ValueError, match="CUDA-IPC or non-colocated collective"):
         configure_generation_config(
             vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
         )
 
 
-@pytest.mark.parametrize("refit_transport", ["vllm_zmq_sparse", "nixl"])
+@pytest.mark.parametrize("colocated", [True, False])
+@pytest.mark.parametrize("refit_transport", ["vllm_zmq_sparse", "nixl", "nccl_reshard"])
 def test_configure_generation_config_rejects_gpu_export_for_explicit_refit_transport(
     refit_transport: str,
+    colocated: bool,
 ) -> None:
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["real_quant"] = True
     vllm_config["real_quant_export_cpu_offload"] = False
     vllm_config["refit_transport"] = refit_transport
+    vllm_config["colocated"]["enabled"] = colocated
 
-    with pytest.raises(ValueError, match="colocated CUDA-IPC refit"):
+    with pytest.raises(ValueError, match="CUDA-IPC or non-colocated collective"):
         configure_generation_config(
             vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
         )

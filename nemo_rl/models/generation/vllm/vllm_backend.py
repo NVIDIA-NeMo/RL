@@ -45,6 +45,10 @@ from nemo_rl.models.generation.vllm.lora_utils import (
     collect_native_lora,
     native_lora_refit_settings,
 )
+from nemo_rl.models.generation.vllm.patches import (
+    finalize_radio_layerscale_loading,
+    radio_layerscale_full_reload,
+)
 from nemo_rl.models.generation.vllm.utils import _format_refit_key_error
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
@@ -88,30 +92,6 @@ if os.environ.get(DRAFT_DISABLE_MODULE_SHARING_ENV) == "1":
 
 class IPCWeightManifestError(RuntimeError):
     """An IPC transfer did not match the prepared state-dict manifest."""
-
-
-def _detach_pending_layerwise_weights(
-    model: torch.nn.Module, source_storage_ptrs: set[int]
-) -> None:
-    """Clone deferred reload weights that still alias a transport buffer.
-
-    vLLM 0.25.1 replays deferred weight-loader arguments during layerwise
-    finalization, after NeMo-RL may have reused the source transport buffer.
-    """
-    if not source_storage_ptrs:
-        return
-
-    # Keep reload internals off the normal non-layerwise weight-loading path.
-    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
-
-    for module in model.modules():
-        info = get_layerwise_info(module)
-        for _, arguments in info.loaded_weights:
-            loaded_weight = arguments.arguments.get("loaded_weight")
-            if not isinstance(loaded_weight, torch.Tensor):
-                continue
-            if loaded_weight.untyped_storage().data_ptr() in source_storage_ptrs:
-                arguments.arguments["loaded_weight"] = loaded_weight.clone()
 
 
 def _refresh_hpc_modules_after_layerwise_reload(model: torch.nn.Module) -> None:
@@ -701,7 +681,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     def _load_full_hf_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> set[str] | None:
-        """Load HF weights and detach any deferred reload tensors from transport storage.
+        """Load HF weights with owned inputs when native reload can defer loading.
 
         Returns the set of weight names vLLM reported as loaded, or ``None``
         when the model's ``load_weights`` does not report one.
@@ -709,35 +689,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if not getattr(self, "_nrl_layerwise_reload_active", False):
             return self.model_runner.model.load_weights(weights=weights)
 
-        source_storage_ptrs: set[int] = set()
-
-        def track_source_storage() -> Iterator[tuple[str, torch.Tensor]]:
-            for name, tensor in weights:
-                source_storage_ptrs.add(tensor.untyped_storage().data_ptr())
-                yield name, tensor
-
-        load_error: Exception | None = None
-        try:
-            return self.model_runner.model.load_weights(weights=track_source_storage())
-        except Exception as error:
-            load_error = error
-            raise
-        finally:
-            try:
-                # Native layerwise reload may defer weight_loader calls until all
-                # shards for a layer have arrived. NCCL/IPC weights are views into
-                # reusable receive buffers that subsequent transfers may overwrite,
-                # so clone any pending tensors that alias the current buffer and
-                # preserve them until deferred replay consumes them.
-                _detach_pending_layerwise_weights(
-                    self.model_runner.model, source_storage_ptrs
-                )
-            except Exception:
-                if load_error is None:
-                    raise
-                logger.exception(
-                    "Failed to detach deferred weights after a weight load failure"
-                )
+        # Native loaders may retain inputs or views until a later batch completes
+        # the layer. Own each input before loading so transport buffers can be
+        # reused without rescanning every module's pending loader arguments.
+        owned_weights = ((name, tensor.clone()) for name, tensor in weights)
+        return self.model_runner.model.load_weights(weights=owned_weights)
 
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
         from nemo_rl.models.generation.vllm.quantization import fp8
@@ -775,7 +731,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         return kept
 
     def _prepare_reload_weight_iterator(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        skip_fp8_conversion: bool = False,
     ) -> Iterable[tuple[str, torch.Tensor]]:
         """Prepare checkpoint-format weights for vLLM's native reload API."""
         model_config = self.model_runner.vllm_config.model_config
@@ -792,6 +751,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             weights = _drop_tied_embedding_aliases(
                 weights, aliases, getattr(model, "hf_to_vllm_mapper", None)
             )
+
+        if skip_fp8_conversion:
+            return weights
 
         from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -1630,6 +1592,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "or collective refit with refit_with_reload_api=False."
             )
 
+    def _get_native_layerwise_reload_targets(self) -> list[torch.nn.Module]:
+        """Select modules whose runtime layout must be restored before loading."""
+        model = self.model_runner.model
+        if self._uses_deepseek_v4_fp8_refit():
+            return [model]
+        # Keep BF16 TRTLLM reload scoped so other MXFP8 metadata survives.
+        return _unquantized_flashinfer_trtllm_modules(model)
+
     @contextmanager
     def _weight_update_lifecycle(
         self, transport: WeightUpdateTransport
@@ -1655,13 +1625,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
 
             model = self.model_runner.model
-            # DSV4 needs a full-model reload; BF16 TRTLLM reload stays scoped
-            # to its realized modules so mixed-model MXFP8 metadata survives.
-            reload_targets = (
-                [model]
-                if use_deepseek_v4_fp8
-                else _unquantized_flashinfer_trtllm_modules(model)
-            )
+            reload_targets = self._get_native_layerwise_reload_targets()
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
             added_skip_tensors: Any = None
             if use_deepseek_v4_fp8:
@@ -1671,6 +1635,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
             def finalize() -> None:
                 with torch.device(self.device):
+                    finalize_radio_layerscale_loading(model, self.model_config)
                     finalize_layerwise_reload(model, self.model_config)
                     if use_deepseek_v4_fp8:
                         deepseek_v4_fp8.finalize_refit(model)
@@ -1680,6 +1645,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         )
                     _refresh_hpc_modules_after_layerwise_reload(model)
                     self._maybe_process_mtp_drafter_after_loading()
+                    if getattr(model, "vision_model", None) is not None:
+                        self.model_runner.reset_encoder_cache()
+                        self.model_runner.reset_mm_cache()
                 torch.cuda.synchronize()
 
             try:
@@ -1730,6 +1698,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     def _synchronize_before_ipc_data_ack(self) -> None:
         """Fence work consuming one IPC data batch before its acknowledgment."""
         torch.cuda.current_stream().synchronize()
+
+    def _prepare_ipc_weight_buffer(
+        self, buffer: torch.Tensor, used_bytes: int
+    ) -> tuple[torch.Tensor, Callable[[Iterable[tuple[str, torch.Tensor]]], Any]]:
+        """Select the storage and loader for one received IPC packet."""
+        return buffer, self._load_weights
+
+    def _can_load_ipc_weights_after_ack(self) -> bool:
+        """Opt in only for independently owned storage and peer-free loading.
+
+        The prepared buffer must not alias IPC storage, and native loading must
+        not issue collectives with peers still exporting or acknowledging data.
+        """
+        return False
 
     def _get_reload_weight_preparer(self) -> _ReloadWeightPreparer | None:
         """Return this worker's transport-neutral checkpoint preparer."""
@@ -1908,13 +1890,16 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if preparer is not None:
             return self._update_weights_via_ipc_zmq_with_reload(preparer)
 
+        ipc_buffer = None
         buffer = None
         weight = None
         weights = None
+        deferred_weights = None
         native_lora_tensors: dict[str, torch.Tensor] = {}
         native_lora_refit = self._native_lora_refit_settings() is not None
 
         try:
+            load_after_ack = self._can_load_ipc_weights_after_ack()
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
             noop_finalize: WeightUpdateFinalizer = lambda: None
@@ -1941,6 +1926,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                         break
 
+                    deferred_weights = None
                     batch_keys = None
                     batch_error = None
                     try:
@@ -1949,8 +1935,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         if batch_keys is None:
                             continue
 
-                        buffer = rebuild_cuda_tensor_from_ipc(
+                        ipc_buffer = rebuild_cuda_tensor_from_ipc(
                             ipc_handle, self.device.index
+                        )
+                        buffer, load_weights = self._prepare_ipc_weight_buffer(
+                            ipc_buffer, used_bytes
                         )
                         weights = []
                         offset = 0
@@ -1975,8 +1964,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         )
                         if native_lora_refit:
                             collect_native_lora(native_lora_tensors, weights)
+                        elif load_after_ack:
+                            deferred_weights, weights = weights, None
                         else:
-                            self._load_weights(weights)
+                            load_weights(weights)
                     except Exception as error:
                         batch_error = error
                         # The manifest only keeps the exception message; log
@@ -1992,7 +1983,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     finally:
                         # Synchronize before releasing or ACKing an IPC allocation,
                         # including when a loader failed after scheduling CUDA work.
-                        if buffer is not None:
+                        if ipc_buffer is not None:
                             try:
                                 self._synchronize_before_ipc_data_ack()
                             except Exception as error:
@@ -2001,15 +1992,47 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
                         if batch_error is not None:
                             manifest.record_load_failure(batch_error)
+                            if deferred_weights is not None:
+                                deferred_weights.clear()
+                                deferred_weights = None
                         elif batch_keys is not None:
                             manifest.record_loaded(batch_keys)
 
-                        # Drop every view before ACK permits sender-side reuse.
-                        del weight, weights, buffer
+                        # Drop transport views before sender-side reuse. An
+                        # opted-in loader retains only independently owned data.
+                        del weight, weights, buffer, ipc_buffer
                         weight = None
                         weights = None
                         buffer = None
+                        ipc_buffer = None
                         self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+
+                    if deferred_weights is not None:
+                        try:
+                            load_weights(deferred_weights)
+                        except Exception as error:
+                            batch_error = error
+                            logger.exception(
+                                "Owned IPC weight batch load failed (batch: %s)",
+                                [
+                                    (name, tuple(tensor.shape))
+                                    for name, tensor in deferred_weights[:40]
+                                ],
+                            )
+                        finally:
+                            # ACK released only the transport allocation. Keep
+                            # owned inputs alive until native CUDA work finishes.
+                            try:
+                                self._synchronize_before_ipc_data_ack()
+                            except Exception as error:
+                                logger.exception("Failed to fence owned IPC weights")
+                                if batch_error is None:
+                                    batch_error = error
+                            if batch_error is not None:
+                                manifest.record_load_failure(batch_error)
+                                deferred_weights.clear()
+                            # Successful loaders may retain the list itself.
+                            deferred_weights = None
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -2021,7 +2044,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: %s",
                 e,
             )
-            return False
+        finally:
+            # ACK can fail before native loading starts; do not retain the owned
+            # packet through the permanently poisoned worker's traceback.
+            deferred_weights = None
+        return False
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
@@ -2094,15 +2121,23 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     src=0,
                     post_unpack_func=None,
                     return_iterator=True,
+                    # Native loaders can retain earlier tensors until a later
+                    # batch completes the layer; keep their stream ordered.
+                    num_buffers=1
+                    if self._uses_native_layerwise_refit("collective")
+                    else None,
                 )
                 assert weight_iterator is not None
                 reload_weight_iterator = self._prepare_reload_weight_iterator(
                     weight_iterator
                 )
                 try:
-                    self.model_runner.reload_weights(
-                        weights_iterator=reload_weight_iterator
-                    )
+                    with radio_layerscale_full_reload(
+                        self.model_runner.get_model(), self.model_config
+                    ):
+                        self.model_runner.reload_weights(
+                            weights_iterator=reload_weight_iterator
+                        )
                 finally:
                     iterators_to_close = [reload_weight_iterator]
                     if reload_weight_iterator is not weight_iterator:

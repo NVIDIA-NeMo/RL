@@ -373,6 +373,53 @@ def test_removed_mcore_generation_keys_report_the_first_and_current_keys_pass():
 
 
 # ============================================================================
+# reject_outdated_real_quant_ignore
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("ignore", "real_quant"), [(None, False), ([], True), (["*.layers.0.*"], True)]
+)
+def test_removed_real_quant_ignore_is_rejected(
+    ignore: list[str] | None, real_quant: bool
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"policy\.generation\.real_quant_ignore was removed.*policy\.quant_cfg",
+    ):
+        check_outdated_config(
+            {
+                "policy": {
+                    "quant_cfg": "W4A16_NVFP4_CFG",
+                    "generation": {
+                        "real_quant": real_quant,
+                        "real_quant_ignore": ignore,
+                    },
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [{"policy": None}, {"policy": {"generation": None}}],
+)
+def test_absent_real_quant_ignore_passes(config: dict[str, Any]) -> None:
+    check_outdated_config(config)
+
+
+def test_policy_quant_recipe_replaces_generation_ignore_list() -> None:
+    check_outdated_config(
+        {
+            "policy": {
+                "quant_cfg": "examples/modelopt/quant_configs/nvfp4_experts.yaml",
+                "generation": {"real_quant": True},
+            }
+        }
+    )
+
+
+# ============================================================================
 # reject_outdated_dynamo_router_reset_states
 # ============================================================================
 

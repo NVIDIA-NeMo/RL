@@ -37,6 +37,8 @@ def _client():
     client.completion_futures = {}
     client.request_submission_times = {}
     client.aborted_request_ids = set()
+    client._pending_source_requests = set()
+    client.abort_futures = {}
     client.streams = {}
     client.socket = SimpleNamespace(
         send_multipart=lambda frames: None, send=messages.append
