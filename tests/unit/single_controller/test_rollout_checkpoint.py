@@ -213,6 +213,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         },
         "checkpointing": {"checkpoint_dir": "/run/one/checkpoints"},
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 120},
+        "rollout_recovery": {"target_level": "turn", "gym_prepare_timeout_s": 300.0},
         "cluster": {"num_nodes": 2},
         "logger": LoggerConfig(log_dir="/run/one"),
     }
@@ -242,6 +243,10 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         },
         "checkpointing": {"checkpoint_dir": "/run/two/checkpoints"},
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 300},
+        "rollout_recovery": {
+            **base["rollout_recovery"],
+            "gym_prepare_timeout_s": 900.0,
+        },
         "cluster": {"num_nodes": 8},
         "logger": LoggerConfig(log_dir="/run/two"),
     }
@@ -381,7 +386,7 @@ def test_builtin_fingerprint_exclusions_reference_declared_config_fields() -> No
             "async_rl",
             {"sampler": {"name": "windowed", "max_staleness_versions": 2}},
         ),
-        ("rollout_recovery", {"default_granularity": "prompt_group"}),
+        ("rollout_recovery", {"target_level": "prompt_group"}),
     ],
 )
 def test_bootstrap_fingerprint_rejects_rollout_semantic_changes(
@@ -403,7 +408,7 @@ def test_bootstrap_fingerprint_rejects_rollout_semantic_changes(
             "mixed_weight_version_policy": "allow",
         },
         "async_rl": {"sampler": {"name": "windowed", "max_staleness_versions": 1}},
-        "rollout_recovery": {"default_granularity": "sibling"},
+        "rollout_recovery": {"target_level": "sibling"},
     }
     modified = {**base, section: {**base[section], **changed}}
 
