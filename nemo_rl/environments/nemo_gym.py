@@ -32,6 +32,10 @@ from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, Typed
 
 import ray
 import torch
+from nemo.lens.resources.attributes import (
+    OTEL_RESOURCE_ATTRIBUTES_ENV,
+    extend_otel_resource_attributes,
+)
 from pydantic import BaseModel, Field, field_validator, model_validator
 from ray.util.placement_group import (
     PlacementGroup,
@@ -109,8 +113,11 @@ from nemo_rl.telemetry.instrumentation import (
     streaming_umbrella_span,
 )
 from nemo_rl.telemetry.setup import (
+    get_telemetry_handle,
     init_telemetry_worker,
     instrument_aiohttp_client,
+    job_resource_attributes,
+    rl_telemetry_config,
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
@@ -824,6 +831,14 @@ def _shut_down_gym_servers(run_helper: Any) -> None:
                     raise
 
 
+def _publish_gym_resource_identity() -> None:
+    """Add this actor's job attributes to OTEL_RESOURCE_ATTRIBUTES; existing values win."""
+    os.environ[OTEL_RESOURCE_ATTRIBUTES_ENV] = extend_otel_resource_attributes(
+        os.environ.get(OTEL_RESOURCE_ATTRIBUTES_ENV),
+        defaults=job_resource_attributes(),
+    )
+
+
 # Fail fast rather than restart. The servers this actor owns are started in
 # _spinup, which Ray does not re-run after a restart, so a restarted actor is
 # permanently broken: _require_spinup() rejects every later rollout call, and
@@ -833,6 +848,17 @@ class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: NemoGymConfig):
+        # Import ahead of init_telemetry_worker so lens sees Gym's span groups when
+        # it validates the spec. Guarded because NemoGym is also constructed without
+        # the optional nemo_gym extra (unit tests), and the early import only avoids
+        # a cosmetic lens warning; a genuine missing dep inside nemo_gym.telemetry
+        # still raises.
+        try:
+            import nemo_gym.telemetry  # noqa: F401
+        except ModuleNotFoundError as exc:
+            if (exc.name or "").split(".")[0] != "nemo_gym":
+                raise
+
         # Named explicitly: built from the environment registry rather than
         # by RayWorkerGroup, so nothing sets NRL_WORKER_GROUP for it.
         init_telemetry_worker(worker_group="nemo_gym")
@@ -965,6 +991,24 @@ class NemoGym(EnvironmentInterface):
         # rather than falling back to localhost, or remote workers will connect to
         # their own loopback interface instead of the actor-hosted service.
         initial_global_config_dict.setdefault("default_host", self.node_ip)
+
+        # Gym turns this block into NEMO_GYM_OTEL_* and adds nemo-lens to each
+        # server venv. Merge, not setdefault: Gym's `enabled` defaults to false,
+        # so the user's keys go last and an explicit `enabled: false` still wins.
+        telemetry_handle = get_telemetry_handle()
+        if telemetry_handle is not None and telemetry_handle.is_exporting:
+            from nemo_gym.telemetry.setup import TELEMETRY_KEY_NAME
+
+            rl = rl_telemetry_config()
+            initial_global_config_dict[TELEMETRY_KEY_NAME] = {
+                "enabled": True,
+                "run_id": rl.run_id,
+                "exporter": rl.exporter,
+                "traces_enabled": rl.traces_enabled,
+                "metrics_enabled": rl.metrics_enabled,
+                **(initial_global_config_dict.get(TELEMETRY_KEY_NAME) or {}),
+            }
+            _publish_gym_resource_identity()
 
         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
