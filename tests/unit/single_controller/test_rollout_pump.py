@@ -79,6 +79,9 @@ from tests.unit.single_controller._dp_fakes import (
     _SyncDPAdapter,
     _TQActor,
 )
+from tests.unit.single_controller._rollout_checkpoints import (
+    attach_rollout_checkpointing,
+)
 
 
 def _failure_cfg(
@@ -1437,6 +1440,7 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
 
         ctrl._finalize_with_actor = _finalize
 
+        attach_rollout_checkpointing(ctrl)
         await ctrl._rollout_pump()
 
         assert manager.recovery_ledger.groups() == []

@@ -93,7 +93,9 @@ from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     ensure_bootstrap_anchor,
     prepare_snapshot_paths,
 )
-from nemo_rl.algorithms.rollout_checkpointing.state import RolloutCheckpointSaveResult
+from nemo_rl.algorithms.rollout_checkpointing.state import (
+    RolloutCheckpointSaveResult,
+)
 from nemo_rl.algorithms.single_controller import (
     RolloutRuntimeState,
     SingleControllerActor,
@@ -1065,7 +1067,7 @@ def test_replay_compatibility_is_checked_without_unfinished_groups(
     try:
         assert actor._rollout_recovery_ledger.groups() == []
         with pytest.raises(ValueError, match=error):
-            asyncio.run(actor._maybe_restore_replay_buffer())
+            asyncio.run(actor._rollout_restorer._restore_replay_buffer())
         actor._buffer.load_state_dict.assert_not_awaited()
         assert actor._dp_client.clear_calls == []
     finally:
@@ -1238,7 +1240,8 @@ def _run_reserve_restore(mc: MasterConfig, actor_args: SingleControllerActorArgs
 
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
-        await actor._maybe_restore_replacement_reserve()
+        attach_rollout_checkpointing(actor)
+        await actor._rollout_restorer._restore_spare_prompts()
         return actor
 
     return asyncio.run(_main())
@@ -1259,7 +1262,8 @@ def _run_restore_then_train_pump(
 
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
-        await actor._maybe_restore_replay_buffer()
+        attach_rollout_checkpointing(actor)
+        await actor._rollout_restorer._restore_replay_buffer()
         actor._sampler = _RestoredGroupsSampler(restored_groups, actor._buffer)
         with patch("ray.cluster_resources", return_value={"GPU": 0}):
             await asyncio.wait_for(actor._train_pump(), timeout=60.0)
@@ -1311,7 +1315,8 @@ class TestCounterRestore:
             RuntimeError,
             match=r"dispatch_index=7, max_target_step=8",
         ):
-            actor._validate_restored_sampler_cursor()
+            attach_rollout_checkpointing(actor)
+            actor._rollout_restorer._validate_sampler_cursor()
 
     def test_accepts_sampler_cursor_covering_restored_work(self) -> None:
         actor = object.__new__(_ACTOR_CLS)
@@ -1323,7 +1328,8 @@ class TestCounterRestore:
         )
         actor._sampler = SimpleNamespace(dispatch_index=8)
 
-        actor._validate_restored_sampler_cursor()
+        attach_rollout_checkpointing(actor)
+        actor._rollout_restorer._validate_sampler_cursor()
 
     def test_restore_from_step_n(self, tmp_path):
         save_state = _initial_grpo_save_state()
@@ -2107,11 +2113,18 @@ class TestPeriodicRolloutCheckpoint:
             }
         if changed_setting in ("penalty", "effort"):
             with pytest.raises(ValueError, match="reward settings differ"):
+                attach_rollout_checkpointing(actor)
                 asyncio.run(
-                    actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                    actor._rollout_restorer._restore_recovery_ledger(
+                        restored_replay_groups=0
+                    )
                 )
         else:
-            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
+            asyncio.run(
+                actor._rollout_restorer._restore_recovery_ledger(
+                    restored_replay_groups=0
+                )
+            )
 
     def test_logs_snapshot_phase_durations(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
@@ -2419,7 +2432,8 @@ class TestPeriodicRolloutCheckpoint:
             "future_restore_phase_seconds": 5.0,
         }
         try:
-            actor._log_rollout_restore_metrics(
+            attach_rollout_checkpointing(actor)
+            actor._rollout_restorer._log_restore_metrics(
                 replay_metadata_load_seconds=3.0,
                 recovery_prepare_seconds=4.0,
                 restored_replay_groups=5,
@@ -2580,7 +2594,12 @@ class TestPeriodicRolloutCheckpoint:
             ).hexdigest(),
         }
         with pytest.raises(ValueError, match="saved with token capture disabled"):
-            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
+            attach_rollout_checkpointing(actor)
+            asyncio.run(
+                actor._rollout_restorer._restore_recovery_ledger(
+                    restored_replay_groups=0
+                )
+            )
 
     @pytest.mark.parametrize("checkpoint_kind", ["snapshot", "full"])
     def test_snapshot_persists_and_restores_pending_finalizer_metrics(
@@ -2659,7 +2678,10 @@ class TestPeriodicRolloutCheckpoint:
         actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
             "metadata"
         ]
-        asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=1))
+        attach_rollout_checkpointing(actor)
+        asyncio.run(
+            actor._rollout_restorer._restore_recovery_ledger(restored_replay_groups=1)
+        )
         assert actor._rollout_runtime.finalizer_metrics_by_group == {
             "claimed-group": pending
         }
@@ -3033,6 +3055,7 @@ class TestDataPlaneCheckpoint:
         )
         actor._master_config.token_capture.forest_training = damage != "mode"
         actor._dataloader = SimpleNamespace(dataset={7: {"idx": 7}})
+        attach_rollout_checkpointing(actor)
         try:
             if damage not in {None, "failed_without_row"}:
                 expected_error = {
@@ -3044,12 +3067,16 @@ class TestDataPlaneCheckpoint:
                 }[damage]
                 with pytest.raises((ValueError, RuntimeError), match=expected_error):
                     asyncio.run(
-                        actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                        actor._rollout_restorer._restore_recovery_ledger(
+                            restored_replay_groups=0
+                        )
                     )
                 assert dp.clear_calls == []
             else:
                 asyncio.run(
-                    actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                    actor._rollout_restorer._restore_recovery_ledger(
+                        restored_replay_groups=0
+                    )
                 )
                 assert dp.clear_calls == [(["orphan"], _STAGING_PARTITION_ID)]
                 restored = actor._rollout_recovery_ledger.get_group("g7")
@@ -4481,8 +4508,14 @@ class TestReplayBufferPersistence:
                 ),
                 SetupTimingMetrics(),
             )
-            restored = await actor._maybe_restore_replay_buffer()
-            await actor._maybe_restore_rollout_recovery(restored_replay_groups=restored)
+            restored = await actor._rollout_restorer._restore_replay_buffer()
+            await actor._rollout_restorer._restore_recovery_ledger(
+                restored_replay_groups=restored
+            )
+            # What _run_pumps does with restore's answer: dispatch through the
+            # ledger, the only dispatch that can launch the queued groups.
+            assert actor._rollout_restorer._requires_recovery_dispatch
+            actor._rollout_recovery_enabled = True
             assert actor._buffer_capacity._value == 4
             actor._rollout_permitted.set()
             try:
@@ -4516,7 +4549,8 @@ class TestReplayBufferPersistence:
         actor._dataloader = _FakeDataloader(dataset=[{"idx": 0}, {"idx": dataset_idx}])
         actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         actor._rollout_manager = _FakeRolloutManager()
-        actor._restored_replay_groups_to_regenerate = [
+        attach_rollout_checkpointing(actor)
+        actor._rollout_restorer._groups_to_regenerate = [
             {
                 "meta": KVBatchMeta(
                     partition_id=_PARTITION_ID,
@@ -4531,7 +4565,8 @@ class TestReplayBufferPersistence:
 
         async def regenerate() -> None:
             async with actor._data_plane_checkpoint_barrier.mutation() as cut:
-                await actor._queue_restored_replay_groups_for_regeneration(cut)
+                attach_rollout_checkpointing(actor)
+                await actor._rollout_restorer._queue_replay_groups_for_regeneration(cut)
 
         with pytest.raises(ValueError, match="prompt"):
             asyncio.run(regenerate())
@@ -4788,12 +4823,13 @@ class TestReplacementReservePersistence:
         actor._data_plane_checkpoint_metadata = {
             "rollout_recovery_schema_version": schema
         }
+        attach_rollout_checkpointing(actor)
         try:
             if schema >= 5:
                 with pytest.raises(FileNotFoundError, match="replacement_reserve"):
-                    asyncio.run(actor._maybe_restore_replacement_reserve())
+                    asyncio.run(actor._rollout_restorer._restore_spare_prompts())
             else:
-                asyncio.run(actor._maybe_restore_replacement_reserve())
+                asyncio.run(actor._rollout_restorer._restore_spare_prompts())
             assert list(actor._rollout_runtime.replacement_reserve) == []
         finally:
             actor._checkpointer.shutdown()
