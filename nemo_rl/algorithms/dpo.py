@@ -163,7 +163,6 @@ def setup(
     loss_fn_factory: Callable[[Any, PolicyConfig, Any], Any] | None = None,
     save_state_cls: type = DPOSaveState,
     initial_save_state_fn: Callable[[], Any] = _initial_dpo_save_state,
-    allow_sequence_packing: bool = False,
     cluster_name: str = "dpo_cluster",
     algorithm_config_name: str = "dpo",
 ) -> tuple[
@@ -196,29 +195,6 @@ def setup(
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
-
-    # Make sure we are not using dynamic batching or sequence packing.
-    # Anything that changes the order of data within a batch is currently incompatible with DPO.
-    assert not policy_config["dynamic_batching"]["enabled"], (
-        "Dynamic batching is currently not supported with DPO. "
-        "See https://github.com/NVIDIA-NeMo/RL/issues/719"
-    )
-    if not allow_sequence_packing:
-        assert not policy_config["sequence_packing"]["enabled"], (
-            "Sequence packing is currently not supported with DPO. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/719"
-        )
-
-    # Add a guardrail for linear CE fusion loss: if sequence packing is enabled for DPO in the future,
-    # we need to validate the fusion path with cu_seqlens-based logprob aggregation first and then remove this guardrail.
-    if policy_config["sequence_packing"]["enabled"]:
-        assert not (
-            policy_config["megatron_cfg"]["enabled"]
-            and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
-        ), (
-            "Linear CE fusion loss is not supported with sequence packing in DPO. "
-            "The fusion path has not been validated with cu_seqlens-based logprob aggregation."
-        )
 
     # ==========================
     #         Logger

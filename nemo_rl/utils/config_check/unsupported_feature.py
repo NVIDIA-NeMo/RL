@@ -22,6 +22,8 @@ from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
+    from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
+    from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
     from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
     from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
     from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
@@ -115,9 +117,29 @@ def _check_algo_distillation(config: DistillationMasterConfig) -> None:
         )
 
 
-def _check_algo_dpo(config: BaseModel) -> None:
+def _check_algo_dpo(config: DPOMasterConfig) -> None:
     """Reject unsupported configurations for dpo."""
-    pass
+    policy_config = config.policy
+    dynamic_batching = policy_config["dynamic_batching"]
+    packing = policy_config.get("sequence_packing")
+
+    # dynamic_batching
+    if dynamic_batching["enabled"]:
+        _raise_unsupported_feature(
+            feature="dynamic batching",
+            condition="using DPO",
+            suggestion="set policy.dynamic_batching.enabled=false.",
+            tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/719",
+        )
+
+    # sequence_packing
+    if packing and packing["enabled"]:
+        _raise_unsupported_feature(
+            feature="sequence packing",
+            condition="using DPO",
+            suggestion="set policy.sequence_packing.enabled=false.",
+            tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/719",
+        )
 
 
 def _check_algo_eval(config: BaseModel) -> None:
@@ -312,9 +334,37 @@ def _check_algo_vlm_grpo(config: BaseModel) -> None:
     pass
 
 
-def _check_algo_vlm_mpo(config: BaseModel) -> None:
+def _check_algo_vlm_mpo(config: MPOMasterConfig) -> None:
     """Reject unsupported configurations for vlm_mpo."""
-    pass
+    policy_config = config.policy
+    dynamic_batching = policy_config["dynamic_batching"]
+    packing = policy_config.get("sequence_packing")
+    megatron_cfg = policy_config.get("megatron_cfg")
+
+    # dynamic_batching
+    if dynamic_batching["enabled"]:
+        _raise_unsupported_feature(
+            feature="dynamic batching",
+            condition="using MPO",
+            suggestion="set policy.dynamic_batching.enabled=false.",
+        )
+
+    if packing and packing["enabled"]:
+        # sequence_packing
+        if not megatron_cfg or not megatron_cfg["enabled"]:
+            _raise_unsupported_feature(
+                feature="sequence packing without Megatron",
+                condition="using MPO",
+                suggestion="use the Megatron backend or disable sequence packing.",
+            )
+
+        # use_fused_linear_logprobs
+        if megatron_cfg.get("use_fused_linear_logprobs"):
+            _raise_unsupported_feature(
+                feature="fused linear logprobs + sequence packing",
+                condition="using MPO",
+                suggestion="set policy.megatron_cfg.use_fused_linear_logprobs=false.",
+            )
 
 
 def _check_algo_xtoken_off_policy_distillation(config: BaseModel) -> None:
@@ -332,7 +382,7 @@ def check_algo(config: BaseModel, *, entrypoint: EntryPoint) -> None:
     if entrypoint == EntryPoint.DISTILLATION:
         _check_algo_distillation(cast("DistillationMasterConfig", config))
     elif entrypoint == EntryPoint.DPO:
-        _check_algo_dpo(config)
+        _check_algo_dpo(cast("DPOMasterConfig", config))
     elif entrypoint == EntryPoint.EVAL:
         _check_algo_eval(config)
     elif entrypoint == EntryPoint.GRPO:
@@ -350,7 +400,7 @@ def check_algo(config: BaseModel, *, entrypoint: EntryPoint) -> None:
     elif entrypoint == EntryPoint.VLM_GRPO:
         _check_algo_vlm_grpo(config)
     elif entrypoint == EntryPoint.VLM_MPO:
-        _check_algo_vlm_mpo(config)
+        _check_algo_vlm_mpo(cast("MPOMasterConfig", config))
     elif entrypoint == EntryPoint.XTOKEN_OFF_POLICY_DISTILLATION:
         _check_algo_xtoken_off_policy_distillation(config)
 

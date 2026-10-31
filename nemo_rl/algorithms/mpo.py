@@ -90,19 +90,11 @@ def _initial_mpo_save_state(config: MPOConfig) -> MPOSaveState:
 def _validate_pair_safe_packing(
     policy_config: PolicyConfig, cluster_config: ClusterConfig
 ) -> None:
-    if policy_config["dynamic_batching"]["enabled"]:
-        raise ValueError("Dynamic batching is not supported with MPO.")
     if not policy_config["sequence_packing"]["enabled"]:
         return
 
     packing_config = cast(dict[str, Any], policy_config["sequence_packing"])
-    raw_megatron_config = policy_config["megatron_cfg"]
-    if not raw_megatron_config["enabled"]:
-        raise ValueError(
-            "MPO with sequence packing requires the Megatron backend; the fused "
-            "packed-loss path is not implemented for Automodel."
-        )
-    megatron_config = cast(MegatronConfig, raw_megatron_config)
+    megatron_config = cast(MegatronConfig, policy_config["megatron_cfg"])
 
     for key, required in (("pair_grouping_key", "pair_index"), ("fuse_loss", True)):
         if packing_config.get(key) != required:
@@ -207,7 +199,6 @@ def setup(
         loss_fn_factory=_make_loss_fn,
         save_state_cls=MPOSaveState,
         initial_save_state_fn=lambda: _initial_mpo_save_state(master_config.mpo),
-        allow_sequence_packing=True,
         cluster_name="mpo_cluster",
         algorithm_config_name="mpo",
     )
