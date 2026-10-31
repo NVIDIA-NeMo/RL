@@ -1015,6 +1015,7 @@ def _disable_opd_full(worker) -> None:
     paths under test read has to be set here by hand.
     """
     worker._opd_full_enabled = False
+    worker._w2s_opd_enabled = False
     worker._opd_full_lm_head_lifecycle = None
     worker._opd_full_teacher_lm_heads = {}
     worker._opd_full_teacher_checkpoint_paths = {}
@@ -1028,6 +1029,7 @@ def _worker_with_teachers(lifecycle, heads, paths):
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker._opd_full_enabled = True
+    worker._w2s_opd_enabled = False
     worker._opd_full_lm_head_lifecycle = lifecycle
     worker._opd_full_teacher_lm_heads = dict(heads)
     worker._opd_full_teacher_checkpoint_paths = dict(paths)
@@ -1145,6 +1147,65 @@ def test_second_teacher_with_another_hidden_size_is_rejected_at_load(monkeypatch
 
     assert 1 not in worker._opd_full_teacher_lm_heads
     assert worker._opd_full_teacher_lm_heads[0].shape == (4, 3)
+
+
+def test_w2s_heads_load_in_arm_order_with_different_widths(monkeypatch):
+    """W2S-OPD keeps each arm in its own column, so its heads may differ in width."""
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    worker = _worker_with_teachers("offload", {}, {})
+    worker._w2s_opd_enabled = True
+    owner = SimpleNamespace(
+        output_layer=SimpleNamespace(
+            weight=torch.zeros(4, 3), output_size_per_partition=4
+        )
+    )
+    monkeypatch.setattr(worker, "_resolve_output_layer_owner", lambda: owner)
+    widths = {"/anchor": 3, "/positive": 5}
+    monkeypatch.setattr(
+        worker_module,
+        "load_teacher_output_layer_weight",
+        lambda **kw: torch.zeros(4, widths[kw["teacher_pretrained_path"]]),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_model_paths",
+        lambda config: (None, config["model_name"], None),
+    )
+
+    paths = worker.load_w2s_teacher_lm_heads([{"model_name": p} for p in widths])
+
+    assert paths == list(widths)
+    assert {
+        index: tuple(head.shape)
+        for index, head in worker._opd_full_teacher_lm_heads.items()
+    } == {0: (4, 3), 1: (4, 5)}
+    assert worker._opd_full_teacher_checkpoint_paths == {
+        0: "/anchor",
+        1: "/positive",
+    }
+    with pytest.raises(ValueError, match="anchor and positive"):
+        worker.load_w2s_teacher_lm_heads([{"model_name": "/anchor"}])
+
+
+@pytest.mark.parametrize(
+    ("w2s_enabled", "heads", "match"),
+    [
+        (False, {}, "W2S-OPD teacher config"),
+        (True, {0: torch.zeros(4, 3)}, "anchor and positive LM heads"),
+    ],
+)
+def test_w2s_proxy_pass_refuses_to_run_without_its_heads(w2s_enabled, heads, match):
+    """Both guards run before the fetch, the forward, or any collective."""
+    worker = _worker_with_teachers("offload", heads, {})
+    worker._w2s_opd_enabled = w2s_enabled
+    worker.cfg = {"on_policy_distillation_full": {"method": "w2s_opd"}}
+
+    with pytest.raises(ValueError, match=match):
+        worker.get_w2s_proxy_logprobs(
+            data=BatchedDataDict({}),
+            fetch_arm_rows=lambda: pytest.fail("fetched before the guards"),
+        )
 
 
 def test_off_last_stage_joins_the_load_without_requesting_a_shard(monkeypatch):

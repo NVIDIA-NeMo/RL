@@ -46,7 +46,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
-from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn, MseValueLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
@@ -69,6 +69,9 @@ from nemo_rl.models.generation.vllm.config import (
     parse_nvfp4_pertoken_rollout,
 )
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
+from nemo_rl.models.policy.teacher_worker_group import (
+    create_teacher_configs_from_opd_config,
+)
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -1034,12 +1037,15 @@ def _validate_opd_full_config(
         ValueError: If ``opd_full`` is enabled with an unsupported backend, an
             incompatible logprob path, a fused packing path that never reaches
             the opd_full branch, or a sampling temperature the hidden-state
-            payload cannot honor.
+            payload cannot honor; or if W2S-OPD is misconfigured (see
+            :func:`_validate_w2s_config`).
     """
-    full_cfg = opd_module.get_opd_full_config(master_config)
+    full_cfg = opd_module.get_opd_distribution_config(master_config)
     if full_cfg is None:
         return
 
+    if isinstance(full_cfg, opd_module.W2SOPDConfig):
+        _validate_w2s_config(master_config, opd_config)
     policy_config = master_config.policy
     if not policy_config.get("megatron_cfg", {}).get("enabled", False):
         raise ValueError(
@@ -1107,6 +1113,91 @@ def _validate_opd_full_config(
             "the full vocabulary per token. This is a numerical-reference path; "
             "prefer 'hidden_states' for production runs.",
             flush=True,
+        )
+
+
+def _validate_w2s_config(
+    master_config: MasterConfig, opd_config: OnPolicyDistillationConfig
+) -> None:
+    """Validate W2S-OPD against the rest of the run before anything is allocated.
+
+    Args:
+        master_config: Full SingleController config, already known to have OPD on.
+        opd_config: The resolved ``on_policy_distillation`` block, with ``w2s``
+            enabled.
+
+    Raises:
+        ValueError: If the loss config sets a knob W2S-OPD has no code path
+            for, the positive/negative/anchor routing is ambiguous, sampling is
+            filtered or tempered, or the negative teacher cannot fold the proxy
+            (no sequence packing, or pipeline parallelism).
+    """
+    w2s_cfg = opd_config.w2s
+    assert w2s_cfg is not None
+    # Runs the opd_full loss validator, which rejects the policy-gradient knobs.
+    ClippedPGLossFn(master_config.loss_fn, opd_full=w2s_cfg)
+    teacher_models = opd_config.teacher_model_by_agent_name
+    reference_models = opd_config.reference_model_by_agent_name
+    if set(teacher_models) != set(reference_models):
+        raise ValueError(
+            "on_policy_distillation.w2s needs a reference_model_by_agent_name "
+            "entry (the pre-RL negative teacher) for every alias in "
+            f"teacher_model_by_agent_name: got teachers {sorted(teacher_models)} "
+            f"and references {sorted(reference_models)}."
+        )
+    if (
+        len(set(teacher_models.values())) != 1
+        or len(set(reference_models.values())) != 1
+    ):
+        raise ValueError(
+            "on_policy_distillation.w2s currently supports exactly one positive "
+            "and one negative checkpoint; aliases may share them."
+        )
+    if any(alias.startswith(("ref:", "anchor:")) for alias in teacher_models):
+        raise ValueError(
+            "on_policy_distillation.w2s reserves the 'ref:' and 'anchor:' teacher "
+            "aliases for its frozen negative and anchor models."
+        )
+    if not opd_config.deduplicate_shared_teacher_checkpoints:
+        raise ValueError(
+            "on_policy_distillation.w2s requires "
+            "deduplicate_shared_teacher_checkpoints=true."
+        )
+    if master_config.loss_fn.reference_policy_kl_penalty != 0:
+        raise ValueError(
+            "on_policy_distillation.w2s already anchors its proxy to the student's "
+            "initialization; set loss_fn.reference_policy_kl_penalty=0."
+        )
+    generation_config = master_config.policy["generation"]
+    if (
+        generation_config["temperature"] != 1.0
+        or generation_config["top_k"] not in (None, 0, -1)
+        or generation_config["top_p"] not in (None, 1.0)
+    ):
+        raise ValueError(
+            "on_policy_distillation.w2s distills the unfiltered, untempered "
+            "student: set policy.generation.temperature=1.0, top_k=null and "
+            "top_p=1.0."
+        )
+    if not master_config.policy.get("sequence_packing", {}).get("enabled", False):
+        raise ValueError(
+            "on_policy_distillation.w2s requires policy.sequence_packing.enabled=true: "
+            "the negative teacher folds the proxy one packed microbatch at a time."
+        )
+    negative_model = next(iter(reference_models.values()))
+    negative = next(
+        teacher
+        for teacher in create_teacher_configs_from_opd_config(
+            opd_config.model_dump(exclude_none=True),
+            anchor_model=master_config.policy["model_name"],
+        )
+        if teacher.model_name == negative_model
+    )
+    if negative.pipeline_model_parallel_size != 1:
+        raise ValueError(
+            "on_policy_distillation.w2s requires the negative teacher to run with "
+            f"pipeline_model_parallel_size=1, got "
+            f"{negative.pipeline_model_parallel_size} for teacher {negative.alias!r}."
         )
 
 
@@ -1535,7 +1626,23 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     )
 
     if isinstance(async_config.sampler, ReadyFirstSamplerConfig):
-        if not master_config.loss_fn.use_importance_sampling_correction:
+        distillation_cfg = master_config.on_policy_distillation
+        if (
+            distillation_cfg is not None
+            and distillation_cfg.w2s is not None
+            and distillation_cfg.w2s.enabled
+        ):
+            # W2S-OPD trains an exact reverse KL over the proxy support at every
+            # position, so there is no sampled-token term for an importance
+            # weight to correct (and the opd_full loss rejects the flag). A stale
+            # sampler only changes which prefixes are distilled; drop rollouts
+            # whose generation and training logprobs disagree too much instead.
+            if algo_cfg.seq_logprob_error_threshold is None:
+                raise ValueError(
+                    "the ready_first sampler with on_policy_distillation.w2s "
+                    "requires seq_logprob_error_threshold"
+                )
+        elif not master_config.loss_fn.use_importance_sampling_correction:
             raise ValueError(
                 "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
@@ -1755,6 +1862,15 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "on_policy_distillation.teacher_model_by_agent_name must contain "
                 "at least one teacher mapping."
+            )
+        if opd_config.reference_model_by_agent_name and not (
+            opd_config.w2s is not None and opd_config.w2s.enabled
+        ):
+            # Each reference becomes a frozen ref:<alias> teacher with its own
+            # GPUs, which nothing but W2S-OPD would ever score.
+            raise ValueError(
+                "on_policy_distillation.reference_model_by_agent_name is only "
+                "used by on_policy_distillation.w2s; enable W2S-OPD or remove it."
             )
         opd_module.assert_prev_logprobs_available(master_config)
         opd_module.assert_trust_region_supported(master_config)

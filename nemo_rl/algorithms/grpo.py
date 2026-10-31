@@ -804,17 +804,24 @@ def setup(
         "grpo.val_num_generations_per_prompt > 1"
     )
 
-    # opd_full is implemented only on the SingleController runtime, which has its
-    # own setup(). This entry point never reads on_policy_distillation.full, so
-    # accepting it would silently train the sampled-token top-k objective while
-    # the user believes they configured the full-vocabulary reverse KL.
-    if opd_module.get_opd_full_config(master_config) is not None:
+    # opd_full and W2S-OPD are implemented only on the SingleController runtime,
+    # which has its own setup(). This entry point never reads
+    # on_policy_distillation.full or .w2s, so accepting either would silently
+    # train the sampled-token top-k objective while the user believes they
+    # configured a reverse KL over a teacher distribution.
+    if opd_module.get_opd_distribution_config(master_config) is not None:
         raise ValueError(
-            "on_policy_distillation.full is only implemented on the "
-            "SingleController runtime (examples/run_grpo_single_controller.py). "
-            "This entry point never reads it, so leaving it enabled here would "
-            "silently train the sampled-token top-k objective instead of the "
-            "full-vocabulary reverse KL."
+            "on_policy_distillation.full and on_policy_distillation.w2s are only "
+            "implemented on the SingleController runtime "
+            "(examples/run_grpo_single_controller.py). This entry point never "
+            "reads them, so leaving one enabled here would silently train the "
+            "sampled-token top-k objective instead."
+        )
+    # Only W2S-OPD scores the frozen ref:<alias> teachers these would reserve.
+    if opd_module._opd_cfg(master_config).get("reference_model_by_agent_name"):
+        raise ValueError(
+            "on_policy_distillation.reference_model_by_agent_name is only used by "
+            "on_policy_distillation.w2s on the SingleController runtime."
         )
 
     # Set seed for all random number generators

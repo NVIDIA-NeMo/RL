@@ -724,6 +724,11 @@ class OnPolicyDistillationFullTransport(TypedDict):
     # right teacher LM-head shard. Only the hidden-state path needs it; the
     # logits payload ships an already-projected distribution, so it is None.
     teacher_index_field: str | None
+    # Present only for W2S-OPD (``W2SOPDConfig``), which rides this transport.
+    method: NotRequired[Literal["w2s_opd"]]
+    alpha: NotRequired[float]
+    top_k: NotRequired[int]
+    vocab_size: NotRequired[int | None]
 
 
 class PolicyConfig(TypedDict):

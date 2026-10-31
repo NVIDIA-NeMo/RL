@@ -1854,6 +1854,14 @@ def test_teacher_full_payload_cpu_boundaries(
             return_value=cp_group,
         ),
         patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group"),
+        # TP0/CP0 is the data-plane writer, the only rank that keeps a payload.
+        patch(
+            "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+            return_value=0,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_rank", return_value=0
+        ),
         patch(
             "megatron.core.tensor_parallel.gather_from_tensor_model_parallel_region",
             side_effect=lambda tensor, group: tensor,
@@ -1900,6 +1908,60 @@ def test_teacher_full_payload_cpu_boundaries(
         torch.testing.assert_close(call.args[0], shard)
         assert call.args[1] is cp_group
         assert call.kwargs == {"seq_dim": 1}
+
+
+@pytest.mark.parametrize(("tp_rank", "cp_rank"), [(1, 0), (0, 1)])
+def test_teacher_full_payload_is_kept_only_by_the_writer(tp_rank, cp_rank) -> None:
+    """Every rank joins the CP gather, but only TP0/CP0 copies the payload to host."""
+    # Megatron is an optional dependency loaded only for mcore tests.
+    from nemo_rl.models.megatron.train import TeacherFullPayloadPostProcessor
+
+    cfg = {
+        "sequence_packing": {"enabled": True},
+        "megatron_cfg": {"context_parallel_size": 2},
+    }
+    sequences = [torch.ones(1, 4, 2), torch.ones(1, 8, 2)]
+    local_payload = torch.cat([seq[:, : seq.shape[1] // 2] for seq in sequences], 1)
+    data = {
+        "input_ids": torch.zeros(2, 6, dtype=torch.long),
+        "input_lengths": torch.tensor([3, 5]),
+    }
+    logprobs = torch.zeros(2, 4)
+
+    with (
+        patch("nemo_rl.models.megatron.train.LogprobsPostProcessor") as logprob_cls,
+        patch("nemo_rl.models.megatron.train.get_context_parallel_group"),
+        patch(
+            "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+            return_value=tp_rank,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_rank",
+            return_value=cp_rank,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.allgather_cp_sharded_tensor",
+            side_effect=sequences,
+        ) as gather,
+    ):
+        logprob_cls.return_value.return_value.return_value = (
+            torch.tensor(0.0),
+            {"logprobs": logprobs},
+        )
+        processor = TeacherFullPayloadPostProcessor(cfg, "hidden_states", torch.float32)
+        wrapped_fn = processor(
+            data_dict=data,
+            input_ids=data["input_ids"],
+            cu_seqlens_padded=(0, 4, 12),
+            original_seq_length=4,
+            hidden_states=local_payload.transpose(0, 1),
+        )
+        _, result = wrapped_fn(local_payload)
+
+    assert result["teacher_full_payload"] is None
+    torch.testing.assert_close(result["logprobs"], logprobs)
+    # The non-writer still took part in the CP collectives.
+    assert gather.call_count == 2
 
 
 class TestTopkLogitsPostProcessor:

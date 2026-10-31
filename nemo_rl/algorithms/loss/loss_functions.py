@@ -357,6 +357,16 @@ class ClippedPGLossFn(LossFunction):
         # conversion. See nemo_rl/distributed/model_utils.py for the fused forward.
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
         self.opd_full = opd_full if opd_full is not None and opd_full.enabled else None
+        # W2S-OPD rides the opd_full branch with its own objective; its metrics
+        # carry a w2s_opd prefix so they never mix with full-vocabulary runs.
+        self._is_w2s = False
+        if self.opd_full is not None:
+            # Deferred: nemo_rl.algorithms.opd imports the data plane
+            # (tensordict), which plain policy-gradient losses never need.
+            from nemo_rl.algorithms.opd import W2SOPDConfig
+
+            self._is_w2s = isinstance(self.opd_full, W2SOPDConfig)
+        self._distribution_metric_prefix = "w2s_opd" if self._is_w2s else "opd_full"
         self.input_type = (
             LossInputType.OPD_FULL
             if self.opd_full is not None
@@ -585,14 +595,25 @@ class ClippedPGLossFn(LossFunction):
         if self.opd_full is not None:
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
+            prefix = self._distribution_metric_prefix
             self.metric_normalizations = {
                 "loss": grad_normalizer,
                 KL_PENALTY_KEY: grad_normalizer,
                 "num_valid_samples": MetricNormalizer.NONE,
-                "opd_full_reverse_kl": MetricNormalizer.TOKENS,
-                "opd_full_reverse_kl_min": MetricNormalizer.NONE,
-                "opd_full_reverse_kl_max": MetricNormalizer.NONE,
+                f"{prefix}_reverse_kl": MetricNormalizer.TOKENS,
+                f"{prefix}_reverse_kl_min": MetricNormalizer.NONE,
+                f"{prefix}_reverse_kl_max": MetricNormalizer.NONE,
             }
+            if self._is_w2s:
+                # Sampler-drift diagnostics, reported when the microbatch
+                # carries both logprob columns; see _opd_full_call.
+                self.metric_normalizations.update(
+                    {
+                        "w2s_opd_sampling_importance_ratio": MetricNormalizer.TOKENS,
+                        "w2s_opd_seq_mean_log_ratio_abs": MetricNormalizer.SEQUENCES,
+                        "w2s_opd_seq_sum_log_ratio_abs": MetricNormalizer.SEQUENCES,
+                    }
+                )
             if self.opd_full.validate_decomposition:
                 self.metric_normalizations.update(
                     {
@@ -1209,6 +1230,7 @@ class ClippedPGLossFn(LossFunction):
                 mask,
                 global_normalization_factor=global_valid_toks,
             )
+            prefix = self._distribution_metric_prefix
             metrics: dict[str, Any] = {
                 "loss": loss.item(),
                 # Report the raw KL, undoing the coefficient. Guard on the
@@ -1220,18 +1242,50 @@ class ClippedPGLossFn(LossFunction):
                     else 0
                 ),
                 "num_valid_samples": sample_mask.sum().item(),
-                "opd_full_reverse_kl": reverse_kl_metric.item(),
-                "opd_full_reverse_kl_min": (
+                f"{prefix}_reverse_kl": reverse_kl_metric.item(),
+                f"{prefix}_reverse_kl_min": (
                     masked_divergence.min().item()
                     if masked_divergence.numel() > 0
                     else float("inf")
                 ),
-                "opd_full_reverse_kl_max": (
+                f"{prefix}_reverse_kl_max": (
                     masked_divergence.max().item()
                     if masked_divergence.numel() > 0
                     else float("-inf")
                 ),
             }
+            # The controller ships prev_logprobs unless force_on_policy_ratio is
+            # set without seq_logprob_error_threshold.
+            if (
+                self._is_w2s
+                and "prev_logprobs" in data
+                and "generation_logprobs" in data
+            ):
+                # How far the rollout sampler q drifted from the trainer p. The
+                # divergence needs no sampled-token weight, but its prefixes are
+                # drawn from q; exp(sum_t log p/q) is the full prefix weight it
+                # does without. Diagnostics only: nothing here enters the loss.
+                log_ratio = torch.nan_to_num(
+                    data["prev_logprobs"][:, 1:] - data["generation_logprobs"][:, 1:],
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                metrics["w2s_opd_sampling_importance_ratio"] = masked_mean(
+                    log_ratio.exp(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+                metrics["w2s_opd_seq_mean_log_ratio_abs"] = masked_mean(
+                    masked_mean(log_ratio, token_mask, dim=-1).abs(),
+                    sample_mask,
+                    global_normalization_factor=global_valid_seqs,
+                ).item()
+                metrics["w2s_opd_seq_sum_log_ratio_abs"] = masked_mean(
+                    (log_ratio * token_mask).sum(dim=-1).abs(),
+                    sample_mask,
+                    global_normalization_factor=global_valid_seqs,
+                ).item()
             if (
                 opd_full_entropy is not None
                 and opd_full_cross_entropy is not None

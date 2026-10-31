@@ -60,6 +60,7 @@ from nemo_rl.data_plane.schema import (
     MICRO_BATCH_LENGTHS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
+    W2S_PROXY_FIELDS,
     fields_with_optional_opd_full,
     fields_with_optional_routed_experts,
 )
@@ -167,12 +168,15 @@ class TQPolicy(TQDriverMixin, Policy):
         )
         # Per-token teacher payload column read by the full-vocabulary MOPD loss,
         # plus (on the hidden-state path) a per-sample teacher-identity column.
-        # Resolved by the driver in setup; absent means the feature is off and
-        # the columns must stay out of every fetch.
+        # W2S-OPD reads its proxy-support columns instead. Resolved by the
+        # driver in setup; absent means the feature is off and the columns must
+        # stay out of every fetch.
         _opd_full_cfg = self.cfg.get("on_policy_distillation_full")
-        self._opd_full_field: Optional[str] = (
+        self._opd_full_field: Optional[str | tuple[str, ...]] = (
             _opd_full_cfg["payload_field"] if _opd_full_cfg else None
         )
+        if _opd_full_cfg and _opd_full_cfg.get("method") == "w2s_opd":
+            self._opd_full_field = W2S_PROXY_FIELDS
         self._opd_full_teacher_index_field: Optional[str] = (
             _opd_full_cfg["teacher_index_field"] if _opd_full_cfg else None
         )
