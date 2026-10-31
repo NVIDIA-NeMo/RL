@@ -110,7 +110,7 @@ def test_royalty_sensitive_codecs_are_excluded(package: str) -> None:
     overrides = [
         override
         for override in lock["manifest"]["overrides"]
-        if canonicalize_name(override["name"]) == canonical_name
+        if "name" in override and canonicalize_name(override["name"]) == canonical_name
     ]
 
     assert len(overrides) == 1, (
