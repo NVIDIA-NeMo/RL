@@ -64,6 +64,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Literal,
     Optional,
     Union,
     cast,
@@ -213,7 +214,6 @@ from nemo_rl.experience.rollout_recovery import (
     SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     PromptGroupPhase,
     RecoveryTargetLevel,
-    RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
@@ -311,9 +311,15 @@ class _RolloutCheckpointSaveResult:
     reason: RolloutCheckpointAttemptReason
 
 
+# Trainer checkpoints save model state and refuse rows a streamed step still
+# owns; rollout snapshots reference a durable trainer checkpoint and re-index
+# those rows. Both capture the rest of the rollout state the same way.
+_CheckpointKind = Literal["trainer_checkpoint", "rollout_snapshot"]
+
+
 @dataclass(frozen=True)
-class _RolloutCheckpointCut:
-    """Controller sidecars captured with one native TQ snapshot."""
+class _CapturedRolloutState:
+    """Controller state captured under one exclusive cut, with its TQ save."""
 
     dataloader_state: dict[str, Any]
     sampler_dispatch_index: int
@@ -4869,73 +4875,97 @@ class SingleControllerActor:
             get_effort_config(self._master_config.env),
         )
 
-    async def _capture_rollout_checkpoint_cut(
+    async def _capture_rollout_state(
         self,
         cut: DataPlaneMutationCut,
         checkpoint_path: PathLike,
-    ) -> _RolloutCheckpointCut:
-        """Save TQ and capture matching restart state under the barrier.
+        kind: _CheckpointKind,
+    ) -> _CapturedRolloutState:
+        """Capture restart-facing controller state and save TQ under the barrier.
 
-        Groups selected by an unfinished streamed step are absent from the live
-        replay index but remain in TQ. Re-index them only in this persisted cut;
-        the live trainer keeps accumulating gradients without modification.
+        A trainer checkpoint saves TQ only with ``checkpointing.save_data_plane``,
+        and refuses rows an unfinished streamed step still owns. A rollout
+        snapshot always saves TQ and re-indexes those rows in the persisted cut
+        only; the live trainer keeps accumulating gradients without modification.
         """
         cut.require_live()
+        snapshot = kind == "rollout_snapshot"
         dataloader_state = self._dataloader.state_dict()
         next_nemo_gym_task_index = self._rollout_manager.get_next_nemo_gym_task_index()
+        # The spare pool and dataloader advance together under the same mutation
+        # cut in recovery-enabled dispatch, so preserve them in this cut too.
         replacement_reserve = list(self._replacement_reserve)
-        training_owned_groups = self._buffer.training_owned_replay_groups()
-        replay_metadata = self._buffer.metadata_state_dict(
-            saved_capacity=self._async_cfg.max_buffered_rollouts,
-            additional_groups=training_owned_groups,
-        )
-        await self._validate_replay_inventory(replay_metadata)
-        replay_row_count = sum(
-            len(group["meta"].sample_ids) for group in replay_metadata["groups"]
-        )
-
-        canonical_group_ids = {group["group_id"] for group in replay_metadata["groups"]}
-        recovery_state = build_rollout_recovery_state(
-            self._rollout_manager.recovery_ledger,
-            batch_shortfall=self._batch_shortfall,
-            sampler_stamps_target_steps=self._sampler_stamps_target_steps,
-            finalizer_metrics_by_group=self._finalizer_metrics_by_group,
-            finalizer_rewards_by_group=self._finalizer_rewards_by_group,
-            reward_settings=self._capture_reward_settings(),
-            canonical_group_ids=canonical_group_ids,
-        )
-        payload_buffer = io.BytesIO()
-        await asyncio.to_thread(torch.save, recovery_state, payload_buffer)
-        recovery_payload = payload_buffer.getvalue()
-        recovery_digest = hashlib.sha256(recovery_payload).hexdigest()
-
+        replay_metadata: Optional[TQReplayMetadataState] = None
+        recovery_payload: Optional[bytes] = None
+        recovery_group_count: Optional[int] = None
+        training_owned_groups: list[TQReplayGroupMetadata] = []
         staging_row_count = 0
-        if self._master_config.token_capture.enabled:
-            staging_row_count = await self._validate_rollout_recovery_inventory(
-                cut,
+        tq_save_seconds = 0.0
+        if snapshot or self._master_config.checkpointing.get("save_data_plane"):
+            training_owned_groups = self._buffer.training_owned_replay_groups()
+            if training_owned_groups and not snapshot:
+                raise RuntimeError(
+                    "full trainer checkpoint still owns streamed training rows: "
+                    f"groups={[group['group_id'] for group in training_owned_groups]!r}"
+                )
+            if snapshot or self._sampler.supports_buffer_checkpoint:
+                replay_metadata = self._buffer.metadata_state_dict(
+                    saved_capacity=self._async_cfg.max_buffered_rollouts,
+                    additional_groups=training_owned_groups,
+                )
+                await self._validate_replay_inventory(replay_metadata)
+
+            recovery_digest: Optional[str] = None
+            if snapshot or self._rollout_recovery_enabled:
+                recovery_state = build_rollout_recovery_state(
+                    self._rollout_manager.recovery_ledger,
+                    batch_shortfall=self._batch_shortfall,
+                    sampler_stamps_target_steps=self._sampler_stamps_target_steps,
+                    finalizer_metrics_by_group=self._finalizer_metrics_by_group,
+                    finalizer_rewards_by_group=self._finalizer_rewards_by_group,
+                    reward_settings=self._capture_reward_settings(),
+                    canonical_group_ids={
+                        group["group_id"] for group in replay_metadata["groups"]
+                    }
+                    if replay_metadata is not None
+                    else set(),
+                )
+                payload_buffer = io.BytesIO()
+                await asyncio.to_thread(torch.save, recovery_state, payload_buffer)
+                recovery_payload = payload_buffer.getvalue()
+                recovery_digest = hashlib.sha256(recovery_payload).hexdigest()
+                recovery_group_count = len(recovery_state["groups"])
+
+            if self._master_config.token_capture.enabled:
+                staging_row_count = await self._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=replay_metadata,
+                    clear_unreferenced=False,
+                )
+            tq_save_started = time.monotonic()
+            await self._save_data_plane_checkpoint(
+                checkpoint_path,
+                train_steps=self._train_steps,
+                trainer_version=self._trainer_version,
+                current_epoch=self._current_epoch,
                 replay_metadata=replay_metadata,
-                clear_unreferenced=False,
+                rollout_recovery_payload_sha256=recovery_digest,
+                rollout_recovery_group_count=recovery_group_count,
             )
-        tq_save_started = time.monotonic()
-        await self._save_data_plane_checkpoint(
-            checkpoint_path,
-            train_steps=self._train_steps,
-            trainer_version=self._trainer_version,
-            current_epoch=self._current_epoch,
-            replay_metadata=replay_metadata,
-            rollout_recovery_payload_sha256=recovery_digest,
-            rollout_recovery_group_count=len(recovery_state["groups"]),
-        )
-        tq_save_seconds = time.monotonic() - tq_save_started
-        return _RolloutCheckpointCut(
+            tq_save_seconds = time.monotonic() - tq_save_started
+        return _CapturedRolloutState(
             dataloader_state=dataloader_state,
             sampler_dispatch_index=self._sampler.dispatch_index,
             next_nemo_gym_task_index=next_nemo_gym_task_index,
             replacement_reserve=replacement_reserve,
             replay_metadata=replay_metadata,
             rollout_recovery_payload=recovery_payload,
-            rollout_recovery_group_count=len(recovery_state["groups"]),
-            replay_row_count=replay_row_count,
+            rollout_recovery_group_count=recovery_group_count,
+            replay_row_count=sum(
+                len(group["meta"].sample_ids) for group in replay_metadata["groups"]
+            )
+            if replay_metadata is not None
+            else 0,
             staging_row_count=staging_row_count,
             rolled_back_train_group_count=len(training_owned_groups),
             mutation_version=self._data_plane_checkpoint_barrier.mutation_version,
@@ -5289,41 +5319,40 @@ class SingleControllerActor:
                     _GYM_CHECKPOINT_DEADLINE_HOLDER
                 )
 
+    @staticmethod
+    async def _write_controller_sidecars(
+        checkpoint_path: PathLike,
+        captured: _CapturedRolloutState,
+    ) -> list[str]:
+        """Write the captured controller state beside TQ; return the files written."""
+        written_paths = [os.path.join(checkpoint_path, "train_dataloader.pt")]
+        await asyncio.to_thread(
+            save_dataloader_state, captured.dataloader_state, checkpoint_path
+        )
+        objects = {
+            REPLACEMENT_RESERVE_FILENAME: captured.replacement_reserve,
+            REPLAY_BUFFER_METADATA_FILENAME: captured.replay_metadata,
+        }
+        for filename, value in objects.items():
+            if value is not None:
+                path = os.path.join(checkpoint_path, filename)
+                await asyncio.to_thread(save_checkpoint_object, value, path)
+                written_paths.append(path)
+        if captured.rollout_recovery_payload is not None:
+            path = os.path.join(checkpoint_path, ROLLOUT_RECOVERY_STATE_FILENAME)
+            await asyncio.to_thread(
+                Path(path).write_bytes, captured.rollout_recovery_payload
+            )
+            written_paths.append(path)
+        return written_paths
+
     async def _write_rollout_checkpoint_sidecars(
         self,
         checkpoint_path: Path,
-        cut: _RolloutCheckpointCut,
+        captured: _CapturedRolloutState,
     ) -> int:
-        """Write controller state beside TQ and return its on-disk byte size."""
-        written_paths: list[Path] = []
-        dataloader_path = checkpoint_path / "train_dataloader.pt"
-        await asyncio.to_thread(
-            torch.save,
-            cut.dataloader_state,
-            dataloader_path,
-        )
-        written_paths.append(dataloader_path)
-        replacement_reserve_path = checkpoint_path / REPLACEMENT_RESERVE_FILENAME
-        await asyncio.to_thread(
-            torch.save, cut.replacement_reserve, replacement_reserve_path
-        )
-        written_paths.append(replacement_reserve_path)
-        if cut.replay_metadata is not None:
-            replay_metadata_path = checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME
-            await asyncio.to_thread(
-                torch.save,
-                cut.replay_metadata,
-                replay_metadata_path,
-            )
-            written_paths.append(replay_metadata_path)
-        if cut.rollout_recovery_payload is not None:
-            rollout_recovery_path = checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME
-            await asyncio.to_thread(
-                rollout_recovery_path.write_bytes,
-                cut.rollout_recovery_payload,
-            )
-            written_paths.append(rollout_recovery_path)
-
+        """Write the snapshot's sidecars and config; return their on-disk size."""
+        written_paths = await self._write_controller_sidecars(checkpoint_path, captured)
         config_path = checkpoint_path / "config.yaml"
 
         def _write_config() -> None:
@@ -5334,9 +5363,9 @@ class SingleControllerActor:
                 yaml.safe_dump(dumped, config_file)
 
         await asyncio.to_thread(_write_config)
-        written_paths.append(config_path)
+        written_paths.append(str(config_path))
         return await asyncio.to_thread(
-            lambda: sum(path.stat().st_size for path in written_paths)
+            lambda: sum(Path(path).stat().st_size for path in written_paths)
         )
 
     def _begin_optimizer_commit(self) -> None:
@@ -5491,8 +5520,8 @@ class SingleControllerActor:
                             await self._validate_gym_checkpoint_cut(
                                 cut, gym_commit, checkpoint_path=tmp_path
                             )
-                        snapshot_cut = await self._capture_rollout_checkpoint_cut(
-                            cut, tmp_path
+                        snapshot_cut = await self._capture_rollout_state(
+                            cut, tmp_path, "rollout_snapshot"
                         )
                     barrier_released = time.monotonic()
                 # Dispatch reopens and Gym resumes when that block exits, so this
@@ -5984,10 +6013,6 @@ class SingleControllerActor:
         await asyncio.to_thread(self._checkpointer.finalize_pending)
 
         print(f"Saving checkpoint for step {self._train_steps}...")
-        replay_metadata: Optional[TQReplayMetadataState] = None
-        rollout_recovery_state: Optional[RolloutRecoveryState] = None
-        rollout_recovery_payload: Optional[bytes] = None
-        rollout_recovery_payload_sha256: Optional[str] = None
 
         # Admission, dataloader movement, replay mutations, and canonical TQ writes
         # all take the mutation side of this barrier. Capture every restart-facing
@@ -6008,10 +6033,6 @@ class SingleControllerActor:
             save_state.next_nemo_gym_task_index = (
                 self._rollout_manager.get_next_nemo_gym_task_index()
             )
-            dataloader_state = self._dataloader.state_dict()
-            # The spare pool and dataloader advance together under the same mutation
-            # cut in recovery-enabled dispatch, so preserve them in this cut too.
-            reserve_state = list(self._replacement_reserve)
 
             checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
                 self._checkpointer.init_tmp_checkpoint,
@@ -6019,72 +6040,16 @@ class SingleControllerActor:
                 vars(save_state),
                 self._master_config,
             )
-
-            if self._master_config.checkpointing.get("save_data_plane"):
-                training_owned_groups = self._buffer.training_owned_replay_groups()
-                if training_owned_groups:
-                    raise RuntimeError(
-                        "full trainer checkpoint still owns streamed training rows: "
-                        f"groups={[group['group_id'] for group in training_owned_groups]!r}"
-                    )
-                if self._sampler.supports_buffer_checkpoint:
-                    replay_metadata = self._buffer.metadata_state_dict(
-                        saved_capacity=self._async_cfg.max_buffered_rollouts
-                    )
-                if replay_metadata is not None:
-                    await self._validate_replay_inventory(replay_metadata)
-
-                if self._rollout_recovery_enabled:
-                    rollout_recovery_state = build_rollout_recovery_state(
-                        self._rollout_manager.recovery_ledger,
-                        batch_shortfall=self._batch_shortfall,
-                        sampler_stamps_target_steps=(self._sampler_stamps_target_steps),
-                        finalizer_metrics_by_group=self._finalizer_metrics_by_group,
-                        finalizer_rewards_by_group=self._finalizer_rewards_by_group,
-                        reward_settings=self._capture_reward_settings(),
-                        canonical_group_ids={
-                            group["group_id"] for group in replay_metadata["groups"]
-                        }
-                        if replay_metadata is not None
-                        else set(),
-                    )
-                    payload_buffer = io.BytesIO()
-                    await asyncio.to_thread(
-                        torch.save,
-                        rollout_recovery_state,
-                        payload_buffer,
-                    )
-                    rollout_recovery_payload = payload_buffer.getvalue()
-                    rollout_recovery_payload_sha256 = hashlib.sha256(
-                        rollout_recovery_payload
-                    ).hexdigest()
-
-                if self._master_config.token_capture.enabled:
-                    await self._validate_rollout_recovery_inventory(
-                        cut,
-                        replay_metadata=replay_metadata,
-                        clear_unreferenced=False,
-                    )
-
-                await self._save_data_plane_checkpoint(
-                    checkpoint_path,
-                    train_steps=save_state.current_step,
-                    trainer_version=self._trainer_version,
-                    current_epoch=save_state.current_epoch,
-                    replay_metadata=replay_metadata,
-                    rollout_recovery_payload_sha256=(rollout_recovery_payload_sha256),
-                    rollout_recovery_group_count=(
-                        len(rollout_recovery_state["groups"])
-                        if rollout_recovery_state is not None
-                        else None
-                    ),
-                )
-                # A turn-level trainer checkpoint holds no Gym state, so it
-                # does not stand in for the next rollout snapshot.
-                if self._gym_checkpoint_coordinator is None:
-                    self._last_rollout_snapshot_mutation_version = (
-                        self._data_plane_checkpoint_barrier.mutation_version
-                    )
+            captured = await self._capture_rollout_state(
+                cut, checkpoint_path, "trainer_checkpoint"
+            )
+            # A turn-level trainer checkpoint holds no Gym state, so it does
+            # not stand in for the next rollout snapshot.
+            if (
+                self._master_config.checkpointing.get("save_data_plane")
+                and self._gym_checkpoint_coordinator is None
+            ):
+                self._last_rollout_snapshot_mutation_version = captured.mutation_version
 
         # Save value model
         if self._is_ppo:
@@ -6127,28 +6092,7 @@ class SingleControllerActor:
             is_final_checkpoint=is_final_checkpoint,
         )
 
-        await asyncio.to_thread(
-            save_dataloader_state, dataloader_state, checkpoint_path
-        )
-        await asyncio.to_thread(
-            save_checkpoint_object,
-            reserve_state,
-            os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
-        )
-        if replay_metadata is not None:
-            await asyncio.to_thread(
-                save_checkpoint_object,
-                replay_metadata,
-                os.path.join(checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME),
-            )
-        if rollout_recovery_payload is not None:
-            await asyncio.to_thread(
-                Path(
-                    checkpoint_path,
-                    ROLLOUT_RECOVERY_STATE_FILENAME,
-                ).write_bytes,
-                rollout_recovery_payload,
-            )
+        await self._write_controller_sidecars(checkpoint_path, captured)
         # Keep this last: the rename it leads to waits only for the policy's async
         # weight write, so anything written into checkpoint_path after it races
         # the rename.
