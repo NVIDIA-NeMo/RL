@@ -464,7 +464,9 @@ override-dependencies = [
     "flashinfer-jit-cache-sm121a==0.7.2.post1+cu130; platform_machine == 'aarch64'",
   ] },
   # Preserve TRT-LLM's existing frontend override without constraining Megatron.
-  { package = { name = "tensorrt-llm" }, dependencies = ["nvidia-cudnn-frontend==1.25.0"] },
+  { package = { name = "tensorrt-llm" }, dependencies = [
+    "nvidia-cudnn-frontend==1.25.0",
+  ] },
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
