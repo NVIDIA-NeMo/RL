@@ -2480,6 +2480,7 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
 
     import nemo_gym.cli as gym_cli
     import nemo_gym.rollout_collection as gym_rollout_collection
+    import nemo_gym.server_utils as gym_server_utils
     from omegaconf import OmegaConf
 
     import nemo_rl.environments.nemo_gym as nemo_gym_mod
@@ -2499,6 +2500,9 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
 
     monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
     monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
     monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
     monkeypatch.delenv("NEMO_RL_POLICY_API_KEY", raising=False)
 
