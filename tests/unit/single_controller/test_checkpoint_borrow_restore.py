@@ -247,7 +247,6 @@ def _controller(
     controller._train_steps = 0
     controller._current_epoch = 0
     controller._rollout_recovery_enabled = True
-    controller._restored_replay_groups_to_regenerate = []
     controller._batch_replacements = {}
     controller._batch_promotions = {}
     controller._finalizer_actors = []
@@ -372,11 +371,12 @@ async def _exercise_round_trip(
         checkpoint_path=checkpoint_path,
         checkpoint_metadata=checkpoint_metadata,
     )
-    restored_group_count = await restored._maybe_restore_replay_buffer()
-    await restored._maybe_restore_rollout_recovery(
+    attach_rollout_checkpointing(restored)
+    restored_group_count = await restored._rollout_restorer._restore_replay_buffer()
+    await restored._rollout_restorer._restore_recovery_ledger(
         restored_replay_groups=restored_group_count
     )
-    restored._validate_restored_sampler_cursor()
+    restored._rollout_restorer._validate_sampler_cursor()
     assert restored._sampler.dispatch_index == snapshot.sampler_dispatch_index
     restored._rollout_manager.prompt_by_group_id.update(
         first._rollout_manager.prompt_by_group_id

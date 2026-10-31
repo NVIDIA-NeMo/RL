@@ -572,7 +572,8 @@ def _rehydration_controller(
 def _run_rehydration(controller: Any) -> None:
     async def rehydrate() -> None:
         async with controller._data_plane_checkpoint_barrier.mutation() as cut:
-            await controller._rehydrate_rollout_recovery_prompts(cut)
+            attach_rollout_checkpointing(controller)
+            await controller._rollout_restorer._rehydrate_prompts(cut)
 
     asyncio.run(rehydrate())
 
@@ -1205,7 +1206,6 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
         controller = object.__new__(controller_cls)
         controller._rollout_runtime = RolloutRuntimeState()
         _init_recovery_telemetry(controller, train_steps=7)
-        controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
@@ -1246,8 +1246,13 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
                 await rollout_manager.complete_recovery(cut, group_id)
 
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
-        await controller._redispatch_restored_rollouts(_recover)
+        attach_rollout_checkpointing(controller)
+        await controller._rollout_restorer._restore_recovery_ledger(
+            restored_replay_groups=0
+        )
+        await controller._rollout_restorer.redispatch_restored(
+            _recover, controller._admit_reserved_prompt_groups
+        )
 
         assert rollout_manager.recovered == [("batch-7-prompt-0", 7)]
         assert sampler.admit_calls == 0
@@ -1322,7 +1327,6 @@ async def _turn_recovery_restart(
     controller._sampler = _CountingInOrderSampler()
     controller._rollout_manager = rollout_manager
     controller._rollout_recovery_ledger = rollout_manager.recovery_ledger
-    controller._restored_replay_groups_to_regenerate = []
     controller._environment_checkpoint = _gym_environment_for(
         controller, gym_coordinator(gym_actor)
     )
@@ -1367,7 +1371,10 @@ def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
             tmp_path
         )
         manifest = _write_turn_manifest(tmp_path, episode)
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        attach_rollout_checkpointing(controller)
+        await controller._rollout_restorer._restore_recovery_ledger(
+            restored_replay_groups=0
+        )
         return rollout_manager, gym_actor, manifest
 
     rollout_manager, gym_actor, manifest = asyncio.run(exercise())
@@ -1394,7 +1401,10 @@ def test_turn_recovery_starts_a_gym_restart_over_from_its_task(tmp_path: Path) -
             tmp_path
         )
         _write_turn_manifest(tmp_path, episode, restarted=True)
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        attach_rollout_checkpointing(controller)
+        await controller._rollout_restorer._restore_recovery_ledger(
+            restored_replay_groups=0
+        )
         return rollout_manager, gym_actor
 
     rollout_manager, gym_actor = asyncio.run(exercise())
@@ -1437,7 +1447,10 @@ def test_failure_after_gym_restore_retires_the_replacements_then_resumes(
         _write_turn_manifest(tmp_path, episode)
         controller._dataloader = SimpleNamespace(collate_fn=rl_collate_fn)
         with pytest.raises(RuntimeError, match="source dataset"):
-            await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            attach_rollout_checkpointing(controller)
+            await controller._rollout_restorer._restore_recovery_ledger(
+                restored_replay_groups=0
+            )
         return gym_actor, episode
 
     gym_actor, episode = asyncio.run(exercise())
@@ -1459,7 +1472,10 @@ def test_failed_gym_restore_is_cleaned_up_once(
         )
         _write_turn_manifest(tmp_path, episode)
         with pytest.raises(RuntimeError, match="gym restore failed"):
-            await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            attach_rollout_checkpointing(controller)
+            await controller._rollout_restorer._restore_recovery_ledger(
+                restored_replay_groups=0
+            )
         return gym_actor
 
     gym_actor = asyncio.run(exercise())
@@ -1479,7 +1495,10 @@ def test_manifest_that_disagrees_with_the_ledger_fails_before_any_gym_call(
             match=r"does not match the rollout recovery ledger for Gym instances "
             r"\['tools/replica-0'\]",
         ):
-            await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            attach_rollout_checkpointing(controller)
+            await controller._rollout_restorer._restore_recovery_ledger(
+                restored_replay_groups=0
+            )
         return gym_actor
 
     assert asyncio.run(exercise()).calls == []
@@ -1490,7 +1509,10 @@ def test_turn_state_without_gym_coordination_is_refused(tmp_path: Path) -> None:
         controller, _, _, episode = await _turn_recovery_restart(tmp_path)
         controller._environment_checkpoint = NoEnvironmentCheckpoint()
         _write_turn_manifest(tmp_path, episode)
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        attach_rollout_checkpointing(controller)
+        await controller._rollout_restorer._restore_recovery_ledger(
+            restored_replay_groups=0
+        )
 
     with pytest.raises(RuntimeError, match="keeps none to restore"):
         asyncio.run(exercise())
@@ -1506,7 +1528,10 @@ def test_turn_recovery_from_a_trainer_checkpoint_restarts_unfinished_turns(
             tmp_path
         )
         controller._restored_from_rollout_snapshot = False
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        attach_rollout_checkpointing(controller)
+        await controller._rollout_restorer._restore_recovery_ledger(
+            restored_replay_groups=0
+        )
         return rollout_manager, gym_actor
 
     rollout_manager, gym_actor = asyncio.run(exercise())
@@ -1534,7 +1559,10 @@ def test_turn_recovery_counts_continued_and_restarted_siblings(
             _write_turn_manifest(tmp_path, episode)
         else:
             controller._restored_from_rollout_snapshot = False
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        attach_rollout_checkpointing(controller)
+        await controller._rollout_restorer._restore_recovery_ledger(
+            restored_replay_groups=0
+        )
 
         async def _recover(
             _prompt: dict[str, Any], _target_step: int | None, group_id: str
@@ -1542,7 +1570,9 @@ def test_turn_recovery_counts_continued_and_restarted_siblings(
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
                 await rollout_manager.complete_recovery(cut, group_id)
 
-        await controller._redispatch_restored_rollouts(_recover)
+        await controller._rollout_restorer.redispatch_restored(
+            _recover, controller._admit_reserved_prompt_groups
+        )
         return controller._logger.log_metrics.call_args.args[0]
 
     metrics = asyncio.run(exercise())
@@ -1560,7 +1590,10 @@ def test_turn_recovery_refuses_a_rollout_snapshot_without_its_gym_manifest(
     async def exercise() -> None:
         controller, _, gym_actor, _ = await _turn_recovery_restart(tmp_path)
         try:
-            await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            attach_rollout_checkpointing(controller)
+            await controller._rollout_restorer._restore_recovery_ledger(
+                restored_replay_groups=0
+            )
         finally:
             assert gym_actor.calls == []
 
@@ -1595,7 +1628,10 @@ def test_recovery_rejects_an_unhandled_phase_before_redispatch() -> None:
             RuntimeError,
             match=r"unrecognized rollout recovery phase.*future-group='future-phase'",
         ):
-            await controller._redispatch_restored_rollouts(_recover)
+            attach_rollout_checkpointing(controller)
+            await controller._rollout_restorer.redispatch_restored(
+                _recover, controller._admit_reserved_prompt_groups
+            )
 
         assert not launched
 
@@ -1630,7 +1666,6 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         controller = object.__new__(controller_cls)
         controller._rollout_runtime = RolloutRuntimeState()
         _init_recovery_telemetry(controller, train_steps=7)
-        controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
@@ -1675,8 +1710,13 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
                 await rollout_manager.complete_recovery(cut, group_id)
 
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
-        await controller._redispatch_restored_rollouts(_recover)
+        attach_rollout_checkpointing(controller)
+        await controller._rollout_restorer._restore_recovery_ledger(
+            restored_replay_groups=0
+        )
+        await controller._rollout_restorer.redispatch_restored(
+            _recover, controller._admit_reserved_prompt_groups
+        )
 
         assert sampler.admit_calls == 0
         assert sampler.admission_commits == 1
@@ -1749,8 +1789,11 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
                 # opens the in-order gate so the reserved batch can become step 8.
                 controller._trainer_version = 7
 
+        attach_rollout_checkpointing(controller)
         await asyncio.wait_for(
-            controller._redispatch_restored_rollouts(_recover),
+            controller._rollout_restorer.redispatch_restored(
+                _recover, controller._admit_reserved_prompt_groups
+            ),
             timeout=1.0,
         )
 
@@ -1793,7 +1836,6 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         controller = object.__new__(controller_cls)
         controller._rollout_runtime = RolloutRuntimeState()
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
-        controller._restored_replay_groups_to_regenerate = []
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
             token_capture=SimpleNamespace(enabled=False, forest_training=False)
@@ -1825,7 +1867,10 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         # Three canonical groups plus two unfinished groups exceed capacity four,
         # but only the canonical groups occupy slots at restore time. Recovery is
         # launched beside the train pump, which releases capacity as it consumes.
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=3)
+        attach_rollout_checkpointing(controller)
+        await controller._rollout_restorer._restore_recovery_ledger(
+            restored_replay_groups=3
+        )
 
         assert len(rollout_manager.recovery_ledger) == 2
 
@@ -2007,8 +2052,11 @@ def test_recovery_rejects_a_corrupt_ledger_sidecar(tmp_path) -> None:
     }
 
     with pytest.raises(ValueError, match="checksum mismatch"):
+        attach_rollout_checkpointing(controller)
         asyncio.run(
-            controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            controller._rollout_restorer._restore_recovery_ledger(
+                restored_replay_groups=0
+            )
         )
 
 
@@ -2030,6 +2078,9 @@ def test_recovery_rejects_a_missing_advertised_ledger_sidecar(tmp_path) -> None:
     }
 
     with pytest.raises(FileNotFoundError, match="sidecar is missing"):
+        attach_rollout_checkpointing(controller)
         asyncio.run(
-            controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            controller._rollout_restorer._restore_recovery_ledger(
+                restored_replay_groups=0
+            )
         )

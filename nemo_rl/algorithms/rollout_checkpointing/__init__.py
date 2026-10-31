@@ -15,6 +15,7 @@
 """Rollout checkpointing for the single controller.
 
 - ``snapshots``: ``RolloutSnapshotter`` saves rollout state.
+- ``restore``: ``RolloutRestorer`` restores it and redispatches what it loaded.
 - ``state``: the state both sides read and the parts they share.
 - ``inventory``: TQ inventory checks both sides run.
 """
