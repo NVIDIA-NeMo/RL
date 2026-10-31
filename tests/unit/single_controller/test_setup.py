@@ -65,6 +65,10 @@ from nemo_rl.algorithms.opd import (
     opd_full_teacher_index_field,
 )
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
+    bootstrap_compatibility_identity,
+    ensure_bootstrap_anchor,
+)
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -80,10 +84,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     _validate_opd_full_config,
     forest_execution_row_multiple,
     validate_single_controller_config,
-)
-from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
-    bootstrap_compatibility_identity,
-    ensure_bootstrap_anchor,
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
