@@ -362,8 +362,8 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 # FlashMLA derives its version from the Git revision in setup.py. Keep this pin
 # synchronized with the static dependency metadata below.
 flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
-# Released functional export API shared with the pinned Megatron-Bridge.
-nvidia-modelopt = { index = "nvidia" }
+# The study needs the reviewed constant KV scale export fix from ModelOpt #3121.
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer.git", rev = "b28f61724c930d0db3a1f4734b1965ae01978559" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.7.0" }
 flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
@@ -455,7 +455,7 @@ override-dependencies = [
   "opencv-python-headless; sys_platform == 'never'",
   "timm<=1.0.22",
   "fastapi[standard]>=0.133.0,<0.137.0",
-  "nvidia-modelopt[torch]==0.48.0rc1",
+  "nvidia-modelopt",
   # vLLM 0.29 lists instanttensor (the optional `load_format="instanttensor"`
   # safetensors loader) as an unconditional dependency. NeMo-RL never selects
   # that load format and vLLM imports it lazily, so it is kept on x86_64 only;
