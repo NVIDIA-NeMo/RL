@@ -36,6 +36,12 @@ from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    MasterConfig as SingleControllerMasterConfig,
+)
+from nemo_rl.algorithms.single_controller_utils.config import (
+    validate_single_controller_config,
+)
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig as XTokenOffPolicyDistillationMasterConfig,
 )
@@ -141,6 +147,10 @@ def test_all_config_files_have_required_keys(config_file):
     if "/evals/" in config_file:
         master_config_class = EvalMasterConfig
         config_type = "eval"
+    elif "async_rl" in config_dict:
+        # SingleController configs also carry a grpo or ppo block, so match them first.
+        master_config_class = SingleControllerMasterConfig
+        config_type = "single_controller"
     elif "teachers" in config_dict or (
         "loss_fn" in config_dict and "projection_matrix_path" in config_dict["loss_fn"]
     ):
@@ -182,6 +192,18 @@ def test_all_config_files_have_required_keys(config_file):
 
     # Validate the entire config using the appropriate MasterConfig
     validate_config_section(config_dict, master_config_class, config_file)
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_single_controller_configs_pass_single_controller_validation(config_file):
+    config_dict = OmegaConf.to_container(
+        load_config_with_inheritance(config_file), resolve=True
+    )
+    if "async_rl" not in config_dict:
+        pytest.skip("Not a SingleController config")
+    validate_single_controller_config(
+        SingleControllerMasterConfig.model_validate(config_dict)
+    )
 
 
 def test_multimodal_dedup_grpo_config_keys_default_off():

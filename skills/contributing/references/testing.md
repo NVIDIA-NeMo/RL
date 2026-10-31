@@ -6,6 +6,7 @@ How to add and change unit, functional and nightly tests.
 
 - **Add `# pragma: no cover` on the `class` or `def` line of anything under `nemo_rl/` decorated with `@ray.remote`.** These run in separate Ray processes that coverage does not track reliably. Contributing Details: [testing](details/testing.md).
 - **Do not test recipe settings: a unit test that only asserts a key of an existing config has a given value.** A recipe change always has a reason, so such a test only fails CI for the next intentional change. A test that keeps every config away from a known issue is fine, for example `test_all_config_no_tp_size_accuracy_issues`, which stops a new config from hitting the known TP>=4 accuracy issue. (#4037)
+- **Do not add a unit test that only checks a config under `examples/configs/` loads or validates.** `test_all_config_files_have_required_keys` in `tests/unit/test_config_validation.py` already loads every one with inheritance and validates it against its algorithm's `MasterConfig`, and `test_single_controller_configs_pass_single_controller_validation` runs `validate_single_controller_config` on every SingleController config. If a new kind of config needs a check, extend those tests.
 - **Put a research project's unit tests under `research/<project>/tests/`.** CI syncs the project's runtime dependencies and `test` group before running them. Contributing Details: [testing](details/testing.md).
 
 ## Functional tests
