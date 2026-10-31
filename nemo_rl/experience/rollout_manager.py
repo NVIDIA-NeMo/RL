@@ -74,6 +74,7 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
     SiblingSealResult,
+    UnresolvedCaptureAcknowledgement,
 )
 from nemo_rl.experience.rollouts import (
     _SHARED_GENRM_METRICS,
@@ -1212,7 +1213,7 @@ class AsyncNemoGymRolloutImpl:
         options: dict[str, Any] = {"num_returns": "streaming"}
         if self._forest_training:
             options["max_task_retries"] = 0
-        # Preserve upstream telemetry dispatch; forest groups are single-attempt.
+        # Capture retries belong to the recovery ledger, not Ray task retries.
         async for result_ref in dispatch_with_trace_context(
             nemo_gym_env.run_rollouts.options(**options),
             pending,
@@ -1842,6 +1843,11 @@ class RolloutManager:
         self._consecutive_infra_drops: int = 0
 
     @property
+    def execution_row_multiple(self) -> int:
+        """Return the resolved row divisibility used to publish forest groups."""
+        return self._execution_row_multiple
+
+    @property
     def stats(self) -> RolloutStats:
         """Counters describing retry/skip activity so far."""
         return self._stats
@@ -2344,21 +2350,12 @@ class RolloutManager:
                     inflight_registry=inflight_registry,
                 )
             except Exception as error:
-                if (
-                    self._forest_training
-                    and classify_rollout_failure(error) is not FailureClass.INFRA
-                ):
+                if isinstance(error, UnresolvedCaptureAcknowledgement):
                     raise
                 reason = type(error).__name__
                 if classify_rollout_failure(error) is FailureClass.INFRA:
                     infra_attempts += 1
                     last_infra_error = error
-                    # Forest selections are request-local until checkpoint recovery
-                    # persists them. Drop this abandoned group through the usual
-                    # bounded policy; do not redispatch and lose sealed selections.
-                    # Retry support: https://github.com/NVIDIA-NeMo/RL/pull/4200.
-                    if self._forest_training:
-                        break
                     if infra_attempts >= policy.max_infra_attempts:
                         break
                     self._stats.record_redispatch(reason)
@@ -2392,12 +2389,6 @@ class RolloutManager:
                 f"max_consecutive_dropped_prompts="
                 f"{policy.max_consecutive_dropped_prompts}; last failure was "
                 f"{reason}: {last_infra_error}"
-                + (
-                    " Forest training does not retry failed groups; accepted-call "
-                    "recovery is in https://github.com/NVIDIA-NeMo/RL/pull/4200."
-                    if self._forest_training
-                    else ""
-                )
             ) from last_infra_error
         self._stats.record_infra_drop(reason, self._consecutive_infra_drops)
         print(
@@ -2450,9 +2441,6 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
-        # Forest does not retry or checkpoint; keep selected-response metadata in this request
-        # while the existing ledger tracks sibling completion and publication.
-        rollout_selections = {}
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -2473,18 +2461,13 @@ class RolloutManager:
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
+            selection = None
             if self._forest_training:
                 selection = env_extras.get("ng_logical_selection")
                 if not selection:
                     raise ValueError(
                         "Forest completion must contain selected responses"
                     )
-                if (
-                    generation_index in rollout_selections
-                    and rollout_selections[generation_index] != selection
-                ):
-                    raise ValueError("conflicting duplicate Forest completion")
-                rollout_selections[generation_index] = selection
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
                 raise ValueError(
@@ -2528,6 +2511,7 @@ class RolloutManager:
                     resolved_agent_name=resolved_agent_name,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
+                    logical_selection=selection,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2560,6 +2544,7 @@ class RolloutManager:
                     resolved_agent_name=resolved_agent_name,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
+                    logical_selection=selection,
                 )
 
         try:
@@ -2607,7 +2592,12 @@ class RolloutManager:
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
                 logical_selections=(
-                    tuple(rollout_selections[i] for i in range(len(rollout_ids)))
+                    tuple(
+                        sibling.current_attempt.logical_selection
+                        for sibling in self._recovery_ledger.get_group(
+                            group_id
+                        ).siblings
+                    )
                     if self._forest_training
                     else None
                 ),
@@ -2618,6 +2608,10 @@ class RolloutManager:
             )
             assert_metadata_only(request)
             return request
+        except UnresolvedCaptureAcknowledgement:
+            # Neither retry nor abandon an attempt whose capture writes may still
+            # be in flight. Surface the failure with its ledger ownership intact.
+            raise
         except BaseException:
             # Abandoned dispatch: no receipt will name these rollouts' staged
             # rows, so they leak until the staging partition is torn down at
