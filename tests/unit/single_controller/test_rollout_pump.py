@@ -347,6 +347,55 @@ def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
     assert launched == []
 
 
+class _NoMutationBarrier(DataPlaneCheckpointBarrier):
+    """Fail the test if dispatch takes a mutation slot."""
+
+    @asynccontextmanager
+    async def mutation(
+        self, kind: CheckpointMutationKind = "other"
+    ) -> AsyncIterator[DataPlaneMutationCut]:
+        raise AssertionError(f"unrecorded dispatch took a {kind!r} mutation slot")
+        yield  # pragma: no cover
+
+
+def test_unrecorded_dispatch_takes_no_mutation_slot() -> None:
+    """Without ledger dispatch, reserving, admitting and discarding record nothing.
+
+    A run without recovery must not wait on a checkpoint to dispatch, and the
+    rollout manager mints the group IDs when it runs the groups.
+    """
+    buffer = _RecordingBuffer([])
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState(
+        replacement_reserve=deque([{"idx": 0}, {"idx": 1}])
+    )
+    ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
+    ctrl._buffer = buffer
+    ctrl._rollout_recovery_enabled = False
+    ctrl._data_plane_checkpoint_barrier = _NoMutationBarrier()
+    ctrl._rollout_manager = SimpleNamespace()  # any ledger call would fail
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
+    ctrl._trainer_version = 0
+    launched: list[Any] = []
+
+    async def launch(*args: Any) -> None:
+        launched.append(args)
+
+    async def exercise() -> None:
+        await ctrl._drain_reserve_into_steps(launch)
+        async with ctrl._dispatch_reservation("group_removals") as cut:
+            assert cut is None
+            ctrl._discard_prompt_group(cut, None)
+
+    asyncio.run(exercise())
+
+    assert [(prompt["idx"], group_id) for prompt, _, group_id in launched] == [
+        (0, None),
+        (1, None),
+    ]
+
+
 class _SkippingRolloutManager:
     """Every prompt is given up on within budget, so nothing is ever committed."""
 
