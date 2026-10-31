@@ -20,6 +20,7 @@ pattern ``test_vllm_fp8_quantization.py`` uses — so the file still collects
 cleanly outside the vllm extra.
 """
 
+import contextlib
 import types
 
 import pytest
@@ -797,9 +798,21 @@ def test_prequantized_extension_uses_native_ipc_reload(
 
     extension = M.NvFp4PerTokenWorkerExtension.__new__(M.NvFp4PerTokenWorkerExtension)
     extension.device = torch.device("cuda:0")
+    vllm_config = object()
     extension.model_runner = types.SimpleNamespace(
-        model=object(), reload_weights=reload_weights
+        model=object(), reload_weights=reload_weights, vllm_config=vllm_config
     )
+
+    @contextlib.contextmanager
+    def set_current_vllm_config(config):
+        assert config is vllm_config
+        call_order.append("config_enter")
+        try:
+            yield
+        finally:
+            call_order.append("config_exit")
+
+    monkeypatch.setattr("vllm.config.set_current_vllm_config", set_current_vllm_config)
     extension.state_dict_info = {name: (source_weight.shape, source_weight.dtype)}
     extension.zmq_socket = FakeSocket()
     extension.maybe_init_zmq = lambda: None
@@ -819,11 +832,13 @@ def test_prequantized_extension_uses_native_ipc_reload(
     ]
     assert extension.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * 2
     assert call_order == [
+        "config_enter",
         "recv_data",
         "data_sync",
         "ack_1",
         "recv_complete",
         "reload_done",
+        "config_exit",
         "final_sync",
         "ack_2",
     ]
