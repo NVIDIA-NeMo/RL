@@ -54,6 +54,7 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
@@ -1690,6 +1691,60 @@ def test_configure_generation_config_respects_explicit_training_load_format():
     )
 
     assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("real_quant", "family_matches", "requested", "expected"),
+    [
+        (True, True, "dummy", "dummy"),
+        (True, True, "auto", "auto"),
+        (False, True, "dummy", "auto"),
+        (False, True, "auto", "auto"),
+        (True, False, "dummy", "dummy"),
+        (True, False, "auto", "auto"),
+        (False, False, "dummy", "dummy"),
+        (False, False, "auto", "auto"),
+    ],
+)
+def test_load_model_preserves_native_quant_loader(
+    monkeypatch, real_quant, family_matches, requested, expected
+):
+    cfg = deepcopy(basic_vllm_test_config)
+    cfg["real_quant"] = real_quant
+    cfg["vllm_cfg"]["load_format"] = requested
+    hf_config = types.SimpleNamespace(
+        model_type="nemotron_h_omni" if family_matches else "qwen3",
+        architectures=[],
+    )
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained", lambda *args, **kwargs: hf_config
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.log_gpu_memory_diagnostics",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.get_nsight_config_if_pattern_matches",
+        lambda pattern: [],
+    )
+    engines = []
+    worker = types.SimpleNamespace(
+        cfg=cfg,
+        model_name="test-model",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        expert_parallel_size=1,
+        enable_expert_parallel=False,
+        gpu_memory_utilization=0.7,
+        precision="bfloat16",
+        _create_engine=engines.append,
+    )
+
+    BaseVllmGenerationWorker._load_model(worker, bundle_indices=[], seed=42)
+
+    assert len(engines) == 1
+    assert engines[0]["load_format"] == expected
 
 
 @pytest.mark.parametrize(
