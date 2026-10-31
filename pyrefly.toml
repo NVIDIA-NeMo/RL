@@ -25,7 +25,6 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
-  "nemo_rl/utils/unsupported_feature_checks.py",
   "nemo_rl/environments/call_selection.py",
   "nemo_rl/algorithms/single_controller_utils/logical_advantage.py",
   "nemo_rl/data/captured_media.py",
@@ -337,6 +336,9 @@ project-includes = [
   "nemo_rl/utils/checkpoint_engines/nixl.py",
   "nemo_rl/utils/checkpoint_storage.py",
   "nemo_rl/utils/config.py",
+  "nemo_rl/utils/config_check/__init__.py",
+  "nemo_rl/utils/config_check/outdated_config.py",
+  "nemo_rl/utils/config_check/unsupported_feature.py",
   "nemo_rl/utils/cuda_ipc.py",
   "nemo_rl/utils/fastokens.py",
   "nemo_rl/utils/grad_norm.py",
@@ -344,7 +346,6 @@ project-includes = [
   "nemo_rl/utils/multimodal_payload_metrics.py",
   "nemo_rl/utils/nsys.py",
   "nemo_rl/utils/nvml.py",
-  "nemo_rl/utils/outdated_config_checks.py",
   "nemo_rl/utils/packed_tensor.py",
   "nemo_rl/utils/prefetch_venvs.py",
   "nemo_rl/utils/r3_trace.py",

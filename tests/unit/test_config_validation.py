@@ -43,7 +43,7 @@ from nemo_rl.utils.config import (
     load_config_with_inheritance,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.outdated_config_checks import check_outdated_config
+from nemo_rl.utils.config_check import check_outdated_config
 
 # All tests in this module should run first
 pytestmark = pytest.mark.run_first

@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from nemo_rl.utils.outdated_config_checks import check_outdated_config
+from nemo_rl.utils.config_check import check_outdated_config
 
 
 @pytest.mark.parametrize("value", [True, False, None])
@@ -37,7 +37,7 @@ def test_forest_config_has_no_obsolete_switch(config):
     check_outdated_config(config)
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 # The entrypoints under test are every file under ENTRYPOINTS_DIRS that imports
 # MasterConfig, plus ENTRYPOINTS_EXTRA_FILES.

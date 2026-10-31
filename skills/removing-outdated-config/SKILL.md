@@ -26,7 +26,7 @@ move the key here once it is actually removed.
 
 ## The three steps
 
-### 1. Add the check to `nemo_rl/utils/outdated_config_checks.py`
+### 1. Add the check to `nemo_rl/utils/config_check/outdated_config.py`
 
 One `reject_outdated_*` function per removal, called from `check_outdated_config`:
 
@@ -60,7 +60,7 @@ The message is the whole point. State what is wrong and what to write instead â€
 who only reads the exception should be able to fix their YAML. Do not write "deprecated"
 when you mean removed: nothing here warns, everything raises.
 
-### 2. Cover it in `tests/unit/utils/test_outdated_config_checks.py`
+### 2. Cover it in `tests/unit/utils/config_check/test_outdated_config.py`
 
 Add a section for the new function (the file is grouped by function, with banner
 comments). Cover the rejected shape, the accepted shape, and absence of the key.
@@ -73,7 +73,7 @@ drift.
 ### 3. Run the tests, then sweep the repo for leftovers
 
 ```bash
-uv run --group test pytest tests/unit/utils/test_outdated_config_checks.py \
+uv run --group test pytest tests/unit/utils/config_check/test_outdated_config.py \
     tests/unit/test_config_validation.py -q
 ```
 
@@ -101,7 +101,7 @@ Not after schema validation either. Entrypoints call `check_outdated_config(conf
 the resolved config **before** building the `MasterConfig`: pydantic rejects a missing
 required key on its own terms, so a check that runs later can never explain a removal
 that changed such a key's shape -- the user sees `data.train Field required` instead of
-the migration guide. `tests/unit/utils/test_outdated_config_checks.py::test_every_entrypoint_checks_outdated_config`
+the migration guide. `tests/unit/utils/config_check/test_outdated_config.py::test_every_entrypoint_checks_outdated_config`
 enforces that a new entrypoint cannot skip the call, and that it comes first.
 
 ## Exemptions

@@ -90,8 +90,7 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.outdated_config_checks import check_outdated_config
-from nemo_rl.utils.unsupported_feature_checks import check_unsupported_feature
+from nemo_rl.utils.config_check import check_outdated_config, check_unsupported_feature
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 
