@@ -433,7 +433,7 @@ class SFTSingleControllerActor:
         metric_name = self._master_config.checkpointing["metric_name"]
         if metric_name is None:
             return {}
-        # setup_sft_v2 already rejected anything but a train: name.
+        # The checkpoint metric is validated before constructing the controller.
         key = metric_name.split(":", 1)[1]
         if key not in metrics:
             raise ValueError(
@@ -539,44 +539,16 @@ def setup_sft_v2(
             )
         if packing.name not in {algorithm.value for algorithm in PackingAlgorithm}:
             raise ValueError("Energon SFT requires a supported packing algorithm.")
-        if dynamic_batching["enabled"]:
-            raise ValueError("Energon packing does not support dynamic batching.")
-    # SFTConfig carries validation knobs that default to on (val_period=10,
-    # val_at_start=True) and this loop has no validation path, so reject them
-    # rather than accepting a config whose validation silently never runs.
-    if (
-        master_config.sft.val_period != 0
-        or master_config.sft.val_at_start
-        or master_config.sft.val_at_end
-    ):
-        raise ValueError(
-            "SFTv2 has no validation loop. Set sft.val_period=0, "
-            "sft.val_at_start=false and sft.val_at_end=false."
-        )
-    # sft_worker builds its loader with split_role="train" only, so a validation
-    # source would be accepted and never read.
-    if master_config.data.get("validation") is not None:
-        raise ValueError("SFTv2 reads no validation source. Set data.validation=null.")
-    # Same reason: only train metrics exist here, so a val: name would leave
-    # keep_top_k ranking every checkpoint on a metric that is never written.
     metric_name = master_config.checkpointing["metric_name"]
-    if metric_name is not None and not metric_name.startswith("train:"):
+    if metric_name is not None and not metric_name.startswith(("train:", "val:")):
         raise ValueError(
-            "SFTv2 can rank checkpoints on training metrics only. Set "
-            "checkpointing.metric_name to null or 'train:<metric>'; got "
-            f"{metric_name!r}."
+            "checkpointing.metric_name must be null, 'train:<metric>' or 'val:<metric>'."
         )
     max_sequence_length = master_config.data["max_input_seq_length"]
     if max_sequence_length is None:
         raise ValueError("SFTv2 requires data.max_input_seq_length.")
     if packing is not None:
         megatron_cfg = master_config.policy["megatron_cfg"]
-        if (
-            megatron_cfg.get("moe_token_dispatcher_type") == "flex"
-            and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
-        ):
-            raise ValueError("Energon packing does not support HybridEP flex dispatch.")
-
         pad_multiple = master_config.policy["make_sequence_length_divisible_by"]
         if pad_multiple <= 0:
             raise ValueError(

@@ -55,7 +55,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
-from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
 
 _NUM_PROMPTS_PER_STEP = 4
@@ -472,49 +471,6 @@ class TestPPOValidation:
         validate_single_controller_config(
             self._warmup_ckpt_config(constant_structure=False)
         )
-
-    @pytest.mark.parametrize(
-        "enable",
-        [
-            lambda cfg: setattr(cfg, "use_dynamic_sampling", True),
-            lambda cfg: setattr(cfg.reward_scaling, "enabled", True),
-            lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
-        ],
-        ids=[
-            "use_dynamic_sampling",
-            "reward_scaling",
-            "reward_shaping",
-        ],
-    )
-    def test_rejects_shaping_the_sc_path_does_not_implement(self, enable):
-        mc = _ppo_master_config()
-        enable(mc.ppo)
-
-        with pytest.raises(
-            NotImplementedError, match="not supported on the SingleController"
-        ):
-            validate_single_controller_config(mc)
-
-    def test_rejects_length_penalty_until_sc_applies_it(self):
-        # The SC path has no length-penalty hook yet; fail at setup rather
-        # than silently training on unadjusted rewards.
-        mc = _make_master_config()
-        mc.grpo.length_penalty = LengthPenaltyConfig.model_validate(
-            {"default": {"total_bonus": 0.1}}
-        )
-
-        with pytest.raises(NotImplementedError, match="length_penalty"):
-            validate_single_controller_config(mc)
-
-    @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
-    def test_accepts_absent_length_penalty(self, algorithm: str):
-        # GRPO with length_penalty: null, and PPO (whose config has no such
-        # field) both pass.
-        mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()
-        if algorithm == "grpo":
-            mc.grpo.length_penalty = None
-
-        validate_single_controller_config(mc)
 
     @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
     def test_accepts_overlong_filtering(self, algorithm: str):

@@ -1221,12 +1221,7 @@ def _validate_failure_settings(
 
 
 def _validate_algo_settings(master_config: MasterConfig) -> None:
-    """Reject algorithm blocks the SingleController path cannot honour.
-
-    Both directions on the critic: one the PPO path needs and does not have, and
-    one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knobs SC reads on neither path.
-    """
+    """Validate SingleController algorithm and generation constraints."""
     algo_cfg = algo_config(master_config)
 
     # None means no epoch bound. SC has no -1 convention though: the rollout pump
@@ -1237,42 +1232,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "SingleController path, which does not use the -1 convention that v1 "
             "async PPO requires. Set a positive max_num_epochs and bound the run "
             "with max_num_steps."
-        )
-
-    # An enabled one here describes shaping this run does not do. An entry leaves
-    # this list once the SC path implements it; overlong_filtering is applied in
-    # the advantage stage from the raw completion flags in the TransferQueue.
-    unsupported = [
-        name
-        for name, enabled in (
-            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
-            ("reward_scaling", algo_cfg.reward_scaling.enabled),
-            ("reward_shaping", algo_cfg.reward_shaping.enabled),
-            # getattr: PPO's config has no length_penalty field.
-            ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
-        )
-        if enabled
-    ]
-    if unsupported:
-        names = ", ".join(unsupported)
-        raise NotImplementedError(
-            f"{names} not supported on the SingleController path, which "
-            "implements none of them -- the run would silently skip the "
-            "shaping. Disable them."
-        )
-
-    # Rejected here rather than at the first advantage call, which is a whole
-    # round of rollouts and logprobs later: gdpo needs one reward column per
-    # component and SC's payload writes a single total_reward, with
-    # AdvantageConfig.repeated_batch_fields never populated.
-    if algo_cfg.adv_estimator.name == "gdpo":
-        raise NotImplementedError(
-            "adv_estimator 'gdpo' is not supported on the SingleController "
-            "path. It needs per-component reward columns (reward/<name>), and "
-            "the SC payload writes only total_reward, so the first advantage "
-            "call would raise 'GDPO requires multiple reward components' after "
-            "the run had already paid for a full step of rollouts. Set "
-            "adv_estimator.name to 'grpo'."
         )
 
     async_config = master_config.async_rl
@@ -1459,12 +1418,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
-    if master_config.loss_fn.seq_logprob_error_in_loss:
-        raise ValueError(
-            "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "
-            "its advantage baselines depend on the pre-training sequence mask. "
-            "Use the non-streaming GRPO trainer."
-        )
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl

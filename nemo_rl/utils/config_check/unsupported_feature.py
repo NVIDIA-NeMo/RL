@@ -25,6 +25,10 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
     from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
     from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
+    from nemo_rl.algorithms.sft_v2 import MasterConfig as SFTV2MasterConfig
+    from nemo_rl.algorithms.single_controller_utils.config import (
+        MasterConfig as SingleControllerMasterConfig,
+    )
 
 
 class EntryPoint(str, Enum):
@@ -74,10 +78,14 @@ def check_common(config: BaseModel | dict[str, Any]) -> None:
 
 def _check_algo_distillation(config: DistillationMasterConfig) -> None:
     """Reject unsupported configurations for distillation."""
-    for section, who, backend_config in (
+    backend_configs = (
         ("policy", "student", config.policy),
         ("teacher", "teacher", config.teacher),
-    ):
+    )
+    generation = config.policy.get("generation")
+
+    # sequence parallel + sequence packing
+    for section, who, backend_config in backend_configs:
         automodel_cfg = backend_config.get("automodel_cfg")
         packing = backend_config.get("sequence_packing")
         if (
@@ -93,6 +101,18 @@ def _check_algo_distillation(config: DistillationMasterConfig) -> None:
                 suggestion=f"set {section}.automodel_cfg.sequence_parallel=false.",
                 tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/1178",
             )
+
+    # non-colocated megatron generation
+    if (
+        generation is not None
+        and generation["backend"] == "megatron"
+        and not generation["colocated"]["enabled"]
+    ):
+        _raise_unsupported_feature(
+            feature="non-colocated Megatron generation",
+            condition="using distillation",
+            suggestion="set policy.generation.colocated.enabled=true or use vLLM.",
+        )
 
 
 def _check_algo_dpo(config: BaseModel) -> None:
@@ -112,41 +132,45 @@ def _check_algo_grpo(config: BaseModel) -> None:
 
 def _check_algo_ppo(config: PPOMasterConfig) -> None:
     """Reject unsupported configurations for ppo."""
-    if config.loss_fn.seq_logprob_error_in_loss:
+    value_config = config.value
+    value_automodel_cfg = value_config.get("automodel_cfg")
+    value_packing = value_config.get("sequence_packing")
+    loss_config = config.loss_fn
+
+    # seq_logprob_error_in_loss
+    if loss_config.seq_logprob_error_in_loss:
         _raise_unsupported_feature(
             feature="loss_fn.seq_logprob_error_in_loss",
             condition="using PPO",
             suggestion="disable it or use non-streaming GRPO.",
         )
 
-    value_config = config.value
-    megatron_cfg = value_config.get("megatron_cfg")
-    if megatron_cfg and megatron_cfg["enabled"]:
-        return
-    automodel_cfg = value_config.get("automodel_cfg")
-    if not automodel_cfg or not automodel_cfg["enabled"]:
-        return
-    packing = value_config.get("sequence_packing")
-    if packing and packing["enabled"]:
-        _raise_unsupported_feature(
-            feature="sequence packing",
-            condition="using the Automodel PPO value model",
-            suggestion="set value.sequence_packing.enabled=false.",
-            tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/2951",
-        )
-    if automodel_cfg["context_parallel_size"] != 1:
-        _raise_unsupported_feature(
-            feature="context parallelism",
-            condition="using the Automodel PPO value model",
-            suggestion="set value.automodel_cfg.context_parallel_size=1.",
-            tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/2951",
-        )
+    if value_automodel_cfg and value_automodel_cfg["enabled"]:
+        # sequence_packing
+        if value_packing and value_packing["enabled"]:
+            _raise_unsupported_feature(
+                feature="sequence packing",
+                condition="using the Automodel PPO value model",
+                suggestion="set value.sequence_packing.enabled=false.",
+                tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/2951",
+            )
+
+        # context_parallel_size
+        if value_automodel_cfg["context_parallel_size"] != 1:
+            _raise_unsupported_feature(
+                feature="context parallelism",
+                condition="using the Automodel PPO value model",
+                suggestion="set value.automodel_cfg.context_parallel_size=1.",
+                tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/2951",
+            )
 
 
 def _check_algo_rm(config: RMMasterConfig) -> None:
     """Reject unsupported configurations for rm."""
     policy_config = config.policy
     automodel_cfg = policy_config.get("automodel_cfg")
+
+    # context_parallel_size
     if not automodel_cfg or not automodel_cfg["enabled"]:
         return
     if automodel_cfg["context_parallel_size"] > 1:
@@ -160,13 +184,19 @@ def _check_algo_rm(config: RMMasterConfig) -> None:
 
 def _check_algo_sft(config: SFTMasterConfig) -> None:
     """Reject unsupported configurations for sft."""
-    if config.data.get("backend") == "energon":
+    data_config = config.data
+    sft_config = config.sft
+
+    # energon
+    if data_config.get("backend") == "energon":
         _raise_unsupported_feature(
             feature="energon",
             condition="using SFT v1",
             suggestion="use SFT v2.",
         )
-    if config.sft.defer_async_checkpoint_finalize:
+
+    # defer_async_checkpoint_finalize
+    if sft_config.defer_async_checkpoint_finalize:
         _raise_unsupported_feature(
             feature="sft.defer_async_checkpoint_finalize",
             condition="using SFT v1",
@@ -174,14 +204,107 @@ def _check_algo_sft(config: SFTMasterConfig) -> None:
         )
 
 
-def _check_algo_sft_v2(config: BaseModel) -> None:
+def _check_algo_sft_v2(config: SFTV2MasterConfig) -> None:
     """Reject unsupported configurations for sft_v2."""
-    pass
+    policy_config = config.policy
+    data_config = config.data
+    sft_config = config.sft
+    energon = data_config.get("energon")
+    packing = energon.task_encoder.packing if energon is not None else None
+    dynamic_batching = policy_config["dynamic_batching"]
+    metric_name = config.checkpointing["metric_name"]
+    megatron_cfg = policy_config.get("megatron_cfg")
+
+    # dynamic_batching
+    if packing is not None and dynamic_batching["enabled"]:
+        _raise_unsupported_feature(
+            feature="dynamic batching",
+            condition="using Energon packing",
+            suggestion="set policy.dynamic_batching.enabled=false.",
+        )
+
+    # validation
+    if sft_config.val_period != 0 or sft_config.val_at_start or sft_config.val_at_end:
+        _raise_unsupported_feature(
+            feature="validation",
+            condition="using SFT v2",
+            suggestion="set sft.val_period=0, sft.val_at_start=false and sft.val_at_end=false.",
+        )
+
+    # data.validation
+    if data_config.get("validation") is not None:
+        _raise_unsupported_feature(
+            feature="validation data",
+            condition="using SFT v2",
+            suggestion="set data.validation=null.",
+        )
+
+    # checkpointing.metric_name
+    if metric_name is not None and metric_name.startswith("val:"):
+        _raise_unsupported_feature(
+            feature=f"checkpointing.metric_name={metric_name!r}",
+            condition="using SFT v2",
+            suggestion="use 'train:<metric>' or null.",
+        )
+
+    # hybridep
+    if (
+        packing is not None
+        and megatron_cfg
+        and megatron_cfg["enabled"]
+        and megatron_cfg.get("moe_token_dispatcher_type") == "flex"
+        and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
+    ):
+        _raise_unsupported_feature(
+            feature="hybridep flex dispatch",
+            condition="using Energon packing",
+            suggestion="disable Energon packing or use a different MoE dispatcher.",
+        )
 
 
-def _check_algo_single_controller(config: BaseModel) -> None:
+def _check_algo_single_controller(config: SingleControllerMasterConfig) -> None:
     """Reject unsupported configurations for single_controller."""
-    pass
+    from nemo_rl.algorithms.single_controller_utils.config import algo_config
+
+    algo = algo_config(config)
+    algo_name = "ppo" if config.ppo is not None else "grpo"
+    grpo_config = config.grpo
+    loss_config = config.loss_fn
+
+    # dynamic sampling, reward scaling/shaping, length penalty
+    unsupported = [
+        f"{algo_name}.{name}"
+        for name, enabled in (
+            ("use_dynamic_sampling", algo.use_dynamic_sampling),
+            ("reward_scaling", algo.reward_scaling.enabled),
+            ("reward_shaping", algo.reward_shaping.enabled),
+        )
+        if enabled
+    ]
+    if grpo_config is not None and grpo_config.length_penalty is not None:
+        unsupported.append("grpo.length_penalty")
+    if unsupported:
+        _raise_unsupported_feature(
+            feature=f"{', '.join(unsupported)} configuration",
+            condition="using SingleController",
+            suggestion="disable these options.",
+        )
+
+    # seq_logprob_error_in_loss
+    if loss_config.seq_logprob_error_in_loss:
+        _raise_unsupported_feature(
+            feature="loss_fn.seq_logprob_error_in_loss",
+            condition="using SingleController",
+            suggestion="disable it or use non-streaming GRPO.",
+        )
+
+    # gdpo
+    if algo.adv_estimator.name == "gdpo":
+        _raise_unsupported_feature(
+            feature="gdpo advantage estimation",
+            condition="using SingleController",
+            suggestion=f"set {algo_name}.adv_estimator.name=grpo.",
+        )
 
 
 def _check_algo_vlm_grpo(config: BaseModel) -> None:
@@ -221,9 +344,9 @@ def check_algo(config: BaseModel, *, entrypoint: EntryPoint) -> None:
     elif entrypoint == EntryPoint.SFT:
         _check_algo_sft(cast("SFTMasterConfig", config))
     elif entrypoint == EntryPoint.SFT_V2:
-        _check_algo_sft_v2(config)
+        _check_algo_sft_v2(cast("SFTV2MasterConfig", config))
     elif entrypoint == EntryPoint.SINGLE_CONTROLLER:
-        _check_algo_single_controller(config)
+        _check_algo_single_controller(cast("SingleControllerMasterConfig", config))
     elif entrypoint == EntryPoint.VLM_GRPO:
         _check_algo_vlm_grpo(config)
     elif entrypoint == EntryPoint.VLM_MPO:

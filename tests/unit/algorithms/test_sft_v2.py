@@ -478,7 +478,6 @@ def test_checkpoint_metric_rejects_a_metric_no_step_produces() -> None:
             {"policy_overrides": {"dynamic_batching": {"enabled": True}}},
             "fixed batching",
         ),
-        ({"sft_overrides": {"val_period": 10}}, "has no validation loop"),
         (
             {"sft_overrides": {"defer_async_checkpoint_finalize": True}},
             "requires policy.megatron_cfg.checkpoint.async_save",
@@ -491,10 +490,6 @@ def test_checkpoint_metric_rejects_a_metric_no_step_produces() -> None:
                 },
             },
             "requires policy.megatron_cfg.checkpoint.async_save",
-        ),
-        (
-            {"data_overrides": {"validation": {"path": "/dataset"}}},
-            "reads no validation source",
         ),
         (
             {"data_overrides": {"max_input_seq_length": None}},
@@ -511,16 +506,6 @@ def test_setup_rejects_configs_sft_v2_cannot_run(
 
     with pytest.raises(ValueError, match=message):
         setup_sft_v2(config, MagicMock())
-
-
-def test_setup_rejects_a_validation_checkpoint_metric() -> None:
-    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
-
-    with pytest.raises(ValueError, match="training metrics only"):
-        setup_sft_v2(
-            _valid_setup_config(metric_name="val:val_loss"),
-            MagicMock(),
-        )
 
 
 @pytest.mark.parametrize(
@@ -548,14 +533,6 @@ def test_setup_rejects_a_validation_checkpoint_metric() -> None:
             1,
             128,
             "Energon SFT requires a supported packing algorithm.",
-        ),
-        (
-            {},
-            True,
-            {},
-            1,
-            128,
-            "Energon packing does not support dynamic batching.",
         ),
         (
             {},
@@ -700,14 +677,6 @@ def test_setup_loaders_passes_canonical_geometry_and_nested_packing(
     ("megatron_overrides", "policy_multiple", "message"),
     [
         ({"context_parallel_size": 2}, 2, "multiple of 4"),
-        (
-            {
-                "moe_token_dispatcher_type": "flex",
-                "moe_flex_dispatcher_backend": "hybridep",
-            },
-            1,
-            "HybridEP",
-        ),
         (
             {"fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"}},
             1,
