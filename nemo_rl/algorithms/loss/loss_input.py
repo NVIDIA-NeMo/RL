@@ -536,6 +536,9 @@ def prepare_packed_loss_input(
         chunk_size=chunk_size if use_chunking else None,
         target_is_pre_rolled=not input_is_prepacked,
         return_packed_layout=input_is_prepacked,
+        # The grad may overwrite these logits only on the chunked path. The
+        # unfiltered KL call below reads them again, but only with chunking off.
+        reuse_logits_storage=use_chunking,
     )
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:

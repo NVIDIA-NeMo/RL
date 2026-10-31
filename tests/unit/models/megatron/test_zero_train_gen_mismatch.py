@@ -21,6 +21,7 @@ pushed through the same gates the workers run at startup.
 """
 
 import copy
+import inspect
 import sys
 import types
 from dataclasses import make_dataclass
@@ -1063,8 +1064,34 @@ def test_logprob_shim_uses_full_vocab_log_softmax_at_any_tp(monkeypatch):
     assert shim.apply(logits, target, 0, 16, None, True) == "orig"
 
 
-@pytest.mark.parametrize("chunked", [False, True])
-def test_logprob_shim_backward_is_the_replaced_functions_backward(monkeypatch, chunked):
+@pytest.mark.parametrize(
+    "shim_name,original_name",
+    [
+        ("_DistributedFullVocabLogprob", "DistributedLogprob"),
+        ("_ChunkedFullVocabLogprob", "ChunkedDistributedLogprob"),
+    ],
+)
+def test_logprob_shim_signature_matches_the_replaced_function(shim_name, original_name):
+    # The shim binds arguments by name, so its apply must list the same
+    # parameters as the replaced forward (minus self / ctx).
+    from nemo_rl.distributed import model_utils
+
+    shim = list(inspect.signature(getattr(zgm, shim_name).apply).parameters)[1:]
+    original = getattr(model_utils, original_name)
+    if isinstance(original, zgm._FullVocabLogprob):
+        original = original._original
+    replaced = list(inspect.signature(original.forward).parameters)[1:]
+    assert shim == replaced
+
+
+# The chunked function takes a trailing reuse_logits_storage after inference_only.
+@pytest.mark.parametrize(
+    "chunked,trailing_args",
+    [(False, ()), (True, ()), (True, (False,)), (True, (True,))],
+)
+def test_logprob_shim_backward_is_the_replaced_functions_backward(
+    monkeypatch, chunked, trailing_args
+):
     import torch
 
     def full_row(shard):
@@ -1096,17 +1123,22 @@ def test_logprob_shim_backward_is_the_replaced_functions_backward(monkeypatch, c
     grad_output = torch.randn(2, 5)
 
     reference_logits = shard.clone().requires_grad_()
-    Original.apply(reference_logits, target, *original_args, False).backward(
-        grad_output
-    )
+    Original.apply(
+        reference_logits, target, *original_args, False, *trailing_args
+    ).backward(grad_output)
 
     calls.clear()
     logits = shard.clone().requires_grad_()
-    shim = zgm._FullVocabLogprob(Original, chunked=chunked)
-    out = shim.apply(logits, target, *original_args, False)
+    shim_cls = (
+        zgm._ChunkedFullVocabLogprob if chunked else zgm._DistributedFullVocabLogprob
+    )
+    shim = shim_cls(Original)
+    out = shim.apply(logits, target, *original_args, False, *trailing_args)
     assert calls == []  # the forward does not call the replaced function
     out.backward(grad_output)
 
-    assert calls == [(*original_args, False)]
+    # The shim passes reuse_logits_storage explicitly, defaulting to False.
+    expected_trailing = (trailing_args or (False,)) if chunked else ()
+    assert calls == [(*original_args, False, *expected_trailing)]
     assert logits.grad.dtype == torch.bfloat16
     assert torch.equal(logits.grad, reference_logits.grad)
