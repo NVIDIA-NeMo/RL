@@ -580,6 +580,26 @@ def is_blockwise_fp8_param_storage(fp8_cfg: Optional[dict[str, Any]]) -> bool:
     )
 
 
+def _speculative_config_carries_draft_weights(speculative_config: Any) -> bool:
+    """Whether a vLLM speculative_config enables a co-trained draft speculator.
+
+    A ``model`` without ``method`` counts: vLLM can infer the method from the
+    draft checkpoint. ``num_speculative_tokens == 0`` disables speculation.
+    """
+    # Lazy: the vllm package __init__ imports the generation workers.
+    from nemo_rl.models.generation.vllm.speculator_runtime import SPECULATOR_TYPES
+
+    if not isinstance(speculative_config, dict):
+        return False
+    num_tokens = speculative_config.get("num_speculative_tokens")
+    if num_tokens is not None and num_tokens <= 0:
+        return False
+    method = speculative_config.get("method")
+    if method is None:
+        return speculative_config.get("model") is not None
+    return method in SPECULATOR_TYPES
+
+
 def check_nccl_reshard_refit_support(master_config: Any) -> None:
     """Validate ``master_config`` against every precondition of nccl_reshard_refit.
 
@@ -647,6 +667,21 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "explicitly unsupported with refit_transport='nccl_reshard' "
             "(nccl_reshard_refit is its own refit path and does not use "
             "vLLM's reload_weights API)."
+        )
+
+    # Draft co-training speculators are refit through the coverage-aware
+    # finalize(); nccl_reshard_refit finalizes the target only and loads its misc
+    # params without a coverage object, so the drafter would never run
+    # process_weights_after_loading. MTP is unaffected: it finalizes through
+    # _mtp_drafter_refit_enabled, not the draft manifest.
+    speculative_config = vllm_kwargs.get("speculative_config")
+    if _speculative_config_carries_draft_weights(speculative_config):
+        assert isinstance(speculative_config, dict)
+        violations.append(
+            "policy.generation.vllm_kwargs.speculative_config.method must not be "
+            f"{speculative_config.get('method')!r} "
+            "(nccl_reshard_refit finalizes the target model only; co-trained "
+            "drafter weights would stay partially finalized after every refit)."
         )
 
     # ModelOpt real-quant rollout holds NVFP4-packed vLLM params and refits
