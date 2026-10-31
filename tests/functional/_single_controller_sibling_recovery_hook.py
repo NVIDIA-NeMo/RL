@@ -74,7 +74,7 @@ class _InstrumentedNemoGymRolloutImpl:
         generation_indices: list[int] | None = None,
         on_completion: RolloutCompletionCallback | None = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
-        gym_instance_id: str | None = None,
+        environment_instance_id: str | None = None,
         dispatch_recorder: Any = None,
     ) -> Any:
         if rollout_ids is None or generation_indices is None or on_completion is None:
@@ -156,7 +156,7 @@ class _InstrumentedNemoGymRolloutImpl:
             generation_indices=indices,
             on_completion=_instrumented_completion,
             recovery_granularity=recovery_granularity,
-            gym_instance_id=gym_instance_id,
+            environment_instance_id=environment_instance_id,
             dispatch_recorder=dispatch_recorder,
         )
         append_event(self._events_path, "capture_complete", **fields)

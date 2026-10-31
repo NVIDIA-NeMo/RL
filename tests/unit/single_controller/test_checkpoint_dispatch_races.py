@@ -1309,7 +1309,7 @@ async def _turn_recovery_restart(
         saved_ledger.mark_group_dispatched(
             cut,
             saved_group.group_id,
-            gym_instance_id="tools/replica-0",
+            environment_instance_id="tools/replica-0",
         )
     saved_state = build_rollout_recovery_state(
         saved_ledger,
@@ -1366,7 +1366,7 @@ async def _turn_recovery_restart(
             "saved_capacity": saved_capacity,
         },
     )
-    return controller, rollout_manager, gym_actor, saved_group.gym_episode(0)
+    return controller, rollout_manager, gym_actor, saved_group.environment_episode(0)
 
 
 def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
@@ -1386,8 +1386,8 @@ def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
     restored_group = rollout_manager.recovery_ledger.get_group("batch-7-prompt-0")
     restored_attempt = restored_group.siblings[0].current_attempt
     assert restored_attempt.status is RolloutAttemptStatus.RESERVED
-    assert restored_attempt.gym_instance_id == "tools/replica-0"
-    assert restored_attempt.gym_attempt == 1
+    assert restored_attempt.environment_instance_id == "tools/replica-0"
+    assert restored_attempt.environment_attempt == 1
     assert gym_actor.operations() == ["restore", "resume"]
     (restore_id, checkpoint_root, episodes), restore_kwargs = gym_actor.calls[0][1:]
     assert restore_id.startswith("restore-")

@@ -63,14 +63,14 @@ class _InstrumentedNemoGymRolloutImpl:
     def _sibling_fields(group: Any, generation_index: int) -> dict[str, Any]:
         sibling = group.siblings[generation_index]
         attempt = sibling.current_attempt
-        episode = group.gym_episode(generation_index)
+        episode = group.environment_episode(generation_index)
         gym_rollout_id, gym_attempt = episode.rollout_id, episode.attempt
         return {
             "generation_index": generation_index,
             "logical_rollout_id": group.logical_rollout_id(generation_index),
             "gate_rollout_id": group.gate_rollout_id(generation_index),
             "gym_rollout_id": gym_rollout_id,
-            "gym_instance_id": attempt.gym_instance_id,
+            "gym_instance_id": attempt.environment_instance_id,
             "gym_attempt": gym_attempt,
             "attempt_id": attempt.attempt_id,
             "status": attempt.status.value,
@@ -84,12 +84,12 @@ class _InstrumentedNemoGymRolloutImpl:
         generation_indices: list[int] | None = None,
         on_completion: RolloutCompletionCallback | None = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
-        gym_instance_id: str | None = None,
+        environment_instance_id: str | None = None,
         dispatch_recorder: Any = None,
     ) -> Any:
         if rollout_ids is None or generation_indices is None or on_completion is None:
             raise RuntimeError("turn recovery hook requires token capture")
-        if gym_instance_id is None:
+        if environment_instance_id is None:
             raise RuntimeError("turn recovery hook requires a Gym checkpoint owner")
         if dispatch_recorder is None:
             raise RuntimeError("turn recovery hook requires a dispatch recorder")
@@ -101,7 +101,7 @@ class _InstrumentedNemoGymRolloutImpl:
             "prompt_idx": int(input_sample["idx"]),
             "target_step": group.target_step,
             "generation_indices": indices,
-            "gym_instance_id": gym_instance_id,
+            "gym_instance_id": environment_instance_id,
         }
 
         def _record_submission(event: str, submitted: list[int]) -> None:
@@ -140,7 +140,7 @@ class _InstrumentedNemoGymRolloutImpl:
             generation_indices=indices,
             on_completion=_record_completion,
             recovery_granularity=recovery_granularity,
-            gym_instance_id=gym_instance_id,
+            environment_instance_id=environment_instance_id,
             dispatch_recorder=_RecordingDispatchRecorder(
                 dispatch_recorder, record=_record_submission
             ),
@@ -197,7 +197,7 @@ class _RecordingRestartLedger:
         self._events_path = events_path
 
     def prepare_for_restart(self, cut: Any, **kwargs: Any) -> Any:
-        restored = kwargs.get("restored_gym_episodes") or set()
+        restored = kwargs.get("continued_attempts") or set()
         append_event(
             self._events_path,
             "gym_restore",
