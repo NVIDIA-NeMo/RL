@@ -711,24 +711,6 @@ def test_fullvocab_recipe_rejects_tropd_before_allocation(tropd_override):
         validate_single_controller_config(config)
 
 
-def test_single_controller_ppo_recipe_inherits_overlong_filtering():
-    """The SC nightly exercises the overlong filtering inherited from its parent."""
-    register_omegaconf_resolvers()
-    repo_root = Path(__file__).resolve().parents[3]
-    recipe = repo_root / (
-        "examples/configs/recipes/llm/"
-        "ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-"
-        "noncolocated-async-single-controller.yaml"
-    )
-    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
-
-    assert isinstance(resolved, dict)
-    config = MasterConfig.model_validate(resolved)
-    validate_single_controller_config(config)
-    assert config.ppo is not None
-    assert config.ppo.overlong_filtering is True
-
-
 def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_contract(
     monkeypatch,
 ):

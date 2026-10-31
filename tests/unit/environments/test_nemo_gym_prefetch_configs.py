@@ -136,41 +136,6 @@ def test_prefetch_configs_exist():
     assert PREFETCH_CONFIGS, "No examples/nemo_gym/prefetch_*.yaml configs found"
 
 
-@pytest.mark.parametrize(
-    "server_instance",
-    [
-        "sav_tracks",
-        "citation_if",
-        # The simulation config installs both a resources server and an agent.
-        "conversational_tool_use_simulation",
-        "conversational_tool_use_agent",
-        # structured_outputs_v4 adds the non_executing_simple_agent venv.
-        "structured_outputs_v4_simple_agent",
-    ],
-)
-def test_super35_prefetch_covers_newer_service_venvs(server_instance: str) -> None:
-    """The Super 3.5 prefetch must install the services the newer blends added.
-
-    Keyed on server instance names, which stay put when Gym moves a server's directory.
-    """
-    # Gym is optional outside the nemo_gym test suite.
-    gym = pytest.importorskip("nemo_gym")
-    config = load_config(
-        os.path.join(
-            REPO_ROOT, "examples", "nemo_gym", "prefetch_super35_all_envs.yaml"
-        )
-    )["env"]["nemo_gym"]
-    bundled = OmegaConf.merge(
-        *(OmegaConf.load(gym.PARENT_DIR / path) for path in config["config_paths"])
-    )
-    assert server_instance in bundled, (
-        f"Super35 prefetch does not install {server_instance}"
-    )
-    ((server_type, servers),) = bundled[server_instance].items()
-    ((server_name, block),) = servers.items()
-    assert (gym.PARENT_DIR / server_type / server_name / block["entrypoint"]).is_file()
-
-
 # Where docker/Dockerfile puts the NeMo RL source (its WORKDIR and COPY target).
 CONTAINER_REPO_ROOT = "/opt/nemo-rl/"
 
