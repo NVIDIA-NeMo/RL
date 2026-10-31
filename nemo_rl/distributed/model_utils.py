@@ -23,6 +23,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
+    replays_sampler_support,
 )
 from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
@@ -675,6 +676,183 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
         grad_vocab_parallel = grad_vocab_parallel.view(B, S, V_local)
 
         return grad_vocab_parallel, None, None, None, None, None, None
+
+
+def _scatter_kept_grad(
+    grad_kept: torch.Tensor,
+    kept_ids: torch.Tensor,
+    vocab_start_index: int,
+    logits_shape: torch.Size,
+    logits_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Scatter per-candidate gradients into this rank's vocab shard (others dropped)."""
+    local_vocab = logits_shape[-1]
+    local_ids = kept_ids.long() - vocab_start_index
+    in_shard = (local_ids >= 0) & (local_ids < local_vocab)
+    return torch.zeros(
+        logits_shape, dtype=logits_dtype, device=kept_ids.device
+    ).scatter_add_(
+        -1,
+        local_ids.clamp(0, local_vocab - 1),
+        torch.where(in_shard, grad_kept, 0.0).to(logits_dtype),
+    )
+
+
+def sampler_support_ids(
+    sampler_topk_token_ids: torch.Tensor, sampler_topk_logprobs: torch.Tensor
+) -> torch.Tensor:
+    """The sampler's captured head ids with ``-1`` where its filters removed the id.
+
+    With ``top_logprobs >= top_k`` the finite entries of vLLM's processed top-K are
+    the set the sampler drew from (S_q).
+    """
+    return sampler_topk_token_ids.long().masked_fill(
+        torch.isneginf(sampler_topk_logprobs.to(sampler_topk_token_ids.device)), -1
+    )
+
+
+def check_sampler_support(
+    input_ids: torch.Tensor,
+    sampler_topk_token_ids: torch.Tensor,
+    sampler_topk_logprobs: torch.Tensor,
+    token_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Which positions' captured heads hold all of the sampler's support.
+
+    Under replay every sampled token was drawn from the finite entries of its
+    captured head. A head can miss part of the support when the sampler kept more
+    tokens than the head holds (vLLM keeps ties at the top_k-th logit for small
+    batches); its finite mass then falls short of 1. Such positions are reported,
+    not raised on, so the caller can drop them. An empty head, or a sampled token
+    missing from a complete head, means the capture is corrupt and raises.
+
+    Returns:
+        ``[B, S]`` bool, True where the head holds the whole support.
+    """
+    support = sampler_support_ids(sampler_topk_token_ids, sampler_topk_logprobs)
+    active = token_mask.to(support.device).bool()
+    if not (support[active] >= 0).any(-1).all():
+        raise ValueError(
+            "sampler replay: a response token has no finite sampler "
+            "candidate in its captured head; the top-K capture is corrupt"
+        )
+    head_mass = sampler_topk_logprobs.to(support.device).float().exp().sum(-1)
+    complete = head_mass >= 1.0 - 1e-4
+    sampled = input_ids.to(support.device).unsqueeze(-1)
+    if not (support == sampled).any(-1)[active & complete].all():
+        raise ValueError(
+            "sampler replay: a sampled token is not in its captured sampler "
+            "support (the finite entries of its top-K head); the capture is corrupt"
+        )
+    return complete
+
+
+def sampled_logprobs_from_support(
+    head: torch.Tensor, support: torch.Tensor, input_ids: torch.Tensor
+) -> torch.Tensor:
+    """The sampled token's log-prob: the head slot holding it (``-inf`` if none).
+
+    Args:
+        head: Next-token log-probs at the support ids, ``[B, S - 1, K]``.
+        support: Token-aligned :func:`sampler_support_ids` ``[B, S, K]``.
+        input_ids: Token ids ``[B, S]``.
+    """
+    sampled = input_ids[:, 1:].to(head.device).unsqueeze(-1)
+    match = support[:, 1:].to(head.device) == sampled
+    logprobs = head.gather(-1, match.int().argmax(-1, keepdim=True)).squeeze(-1)
+    return torch.where(match.any(-1), logprobs, -float("inf"))
+
+
+class SamplerSupportLogprob(torch.autograd.Function):
+    """Log-probs at the sampler's support ids, renormalized over that support.
+
+    ``support`` holds each position's captured head ids, ``-1`` where the sampler
+    filtered the id out, so its non-negative entries are the set the sampler drew
+    from (S_q). Each output is the id's logit minus the logsumexp over the support;
+    filtered slots get ``-inf``. With vocab-parallel logits each rank gathers its
+    shard's support logits and one all-reduce sums them: no vocabulary top-k,
+    softmax or collective. The backward is local.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]  Always ignore torch.autograd.Function.forward's type since it's always more specific than the base class
+        ctx: Any,
+        logits: torch.Tensor,
+        support: torch.Tensor,
+        vocab_start_index: int,
+        group: Optional[torch.distributed.ProcessGroup],
+        chunk_size: Optional[int] = None,
+        inference_only: bool = False,
+    ) -> torch.Tensor:
+        """Support-renormalized log-probs at ``support``.
+
+        Args:
+            logits: ``[B, S, V_local]`` logits, the vocab shard starting at
+                ``vocab_start_index`` (the whole vocabulary without ``group``).
+            support: ``[B, S, K]`` distinct support ids (already shifted), ``-1``
+                for filtered slots.
+            vocab_start_index: Global id of the first local vocab entry.
+            group: Vocab-parallel process group, or None for the full vocabulary.
+            chunk_size: Sequence chunk size bounding each all-reduce.
+            inference_only: If True, don't save tensors for backward.
+
+        Returns:
+            Log-probs ``[B, S, K]``; ``-inf`` at filtered slots.
+        """
+        local_vocab = logits.shape[-1]
+        local_ids = support.long() - vocab_start_index
+        in_shard = (local_ids >= 0) & (local_ids < local_vocab)
+        seq_len = max(logits.shape[1], 1)
+        chunk_size = chunk_size or seq_len
+        chunks = []
+        for start in range(0, seq_len, chunk_size):
+            end = start + chunk_size
+            values = (
+                logits[:, start:end]
+                .detach()
+                .gather(-1, local_ids[:, start:end].clamp(0, local_vocab - 1))
+                .float()
+            )
+            values = torch.where(in_shard[:, start:end], values, 0.0)
+            if group is not None:
+                torch.distributed.all_reduce(values, group=group)
+            chunks.append(values)
+        values = torch.cat(chunks, dim=1).masked_fill(support < 0, -float("inf"))
+        # An all-filtered position (padding) stays -inf rather than NaN.
+        log_norm = values.logsumexp(-1, keepdim=True)
+        log_norm = torch.where(torch.isneginf(log_norm), 0.0, log_norm)
+        logprobs = values - log_norm
+
+        if not inference_only:
+            ctx.save_for_backward(support, logprobs.exp())
+            ctx.vocab_start_index = vocab_start_index
+            ctx.logits_shape = logits.shape
+            ctx.logits_dtype = logits.dtype
+        return logprobs
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        *grad_outputs: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None, None, None]:
+        """Gradient g - softmax * sum(g), on this shard's support ids."""
+        support, probs = ctx.saved_tensors
+        grad = torch.where(support >= 0, grad_outputs[0].float(), 0.0)
+        grad_kept = grad - probs * grad.sum(-1, keepdim=True)
+        return (
+            _scatter_kept_grad(
+                grad_kept,
+                support,
+                ctx.vocab_start_index,
+                ctx.logits_shape,
+                ctx.logits_dtype,
+            ),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class ChunkedDistributedGatherLogprob(torch.autograd.Function):
@@ -1714,6 +1892,7 @@ def get_policy_logprobs_at_sampler_topk(
     cu_seqlens_q: Optional[CpuIntTuple] = None,
     cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
     packed_sampler_topk_token_ids: Optional[torch.Tensor] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
 ) -> torch.Tensor:
     """Next-token log-probs at each position's sampler top-k ids.
 
@@ -1740,10 +1919,22 @@ def get_policy_logprobs_at_sampler_topk(
 
         packed_sampler_topk_token_ids: Caller-packed, next-token-aligned IDs
             ``[1, T // CP, k]``, required with packed boundaries.
+        sampling_params: Top-k/top-p filters the sampler applied. Under filters the
+            head is only defined over the sampler's own support, so they require
+            ``sampler_replay``: the ids must be :func:`sampler_support_ids`
+            and the log-probs are renormalized over that support
+            (:class:`SamplerSupportLogprob`).
 
     Returns:
         Log-probs ``[B, S - 1, k]``.
     """
+    if need_top_k_or_top_p_filtering(sampling_params) and not replays_sampler_support(
+        sampling_params
+    ):
+        raise ValueError(
+            "the sampler head under top-k/top-p sampling is scored over the sampler's "
+            "captured support: set policy.generation.sampler_replay.enabled=true"
+        )
     if cp_sharder is not None or isinstance(
         next_token_logits, torch.distributed.tensor.DTensor
     ):
@@ -1790,7 +1981,18 @@ def get_policy_logprobs_at_sampler_topk(
         if cp_size > 1:
             targets = _get_tokens_on_this_cp_rank(targets, cp_rank, cp_size, seq_dim=1)
 
-    if vocab_parallel_group is not None:
+    if replays_sampler_support(sampling_params):
+        vocab_rank = 0 if vocab_parallel_group is None else vocab_parallel_rank
+        assert vocab_rank is not None
+        head = SamplerSupportLogprob.apply(
+            next_token_logits,
+            targets,
+            vocab_rank * next_token_logits.shape[-1],
+            vocab_parallel_group,
+            chunk_size,
+            not torch.is_grad_enabled(),
+        )
+    elif vocab_parallel_group is not None:
         assert vocab_parallel_rank is not None
         local_vocab = next_token_logits.shape[-1]
         head = ChunkedDistributedGatherLogprob.apply(
