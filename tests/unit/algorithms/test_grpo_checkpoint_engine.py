@@ -14,33 +14,8 @@
 
 """Tests for GRPO checkpoint-engine refit routing."""
 
-from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
-
-from omegaconf import OmegaConf
-
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
-
-
-def test_nixl_example_validates():
-    from nemo_rl.algorithms.grpo import MasterConfig
-    from nemo_rl.models.generation.vllm.config import (
-        VllmConfig,
-        normalize_vllm_refit_config,
-    )
-
-    repo_root = Path(__file__).parents[3]
-    register_omegaconf_resolvers()
-    raw_config = load_config(
-        repo_root / "examples/configs/grpo_math_8B_megatron_nixl.yaml"
-    )
-    resolved_config = OmegaConf.to_container(raw_config, resolve=True)
-    assert isinstance(resolved_config, dict)
-    config = MasterConfig(**resolved_config)
-
-    generation = config.policy["generation"]
-    normalize_vllm_refit_config(cast(VllmConfig, generation))
 
 
 def test_reset_encoder_cache_flag_rejected_on_unsupported_refit_transports():

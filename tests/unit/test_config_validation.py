@@ -470,7 +470,17 @@ def test_base_exemplars_pin_flash_attention_to_fa2():
 @pytest.mark.parametrize("path", full_config_files + suite_scripts)
 def test_shipped_configs_and_suite_scripts_have_no_local_paths(path):
     text = Path(path).read_text().lower()
-    for local_prefix in ("/lustre/", "/home/"):
+    for local_prefix in ("/lustre/", "/scratch/", "/home/"):
         assert local_prefix not in text, (
             f"{path} contains a local path ({local_prefix})"
         )
+
+
+@pytest.mark.parametrize("config_file", full_config_files)
+def test_shipped_configs_do_not_pin_wandb_entity(config_file):
+    raw = yaml.safe_load(Path(config_file).read_text())
+    logger = raw.get("logger") if isinstance(raw, dict) else None
+    wandb_config = logger.get("wandb") if isinstance(logger, dict) else None
+    assert not isinstance(wandb_config, dict) or "entity" not in wandb_config, (
+        f"{config_file} pins a W&B entity"
+    )

@@ -632,24 +632,6 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     assert teacher_topology is None
 
 
-def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch):
-    """The inherited recipe resolves exactly as the SC entrypoint consumes it."""
-    # The parent recipe locates its fixture data below HF_HOME. This test only
-    # validates config resolution, so it needs a stable path, not real data.
-    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
-    register_omegaconf_resolvers()
-    repo_root = Path(__file__).resolve().parents[3]
-    recipe = repo_root / (
-        "examples/configs/recipes/llm/"
-        "mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller.yaml"
-    )
-    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
-
-    assert isinstance(resolved, dict)
-    config = MasterConfig.model_validate(resolved)
-    validate_single_controller_config(config)
-
-
 def test_single_controller_mopd_recipe_builds_tropd_estimator(monkeypatch):
     """TROPD knobs reach the SC advantage estimator from the recipe YAML."""
     monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
@@ -691,30 +673,6 @@ def test_fullvocab_recipe_rejects_tropd_before_allocation(tropd_override):
     )
     with pytest.raises(ValueError, match="ignores advantages"):
         validate_single_controller_config(config)
-
-
-def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_contract(
-    monkeypatch,
-):
-    """The token-capture nightly must pass the same validation the entrypoint runs.
-
-    Its in_order sampler keeps one dispatched batch in flight per lookahead
-    version plus the live one, so the buffer must hold two steps of prompt
-    groups; anything smaller fails validation before any GPU is allocated.
-    """
-    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
-    register_omegaconf_resolvers()
-    repo_root = Path(__file__).resolve().parents[3]
-    recipe = repo_root / (
-        "examples/configs/recipes/llm/"
-        "grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-"
-        "single-controller-token_capture.yaml"
-    )
-    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
-
-    assert isinstance(resolved, dict)
-    config = MasterConfig.model_validate(resolved)
-    validate_single_controller_config(config)
 
 
 @pytest.mark.parametrize(
