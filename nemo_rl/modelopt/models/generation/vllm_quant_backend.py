@@ -556,6 +556,14 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         state_dict_info: dict[str, Any],
         serialized_fp8_config: Optional[dict[str, Any]] = None,
     ) -> Optional[list[str]]:
+        # Reject before any weight moves: real-quant refits go through vLLM's
+        # layerwise reload, which has no drafter equivalent.
+        if self._is_real_quant_model() and any(
+            name.startswith("draft.") for name in state_dict_info
+        ):
+            raise RuntimeError(
+                "ModelOpt real-quant refit does not support draft finalization"
+            )
         if not self._is_real_quant_model():
             return super().prepare_refit_info(state_dict_info, serialized_fp8_config)
 
@@ -650,12 +658,19 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             for buf in attached:
                 del buf.weight_loader
 
-    def _load_weights(self, weights):
+    def _load_weights(self, weights, *, coverage=None):
         """Load pre-folded weights and activation-quantizer amax buffers.
 
         Weights arrive already folded from the Megatron side (weight_quantizer
         applied during export), so no fold_weight step is needed here.
+
+        ``coverage`` follows the base signature; the full delivered name set is
+        recorded here (real-quant deliberately filters some scale entries out
+        of the actual load, but they are still handled).
         """
+        if coverage is not None:
+            weights = list(weights)
+            coverage.record_loaded(tuple(name for name, _ in weights))
         if self._is_real_quant_model():
             weights = list(weights)
             source_storage_ptrs = {
