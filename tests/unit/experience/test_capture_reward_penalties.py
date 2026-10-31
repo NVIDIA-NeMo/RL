@@ -246,7 +246,7 @@ def test_malformed_think_tag_requires_decode():
         thinking_tags=["<think>", "</think>"],
     )
     assert (reward, counts["malformed_think_tag"]) == (1.0, 0)
-    with pytest.raises(ValueError, match="needs_decode"):
+    with pytest.raises(RuntimeError, match="needs decode"):
         finalize_capture_reward(
             1.0,
             checks=None,

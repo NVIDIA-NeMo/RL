@@ -377,15 +377,6 @@ class RolloutReassembler:
         thinking_tags: Sequence[str] | None = None,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
-        if (
-            reward_penalty_config is not None
-            and reward_penalty_config.penalize_malformed_think_tag
-            and (tokenizer is None or thinking_tags is None or len(thinking_tags) < 2)
-        ):
-            raise ValueError(
-                "penalize_malformed_think_tag requires a tokenizer and resolved "
-                "open/close thinking_tags"
-            )
         # Decodes generations for the malformed-think-tag string check.
         self._tokenizer = tokenizer
         self._thinking_tags = thinking_tags

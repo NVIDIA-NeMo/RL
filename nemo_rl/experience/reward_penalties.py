@@ -484,7 +484,10 @@ def finalize_capture_reward(
         think_tag_ids: tuple[int, int] | None = None
         if penalty_config.penalize_malformed_think_tag:
             if decode is None or thinking_tags is None or len(thinking_tags) < 2:
-                raise ValueError("malformed_think_tag_needs_decode_and_tags")
+                raise RuntimeError(
+                    "penalize_malformed_think_tag needs decode and open/close "
+                    "thinking_tags; the finalizer was built without them"
+                )
             think_tags = thinking_tags
             think_ids = penalty_config.token_ids
             if (

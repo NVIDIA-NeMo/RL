@@ -2169,13 +2169,19 @@ def resolve_reward_penalty_config(
                     token_ids["think_open"] = inferred_open
                 if inferred_close is not None:
                     token_ids["think_close"] = inferred_close
+        else:
+            raise ValueError(
+                "penalize_malformed_think_tag needs open and close thinking tags in "
+                f"env.nemo_gym.thinking_tags, got {tags!r}"
+            )
 
     if resolved.get("penalize_malformed_think_tag") and (
         ("think_open" in token_ids) != ("think_close" in token_ids)
     ):
         raise ValueError(
-            "reward_penalties.token_ids.think_open and "
-            "reward_penalties.token_ids.think_close must both be set"
+            "reward_penalties.token_ids.think_open and think_close must both be set "
+            "or both omitted; omitted IDs are inferred from single-token "
+            "thinking_tags, otherwise only the decoded-text check runs"
         )
     if token_ids:
         resolved["token_ids"] = token_ids
@@ -2320,8 +2326,9 @@ def apply_reward_penalties(
         )
         if (think_open_token_id is None) != (think_close_token_id is None):
             raise ValueError(
-                "reward_penalties.token_ids.think_open and "
-                "reward_penalties.token_ids.think_close must both be set"
+                "reward_penalties.token_ids.think_open and think_close must both be "
+                "set or both omitted; omitted IDs are inferred from single-token "
+                "thinking_tags, otherwise only the decoded-text check runs"
             )
         for result in results:
             has_violation = any(

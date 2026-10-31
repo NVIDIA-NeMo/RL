@@ -1634,19 +1634,6 @@ def test_malformed_think_tag_penalty_decodes_each_generation(
     assert all(set(ids) <= generated for ids in tokenizer.decoded)
 
 
-def test_malformed_think_tag_penalty_requires_a_tokenizer(tq_client, partitions):
-    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
-
-    with pytest.raises(ValueError, match="requires a tokenizer"):
-        _finalizer(
-            tq_client,
-            reward_penalty_config=RewardPenaltyConfig(
-                penalize_malformed_think_tag=True
-            ),
-            thinking_tags=("<think>", "</think>"),
-        )
-
-
 def test_penalized_rewards_reach_grpo_advantages_without_token_changes(
     tq_client, partitions
 ):
