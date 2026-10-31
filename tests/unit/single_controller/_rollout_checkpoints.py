@@ -14,9 +14,11 @@
 
 """Rollout checkpointing for controllers that tests build without __init__."""
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any, Optional
 
+from nemo_rl.algorithms.rollout_checkpointing.restore import RolloutRestorer
 from nemo_rl.algorithms.rollout_checkpointing.snapshots import RolloutSnapshotter
 from nemo_rl.algorithms.rollout_checkpointing.state import (
     RolloutParts,
@@ -24,6 +26,15 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
     TrainingProgress,
 )
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
+
+# What the resumed checkpoint gave restore, keyed by RolloutRestorer's
+# constructor argument, with the value for a fresh run.
+_RESTORE_INPUTS: dict[str, Any] = {
+    "last_checkpoint_path": None,
+    "restored_from_rollout_snapshot": False,
+    "data_plane_checkpoint_metadata": None,
+    "rollout_checkpoint_load_metrics": None,
+}
 
 
 def bare_rollout_snapshotter(
@@ -58,10 +69,11 @@ def attach_rollout_checkpointing(controller: Any) -> None:
 
     Call it again after a test swaps one of those parts, such as the
     environment checkpoint; parts a bare controller lacks are left empty, and
-    state the previous snapshotter held carries over.
+    state the previous snapshotter and restorer held carries over.
     """
     rollout_manager = getattr(controller, "_rollout_manager", None)
     snapshots = getattr(controller, "_rollout_snapshots", None)
+    restorer = getattr(controller, "_rollout_restorer", None)
     master_config = getattr(controller, "_master_config", SimpleNamespace())
     if not hasattr(master_config, "async_rl"):
         # Bare controllers carry their async config on the controller.
@@ -102,3 +114,23 @@ def attach_rollout_checkpointing(controller: Any) -> None:
             controller, "_rollout_recovery_enabled", False
         ),
     )
+    controller._rollout_restorer = RolloutRestorer(
+        parts,
+        algo_cfg=getattr(controller, "_algo_cfg", None),
+        buffer_capacity=getattr(controller, "_buffer_capacity", asyncio.Semaphore(0)),
+        # Restore inputs a test set on the controller win; otherwise keep what
+        # the restorer was built with.
+        **{
+            name: getattr(
+                controller, f"_{name}", getattr(restorer, f"_{name}", default)
+            )
+            for name, default in _RESTORE_INPUTS.items()
+        },
+    )
+    if restorer is not None:
+        controller._rollout_restorer._groups_to_regenerate = (
+            restorer._groups_to_regenerate
+        )
+        controller._rollout_restorer._requires_recovery_dispatch = (
+            restorer._requires_recovery_dispatch
+        )
