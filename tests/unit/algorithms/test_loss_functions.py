@@ -1050,6 +1050,35 @@ def test_calculate_kl(kl_type):
     assert torch.allclose(kl_clamped, expected_kl_clamped[kl_type], rtol=1e-3)
 
 
+def test_calculate_kl_k3_is_accurate_near_the_reference():
+    """k3 stays accurate when the policy is close to the reference.
+
+    exp(logr) - 1 cancels in fp32 for small logr, so the KL value (~logr^2 / 2)
+    and its gradient lose most of their digits (see
+    https://jonbarron.info/softmaxfix/); expm1 avoids that.
+    """
+    log_ratios = torch.tensor([[1e-2, 1e-3, 1e-4]])
+    logprobs = (-log_ratios).requires_grad_(True)
+
+    kl = calculate_kl(
+        logprobs=logprobs,
+        logprobs_reference=torch.zeros_like(logprobs),
+        kl_type="k3",
+        input_clamp_value=None,
+        output_clamp_value=None,
+    )
+    kl.sum().backward()
+
+    log_ratios_ref = log_ratios.double()
+    expected_kl = torch.expm1(log_ratios_ref) - log_ratios_ref
+    expected_grad = -torch.expm1(log_ratios_ref)
+
+    torch.testing.assert_close(kl.double(), expected_kl, rtol=1e-3, atol=0.0)
+    torch.testing.assert_close(
+        logprobs.grad.double(), expected_grad, rtol=1e-5, atol=0.0
+    )
+
+
 def test_calculate_kl_detaches_importance_sampling_when_input_clamped():
     """Input-clamped KL terms should not keep score-function gradients alive."""
     logprobs = torch.tensor([[-3.0, -1.0]], requires_grad=True)

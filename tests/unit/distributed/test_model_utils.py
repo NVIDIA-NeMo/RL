@@ -31,6 +31,7 @@ from nemo_rl.distributed.model_utils import (
     _compute_distributed_log_softmax,
     _compute_distributed_selected_logprobs,
     _get_tokens_on_this_cp_rank,
+    _tp_target_logprobs,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
@@ -110,7 +111,12 @@ def test_compute_distributed_selected_logprobs_tp_shards(monkeypatch):
     target = torch.randint(0, full_logits.shape[-1], (2, 5))
     global_max = full_logits.amax(dim=-1, keepdim=True)
     shifted_full_logits = full_logits - global_max
-    global_sum_exp = shifted_full_logits.exp().sum(dim=-1, keepdim=True)
+    # The normalizer is reduced over the non-target tokens only.
+    global_sum_exp = (
+        shifted_full_logits.exp()
+        .scatter(-1, target.unsqueeze(-1), 0.0)
+        .sum(dim=-1, keepdim=True)
+    )
     expected = (
         torch.log_softmax(full_logits, dim=-1)
         .gather(-1, target.unsqueeze(-1))
@@ -143,6 +149,58 @@ def test_compute_distributed_selected_logprobs_tp_shards(monkeypatch):
             group=None,
         )
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("impl", ["distributed", "chunked", "local"])
+def test_target_logprobs_survive_softmax_collapse(single_rank_collectives, impl):
+    """Confident targets keep a nonzero logprob and a zero-sum gradient.
+
+    Once the target beats every other logit by more than ~16.6 in fp32, the
+    usual max-shifted log-softmax rounds its probability to exactly 1: the
+    logprob and the target gradient collapse to 0 while the other gradients
+    stay positive (see https://jonbarron.info/softmaxfix/).
+    """
+    torch.manual_seed(0)
+    margins = torch.tensor([5.0, 20.0, 40.0, 60.0])
+    logits = 0.5 * torch.randn(1, 4, 6)
+    target = torch.tensor([[0, 2, 5, 3]])
+    logits.scatter_(-1, target.unsqueeze(-1), margins.view(1, 4, 1))
+    vocab_size = logits.shape[-1]
+
+    logits.requires_grad_(True)
+    if impl == "distributed":
+        logprobs = DistributedLogprob.apply(logits, target, 0, vocab_size, None)
+    elif impl == "chunked":
+        logprobs = ChunkedDistributedLogprob.apply(
+            logits, target, 0, vocab_size, 3, None
+        )
+    else:
+        logprobs = _tp_target_logprobs(
+            logits,
+            target,
+            vocab_start_index=0,
+            vocab_end_index=vocab_size,
+            tp_group=None,
+            chunk_size=3,
+        )
+    logprobs.sum().backward()
+
+    # Closed-form fp64 reference relative to the target logit, since fp64
+    # log_softmax itself collapses past a margin of ~36.7.
+    logits_ref = logits.detach().double()
+    target_logits = logits_ref.gather(-1, target.unsqueeze(-1))
+    is_target = torch.zeros_like(logits_ref, dtype=torch.bool).scatter_(
+        -1, target.unsqueeze(-1), True
+    )
+    ratios = (logits_ref - target_logits).exp().masked_fill(is_target, 0.0)
+    other_mass = ratios.sum(-1, keepdim=True)
+    expected = -torch.log1p(other_mass).squeeze(-1)
+    expected_grad = torch.where(
+        is_target, other_mass / (1 + other_mass), -ratios / (1 + other_mass)
+    )
+
+    torch.testing.assert_close(logprobs.double(), expected, rtol=1e-4, atol=0.0)
+    torch.testing.assert_close(logits.grad.double(), expected_grad, rtol=1e-4, atol=0.0)
 
 
 @ray.remote(num_gpus=1)
