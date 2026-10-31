@@ -15,11 +15,12 @@
 import ast
 import glob
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Type
 
 import pytest
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from pydantic import TypeAdapter, ValidationError
 
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
@@ -104,9 +105,9 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
-# Every shipped config tree. Only the outdated-config guard uses it -- most of examples/nemo_gym
-# cannot satisfy the schema test by design (env manifests, launcher templates, unset env
-# interpolations).
+# Every shipped config tree. Configs outside examples/configs only receive the
+# outdated-config check: env manifests and launcher templates cannot satisfy the
+# training schema and may contain unset environment interpolations.
 repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
 full_config_files = config_files + [
     path
@@ -115,14 +116,11 @@ full_config_files = config_files + [
 ]
 
 
-@pytest.mark.parametrize("config_file", config_files)
-def test_all_config_files_have_required_keys(config_file):
+def _check_required_keys(config_file: str, config: DictConfig) -> None:
     """Test that all config files in examples/configs have all required keys for their respective sections."""
 
     print(f"\nValidating config file: {config_file}")
 
-    # Load the config file with inheritance
-    config = load_config_with_inheritance(config_file)
     config_dict = OmegaConf.to_container(config, resolve=True)
 
     if config_dict is None:
@@ -304,8 +302,7 @@ def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
     assert config.token_ids.unwanted == [2]
 
 
-@pytest.mark.parametrize("config_file", config_files)
-def test_all_config_no_tp_size_accuracy_issues(config_file):
+def _check_tp_size_accuracy(config_file: str, config: DictConfig) -> None:
     """Test that all config files in examples/configs have no TP size >= 4 accuracy issues.
 
     There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.
@@ -327,8 +324,6 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
 
     print(f"\nValidating config file: {config_file}")
 
-    # Load the config file with inheritance
-    config = load_config_with_inheritance(config_file)
     config_dict = OmegaConf.to_container(config, resolve=True)
 
     # Skip if config does not have policy or logprob_batch_size
@@ -357,8 +352,7 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
         )
 
 
-@pytest.mark.parametrize("config_file", full_config_files)
-def test_no_shipped_config_is_outdated(config_file):
+def _check_outdated_config(config_file: str, config: DictConfig) -> None:
     """Test that every shipped config passes the same checks the entrypoints run.
 
     Reusing check_outdated_config keeps this from drifting: a check added there is
@@ -371,7 +365,6 @@ def test_no_shipped_config_is_outdated(config_file):
 
     print(f"\nValidating config file: {config_file}")
 
-    config = load_config_with_inheritance(config_file)
     # resolve=False: the checked keys are never interpolations, and resolving would fail
     # on the configs that interpolate an env var CI does not set.
     config_dict = OmegaConf.to_container(config, resolve=False)
@@ -393,11 +386,7 @@ DEEPEP_FALLBACK_RECIPES = {
 }
 
 
-@pytest.mark.parametrize("config_file", config_files)
-def test_automodel_moe_recipes_use_expected_dispatcher(
-    config_file: str,
-) -> None:
-    config = load_config_with_inheritance(config_file)
+def _check_automodel_moe_dispatcher(config_file: str, config: DictConfig) -> None:
     automodel_cfg = OmegaConf.select(config, "policy.automodel_cfg")
     if (
         automodel_cfg is None
@@ -419,3 +408,21 @@ def test_automodel_moe_recipes_use_expected_dispatcher(
         assert config.policy.make_sequence_length_divisible_by % 64 == 0, (
             f"{config_file}: HybridEP input width must be padded to a multiple of 64"
         )
+
+
+@pytest.mark.parametrize("config_file", full_config_files)
+def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
+    """Load each shipped config once and report each applicable check separately."""
+    config = load_config_with_inheritance(config_file)
+    if config_file in config_files:
+        with subtests.test(check="required_keys"):
+            _check_required_keys(config_file, deepcopy(config))
+        with subtests.test(check="tp_size_accuracy"):
+            _check_tp_size_accuracy(config_file, deepcopy(config))
+
+    with subtests.test(check="outdated_config"):
+        _check_outdated_config(config_file, deepcopy(config))
+
+    if config_file in config_files:
+        with subtests.test(check="automodel_moe_dispatcher"):
+            _check_automodel_moe_dispatcher(config_file, deepcopy(config))
