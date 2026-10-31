@@ -40,6 +40,7 @@ from nemo_rl.utils.config import (
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
+from nemo_rl.utils.unsupported_feature_checks import check_unsupported_feature
 
 
 def parse_args():
@@ -209,6 +210,7 @@ def main(is_vlm: bool = False):
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
+    check_unsupported_feature(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 

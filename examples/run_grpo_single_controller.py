@@ -58,6 +58,7 @@ from nemo_rl.utils.config import (
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
+from nemo_rl.utils.unsupported_feature_checks import check_unsupported_feature
 
 # Drop examples/ from sys.path so examples/nemo_gym/ (no __init__.py) doesn't
 # shadow the real nemo_gym package as a namespace package.
@@ -105,6 +106,7 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
+    check_unsupported_feature(config)
     config = MasterConfig(**config)
     # Keep the processor, dataset and vLLM MediaIO on one frame-count contract.
     # Without this, vLLM's VideoMediaIO silently falls back to 32 frames even

@@ -56,6 +56,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
+from nemo_rl.utils.unsupported_feature_checks import check_unsupported_feature
 
 # register the worker extension class to the actor environment registry
 ACTOR_ENVIRONMENT_REGISTRY[
@@ -229,6 +230,7 @@ if __name__ == "__main__":
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
+    check_unsupported_feature(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 

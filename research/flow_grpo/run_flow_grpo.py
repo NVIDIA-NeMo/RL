@@ -41,6 +41,7 @@ from nemo_rl.utils.config import (
 )
 from nemo_rl.utils.logger import Logger, get_next_experiment_dir
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
+from nemo_rl.utils.unsupported_feature_checks import check_unsupported_feature
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
 
@@ -71,6 +72,7 @@ def main() -> None:
         cfg = parse_hydra_overrides(cfg, overrides)
     cfg = OmegaConf.to_container(cfg, resolve=True)
     check_outdated_config(cfg)
+    check_unsupported_feature(cfg)
     print("Final config:")
     pprint.pprint(cfg)
 

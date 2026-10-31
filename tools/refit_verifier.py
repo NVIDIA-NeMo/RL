@@ -91,6 +91,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
+from nemo_rl.utils.unsupported_feature_checks import check_unsupported_feature
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 
@@ -724,6 +725,7 @@ def main_sglang():
         config = parse_hydra_overrides(config, overrides)
     master_config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(master_config)
+    check_unsupported_feature(master_config)
 
     init_ray()
 
