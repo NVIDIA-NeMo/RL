@@ -2313,7 +2313,7 @@ def _make_capture_manager(
             generation_indices=None,
             on_completion=None,
             recovery_granularity=RecoveryGranularity.SIBLING,
-            gym_instance_id=None,
+            environment_instance_id=None,
             dispatch_recorder=None,
         ):
             self.seen_rollout_ids = rollout_ids
@@ -2571,7 +2571,7 @@ class TestGenerateForFinalizationFlow:
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
-                gym_instance_id=None,
+                environment_instance_id=None,
                 dispatch_recorder=None,
             ):
                 del _sample, recovery_granularity
@@ -2685,7 +2685,7 @@ class TestGenerateForFinalizationFlow:
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
-                gym_instance_id=None,
+                environment_instance_id=None,
                 dispatch_recorder=None,
             ):
                 indices = list(generation_indices)
