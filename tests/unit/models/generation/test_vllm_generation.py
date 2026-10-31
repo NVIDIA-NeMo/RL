@@ -475,6 +475,66 @@ async def test_async_vllm_worker_gpu_profiling_awaits_collective_rpc(
 
 
 @pytest.mark.asyncio
+async def test_async_vllm_worker_gpu_profiling_leaves_outer_profiler_alone(
+    monkeypatch,
+) -> None:
+    """The outer async actor never opens its own capture (no near-empty outer report);
+    a non-owner worker (llm is None) is a no-op."""
+    start, stop = MagicMock(), MagicMock()
+    monkeypatch.setattr(torch.cuda.profiler, "start", start)
+    monkeypatch.setattr(torch.cuda.profiler, "stop", stop)
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = MagicMock(collective_rpc=AsyncMock())
+
+    await worker.start_gpu_profiling()
+    await worker.stop_gpu_profiling()
+    start.assert_not_called()
+    stop.assert_not_called()
+
+    worker.llm = None
+    await worker.start_gpu_profiling()
+    await worker.stop_gpu_profiling()
+    start.assert_not_called()
+    stop.assert_not_called()
+
+
+def test_v1_executor_patch_uses_repeat_without_wait(monkeypatch):
+    """The v1 Ray executor keeps capture-range-end=repeat and no `wait`; the v2 plugin
+    uses stop + wait=primary. Both come from build_inner_nsight_config."""
+
+    class RayDistributedExecutor:
+        # read by build_executor_nsight_config (per-worker GPU metrics)
+        parallel_config = types.SimpleNamespace(world_size=2)
+
+        def _configure_ray_workers_use_nsight(self, ray_remote_kwargs):
+            raise AssertionError("vLLM's stock nsight config must be replaced")
+
+    v1_module = types.ModuleType("vllm.v1.executor.ray_executor")
+    v1_module.RayDistributedExecutor = RayDistributedExecutor
+    # A fresh stub class: the real executor is never patched, nothing leaks.
+    monkeypatch.setitem(sys.modules, "vllm.v1.executor.ray_executor", v1_module)
+    monkeypatch.setattr("nemo_rl.utils.nsys.NRL_NSYS_PROFILE_STEP_RANGE", "2:4")
+    monkeypatch.setattr(
+        "nemo_rl.utils.nsys.NRL_NSYS_EXTRA_OPTIONS",
+        {"t": "cuda-sw,nvtx", "cuda-graph-trace": None},
+    )
+
+    VllmGenerationWorkerImpl._patch_vllm_nsight_config()
+
+    kwargs = RayDistributedExecutor()._configure_ray_workers_use_nsight(
+        {"runtime_env": {"env_vars": {"KEEP": "1"}}}
+    )
+    assert kwargs["runtime_env"]["env_vars"] == {"KEEP": "1"}
+    nsight = kwargs["runtime_env"]["nsight"]
+    assert nsight["o"] == "'vllm_tp_worker_2:4_%p'"
+    assert nsight["capture-range"] == "cudaProfilerApi"
+    assert nsight["capture-range-end"] == "repeat"
+    assert "wait" not in nsight
+    assert nsight["t"] == "cuda-sw,nvtx"
+    assert "cuda-graph-trace" not in nsight
+
+
+@pytest.mark.asyncio
 async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
     engine_loop = asyncio.get_running_loop()
     engine_thread = threading.get_ident()

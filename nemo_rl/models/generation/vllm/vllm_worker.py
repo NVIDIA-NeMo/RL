@@ -270,6 +270,10 @@ def _configure_nvfp4_pertoken_engine_kwargs(
 
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
+    # Colocated with the training workers (fractional num_gpus), leave each shared
+    # GPU's nsys GPU-metrics sampler to them; only one process can sample a GPU.
+    _nsys_gpu_metrics_on_shared_gpu = False
+
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -941,18 +945,9 @@ class BaseVllmGenerationWorker:
         tracing until start_gpu_profiling() triggers cudaProfilerStart() on each
         internal worker via collective_rpc.
         """
-        from nemo_rl.utils.nsys import NRL_NSYS_PROFILE_STEP_RANGE
+        from nemo_rl.utils.vllm_nsight_plugin import build_executor_nsight_config
 
-        nsight_config = {
-            "t": "cuda,cudnn,cublas,nvtx",
-            "o": f"'vllm_tp_worker_{NRL_NSYS_PROFILE_STEP_RANGE}_%p'",
-            "stop-on-exit": "true",
-            "s": "none",
-            "capture-range": "cudaProfilerApi",
-            "capture-range-end": "repeat",
-            "cuda-graph-trace": "node",
-        }
-
+        # vLLM v1 Ray executor (VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0).
         try:
             from vllm.v1.executor.ray_executor import RayDistributedExecutor
         except ImportError:
@@ -961,11 +956,23 @@ class BaseVllmGenerationWorker:
             )
 
         def _patched_configure(self, ray_remote_kwargs):
+            # NRL_NSYS_EXTRA_OPTIONS is merged in (e.g. t=cuda-sw,nvtx on platforms
+            # where the HW cuda target crashes at cudaProfilerStart).
             runtime_env = ray_remote_kwargs.setdefault("runtime_env", {})
-            runtime_env.update({"nsight": nsight_config})
+            runtime_env["nsight"] = build_executor_nsight_config(
+                RayDistributedExecutor,
+                self.parallel_config,
+                capture_range_end="repeat",
+            )
             return ray_remote_kwargs
 
         RayDistributedExecutor._configure_ray_workers_use_nsight = _patched_configure
+
+        # vLLM v2 Ray executor (default for vLLM >= 0.25) is built inside the vLLM
+        # EngineCore subprocess (spawn -> pristine vLLM import), so an in-process
+        # monkey-patch here cannot reach it. Its inner-worker nsight config is instead
+        # installed by the `vllm.general_plugins` entry point in
+        # nemo_rl.utils.vllm_nsight_plugin, which vLLM loads inside that subprocess.
 
     def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
         """Get the vLLM engine's Prometheus counters.

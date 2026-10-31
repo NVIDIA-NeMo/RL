@@ -1,0 +1,16 @@
+# nsys profiling coverage for the base Megatron recipe; the matching test suite script
+# sets NRL_NSYS_* and checks the reports. vLLM TP=2 so generation runs in vLLM's inner
+# Ray TP workers (TP=1 has none), and the async engine so start/stop_gpu_profiling go
+# through the async worker.
+defaults: grpo-llama3.2-1b-instruct-1n8g-megatron.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n8g-megatron-nsys
+policy:
+  generation:
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 2
+logger:
+  log_dir: logs/grpo-llama3.2-1b-instruct-1n8g-megatron-nsys
+  wandb:
+    name: grpo-llama3.2-1b-instruct-1n8g-megatron-nsys

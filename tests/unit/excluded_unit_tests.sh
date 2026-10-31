@@ -37,10 +37,11 @@ EXCLUDED_UNIT_TESTS=(
     # DISTRIBUTED
     ###########################################################################
 
-    # test_virtual_cluster.py — exclude only the two tests over 1s; the rest are
+    # test_virtual_cluster.py — exclude only the tests over 1s; the rest are
     # pure regex/set/mock checks (<1s), including the router-band guards.
     --deselect=tests/unit/distributed/test_virtual_cluster.py::test_mcore_py_executable
     --deselect=tests/unit/distributed/test_virtual_cluster.py::test_create_sorted_bundle_indices_for_unified_pg
+    --deselect=tests/unit/distributed/test_virtual_cluster.py::test_get_bundle_gpu_id_matches_bundle_probe
 
     # test_worker_groups.py — exclude 2D sharding variants (require complex Ray setup)
     --deselect=tests/unit/distributed/test_worker_groups.py::test_run_all_workers_single_data_2d_sharding_no_filter
