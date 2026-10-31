@@ -635,7 +635,11 @@ class BaseVllmGenerationWorker:
             os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
-        if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
+        # Native ModelOpt refits populate the complete model, including frozen
+        # media weights. Loading BF16 disk weights into packed buffers is invalid.
+        if not self.cfg.get("real_quant") and ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(
+            self.model_name
+        ):
             load_format = "auto"
 
         # MTP speculative decoding with load_format="dummy" gets its policy
