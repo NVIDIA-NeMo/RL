@@ -331,21 +331,22 @@ class CaptureRewardSettings:
             if (spec.flag in self.enabled_penalties) != (
                 spec.flag in current.enabled_penalties
             ):
-                differences.append(f"penalties.{spec.flag}")
+                differences.append(f"reward_penalties.{spec.flag}")
         if self.unwanted_tokens != current.unwanted_tokens:
-            differences.append("penalties.token_ids.unwanted")
+            differences.append("reward_penalties.token_ids.unwanted")
         if self.think_tag_ids != current.think_tag_ids:
-            differences.append("penalties.token_ids.think_open/think_close")
+            differences.append("reward_penalties.token_ids.think_open/think_close")
         if self.thinking_tags != current.thinking_tags:
-            differences.append("thinking_tags")
+            differences.append("env.nemo_gym.thinking_tags")
         if self.effort != current.effort:
             if self.effort is None or current.effort is None:
-                differences.append("effort.enabled")
+                # No enabled flag: shaping is off when the block disables it.
+                differences.append("env.nemo_gym.effort_levels")
             else:
                 previous = asdict(self.effort)
                 for name, value in asdict(current.effort).items():
                     if value != previous[name]:
-                        differences.append(f"effort.{name}")
+                        differences.append(f"env.nemo_gym.effort_levels.{name}")
         if differences:
             raise ValueError(
                 "capture reward settings differ from the checkpoint: "

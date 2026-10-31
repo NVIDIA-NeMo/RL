@@ -487,7 +487,7 @@ def test_reward_settings_normalize_active_tokens_and_nested_extras():
     [
         (
             {"penalties": {"penalize_empty_final_answer": True}},
-            "penalize_empty_final_answer",
+            "reward_penalties.penalize_empty_final_answer",
         ),
         (
             {
@@ -496,13 +496,13 @@ def test_reward_settings_normalize_active_tokens_and_nested_extras():
                     "token_ids": {"unwanted": [2]},
                 }
             },
-            "token_ids.unwanted",
+            "reward_penalties.token_ids.unwanted",
         ),
         (
             {"effort": {"low_weight": 1, "low_string": "budget", "low_ub": 100}},
-            "effort.low_ub",
+            "env.nemo_gym.effort_levels.low_ub",
         ),
-        ({"effort": None}, "effort.enabled"),
+        ({"effort": None}, "env.nemo_gym.effort_levels$"),
         (
             {
                 "penalties": {
@@ -510,7 +510,7 @@ def test_reward_settings_normalize_active_tokens_and_nested_extras():
                     "thinking_tags": ["<think>", "</think>"],
                 }
             },
-            "penalize_malformed_think_tag",
+            "reward_penalties.penalize_malformed_think_tag",
         ),
     ],
 )
@@ -570,7 +570,7 @@ def test_reward_settings_persist_think_tag_rules():
     saved.require_compatible(_think_settings(1, 2))
     with pytest.raises(ValueError, match="think_open/think_close"):
         saved.require_compatible(_think_settings(3, 4))
-    with pytest.raises(ValueError, match="thinking_tags"):
+    with pytest.raises(ValueError, match="env.nemo_gym.thinking_tags"):
         saved.require_compatible(_think_settings(1, 2, ("<t>", "</t>")))
     # Inferred IDs (none configured) differ from configured ones.
     with pytest.raises(ValueError, match="think_open/think_close"):
