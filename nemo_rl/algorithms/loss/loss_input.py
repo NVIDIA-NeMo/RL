@@ -312,6 +312,8 @@ def prepare_loss_input(
                 teacher_topk_indices=data["teacher_topk_indices"],
                 zero_outside_topk=loss_fn.zero_outside_topk,
                 calculate_entropy=calculate_entropy,
+                # Legacy unmasked loss callers keep fp32 gather accumulation.
+                defer_fp32_upcast="token_mask" in data and "sample_mask" in data,
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
