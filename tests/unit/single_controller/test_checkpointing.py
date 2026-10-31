@@ -109,6 +109,8 @@ from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
+from nemo_rl.environments.checkpointing.nemo_gym import GymEnvironmentCheckpoint
 from nemo_rl.environments.gym_checkpoint_coordinator import (
     GymCheckpointNotReady,
     GymCheckpointOperationError,
@@ -143,6 +145,56 @@ from tests.unit.single_controller.test_tq_replay_buffer import (
 # Instantiate the underlying class in-process (same pattern as
 # tests/unit/algorithms/test_async_utils.py for AsyncTrajectoryCollector).
 _ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
+
+
+class _FakeEnvironmentSnapshot:
+    """An environment's part of a snapshot that records its check and its pause."""
+
+    restarted_rollouts = 0
+
+    def __init__(self) -> None:
+        self.checked_cuts: list[Any] = []
+
+    async def check_against_cut(self, cut: Any) -> None:
+        self.checked_cuts.append(cut)
+
+    def metrics(self, paused_seconds: float) -> dict[str, float]:
+        return {"environment_paused_seconds": paused_seconds}
+
+
+class _FakeEnvironmentCheckpoint(NoEnvironmentCheckpoint):
+    """An environment that keeps rollout state; ``snapshot`` comes from a factory."""
+
+    def __init__(
+        self,
+        snapshot: Optional[
+            Callable[[Path], contextlib.AbstractAsyncContextManager[Any]]
+        ] = None,
+    ) -> None:
+        self._snapshot_factory = snapshot
+
+    @property
+    def holds_rollout_state(self) -> bool:
+        return True
+
+    def snapshot(self, checkpoint_path: Path):  # type: ignore[override]
+        assert self._snapshot_factory is not None
+        return self._snapshot_factory(checkpoint_path)
+
+
+async def _no_staging_keys() -> list[str]:
+    return []
+
+
+def _gym_environment_checkpoint(actor: Any) -> GymEnvironmentCheckpoint:
+    """A turn-level Gym checkpoint over one fake Gym actor."""
+    return GymEnvironmentCheckpoint(
+        gym_coordinator(FakeGymActor()),
+        ledger=RolloutRecoveryLedger(),
+        rollout_manager=actor._rollout_manager,
+        list_staging_keys=_no_staging_keys,
+    )
+
 
 _PARTITION_ID = "rollout_data"
 _STAGING_PARTITION_ID = "rollout_staging"
@@ -2082,8 +2134,9 @@ class TestPeriodicRolloutCheckpoint:
         )
         assert logged[TELEMETRY_WALL_TIME_METRIC] == 1_750_000_000.0
         assert "sample_index" not in logged
-        # No Gym coordination, so nothing was parked.
+        # The environment keeps no rollout state, so nothing was paused.
         assert "gym_parked_seconds" not in logged
+        assert "environment_paused_seconds" not in logged
         assert actor._logger.log_metrics.call_args.kwargs == {
             "step": wall_time_ns,
             "prefix": "timing/rollout_checkpoint",
@@ -2091,28 +2144,22 @@ class TestPeriodicRolloutCheckpoint:
         }
 
     @pytest.mark.parametrize("interval_s, warns", [(120.0, False), (0.5, True)])
-    def test_logs_how_long_gym_held_rollout_dispatch(
+    def test_logs_how_long_the_environment_held_rollout_dispatch(
         self, tmp_path: Path, interval_s: float, warns: bool
     ) -> None:
-        """The Gym window spans the barrier hold and is flagged past the interval."""
+        """The environment window spans the barrier hold and is flagged past the interval."""
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = (
             interval_s
         )
-        gym_commit = SimpleNamespace(manifest=SimpleNamespace(restarts={}))
-        validated_commits: list[object] = []
+        environment_snapshot = _FakeEnvironmentSnapshot()
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
-            assert checkpoint_id.startswith("rollout-")
-            yield gym_commit
+        async def snapshot(_path):
+            yield environment_snapshot
 
-        async def validate_gym_checkpoint_cut(cut, commit, *, checkpoint_path):
-            validated_commits.append(commit)
-
-        actor._prepared_gym_checkpoint = prepared_gym_checkpoint
-        actor._validate_gym_checkpoint_cut = validate_gym_checkpoint_cut
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
         try:
             with (
                 patch(
@@ -2127,11 +2174,11 @@ class TestPeriodicRolloutCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
-        assert validated_commits == [gym_commit]
+        assert len(environment_snapshot.checked_cuts) == 1
         logged = actor._logger.log_metrics.call_args.args[0]
         assert (
             logged["exclusive_hold_seconds"]
-            < logged["gym_parked_seconds"]
+            < logged["environment_paused_seconds"]
             < logged["total_save_seconds"]
         )
         parked_warnings = [
@@ -2154,15 +2201,11 @@ class TestPeriodicRolloutCheckpoint:
         coordinator = gym_coordinator(gym)
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
-            async with coordinator.prepared(checkpoint_id):
-                yield SimpleNamespace(manifest=SimpleNamespace(restarts={}))
+        async def snapshot(_path):
+            async with coordinator.prepared("rollout-1"):
+                yield _FakeEnvironmentSnapshot()
 
-        async def validate_gym_checkpoint_cut(cut, commit, *, checkpoint_path):
-            return None
-
-        actor._prepared_gym_checkpoint = prepared_gym_checkpoint
-        actor._validate_gym_checkpoint_cut = validate_gym_checkpoint_cut
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
         try:
             with pytest.warns(UserWarning, match="resume failed"):
                 result = asyncio.run(actor._save_rollout_checkpoint(force=True))
@@ -2188,16 +2231,16 @@ class TestPeriodicRolloutCheckpoint:
         gym_parked = asyncio.Event()
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
+        async def snapshot(_path):
             gym_phase_events.append("park")
             try:
                 gym_parked.set()
                 await asyncio.Event().wait()  # prepare/commit/drain never finish
-                yield object()
+                yield _FakeEnvironmentSnapshot()
             finally:
                 gym_phase_events.append("resume")
 
-        actor._prepared_gym_checkpoint = prepared_gym_checkpoint
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
 
         async def exercise() -> _RolloutCheckpointSaveResult:
             if stale_commit_event:
@@ -2232,7 +2275,11 @@ class TestPeriodicRolloutCheckpoint:
         actor._logger = MagicMock()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         actor._master_config.rollout_checkpointing.max_consecutive_failures = 2
-        actor._gym_checkpoint_coordinator = object() if gym_coordinated else None
+        actor._environment_checkpoint = (
+            _FakeEnvironmentCheckpoint()
+            if gym_coordinated
+            else NoEnvironmentCheckpoint()
+        )
         actor._train_steps = 1
         # Two streaks of discards (2, then 3) split by a saved snapshot.
         reasons = [
@@ -2801,6 +2848,7 @@ class TestPeriodicRolloutCheckpoint:
         actor._logger = MagicMock()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         actor._train_steps = 1
+        actor._environment_checkpoint = _gym_environment_checkpoint(actor)
 
         async def _main() -> None:
             two_failures = asyncio.Event()
@@ -2836,6 +2884,7 @@ class TestPeriodicRolloutCheckpoint:
         actor._logger = MagicMock()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         actor._train_steps = 1
+        actor._environment_checkpoint = _gym_environment_checkpoint(actor)
         calls = 0
 
         async def _main() -> None:
@@ -3540,8 +3589,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._checkpointer = MagicMock()
     actor._checkpointer.save_optimizer = True
     actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
-    actor._gym_checkpoint_coordinator = None
-    actor._rollout_dispatch_admission_gate = None
+    actor._environment_checkpoint = NoEnvironmentCheckpoint()
     actor._is_ppo = True
     actor._loss_fn = object()
     actor._trainer = _OrderRecordingPolicy(calls)
