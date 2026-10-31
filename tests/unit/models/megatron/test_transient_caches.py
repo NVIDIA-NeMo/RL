@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -69,3 +70,26 @@ def test_clear_transient_megatron_caches_clears_rope_cache(monkeypatch):
     clear_transient_megatron_caches(torch.nn.Linear(1, 1))
 
     assert cleared == [True]
+
+
+@pytest.mark.mcore
+def test_clear_transient_megatron_caches_is_best_effort(monkeypatch):
+    """Failures in either step are swallowed."""
+    from megatron.core.models.common.embeddings import rotary_pos_embedding
+
+    from nemo_rl.models.megatron.common import clear_transient_megatron_caches
+
+    def forward():
+        return None
+
+    forward.cache_clear = MagicMock(side_effect=RuntimeError("rotary cache"))
+    monkeypatch.setattr(
+        rotary_pos_embedding,
+        "RotaryEmbedding",
+        SimpleNamespace(forward=forward),
+    )
+    model = SimpleNamespace(
+        modules=MagicMock(side_effect=RuntimeError("module traversal"))
+    )
+
+    clear_transient_megatron_caches(model)

@@ -1047,10 +1047,8 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         ):
             self.move_optimizer("cpu")
 
-        # The critic trains with activation recompute on variable-length sequences,
-        # so the RoPE cache and MoE dispatcher cycles described in
-        # clear_transient_megatron_caches would otherwise stay resident across the
-        # offload, as they do for the policy before a refit.
+        # Same transient caches the policy clears before refit; see
+        # clear_transient_megatron_caches.
         if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit"):
             clear_transient_megatron_caches(self.model)
 

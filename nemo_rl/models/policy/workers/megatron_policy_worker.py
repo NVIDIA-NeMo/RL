@@ -4873,7 +4873,7 @@ class MegatronPolicyWorkerImpl(
             self._clear_fp8_caches()
 
         if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
-            self._clear_rope_and_moe_dispatcher_caches()
+            clear_transient_megatron_caches(self.model)
 
         torch.randn(1).cuda()  # wake up torch allocator
         if (
@@ -4894,10 +4894,6 @@ class MegatronPolicyWorkerImpl(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
         no_grad.__exit__(None, None, None)
-
-    def _clear_rope_and_moe_dispatcher_caches(self) -> None:
-        """Clear rotary-embedding and MoE dispatcher caches repopulated by forwards."""
-        clear_transient_megatron_caches(self.model)
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
