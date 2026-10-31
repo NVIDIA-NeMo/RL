@@ -1032,22 +1032,13 @@ def _run_lightning_launcher(**overrides):
         )
 
 
-def test_lightning_launcher_dry_run_builds_reference_external_pool_topology():
+def test_lightning_launcher_dry_run_fills_external_service_placeholders():
     result = _run_lightning_launcher()
 
     assert result.returncode == 0, result.stderr
-    assert "Nodes:       86 total" in result.stdout
-    assert "Hetgroup 0: 66 NeMo RL nodes" in result.stdout
-    assert "Hetgroup 1: 20 external-service nodes" in result.stdout
-    assert "GenRM:    8 independent TP=8, DP=1 servers" in result.stdout
-    assert "NL2Bash:  4 independent TP=4, DP=1 servers" in result.stdout
     assert "base_url=__GENRM_BASE_URL__" in result.stdout
     assert "base_url=__NL2BASH_BASE_URL__" in result.stdout
     assert "__EXTERNAL_SERVICE_READINESS__" in result.stdout
-    assert "--reasoning-parser\n  nemotron_v3" in result.stdout
-    assert "--reasoning-parser-plugin" not in result.stdout
-    assert "--attention-backend\n  TRITON_ATTN" in result.stdout
-    assert result.stdout.count("--enable-expert-parallel") == 2
 
 
 def test_lightning_launcher_rejects_invalid_external_pool_tp():

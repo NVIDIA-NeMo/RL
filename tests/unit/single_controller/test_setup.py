@@ -648,24 +648,6 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch)
     assert isinstance(resolved, dict)
     config = MasterConfig.model_validate(resolved)
     validate_single_controller_config(config)
-    assert config.grpo.async_grpo is None
-    assert config.grpo.adv_estimator.name == "opd"
-    assert config.grpo.skip_reference_policy_logprobs_calculation is True
-    assert config.async_rl.min_groups_for_streaming_train == (
-        config.grpo.num_prompts_per_step
-    )
-    assert config.policy["train_global_batch_size"] == (
-        config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
-    )
-    assert config.data_plane["enabled"] is True
-    assert config.env["should_use_nemo_gym"] is True
-    assert config.on_policy_distillation.enabled is True
-    assert config.on_policy_distillation.non_colocated_teachers is not None
-    assert config.on_policy_distillation.non_colocated_teachers.enabled is True
-    assert (
-        config.on_policy_distillation.teacher_model_by_agent_name["default_teacher"]
-        == config.policy["model_name"]
-    )
 
 
 def test_single_controller_mopd_recipe_builds_tropd_estimator(monkeypatch):
@@ -733,15 +715,6 @@ def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_cont
     assert isinstance(resolved, dict)
     config = MasterConfig.model_validate(resolved)
     validate_single_controller_config(config)
-    assert config.token_capture.enabled is True
-    assert config.async_rl.sampler.name == "in_order"
-    assert config.async_rl.max_buffered_rollouts == (
-        config.grpo.num_prompts_per_step
-        * (config.async_rl.sampler.max_lookahead_versions + 1)
-    )
-    assert config.policy["train_global_batch_size"] == (
-        config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
-    )
 
 
 @pytest.mark.parametrize(

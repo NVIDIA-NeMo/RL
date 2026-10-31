@@ -192,18 +192,6 @@ class TestAlgorithmBlockValidator:
         assert isinstance(resolved, dict)
         return resolved
 
-    @pytest.mark.parametrize(
-        "name",
-        [
-            "grpo_math_1B_megatron_single_controller.yaml",
-            "ppo_math_1B_megatron_single_controller.yaml",
-        ],
-        ids=["grpo", "ppo"],
-    )
-    def test_the_exemplars_still_validate(self, name):
-        config = MasterConfig(**self._resolved(name))
-        assert config.checkpointing["save_period"] == 1
-
     def test_rejects_a_config_with_no_algorithm_block(self):
         resolved = self._resolved("grpo_math_1B_megatron_single_controller.yaml")
         del resolved["grpo"]

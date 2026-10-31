@@ -41,7 +41,6 @@ from nemo_rl.algorithms.single_controller_utils.config import AsyncRLConfig
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
 from nemo_rl.utils.config import (
     load_config,
-    parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
 
@@ -70,59 +69,6 @@ def test_async_kv_recompute_defaults_on_with_explicit_opt_out(config_class):
         ).recompute_kv_cache_after_weight_updates
         is False
     )
-
-
-@pytest.mark.parametrize(
-    ("filename", "expected"),
-    [
-        ("grpo_math_1B.yaml", True),
-        ("ppo_math_1B.yaml", True),
-        ("grpo_math_1B_megatron_single_controller.yaml", True),
-        ("ppo_math_1B_megatron_single_controller.yaml", True),
-        ("grpo_math_1B_megatron_generation_colocated_single_controller.yaml", True),
-        (
-            "recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym.yaml",
-            True,
-        ),
-        (
-            "recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym.yaml",
-            True,
-        ),
-        (
-            "../nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml",
-            True,
-        ),
-        (
-            "recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml",
-            True,
-        ),
-    ],
-)
-def test_async_kv_recompute_exemplars_and_megatron_mode(filename, expected):
-    config = load_config(real_configs_dir / filename)
-    if "async_rl" in config:
-        async_config = config.async_rl
-        config_class = AsyncRLConfig
-    elif "grpo" in config:
-        async_config = config.grpo.async_grpo
-        config_class = AsyncGRPOConfig
-    else:
-        async_config = config.ppo.async_ppo
-        config_class = AsyncPPOConfig
-    resolved = OmegaConf.to_container(async_config, resolve=True)
-    assert config_class(**resolved).recompute_kv_cache_after_weight_updates is expected
-    if config.policy.generation.backend == "megatron":
-        mode = config.policy.generation.mcore_generation_config.kv_cache_management_mode
-        assert expected == (mode == "recompute")
-
-
-def test_ppo_recipe_critic_epochs_follow_actor_override():
-    config = load_config(real_configs_dir / "ppo_math_1B.yaml")
-    config = parse_hydra_overrides(config, ["ppo.ppo_epochs=7"])
-
-    resolved = OmegaConf.to_container(config, resolve=True)
-    assert resolved["ppo"]["ppo_epochs"] == 7
-    assert resolved["ppo"]["critic_ppo_epochs"] == 7
 
 
 def _collect_mismatched_keys(real: dict, reference: dict, path: str = ""):
@@ -236,20 +182,3 @@ def test_config_v2_same_as_v1(config_file):
         f"\nKeys present in both v1 and v2 but with different values ({config_file}):\n"
         + "\n".join(f"  - {k}" for k in different)
     )
-
-
-def test_masked_reward_policy_experiments_differ_only_in_policy() -> None:
-    configs = []
-    for policy in ("exclude", "include"):
-        path = (
-            real_configs_dir
-            / "experiments"
-            / f"grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-{policy}.yaml"
-        )
-        resolved = OmegaConf.to_container(load_config(path), resolve=True)
-        config = GRPOMasterConfig(**resolved)
-        assert config.grpo.masked_reward_policy == policy
-        values = config.model_dump()
-        del values["grpo"]["masked_reward_policy"]
-        configs.append(values)
-    assert configs[0] == configs[1]

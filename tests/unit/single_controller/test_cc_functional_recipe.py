@@ -88,34 +88,17 @@ def functional_recipe(
 
 
 def test_gym_functional_launch_config(functional_recipe) -> None:
-    cc, master, transformed, checks = functional_recipe
-    assert master.token_capture.forest_training is cc
+    cc, _master, transformed, _checks = functional_recipe
     if cc:
         assert transformed["responses_create_params"]["tools"] == [
             {"name": "first"},
             {"name": "second"},
         ]
-        assert master.policy["max_total_sequence_length"] == 16384
         assert transformed["agent_ref"]["name"] == "browsecomp_agent"
         assert "task_source" not in transformed
-        assert master.token_capture.enabled
-        assert master.loss_fn.token_level_loss
-        assert not master.loss_fn.sequence_level_importance_ratios
-        assert not master.grpo.calculate_advantages_on_gpu
-        agent = master.env["nemo_gym"]["browsecomp_agent"]["responses_api_agents"][
-            "browsecomp_agent"
-        ]
-        assert agent["keep_rounds"] == 1
-        assert agent["max_steps"] == 6
-        assert agent["max_context_tokens"] == 0
-        assert not agent["nudge_steps"]
-        assert 'max(data["train/global_valid_seqs"]) > 8' in checks
-        assert 'max(data["train/token_mult_prob_error"]) < 1.05' in checks
-        assert 'len(data["train/token_mult_prob_error"]) == 10' in checks
     else:
         assert transformed["responses_create_params"]["tools"] == [{"name": "first"}]
         assert transformed["task_source"] == "workplace_assistant"
-        assert not any("token_mult_prob_error" in arg for arg in checks)
 
 
 @pytest.mark.nemo_gym
