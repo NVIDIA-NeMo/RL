@@ -25,6 +25,7 @@ from pydantic import (
     PositiveInt,
 )
 
+from nemo_rl.models.generation.dynamo.config import DynamoCfg
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
@@ -262,6 +263,13 @@ class VllmConfig(GenerationConfig):
     # be combined with quant_cfg. Its runtime environment must already be in
     # ACTOR_ENVIRONMENT_REGISTRY.
     worker_extension_cls_fqn: NotRequired[str | None]
+
+    # Serve these same workers behind Dynamo's frontend (OpenAI API and KV-aware
+    # router). Every other vLLM setting keeps its meaning. Implies
+    # vllm_cfg.async_engine, since Dynamo drives the engine's AsyncLLM.
+    dynamo: NotRequired[bool]
+    # Optional frontend and registration settings; DynamoCfg holds the defaults.
+    dynamo_cfg: NotRequired[DynamoCfg]
 
 
 def validate_vllm_quantization_config(config: VllmConfig) -> None:
