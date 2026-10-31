@@ -62,7 +62,7 @@ def main() -> None:
     check_outdated_config(resolved)
 
     master_config = MasterConfig.model_validate(resolved)
-    check_unsupported_feature(master_config, entrypoint=EntryPoint.VLM_MPO)
+    check_unsupported_feature(master_config, entrypoint=EntryPoint.MPO)
     pprint.pprint(master_config.model_dump())
 
     master_config.logger.log_dir = get_next_experiment_dir(master_config.logger.log_dir)

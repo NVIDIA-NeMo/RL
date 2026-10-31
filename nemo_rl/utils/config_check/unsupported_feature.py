@@ -16,13 +16,14 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING, Any, NoReturn, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
     from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
+    from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
     from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
     from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
     from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import (
         MasterConfig as SingleControllerMasterConfig,
     )
+    from nemo_rl.models.policy import PolicyConfig
 
 
 class EntryPoint(str, Enum):
@@ -40,13 +42,12 @@ class EntryPoint(str, Enum):
     DPO = "dpo"
     EVAL = "eval"
     GRPO = "grpo"
+    MPO = "mpo"
     PPO = "ppo"
     RM = "rm"
     SFT = "sft"
     SFT_V2 = "sft_v2"
     SINGLE_CONTROLLER = "single_controller"
-    VLM_GRPO = "vlm_grpo"
-    VLM_MPO = "vlm_mpo"
     XTOKEN_OFF_POLICY_DISTILLATION = "xtoken_off_policy_distillation"
 
 
@@ -73,9 +74,139 @@ def _raise_unsupported_feature(
     raise ValueError(" ".join(parts))
 
 
-def check_common(config: BaseModel | dict[str, Any]) -> None:
+def _check_megatron(config: PolicyConfig) -> None:
+    """Reject unsupported Megatron policy configurations."""
+    megatron_cfg = config["megatron_cfg"]
+    packing = config.get("sequence_packing")
+    generation = config.get("generation")
+
+    if not megatron_cfg.get("use_fused_linear_logprobs"):
+        return
+
+    # sequence_packing
+    if packing and packing["enabled"]:
+        _raise_unsupported_feature(
+            feature="fused linear logprobs + sequence packing",
+            suggestion="set policy.megatron_cfg.use_fused_linear_logprobs=false or policy.sequence_packing.enabled=false.",
+        )
+
+    # top_k, top_p
+    if generation is not None and (
+        (generation["top_k"] is not None and generation["top_k"] > 0)
+        or (generation["top_p"] is not None and generation["top_p"] != 1.0)
+    ):
+        _raise_unsupported_feature(
+            feature="fused linear logprobs + top-k/top-p filtering",
+            suggestion="set policy.megatron_cfg.use_fused_linear_logprobs=false or disable filtering (policy.generation.top_k=null, policy.generation.top_p=1.0).",
+        )
+
+
+def _check_policy(config: BaseModel) -> None:
+    """Reject unsupported policy configurations."""
+    policy_config = getattr(config, "policy", None)
+    if policy_config is None:
+        return
+    megatron_cfg = policy_config.get("megatron_cfg")
+
+    if megatron_cfg and megatron_cfg["enabled"]:
+        _check_megatron(policy_config)
+
+
+def _check_megatron_generation(
+    config: BaseModel, *, entrypoint: EntryPoint | None
+) -> None:
+    """Reject unsupported Megatron generation configurations."""
+    policy_config = getattr(config, "policy", None)
+    router_replay = (
+        policy_config.get("router_replay") if policy_config is not None else None
+    )
+
+    # router_replay
+    if (
+        router_replay
+        and router_replay.get("enabled")
+        and entrypoint != EntryPoint.SINGLE_CONTROLLER
+    ):
+        _raise_unsupported_feature(
+            feature="Megatron-generation router replay outside SingleController",
+            suggestion="use the SingleController token-capture path.",
+        )
+
+
+def _check_dynamo(config: BaseModel) -> None:
+    """Reject unsupported managed Dynamo configurations."""
+    grpo_config = getattr(config, "grpo", None)
+    if grpo_config is None:
+        return
+    async_grpo = grpo_config.async_grpo
+    in_flight_weight_updates = (
+        async_grpo is not None and async_grpo.in_flight_weight_updates
+    )
+
+    # in_flight_weight_updates
+    if in_flight_weight_updates:
+        _raise_unsupported_feature(
+            feature="grpo.async_grpo.in_flight_weight_updates",
+            condition="using managed Dynamo",
+            suggestion="set grpo.async_grpo.in_flight_weight_updates=false.",
+        )
+
+
+def _check_generation(config: BaseModel, *, entrypoint: EntryPoint | None) -> None:
+    """Reject unsupported generation configurations."""
+    policy_config = getattr(config, "policy", None)
+    generation = getattr(config, "generation", None)
+    env_config = getattr(config, "env", None)
+    if policy_config is not None:
+        generation = policy_config.get("generation")
+    if generation is None:
+        return
+    backend = generation["backend"]
+    enable_nemo_gym = bool(env_config and env_config.get("should_use_nemo_gym"))
+    refit_transport = generation.get("refit_transport")
+    val_sampling_overridden = (
+        generation["val_temperature"] != generation["temperature"]
+        or generation["val_top_p"] != generation["top_p"]
+        or generation["val_top_k"] != generation["top_k"]
+    )
+
+    if backend == "megatron":
+        _check_megatron_generation(config, entrypoint=entrypoint)
+    elif backend == "dynamo":
+        _check_dynamo(config)
+
+    # validation sampling
+    if val_sampling_overridden:
+        if backend != "vllm" or not enable_nemo_gym:
+            _raise_unsupported_feature(
+                feature="validation sampling overrides without vLLM + NeMo-Gym",
+                suggestion="match validation sampling parameters to training or use vLLM NeMo-Gym rollouts.",
+            )
+
+        # val_top_k
+        if generation["val_top_k"]:
+            _raise_unsupported_feature(
+                feature="generation.val_top_k overrides",
+                condition="using NeMo-Gym",
+                suggestion="leave policy.generation.val_top_k=null.",
+            )
+
+    # refit_transport
+    if refit_transport is not None and not (
+        backend == "vllm"
+        or (backend == "megatron" and refit_transport in ("mcore", "nccl_reshard"))
+    ):
+        _raise_unsupported_feature(
+            feature=f"refit_transport={refit_transport!r}",
+            condition=f"using generation backend={backend!r}",
+            suggestion="set policy.generation.refit_transport=null, or use vLLM or Megatron (mcore/nccl_reshard).",
+        )
+
+
+def check_common(config: BaseModel, *, entrypoint: EntryPoint | None = None) -> None:
     """Reject unsupported configurations shared by all entrypoints."""
-    pass
+    _check_policy(config)
+    _check_generation(config, entrypoint=entrypoint)
 
 
 def _check_algo_distillation(config: DistillationMasterConfig) -> None:
@@ -147,9 +278,56 @@ def _check_algo_eval(config: BaseModel) -> None:
     pass
 
 
-def _check_algo_grpo(config: BaseModel) -> None:
+def _check_algo_grpo(config: GRPOMasterConfig) -> None:
     """Reject unsupported configurations for grpo."""
-    pass
+    grpo_config = config.grpo
+
+    # async grpo
+    if grpo_config.async_grpo.enabled:
+        unsupported = [
+            name
+            for name, enabled in (
+                ("grpo.use_dynamic_sampling", grpo_config.use_dynamic_sampling),
+                ("grpo.reward_scaling", grpo_config.reward_scaling.enabled),
+                ("grpo.reward_shaping", grpo_config.reward_shaping.enabled),
+                (
+                    "data.use_multiple_dataloader",
+                    config.data["use_multiple_dataloader"],
+                ),
+            )
+            if enabled
+        ]
+        if unsupported:
+            _raise_unsupported_feature(
+                feature=", ".join(unsupported),
+                condition="using async GRPO",
+                suggestion="disable these options.",
+            )
+
+
+def _check_algo_mpo(config: MPOMasterConfig) -> None:
+    """Reject unsupported configurations for mpo."""
+    policy_config = config.policy
+    dynamic_batching = policy_config["dynamic_batching"]
+    packing = policy_config.get("sequence_packing")
+    megatron_cfg = policy_config.get("megatron_cfg")
+
+    # dynamic_batching
+    if dynamic_batching["enabled"]:
+        _raise_unsupported_feature(
+            feature="dynamic batching",
+            condition="using MPO",
+            suggestion="set policy.dynamic_batching.enabled=false.",
+        )
+
+    if packing and packing["enabled"]:
+        # sequence_packing
+        if not megatron_cfg or not megatron_cfg["enabled"]:
+            _raise_unsupported_feature(
+                feature="sequence packing without Megatron",
+                condition="using MPO",
+                suggestion="use the Megatron backend or disable sequence packing.",
+            )
 
 
 def _check_algo_ppo(config: PPOMasterConfig) -> None:
@@ -329,44 +507,6 @@ def _check_algo_single_controller(config: SingleControllerMasterConfig) -> None:
         )
 
 
-def _check_algo_vlm_grpo(config: BaseModel) -> None:
-    """Reject unsupported configurations for vlm_grpo."""
-    pass
-
-
-def _check_algo_vlm_mpo(config: MPOMasterConfig) -> None:
-    """Reject unsupported configurations for vlm_mpo."""
-    policy_config = config.policy
-    dynamic_batching = policy_config["dynamic_batching"]
-    packing = policy_config.get("sequence_packing")
-    megatron_cfg = policy_config.get("megatron_cfg")
-
-    # dynamic_batching
-    if dynamic_batching["enabled"]:
-        _raise_unsupported_feature(
-            feature="dynamic batching",
-            condition="using MPO",
-            suggestion="set policy.dynamic_batching.enabled=false.",
-        )
-
-    if packing and packing["enabled"]:
-        # sequence_packing
-        if not megatron_cfg or not megatron_cfg["enabled"]:
-            _raise_unsupported_feature(
-                feature="sequence packing without Megatron",
-                condition="using MPO",
-                suggestion="use the Megatron backend or disable sequence packing.",
-            )
-
-        # use_fused_linear_logprobs
-        if megatron_cfg.get("use_fused_linear_logprobs"):
-            _raise_unsupported_feature(
-                feature="fused linear logprobs + sequence packing",
-                condition="using MPO",
-                suggestion="set policy.megatron_cfg.use_fused_linear_logprobs=false.",
-            )
-
-
 def _check_algo_xtoken_off_policy_distillation(config: BaseModel) -> None:
     """Reject unsupported configurations for xtoken_off_policy_distillation."""
     pass
@@ -386,7 +526,9 @@ def check_algo(config: BaseModel, *, entrypoint: EntryPoint) -> None:
     elif entrypoint == EntryPoint.EVAL:
         _check_algo_eval(config)
     elif entrypoint == EntryPoint.GRPO:
-        _check_algo_grpo(config)
+        _check_algo_grpo(cast("GRPOMasterConfig", config))
+    elif entrypoint == EntryPoint.MPO:
+        _check_algo_mpo(cast("MPOMasterConfig", config))
     elif entrypoint == EntryPoint.PPO:
         _check_algo_ppo(cast("PPOMasterConfig", config))
     elif entrypoint == EntryPoint.RM:
@@ -397,16 +539,12 @@ def check_algo(config: BaseModel, *, entrypoint: EntryPoint) -> None:
         _check_algo_sft_v2(cast("SFTV2MasterConfig", config))
     elif entrypoint == EntryPoint.SINGLE_CONTROLLER:
         _check_algo_single_controller(cast("SingleControllerMasterConfig", config))
-    elif entrypoint == EntryPoint.VLM_GRPO:
-        _check_algo_vlm_grpo(config)
-    elif entrypoint == EntryPoint.VLM_MPO:
-        _check_algo_vlm_mpo(cast("MPOMasterConfig", config))
     elif entrypoint == EntryPoint.XTOKEN_OFF_POLICY_DISTILLATION:
         _check_algo_xtoken_off_policy_distillation(config)
 
 
 def check_unsupported_feature(
-    config: BaseModel | dict[str, Any], *, entrypoint: EntryPoint | None = None
+    config: BaseModel, *, entrypoint: EntryPoint | None = None
 ) -> None:
     """Reject unsupported features and configuration combinations at startup.
 
@@ -415,9 +553,9 @@ def check_unsupported_feature(
     should name the unsupported configuration and explain how to adjust it.
 
     Args:
-        config: The validated MasterConfig, or a resolved dict for tools without a schema.
+        config: The validated MasterConfig.
         entrypoint: The execution entrypoint, or None for entrypoint-independent checks.
     """
-    check_common(config)
+    check_common(config, entrypoint=entrypoint)
     if entrypoint is not None:
-        check_algo(cast(BaseModel, config), entrypoint=entrypoint)
+        check_algo(config, entrypoint=entrypoint)

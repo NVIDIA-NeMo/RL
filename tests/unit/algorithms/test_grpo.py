@@ -4233,32 +4233,6 @@ def test_setup_automodel_fp8_kv_cache_guard(
     policy_init.assert_not_called()
 
 
-def test_setup_rejects_megatron_router_replay_before_side_effects(
-    mock_grpo_components,
-):
-    from nemo_rl.algorithms.grpo import setup
-
-    master_config = mock_grpo_components["master_config"]
-    master_config.policy["router_replay"] = {"enabled": True}
-    master_config.policy["generation"]["backend"] = "megatron"
-
-    with (
-        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
-        pytest.raises(
-            NotImplementedError,
-            match="only supported on the SingleController token-capture path",
-        ),
-    ):
-        setup(
-            master_config,
-            tokenizer=MagicMock(),
-            dataset=MagicMock(),
-            val_dataset=None,
-        )
-
-    mock_logger.assert_not_called()
-
-
 def test_setup_restores_adaptive_ppo_clip_state_from_checkpoint(
     mock_grpo_components, monkeypatch
 ):
@@ -4414,19 +4388,6 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
             "resources": {"gpus_per_node": None, "num_nodes": None},
         },
     }
-
-    master_config.grpo.async_grpo.in_flight_weight_updates = True
-    with (
-        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
-        pytest.raises(ValueError, match="in_flight_weight_updates must be false"),
-    ):
-        setup(
-            master_config,
-            tokenizer=MagicMock(),
-            dataset=MagicMock(),
-            val_dataset=None,
-        )
-    mock_logger.assert_not_called()
 
     master_config.grpo.async_grpo.in_flight_weight_updates = False
 
@@ -7865,20 +7826,6 @@ class TestValidateFunction:
         assert sampling_params.top_k is None
         assert val_metrics["accuracy"] == pytest.approx(0.25)
         assert val_metrics["pass_k"] == pytest.approx(0.5)
-
-    def test_setup_rejects_val_sampling_outside_gym_vllm_path(
-        self, mock_grpo_components
-    ):
-        master_config = mock_grpo_components["master_config"]
-        # Non-gym rollouts (env has no nemo_gym) with validation sampling
-        # different from training must be rejected at setup time.
-        master_config.policy["generation"].update(
-            {"backend": "megatron", "val_temperature": 0.1}
-        )
-        master_config.env = {}
-
-        with pytest.raises(AssertionError, match="only supported for vLLM NeMo-Gym"):
-            setup(master_config, MagicMock(), MagicMock(), None)
 
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""

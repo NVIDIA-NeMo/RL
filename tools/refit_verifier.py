@@ -76,7 +76,7 @@ import torch
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
-from nemo_rl.algorithms.grpo import refit_policy_generation
+from nemo_rl.algorithms.grpo import MasterConfig, refit_policy_generation
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
@@ -727,7 +727,7 @@ def main_sglang():
         config = parse_hydra_overrides(config, overrides)
     master_config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(master_config)
-    check_unsupported_feature(master_config)
+    check_unsupported_feature(MasterConfig(**master_config))
 
     init_ray()
 

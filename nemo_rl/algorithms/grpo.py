@@ -716,27 +716,11 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
     )
-    if (
-        router_replay_enabled(policy_config)
-        and generation_config["backend"] == "megatron"
-    ):
-        raise NotImplementedError(
-            "Megatron-generation router replay is only supported on the "
-            "SingleController token-capture path"
-        )
     configure_lora_refit(policy_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
     elif generation_config["backend"] == "dynamo":
-        # Validate the complete managed-Dynamo boundary before allocating Ray
-        # placement groups or starting any external services.
-        if grpo_config.async_grpo.in_flight_weight_updates:
-            raise ValueError(
-                "grpo.async_grpo.in_flight_weight_updates must be false when "
-                "policy.generation.backend='dynamo'; managed Dynamo drains "
-                "rollouts before layerwise weight refit"
-            )
         generation_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
             policy_config.get("hf_config_overrides") or {}
         )
@@ -770,27 +754,6 @@ def setup(
     _validate_seq_logprob_error_in_loss(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
 
-    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
-    # path; everywhere else validation must sample exactly like training.
-    val_sampling_overridden = (
-        generation_config["val_temperature"] != generation_config["temperature"]
-        or generation_config["val_top_p"] != generation_config["top_p"]
-        or generation_config["val_top_k"] != generation_config["top_k"]
-    )
-    if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
-            master_config
-        ), (
-            "generation.val_temperature/val_top_p/val_top_k differing from the "
-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
-        )
-        # The NeMo-Gym path only stamps temperature/top_p onto requests and
-        # rejects any top_k at rollout time, so a val_top_k override can never
-        # be honored — fail here instead of at the first validation step.
-        assert not generation_config["val_top_k"], (
-            "generation.val_top_k is not supported: the NeMo-Gym rollout path "
-            "only honors val_temperature/val_top_p. Leave val_top_k null."
-        )
     assert grpo_config.val_num_generations_per_prompt >= 1, (
         "grpo.val_num_generations_per_prompt must be >= 1"
     )
@@ -951,32 +914,6 @@ def setup(
     use_fused_linear_logprobs = bool(
         megatron_cfg.get("enabled") and megatron_cfg.get("use_fused_linear_logprobs")
     )
-    if use_fused_linear_logprobs:
-        # Sequence packing is not yet validated with the fused path: the fused
-        # forward rolls labels over the whole (packed) sequence and would mix
-        # tokens across packed-sequence boundaries.
-        assert not policy_config["sequence_packing"]["enabled"], (
-            "Linear CE fusion loss is not supported with sequence packing for GRPO. "
-            "The fused path has not been validated with cu_seqlens-based logprob "
-            "aggregation. Set policy.megatron_cfg.use_fused_linear_logprobs=false "
-            "or policy.sequence_packing.enabled=false."
-        )
-        # The fused forward gathers the logprob of the realized token from the raw
-        # (unfiltered) logits, so top-k/top-p training-time filtering cannot be
-        # applied. This also keeps prev/reference logprobs (computed via the fused
-        # get_logprobs path) consistent with the actor logprobs.
-        assert not need_top_k_or_top_p_filtering(
-            TrainingSamplingParams(
-                top_k=generation_config["top_k"],
-                top_p=generation_config["top_p"],
-            )
-        ), (
-            "Linear CE fusion loss is not supported with top-k/top-p training-time "
-            "filtering for GRPO. The fused path computes logprobs from unfiltered "
-            "logits. Set policy.megatron_cfg.use_fused_linear_logprobs=false, or "
-            "disable filtering (policy.generation.top_k=null, "
-            "policy.generation.top_p=1.0)."
-        )
 
     loss_fn = ClippedPGLossFn(
         loss_config,
@@ -1969,18 +1906,6 @@ def setup(
     )
     if nccl_reshard_refit_enabled:
         check_nccl_reshard_refit_support(master_config)
-
-    refit_transport = generation_config.get("refit_transport")
-    if refit_transport is not None and not (
-        backend == "vllm"
-        or (backend == "megatron" and refit_transport in ("mcore", "nccl_reshard"))
-    ):
-        raise NotImplementedError(
-            f"refit_transport={refit_transport!r} is not supported for "
-            f"policy.generation.backend={backend!r}. "
-            "Set policy.generation.refit_transport=null. Megatron generation "
-            "supports refit_transport='mcore' or 'nccl_reshard'."
-        )
 
     if backend == "megatron":
         if policy_generation.weight_synchronizer is None:
