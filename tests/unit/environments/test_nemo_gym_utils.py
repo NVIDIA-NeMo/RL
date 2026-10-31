@@ -29,6 +29,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 from omegaconf import DictConfig
+from ray.exceptions import GetTimeoutError, RayTaskError
 
 from nemo_rl.environments import nemo_gym as nemo_gym_mod
 from nemo_rl.environments.nemo_gym import (
@@ -931,21 +932,21 @@ class _FakeGymCluster:
         kind, index = reference
         if kind == "spinup":
             if index in self.wedged_spinups and timeout is not None:
-                raise TimeoutError("startup remained wedged")
+                raise GetTimeoutError("startup remained wedged")
             if (
                 index in self.spinup_timeouts
                 and index not in self.timed_out_spinups
                 and timeout is not None
             ):
                 self.timed_out_spinups.add(index)
-                raise TimeoutError("startup deadline")
+                raise GetTimeoutError("startup deadline")
             failure = self.spinup_failures.get(index)
             if failure is not None:
                 raise failure
             return None
         if kind == "tokenizer":
             if index in self.tokenizer_timeouts and timeout is not None:
-                raise TimeoutError("startup budget expired")
+                raise GetTimeoutError("startup budget expired")
             return None
         return self.entries_by_index.get(index, {})
 
@@ -1277,7 +1278,10 @@ def test_timed_out_shard_startup_is_drained_before_teardown(detected_uv_dirs):
     cluster = _FakeGymCluster(spinup_timeouts={0})
 
     with _patched_cluster(cluster):
-        with pytest.raises(nemo_gym_mod.ShardSetupError, match="failed to start"):
+        with pytest.raises(
+            nemo_gym_mod.ShardSetupError,
+            match="failed to start within the 1800.0s startup budget",
+        ):
             nemo_gym_mod.build_nemo_gym_actors(
                 _shard_env_configs(),
                 base_urls=["http://vllm-0"],
@@ -1305,7 +1309,10 @@ def test_wedged_shard_startup_cannot_block_forced_teardown(detected_uv_dirs):
     cluster = _FakeGymCluster(wedged_spinups={0})
 
     with _patched_cluster(cluster):
-        with pytest.raises(nemo_gym_mod.ShardSetupError, match="failed to start"):
+        with pytest.raises(
+            nemo_gym_mod.ShardSetupError,
+            match="failed to start within the 1800.0s startup budget",
+        ):
             nemo_gym_mod.build_nemo_gym_actors(
                 _shard_env_configs(),
                 base_urls=["http://vllm-0"],
@@ -1335,15 +1342,230 @@ def test_tokenizer_timeout_reports_exhausted_shared_startup_budget(
             match="used the whole 1.0s startup budget before the tokenizer",
         ):
             nemo_gym_mod.build_nemo_gym_actors(
+                _shard_env_configs(spinup_timeout=1.0),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+                tokenizer=_TOKENIZER,
+                enable_router_replay=False,
+                use_fastokens=False,
+            )
+
+    cluster.shutdown_environments.assert_called_once()
+
+
+def _spinup_waits(cluster):
+    return [
+        timeout
+        for reference, timeout in cluster.ray_get_calls
+        if isinstance(reference, tuple) and reference[0] == "spinup"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [(None, 1800.0), (7200, 7200.0)],
+    ids=["default", "configured"],
+)
+def test_sharded_spinup_uses_the_configured_spinup_timeout(
+    detected_uv_dirs, monkeypatch, configured, expected
+):
+    """env.nemo_gym.spinup_timeout sets the shard startup budget.
+
+    It is a NeMo-RL setting, so it must not reach the config Gym receives.
+    """
+    cluster = _FakeGymCluster()
+    monkeypatch.setattr(nemo_gym_mod, "monotonic", lambda: 0.0)
+    overrides = {} if configured is None else {"spinup_timeout": configured}
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _shard_env_configs(**overrides),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+
+    assert _spinup_waits(cluster) == [expected] * 3
+    for config in cluster.actor_configs:
+        assert "spinup_timeout" not in config["initial_global_config_dict"]
+
+
+@pytest.mark.parametrize("entrypoint", ["actors", "config"])
+def test_spinup_timeout_without_shards_is_rejected(detected_uv_dirs, entrypoint):
+    """Like placement_strategy, it only means something for a sharded job."""
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        with pytest.raises(
+            nemo_gym_mod.ShardConfigError,
+            match=r"sharding keys \['spinup_timeout'\] but no 'shards' block",
+        ):
+            if entrypoint == "actors":
+                nemo_gym_mod.build_nemo_gym_actors(
+                    _env_configs(spinup_timeout=7200),
+                    base_urls=["http://vllm-0"],
+                    model_name="test-model",
+                    tokenizer=_TOKENIZER,
+                    enable_router_replay=False,
+                    use_fastokens=False,
+                )
+            else:
+                build_nemo_gym_config(
+                    _env_configs(spinup_timeout=7200),
+                    base_urls=[],
+                    model_name="test-model",
+                    enable_router_replay=False,
+                    use_fastokens=False,
+                )
+
+    assert cluster.actors == []
+
+
+def _readiness(timeout_seconds):
+    return {
+        "services": [
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        "timeout_seconds": timeout_seconds,
+        "poll_interval_seconds": 5,
+        "request_timeout_seconds": 10,
+    }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "shard_name", "budget"),
+    [
+        ({"external_service_readiness": _readiness(3600)}, "judged", 1800.0),
+        (
+            {"spinup_timeout": 3000, "external_service_readiness": _readiness(3600)},
+            "judged",
+            3000.0,
+        ),
+        (
+            {
+                "spinup_timeout": 3000,
+                "external_service_readiness": _readiness(600),
+                "shards": [
+                    {"name": "judged", "config_paths": ["judge.yaml"]},
+                    {
+                        "name": "tools",
+                        "config_paths": ["tools.yaml"],
+                        "overrides": {"external_service_readiness": _readiness(3600)},
+                    },
+                ],
+            },
+            "tools",
+            3000.0,
+        ),
+    ],
+    ids=["default-budget", "configured-budget", "shard-override"],
+)
+def test_a_spinup_timeout_shorter_than_external_readiness_fails_at_setup(
+    detected_uv_dirs, overrides, shard_name, budget
+):
+    """Otherwise the shards time out while the readiness gate would still wait."""
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        with pytest.raises(nemo_gym_mod.ShardConfigError) as excinfo:
+            nemo_gym_mod.build_nemo_gym_actors(
+                _shard_env_configs(**overrides),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+                tokenizer=_TOKENIZER,
+                enable_router_replay=False,
+                use_fastokens=False,
+            )
+
+    message = str(excinfo.value)
+    assert f"env.nemo_gym.spinup_timeout is {budget}s" in message
+    assert f"shard '{shard_name}'" in message
+    assert "3600.0s" in message
+    assert cluster.events == []
+    assert cluster.actors == []
+
+
+def test_a_spinup_timeout_that_covers_external_readiness_starts_the_shards(
+    detected_uv_dirs,
+):
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _shard_env_configs(
+                spinup_timeout=3600, external_service_readiness=_readiness(3600)
+            ),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+
+    assert len(cluster.actors) == 3
+    for config in cluster.actor_configs:
+        assert config["external_service_readiness"].timeout_seconds == 3600
+
+
+def test_a_shard_out_of_startup_budget_points_at_spinup_timeout(detected_uv_dirs):
+    """A ray.get timeout on _spinup is the budget running out, not a bad config."""
+    cluster = _FakeGymCluster(spinup_timeouts={1})
+
+    with _patched_cluster(cluster):
+        with pytest.raises(
+            nemo_gym_mod.ShardSetupError,
+            match="shard 'tools' \\(replica 0\\) failed to start within the 900.0s",
+        ) as excinfo:
+            nemo_gym_mod.build_nemo_gym_actors(
+                _shard_env_configs(spinup_timeout=900),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+                tokenizer=_TOKENIZER,
+                enable_router_replay=False,
+                use_fastokens=False,
+            )
+
+    assert "Raise env.nemo_gym.spinup_timeout" in str(excinfo.value)
+    assert "config_paths" not in str(excinfo.value)
+    cluster.shutdown_environments.assert_called_once()
+
+
+def test_a_timeout_inside_spinup_is_reported_as_a_timeout(detected_uv_dirs):
+    """Not the startup budget, and not the config fault the generic message suggests.
+
+    A TimeoutError raised inside the actor, such as the external_service_readiness
+    gate giving up, reaches the driver as a RayTaskError that also subclasses
+    TimeoutError.
+    """
+    readiness_expired = RayTaskError(
+        "_spinup",
+        "Traceback (most recent call last): ...",
+        TimeoutError("Timed out waiting for external NeMo-Gym services"),
+    ).as_instanceof_cause()
+    cluster = _FakeGymCluster(spinup_failures={1: readiness_expired})
+
+    with _patched_cluster(cluster):
+        with pytest.raises(
+            nemo_gym_mod.ShardSetupError,
+            match="shard 'tools' \\(replica 0\\) timed out while starting",
+        ) as excinfo:
+            nemo_gym_mod.build_nemo_gym_actors(
                 _shard_env_configs(),
                 base_urls=["http://vllm-0"],
                 model_name="test-model",
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
-                spinup_timeout=1.0,
             )
 
+    assert "startup budget" not in str(excinfo.value)
+    assert "config_paths" not in str(excinfo.value)
     cluster.shutdown_environments.assert_called_once()
 
 
