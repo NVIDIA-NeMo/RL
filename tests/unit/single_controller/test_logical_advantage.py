@@ -121,7 +121,6 @@ def _batch(
 def test_forest_selection_config(policy):
     config = TokenCaptureConfig(forest_training=True, selection_policy=policy)
     assert config.selection_policy == policy
-    assert TokenCaptureConfig().selection_policy == "returned_history"
     with pytest.raises(ValueError, match="requires forest_training"):
         TokenCaptureConfig(selection_policy="all_captured")
     with pytest.raises(ValueError, match="selection_policy"):

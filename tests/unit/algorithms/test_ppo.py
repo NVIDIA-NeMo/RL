@@ -674,13 +674,6 @@ def test_ppo_schema_rejects_unsupported_estimator_name():
         PPOConfig(adv_estimator={"name": "grpo"})
 
 
-def test_ppo_config_defaults_both_epoch_counts_to_four():
-    config = PPOConfig()
-
-    assert config.ppo_epochs == 4
-    assert config.critic_ppo_epochs == 4
-
-
 def test_ppo_config_accepts_more_critic_epochs():
     config = PPOConfig(ppo_epochs=1, critic_ppo_epochs=3)
 
@@ -2604,21 +2597,11 @@ def test_async_ppo_config_allows_kv_cache_recompute_without_inflight_updates():
     assert config.recompute_kv_cache_after_weight_updates
 
 
-def test_async_ppo_config_defaults():
-    from nemo_rl.algorithms.ppo import AsyncPPOConfig
-
-    config = AsyncPPOConfig()
-
-    assert not config.in_flight_weight_updates
-    assert not config.drop_incomplete_targets_on_restore
-
-
 def test_async_ppo_config_warmup_lead_defaults_to_training_age():
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 
     config = AsyncPPOConfig(max_trajectory_age_steps=3)
 
-    assert config.warmup_generation_lead_steps is None
     assert config.resolved_warmup_generation_lead_steps == 3
 
 

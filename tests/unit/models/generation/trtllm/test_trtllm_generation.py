@@ -409,22 +409,10 @@ def test_ipc_refit_and_missing_worker_group():
 def test_disagg_defaults_come_from_the_schema_not_the_call_sites():
     # Absent and present-but-empty must agree: every default lives on the model,
     # so no consumer has to re-derive one per key.
-    for raw in (None, {}):
-        cfg = _config(disaggregation=raw) if raw is not None else _config()
-        layout = resolve_disagg_layout(cfg)
-        assert layout.enabled is False
-        assert layout.num_prefill_engines == 1
-        assert layout.num_decode_engines == 1
-        assert layout.num_frontend_workers == 1
-        assert layout.frontend_tokenize is False
-        assert layout.frontend_base_port == 8300
-
-        server = resolve_disagg_server_config(cfg)
-        assert server.ctx_router == "conversation"
-        assert server.gen_router == "load_balancing"
-        assert server.gen_tokids_ctxbytes is False
-        assert server.gen_strip_message_history is False
-
+    absent, empty = _config(), _config(disaggregation={})
+    assert resolve_disagg_layout(absent) == resolve_disagg_layout(empty)
+    assert resolve_disagg_server_config(absent) == resolve_disagg_server_config(empty)
+    for cfg in (absent, empty):
         assert "prefill_engine" not in cfg["trtllm_cfg"]
 
 

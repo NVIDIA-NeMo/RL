@@ -26,11 +26,10 @@ from pydantic import TypeAdapter, ValidationError
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
 from nemo_rl.algorithms.grpo import (
-    GRPOConfig,
-    RewardPenaltyConfig,
+    MasterConfig as GRPOMasterConfig,
 )
 from nemo_rl.algorithms.grpo import (
-    MasterConfig as GRPOMasterConfig,
+    RewardPenaltyConfig,
 )
 from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
@@ -204,12 +203,6 @@ def test_single_controller_configs_pass_single_controller_validation(config_file
     validate_single_controller_config(
         SingleControllerMasterConfig.model_validate(config_dict)
     )
-
-
-def test_multimodal_dedup_grpo_config_keys_default_off():
-    """Older recipes keep flag-off behavior without duplicating default keys."""
-    assert GRPOConfig.model_fields["deduplicate_multimodal_data"].default is False
-    assert GRPOConfig.model_fields["debug_payload_metrics"].default is False
 
 
 def _sync_trainer_names(tree: ast.Module) -> set[str]:

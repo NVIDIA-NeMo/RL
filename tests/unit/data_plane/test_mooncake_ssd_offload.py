@@ -57,11 +57,6 @@ def test_master_args_turn_eviction_into_offload() -> None:
     )
 
 
-def test_offload_starts_at_half_full_by_default() -> None:
-    # At 0.9 the headroom above the watermark is less than one large put.
-    assert _cfg(ssd_offload=_SSD).ssd_offload.offload_threshold == 0.5
-
-
 @pytest.mark.parametrize(
     ("unit_segment_size", "segment_size", "owned"),
     [

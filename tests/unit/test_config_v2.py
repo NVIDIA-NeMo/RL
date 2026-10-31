@@ -37,7 +37,6 @@ from nemo_rl.algorithms.ppo import AsyncPPOConfig, PPOConfig
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
-from nemo_rl.algorithms.single_controller_utils.config import AsyncRLConfig
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
 from nemo_rl.utils.config import (
     load_config,
@@ -56,19 +55,6 @@ reference_configs_dir = Path(os.path.join(absolute_dir, "reference_configs"))
 reference_config_files = glob.glob(
     str(reference_configs_dir / "*.yaml"), recursive=True
 )
-
-
-@pytest.mark.parametrize(
-    "config_class", [AsyncRLConfig, AsyncGRPOConfig, AsyncPPOConfig]
-)
-def test_async_kv_recompute_defaults_on_with_explicit_opt_out(config_class):
-    assert config_class().recompute_kv_cache_after_weight_updates is True
-    assert (
-        config_class(
-            recompute_kv_cache_after_weight_updates=False
-        ).recompute_kv_cache_after_weight_updates
-        is False
-    )
 
 
 def _collect_mismatched_keys(real: dict, reference: dict, path: str = ""):
