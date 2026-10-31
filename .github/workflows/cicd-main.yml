@@ -400,7 +400,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
-          version: "0.11.18"
+          version: "0.11.28"
           enable-cache: true
           prune-cache: false
       # Faster than uv python install since it caches python alongside runner
@@ -589,6 +589,8 @@ jobs:
         BUILD_DYNAMO=1
         TRTLLM_BUILD_JOBS=24
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
+    secrets:
+      APPTAINER_GITHUB_TOKEN: ${{ secrets.APPTAINER_GITHUB_TOKEN }}
 
   build-container-gb200:
     name: Build GB200/GCP container
@@ -637,6 +639,8 @@ jobs:
         MAX_JOBS=4
         TRTLLM_BUILD_JOBS=8
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
+    secrets:
+      APPTAINER_GITHUB_TOKEN: ${{ secrets.APPTAINER_GITHUB_TOKEN }}
 
   cicd-doc-tests:
     strategy:

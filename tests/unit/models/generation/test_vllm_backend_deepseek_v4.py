@@ -34,8 +34,12 @@ def test_collective_reload_api_guard(monkeypatch, model_type, fp8_enabled):
     model = torch.nn.Module()
     model.config = SimpleNamespace(model_type=model_type)
     ext.model_runner = SimpleNamespace(
-        model=model, vllm_config=object(), reload_weights=Mock()
+        model=model,
+        get_model=lambda: model,
+        vllm_config=object(),
+        reload_weights=Mock(),
     )
+    ext.model_config = object()
     ext.state_dict_info = {}
     ext.model_update_group = object()
     ext._prepare_reload_weight_iterator = lambda weights: weights

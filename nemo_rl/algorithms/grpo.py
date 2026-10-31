@@ -356,7 +356,8 @@ _REWARD_PENALTY_FLAGS = (
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
-    max_num_epochs: int = 1
+    # None trains until max_num_steps, cycling the dataset as needed.
+    max_num_epochs: int | None = 1
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
     normalize_rewards: bool = True
@@ -455,6 +456,9 @@ class GRPOSaveState:
     # adaptive-ppo-clip's upper-bound offset k. None when adaptive-ppo-clip is
     # off and on checkpoints that predate it.
     cur_adaptive_ppo_clip_k: Optional[float] = None
+    # SingleController NeMo-Gym only: next per-attempt task ID. Zero keeps
+    # checkpoints written before the counter was introduced loadable.
+    next_nemo_gym_task_index: int = 0
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
@@ -1437,10 +1441,11 @@ def setup(
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
-            grpo_config.max_num_steps,
-            grpo_config.max_num_epochs * train_sample_count,
-        )
+        total_train_iters = grpo_config.max_num_steps
+        if grpo_config.max_num_epochs is not None:
+            total_train_iters = min(
+                total_train_iters, grpo_config.max_num_epochs * train_sample_count
+            )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Megatron generation expresses recompute-after-refit engine-side via
@@ -2406,6 +2411,7 @@ def extract_initial_prompt_messages(
 
 def add_grpo_token_loss_masks_and_generation_logprobs(
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
+    per_token_multimodal_fields: tuple[str, ...] = (),
 ) -> None:
     """Add GRPO loss masks and ensure generation logprobs exist in message logs.
 
@@ -2426,6 +2432,8 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
         message_logs: Batch of tokenized message logs. Each message must contain a
             ``role`` and ``token_ids`` field. Messages that already contain
             ``generation_logprobs`` are treated as rollout-generated messages.
+        per_token_multimodal_fields: A multimodal run's fixed per-token schema;
+            messages missing one of these fields get zeros (text).
     """
     backfill_missing_routed_experts(message_logs)
 
@@ -2440,7 +2448,8 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     # Only add masks if some message has non-empty media. Overlength messages keep
     # empty media, which is not stored; storing their mask anyway would make
     # reading them together with text-only messages fail on the missing mask.
-    has_media = any(
+    # A multimodal run's schema writes it on every message instead.
+    has_media = "media_token_validity_mask" in per_token_multimodal_fields or any(
         _owns_media(message) for message_log in message_logs for message in message_log
     )
     for message_log in message_logs:
@@ -2470,6 +2479,9 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
                     fill_value=_owns_media(message),
                     dtype=torch.bool,
                 )
+            for key in per_token_multimodal_fields:
+                if key not in message:
+                    message[key] = torch.zeros_like(token_ids)
 
 
 def _resolve_message_level_advantage_penalties(
@@ -3290,6 +3302,7 @@ def compute_and_apply_seq_logprob_error_masking(
     seq_logprob_error_threshold: Optional[float],
     *,
     filtering_on: bool = False,
+    row_owner: Optional[torch.Tensor] = None,
 ) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
@@ -3306,6 +3319,9 @@ def compute_and_apply_seq_logprob_error_masking(
                                     exceeding this threshold. None disables threshold
                                     filtering, but token/sample validity still applies.
         filtering_on: Whether policy top-k/top-p can produce unsupported -inf tokens.
+        row_owner: Optional logical owner index per row (-1 for padding). When
+            supplied, threshold the token-weighted error across each owner's
+            rows and mask them together. Diagnostics remain per physical row.
 
     Returns:
         Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
@@ -3361,9 +3377,29 @@ def compute_and_apply_seq_logprob_error_masking(
 
         original_sample_mask = sample_mask.clone()
 
-        # Create mask for sequences below threshold
+        threshold_errors = seq_mult_prob_error
+        if row_owner is not None:
+            if row_owner.shape != sample_mask.shape or row_owner.dtype != torch.long:
+                raise ValueError("row_owner must be an int64 index per sample")
+            # Only generated tokens owned by this rollout contribute. Use the
+            # narrowed diagnostic mask above so unsupported tokens cannot dilute
+            # the pooled error when top-k/top-p filtering is enabled.
+            counts = (token_mask * sample_mask.unsqueeze(-1)).sum(dim=-1)
+            counts = torch.where(row_owner >= 0, counts, 0.0)
+            owners, inverse = torch.unique(row_owner, return_inverse=True)
+            error_sums = counts.new_zeros(owners.numel()).scatter_add_(
+                0,
+                inverse,
+                torch.where(counts > 0, seq_mult_prob_error * counts, 0.0),
+            )
+            token_counts = counts.new_zeros(owners.numel()).scatter_add_(
+                0, inverse, counts
+            )
+            threshold_errors = (error_sums / token_counts.clamp_min(1))[inverse]
+
+        # Create mask for sequences whose owner (or row) passes the threshold.
         seq_error_mask = (
-            seq_mult_prob_error <= seq_logprob_error_threshold
+            threshold_errors <= seq_logprob_error_threshold
         ).float() * original_sample_mask
 
         diff_mask = original_sample_mask - seq_error_mask
@@ -3393,7 +3429,7 @@ def compute_and_apply_seq_logprob_error_masking(
         train_data["sample_mask"] = seq_error_mask
 
         print(
-            f"  Masked {num_masked_seqs} sequences with mult_prob_error > {seq_logprob_error_threshold}",
+            f"  Masked {num_masked_seqs} sequences by logprob error (threshold={seq_logprob_error_threshold})",
             flush=True,
         )
         if num_masked_seqs > 0:
@@ -3575,7 +3611,9 @@ def _grpo_train_impl(
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
 
-    while current_epoch < max_num_epochs and total_steps < max_num_steps:
+    while (
+        max_num_epochs is None or current_epoch < max_num_epochs
+    ) and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
         # batch cache is used for DAPO. We store prompts with non-zero standard deviation in this cache.

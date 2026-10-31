@@ -21,13 +21,17 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import PreTrainedTokenizerFast
 
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
-from nemo_rl.data.interfaces import TaskDataSpec
-from nemo_rl.data.processors import kd_data_processor
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
-from nemo_rl.data.xtoken.native_chat import _render_and_tokenize_chat
+from nemo_rl.data.cross_tokenizer.native_chat import _render_and_tokenize_chat
+from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.processors import kd_data_processor
+from tests.unit.data.test_cross_tokenizer_collate import (
+    _assert_batches_equal,
+    _batch_checksums,
+)
 
 
 def _tokenizer(
@@ -43,7 +47,15 @@ def _tokenizer(
         "<u>",
         "<a>",
     ]
-    tokens = specials + ["Question", "Answer", "Again", "Done"]
+    tokens = specials + [
+        "Question",
+        "Answer",
+        "Again",
+        "Done",
+        "<think>",
+        "Why",
+        "</think>",
+    ]
     backend = Tokenizer(
         WordLevel(dict(zip(tokens, range(len(tokens)))), unk_token="[UNK]")
     )
@@ -72,6 +84,8 @@ def _collator(
     *,
     student_length: int = 64,
     teacher_length: int = 64,
+    teacher_divisor: int = 8,
+    **options: bool,
 ) -> CrossTokenizerCollator:
     return CrossTokenizerCollator(
         config=CrossTokenizerCollatorConfig(mode="chat"),
@@ -86,7 +100,8 @@ def _collator(
         ctx_length_teachers=[teacher_length],
         drop_first_assistant_chunk_kl_by_teacher=[False],
         make_seq_div_by_student=8,
-        make_seq_div_by_teachers=[8],
+        make_seq_div_by_teachers=[teacher_divisor],
+        **options,
     )
 
 
@@ -141,6 +156,50 @@ def test_one_sided_overflow_is_rejected(student_length: int, teacher_length: int
             student_length=student_length,
             teacher_length=teacher_length,
         )([_datum()])
+
+
+@pytest.mark.parametrize("reject_overlength_text", [False, True])
+def test_same_tokenizer_teacher_rejects_chat_padding_overflow(
+    reject_overlength_text: bool,
+) -> None:
+    student = _tokenizer(suffix="<eot>")
+    collator = _collator(
+        student,
+        None,
+        teacher_length=12,
+        teacher_divisor=2,
+        reject_overlength_text=reject_overlength_text,
+    )
+    # Nine real tokens fit the teacher's context, even rounded to its divisor
+    # of two. Its shared input instead pads to the student's multiple of eight.
+    longer_row = {**_datum(trailing_content=" Again Again Again"), "idx": 7}
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"^teacher 0, sample idx=7: shared tokenization has 9 tokens, "
+            r"padded to 16 for a sequence-length multiple of 8, exceeding context "
+            r"length 12; overlength rows are rejected$"
+        ),
+    ):
+        collator([_datum(), longer_row])
+
+
+@pytest.mark.parametrize(
+    "teacher_length,trailing_content,token_count,padded_width",
+    [(8, "", 6, 8), (12, "", 6, 8), (16, " Again Again Again", 9, 16)],
+)
+def test_same_tokenizer_teacher_accepts_chat_padding_that_fits(
+    teacher_length: int,
+    trailing_content: str,
+    token_count: int,
+    padded_width: int,
+) -> None:
+    student = _tokenizer(suffix="<eot>")
+    batch = _collator(student, None, teacher_length=teacher_length, teacher_divisor=2)(
+        [_datum(trailing_content=trailing_content)]
+    )
+    assert batch["input_ids"].shape == (1, padded_width)
+    assert batch["input_lengths"].tolist() == [token_count]
 
 
 def test_template_without_terminators_does_not_supervise_next_role_header():
@@ -209,3 +268,306 @@ def test_eot_token_can_absorb_preceding_whitespace(trailing_content: str):
     assert doc.input_ids[2] == tokenizer.convert_tokens_to_ids("<eot>")
     assert doc.assistant_mask == [0, 1, 1]
     assert doc.offsets[2][0] <= doc.assistant_spans[0][1]
+
+
+def _chat_snapshot_batch():
+    """Default chat batch with cross-tokenizer and same-tokenizer teachers."""
+    student = _tokenizer(suffix=" \n\n<eot>\n")
+    teacher = _tokenizer(suffix="\n<eot>", teacher=True)
+    collator = CrossTokenizerCollator(
+        config=CrossTokenizerCollatorConfig(mode="chat"),
+        student_tokenizer=student,
+        teacher_tokenizers=[teacher, student],
+        aligners=[
+            TokenAligner(student, teacher, projection_matrix_path="unused.pt"),
+            None,
+        ],
+        ctx_length_student=64,
+        ctx_length_teachers=[64, 64],
+        drop_first_assistant_chunk_kl_by_teacher=[False, False],
+        make_seq_div_by_student=8,
+        make_seq_div_by_teachers=[4, 1],
+    )
+    return collator(
+        [
+            _datum(multiple_turns=True),
+            {**_datum(trailing_content="  \n"), "idx": 1, "loss_multiplier": 0.5},
+        ]
+    )
+
+
+# Captured from the collator before the optional overlength and CE-turn
+# behaviors existed; the default batch must stay bitwise identical.
+_CHAT_SNAPSHOT_CHECKSUMS = {
+    "input_ids": 3045364916,
+    "input_lengths": 1242912239,
+    "token_mask": 1070972743,
+    "sample_mask": 586538992,
+    "idx": 2005179788,
+    "teacher_0_input_ids": 798308162,
+    "teacher_0_input_lengths": 1242912239,
+    "teacher_0_token_mask": 2796794980,
+    "alignment_0_pair_valid": 1323192758,
+    "alignment_0_pair_is_correct": 1323192758,
+    "alignment_0_student_chunk_id": 3606849464,
+    "alignment_0_teacher_chunk_id": 2913205021,
+}
+
+
+def test_default_chat_batch_matches_pinned_output():
+    assert _batch_checksums(_chat_snapshot_batch()) == _CHAT_SNAPSHOT_CHECKSUMS
+
+
+def test_reject_overlength_text_leaves_chat_batches_unchanged():
+    student = _tokenizer(suffix="<eot>\n")
+    teacher = _tokenizer(suffix="\n<eot>", teacher=True)
+    batch = [_datum(multiple_turns=True)]
+    _assert_batches_equal(
+        _collator(student, teacher, reject_overlength_text=True)(batch),
+        _collator(student, teacher)(batch),
+    )
+
+
+def _supervised_tokens(tokenizer, batch, mask_key: str, row: int = 0) -> list[str]:
+    mask = batch[mask_key][row].bool()
+    return tokenizer.convert_ids_to_tokens(batch["input_ids"][row][mask].tolist())
+
+
+@pytest.mark.parametrize("cross_tokenizer", [False, True])
+def test_ce_covers_whole_final_assistant_turn(cross_tokenizer: bool):
+    student = _tokenizer(suffix="<eot>\n")
+    teacher = _tokenizer(suffix="\n<eot>", teacher=True) if cross_tokenizer else None
+    # Rows whose final turns start at different positions.
+    batch = [_datum(multiple_turns=True), {**_datum(), "idx": 1}]
+    default = _collator(student, teacher)(batch)
+    actual = _collator(student, teacher, ce_covers_assistant_turn=True)(batch)
+
+    # Earlier turns, including the earlier assistant turn, remain context.
+    assert _supervised_tokens(student, actual, "token_mask", row=0) == [
+        "<assistant>",
+        "Done",
+        "<eot>",
+    ]
+    assert _supervised_tokens(student, actual, "token_mask", row=1) == [
+        "<assistant>",
+        "Answer",
+        "<eot>",
+    ]
+    assert _supervised_tokens(student, actual, "kd_token_mask", row=0) == [
+        "Done",
+        "<eot>",
+    ]
+    assert torch.equal(actual["kd_token_mask"], default["token_mask"])
+    assert set(actual.keys()) == set(default.keys()) | {"kd_token_mask"}
+    assert ("alignment_0_pair_valid" in actual) is cross_tokenizer
+    for key, value in default.items():
+        if key == "token_mask":
+            continue
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(actual[key], value), key
+        else:
+            assert actual[key] == value, key
+
+
+def test_ce_turn_covers_reasoning_that_kd_excludes():
+    student = _tokenizer(suffix="<eot>")
+    messages = [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "<think> Why </think> Answer"},
+    ]
+    batch = [kd_data_processor({"messages": messages}, TaskDataSpec(), None, None, 0)]
+    default = _collator(student, None)(batch)
+    actual = _collator(student, None, ce_covers_assistant_turn=True)(batch)
+    assert _supervised_tokens(student, default, "token_mask") == ["Answer", "<eot>"]
+    assert torch.equal(actual["kd_token_mask"], default["token_mask"])
+    assert _supervised_tokens(student, actual, "token_mask") == [
+        "<assistant>",
+        "<think>",
+        "Why",
+        "</think>",
+        "Answer",
+        "<eot>",
+    ]
+
+
+def test_ce_turn_token_may_absorb_history_whitespace():
+    student = _tokenizer(suffix="<eot>\n")
+    student.add_special_tokens(
+        {"additional_special_tokens": [AddedToken("<assistant>", lstrip=True)]}
+    )
+    collator = _collator(student, None, ce_covers_assistant_turn=True)
+    datum = _datum(multiple_turns=True)
+    doc = collator._render_document(student, datum, 64, "student")
+    history = student.apply_chat_template(datum["message_log"][:-1], tokenize=False)
+    first = collator._final_turn_start(datum, doc)
+    # The role token also covers the newline that ends the history.
+    assert doc.offsets[first][0] < len(history)
+    assert _supervised_tokens(student, collator([datum]), "token_mask") == [
+        "<assistant>",
+        "Done",
+        "<eot>",
+    ]
+
+
+def test_ce_turn_without_history_is_the_whole_rendering():
+    student = _tokenizer(suffix="<eot>")
+    datum = {
+        "message_log": [{"role": "assistant", "content": "Answer"}],
+        "message_loss_mask": [1],
+        "loss_multiplier": 1.0,
+        "idx": 9,
+    }
+    batch = _collator(student, None, ce_covers_assistant_turn=True)([datum])
+    assert _supervised_tokens(student, batch, "token_mask") == [
+        "<assistant>",
+        "Answer",
+        "<eot>",
+    ]
+    assert _supervised_tokens(student, batch, "kd_token_mask") == ["Answer", "<eot>"]
+
+
+def test_ce_turn_rejects_history_that_is_not_a_prefix():
+    student = _tokenizer(suffix="<eot>")
+    # A footer after the last message is not part of the shorter rendering.
+    student.chat_template += "{{ '<eos>' }}"
+    default = _collator(student, None)([_datum()])
+    assert _supervised_tokens(student, default, "token_mask") == ["Answer", "<eot>"]
+    with pytest.raises(
+        ValueError,
+        match=r"^student, sample idx=0: rendering the messages before the final "
+        r"assistant turn does not give a prefix of the full rendering",
+    ):
+        _collator(student, None, ce_covers_assistant_turn=True)([_datum()])
+
+
+def test_ce_turn_rejects_full_rendering_identical_to_history() -> None:
+    student = _tokenizer(suffix="<eot>")
+    student.chat_template = "{{ messages[-1]['content'] }}"
+    datum = _datum()
+    datum["message_log"][0]["content"] = "Answer"
+    # With identical last-message content, this template adds no text when the
+    # final assistant turn is appended. Ordinary content supervision still works.
+    rendered = student.apply_chat_template(datum["message_log"], tokenize=False)
+    history = student.apply_chat_template(datum["message_log"][:-1], tokenize=False)
+    assert rendered == history == "Answer"
+    default = _collator(student, None)([datum])
+    assert _supervised_tokens(student, default, "token_mask") == ["Answer"]
+    with pytest.raises(
+        ValueError,
+        match=r"^student, sample idx=0: final assistant turn has no tokens$",
+    ):
+        _collator(student, None, ce_covers_assistant_turn=True)([datum])
+
+
+def test_ce_turn_rejects_token_that_carries_history_text():
+    student = _tokenizer(suffix="<eot>")
+    collator = _collator(student, None, ce_covers_assistant_turn=True)
+    datum = _datum()
+    doc = collator._render_document(student, datum, 64, "student")
+    # Tokens: <user> Question <eot> | <assistant> Answer <eot>. Make the first
+    # turn token also cover the history's <eot> text.
+    doc.offsets[3] = (doc.offsets[2][0], doc.offsets[3][1])
+    with pytest.raises(
+        ValueError,
+        match=r"^student, sample idx=0: token 3 crosses the final assistant turn",
+    ):
+        collator._final_turn_start(datum, doc)
+
+
+def test_ce_turn_rejects_targets_before_the_turn():
+    student = _tokenizer(suffix="<eot>")
+    collator = _collator(student, None, ce_covers_assistant_turn=True)
+    datum = _datum()
+    doc = collator._render_document(student, datum, 64, "student")
+    assert collator._final_turn_start(datum, doc) == 3
+    doc.assistant_mask[1] = 1
+    with pytest.raises(
+        ValueError, match="assistant targets precede the final assistant turn"
+    ):
+        collator._final_turn_start(datum, doc)
+
+
+def test_ce_turn_history_keeps_reasoning_the_full_rendering_keeps():
+    student = _tokenizer(suffix="<eot>")
+    # Earlier reasoning is rendered only when the template is asked to
+    # preserve it, as history-preserving templates do.
+    student.chat_template = (
+        "{% for message in messages %}"
+        "{% set content = message['content'] %}"
+        "{% if message['role'] == 'assistant' and not loop.last"
+        " and not preserve_thinking %}"
+        "{% set content = content.split('</think>')[-1] %}"
+        "{% endif %}"
+        "{{ '<' + message['role'] + '>' + content + '<eot>' }}"
+        "{% endfor %}"
+    )
+    messages = [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "<think> Why </think> Answer"},
+        {"role": "user", "content": "Again"},
+        {"role": "assistant", "content": "<think> Why </think> Done"},
+    ]
+    batch = [kd_data_processor({"messages": messages}, TaskDataSpec(), None, None, 0)]
+
+    def collate(**options: bool):
+        return CrossTokenizerCollator(
+            config=CrossTokenizerCollatorConfig(
+                mode="chat", include_thinking_in_loss=True
+            ),
+            student_tokenizer=student,
+            teacher_tokenizers=[None],
+            aligners=[None],
+            ctx_length_student=64,
+            ctx_length_teachers=[64],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
+            make_seq_div_by_student=8,
+            make_seq_div_by_teachers=[8],
+            **options,
+        )(batch)
+
+    default = collate()
+    actual = collate(ce_covers_assistant_turn=True)
+    tokens = student.convert_ids_to_tokens(
+        actual["input_ids"][0][: int(actual["input_lengths"][0])].tolist()
+    )
+    # The earlier turn keeps its reasoning as context.
+    assert tokens.count("Why") == 2
+    assert _supervised_tokens(student, actual, "token_mask") == [
+        "<assistant>",
+        "<think>",
+        "Why",
+        "</think>",
+        "Done",
+        "<eot>",
+    ]
+    assert _supervised_tokens(student, default, "token_mask") == [
+        "Why",
+        "</think>",
+        "Done",
+        "<eot>",
+    ]
+    assert torch.equal(actual["kd_token_mask"], default["token_mask"])
+
+
+def test_ce_turn_history_renders_the_same_tools():
+    student = _tokenizer(suffix="<eot>")
+    # Tool names precede the conversation only when tools are passed.
+    student.chat_template = (
+        "{% for tool in tools or [] %}{{ tool['function']['name'] }} {% endfor %}"
+        + student.chat_template
+    )
+    datum = {
+        **_datum(multiple_turns=True),
+        "tools": [{"type": "function", "function": {"name": "Why"}}],
+    }
+    batch = _collator(student, None, ce_covers_assistant_turn=True)([datum])
+    tokens = student.convert_ids_to_tokens(
+        batch["input_ids"][0][: int(batch["input_lengths"][0])].tolist()
+    )
+    assert tokens[0] == "Why"
+    assert _supervised_tokens(student, batch, "token_mask") == [
+        "<assistant>",
+        "Done",
+        "<eot>",
+    ]
+    assert _supervised_tokens(student, batch, "kd_token_mask") == ["Done", "<eot>"]

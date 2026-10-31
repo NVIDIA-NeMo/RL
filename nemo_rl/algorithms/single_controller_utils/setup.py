@@ -71,7 +71,9 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
+    forest_execution_row_multiple,
     is_ppo_run,
+    logprob_passes_required,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -83,7 +85,11 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
+from nemo_rl.data.multimodal_utils import (
+    WIRE_MULTIMODAL_FIELDS,
+    per_token_multimodal_schema,
+    uses_image_placeholder,
+)
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -339,7 +345,9 @@ def _register_single_controller_partitions(
         from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 
         partition_fields = fields_with_optional_routed_experts(
-            DP_TRAIN_FIELDS,
+            SC_ROLLOUT_SCHEMA_FIELDS
+            if token_capture_cfg.forest_training
+            else DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
     if include_multimodal_fields:
@@ -754,6 +762,7 @@ def _build_value(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
     *,
+    seed: int,
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
 ) -> tuple[TQValue, float]:
@@ -763,6 +772,7 @@ def _build_value(
         train_cluster: Ray virtual cluster the critic shares with the trainer.
         master_config: SC MasterConfig.
         tokenizer: Tokenizer used by the value model.
+        seed: Algorithm seed forwarded to the critic; the Megatron critic ignores it.
         weights_path: Checkpointed value weights to resume from, or None.
         optimizer_path: Checkpointed value optimizer state to resume from, or None.
 
@@ -774,6 +784,7 @@ def _build_value(
         cluster=train_cluster,
         config=master_config.value,
         tokenizer=tokenizer,
+        seed=seed,
         name_prefix="lm_value",
         weights_path=weights_path,
         optimizer_path=optimizer_path,
@@ -1529,6 +1540,10 @@ def setup_single_controller(
         save_state.sampler_dispatch_index = (
             resolved_snapshot.manifest.sampler_dispatch_index
         )
+        if resolved_snapshot.manifest.next_nemo_gym_task_index is not None:
+            save_state.next_nemo_gym_task_index = (
+                resolved_snapshot.manifest.next_nemo_gym_task_index
+            )
         print(
             f"📦 Selected rollout recovery snapshot: {recovery_checkpoint_path}",
             flush=True,
@@ -1760,6 +1775,7 @@ def setup_single_controller(
             train_cluster,
             master_config,
             tokenizer,
+            seed=algo_cfg.seed,
             weights_path=value_weights_path,
             optimizer_path=value_optimizer_path,
         )
@@ -2183,6 +2199,10 @@ def setup_single_controller(
         dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
+        # Captured rows use a separate producer and derive validity in workers.
+        per_token_multimodal_fields=(
+            () if token_capture_cfg.enabled else per_token_multimodal_schema(processor)
+        ),
         include_message_violation_fields=(
             algo_cfg.invalid_tool_call_advantage is not None
             or algo_cfg.malformed_thinking_advantage is not None
@@ -2236,6 +2256,14 @@ def setup_single_controller(
             advantage_estimator,
             num_workers=master_config.async_rl.num_advantage_workers,
         )
+    if token_capture_cfg.forest_training:
+        # Padding or borrowed inputs may appear in any step. Validate the loaded
+        # model before admitting rollouts, even if the first batch needs neither.
+        ray.get(
+            trainer.worker_group.run_all_workers_single_data(
+                "validate_forest_execution_padding"
+            )
+        )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -2259,6 +2287,16 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
+        forest_training=token_capture_cfg.forest_training,
+        execution_row_multiple=(
+            forest_execution_row_multiple(
+                trainer.cfg,
+                dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
+                logprobs_required=any(logprob_passes_required(master_config, algo_cfg)),
+            )
+            if token_capture_cfg.forest_training
+            else 1
+        ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
     )
 

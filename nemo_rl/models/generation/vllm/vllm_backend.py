@@ -1681,6 +1681,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 )
             self._maybe_process_mtp_drafter_after_loading()
 
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            fp8.prepare_fp8_linear_refit(self.model_runner.model)
         yield finalize
         # KV-cache scales are covered by the full process_weights_after_loading
         # pass in finalize(); no second pass is needed.

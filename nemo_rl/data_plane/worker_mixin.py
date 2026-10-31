@@ -41,6 +41,7 @@ from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.codec import pad_batch
+from nemo_rl.data_plane.column_io import fetch_columns
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
 from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
@@ -563,11 +564,7 @@ class TQWorkerMixin:
                         select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
                     )
                 else:
-                    td = dp_client.get_samples(
-                        sample_ids=meta.sample_ids,
-                        partition_id=meta.partition_id,
-                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-                    )
+                    td = fetch_columns(dp_client, meta, meta.fields)
                 data = _materialize_fetched(
                     td,
                     local_batch=local_batch,
@@ -621,11 +618,7 @@ class TQWorkerMixin:
                 select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
             )
         else:
-            td = dp_client.get_samples(
-                sample_ids=meta.sample_ids,
-                partition_id=meta.partition_id,
-                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-            )
+            td = fetch_columns(dp_client, meta, meta.fields)
         data = _materialize_fetched(
             td,
             local_batch=local_batch,

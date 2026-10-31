@@ -450,11 +450,6 @@ def setup(
             "Context parallelism (CP>1) is currently not supported for the Automodel PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
-        assert value_config["dynamic_batching"]["enabled"] is False, (
-            "Dynamic batching currently has some issue for the Automodel PPO value model. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2953."
-        )
-
     # Set seed for all random number generators
     set_seed(ppo_config.seed)
 
@@ -862,6 +857,7 @@ def setup(
             cluster=train_cluster,
             config=value_config,
             tokenizer=tokenizer,
+            seed=ppo_config.seed,
             name_prefix="lm_value",
             weights_path=value_weights_path,
             optimizer_path=value_optimizer_path,

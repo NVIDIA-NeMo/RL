@@ -218,6 +218,17 @@ def reject_outdated_dynamo_router_reset_states(config: dict[str, Any]) -> None:
         )
 
 
+def reject_outdated_context_compaction(config: dict[str, Any]) -> None:
+    """Reject the old forest-training switch before schema validation."""
+    capture = config.get("token_capture")
+    if isinstance(capture, dict) and "context_compaction" in capture:
+        raise ValueError(
+            "token_capture.context_compaction was renamed to "
+            "token_capture.forest_training. Rename the key, keeping its value; "
+            "selection_policy=returned_history preserves the existing behavior."
+        )
+
+
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -236,3 +247,4 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_mcore_generation_keys(config)
     reject_outdated_real_quant_ignore(config)
     reject_outdated_dynamo_router_reset_states(config)
+    reject_outdated_context_compaction(config)
