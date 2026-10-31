@@ -69,7 +69,7 @@ def is_nano_nemotron_vl_model(model_name: str) -> bool:
 
     These models build their vision tower even for text-only rollouts. Ordinary
     refit may omit frozen media weights, requiring ``load_format=auto``. Native
-    ModelOpt refit supplies the complete model and preserves its selected loader.
+    ModelOpt policy refit supplies the complete model after dummy initialization.
     """
     hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     return hasattr(hf_config, "model_type") and hf_config.model_type in [

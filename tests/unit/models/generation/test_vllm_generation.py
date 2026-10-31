@@ -1639,11 +1639,11 @@ def test_configure_generation_config_respects_explicit_training_load_format():
     ("real_quant", "family_matches", "requested", "expected"),
     [
         (True, True, "dummy", "dummy"),
-        (True, True, "auto", "auto"),
+        (True, True, "auto", None),
         (False, True, "dummy", "auto"),
         (False, True, "auto", "auto"),
         (True, False, "dummy", "dummy"),
-        (True, False, "auto", "auto"),
+        (True, False, "auto", None),
         (False, False, "dummy", "dummy"),
         (False, False, "auto", "auto"),
     ],
@@ -1654,6 +1654,10 @@ def test_load_model_preserves_native_quant_loader(
     cfg = deepcopy(basic_vllm_test_config)
     cfg["real_quant"] = real_quant
     cfg["vllm_cfg"]["load_format"] = requested
+    cfg["vllm_kwargs"]["speculative_config"] = {
+        "method": "mtp",
+        "num_speculative_tokens": 1,
+    }
     hf_config = types.SimpleNamespace(
         model_type="nemotron_h_omni" if family_matches else "qwen3",
         architectures=[],
@@ -1682,10 +1686,17 @@ def test_load_model_preserves_native_quant_loader(
         _create_engine=engines.append,
     )
 
+    if expected is None:
+        with pytest.raises(ValueError, match="load_format='dummy'"):
+            BaseVllmGenerationWorker._load_model(worker, bundle_indices=[], seed=42)
+        assert not engines
+        return
+
     BaseVllmGenerationWorker._load_model(worker, bundle_indices=[], seed=42)
 
     assert len(engines) == 1
     assert engines[0]["load_format"] == expected
+    assert worker._mtp_load_from_disk is (expected == "dummy")
 
 
 @pytest.mark.parametrize(
