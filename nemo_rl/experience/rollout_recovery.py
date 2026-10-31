@@ -45,7 +45,13 @@ if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
 ROLLOUT_RECOVERY_SCHEMA_VERSION = 6
-SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
+# Schemas 2 to 5 predate turn-level recovery; they load through
+# _upgrade_pre_turn_recovery_groups.
+_PRE_TURN_RECOVERY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
+    *_PRE_TURN_RECOVERY_SCHEMA_VERSIONS,
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -108,6 +114,67 @@ def _reject_unknown_fields(
         raise ValueError(
             f"{context} contains unknown fields: {sorted(unknown, key=repr)!r}"
         )
+
+
+def _upgrade_pre_turn_recovery_groups(raw_groups: list[Any]) -> list[Any]:
+    """Rewrite schema 2 to 5 groups in the schema 6 shape.
+
+    Those schemas recorded a group's retry unit as ``recovery_granularity``,
+    whose values are also restore levels, and had no Gym turn state, so each
+    attempt starts with none, as a fresh attempt does. Anything already in the
+    schema 6 shape is refused rather than guessed at. Shapes this does not
+    recognize pass through for ``_group_from_state`` to reject.
+    """
+    upgraded: list[Any] = []
+    for raw_group in raw_groups:
+        if not isinstance(raw_group, dict):
+            upgraded.append(raw_group)
+            continue
+        if "restore_level" in raw_group or "recovery_granularity" not in raw_group:
+            raise ValueError(
+                "rollout-recovery group from schemas 2 to 5 must record "
+                "recovery_granularity, not restore_level"
+            )
+        raw_granularity = raw_group["recovery_granularity"]
+        try:
+            RecoveryGranularity(raw_granularity)
+        except ValueError as error:
+            raise ValueError(
+                f"invalid recovery_granularity={raw_granularity!r}"
+            ) from error
+        group = {
+            key: value
+            for key, value in raw_group.items()
+            if key != "recovery_granularity"
+        }
+        group["restore_level"] = raw_granularity
+        siblings = raw_group.get("siblings")
+        if isinstance(siblings, list):
+            group["siblings"] = [
+                {
+                    **sibling,
+                    "attempts": [
+                        _upgrade_pre_turn_recovery_attempt(attempt)
+                        for attempt in sibling["attempts"]
+                    ],
+                }
+                if isinstance(sibling, dict)
+                and isinstance(sibling.get("attempts"), list)
+                else sibling
+                for sibling in siblings
+            ]
+        upgraded.append(group)
+    return upgraded
+
+
+def _upgrade_pre_turn_recovery_attempt(raw_attempt: Any) -> Any:
+    if not isinstance(raw_attempt, dict):
+        return raw_attempt
+    if "gym_instance_id" in raw_attempt or "gym_attempt" in raw_attempt:
+        raise ValueError(
+            "rollout-recovery attempt from schemas 2 to 5 cannot carry Gym turn state"
+        )
+    return {**raw_attempt, "gym_instance_id": None, "gym_attempt": 0}
 
 
 class PromptGroupPhase(StrEnum):
@@ -1424,11 +1491,14 @@ class RolloutRecoveryLedger:
         ):
             raise ValueError(
                 f"Unsupported rollout-recovery schema version: {schema_version!r}; "
-                f"expected {ROLLOUT_RECOVERY_SCHEMA_VERSION}"
+                f"supported versions are "
+                f"{sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
             )
         raw_groups = state.get("groups")
         if not isinstance(raw_groups, list):
             raise ValueError("rollout-recovery state must contain a groups list")
+        if schema_version in _PRE_TURN_RECOVERY_SCHEMA_VERSIONS:
+            raw_groups = _upgrade_pre_turn_recovery_groups(raw_groups)
 
         ledger = cls()
         seen_attempt_uuids: set[uuid.UUID] = set()
