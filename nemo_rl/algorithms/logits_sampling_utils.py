@@ -37,8 +37,8 @@ class TrainingSamplingParams:
         top_k: Top-k filtering parameter (None or -1 to disable)
         top_p: Top-p filtering parameter (1.0 to disable)
         temperature: Temperature for scaling logits (default: 1.0)
-        sampler_replay: Score the sampled token and the score-centering
-            head over the sampler's realized support (its captured top-K head)
+        sampler_replay: Score the sampled token (and, with score
+            centering, the head) over the sampler's realized support (its captured top-K head)
             instead of recomputing top_k/top_p on the trainer's logits. Top-p
             then requires top_k, which bounds the support.
     """

@@ -64,6 +64,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.call_selection import resolve_selection_policy
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
@@ -1511,10 +1512,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         or top_logprobs < 0
     ):
         raise ValueError("policy.generation.top_logprobs must be a nonnegative integer")
-    if top_logprobs > 0 and not master_config.loss_fn.score_centering:
+    score_centering = master_config.loss_fn.score_centering
+    replay = sampler_replay_enabled(generation_cfg)
+    if top_logprobs > 0 and not (score_centering or replay):
         raise ValueError(
-            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering; "
-            "set it to 0 or enable score centering"
+            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering "
+            "and policy.generation.sampler_replay.enabled; set it to 0 or enable one"
         )
     if top_logprobs > 0:
         if master_config.policy["generation"]["backend"] != "vllm":
@@ -1525,12 +1528,11 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "policy.generation.top_logprobs requires token_capture.enabled=true"
             )
-    if master_config.loss_fn.score_centering:
+    if score_centering:
         if top_logprobs == 0:
             raise ValueError(
                 "loss_fn.score_centering requires policy.generation.top_logprobs > 0"
             )
-        generation_cfg = master_config.policy["generation"]
         temperature = generation_cfg["temperature"]
         logprobs_mode = (generation_cfg.get("vllm_cfg") or {}).get("logprobs_mode")
         if logprobs_mode is None:
@@ -1551,13 +1553,26 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "processed_logprobs when policy.generation.temperature != 1.0"
             )
         if (
-            generation_cfg.get("top_p") != 1.0
-            or generation_cfg.get("top_k") is not None
+            need_top_k_or_top_p_filtering(
+                TrainingSamplingParams(
+                    top_k=generation_cfg["top_k"], top_p=generation_cfg["top_p"]
+                )
+            )
+            and not replay
         ):
             raise ValueError(
-                "loss_fn.score_centering needs unfiltered sampling "
-                "(policy.generation.top_p=1, top_k=null) so the captured top-k is "
-                "the sampling distribution"
+                "loss_fn.score_centering with top-k/top-p sampling requires "
+                "policy.generation.sampler_replay.enabled=true: the estimator is "
+                "exact only over the support the sampler drew from"
+            )
+    if score_centering or replay:
+        # Both score the trainer's logits at the captured sampler head ids.
+        top_k = generation_cfg["top_k"]
+        if top_k is not None and top_logprobs < top_k:
+            raise ValueError(
+                "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                "with top-k sampling require policy.generation.top_logprobs >= "
+                "policy.generation.top_k, so the captured head holds the kept set"
             )
 
         automodel_cfg = master_config.policy.get("automodel_cfg")
@@ -1568,15 +1583,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 or enabled_automodel_cfg["context_parallel_size"] > 1
             ):
                 raise ValueError(
-                    "loss_fn.score_centering supports Automodel only with "
-                    "tensor_parallel_size=1 and context_parallel_size=1; use Megatron for TP/CP"
+                    "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                    "support Automodel only with tensor_parallel_size=1 and "
+                    "context_parallel_size=1; use Megatron for TP/CP"
                 )
         megatron_cfg = master_config.policy.get("megatron_cfg") or {}
         if megatron_cfg.get("enabled") and megatron_cfg.get(
             "use_fused_linear_logprobs"
         ):
             raise ValueError(
-                "loss_fn.score_centering needs vocabulary logits; disable "
+                "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                "need vocabulary logits; disable "
                 "policy.megatron_cfg.use_fused_linear_logprobs"
             )
 

@@ -21,6 +21,7 @@ import torch
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
+    replays_sampler_support,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.loss.utils import (
@@ -37,11 +38,14 @@ from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
     ChunkedDistributedReverseKLToFixedLogits,
     allgather_cp_sharded_tensor,
+    check_sampler_support,
     from_parallel_logits_to_logprobs_packed_sequences,
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
     get_policy_logprobs_at_sampler_topk,
+    sampled_logprobs_from_support,
+    sampler_support_ids,
 )
 from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
@@ -60,10 +64,112 @@ def _validate_score_centering_data(data: BatchedDataDict[Any]) -> None:
     ]
     if missing:
         raise ValueError(
-            f"Score centering requires {', '.join(missing)}: use SingleController "
-            "with NeMo Gym + vLLM, token_capture.enabled=true and "
-            "policy.generation.top_logprobs > 0."
+            f"Score centering and sampler replay require {', '.join(missing)}: "
+            "use SingleController with NeMo Gym + vLLM, token_capture.enabled=true "
+            "and policy.generation.top_logprobs > 0."
         )
+
+
+def _replayed_sampler_support(
+    data: BatchedDataDict[Any], sampling_params: Optional[TrainingSamplingParams]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Checked :func:`sampler_support_ids` for training under sampling filters.
+
+    The trainer renormalizes over the support the sampler drew from, which its
+    captured head holds, for the actor loss and the score-centering head.
+
+    Returns:
+        The support ids ``[B, S, K]`` and where the head holds the whole support
+        ``[B, S]`` (see :func:`check_sampler_support`).
+    """
+    assert sampling_params is not None
+    _validate_score_centering_data(data)
+    if not sampling_params.sampler_replay:
+        raise ValueError(
+            "scoring over the sampler's support requires "
+            "policy.generation.sampler_replay.enabled=true"
+        )
+    token_mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+    complete = check_sampler_support(
+        data["input_ids"],
+        data["sampler_topk_token_ids"],
+        data["sampler_topk_logprobs"],
+        token_mask,
+    )
+    support = sampler_support_ids(
+        data["sampler_topk_token_ids"], data["sampler_topk_logprobs"]
+    )
+    return support, complete
+
+
+def sampler_support_logprobs(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    sampling_params: Optional[TrainingSamplingParams],
+    *,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_size: Optional[int] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
+    cu_seqlens_q: Optional[CpuIntTuple] = None,
+    cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sampled-token and head log-probs renormalized over the sampler's support.
+
+    Shared by the actor loss and the prev-logprob pass, so both see the same
+    distribution: the head is scored once and the sampled token read from its slot.
+
+    Args:
+        logits: Next-token logits, the local TP/CP shard, packed with ``cu_seqlens_q``.
+        data: Canonical microbatch with ``input_ids``, ``token_mask``,
+            ``sample_mask`` and the captured sampler head.
+        sampling_params: Sampling filters with ``sampler_replay``.
+        vocab_parallel_rank: Vocab-parallel rank (with the group).
+        vocab_parallel_group: Vocab-parallel group, or None for the full vocabulary.
+        context_parallel_group: Context-parallel group.
+        chunk_size: Sequence chunk size (policy.logprob_chunk_size).
+        cp_sharder: Automodel context-parallel sharder (not supported).
+        cu_seqlens_q: Unpadded packed-sequence boundaries, when packed.
+        cu_seqlens_q_padded: Padded packed-sequence boundaries, when packed.
+
+    Returns:
+        The sampled token's log-probs ``[B, S - 1]`` and the head's ``[B, S - 1, K]``.
+        Tokens whose captured head misses part of the support get ``-inf``, so the
+        loss drops them and counts them in ``policy_support_excluded_tokens``.
+    """
+    support, complete = _replayed_sampler_support(data, sampling_params)
+    packed_support = None
+    if cu_seqlens_q is not None:
+        assert cu_seqlens_q_padded is not None
+        cp_size, cp_rank = 1, 0
+        if context_parallel_group is not None:
+            cp_size = torch.distributed.get_world_size(context_parallel_group)
+            cp_rank = torch.distributed.get_rank(context_parallel_group)
+        packed_support = _pack_input_ids(
+            support,
+            cu_seqlens_q,
+            cu_seqlens_q_padded,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            roll_shift=-1,
+        )
+    head = get_policy_logprobs_at_sampler_topk(
+        sampler_topk_token_ids=support,
+        next_token_logits=logits,
+        vocab_parallel_rank=vocab_parallel_rank,
+        vocab_parallel_group=vocab_parallel_group,
+        context_parallel_group=context_parallel_group,
+        chunk_size=chunk_size,
+        cp_sharder=cp_sharder,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        packed_sampler_topk_token_ids=packed_support,
+        sampling_params=sampling_params,
+    )
+    sampled = sampled_logprobs_from_support(head, support, data["input_ids"])
+    sampled = sampled.masked_fill(~complete[:, 1:].to(sampled.device), -float("inf"))
+    return sampled, head
 
 
 def _prepare_opd_full_loss_input(
@@ -263,6 +369,8 @@ def prepare_loss_input(
         loss_input = {"logits": logits}
 
     elif loss_fn.input_type == LossInputType.LOGPROB:
+        score_centering = getattr(loss_fn, "score_centering", False)
+        support_head = None
         # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
         # Keep normal path unchanged for standard logits (3D tensor).
         if (
@@ -272,6 +380,17 @@ def prepare_loss_input(
             logprobs = logits
             logprobs = logprobs.to(torch.float32)
             logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
+        elif replays_sampler_support(sampling_params):
+            logprobs, support_head = sampler_support_logprobs(
+                logits,
+                data,
+                sampling_params,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                chunk_size=chunk_size,
+                cp_sharder=cp_sharder,
+            )
         else:
             logprobs = get_next_token_logprobs_from_logits(
                 input_ids=data["input_ids"],
@@ -307,8 +426,12 @@ def prepare_loss_input(
         loss_input = {"next_token_logprobs": logprobs}
         if need_top_k_or_top_p_filtering(sampling_params):
             loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
-        if getattr(loss_fn, "score_centering", False):
+        if score_centering and support_head is not None:
+            loss_input["policy_logprobs_at_sampler_topk"] = support_head
+        elif score_centering:
             # Log-probs at the sampler's captured top-k ids, for score centering.
+            # Under filters without replay this raises: the head is only defined
+            # over the sampler's support.
             loss_input["policy_logprobs_at_sampler_topk"] = (
                 get_policy_logprobs_at_sampler_topk(
                     sampler_topk_token_ids=data["sampler_topk_token_ids"],
@@ -318,6 +441,7 @@ def prepare_loss_input(
                     context_parallel_group=context_parallel_group,
                     chunk_size=chunk_size,
                     cp_sharder=cp_sharder,
+                    sampling_params=sampling_params,
                 )
             )
 
@@ -517,13 +641,18 @@ def prepare_packed_loss_input(
         "vocab_parallel_rank must be provided with vocab_parallel_group."
     )
 
-    if getattr(loss_fn, "score_centering", False):
+    score_centering = getattr(loss_fn, "score_centering", False)
+    if score_centering:
         _validate_score_centering_data(data)
     input_ids = data["input_ids"]
     unpacked_seqlen = input_ids.shape[1]
     input_is_prepacked = "cu_seqlens" in data
-    if getattr(loss_fn, "score_centering", False) and input_is_prepacked:
-        raise ValueError("Score centering does not support externally prepacked inputs")
+    replay = replays_sampler_support(sampling_params)
+    if (score_centering or replay) and input_is_prepacked:
+        raise ValueError(
+            "Score centering and sampler replay do not support externally "
+            "prepacked inputs"
+        )
     cp_size = (
         1
         if context_parallel_group is None
@@ -557,21 +686,56 @@ def prepare_packed_loss_input(
     )
     logits_for_logprobs = logits if use_chunking else logits.to(torch.float32)
 
-    logprobs = from_parallel_logits_to_logprobs_packed_sequences(
-        logits_for_logprobs,
-        packed_targets,
-        cu_seqlens_q_padded,
-        unpacked_seqlen,
-        vocab_start_index=vocab_parallel_rank * logits.shape[-1],
-        vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
-        group=vocab_parallel_group,
-        inference_only=False,
-        cp_group=context_parallel_group,
-        sampling_params=sampling_params,
-        chunk_size=chunk_size if use_chunking else None,
-        target_is_pre_rolled=not input_is_prepacked,
-        return_packed_layout=input_is_prepacked,
-    )
+    def sampler_topk_logprobs(ids: torch.Tensor) -> torch.Tensor:
+        return get_policy_logprobs_at_sampler_topk(
+            sampler_topk_token_ids=ids,
+            next_token_logits=logits,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            chunk_size=chunk_size,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+            packed_sampler_topk_token_ids=_pack_input_ids(
+                ids,
+                cu_seqlens_q,
+                cu_seqlens_q_padded,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                roll_shift=-1,
+            ),
+            sampling_params=sampling_params,
+        )
+
+    support_head = None
+    if replay:
+        logprobs, support_head = sampler_support_logprobs(
+            logits,
+            data,
+            sampling_params,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            chunk_size=chunk_size,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+        )
+    else:
+        logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+            logits_for_logprobs,
+            packed_targets,
+            cu_seqlens_q_padded,
+            unpacked_seqlen,
+            vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+            vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+            group=vocab_parallel_group,
+            inference_only=False,
+            cp_group=context_parallel_group,
+            sampling_params=sampling_params,
+            chunk_size=chunk_size if use_chunking else None,
+            target_is_pre_rolled=not input_is_prepacked,
+            return_packed_layout=input_is_prepacked,
+        )
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:
     # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
@@ -602,26 +766,10 @@ def prepare_packed_loss_input(
     loss_input = {"next_token_logprobs": logprobs}
     if need_top_k_or_top_p_filtering(sampling_params):
         loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
-    if getattr(loss_fn, "score_centering", False):
-        packed_sampler_ids = _pack_input_ids(
-            data["sampler_topk_token_ids"],
-            cu_seqlens_q,
-            cu_seqlens_q_padded,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            roll_shift=-1,
-        )
-        loss_input["policy_logprobs_at_sampler_topk"] = (
-            get_policy_logprobs_at_sampler_topk(
-                sampler_topk_token_ids=data["sampler_topk_token_ids"],
-                next_token_logits=logits,
-                vocab_parallel_rank=vocab_parallel_rank,
-                vocab_parallel_group=vocab_parallel_group,
-                context_parallel_group=context_parallel_group,
-                chunk_size=chunk_size,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_q_padded=cu_seqlens_q_padded,
-                packed_sampler_topk_token_ids=packed_sampler_ids,
-            )
+    if score_centering and support_head is not None:
+        loss_input["policy_logprobs_at_sampler_topk"] = support_head
+    elif score_centering:
+        loss_input["policy_logprobs_at_sampler_topk"] = sampler_topk_logprobs(
+            data["sampler_topk_token_ids"]
         )
     return loss_input, data

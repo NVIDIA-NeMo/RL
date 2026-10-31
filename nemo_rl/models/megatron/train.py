@@ -40,6 +40,7 @@ from megatron.core.utils import (
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
+    replays_sampler_support,
 )
 from nemo_rl.algorithms.loss import (
     DraftLossWrapper,
@@ -52,6 +53,7 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_input import sampler_support_logprobs
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.data.megatron_sft_packed import is_direct_packed_row
@@ -475,6 +477,9 @@ def forward_with_post_processing_fn(
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
             original_seq_length=original_seq_length,
+            cu_seqlens=(
+                None if packed_seq_params is None else packed_seq_params.cu_seqlens_q
+            ),
         )
     elif isinstance(post_processing_fn, TeacherFullPayloadPostProcessor):
         assert original_seq_length is not None
@@ -891,6 +896,7 @@ class LogprobsPostProcessor:
         input_ids: torch.Tensor,
         cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
         original_seq_length: int,
+        cu_seqlens: Optional[torch.Tensor | CpuIntTuple] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -902,6 +908,8 @@ class LogprobsPostProcessor:
             input_ids: Processed input token IDs
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
             original_seq_length: Sequence width before dense padding was applied
+            cu_seqlens: Unpadded packed-sequence boundaries; needed to replay the
+                sampler's support on packed sequences
 
         Returns:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
@@ -916,6 +924,23 @@ class LogprobsPostProcessor:
             if self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
+            elif replays_sampler_support(self.sampling_params):
+                # Same support-renormalized log-probs as the actor loss.
+                packed = self.cfg["sequence_packing"]["enabled"]
+                assert not packed or cu_seqlens is not None
+                token_logprobs, _ = sampler_support_logprobs(
+                    output_tensor,
+                    data_dict,
+                    self.sampling_params,
+                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    context_parallel_group=(
+                        get_context_parallel_group() if packed else None
+                    ),
+                    chunk_size=self.cfg.get("logprob_chunk_size", None),
+                    cu_seqlens_q=to_cpu_int_tuple(cu_seqlens) if packed else None,
+                    cu_seqlens_q_padded=cu_seqlens_padded_cpu,
+                )
             elif self.cfg["sequence_packing"]["enabled"]:
                 assert cu_seqlens_padded_cpu is not None
                 tp_grp = get_tensor_model_parallel_group()
