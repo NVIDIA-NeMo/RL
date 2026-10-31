@@ -362,7 +362,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             tp_size = config["automodel_cfg"]["tensor_parallel_size"]
             cp_size = config["automodel_cfg"]["context_parallel_size"]
 
-            env_vars = config["automodel_cfg"].get("env_vars", {})
+            env_vars = dict(config["automodel_cfg"].get("env_vars") or {})
             if config["automodel_cfg"].get("deterministic"):
                 env_vars = {**(env_vars or {}), **DETERMINISTIC_ENV_VARS}
 

@@ -16,6 +16,7 @@ import math
 import os
 import sys
 import time
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
@@ -80,6 +81,19 @@ def _check_dp_leader_worker_indices(
             f"dp_leader_worker_indices {requested} must be an ascending subset "
             f"of the tied group leaders {tied_group_leaders}."
         )
+
+
+def _merge_process_environment(env_vars: Mapping[str, str]) -> dict[str, str]:
+    """Return a new mapping of ``env_vars`` layered over the current process environment.
+
+    Explicit entries in ``env_vars`` win over ``os.environ``. The input is never
+    mutated: callers typically pass a dict that lives inside the master config,
+    and an in-place merge would leak the whole launcher environment (including
+    any secrets) into every checkpoint's ``config.yaml``.
+    """
+    merged = dict(os.environ)
+    merged.update(env_vars)
+    return merged
 
 
 def _get_initializer_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
@@ -514,7 +528,7 @@ class RayWorkerGroup:
         self,
         remote_worker_builder: RayWorkerBuilder,
         bundle_indices_list: list[tuple[int, list[int]]],
-        env_vars: dict[str, str] = {},
+        env_vars: Mapping[str, str],
     ) -> None:
         """Create workers based on explicit bundle indices for tied worker groups.
 
@@ -529,10 +543,10 @@ class RayWorkerGroup:
             self.cluster.get_master_address_and_port()
         )
 
-        # Update env_vars with the current environment variables
-        for k, v in os.environ.items():
-            if k not in env_vars:
-                env_vars[k] = v
+        # Workers inherit the launcher's environment, but the caller's mapping
+        # is left untouched: it is usually a live reference into the run config
+        # that CheckpointManager later writes to config.yaml (#3384).
+        env_vars = _merge_process_environment(env_vars)
 
         # Get the python environment for the actor
         actor_python_env = get_actor_python_env(
