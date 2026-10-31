@@ -13,38 +13,9 @@
 # limitations under the License.
 """Rejects config the code no longer accepts, pointing at the migration to apply."""
 
-from typing import Any, Iterator
+from typing import Any
 
-
-def _train_backend_configs(
-    config: dict[str, Any],
-) -> Iterator[tuple[str, dict[str, Any]]]:
-    """Yields (dotted path, config) for every block that selects a training backend.
-
-    The policy, the value model, the teachers and the reward-model environment. A check
-    for any backend key can iterate these rather than re-deriving the locations.
-
-    Distillation keeps its single teacher under "teacher", while the multi-teacher
-    algorithms use a "teachers" list, so both spellings are visited.
-    """
-    # policy, value model and single-teacher (distillation) blocks
-    blocks = [
-        (section, config.get(section)) for section in ("policy", "value", "teacher")
-    ]
-
-    # multi-teacher blocks
-    teachers = config.get("teachers")
-    if isinstance(teachers, (list, tuple)):
-        blocks += [(f"teachers.{i}", t) for i, t in enumerate(teachers)]
-
-    # reward-model environment block
-    env = config.get("env")
-    if isinstance(env, dict):
-        blocks.append(("env.reward_model", env.get("reward_model")))
-
-    for path, block in blocks:
-        if isinstance(block, dict):
-            yield path, block
+from nemo_rl.utils.config_check.utils import train_backend_configs
 
 
 def reject_outdated_automodel_block(config: dict[str, Any]) -> None:
@@ -57,7 +28,7 @@ def reject_outdated_automodel_block(config: dict[str, Any]) -> None:
     Args:
         config: The config as the user wrote it, resolved to plain dicts.
     """
-    for path, backend_config in _train_backend_configs(config):
+    for path, backend_config in train_backend_configs(config):
         megatron_cfg = backend_config.get("megatron_cfg")
         if isinstance(megatron_cfg, dict) and megatron_cfg.get("enabled"):
             continue
@@ -83,7 +54,7 @@ def reject_outdated_teacher_projection_matrix_path(config: dict[str, Any]) -> No
     Args:
         config: The config as the user wrote it, resolved to plain dicts.
     """
-    for path, teacher_config in _train_backend_configs(config):
+    for path, teacher_config in train_backend_configs(config):
         if path.startswith("teachers.") and "projection_matrix_path" in teacher_config:
             raise ValueError(
                 f"{path}.projection_matrix_path is no longer supported; "

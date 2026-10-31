@@ -479,13 +479,6 @@ class TestPPOValidation:
 
         validate_single_controller_config(mc)
 
-    def test_rejects_automodel_critic(self):
-        """Only the Megatron value worker carries TQWorkerMixin."""
-        mc = _ppo_master_config(value=_value_config(megatron_enabled=False))
-
-        with pytest.raises(ValueError, match=r"value\.megatron_cfg\.enabled=true"):
-            validate_single_controller_config(mc)
-
     @pytest.mark.parametrize(
         "field", ["max_skipped_prompts", "max_consecutive_dropped_prompts"]
     )

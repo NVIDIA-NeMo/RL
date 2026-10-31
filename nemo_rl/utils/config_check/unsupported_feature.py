@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, NoReturn, cast
 
 from pydantic import BaseModel
 
+from nemo_rl.utils.config_check.utils import train_backend_configs
+
 if TYPE_CHECKING:
     from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
     from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
@@ -74,48 +76,117 @@ def _raise_unsupported_feature(
     raise ValueError(" ".join(parts))
 
 
-def _check_megatron(config: PolicyConfig) -> None:
-    """Reject unsupported Megatron policy configurations."""
-    megatron_cfg = config["megatron_cfg"]
-    packing = config.get("sequence_packing")
-    generation = config.get("generation")
+def _check_automodel(backend_config: PolicyConfig, *, path: str) -> None:
+    """Reject unsupported Automodel training configurations."""
+    # resolve config
+    automodel_cfg = backend_config["automodel_cfg"]
+    packing = backend_config.get("sequence_packing")
+    hf_config_overrides = backend_config.get("hf_config_overrides")
+    rope_scaling = (
+        hf_config_overrides.get("rope_scaling") if hf_config_overrides else None
+    )
 
-    if not megatron_cfg.get("use_fused_linear_logprobs"):
-        return
-
-    # sequence_packing
-    if packing and packing["enabled"]:
+    # yarn
+    if rope_scaling and rope_scaling.get("rope_type") == "yarn":
         _raise_unsupported_feature(
-            feature="fused linear logprobs + sequence packing",
-            suggestion="set policy.megatron_cfg.use_fused_linear_logprobs=false or policy.sequence_packing.enabled=false.",
+            feature="YaRN RoPE scaling",
+            condition=f"using Automodel for {path}",
+            suggestion="use the Megatron backend.",
         )
 
-    # top_k, top_p
-    if generation is not None and (
-        (generation["top_k"] is not None and generation["top_k"] > 0)
-        or (generation["top_p"] is not None and generation["top_p"] != 1.0)
+    # context_parallel_size, sequence_packing
+    if automodel_cfg["context_parallel_size"] > 1 and packing and packing["enabled"]:
+        _raise_unsupported_feature(
+            feature="context parallel + sequence packing",
+            condition=f"using Automodel for {path}",
+            suggestion=f"set {path}.automodel_cfg.context_parallel_size=1 or disable sequence packing.",
+            tracking_url="https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-automodel",
+        )
+
+
+def _check_megatron(backend_config: PolicyConfig, *, path: str) -> None:
+    """Reject unsupported Megatron training configurations."""
+    # resolve config
+    megatron_cfg = backend_config["megatron_cfg"]
+    packing = backend_config.get("sequence_packing")
+    generation = backend_config.get("generation")
+    draft = backend_config.get("draft")
+    ddp_config = megatron_cfg.get("distributed_data_parallel_config")
+
+    # draft, context_parallel_size
+    if (
+        draft is not None
+        and draft.enabled
+        and megatron_cfg["context_parallel_size"] > 1
     ):
         _raise_unsupported_feature(
-            feature="fused linear logprobs + top-k/top-p filtering",
-            suggestion="set policy.megatron_cfg.use_fused_linear_logprobs=false or disable filtering (policy.generation.top_k=null, policy.generation.top_p=1.0).",
+            feature="draft training + context parallel",
+            condition=f"using Megatron for {path}",
+            suggestion=f"set {path}.megatron_cfg.context_parallel_size=1 or disable {path}.draft.",
         )
+
+    if megatron_cfg.get("use_fused_linear_logprobs"):
+        # overlap_param_gather
+        if ddp_config and ddp_config.get("overlap_param_gather"):
+            _raise_unsupported_feature(
+                feature="fused linear logprobs + overlap_param_gather",
+                suggestion=f"set {path}.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=false.",
+            )
+
+        # sequence_packing
+        if packing and packing["enabled"]:
+            _raise_unsupported_feature(
+                feature="fused linear logprobs + sequence packing",
+                suggestion=f"set {path}.megatron_cfg.use_fused_linear_logprobs=false or {path}.sequence_packing.enabled=false.",
+            )
+
+        # top_k, top_p
+        if generation is not None and (
+            (generation["top_k"] is not None and generation["top_k"] > 0)
+            or (generation["top_p"] is not None and generation["top_p"] != 1.0)
+        ):
+            _raise_unsupported_feature(
+                feature="fused linear logprobs + top-k/top-p filtering",
+                suggestion=f"set {path}.megatron_cfg.use_fused_linear_logprobs=false or disable filtering ({path}.generation.top_k=null, {path}.generation.top_p=1.0).",
+            )
 
 
 def _check_policy(config: BaseModel) -> None:
-    """Reject unsupported policy configurations."""
-    policy_config = getattr(config, "policy", None)
-    if policy_config is None:
-        return
-    megatron_cfg = policy_config.get("megatron_cfg")
+    """Reject unsupported configurations for each training backend."""
+    # resolve config
+    backend_configs = train_backend_configs(config)
 
-    if megatron_cfg and megatron_cfg["enabled"]:
-        _check_megatron(policy_config)
+    for path, backend_config in backend_configs:
+        # resolve config
+        megatron_cfg = backend_config.get("megatron_cfg")
+        automodel_cfg = backend_config.get("automodel_cfg")
+        dynamic_batching = backend_config.get("dynamic_batching")
+        pp_size = (
+            megatron_cfg["pipeline_model_parallel_size"]
+            if megatron_cfg and megatron_cfg["enabled"]
+            else 1
+        )
+
+        # dispatch checks
+        if megatron_cfg and megatron_cfg["enabled"]:
+            _check_megatron(backend_config, path=path)
+        elif automodel_cfg and automodel_cfg["enabled"]:
+            _check_automodel(backend_config, path=path)
+
+        # dynamic_batching, pipeline_model_parallel_size
+        if dynamic_batching and dynamic_batching["enabled"] and pp_size > 1:
+            _raise_unsupported_feature(
+                feature="dynamic batching + pipeline parallel",
+                condition=f"training {path}",
+                suggestion=f"disable {path}.dynamic_batching or set {path}.megatron_cfg.pipeline_model_parallel_size=1.",
+            )
 
 
 def _check_megatron_generation(
     config: BaseModel, *, entrypoint: EntryPoint | None
 ) -> None:
     """Reject unsupported Megatron generation configurations."""
+    # resolve config
     policy_config = getattr(config, "policy", None)
     router_replay = (
         policy_config.get("router_replay") if policy_config is not None else None
@@ -135,6 +206,7 @@ def _check_megatron_generation(
 
 def _check_dynamo(config: BaseModel) -> None:
     """Reject unsupported managed Dynamo configurations."""
+    # resolve config
     grpo_config = getattr(config, "grpo", None)
     if grpo_config is None:
         return
@@ -154,6 +226,7 @@ def _check_dynamo(config: BaseModel) -> None:
 
 def _check_generation(config: BaseModel, *, entrypoint: EntryPoint | None) -> None:
     """Reject unsupported generation configurations."""
+    # resolve config
     policy_config = getattr(config, "policy", None)
     generation = getattr(config, "generation", None)
     env_config = getattr(config, "env", None)
@@ -170,6 +243,7 @@ def _check_generation(config: BaseModel, *, entrypoint: EntryPoint | None) -> No
         or generation["val_top_k"] != generation["top_k"]
     )
 
+    # dispatch checks
     if backend == "megatron":
         _check_megatron_generation(config, entrypoint=entrypoint)
     elif backend == "dynamo":
@@ -211,6 +285,7 @@ def check_common(config: BaseModel, *, entrypoint: EntryPoint | None = None) -> 
 
 def _check_algo_distillation(config: DistillationMasterConfig) -> None:
     """Reject unsupported configurations for distillation."""
+    # resolve config
     backend_configs = (
         ("policy", "student", config.policy),
         ("teacher", "teacher", config.teacher),
@@ -250,6 +325,7 @@ def _check_algo_distillation(config: DistillationMasterConfig) -> None:
 
 def _check_algo_dpo(config: DPOMasterConfig) -> None:
     """Reject unsupported configurations for dpo."""
+    # resolve config
     policy_config = config.policy
     dynamic_batching = policy_config["dynamic_batching"]
     packing = policy_config.get("sequence_packing")
@@ -280,6 +356,7 @@ def _check_algo_eval(config: BaseModel) -> None:
 
 def _check_algo_grpo(config: GRPOMasterConfig) -> None:
     """Reject unsupported configurations for grpo."""
+    # resolve config
     grpo_config = config.grpo
 
     # async grpo
@@ -307,6 +384,7 @@ def _check_algo_grpo(config: GRPOMasterConfig) -> None:
 
 def _check_algo_mpo(config: MPOMasterConfig) -> None:
     """Reject unsupported configurations for mpo."""
+    # resolve config
     policy_config = config.policy
     dynamic_batching = policy_config["dynamic_batching"]
     packing = policy_config.get("sequence_packing")
@@ -332,6 +410,7 @@ def _check_algo_mpo(config: MPOMasterConfig) -> None:
 
 def _check_algo_ppo(config: PPOMasterConfig) -> None:
     """Reject unsupported configurations for ppo."""
+    # resolve config
     value_config = config.value
     value_automodel_cfg = value_config.get("automodel_cfg")
     value_packing = value_config.get("sequence_packing")
@@ -367,6 +446,7 @@ def _check_algo_ppo(config: PPOMasterConfig) -> None:
 
 def _check_algo_rm(config: RMMasterConfig) -> None:
     """Reject unsupported configurations for rm."""
+    # resolve config
     policy_config = config.policy
     automodel_cfg = policy_config.get("automodel_cfg")
 
@@ -384,6 +464,7 @@ def _check_algo_rm(config: RMMasterConfig) -> None:
 
 def _check_algo_sft(config: SFTMasterConfig) -> None:
     """Reject unsupported configurations for sft."""
+    # resolve config
     data_config = config.data
     sft_config = config.sft
 
@@ -406,6 +487,7 @@ def _check_algo_sft(config: SFTMasterConfig) -> None:
 
 def _check_algo_sft_v2(config: SFTV2MasterConfig) -> None:
     """Reject unsupported configurations for sft_v2."""
+    # resolve config
     policy_config = config.policy
     data_config = config.data
     sft_config = config.sft
@@ -466,10 +548,12 @@ def _check_algo_single_controller(config: SingleControllerMasterConfig) -> None:
     """Reject unsupported configurations for single_controller."""
     from nemo_rl.algorithms.single_controller_utils.config import algo_config
 
+    # resolve config
     algo = algo_config(config)
     algo_name = "ppo" if config.ppo is not None else "grpo"
     grpo_config = config.grpo
     loss_config = config.loss_fn
+    backend_configs = train_backend_configs(config)
 
     # dynamic sampling, reward scaling/shaping, length penalty
     unsupported = [
@@ -489,6 +573,16 @@ def _check_algo_single_controller(config: SingleControllerMasterConfig) -> None:
             condition="using SingleController",
             suggestion="disable these options.",
         )
+
+    # automodel
+    for section, backend_config in backend_configs:
+        automodel_cfg = backend_config.get("automodel_cfg")
+        if automodel_cfg and automodel_cfg["enabled"]:
+            _raise_unsupported_feature(
+                feature=f"Automodel {section}",
+                condition="using SingleController",
+                suggestion=f"use the Megatron backend for {section}.",
+            )
 
     # seq_logprob_error_in_loss
     if loss_config.seq_logprob_error_in_loss:

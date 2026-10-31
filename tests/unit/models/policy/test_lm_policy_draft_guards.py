@@ -46,12 +46,6 @@ def _init_policy(config):
     )
 
 
-def test_draft_with_context_parallelism_is_rejected():
-    """Online draft training must reject CP>1 at setup."""
-    with pytest.raises(ValueError, match="context parallelism"):
-        _init_policy(_draft_config(context_parallel_size=2))
-
-
 def test_draft_with_packing_and_pipeline_parallelism_is_rejected():
     """Packed draft training must reject PP>1: the re-embed of the shifted
     token ids needs the model embedding, which MCore constructs only on the

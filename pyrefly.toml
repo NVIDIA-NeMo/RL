@@ -339,6 +339,7 @@ project-includes = [
   "nemo_rl/utils/config_check/__init__.py",
   "nemo_rl/utils/config_check/outdated_config.py",
   "nemo_rl/utils/config_check/unsupported_feature.py",
+  "nemo_rl/utils/config_check/utils.py",
   "nemo_rl/utils/cuda_ipc.py",
   "nemo_rl/utils/fastokens.py",
   "nemo_rl/utils/grad_norm.py",

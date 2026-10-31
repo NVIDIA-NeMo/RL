@@ -1302,17 +1302,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "See examples/configs/ppo_math_1B_megatron_single_controller.yaml."
             )
 
-    # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
-    # setup_data_plane unconditionally, so an Automodel critic dies in Ray with the
-    # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
-    value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
-    if not value_megatron_cfg.get("enabled"):
-        raise ValueError(
-            "PPO on the SingleController path requires a Megatron critic "
-            "(value.megatron_cfg.enabled=true). The Automodel value worker does not "
-            "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
-        )
-
     policy_megatron_cfg = master_config.policy.get("megatron_cfg")
     if async_config.min_groups_for_streaming_train < algo_cfg.num_prompts_per_step:
         # Policy chunks accumulate into one optimizer update; critic epochs

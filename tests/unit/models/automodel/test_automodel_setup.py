@@ -205,29 +205,6 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
-    def test_context_parallel_with_sequence_packing_raises_error(
-        self,
-        mock_dynamo,
-        mock_resolve_class,
-        mock_autoconfig_class,
-        mock_config,
-    ):
-        """Test that CP with sequence packing raises ValueError."""
-        mock_config["sequence_packing"]["enabled"] = True
-        mock_config["automodel_cfg"]["context_parallel_size"] = 2
-
-        with pytest.raises(
-            ValueError, match="Context parallel is not supported for sequence packing"
-        ):
-            validate_and_prepare_config(
-                config=mock_config,
-                processor=None,
-                rank=0,
-            )
-
-    @patch("nemo_rl.models.automodel.setup.AutoConfig")
-    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
-    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
     def test_sequence_parallel_with_tp_size_one_prints_warning(
         self,
         mock_dynamo,

@@ -53,7 +53,7 @@ Every entrypoint that resolves a user config -- the `examples/` ones, the `resea
 ones, and `tools/refit_verifier.py` -- calls `check_outdated_config(config)` on it before
 the `MasterConfig` is built, so your function runs on the first line of every run and
 receives the config as the user wrote it -- plain dicts, no pydantic. If the key lives on
-a training backend block, iterate `_train_backend_configs` instead of re-deriving where
+a training backend block, iterate `train_backend_configs` instead of re-deriving where
 `policy`, `value`, `teacher`, `teachers[i]` and `env.reward_model` are.
 
 The message is the whole point. State what is wrong and what to write instead — a user

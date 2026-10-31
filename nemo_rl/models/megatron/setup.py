@@ -2232,22 +2232,6 @@ def _create_megatron_config(
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
-    # Fused linear logprobs run the decoder but read output_layer.weight directly
-    # instead of calling output_layer.forward(). Megatron's distributed-optimizer
-    # overlap_param_gather prefetch chain assumes every param-gather bucket
-    # (including the output layer) is consumed by a module forward; skipping it
-    # leaves a stale param_gather_handle and trips
-    #   assert self.param_gather_handle is None  (param_and_grad_buffer.py)
-    # on the next iteration, so the two are mutually exclusive.
-    if config["megatron_cfg"].get("use_fused_linear_logprobs", False):
-        assert not overlap_param_gather, (
-            "use_fused_linear_logprobs is incompatible with overlap_param_gather: "
-            "the fused forward bypasses output_layer.forward(), leaving a stale "
-            "param_gather_handle in the distributed-optimizer prefetch chain. "
-            "Set policy.megatron_cfg.distributed_data_parallel_config."
-            "overlap_param_gather=false."
-        )
-
     dist_cfg = DistributedInitConfig()
     # Bridge creates the model-parallel groups (TP/PP/DP/CP/EP) with an explicit
     # timeout from this field, so it must match the default group's timeout.

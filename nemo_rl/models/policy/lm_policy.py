@@ -226,18 +226,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "Automodel backend (policy.automodel_cfg.enabled=true)."
                 )
             if megatron_enabled:
-                # Megatron-specific guards (main #3463).
-                if config["megatron_cfg"]["context_parallel_size"] > 1:
-                    # Sequence packing itself is supported with the draft; CP
-                    # is not: the hidden-state capture and the per-segment
-                    # shifts assume each packed sequence lives whole on one
-                    # rank.
-                    raise ValueError(
-                        "policy.draft.enabled=true does not support context "
-                        "parallelism yet. Set "
-                        "policy.megatron_cfg.context_parallel_size=1 or disable "
-                        "policy.draft."
-                    )
                 if (
                     # sequence_packing is NotRequired in PolicyConfig, so
                     # tolerate its absence.
@@ -490,9 +478,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
 
         if config["dynamic_batching"]["enabled"]:
-            assert pp_size == 1, (
-                "Dynamic batching is only supported for single pipeline parallel stage"
-            )
             self.use_dynamic_batches = True
             self.dynamic_batching_args: DynamicBatchingArgs = {
                 "input_key": "input_ids",

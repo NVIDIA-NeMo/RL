@@ -355,12 +355,6 @@ def validate_and_prepare_config(
     # Get HF config overrides
     hf_config_overrides = config.get("hf_config_overrides", {}) or {}
 
-    rope_scaling = hf_config_overrides.get("rope_scaling") or {}
-    assert rope_scaling.get("rope_type") != "yarn", (
-        "YaRN RoPE scaling is not supported with the Automodel backend. "
-        "Please use the Megatron backend (policy.megatron_cfg.enabled=True) for YaRN."
-    )
-
     # NeMoAutoModelForCausalLM uses flash_attention_2 by default
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
@@ -426,13 +420,6 @@ def validate_and_prepare_config(
     tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["automodel_cfg"].get("context_parallel_size", 1)
     sequence_parallel_enabled = config["automodel_cfg"]["sequence_parallel"]
-
-    # Validate parallelization configuration
-    if cp_size > 1 and enable_seq_packing:
-        raise ValueError(
-            "Context parallel is not supported for sequence packing. "
-            "Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-automodel for more details."
-        )
 
     if sequence_parallel_enabled and tp_size == 1:
         print(
