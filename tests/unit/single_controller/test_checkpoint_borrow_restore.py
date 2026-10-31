@@ -34,6 +34,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.rollout_checkpointing.state import ResumeSource
 from nemo_rl.algorithms.single_controller import (
     RolloutRuntimeState,
     SingleControllerActor,
@@ -257,10 +258,10 @@ def _controller(
     controller._rollout_completion_durations_s = deque(maxlen=10_000)
     controller._rollout_queue_wait_durations_s = deque(maxlen=10_000)
     controller._logger = MagicMock()
-    controller._last_checkpoint_path = (
-        str(checkpoint_path) if checkpoint_path is not None else None
+    controller._resume = ResumeSource(
+        path=str(checkpoint_path) if checkpoint_path is not None else None,
+        data_plane_metadata=checkpoint_metadata,
     )
-    controller._data_plane_checkpoint_metadata = checkpoint_metadata
     attach_rollout_checkpointing(controller)
     return controller
 

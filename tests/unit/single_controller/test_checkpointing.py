@@ -94,6 +94,7 @@ from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     prepare_snapshot_paths,
 )
 from nemo_rl.algorithms.rollout_checkpointing.state import (
+    ResumeSource,
     RolloutCheckpointSaveResult,
 )
 from nemo_rl.algorithms.single_controller import (
@@ -2083,10 +2084,10 @@ class TestPeriodicRolloutCheckpoint:
             state["reward_settings"]
             == capture_reward_settings(actor._master_config).to_state()
         )
-        actor._last_checkpoint_path = str(snapshot)
-        actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
-            "metadata"
-        ]
+        actor._resume = ResumeSource(
+            path=str(snapshot),
+            data_plane_metadata=actor._dp_client.save_calls[-1]["metadata"],
+        )
         if changed_setting == "penalty":
             actor._master_config.reward_penalties.penalize_empty_final_answer = True
         elif changed_setting == "effort":
@@ -2425,12 +2426,14 @@ class TestPeriodicRolloutCheckpoint:
     def test_logs_restore_phase_total_and_reused_groups(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
-        actor._rollout_checkpoint_load_metrics = {
-            "snapshot_resolution_seconds": 0.5,
-            "dataloader_load_seconds": 1.0,
-            "tq_load_seconds": 2.0,
-            "future_restore_phase_seconds": 5.0,
-        }
+        actor._resume = ResumeSource(
+            load_metrics={
+                "snapshot_resolution_seconds": 0.5,
+                "dataloader_load_seconds": 1.0,
+                "tq_load_seconds": 2.0,
+                "future_restore_phase_seconds": 5.0,
+            }
+        )
         try:
             attach_rollout_checkpointing(actor)
             actor._rollout_restorer._log_restore_metrics(
@@ -2586,13 +2589,15 @@ class TestPeriodicRolloutCheckpoint:
         state = torch.load(recovery_path, weights_only=True)
         state["reward_settings"] = None
         torch.save(state, recovery_path)
-        actor._last_checkpoint_path = str(snapshot)
-        actor._data_plane_checkpoint_metadata = {
-            **actor._dp_client.save_calls[-1]["metadata"],
-            "rollout_recovery_payload_sha256": hashlib.sha256(
-                recovery_path.read_bytes()
-            ).hexdigest(),
-        }
+        actor._resume = ResumeSource(
+            path=str(snapshot),
+            data_plane_metadata={
+                **actor._dp_client.save_calls[-1]["metadata"],
+                "rollout_recovery_payload_sha256": hashlib.sha256(
+                    recovery_path.read_bytes()
+                ).hexdigest(),
+            },
+        )
         with pytest.raises(ValueError, match="saved with token capture disabled"):
             attach_rollout_checkpointing(actor)
             asyncio.run(
@@ -2674,10 +2679,10 @@ class TestPeriodicRolloutCheckpoint:
         actor._rollout_runtime.finalizer_rewards_by_group = {}
         actor._buffer.training_claims = []
         actor._buffer._metadata_state["groups"] = [canonical_group]
-        actor._last_checkpoint_path = str(snapshot)
-        actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
-            "metadata"
-        ]
+        actor._resume = ResumeSource(
+            path=str(snapshot),
+            data_plane_metadata=actor._dp_client.save_calls[-1]["metadata"],
+        )
         attach_rollout_checkpointing(actor)
         asyncio.run(
             actor._rollout_restorer._restore_recovery_ledger(restored_replay_groups=1)
@@ -4819,10 +4824,10 @@ class TestReplacementReservePersistence:
         actor = _ACTOR_CLS(
             _actor_master_config(tmp_path), _make_actor_args(), SetupTimingMetrics()
         )
-        actor._last_checkpoint_path = str(tmp_path)
-        actor._data_plane_checkpoint_metadata = {
-            "rollout_recovery_schema_version": schema
-        }
+        actor._resume = ResumeSource(
+            path=str(tmp_path),
+            data_plane_metadata={"rollout_recovery_schema_version": schema},
+        )
         attach_rollout_checkpointing(actor)
         try:
             if schema >= 5:
