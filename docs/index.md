@@ -388,6 +388,7 @@ design-docs/uv.md
 design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
+design-docs/sampling-params.md
 design-docs/ppo-colocated-streaming.md
 design-docs/pd-disaggregation-rollout.md
 design-docs/dynamo-integration.md
