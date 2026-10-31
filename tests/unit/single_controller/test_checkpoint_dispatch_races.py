@@ -33,7 +33,7 @@ import contextlib
 import hashlib
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional, TypeVar, cast
@@ -51,6 +51,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import _initial_grpo_save_state
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.rollout_checkpointing.state import ResumeSource
 from nemo_rl.algorithms.single_controller import (
     RolloutRuntimeState,
     SingleControllerActor,
@@ -1211,14 +1212,16 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
         controller._master_config = SimpleNamespace(
             token_capture=SimpleNamespace(enabled=False, forest_training=False)
         )
-        controller._last_checkpoint_path = str(tmp_path)
-        controller._data_plane_checkpoint_metadata = {
-            "forest_training": False,
-            "forest_execution_row_multiple": None,
-            "rollout_recovery_schema_version": schema_version,
-            "rollout_recovery_payload_sha256": payload_sha256,
-            "rollout_recovery_group_count": 1,
-        }
+        controller._resume = ResumeSource(
+            path=str(tmp_path),
+            data_plane_metadata={
+                "forest_training": False,
+                "forest_execution_row_multiple": None,
+                "rollout_recovery_schema_version": schema_version,
+                "rollout_recovery_payload_sha256": payload_sha256,
+                "rollout_recovery_group_count": 1,
+            },
+        )
         controller._async_cfg = SimpleNamespace(
             max_buffered_rollouts=4,
             max_inflight_prompts=2,
@@ -1333,17 +1336,19 @@ async def _turn_recovery_restart(
     controller._master_config = SimpleNamespace(
         token_capture=SimpleNamespace(enabled=False, forest_training=False)
     )
-    controller._last_checkpoint_path = str(tmp_path)
     # A rollout snapshot, which holds Gym state; a test of a trainer checkpoint
-    # clears this.
-    controller._restored_from_rollout_snapshot = True
-    controller._data_plane_checkpoint_metadata = {
-        "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-        "forest_training": False,
-        "forest_execution_row_multiple": None,
-        "rollout_recovery_payload_sha256": payload_sha256,
-        "rollout_recovery_group_count": 1,
-    }
+    # clears from_rollout_snapshot.
+    controller._resume = ResumeSource(
+        path=str(tmp_path),
+        from_rollout_snapshot=True,
+        data_plane_metadata={
+            "forest_training": False,
+            "forest_execution_row_multiple": None,
+            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "rollout_recovery_payload_sha256": payload_sha256,
+            "rollout_recovery_group_count": 1,
+        },
+    )
     controller._async_cfg = SimpleNamespace(
         max_buffered_rollouts=4,
         max_inflight_prompts=2,
@@ -1527,7 +1532,7 @@ def test_turn_recovery_from_a_trainer_checkpoint_restarts_unfinished_turns(
         controller, rollout_manager, gym_actor, _ = await _turn_recovery_restart(
             tmp_path
         )
-        controller._restored_from_rollout_snapshot = False
+        controller._resume = replace(controller._resume, from_rollout_snapshot=False)
         attach_rollout_checkpointing(controller)
         await controller._rollout_restorer._restore_recovery_ledger(
             restored_replay_groups=0
@@ -1558,7 +1563,9 @@ def test_turn_recovery_counts_continued_and_restarted_siblings(
         if gym_state == "manifest":
             _write_turn_manifest(tmp_path, episode)
         else:
-            controller._restored_from_rollout_snapshot = False
+            controller._resume = replace(
+                controller._resume, from_rollout_snapshot=False
+            )
         attach_rollout_checkpointing(controller)
         await controller._rollout_restorer._restore_recovery_ledger(
             restored_replay_groups=0
@@ -1671,16 +1678,18 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         controller._master_config = SimpleNamespace(
             token_capture=SimpleNamespace(enabled=False, forest_training=False)
         )
-        controller._last_checkpoint_path = str(tmp_path)
-        controller._data_plane_checkpoint_metadata = {
-            "forest_training": False,
-            "forest_execution_row_multiple": None,
-            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-            "rollout_recovery_payload_sha256": hashlib.sha256(
-                recovery_path.read_bytes()
-            ).hexdigest(),
-            "rollout_recovery_group_count": 2,
-        }
+        controller._resume = ResumeSource(
+            path=str(tmp_path),
+            data_plane_metadata={
+                "forest_training": False,
+                "forest_execution_row_multiple": None,
+                "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+                "rollout_recovery_payload_sha256": hashlib.sha256(
+                    recovery_path.read_bytes()
+                ).hexdigest(),
+                "rollout_recovery_group_count": 2,
+            },
+        )
         controller._async_cfg = SimpleNamespace(
             max_buffered_rollouts=4,
             max_inflight_prompts=2,
@@ -1840,16 +1849,18 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         controller._master_config = SimpleNamespace(
             token_capture=SimpleNamespace(enabled=False, forest_training=False)
         )
-        controller._last_checkpoint_path = str(tmp_path)
-        controller._data_plane_checkpoint_metadata = {
-            "forest_training": False,
-            "forest_execution_row_multiple": None,
-            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-            "rollout_recovery_payload_sha256": hashlib.sha256(
-                recovery_path.read_bytes()
-            ).hexdigest(),
-            "rollout_recovery_group_count": 2,
-        }
+        controller._resume = ResumeSource(
+            path=str(tmp_path),
+            data_plane_metadata={
+                "forest_training": False,
+                "forest_execution_row_multiple": None,
+                "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+                "rollout_recovery_payload_sha256": hashlib.sha256(
+                    recovery_path.read_bytes()
+                ).hexdigest(),
+                "rollout_recovery_group_count": 2,
+            },
+        )
         controller._async_cfg = SimpleNamespace(max_buffered_rollouts=4)
         controller._dataloader = SimpleNamespace(
             dataset={
@@ -2042,14 +2053,16 @@ def test_recovery_rejects_a_corrupt_ledger_sidecar(tmp_path) -> None:
     controller._master_config = SimpleNamespace(
         token_capture=SimpleNamespace(forest_training=False)
     )
-    controller._last_checkpoint_path = str(tmp_path)
-    controller._data_plane_checkpoint_metadata = {
-        "forest_training": False,
-        "forest_execution_row_multiple": None,
-        "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-        "rollout_recovery_payload_sha256": "0" * 64,
-        "rollout_recovery_group_count": 1,
-    }
+    controller._resume = ResumeSource(
+        path=str(tmp_path),
+        data_plane_metadata={
+            "forest_training": False,
+            "forest_execution_row_multiple": None,
+            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "rollout_recovery_payload_sha256": "0" * 64,
+            "rollout_recovery_group_count": 1,
+        },
+    )
 
     with pytest.raises(ValueError, match="checksum mismatch"):
         attach_rollout_checkpointing(controller)
@@ -2068,14 +2081,16 @@ def test_recovery_rejects_a_missing_advertised_ledger_sidecar(tmp_path) -> None:
     controller._master_config = SimpleNamespace(
         token_capture=SimpleNamespace(forest_training=False)
     )
-    controller._last_checkpoint_path = str(tmp_path)
-    controller._data_plane_checkpoint_metadata = {
-        "forest_training": False,
-        "forest_execution_row_multiple": None,
-        "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-        "rollout_recovery_payload_sha256": "0" * 64,
-        "rollout_recovery_group_count": 1,
-    }
+    controller._resume = ResumeSource(
+        path=str(tmp_path),
+        data_plane_metadata={
+            "forest_training": False,
+            "forest_execution_row_multiple": None,
+            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "rollout_recovery_payload_sha256": "0" * 64,
+            "rollout_recovery_group_count": 1,
+        },
+    )
 
     with pytest.raises(FileNotFoundError, match="sidecar is missing"):
         attach_rollout_checkpointing(controller)

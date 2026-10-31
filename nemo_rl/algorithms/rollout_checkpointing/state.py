@@ -28,6 +28,7 @@ from typing import (
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
+    DataPlaneCheckpointMetadata,
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.metric_utils import (
@@ -123,6 +124,17 @@ class TrainingProgress:
     train_steps: int
     trainer_version: int
     current_epoch: int
+
+
+@dataclass(frozen=True)
+class ResumeSource:
+    """The checkpoint setup restored from; the defaults describe a fresh run."""
+
+    path: Optional[str] = None
+    from_rollout_snapshot: bool = False
+    data_plane_metadata: Optional[DataPlaneCheckpointMetadata] = None
+    # Setup's load timings, logged with the restore timings.
+    load_metrics: Optional[dict[str, float]] = None
 
 
 @dataclass(frozen=True)

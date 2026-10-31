@@ -21,20 +21,12 @@ from typing import Any, Optional
 from nemo_rl.algorithms.rollout_checkpointing.restore import RolloutRestorer
 from nemo_rl.algorithms.rollout_checkpointing.snapshots import RolloutSnapshotter
 from nemo_rl.algorithms.rollout_checkpointing.state import (
+    ResumeSource,
     RolloutParts,
     RolloutRuntimeState,
     TrainingProgress,
 )
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
-
-# What the resumed checkpoint gave restore, keyed by RolloutRestorer's
-# constructor argument, with the value for a fresh run.
-_RESTORE_INPUTS: dict[str, Any] = {
-    "last_checkpoint_path": None,
-    "restored_from_rollout_snapshot": False,
-    "data_plane_checkpoint_metadata": None,
-    "rollout_checkpoint_load_metrics": None,
-}
 
 
 def bare_rollout_snapshotter(
@@ -118,14 +110,11 @@ def attach_rollout_checkpointing(controller: Any) -> None:
         parts,
         algo_cfg=getattr(controller, "_algo_cfg", None),
         buffer_capacity=getattr(controller, "_buffer_capacity", asyncio.Semaphore(0)),
-        # Restore inputs a test set on the controller win; otherwise keep what
-        # the restorer was built with.
-        **{
-            name: getattr(
-                controller, f"_{name}", getattr(restorer, f"_{name}", default)
-            )
-            for name, default in _RESTORE_INPUTS.items()
-        },
+        # A test sets what the run resumed from on the controller; otherwise
+        # keep what the restorer was built with.
+        resume=getattr(
+            controller, "_resume", restorer._resume if restorer else ResumeSource()
+        ),
     )
     if restorer is not None:
         controller._rollout_restorer._groups_to_regenerate = (
