@@ -46,6 +46,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.distributed.refit_watchdog import is_refit_context_lost
 from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
@@ -215,7 +216,12 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
             try:
                 ray.get(futures_train)
-            except BaseException:
+            except BaseException as failure:
+                # A lost CUDA context cannot be recovered in this process. Waiting for
+                # stragglers would hide this diagnosis behind the controller's shorter
+                # timeout, which then attempts a rebuild on the unusable devices.
+                if is_refit_context_lost(failure):
+                    raise
                 # Every rank must be out of the old refit before the caller can rebuild
                 # over the survivors; see _settle_before_propagating. BOTH sides: the
                 # rebuild dispatches init_collective to the generation ranks too, and
@@ -253,7 +259,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 dp_size=self._generation.worker_group.dp_size,
                 total_gen_workers=len(self._generation.worker_group.workers),
                 train_world_size=self._train_cluster.world_size(),
-            )
+            ).with_actor_ids(self._generation.worker_group.workers)
         )
 
     def _build(self, membership: RefitMembership) -> None:
@@ -374,6 +380,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             nccl_reshard_refit_info
         )
         self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
+        membership.validate_actor_ids(self._generation.worker_group.workers)
         self._built_membership = membership
 
     def _settle_budget_s(self) -> float:
@@ -410,7 +417,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             dp_size=self._generation.worker_group.dp_size,
             total_gen_workers=len(self._generation.worker_group.workers),
             train_world_size=self._train_cluster.world_size(),
-        )
+        ).with_actor_ids(self._generation.worker_group.workers)
         # An unrecorded membership means the full fleet -- see should_rebuild's docstring,
         # which owns the rest of this rule for both hardened transports.
         if self._built_membership is None:
@@ -419,7 +426,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 dp_size=self._generation.worker_group.dp_size,
                 total_gen_workers=len(self._generation.worker_group.workers),
                 train_world_size=membership.train_world_size,
-            )
+            ).with_actor_ids(self._generation.worker_group.workers)
         if not should_rebuild(
             desired=membership,
             built=self._built_membership,
@@ -430,7 +437,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         print(
             f"  refit: rebuilding nccl_reshard communicators over shards "
             f"{membership.surviving_shards}; gen world "
-            f"{membership.world_size - membership.train_world_size}",
+            f"{membership.world_size - membership.train_world_size}; actor identities "
+            f"changed={membership.actor_ids != self._built_membership.actor_ids}",
             flush=True,
         )
         self._build(membership)

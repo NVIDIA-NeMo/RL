@@ -23,9 +23,12 @@ transports that own no NCCL world alone.
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+from ray import ActorID
 
+from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -34,7 +37,7 @@ from nemo_rl.models.generation.fleet_health import (
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
-from nemo_rl.weight_sync.membership import NoSurvivingShards
+from nemo_rl.weight_sync.membership import NoSurvivingShards, desired_membership
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
     NcclReshardWeightSynchronizer,
 )
@@ -49,7 +52,7 @@ def _minimal_generation(dp_size=2):
     """
     return SimpleNamespace(
         worker_group=SimpleNamespace(
-            workers=[object()] * dp_size,
+            workers=[_FakeWorker(idx) for idx in range(dp_size)],
             dp_size=dp_size,
             get_dp_leader_worker_idx=lambda shard: shard,
         ),
@@ -101,6 +104,7 @@ class _FakeWorker:
 
     def __init__(self, idx: int, *, dead: bool = False) -> None:
         self.idx = idx
+        self._actor_id = ActorID.from_random()
         self.dead = dead
         self.calls: list[dict] = []
 
@@ -141,6 +145,7 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
         # asks the backend which one that is. A stand-in has to carry every hook the code
         # under test reads, or it tests a shape the product never has.
         get_collective_sender_spec=lambda: SimpleNamespace(nccl_peer="nemo"),
+        get_inference_world_size=lambda: dp_size * workers_per_shard,
     )
     from nemo_rl.models.generation.vllm import vllm_generation
 
@@ -155,6 +160,18 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     generation.rebuild_collective = lambda membership, ip, port: (
         vllm_generation.VllmGeneration.rebuild_collective(
             generation, membership, ip, port
+        )
+    )
+    generation.init_collective = (
+        lambda ip, port, world_size, train_world_size: generation.rebuild_collective(
+            desired_membership(
+                absent_shards=[],
+                dp_size=dp_size,
+                total_gen_workers=len(workers),
+                train_world_size=train_world_size,
+            ),
+            ip,
+            port,
         )
     )
     policy_calls = []
@@ -612,6 +629,39 @@ class TestStragglersAreWaitedForBeforeARebuild:
         assert waited["num_returns"] == 3, "all of them, not just the first"
         assert waited["timeout"] == 90.0
 
+    @pytest.mark.parametrize(
+        ("failure", "should_settle"),
+        [
+            (RefitAborted("[refit-context-lost] bulk transfer timed out"), False),
+            (RuntimeError("remote failure: [refit-context-lost]"), False),
+            (RefitAborted("a generation rank died"), True),
+        ],
+    )
+    def test_fatal_refit_errors_are_not_delayed_by_stragglers(
+        self, monkeypatch: pytest.MonkeyPatch, failure: Exception, should_settle: bool
+    ) -> None:
+        """A fatal worker diagnosis must reach the controller before its timeout."""
+        sync = _reshard()
+        sync._policy = SimpleNamespace(
+            nccl_reshard_refit=Mock(return_value=["train-0", "train-1"])
+        )
+        sync._generation.nccl_reshard_refit = Mock(return_value=["gen-0", "gen-1"])
+        monkeypatch.setattr("ray.get", Mock(side_effect=failure))
+        wait = Mock(return_value=([], ["pending"]))
+        monkeypatch.setattr("ray.wait", wait)
+
+        with pytest.raises(type(failure)) as caught:
+            sync.sync_weights()
+
+        assert caught.value is failure
+        if should_settle:
+            assert [call.args[0] for call in wait.call_args_list] == [
+                ["train-0", "train-1"],
+                ["gen-0", "gen-1"],
+            ]
+        else:
+            wait.assert_not_called()
+
     def test_it_is_bounded_rather_than_blocking_the_recovery(self, monkeypatch):
         """A caller stuck here is a worse wedge than the one being recovered from."""
         from nemo_rl.weight_sync import nccl_reshard_weight_synchronizer as mod
@@ -678,7 +728,7 @@ class TestBackendsWithoutAWorkerGroup:
         generation = SimpleNamespace()
         if has_worker_group:
             generation.worker_group = SimpleNamespace(
-                dp_size=2, workers=[object(), object()]
+                dp_size=2, workers=[_FakeWorker(0), _FakeWorker(1)]
             )
         sync._generation = generation
         sync._train_cluster = SimpleNamespace(world_size=lambda: 2)
