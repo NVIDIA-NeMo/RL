@@ -793,6 +793,7 @@ def _distillation_train_impl(
         )
 
         for batch in dataloader:
+            checkpointer.raise_if_finalization_failed()
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_steps)} {'=' * 25}",
                 flush=True,

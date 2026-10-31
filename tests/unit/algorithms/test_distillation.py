@@ -279,6 +279,33 @@ def test_distillation_train_max_steps(mock_components):
     assert final_timing_call.kwargs["step_finished"] is True
 
 
+def test_failed_checkpoint_finalization_stops_before_training(mock_components):
+    """A failed background checkpoint finalization stops the loop before it trains."""
+    checkpointer = mock_components["checkpointer"]
+    checkpointer.raise_if_finalization_failed.side_effect = RuntimeError(
+        "Background checkpoint finalization failed"
+    )
+
+    with pytest.raises(RuntimeError, match="Background checkpoint finalization failed"):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            checkpointer,
+            _initial_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+    mock_components["student_policy"].train.assert_not_called()
+
+
 def test_ft_save_period_triggers_periodic_saves(mock_components):
     """ft_save_period triggers checkpoint saves independent of save_period."""
     cfg = mock_components["master_config"]

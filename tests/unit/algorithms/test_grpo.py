@@ -117,6 +117,7 @@ from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig, WandbConfig
@@ -5647,6 +5648,106 @@ def test_grpo_ft_save_period_triggers_periodic_saves(
     # step (5). Each save calls init_tmp_checkpoint(step, ...).
     saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
     assert saved_steps == [2, 4, 5]
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_failed_checkpoint_finalization_stops_before_next_step(
+    mock_grpo_components, train_func, tmp_path, monkeypatch
+):
+    """A failed background checkpoint finalization stops training at the next step.
+
+    The step-2 checkpoint's async write fails while it finalizes in the
+    background. Training must stop before step 3 trains instead of running on
+    until the step-4 save notices the failure.
+    """
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 6
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 2
+    master_config.checkpointing["metric_name"] = None
+
+    checkpointer = CheckpointManager(
+        {
+            "enabled": True,
+            "checkpoint_dir": tmp_path,
+            "metric_name": None,
+            "higher_is_better": False,
+            "save_period": 2,
+            "keep_top_k": None,
+            "save_optimizer": True,
+        }
+    )
+    policy.finalize_async_save.side_effect = OSError("async checkpoint write failed")
+
+    # Let the failure land before the next step starts, as it does whenever the
+    # async write fails sooner than a training step finishes.
+    begin_finalization = checkpointer.begin_finalization
+
+    def begin_finalization_and_wait(*args, **kwargs):
+        begin_finalization(*args, **kwargs)
+        checkpointer._finalize_thread.join(timeout=10)
+        assert not checkpointer._finalize_thread.is_alive()
+
+    monkeypatch.setattr(checkpointer, "begin_finalization", begin_finalization_and_wait)
+
+    with ExitStack() as stack:
+        if train_func == async_grpo_train:
+            master_config.policy["generation"]["colocated"]["enabled"] = False
+            stack.enter_context(
+                mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+            )
+        else:
+            for rollout_fn in (
+                "run_multi_turn_rollout",
+                "run_async_multi_turn_rollout",
+            ):
+                stack.enter_context(
+                    patch(
+                        f"nemo_rl.algorithms.grpo.{rollout_fn}",
+                        return_value=(mock_batch, mock_rollout_metrics),
+                    )
+                )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                    return_value=_mock_seq_logprob_error_result(),
+                )
+            )
+        stack.enter_context(_patched_logprob_phase(policy))
+        stack.enter_context(patch("nemo_rl.algorithms.grpo.torch.save"))
+
+        with pytest.raises(
+            RuntimeError, match="Background checkpoint finalization failed"
+        ):
+            train_func(
+                policy,
+                _mock_policy_generation(),
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                checkpointer,
+                _initial_grpo_save_state(),
+                master_config,
+            )
+
+    # Steps 1 and 2 trained; step 3 never did.
+    assert policy.train.call_count == 2
+    # The failed checkpoint never became visible to resume.
+    assert (tmp_path / "tmp_step_2").is_dir()
+    assert not (tmp_path / "step_2").exists()
 
 
 def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
