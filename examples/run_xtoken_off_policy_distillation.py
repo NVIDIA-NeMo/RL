@@ -34,7 +34,11 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.config_check import check_outdated_config, check_unsupported_feature
+from nemo_rl.utils.config_check import (
+    EntryPoint,
+    check_outdated_config,
+    check_unsupported_feature,
+)
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 
@@ -66,7 +70,9 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    check_unsupported_feature(config)
+    check_unsupported_feature(
+        config, entrypoint=EntryPoint.XTOKEN_OFF_POLICY_DISTILLATION
+    )
 
     config = MasterConfig(**config)
     # Per-teacher same-vocab vs cross-tokenizer is determined solely by

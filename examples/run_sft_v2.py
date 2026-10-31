@@ -44,7 +44,11 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.config_check import check_outdated_config, check_unsupported_feature
+from nemo_rl.utils.config_check import (
+    EntryPoint,
+    check_outdated_config,
+    check_unsupported_feature,
+)
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 
@@ -74,7 +78,7 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
     resolved = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(resolved)
-    check_unsupported_feature(resolved)
+    check_unsupported_feature(resolved, entrypoint=EntryPoint.SFT_V2)
     master_config = MasterConfig.model_validate(resolved)
     master_config.logger.log_dir = get_next_experiment_dir(master_config.logger.log_dir)
     pprint.pprint(master_config.model_dump())

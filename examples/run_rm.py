@@ -24,7 +24,11 @@ from nemo_rl.data.utils import setup_preference_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
-from nemo_rl.utils.config_check import check_outdated_config, check_unsupported_feature
+from nemo_rl.utils.config_check import (
+    EntryPoint,
+    check_outdated_config,
+    check_unsupported_feature,
+)
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 
@@ -58,7 +62,7 @@ def main():
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    check_unsupported_feature(config)
+    check_unsupported_feature(config, entrypoint=EntryPoint.RM)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 

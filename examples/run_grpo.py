@@ -45,7 +45,11 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.config_check import check_outdated_config, check_unsupported_feature
+from nemo_rl.utils.config_check import (
+    EntryPoint,
+    check_outdated_config,
+    check_unsupported_feature,
+)
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
 from nemo_rl.utils.timer import Timer
 
@@ -89,7 +93,7 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
-        check_unsupported_feature(config)
+        check_unsupported_feature(config, entrypoint=EntryPoint.GRPO)
         config = MasterConfig(**config)
         if config.env.get("should_use_nemo_gym"):
             raise ValueError(

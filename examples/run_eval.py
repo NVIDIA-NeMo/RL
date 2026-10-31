@@ -30,7 +30,7 @@ from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config
-from nemo_rl.utils.config_check import check_unsupported_feature
+from nemo_rl.utils.config_check import EntryPoint, check_unsupported_feature
 
 
 def parse_args():
@@ -103,7 +103,7 @@ def main():
         config = OmegaConf.merge(config, override_conf)
 
     config = OmegaConf.to_container(config, resolve=True)
-    check_unsupported_feature(config)
+    check_unsupported_feature(config, entrypoint=EntryPoint.EVAL)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 

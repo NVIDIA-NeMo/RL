@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from nemo_rl.utils.config_check.outdated_config import check_outdated_config
-from nemo_rl.utils.config_check.unsupported_feature import check_unsupported_feature
+from nemo_rl.utils.config_check.unsupported_feature import (
+    EntryPoint,
+    check_unsupported_feature,
+)
 
-__all__ = ["check_outdated_config", "check_unsupported_feature"]
+__all__ = ["EntryPoint", "check_outdated_config", "check_unsupported_feature"]

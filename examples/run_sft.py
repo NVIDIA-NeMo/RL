@@ -38,7 +38,11 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.config_check import check_outdated_config, check_unsupported_feature
+from nemo_rl.utils.config_check import (
+    EntryPoint,
+    check_outdated_config,
+    check_unsupported_feature,
+)
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 
@@ -209,7 +213,7 @@ def main(is_vlm: bool = False):
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    check_unsupported_feature(config)
+    check_unsupported_feature(config, entrypoint=EntryPoint.SFT)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
