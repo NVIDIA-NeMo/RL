@@ -3553,6 +3553,8 @@ def test_worker_initialization_preserves_only_restored_rng(
             "_model_slices_context_parallel_inputs",
             "_model_accepts_media_token_validity_mask",
             "_reserved_http_server_port_for_rank",
+            "resolve_draft_speculator",
+            "_validate_draft_training_setup",
         )
     }
     runtime = MagicMock()
