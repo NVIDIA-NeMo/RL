@@ -75,6 +75,57 @@ def test_dtype_bucket_pp1_preserves_current_validated_export() -> None:
         )
 
 
+@pytest.mark.mcore
+@pytest.mark.parametrize("metadata_only", [False, True])
+def test_pp_owner_transport_batches_dtypes_in_pytest_process(
+    monkeypatch: pytest.MonkeyPatch, metadata_only: bool
+) -> None:
+    pp_group = object()
+    expected = [
+        ("draft.bf16_a", torch.arange(2, dtype=torch.bfloat16)),
+        ("draft.fp32", torch.arange(3, dtype=torch.float32)),
+        ("draft.bf16_b", torch.arange(4, dtype=torch.bfloat16)),
+    ]
+    broadcast_dtypes: list[torch.dtype] = []
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [0, 1])
+    monkeypatch.setattr(dist, "get_backend", lambda group: "gloo")
+    monkeypatch.setattr(dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(dist, "all_reduce", lambda tensor, *, op, group: None)
+
+    def record_broadcast(tensor: torch.Tensor, *, src: int, group: object) -> None:
+        assert src == 1
+        assert group is pp_group
+        broadcast_dtypes.append(tensor.dtype)
+
+    monkeypatch.setattr(dist, "broadcast", record_broadcast)
+
+    result = draft_utils.broadcast_draft_weights_from_pp_owner(
+        local_exporter=lambda: expected,
+        metadata_only=metadata_only,
+        pp_group=pp_group,
+        expected_pp_size=2,
+        cp_rank=0,
+    )
+
+    assert [name for name, _ in result] == [name for name, _ in expected]
+    if metadata_only:
+        assert all(tensor.device.type == "meta" for _, tensor in result)
+        assert broadcast_dtypes == [torch.int64, torch.int64, torch.uint8]
+    else:
+        for (_, actual), (_, wanted) in zip(result, expected, strict=True):
+            torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+        assert broadcast_dtypes == [
+            torch.int64,
+            torch.int64,
+            torch.uint8,
+            torch.bfloat16,
+            torch.float32,
+        ]
+
+
 def _lane_groups(rank: int) -> tuple[dist.ProcessGroup, dist.ProcessGroup, int]:
     pp_groups = [dist.new_group([0, 2]), dist.new_group([1, 3])]
     cp_groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
