@@ -342,7 +342,9 @@ async def _exercise_round_trip(
     checkpoint_path = tmp_path / "step_0"
     checkpoint_path.mkdir()
     async with first._data_plane_checkpoint_barrier.checkpoint() as cut:
-        snapshot = await first._capture_rollout_checkpoint_cut(cut, checkpoint_path)
+        snapshot = await first._capture_rollout_state(
+            cut, checkpoint_path, "rollout_snapshot"
+        )
     assert snapshot.replay_metadata is not None
     assert snapshot.rollout_recovery_payload is not None
     torch.save(
