@@ -162,6 +162,8 @@ policy:
     manual_gc: false
     manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     fine_grained_activation_offloading: false
     offload_modules: null
     converter_type: "Qwen2ForCausalLM"
@@ -371,6 +373,8 @@ value:
     manual_gc: false
     manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     fine_grained_activation_offloading: false
     offload_modules: null
     tensor_model_parallel_size: 1

@@ -163,6 +163,8 @@ policy:
     manual_gc: false
     manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
     # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
     fine_grained_activation_offloading: false
@@ -394,6 +396,8 @@ value:
     manual_gc: false
     manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
     # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
     fine_grained_activation_offloading: false
