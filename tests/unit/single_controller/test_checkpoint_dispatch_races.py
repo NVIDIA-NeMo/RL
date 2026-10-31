@@ -1581,11 +1581,14 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
                 saved_state.pop(key)
             for group in saved_state["groups"]:
                 group.pop("resolved_agent_name", None)
+                group["recovery_granularity"] = group.pop("restore_level")
                 for sibling in group["siblings"]:
                     for attempt in sibling["attempts"]:
                         attempt.pop("reward_checks", None)
                         attempt.pop("reward_log_context", None)
                         attempt.pop("logical_selection", None)
+                        attempt.pop("gym_instance_id")
+                        attempt.pop("gym_attempt")
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
         torch.save(saved_state, recovery_path)
         payload_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()
