@@ -232,8 +232,9 @@ if __name__ == "__main__":
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    check_unsupported_feature(config)
+
     config = MasterConfig(**config)
+    check_unsupported_feature(config)
     print("Applied CLI overrides")
 
     pprint(config)

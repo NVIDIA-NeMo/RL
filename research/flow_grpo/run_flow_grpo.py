@@ -74,13 +74,14 @@ def main() -> None:
         cfg = parse_hydra_overrides(cfg, overrides)
     cfg = OmegaConf.to_container(cfg, resolve=True)
     check_outdated_config(cfg)
-    check_unsupported_feature(cfg)
+
     print("Final config:")
     pprint.pprint(cfg)
 
     # Validate against the schema; field defaults live on the BaseModels
     # (config-conventions v2), so downstream code reads values directly.
     master = MasterConfig.model_validate(cfg)
+    check_unsupported_feature(master)
 
     master.logger.log_dir = get_next_experiment_dir(master.logger.log_dir)
     print(f"📊 log_dir: {master.logger.log_dir}")

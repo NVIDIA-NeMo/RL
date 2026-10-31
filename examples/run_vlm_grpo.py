@@ -79,8 +79,9 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
-        check_unsupported_feature(config, entrypoint=EntryPoint.VLM_GRPO)
+
         config = MasterConfig(**config)
+        check_unsupported_feature(config, entrypoint=EntryPoint.VLM_GRPO)
         # Materialize the video sampling contract before constructing the
         # processor or vLLM workers.  In particular, this overrides vLLM
         # VideoMediaIO's independent 32-frame default for 64-frame recipes.

@@ -61,8 +61,9 @@ def main():
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    check_unsupported_feature(config, entrypoint=EntryPoint.DPO)
+
     config = MasterConfig(**config)
+    check_unsupported_feature(config, entrypoint=EntryPoint.DPO)
     print("Applied CLI overrides")
 
     # Print config

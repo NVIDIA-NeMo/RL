@@ -93,8 +93,9 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
-        check_unsupported_feature(config, entrypoint=EntryPoint.GRPO)
+
         config = MasterConfig(**config)
+        check_unsupported_feature(config, entrypoint=EntryPoint.GRPO)
         if config.env.get("should_use_nemo_gym"):
             raise ValueError(
                 "env.should_use_nemo_gym=true: run this config with "

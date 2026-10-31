@@ -223,8 +223,9 @@ def main():
 
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
-        check_unsupported_feature(config, entrypoint=EntryPoint.GRPO)
+
         config = MasterConfig(**config)
+        check_unsupported_feature(config, entrypoint=EntryPoint.GRPO)
         print("Applied CLI overrides")
 
     # Print config

@@ -114,8 +114,9 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    check_unsupported_feature(config, entrypoint=EntryPoint.PPO)
+
     config = MasterConfig(**config)
+    check_unsupported_feature(config, entrypoint=EntryPoint.PPO)
     print("Applied CLI overrides")
 
     if config.ppo.async_ppo is None:

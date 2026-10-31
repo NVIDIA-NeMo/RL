@@ -60,8 +60,9 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
     resolved = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(resolved)
-    check_unsupported_feature(resolved, entrypoint=EntryPoint.VLM_MPO)
+
     master_config = MasterConfig.model_validate(resolved)
+    check_unsupported_feature(master_config, entrypoint=EntryPoint.VLM_MPO)
     pprint.pprint(master_config.model_dump())
 
     master_config.logger.log_dir = get_next_experiment_dir(master_config.logger.log_dir)

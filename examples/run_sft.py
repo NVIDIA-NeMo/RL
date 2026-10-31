@@ -213,8 +213,9 @@ def main(is_vlm: bool = False):
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    check_unsupported_feature(config, entrypoint=EntryPoint.SFT)
+
     config = MasterConfig(**config)
+    check_unsupported_feature(config, entrypoint=EntryPoint.SFT)
     print("Applied CLI overrides")
 
     # Print config

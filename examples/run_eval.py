@@ -103,8 +103,9 @@ def main():
         config = OmegaConf.merge(config, override_conf)
 
     config = OmegaConf.to_container(config, resolve=True)
-    check_unsupported_feature(config, entrypoint=EntryPoint.EVAL)
+
     config = MasterConfig(**config)
+    check_unsupported_feature(config, entrypoint=EntryPoint.EVAL)
     print("Applied CLI overrides")
 
     # Print config

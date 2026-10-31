@@ -13,8 +13,18 @@
 # limitations under the License.
 """Checks configuration for unsupported features before worker startup."""
 
+from __future__ import annotations
+
 from enum import Enum
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, cast
+
+from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
+    from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+    from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
+    from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
 
 
 class EntryPoint(str, Enum):
@@ -57,25 +67,25 @@ def _raise_unsupported_feature(
     raise ValueError(" ".join(parts))
 
 
-def check_common(config: dict[str, Any]) -> None:
+def check_common(config: BaseModel | dict[str, Any]) -> None:
     """Reject unsupported configurations shared by all entrypoints."""
     pass
 
 
-def _check_algo_distillation(config: dict[str, Any]) -> None:
+def _check_algo_distillation(config: DistillationMasterConfig) -> None:
     """Reject unsupported configurations for distillation."""
-    for section, who in (("policy", "student"), ("teacher", "teacher")):
-        backend_config = config.get(section)
-        if not isinstance(backend_config, dict):
-            continue
+    for section, who, backend_config in (
+        ("policy", "student", config.policy),
+        ("teacher", "teacher", config.teacher),
+    ):
         automodel_cfg = backend_config.get("automodel_cfg")
         packing = backend_config.get("sequence_packing")
         if (
-            isinstance(automodel_cfg, dict)
-            and automodel_cfg.get("enabled")
-            and automodel_cfg.get("sequence_parallel")
-            and isinstance(packing, dict)
-            and packing.get("enabled")
+            automodel_cfg
+            and automodel_cfg["enabled"]
+            and automodel_cfg["sequence_parallel"]
+            and packing
+            and packing["enabled"]
         ):
             _raise_unsupported_feature(
                 feature="sequence parallel + sequence packing",
@@ -85,50 +95,46 @@ def _check_algo_distillation(config: dict[str, Any]) -> None:
             )
 
 
-def _check_algo_dpo(config: dict[str, Any]) -> None:
+def _check_algo_dpo(config: BaseModel) -> None:
     """Reject unsupported configurations for dpo."""
     pass
 
 
-def _check_algo_eval(config: dict[str, Any]) -> None:
+def _check_algo_eval(config: BaseModel) -> None:
     """Reject unsupported configurations for eval."""
     pass
 
 
-def _check_algo_grpo(config: dict[str, Any]) -> None:
+def _check_algo_grpo(config: BaseModel) -> None:
     """Reject unsupported configurations for grpo."""
     pass
 
 
-def _check_algo_ppo(config: dict[str, Any]) -> None:
+def _check_algo_ppo(config: PPOMasterConfig) -> None:
     """Reject unsupported configurations for ppo."""
-    loss_config = config.get("loss_fn")
-    if isinstance(loss_config, dict) and loss_config.get("seq_logprob_error_in_loss"):
+    if config.loss_fn.seq_logprob_error_in_loss:
         _raise_unsupported_feature(
             feature="loss_fn.seq_logprob_error_in_loss",
             condition="using PPO",
             suggestion="disable it or use non-streaming GRPO.",
         )
 
-    value_config = config.get("value")
-    if not isinstance(value_config, dict):
-        return
+    value_config = config.value
     megatron_cfg = value_config.get("megatron_cfg")
-    if isinstance(megatron_cfg, dict) and megatron_cfg.get("enabled"):
+    if megatron_cfg and megatron_cfg["enabled"]:
         return
     automodel_cfg = value_config.get("automodel_cfg")
-    if not isinstance(automodel_cfg, dict) or not automodel_cfg.get("enabled"):
+    if not automodel_cfg or not automodel_cfg["enabled"]:
         return
     packing = value_config.get("sequence_packing")
-    if isinstance(packing, dict) and packing.get("enabled"):
+    if packing and packing["enabled"]:
         _raise_unsupported_feature(
             feature="sequence packing",
             condition="using the Automodel PPO value model",
             suggestion="set value.sequence_packing.enabled=false.",
             tracking_url="https://github.com/NVIDIA-NeMo/RL/issues/2951",
         )
-    cp_size = automodel_cfg.get("context_parallel_size")
-    if cp_size is not None and cp_size != 1:
+    if automodel_cfg["context_parallel_size"] != 1:
         _raise_unsupported_feature(
             feature="context parallelism",
             condition="using the Automodel PPO value model",
@@ -137,16 +143,13 @@ def _check_algo_ppo(config: dict[str, Any]) -> None:
         )
 
 
-def _check_algo_rm(config: dict[str, Any]) -> None:
+def _check_algo_rm(config: RMMasterConfig) -> None:
     """Reject unsupported configurations for rm."""
-    policy_config = config.get("policy")
-    if not isinstance(policy_config, dict):
-        return
+    policy_config = config.policy
     automodel_cfg = policy_config.get("automodel_cfg")
-    if not isinstance(automodel_cfg, dict) or not automodel_cfg.get("enabled"):
+    if not automodel_cfg or not automodel_cfg["enabled"]:
         return
-    cp_size = automodel_cfg.get("context_parallel_size")
-    if cp_size is not None and cp_size > 1:
+    if automodel_cfg["context_parallel_size"] > 1:
         _raise_unsupported_feature(
             feature="context parallelism",
             condition="using Automodel RM",
@@ -155,19 +158,15 @@ def _check_algo_rm(config: dict[str, Any]) -> None:
         )
 
 
-def _check_algo_sft(config: dict[str, Any]) -> None:
+def _check_algo_sft(config: SFTMasterConfig) -> None:
     """Reject unsupported configurations for sft."""
-    data_config = config.get("data")
-    if isinstance(data_config, dict) and data_config.get("backend") == "energon":
+    if config.data.get("backend") == "energon":
         _raise_unsupported_feature(
             feature="energon",
             condition="using SFT v1",
             suggestion="use SFT v2.",
         )
-    sft_config = config.get("sft")
-    if isinstance(sft_config, dict) and sft_config.get(
-        "defer_async_checkpoint_finalize"
-    ):
+    if config.sft.defer_async_checkpoint_finalize:
         _raise_unsupported_feature(
             feature="sft.defer_async_checkpoint_finalize",
             condition="using SFT v1",
@@ -175,40 +174,40 @@ def _check_algo_sft(config: dict[str, Any]) -> None:
         )
 
 
-def _check_algo_sft_v2(config: dict[str, Any]) -> None:
+def _check_algo_sft_v2(config: BaseModel) -> None:
     """Reject unsupported configurations for sft_v2."""
     pass
 
 
-def _check_algo_single_controller(config: dict[str, Any]) -> None:
+def _check_algo_single_controller(config: BaseModel) -> None:
     """Reject unsupported configurations for single_controller."""
     pass
 
 
-def _check_algo_vlm_grpo(config: dict[str, Any]) -> None:
+def _check_algo_vlm_grpo(config: BaseModel) -> None:
     """Reject unsupported configurations for vlm_grpo."""
     pass
 
 
-def _check_algo_vlm_mpo(config: dict[str, Any]) -> None:
+def _check_algo_vlm_mpo(config: BaseModel) -> None:
     """Reject unsupported configurations for vlm_mpo."""
     pass
 
 
-def _check_algo_xtoken_off_policy_distillation(config: dict[str, Any]) -> None:
+def _check_algo_xtoken_off_policy_distillation(config: BaseModel) -> None:
     """Reject unsupported configurations for xtoken_off_policy_distillation."""
     pass
 
 
-def check_algo(config: dict[str, Any], *, entrypoint: EntryPoint) -> None:
+def check_algo(config: BaseModel, *, entrypoint: EntryPoint) -> None:
     """Reject unsupported configurations for the selected algorithm path.
 
     Args:
-        config: The config resolved to plain dicts by OmegaConf.to_container.
+        config: The validated MasterConfig for the selected algorithm.
         entrypoint: The execution entrypoint selecting the algorithm checks.
     """
     if entrypoint == EntryPoint.DISTILLATION:
-        _check_algo_distillation(config)
+        _check_algo_distillation(cast("DistillationMasterConfig", config))
     elif entrypoint == EntryPoint.DPO:
         _check_algo_dpo(config)
     elif entrypoint == EntryPoint.EVAL:
@@ -216,11 +215,11 @@ def check_algo(config: dict[str, Any], *, entrypoint: EntryPoint) -> None:
     elif entrypoint == EntryPoint.GRPO:
         _check_algo_grpo(config)
     elif entrypoint == EntryPoint.PPO:
-        _check_algo_ppo(config)
+        _check_algo_ppo(cast("PPOMasterConfig", config))
     elif entrypoint == EntryPoint.RM:
-        _check_algo_rm(config)
+        _check_algo_rm(cast("RMMasterConfig", config))
     elif entrypoint == EntryPoint.SFT:
-        _check_algo_sft(config)
+        _check_algo_sft(cast("SFTMasterConfig", config))
     elif entrypoint == EntryPoint.SFT_V2:
         _check_algo_sft_v2(config)
     elif entrypoint == EntryPoint.SINGLE_CONTROLLER:
@@ -234,18 +233,18 @@ def check_algo(config: dict[str, Any], *, entrypoint: EntryPoint) -> None:
 
 
 def check_unsupported_feature(
-    config: dict[str, Any], *, entrypoint: EntryPoint | None = None
+    config: BaseModel | dict[str, Any], *, entrypoint: EntryPoint | None = None
 ) -> None:
     """Reject unsupported features and configuration combinations at startup.
 
-    Call this on the resolved config before building MasterConfig. Common checks
-    always run; entrypoint checks run when an entrypoint is provided. Each check
+    Call this after building MasterConfig. Common checks always run;
+    entrypoint checks run when an entrypoint is provided. Each check
     should name the unsupported configuration and explain how to adjust it.
 
     Args:
-        config: The config resolved to plain dicts by OmegaConf.to_container.
+        config: The validated MasterConfig, or a resolved dict for tools without a schema.
         entrypoint: The execution entrypoint, or None for entrypoint-independent checks.
     """
     check_common(config)
     if entrypoint is not None:
-        check_algo(config, entrypoint=entrypoint)
+        check_algo(cast(BaseModel, config), entrypoint=entrypoint)

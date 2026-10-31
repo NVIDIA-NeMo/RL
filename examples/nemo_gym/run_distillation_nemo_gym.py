@@ -86,8 +86,9 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    check_unsupported_feature(config, entrypoint=EntryPoint.DISTILLATION)
+
     config = MasterConfig(**config)
+    check_unsupported_feature(config, entrypoint=EntryPoint.DISTILLATION)
     print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID

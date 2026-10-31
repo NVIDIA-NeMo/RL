@@ -70,11 +70,11 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
+
+    config = MasterConfig(**config)
     check_unsupported_feature(
         config, entrypoint=EntryPoint.XTOKEN_OFF_POLICY_DISTILLATION
     )
-
-    config = MasterConfig(**config)
     # Per-teacher same-vocab vs cross-tokenizer is determined solely by
     # `teachers[i].aligner.projection_matrix_path` (null => same-vocab direct
     # KL; set => cross-tokenizer). The consistency check (a same-vocab teacher
