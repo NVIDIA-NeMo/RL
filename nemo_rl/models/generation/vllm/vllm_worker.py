@@ -635,11 +635,17 @@ class BaseVllmGenerationWorker:
             vllm_kwargs.update(kwarg_updates)
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
-        # Native ModelOpt refits populate the complete model, including frozen
-        # media weights. Loading BF16 disk weights into packed buffers is invalid.
-        if not self.cfg.get("real_quant") and ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(
-            self.model_name
-        ):
+        # Native policy refit initializes packed weights and frozen media together.
+        # The BF16 source checkpoint cannot populate packed parameters directly.
+        if self.cfg.get("real_quant"):
+            if load_format != "dummy":
+                raise ValueError(
+                    "ModelOpt real-quant policy refit requires "
+                    "generation.vllm_cfg.load_format='dummy'; "
+                    f"got {load_format!r}. BF16 checkpoint weights cannot be "
+                    "loaded directly into the packed runtime."
+                )
+        elif ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
         # MTP speculative decoding with load_format="dummy" gets its policy
