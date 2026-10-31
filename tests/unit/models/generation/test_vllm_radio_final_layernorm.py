@@ -316,9 +316,14 @@ def composed_radio_modules(tmp_path, monkeypatch):
 )
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize(
-    ("reload_api", "real_quant"),
-    [(False, True), (True, True), (True, False)],
-    ids=["modelopt-chunked", "modelopt-native", "bf16-native"],
+    ("reload_api", "real_quant", "architecture"),
+    [
+        (False, True, "NemotronH_Nano_VL_V2"),
+        (True, True, "NemotronH_Nano_VL_V2"),
+        (True, False, "NemotronH_Nano_VL_V2"),
+        (False, True, "NemotronH_Omni_Reasoning_V3"),
+    ],
+    ids=["modelopt-chunked", "modelopt-native", "bf16-native", "super-modelopt"],
 )
 @pytest.mark.parametrize("scale_source", ["explicit", "folded", "unverified"])
 @torch.inference_mode()
@@ -330,6 +335,7 @@ def test_composed_native_vision_refit(
     reload_api,
     scale_source,
     real_quant: bool,
+    architecture,
 ):
     """Real loaders/lifecycle: late scales, folded defaults, frozen omission and graphs."""
     from vllm.config import MultiModalConfig, VllmConfig, set_current_vllm_config
@@ -351,7 +357,7 @@ def test_composed_native_vision_refit(
         revision=None,
         dtype=torch.bfloat16,
         quantization="modelopt" if real_quant else None,
-        architectures=["NemotronH_Nano_VL_V2"],
+        architectures=[architecture],
         hf_config=SimpleNamespace(
             vision_config=SimpleNamespace(model_type="radio", layerscale_value=1.0)
         ),
@@ -385,6 +391,10 @@ def test_composed_native_vision_refit(
         layer.attn = nn.Module()
         layer.attn.proj = nn.Linear(4, 4).bfloat16()
         radio.model.encoder.layers = nn.ModuleList([layer])
+        radio.model.patch_generator = nn.Module()
+        radio.model.patch_generator.video_embedder = nn.Linear(
+            4, 4, bias=False
+        ).bfloat16()
         model.vision_model = radio
         initialize_dummy_weights(model, config)
         expected = {name: param.clone() for name, param in model.named_parameters()}
@@ -422,6 +432,9 @@ def test_composed_native_vision_refit(
             mapping[f"vision_model.encoder.layer.0.layer_scale{index}.lambda1"] = (
                 f"vision_model.model.encoder.layers.0.ls{index}"
             )
+        mapping[
+            "vision_model.radio_model.model.patch_generator.video_embedder.weight"
+        ] = "vision_model.model.patch_generator.video_embedder.weight"
         index_keys = {
             name: "weights.safetensors"
             for name in mapping
@@ -433,6 +446,7 @@ def test_composed_native_vision_refit(
 
         def forward():
             features = layer.attn.proj(inputs) * layer.ls1 + inputs * layer.ls2
+            features = features + radio.model.patch_generator.video_embedder(inputs)
             return model.mlp1(model._apply_vision_final_layernorm(features))
 
         def reference():
@@ -444,6 +458,10 @@ def test_composed_native_vision_refit(
                 state[prefix + "attn.proj.bias"],
             )
             features = features * state[prefix + "ls1"] + inputs * state[prefix + "ls2"]
+            features = features + nn.functional.linear(
+                inputs,
+                state["vision_model.model.patch_generator.video_embedder.weight"],
+            )
             features = nn.functional.layer_norm(
                 features.float(),
                 (4,),
