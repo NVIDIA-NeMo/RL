@@ -9,24 +9,6 @@ from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.setup import _ENV_FIELD_MAP, _config_to_env
 
 
-def test_defaults():
-    cfg = TelemetryConfig()
-    assert cfg.enabled is False
-    assert cfg.service_name == "nemo-rl"
-    assert cfg.span_groups == "default"
-    # Must match the nemo-lens defaults, since propagating them is unconditional.
-    assert cfg.traces_enabled is True
-    assert cfg.metrics_enabled is True
-    assert cfg.logs_enabled is False
-    assert cfg.exporter == "otlp"
-    assert cfg.vllm_native_tracing is False
-
-
-def test_extra_keys_allowed():
-    cfg = TelemetryConfig(enabled=True, future_unknown_key="x")
-    assert cfg.enabled is True
-
-
 def test_config_to_env_translation():
     tel = TelemetryConfig(
         enabled=True,

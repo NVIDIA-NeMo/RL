@@ -85,4 +85,4 @@ Common failure patterns:
 | CI never starts | No trust signal or copy-pr-bot not triggered | Post `/ok to test <sha>` |
 | `semantic-pull-request` fails | PR title doesn't follow Conventional Commits | Fix PR title; see `contributing` skill |
 | Linting fails | Style violation | Run `uv run ruff check --fix . && uv run ruff format .` |
-| Unit test failure | Code regression or missing dependency | Reproduce locally; see `testing` skill |
+| Unit test failure | Code regression or missing dependency | Reproduce locally; see `skills/contributing/references/testing.md` |

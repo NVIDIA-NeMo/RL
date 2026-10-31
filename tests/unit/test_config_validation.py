@@ -19,22 +19,28 @@ from pathlib import Path
 from typing import Any, Dict, Type
 
 import pytest
+import yaml
 from omegaconf import OmegaConf
 from pydantic import TypeAdapter, ValidationError
 
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
 from nemo_rl.algorithms.grpo import (
-    GRPOConfig,
-    RewardPenaltyConfig,
+    MasterConfig as GRPOMasterConfig,
 )
 from nemo_rl.algorithms.grpo import (
-    MasterConfig as GRPOMasterConfig,
+    RewardPenaltyConfig,
 )
 from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    MasterConfig as SingleControllerMasterConfig,
+)
+from nemo_rl.algorithms.single_controller_utils.config import (
+    validate_single_controller_config,
+)
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig as XTokenOffPolicyDistillationMasterConfig,
 )
@@ -104,7 +110,7 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
-# Every shipped config tree. Only the outdated-config guard uses it -- most of examples/nemo_gym
+# Every shipped config tree. Only the outdated-config and local-path guards use it -- most of examples/nemo_gym
 # cannot satisfy the schema test by design (env manifests, launcher templates, unset env
 # interpolations).
 repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
@@ -112,6 +118,11 @@ full_config_files = config_files + [
     path
     for extra in ("examples/nemo_gym", "research")
     for path in glob.glob(str(repo_root / extra / "**/*.yaml"), recursive=True)
+]
+suite_scripts = [
+    path
+    for pattern in ("tests/test_suites/**/*.sh", "research/*/tests/test_suites/**/*.sh")
+    for path in glob.glob(str(repo_root / pattern), recursive=True)
 ]
 
 
@@ -135,6 +146,10 @@ def test_all_config_files_have_required_keys(config_file):
     if "/evals/" in config_file:
         master_config_class = EvalMasterConfig
         config_type = "eval"
+    elif "async_rl" in config_dict:
+        # SingleController configs also carry a grpo or ppo block, so match them first.
+        master_config_class = SingleControllerMasterConfig
+        config_type = "single_controller"
     elif "teachers" in config_dict or (
         "loss_fn" in config_dict and "projection_matrix_path" in config_dict["loss_fn"]
     ):
@@ -178,10 +193,16 @@ def test_all_config_files_have_required_keys(config_file):
     validate_config_section(config_dict, master_config_class, config_file)
 
 
-def test_multimodal_dedup_grpo_config_keys_default_off():
-    """Older recipes keep flag-off behavior without duplicating default keys."""
-    assert GRPOConfig.model_fields["deduplicate_multimodal_data"].default is False
-    assert GRPOConfig.model_fields["debug_payload_metrics"].default is False
+@pytest.mark.parametrize("config_file", config_files)
+def test_single_controller_configs_pass_single_controller_validation(config_file):
+    config_dict = OmegaConf.to_container(
+        load_config_with_inheritance(config_file), resolve=True
+    )
+    if "async_rl" not in config_dict:
+        pytest.skip("Not a SingleController config")
+    validate_single_controller_config(
+        SingleControllerMasterConfig.model_validate(config_dict)
+    )
 
 
 def _sync_trainer_names(tree: ast.Module) -> set[str]:
@@ -382,21 +403,18 @@ def test_no_shipped_config_is_outdated(config_file):
         raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
 
 
-# Keep only the regressions tracked in #4427 on DeepEP until they pass validation.
-DEEPEP_FALLBACK_RECIPES = {
-    Path("recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-ep8.yaml"),
-    Path("recipes/llm/sft-nanov3-30BA3B-2n4g-automodel-ep4.yaml"),
-    Path("recipes/llm/sft-gpt-oss-20b-1n8g-automodel-ep8.yaml"),
-    Path("recipes/llm/sft-gpt-oss-20b-1n4g-automodel-ep4.yaml"),
-    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml"),
-    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml"),
-}
-
-
 @pytest.mark.parametrize("config_file", config_files)
-def test_automodel_moe_recipes_use_expected_dispatcher(
+def test_automodel_moe_recipes_satisfy_hybridep_constraints(
     config_file: str,
 ) -> None:
+    skip_config_files = [
+        "grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.yaml",
+    ]
+    if os.path.basename(config_file) in skip_config_files:
+        pytest.skip(
+            f"Skipping config file {config_file} because DeepSeek-V4 pads each CP rank's slice in its own CP sharder"
+        )
+
     config = load_config_with_inheritance(config_file)
     automodel_cfg = OmegaConf.select(config, "policy.automodel_cfg")
     if (
@@ -408,14 +426,54 @@ def test_automodel_moe_recipes_use_expected_dispatcher(
 
     backend = automodel_cfg.automodel_kwargs.backend
     assert "enable_deepep" not in backend
-    if Path(config_file).relative_to(configs_dir) in DEEPEP_FALLBACK_RECIPES:
-        assert backend.get("dispatcher") == "deepep"
-    else:
-        assert backend.get("dispatcher") in {"hybridep", "torch"}
-    if backend.dispatcher == "hybridep":
-        assert backend.get("experts") is not None, (
-            f"{config_file}: HybridEP must explicitly select an experts backend"
+    if backend.get("dispatcher") != "hybridep":
+        return
+    assert backend.get("experts") is not None, (
+        f"{config_file}: HybridEP must explicitly select an experts backend"
+    )
+
+    # HybridEP's combine kernel asserts each rank's slice after the CP split is a
+    # multiple of 64, so the global width must be a multiple of 64 * CP.
+    alignment = 64 * automodel_cfg.get("context_parallel_size", 1)
+    assert config.policy.make_sequence_length_divisible_by % alignment == 0, (
+        f"{config_file}: make_sequence_length_divisible_by must be a multiple of {alignment}"
+    )
+    dynamic_batching = OmegaConf.select(config, "policy.dynamic_batching")
+    if dynamic_batching is not None and dynamic_batching.enabled:
+        assert dynamic_batching.sequence_length_round % alignment == 0, (
+            f"{config_file}: dynamic_batching.sequence_length_round must be a multiple of {alignment}"
         )
-        assert config.policy.make_sequence_length_divisible_by % 64 == 0, (
-            f"{config_file}: HybridEP input width must be padded to a multiple of 64"
+
+
+def test_base_exemplars_pin_flash_attention_to_fa2():
+    # flash-attn-4 is installed in the mcore extra; without an explicit pin TE
+    # would pick FA4 for every Megatron run. Only batch-invariant recipes use 4.
+    for path in sorted(configs_dir.glob("*.yaml")):
+        raw = yaml.safe_load(path.read_text())
+        if not isinstance(raw, dict) or "defaults" in raw:
+            continue
+        for section in raw.values():
+            megatron_cfg = (
+                section.get("megatron_cfg") if isinstance(section, dict) else None
+            )
+            if isinstance(megatron_cfg, dict) and "apply_rope_fusion" in megatron_cfg:
+                assert megatron_cfg.get("flash_attention_version") == 2, path.name
+
+
+@pytest.mark.parametrize("path", full_config_files + suite_scripts)
+def test_shipped_configs_and_suite_scripts_have_no_local_paths(path):
+    text = Path(path).read_text().lower()
+    for local_prefix in ("/lustre/", "/scratch/", "/home/"):
+        assert local_prefix not in text, (
+            f"{path} contains a local path ({local_prefix})"
         )
+
+
+@pytest.mark.parametrize("config_file", full_config_files)
+def test_shipped_configs_do_not_pin_wandb_entity(config_file):
+    raw = yaml.safe_load(Path(config_file).read_text())
+    logger = raw.get("logger") if isinstance(raw, dict) else None
+    wandb_config = logger.get("wandb") if isinstance(logger, dict) else None
+    assert not isinstance(wandb_config, dict) or "entity" not in wandb_config, (
+        f"{config_file} pins a W&B entity"
+    )

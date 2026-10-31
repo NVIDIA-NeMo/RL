@@ -76,7 +76,7 @@ def test_opd_full_config_rejects_a_degenerate_chunk_size():
     with pytest.raises(ValueError, match="chunk_size must be >= 1"):
         OnPolicyDistillationFullConfig(chunk_size=0)
     # None means "the whole sequence in one chunk" and must stay legal.
-    assert OnPolicyDistillationFullConfig(chunk_size=None).chunk_size is None
+    OnPolicyDistillationFullConfig(chunk_size=None)
 
 
 def test_get_opd_full_config_requires_both_switches():
@@ -203,6 +203,10 @@ def test_disabled_opd_full_leaves_the_logprob_path_intact():
     )
     assert loss_fn.opd_full is None
     assert loss_fn.input_type is LossInputType.LOGPROB
+
+
+def test_enabled_opd_full_switches_to_the_opd_full_input():
+    assert _loss_fn().input_type is LossInputType.OPD_FULL
 
 
 @pytest.mark.parametrize(

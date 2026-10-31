@@ -17,13 +17,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from nemo_rl.data.energon.config import EnergonLoaderConfig, EnergonPackingOptions
-
-
-@pytest.mark.parametrize("cap", [0, -1])
-def test_packing_cap_rejects_nonpositive_values(cap: int) -> None:
-    with pytest.raises(ValueError):
-        EnergonPackingOptions(max_sequences_per_bin=cap)
+from nemo_rl.data.energon.config import EnergonLoaderConfig
 
 
 @pytest.mark.mcore

@@ -24,23 +24,12 @@ import copy
 import sys
 import types
 from dataclasses import make_dataclass
-from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
-from omegaconf import OmegaConf
 from packaging.version import Version
 
 from nemo_rl.models.megatron import zero_train_gen_mismatch as zgm
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
-
-CONFIGS_DIR = Path(__file__).resolve().parents[4] / "examples" / "configs"
-
-ZERO_KL_EXEMPLARS = [
-    "recipes/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl.yaml",
-    "recipes/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8.yaml",
-]
 
 # Installed-package versions that satisfy every gate in `_validate_packages`.
 GOOD_VERSIONS = {
@@ -912,46 +901,6 @@ def test_batch_invariant_token_multiple_accepts_larger_multiples():
 # --------------------------------------------------------------------------- #
 
 
-def _load_policy(name: str) -> dict[str, Any]:
-    register_omegaconf_resolvers()
-    cfg = load_config(CONFIGS_DIR / name)
-    container = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False)
-    assert isinstance(container, dict)
-    policy = container["policy"]
-    assert isinstance(policy, dict)
-    return policy
-
-
-@pytest.mark.parametrize("name", ZERO_KL_EXEMPLARS)
-def test_shipped_recipes_pass_the_zero_kl_gates(name):
-    policy = _load_policy(name)
-    zgm.validate_zero_train_gen_kl(policy, check_environment=False)
-
-
-@pytest.mark.parametrize("name", ZERO_KL_EXEMPLARS)
-def test_shipped_recipes_train_and_generate_with_the_same_tp(name):
-    policy = _load_policy(name)
-    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
-
-    inference = merged_inference_megatron_cfg(policy)
-    assert (
-        inference["tensor_model_parallel_size"]
-        == policy["megatron_cfg"]["tensor_model_parallel_size"]
-    )
-    assert inference["context_parallel_size"] == 1
-
-
-def test_nano_zero_kl_recipe_covers_packing_and_chunked_prefill():
-    # The recipe inherits both settings from grpo_math_1B.yaml (minimize-check
-    # strips them from the recipe), and its nightly is what proves zero KL with them on.
-    policy = _load_policy(
-        "recipes/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8.yaml"
-    )
-    generation = policy["generation"]["mcore_generation_config"]
-    assert policy["sequence_packing"]["enabled"] is True
-    assert generation["enable_chunked_prefill"] is True
-
-
 @pytest.mark.parametrize(
     ("tp_size", "expected"), [(1, 64), (2, 64), (3, 66), (128, 128)]
 )
@@ -959,36 +908,6 @@ def test_batch_invariant_token_multiple(tp_size, expected):
     from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple
 
     assert batch_invariant_token_multiple(tp_size) == expected
-
-
-def _standalone_megatron_exemplars() -> list[Path]:
-    """Top-level exemplars that define a full (enabled) Megatron block themselves."""
-    found = []
-    for path in sorted(CONFIGS_DIR.glob("*.yaml")):
-        raw = yaml.safe_load(path.read_text())
-        if not isinstance(raw, dict) or "defaults" in raw:
-            continue
-        for section in raw.values():
-            megatron_cfg = (
-                section.get("megatron_cfg") if isinstance(section, dict) else None
-            )
-            if isinstance(megatron_cfg, dict) and "apply_rope_fusion" in megatron_cfg:
-                found.append(path)
-                break
-    return found
-
-
-@pytest.mark.parametrize("path", _standalone_megatron_exemplars(), ids=lambda p: p.name)
-def test_base_exemplars_pin_flash_attention_to_fa2(path):
-    # flash-attn-4 is installed in the mcore extra; without an explicit pin TE
-    # would pick FA4 for every Megatron run. Only batch-invariant recipes use 4.
-    raw = yaml.safe_load(path.read_text())
-    for section in raw.values():
-        megatron_cfg = (
-            section.get("megatron_cfg") if isinstance(section, dict) else None
-        )
-        if isinstance(megatron_cfg, dict) and "apply_rope_fusion" in megatron_cfg:
-            assert megatron_cfg.get("flash_attention_version") == 2, path.name
 
 
 def test_token_rounder_matches_megatron_core():

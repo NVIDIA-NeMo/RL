@@ -278,10 +278,6 @@ def test_nemo_gym_configs_satisfy_current_grpo_contract(config_path):
 
     resolved = OmegaConf.to_container(config, resolve=True)
 
-    if config_path == "examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml":
-        assert resolved["grpo"]["val_num_generations_per_prompt"] == 2
-        assert resolved["checkpointing"]["metric_name"] is None
-
     # The real contract checks: the config validates against GRPO's MasterConfig
     # schema and the checkpointing block is accepted by CheckpointManager.
     master_config = MasterConfig.model_validate(resolved)

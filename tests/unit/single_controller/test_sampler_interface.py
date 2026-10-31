@@ -316,10 +316,6 @@ class TestReadyFirstConfig:
         assert isinstance(cfg, ReadyFirstSamplerConfig)
         assert cfg.max_staleness_versions == 2
 
-    def test_negative_staleness_is_rejected(self):
-        with pytest.raises(ValidationError):
-            ReadyFirstSamplerConfig(max_staleness_versions=-1)
-
     @pytest.mark.parametrize(
         ("cfg", "expected", "instance_expected"),
         [

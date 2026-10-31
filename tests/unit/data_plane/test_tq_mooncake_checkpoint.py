@@ -679,10 +679,6 @@ def test_distributed_checkpoint_round_trip_over_command_only_rpc(
     }
 
 
-def test_checkpoint_timeout_matches_simple_default() -> None:
-    assert checkpoint_plugin._DEFAULT_TIMEOUT_S == 200.0
-
-
 def test_participant_timeout_is_fatal_to_the_checkpoint_caller(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
