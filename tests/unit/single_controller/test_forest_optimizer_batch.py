@@ -314,7 +314,7 @@ def test_forest_partial_step_matches_same_survivors_in_a_full_step(
     assert partial._master_config.policy["train_global_batch_size"] == 4
     metrics = partial._logger.log_metrics.call_args_list[0].args[0]
     assert metrics["dropped_prompt_groups"] == 1
-    assert partial._batch_shortfall == {}
+    assert partial._rollout_runtime.batch_shortfall == {}
 
 
 @pytest.mark.parametrize("fraction,dropped", [(0.75, 1), (0.5, 2)])
@@ -323,7 +323,7 @@ def test_forest_partial_step_enforces_floor_and_nonempty_batch(
 ):
     ctrl, _ = _setup(monkeypatch)
     ctrl._async_cfg.rollout_failure.min_step_batch_fraction = fraction
-    ctrl._batch_shortfall[0] = dropped
+    ctrl._rollout_runtime.batch_shortfall[0] = dropped
     with pytest.raises(RuntimeError, match="below the floor"):
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
     ctrl._trainer.train_microbatches_from_meta.assert_not_called()
@@ -342,7 +342,7 @@ def test_forest_partial_step_still_requires_complete_retained_groups(
     ctrl._algo_cfg.num_prompts_per_step = 2
     ctrl._master_config.policy["train_global_batch_size"] = 4
     ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
-    ctrl._batch_shortfall[0] = 1
+    ctrl._rollout_runtime.batch_shortfall[0] = 1
     with pytest.raises(
         ValueError, match="every logical slot|every segment exactly once"
     ):

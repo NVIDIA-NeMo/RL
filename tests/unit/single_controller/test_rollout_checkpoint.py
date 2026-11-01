@@ -20,14 +20,8 @@ from unittest.mock import Mock, call
 
 import pytest
 
-from nemo_rl.algorithms.single_controller_utils import rollout_checkpoint
-from nemo_rl.algorithms.single_controller_utils.config import (
-    AsyncRLConfig,
-    MasterConfig,
-    RolloutCheckpointConfig,
-    TokenCaptureConfig,
-)
-from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+from nemo_rl.algorithms.rollout_checkpointing import manifest as snapshot_manifest
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION,
     BOOTSTRAP_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
@@ -35,7 +29,6 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BootstrapCompatibilityIdentity,
     RolloutSnapshotManifest,
     bootstrap_compatibility_identity,
-    bootstrap_fingerprint,
     commit_snapshot,
     ensure_bootstrap_anchor,
     prepare_snapshot_paths,
@@ -43,10 +36,21 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
 )
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AsyncRLConfig,
+    MasterConfig,
+    RolloutCheckpointConfig,
+    TokenCaptureConfig,
+)
 from nemo_rl.data import DataConfig
 from nemo_rl.models.generation.vllm.config import VllmConfig, VllmSpecificArgs
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.logger import LoggerConfig
+
+
+def bootstrap_fingerprint(master_config: MasterConfig) -> str:
+    """The digest that decides whether a bootstrap snapshot can be reused."""
+    return bootstrap_compatibility_identity(master_config).fingerprint()
 
 
 class _DumpedConfig:
@@ -360,7 +364,7 @@ def test_builtin_fingerprint_exclusions_reference_declared_config_fields() -> No
         ("rollout_checkpointing",): _fields(RolloutCheckpointConfig),
         ("token_capture",): _fields(TokenCaptureConfig),
     }
-    for excluded_path in rollout_checkpoint._BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS:
+    for excluded_path in snapshot_manifest._BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS:
         segments = tuple(excluded_path.split("."))
         for prefix, fields in schemas_by_prefix.items():
             if segments[: len(prefix)] != prefix or len(segments) == len(prefix):
@@ -825,8 +829,8 @@ def test_commit_snapshot_flushes_payload_before_publication(tmp_path, monkeypatc
     (tmp_snapshot / "payload").write_text("payload")
     fsync_tree = Mock()
     fsync_directory = Mock()
-    monkeypatch.setattr(rollout_checkpoint, "_fsync_tree", fsync_tree)
-    monkeypatch.setattr(rollout_checkpoint, "_fsync_directory", fsync_directory)
+    monkeypatch.setattr(snapshot_manifest, "_fsync_tree", fsync_tree)
+    monkeypatch.setattr(snapshot_manifest, "_fsync_directory", fsync_directory)
 
     commit_snapshot(tmp_snapshot, final_snapshot, keep_latest_k=1)
 
@@ -883,7 +887,7 @@ def test_commit_snapshot_removes_stale_snapshot_from_live_namespace_before_delet
     (third_tmp / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text(
         json.dumps(manifest.to_dict())
     )
-    real_rmtree = rollout_checkpoint.shutil.rmtree
+    real_rmtree = snapshot_manifest.shutil.rmtree
 
     def fail_trash_delete(path: Path) -> None:
         path = Path(path)
@@ -891,7 +895,7 @@ def test_commit_snapshot_removes_stale_snapshot_from_live_namespace_before_delet
             raise OSError("simulated delete failure")
         real_rmtree(path)
 
-    monkeypatch.setattr(rollout_checkpoint.shutil, "rmtree", fail_trash_delete)
+    monkeypatch.setattr(snapshot_manifest.shutil, "rmtree", fail_trash_delete)
 
     with pytest.raises(OSError, match="simulated delete failure"):
         commit_snapshot(third_tmp, third, keep_latest_k=2)
@@ -911,7 +915,7 @@ def test_commit_snapshot_removes_stale_snapshot_from_live_namespace_before_delet
 
 def test_prepare_snapshot_paths_sweeps_interrupted_snapshot_garbage(tmp_path):
     anchor = _ensure_test_bootstrap_anchor(tmp_path)
-    root = anchor / rollout_checkpoint.ROLLOUT_SNAPSHOTS_DIRNAME
+    root = anchor / snapshot_manifest.ROLLOUT_SNAPSHOTS_DIRNAME
     stale_tmp = root / "tmp_snapshot_000001"
     stale_trash = root / "trash_snapshot_000002"
     stale_tmp.mkdir(parents=True)

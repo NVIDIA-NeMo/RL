@@ -24,12 +24,16 @@ import shutil
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from nemo_rl.algorithms.grpo import RewardPenaltyConfig
-from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.experience.reward_penalties import CaptureRewardSettings
 from nemo_rl.experience.rollouts import get_effort_config
+
+if TYPE_CHECKING:
+    # Annotations only: importing the config at runtime would import
+    # single_controller_utils, whose setup imports this module.
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 3
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
@@ -390,16 +394,6 @@ def bootstrap_compatibility_identity(
             excluded_paths=parsed_excluded_paths,
         ),
     )
-
-
-def bootstrap_fingerprint(master_config: MasterConfig) -> str:
-    """Hash rollout-semantic inputs needed to reuse a bootstrap snapshot.
-
-    This is a compatibility guard, not a hash of the full training recipe.
-    Operational settings are deliberately excluded so a restart may use a
-    different cluster shape, checkpoint interval, or logging destination.
-    """
-    return bootstrap_compatibility_identity(master_config).fingerprint()
 
 
 _MISSING = object()
