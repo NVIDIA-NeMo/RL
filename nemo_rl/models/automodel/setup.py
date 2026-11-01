@@ -75,6 +75,7 @@ from nemo_rl.models.automodel.router_replay import (
     validate_automodel_router_replay_config,
 )
 from nemo_rl.models.automodel.utils import resolve_model_class
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import (
     LoRAConfig,
@@ -317,6 +318,7 @@ def validate_and_prepare_config(
             top_k=generation_cfg["top_k"],
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
+            sampler_replay=sampler_replay_enabled(generation_cfg),
         )
 
     # Explicitly set NCCL_CUMEM_ENABLE for non-colocated refit.

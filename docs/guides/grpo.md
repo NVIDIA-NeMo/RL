@@ -766,12 +766,16 @@ Set explicit bounds (for example, `-5.0` and `5.0`) when small reward variance p
 
 The implementation aligns with vLLM’s top-p and top-k filtering by applying an equivalent process to the logits.
 
+Because the trainer replays the filters, the logprobs vLLM reports must also be the filtered ones: training with top-p or top-k requires `policy.generation.vllm_cfg.logprobs_mode: processed_logprobs` (setup raises otherwise; `vllm_cfg` takes precedence over `vllm_kwargs`). Requests served through the vLLM HTTP server (NeMo-Gym rollouts) are pinned to the configured `top_k`, to `min_p=0` and to `repetition_penalty=1`, which the trainer does not replay; otherwise vLLM would fill unset values from the model's `generation_config.json`.
+
 When top-p or top-k filtering is enabled, the following conventions apply:
 
 - **`curr_logprobs` and `prev_logprobs`** are computed *with* filtering applied, for compatibility with the actor loss.
 - **`reference_policy_logprobs`** is computed *without* filtering (see the `use_reference_model` in the policy worker).
 - **KL divergence** uses `curr_logprobs_unfiltered`(`curr_logprobs` *without* filtering) so that it is consistent with the reference policy logprobs.
 - **Invalid policy support** caused by disagreement on the top-k/top-p filtered set is excluded from actor ratios, actor-loss reduction, KL-in-reward, OPD advantages, and sequence-error checks. Excluded positions still count toward global token/sequence normalization. The shared `token_mask` stays unchanged so the unfiltered reference KL still uses valid response tokens. Diagnostic JSONL dumps represent nonfinite log probabilities as `null`; the training tensors retain their original values.
+
+Alternatively, [Sampler Replay](sampler-replay.md) (`policy.generation.sampler_replay.enabled: true`, SingleController with NeMo Gym and vLLM) renormalizes over the set of tokens the sampler actually drew from, read from its captured top-K head, instead of recomputing the filters. The sampled token is then always inside the support. Score centering under top-k/top-p requires it.
 
 Under tensor parallelism (TP), enabling top-p or top-k adds communication overhead. The vocabulary is sharded across GPUs (vocab-parallel), while top-p and top-k require full-vocabulary probabilities. A naive all-gather of logits would require large additional memory. The implementation therefore switches to a batch–sequence-parallel layout via all-to-all communication, applies filtering over the full vocabulary, then switches back, avoiding materialization of the full vocabulary on any single rank.
 

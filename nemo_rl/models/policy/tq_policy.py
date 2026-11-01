@@ -60,9 +60,11 @@ from nemo_rl.data_plane.schema import (
     MICRO_BATCH_LENGTHS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
+    SAMPLER_TOPK_FIELDS,
     fields_with_optional_opd_full,
     fields_with_optional_routed_experts,
 )
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
@@ -411,8 +413,12 @@ class TQPolicy(TQDriverMixin, Policy):
         timer: Optional[Timer],
         common_kwargs: dict[str, Any],
         include_router_replay: bool = False,
+        extra_fields: tuple[str, ...] = (),
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
+
+        ``extra_fields`` are fetched beyond ``LP_SEED_FIELDS`` (the captured sampler
+        head when prev logprobs replay the sampler's support).
 
         Logprob workers fetch ``LP_SEED_FIELDS`` plus the multimodal
         columns ``_isolated_meta`` unions in, so prev/ref logprobs see the
@@ -432,7 +438,7 @@ class TQPolicy(TQDriverMixin, Policy):
         # prev/ref logprobs and the training forward see identical model inputs.
         lp_meta = self._with_route_fields(
             meta,
-            LP_SEED_FIELDS,
+            LP_SEED_FIELDS + extra_fields,
             task_name=task_name,
             want_routes=include_router_replay,
         )
@@ -470,6 +476,8 @@ class TQPolicy(TQDriverMixin, Policy):
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
     ) -> None:
+        generation_cfg = self.cfg.get("generation")
+        replay = generation_cfg is not None and sampler_replay_enabled(generation_cfg)
         self._logprob_dispatch(
             meta,
             task_name="prev_lp",
@@ -478,6 +486,8 @@ class TQPolicy(TQDriverMixin, Policy):
             timer=timer,
             common_kwargs={"micro_batch_size": micro_batch_size},
             include_router_replay=True,
+            # Replay renormalizes prev logprobs over the captured sampler support.
+            extra_fields=SAMPLER_TOPK_FIELDS if replay else (),
         )
 
     def get_reference_policy_logprobs_from_meta(

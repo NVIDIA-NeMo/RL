@@ -1788,6 +1788,22 @@ def test_ppo_rejects_in_loss_filter_before_cluster_creation(
     cluster_cls.assert_not_called()
 
 
+def test_ppo_rejects_sampler_support_replay_before_cluster_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay reads the captured sampler head, which only SingleController stages."""
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.policy["generation"]["sampler_replay"] = {"enabled": True}
+
+    with pytest.raises(ValueError, match="sampler_replay.*legacy PPO trainer"):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
 def test_ppo_rejects_adaptive_ppo_clip_before_cluster_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
