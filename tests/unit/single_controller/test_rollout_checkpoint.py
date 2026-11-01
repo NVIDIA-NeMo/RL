@@ -29,7 +29,6 @@ from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     BootstrapCompatibilityIdentity,
     RolloutSnapshotManifest,
     bootstrap_compatibility_identity,
-    bootstrap_fingerprint,
     commit_snapshot,
     ensure_bootstrap_anchor,
     prepare_snapshot_paths,
@@ -47,6 +46,11 @@ from nemo_rl.data import DataConfig
 from nemo_rl.models.generation.vllm.config import VllmConfig, VllmSpecificArgs
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.logger import LoggerConfig
+
+
+def bootstrap_fingerprint(master_config: MasterConfig) -> str:
+    """The digest that decides whether a bootstrap snapshot can be reused."""
+    return bootstrap_compatibility_identity(master_config).fingerprint()
 
 
 class _DumpedConfig:

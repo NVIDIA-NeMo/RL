@@ -40,7 +40,6 @@ from typing import (
 import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
-    LEGACY_REPLAY_BUFFER_FILENAME,
     REPLACEMENT_RESERVE_FILENAME,
     REPLAY_BUFFER_METADATA_FILENAME,
     DataPlaneMutationCut,
@@ -282,19 +281,8 @@ class RolloutRestorer(_UsesRolloutParts):
         if not self._sampler.supports_buffer_checkpoint:
             return 0
         if not os.path.exists(metadata_path):
-            legacy_path = os.path.join(self._resume.path, LEGACY_REPLAY_BUFFER_FILENAME)
-            if os.path.exists(legacy_path):
-                raise RuntimeError(
-                    "Checkpoint contains legacy replay_buffer.pt state, which "
-                    "predates authoritative native TQ replay recovery. Resume it "
-                    "with the older implementation or explicitly start without "
-                    "restoring buffered rollouts."
-                )
-            print(
-                f"⚠️ No native replay metadata found at {metadata_path}. "
-                "Starting with an empty replay buffer.",
-                flush=True,
-            )
+            # Setup already rejected a legacy replay file and warned that the
+            # replay buffer starts empty.
             return 0
         print(f"📦 Restoring replay buffer metadata: {metadata_path}")
         # weights_only=False: the replay metadata file contains pickled KVBatchMeta
@@ -307,21 +295,15 @@ class RolloutRestorer(_UsesRolloutParts):
                 "Found metadata-only replay checkpoint, but the matching "
                 "native TQ checkpoint was not restored during setup"
             )
-        expected_manifest_digest_value = self._resume.data_plane_metadata.get(
+        # Setup validated the digest and group count when it loaded the TQ
+        # checkpoint; the replay metadata file must agree with them.
+        expected_manifest_digest_value = self._resume.data_plane_metadata[
             "replay_manifest_digest"
-        )
-        if not isinstance(expected_manifest_digest_value, str):
-            raise ValueError(
-                "Restored TQ checkpoint metadata is missing a replay manifest digest"
-            )
-        expected_group_count = self._resume.data_plane_metadata.get(
-            "replay_group_count"
-        )
+        ]
         groups = buffer_state.get("groups")
         if (
-            not isinstance(expected_group_count, int)
-            or not isinstance(groups, list)
-            or len(groups) != expected_group_count
+            not isinstance(groups, list)
+            or len(groups) != self._resume.data_plane_metadata["replay_group_count"]
         ):
             raise ValueError(
                 "Replay-buffer metadata group count does not match the "

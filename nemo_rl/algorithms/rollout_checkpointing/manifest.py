@@ -396,16 +396,6 @@ def bootstrap_compatibility_identity(
     )
 
 
-def bootstrap_fingerprint(master_config: MasterConfig) -> str:
-    """Hash rollout-semantic inputs needed to reuse a bootstrap snapshot.
-
-    This is a compatibility guard, not a hash of the full training recipe.
-    Operational settings are deliberately excluded so a restart may use a
-    different cluster shape, checkpoint interval, or logging destination.
-    """
-    return bootstrap_compatibility_identity(master_config).fingerprint()
-
-
 _MISSING = object()
 
 

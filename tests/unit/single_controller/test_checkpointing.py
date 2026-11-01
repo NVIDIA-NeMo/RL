@@ -55,7 +55,6 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
-    LEGACY_REPLAY_BUFFER_FILENAME,
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     REPLAY_BUFFER_METADATA_STORAGE,
@@ -4300,26 +4299,6 @@ class TestReplayBufferPersistence:
         assert (ckpt_dir / "step_2" / REPLAY_BUFFER_METADATA_FILENAME).exists()
         assert buffer.metadata_state_dict_calls == [4]
 
-    def test_run_rejects_legacy_replay_file(self, tmp_path):
-        ckpt_dir = tmp_path / "resume_ckpt"
-        ckpt_dir.mkdir()
-        torch.save({"groups": ["legacy"]}, ckpt_dir / LEGACY_REPLAY_BUFFER_FILENAME)
-        mc = _actor_master_config(
-            tmp_path,
-            max_num_steps=0,
-            buffer_checkpoint=True,
-            data_plane_checkpoint=True,
-        )
-        buffer = _FakeTQBuffer()
-
-        with pytest.raises(RuntimeError, match="legacy replay_buffer.pt"):
-            _run_actor_run(
-                mc,
-                _make_actor_args(tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)),
-            )
-
-        assert buffer.load_calls == []
-
     def test_run_restores_native_tq_replay_metadata_without_payload_reput(
         self, tmp_path
     ):
@@ -4687,32 +4666,6 @@ class TestReplayBufferPersistence:
                     data_plane_checkpoint_metadata=_data_plane_checkpoint_metadata(
                         group_count=2
                     ),
-                ),
-            )
-
-        assert buffer.load_calls == []
-
-    def test_native_replay_metadata_rejects_missing_manifest_digest(self, tmp_path):
-        ckpt_dir = tmp_path / "resume_ckpt"
-        ckpt_dir.mkdir()
-        torch.save({"groups": []}, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
-        mc = _actor_master_config(
-            tmp_path,
-            max_num_steps=0,
-            buffer_checkpoint=True,
-            data_plane_checkpoint=True,
-        )
-        buffer = _FakeTQBuffer()
-        tq_metadata = _data_plane_checkpoint_metadata()
-        del tq_metadata["replay_manifest_digest"]
-
-        with pytest.raises(ValueError, match="missing a replay manifest digest"):
-            _run_actor_run(
-                mc,
-                _make_actor_args(
-                    tq_buffer=buffer,
-                    last_checkpoint_path=str(ckpt_dir),
-                    data_plane_checkpoint_metadata=tq_metadata,
                 ),
             )
 
