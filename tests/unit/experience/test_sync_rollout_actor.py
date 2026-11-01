@@ -85,6 +85,8 @@ def test_actor_stamps_distinct_groups_and_preserves_multimodal_tags(
             "loss_multiplier": torch.ones(4),
             "truncated": torch.zeros(4, dtype=torch.bool),
             "length": torch.full((4,), 10 + history_length),
+            "attribution_key": ["math:train"] * 2 + ["code_agent"] * 2,
+            "agent_ref": [None] * 2 + [{"name": "code_agent"}] * 2,
         }
     )
     monkeypatch.setattr(
@@ -116,6 +118,8 @@ def test_actor_stamps_distinct_groups_and_preserves_multimodal_tags(
     monkeypatch.setattr(actor_mod, "kv_first_write", write)
     meta, carry, _, _ = actor.rollout_to_tq(batch, partition_id="train", group_size=2)
     assert carry["response_token_lengths"].tolist() == [15] * 4
+    assert carry["attribution_key"] == ["math:train"] * 2 + ["code_agent"] * 2
+    assert carry["agent_ref"] == [None] * 2 + [{"name": "code_agent"}] * 2
     # Flattening has now filled in history logprobs; length must use the earlier log.
     assert "generation_logprobs" in batch["message_log"][0][1]
     groups = row_group_ids(meta)

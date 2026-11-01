@@ -376,6 +376,9 @@ class SyncRolloutActor:
             # apply_reward_shaping on the driver without a TQ fetch.
             "response_token_lengths": decomposed["response_token_lengths"],
         }
+        for key in ("agent_ref", "attribution_key"):
+            if key in fb:
+                driver_carry[key] = fb[key]
         # Pre-length-penalty env reward (present only when grpo.length_penalty
         # ran); feeds the driver's baseline_reward/pct_* diagnostics.
         if "env_reward" in fb:

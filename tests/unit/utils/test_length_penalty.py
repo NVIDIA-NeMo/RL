@@ -1471,7 +1471,8 @@ class TestNemoGymPostprocessHook:
         )
         return rollout_result
 
-    def test_each_prompt_group_uses_its_own_rows(self):
+    @pytest.mark.parametrize("materialized", [False, True])
+    def test_each_prompt_group_uses_its_own_rows(self, materialized):
         # Two prompt groups in one call (the legacy sync batch). Totals 10/20
         # vs profiled threshold 12: the long rollout loses 0.3 (AGENT) or 0.6
         # (code_agent override), then its own row band scales the rest:
@@ -1486,6 +1487,19 @@ class TestNemoGymPostprocessHook:
             for agent, b in ((AGENT, 20), ("code_agent", 30))
             for _ in range(2)
         ]
+        if materialized:
+            rows = [
+                {
+                    "task_id": {
+                        "taskset": row["agent_ref"]["name"],
+                        "task_id": str(index // 2),
+                    },
+                    "task_input": {
+                        key: value for key, value in row.items() if key != "agent_ref"
+                    },
+                }
+                for index, row in enumerate(rows)
+            ]
         grpo_config = make_config(
             default={"profiled_length_penalty": 0.3, "profile_band_total": True}
         )["grpo"]

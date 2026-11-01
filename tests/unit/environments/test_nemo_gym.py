@@ -2126,7 +2126,10 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         ]
         assert streamed_results[0][0] == 7
         assert streamed_results[0][1] == nemo_gym_row["agent_ref"]
-        assert streamed_results[0][2] == {"message_log": []}
+        assert streamed_results[0][2] == {
+            "message_log": [],
+            "attribution_key": "legacy_test_agent",
+        }
 
     asyncio.run(_run())
 
