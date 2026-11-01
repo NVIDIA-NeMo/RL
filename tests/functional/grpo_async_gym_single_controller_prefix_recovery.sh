@@ -71,8 +71,9 @@ mkdir -p "$TEST_DIR"
 
 # Each step has one Workplace prompt group per LIST_LENGTHS entry. Each episode
 # makes a named calendar_create_event call, then closes by listing the integers
-# 1..N. The checkpoint test agent switches the closing turn to tool_choice none
-# without forcing a length, so that call is unconstrained (cuttable mid-decode),
+# 1..N. Gym sees tool_choice auto on every turn, so both calls are cuttable; the
+# test hook's policy proxy sends every call after the tool result to vLLM with
+# tool_choice none and no forced length, so the closing call lists the integers,
 # ends at its natural EOS, and the groups finish in an order fixed by N rather
 # than by scheduling noise.
 # The second Workplace prompt expects a different duration than requested, so
@@ -99,11 +100,6 @@ jq -n -c -L "$SCRIPT_DIR" \
         | .responses_create_params.max_output_tokens = ($list_length * $tokens_per_item + $output_slack)
     ' > "$TEST_DATA"
 
-# After the calendar mutation, the checkpoint test agent stops further tool
-# calls on the closing turn and leaves its length to the model.
-WORKPLACE_PREFIX_ENV=(
-    NEMO_GYM_TEST_WORKPLACE_PREFIX_AFTER_MUTATION=1
-)
 
 stop_phase1() {
     if [[ -z "$PHASE1_PID" ]]; then
@@ -175,10 +171,6 @@ COMMON_OVERRIDES=(
     policy.generation.temperature=1.0
     policy.generation.top_p=0.000001
     '~env.nemo_gym.code_gen'
-    # The base config's inline environment server names the stock Workplace
-    # agent; the checkpoint test agent's config brings its own.
-    '~env.nemo_gym.workplace_assistant_environment_server'
-    "env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/workplace_assistant.yaml]"
     # Keep each step's prompt membership fixed across runs.
     data.shuffle=false
     data.train.data_path="$TEST_DATA"
@@ -188,7 +180,6 @@ COMMON_OVERRIDES=(
 echo "=== Reference: run the same workload without interruption ==="
 timeout --signal=TERM --kill-after=30s "${PHASE2_TIMEOUT_S}s" \
     env \
-        "${WORKPLACE_PREFIX_ENV[@]}" \
         SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
         SC_TEST_CONFIG="$TEST_CONFIG" \
         SC_GYM_RECOVERY_TEST_EVENTS="$BASELINE_EVENTS" \
@@ -204,7 +195,6 @@ cp "$BASE_RUN_LOG" "$BASELINE_LOG"
 echo "=== Phase 1: publish a checkpoint containing an active generation prefix ==="
 command -v setsid >/dev/null
 setsid env \
-    "${WORKPLACE_PREFIX_ENV[@]}" \
     SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
     SC_TEST_CONFIG="$TEST_CONFIG" \
     SC_GYM_RECOVERY_TEST_EVENTS="$PHASE1_EVENTS" \
@@ -254,7 +244,6 @@ done
 echo "=== Phase 2: restore the prefix and generate its remaining suffix ==="
 timeout --signal=TERM --kill-after=30s "${PHASE2_TIMEOUT_S}s" \
     env \
-        "${WORKPLACE_PREFIX_ENV[@]}" \
         SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
         SC_TEST_CONFIG="$TEST_CONFIG" \
         SC_GYM_RECOVERY_TEST_EVENTS="$PHASE2_EVENTS" \
