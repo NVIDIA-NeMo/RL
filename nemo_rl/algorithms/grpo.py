@@ -664,6 +664,79 @@ def _shutdown_completed_nemo_gym_startup(
     shard_set.shutdown()
 
 
+def inference_gpus_per_instance(
+    generation_config: GenerationConfig, policy_config: PolicyConfig
+) -> int:
+    """GPUs one generation instance spans: the unit kept inside one NVLink domain.
+
+    For vLLM: total GPUs per instance = TP * PP (separate dimensions).
+    For SGLang: gpus_per_server already includes all parallelism dimensions
+      (TP, DP-attention, PP are internal subdivisions), so we use it directly
+      without multiplying by pp_size.
+    For Megatron: the NVLink-domain span of the parallelism the generation
+      workers actually run with.
+    For TRT-LLM: under PD disaggregation the whole replica, not one engine.
+    """
+    if generation_config["backend"] == "megatron":
+        return MegatronGeneration.nvlink_domain_span(policy_config)
+    if generation_config["backend"] == "vllm":
+        vllm_cfg = generation_config.get("vllm_cfg", {})
+        return vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
+            "pipeline_parallel_size", 1
+        )
+    if generation_config["backend"] == "trtllm":
+        return replica_width(cast(TrtllmConfig, generation_config))
+    if generation_config["backend"] == "dynamo":
+        return DynamoConfig.model_validate(generation_config).engine_world_size
+    sglang_cfg = generation_config.get("sglang_cfg", {})
+    return sglang_cfg.get("gpus_per_server", 1)
+
+
+def prepare_inference_segment_topology(
+    generation_config: GenerationConfig,
+    policy_config: PolicyConfig,
+    inference_nodes: int,
+    inference_gpus_per_node: int,
+    topology: dict[str, tuple[str, int]],
+) -> tuple[Optional[list[dict[str, float]]], Optional[int], Optional[list[str]]]:
+    """Pin each multi-node generation instance to one NVLink domain.
+
+    Each inference instance spans nodes_per_instance nodes; keep those within
+    one domain so cross-node all-reduce (and, under PD disaggregation, the KV
+    transfer) uses NVLink, not InfiniBand. Instances that fit on one node, or
+    a node count the instance width does not divide, get no constraints.
+
+    Args:
+        topology: The nodes inference may use (node_id -> (domain, topo_rank)).
+
+    Returns:
+        ``(node_resource_constraints, segment_size, remaining_node_ids)`` for
+        the inference ``RayVirtualCluster``; all three are None when no
+        constraints apply. remaining_node_ids are the topology's nodes left
+        unselected.
+    """
+    gpus_per_instance = inference_gpus_per_instance(generation_config, policy_config)
+    nodes_per_instance = (
+        gpus_per_instance + inference_gpus_per_node - 1
+    ) // inference_gpus_per_node
+    if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
+        constraints, remaining_node_ids, _ = prepare_segment_topology(
+            nodes_per_instance,
+            inference_nodes,
+            topology=topology,
+            role="inference",
+        )
+        return constraints, nodes_per_instance, remaining_node_ids
+    if nodes_per_instance > 1:
+        print(
+            f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
+            f"nodes_per_instance={nodes_per_instance} (gpus_per_instance={gpus_per_instance}); "
+            f"skipping inference topology constraints",
+            flush=True,
+        )
+    return None, None, None
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -1274,63 +1347,21 @@ def setup(
                 # Inference topology: each inference instance spans
                 # nodes_per_instance nodes; keep those within one domain
                 # so cross-node all-reduce uses NVLink, not InfiniBand.
-                #
-                # For vLLM: total GPUs per instance = TP * PP (separate dimensions).
-                # For SGLang: gpus_per_server already includes all parallelism
-                #   dimensions (TP, DP-attention, PP are internal subdivisions),
-                #   so we use it directly without multiplying by pp_size.
-                # For Megatron: the NVLink-domain span of the parallelism the
-                #   generation workers actually run with.
-                if generation_config["backend"] == "megatron":
-                    gpus_per_instance = MegatronGeneration.nvlink_domain_span(
-                        policy_config
-                    )
-                elif generation_config["backend"] == "vllm":
-                    vllm_cfg = generation_config.get("vllm_cfg", {})
-                    gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
-                        "pipeline_parallel_size", 1
-                    )
-                elif generation_config["backend"] == "trtllm":
-                    # Under PD disaggregation the unit to keep inside one NVLink
-                    # domain is the whole replica, not one engine.
-                    gpus_per_instance = replica_width(
-                        cast(TrtllmConfig, generation_config)
-                    )
-                elif generation_config["backend"] == "dynamo":
-                    gpus_per_instance = DynamoConfig.model_validate(
-                        generation_config
-                    ).engine_world_size
-                else:
-                    sglang_cfg = generation_config.get("sglang_cfg", {})
-                    gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
-                nodes_per_instance = (
-                    gpus_per_instance + inference_gpus_per_node - 1
-                ) // inference_gpus_per_node
-                if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
-                    remaining_topology = {
-                        nid: topology[nid] for nid in remaining_node_ids
-                    }
-                    (
-                        inference_node_resource_constraints,
-                        inference_remaining_ids,
-                        _,
-                    ) = prepare_segment_topology(
-                        nodes_per_instance,
-                        inference_nodes,
-                        topology=remaining_topology,
-                        role="inference",
-                    )
-                    inference_segment_size = nodes_per_instance
+                (
+                    inference_node_resource_constraints,
+                    inference_segment_size,
+                    inference_remaining_ids,
+                ) = prepare_inference_segment_topology(
+                    generation_config,
+                    policy_config,
+                    inference_nodes,
+                    inference_gpus_per_node,
+                    topology={nid: topology[nid] for nid in remaining_node_ids},
+                )
+                if inference_remaining_ids is not None:
                     teacher_segment_topology = {
                         nid: topology[nid] for nid in inference_remaining_ids
                     }
-                elif nodes_per_instance > 1:
-                    print(
-                        f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
-                        f"nodes_per_instance={nodes_per_instance} (gpus_per_instance={gpus_per_instance}); "
-                        f"skipping inference topology constraints",
-                        flush=True,
-                    )
 
         # initialize train cluster
         train_cluster = RayVirtualCluster(
