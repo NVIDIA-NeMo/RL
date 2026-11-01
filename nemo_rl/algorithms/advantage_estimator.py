@@ -265,6 +265,8 @@ class ReinforcePlusPlusAdvantageEstimator:
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type
+        self.kl_input_clamp_value = loss_config.kl_input_clamp_value
+        self.kl_output_clamp_value = loss_config.kl_output_clamp_value
 
     def compute_advantage(
         self,
@@ -327,6 +329,8 @@ class ReinforcePlusPlusAdvantageEstimator:
                 logprobs_policy,
                 logprobs_reference,
                 kl_type=self.kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
             )
             # Tokens outside the filtered policy support are excluded from the
             # actor loss; keep their -inf logprobs from poisoning the batch.
@@ -420,6 +424,8 @@ class GeneralizedAdvantageEstimator:
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type
+        self.kl_input_clamp_value = loss_config.kl_input_clamp_value
+        self.kl_output_clamp_value = loss_config.kl_output_clamp_value
 
     def _reward_whiten(
         self,
@@ -469,7 +475,13 @@ class GeneralizedAdvantageEstimator:
             and logprobs_policy is not None
             and logprobs_reference is not None
         ):
-            kl = calculate_kl(logprobs_policy, logprobs_reference, self.kl_type)
+            kl = calculate_kl(
+                logprobs_policy,
+                logprobs_reference,
+                self.kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+            )
             # Tokens outside the filtered policy support are excluded from the
             # actor loss; keep their -inf logprobs from poisoning the rewards.
             kl = torch.where(~torch.isneginf(logprobs_policy), kl, 0.0)
