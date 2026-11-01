@@ -16,6 +16,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
+from itertools import accumulate
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, cast
 
 import torch
@@ -543,7 +544,6 @@ def forward_with_post_processing_fn(
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
-            packed_seq_params=packed_seq_params,
         )
     else:
         raise TypeError(
@@ -815,7 +815,15 @@ class LossPostProcessor:
                 wrapper_cls = SequencePackingLossWrapper
                 prepare_fn = prepare_loss_input_wrapped
 
-            cu_seqlens_q_cpu = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
+            if wrapper_cls is CSDSequencePackingLossWrapper:
+                # The packing note holds padded boundaries in every field; the
+                # CSD wrapper zero-fills each row past its real length.
+                cu_seqlens_q_cpu = (
+                    0,
+                    *accumulate(to_cpu_int_tuple(data_dict["input_lengths"])),
+                )
+            else:
+                cu_seqlens_q_cpu = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
             cu_seqlens_q_padded_cpu = (
                 to_cpu_int_tuple(packed_seq_params.cu_seqlens_q_padded)
                 if packed_seq_params.cu_seqlens_q_padded is not None
@@ -1559,7 +1567,6 @@ class FullLogitsPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         cu_seqlens_padded: Optional[torch.Tensor],
-        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Callable[
         [torch.Tensor],
         Tuple[
@@ -1570,10 +1577,9 @@ class FullLogitsPostProcessor:
         """Create a post-processing function that emits raw full-vocab logit shards.
 
         Args:
-            data_dict: Batched data dictionary.
+            data_dict: Batched data dictionary. Its ``input_lengths`` hold each
+                packed sample's real length.
             cu_seqlens_padded: Physical cumulative sequence boundaries.
-            packed_seq_params: Packed metadata carrying distinct raw and padded
-                cumulative boundaries.
 
         Returns:
             Callable that maps the model output tensor to
@@ -1584,10 +1590,10 @@ class FullLogitsPostProcessor:
             ``full_logits`` is tensor-free :class:`StreamedFullLogitsMetadata`.
         """
         pack = self.cfg["sequence_packing"]["enabled"]
-        if pack and (packed_seq_params is None or cu_seqlens_padded is None):
+        if pack and cu_seqlens_padded is None:
             raise ValueError(
-                "Packed full-logit export requires PackedSeqParams and padded "
-                "cumulative sequence boundaries."
+                "Packed full-logit export requires padded cumulative sequence "
+                "boundaries."
             )
 
         def processor_fn_inner(output_tensor):
@@ -1597,16 +1603,11 @@ class FullLogitsPostProcessor:
             # reassembles the full vocab.
             logits = output_tensor.to(torch.float32)
             if pack:
-                assert packed_seq_params is not None
                 assert cu_seqlens_padded is not None
-                raw_cu_seqlens = packed_seq_params.cu_seqlens_q
-                if raw_cu_seqlens is None:
-                    raise ValueError(
-                        "PackedSeqParams.cu_seqlens_q must preserve raw boundaries."
-                    )
                 batch_size, logical_seq_len = data_dict["input_ids"].shape[:2]
+                input_lengths = data_dict["input_lengths"]
                 if (
-                    int(raw_cu_seqlens.numel()) != batch_size + 1
+                    int(input_lengths.numel()) != batch_size
                     or int(cu_seqlens_padded.numel()) != batch_size + 1
                 ):
                     raise ValueError(
@@ -1628,24 +1629,11 @@ class FullLogitsPostProcessor:
                 logical_window_start = cp_rank * local_logical_len
                 logical_window_end = logical_window_start + local_logical_len
                 cp_padding_multiple = 2 * cp_size if cp_size > 1 else 1
-                input_lengths = data_dict["input_lengths"]
                 cp_group = get_context_parallel_group() if cp_size > 1 else None
                 sample_slices: list[tuple[int, int, int, int]] = []
                 stored_seq_lengths: list[int] = []
                 for sample_index in range(batch_size):
-                    raw_length = int(
-                        (
-                            raw_cu_seqlens[sample_index + 1]
-                            - raw_cu_seqlens[sample_index]
-                        ).item()
-                    )
-                    input_length = int(input_lengths[sample_index].item())
-                    if raw_length != input_length:
-                        raise ValueError(
-                            "Packed raw boundary disagrees with input_lengths "
-                            f"for sample {sample_index}: raw={raw_length}, "
-                            f"input_length={input_length}."
-                        )
+                    raw_length = int(input_lengths[sample_index].item())
                     padded_start = int(cu_seqlens_padded[sample_index].item())
                     padded_end = int(cu_seqlens_padded[sample_index + 1].item())
                     padded_length = padded_end - padded_start

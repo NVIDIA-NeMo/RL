@@ -2033,9 +2033,13 @@ def _pack_sequences_for_megatron(
 
     # total_tokens is required for PackedSeqParams.__post_init__ to build
     # seq_idx, which Mamba uses to reset SSM state at sample boundaries.
+    # One padded tensor fills all four boundary fields: TE infers no
+    # inter-sequence padding only when the padded and unpadded fields are the
+    # same object, which keeps FlashAttention eligible. Readers that need real
+    # per-sample lengths use the returned cu_seqlens or input_lengths.
     packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=int(max_seqlen),
