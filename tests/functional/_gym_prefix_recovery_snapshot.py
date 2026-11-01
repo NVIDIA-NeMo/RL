@@ -26,26 +26,19 @@ from pathlib import Path
 from typing import Any
 
 from _gym_recovery_snapshot_helpers import (
+    calendar_sentinel_count,
     ledger_episode_index,
     matching_siblings,
     participant_records,
     read_json,
+    read_jsonl,
+    restored_prefixes,
 )
 
 
 def _episode_key(record: dict[str, Any]) -> tuple[str, int]:
     episode = record["episode_id"]
     return episode["rollout_id"], episode["attempt"]
-
-
-def _calendar_sentinel_count(state: dict[str, Any], event_name: str) -> int:
-    """Count the selected calendar event in a checkpointed Workplace state."""
-
-    columns = state["calendar"]["_calendar_events"]["columns"]
-    names = next(
-        column["values"] for column in columns if column["name"] == "event_name"
-    )
-    return sum(str(name).lower() == event_name.lower() for name in names)
 
 
 def _process_alive(pid: int) -> bool:
@@ -154,10 +147,7 @@ def inspect_snapshot(
         if recovery is None or cut is None or resource_entry is None:
             continue
         resources_manifest, resources_state = resource_entry
-        try:
-            sentinel_count = _calendar_sentinel_count(resources_state, sentinel_event)
-        except (KeyError, StopIteration, TypeError):
-            continue
+        sentinel_count = calendar_sentinel_count(resources_state, sentinel_event)
         instance_id = recovery["gym_instance_id"]
         checkpointed_episodes = {
             (episode["rollout_id"], episode["attempt"])
@@ -242,16 +232,12 @@ def select_snapshot(args: argparse.Namespace) -> None:
     raise TimeoutError(f"no recoverable prefix snapshot found ({last_error})")
 
 
-def _events(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line]
-
-
 def _verify_restored_cut(
     cut: dict[str, Any],
     *,
     phase1: list[dict[str, Any]],
     phase2: list[dict[str, Any]],
-    restored_prefixes: list[tuple[str, ...]],
+    restored: list[dict[str, Any]],
 ) -> None:
     """Require one cut to return to its Gym owner and resume its exact prefix."""
 
@@ -276,16 +262,16 @@ def _verify_restored_cut(
         raise AssertionError(
             f"expected one accepted restored dispatch: {phase2_dispatch!r}, {phase2_refused!r}"
         )
-    restored = phase2_dispatch[-1]
+    restored_dispatch = phase2_dispatch[-1]
     expected_identity = (
         cut["gym_instance_id"],
         cut["gym_attempt"] + 1,
         cut["generation_index"],
     )
     actual_identity = (
-        restored["gym_instance_id"],
-        restored["gym_attempt"],
-        restored["generation_index"],
+        restored_dispatch["gym_instance_id"],
+        restored_dispatch["gym_attempt"],
+        restored_dispatch["generation_index"],
     )
     if actual_identity != expected_identity:
         raise AssertionError((actual_identity, expected_identity))
@@ -305,37 +291,30 @@ def _verify_restored_cut(
         cut["prefix_digest"],
     )
     if not any(
-        source_model_call_id == expected_prefix[0]
-        and int(prefix_tokens) == expected_prefix[1]
-        and prefix_digest == expected_prefix[2]
-        for _, _, source_model_call_id, prefix_tokens, prefix_digest in restored_prefixes
+        (
+            line["source_model_call_id"],
+            line["prefix_tokens"],
+            line["prefix_digest"],
+        )
+        == expected_prefix
+        for line in restored
     ):
         raise AssertionError(
             f"cut prefix was not restored: expected={expected_prefix!r}, "
-            f"observed={restored_prefixes!r}"
+            f"observed={restored!r}"
         )
 
 
 def verify_restore(args: argparse.Namespace) -> None:
     selection = read_json(Path(args.selection_file))
-    phase1 = _events(Path(args.phase1_events))
-    phase2 = _events(Path(args.phase2_events))
+    phase1 = read_jsonl(Path(args.phase1_events))
+    phase2 = read_jsonl(Path(args.phase2_events))
     log = Path(args.phase2_log).read_text()
     training_info = read_json(Path(args.training_info))
 
-    restored_prefixes = re.findall(
-        r"generation prefix restored: rollout_id=(\S+) model_call_id=(\S+) "
-        r"source_model_call_id=(\S+) prefix_tokens=(\d+) "
-        r"prefix_digest=([0-9a-f]{64})",
-        log,
-    )
-    for cut in selection.get("cuts", [selection]):
-        _verify_restored_cut(
-            cut,
-            phase1=phase1,
-            phase2=phase2,
-            restored_prefixes=restored_prefixes,
-        )
+    restored = restored_prefixes(log)
+    for cut in selection["cuts"]:
+        _verify_restored_cut(cut, phase1=phase1, phase2=phase2, restored=restored)
 
     if training_info["current_step"] != args.max_steps:
         raise AssertionError(training_info)
