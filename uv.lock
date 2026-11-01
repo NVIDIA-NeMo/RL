@@ -4214,6 +4214,7 @@ requires-dist = [
     { name = "ray", extras = ["default"], marker = "extra == 'ray'", specifier = ">=2.58.0" },
     { name = "requests" },
     { name = "requests-mock", marker = "extra == 'dev'" },
+    { name = "requests" },
     { name = "rich" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "scipy", specifier = ">=1.14.1" },

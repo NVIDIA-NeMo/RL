@@ -157,6 +157,7 @@ def _make_master_config(
     """
     generation_config: dict = {
         "backend": backend,
+        "top_logprobs": 0,
         "colocated": {"enabled": colocated, "resources": {}},
     }
     policy_config: dict = {
@@ -706,6 +707,84 @@ def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_cont
     assert config.policy["train_global_batch_size"] == (
         config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
     )
+
+
+def test_generation_top_logprobs_requires_capture():
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.policy["generation"].update(
+        top_logprobs=4, temperature=1.0, top_p=1.0, top_k=None
+    )
+    with pytest.raises(ValueError, match="token_capture.enabled"):
+        validate_single_controller_config(mc)
+    mc.token_capture.enabled = True
+    validate_single_controller_config(mc)
+
+
+def test_token_capture_top_logprobs_rejects_megatron_generation():
+    mc = _make_master_config(
+        backend="megatron",
+        megatron_enabled=True,
+        loss_cfg=ClippedPGLossConfig(score_centering=True),
+    )
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = 4
+    with pytest.raises(ValueError, match="vllm generation backend"):
+        validate_single_controller_config(mc)
+
+
+def test_score_centering_requires_top_logprobs_and_unfiltered_sampling():
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+
+    with pytest.raises(ValueError, match="policy.generation.top_logprobs > 0"):
+        validate_single_controller_config(mc)
+
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = 4
+    mc.policy["generation"]["vllm_kwargs"] = {"max_logprobs": 4}
+    mc.policy["generation"]["top_p"] = 0.9
+    mc.policy["generation"]["temperature"] = 1.0
+    mc.policy["generation"]["top_k"] = None
+    with pytest.raises(ValueError, match="unfiltered sampling"):
+        validate_single_controller_config(mc)
+
+    mc.policy["generation"]["top_p"] = 1.0
+    validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize(
+    "temperature,mode,valid",
+    [
+        (1.0, None, True),
+        (1.0, "raw_logprobs", True),
+        (0.7, None, False),
+        (0.7, "raw_logprobs", False),
+        (0.7, "processed_logprobs", True),
+        (1.3, "processed_logprobs", True),
+        (0.0, "processed_logprobs", False),
+        (-1.0, "processed_logprobs", False),
+        (float("nan"), "processed_logprobs", False),
+        (float("inf"), "processed_logprobs", False),
+        (1.0, "raw_logits", False),
+        (1.0, "processed_logits", False),
+    ],
+)
+@pytest.mark.parametrize("source", ["vllm_cfg", "vllm_kwargs"])
+def test_score_centering_validates_sampler_distribution(
+    temperature, mode, valid, source
+):
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = 4
+    generation = mc.policy["generation"]
+    generation.update(
+        temperature=temperature, top_p=1.0, top_k=None, vllm_kwargs={"max_logprobs": 4}
+    )
+    generation.setdefault(source, {})["logprobs_mode"] = mode
+    if valid:
+        validate_single_controller_config(mc)
+    else:
+        with pytest.raises(ValueError, match="score_centering requires"):
+            validate_single_controller_config(mc)
 
 
 @pytest.mark.parametrize(
@@ -3191,8 +3270,8 @@ class TestAdaptiveLossRestore:
         checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
         checkpointer.load_training_info.return_value = vars(save_state)
         checkpointer.get_resume_paths.return_value = (None, None)
-        patched_factories["ClippedPGLossFn"].side_effect = (
-            lambda cfg, **kwargs: ClippedPGLossFn(cfg, **kwargs)
+        patched_factories["ClippedPGLossFn"].side_effect = lambda cfg, **kwargs: (
+            ClippedPGLossFn(cfg, **kwargs)
         )
         mc = _make_master_config(
             loss_cfg=ClippedPGLossConfig(
@@ -4088,7 +4167,10 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     finalizer_config = mock_finalizers.call_args.args[1]
     assert finalizer_config.capture_media is multimodal
     actor_args.gen_handle.setup_token_capture.assert_called_once_with(
-        ANY, mc.token_capture.staging_partition, capture_media=multimodal
+        ANY,
+        mc.token_capture.staging_partition,
+        capture_media=multimodal,
+        top_logprobs=0,
     )
     # What the workers pinned the media column to is what the finalizers get.
     assert (
@@ -4144,3 +4226,115 @@ def test_minf_image_preprocessing_emits_float32_pixels():
     assert tuple(imgs.shape) == (1, 4, 3 * 2 * 2)
     assert imgs_sizes.dtype == torch.int32
     assert imgs_sizes.tolist() == [[4, 4]]
+
+
+@pytest.mark.parametrize(
+    "backend_cfg",
+    [
+        {
+            "automodel_cfg": {
+                "enabled": True,
+                "tensor_parallel_size": 2,
+                "context_parallel_size": 1,
+            }
+        },
+        {
+            "automodel_cfg": {
+                "enabled": True,
+                "tensor_parallel_size": 1,
+                "context_parallel_size": 2,
+            }
+        },
+        {"megatron_cfg": {"enabled": True, "use_fused_linear_logprobs": True}},
+    ],
+)
+def test_score_centering_rejects_unsupported_trainer_logits(backend_cfg):
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = 4
+    mc.policy["generation"].update(
+        temperature=1.0, top_p=1.0, top_k=None, vllm_kwargs={"max_logprobs": 4}
+    )
+    validate_single_controller_config(mc)
+    for name, cfg in backend_cfg.items():
+        mc.policy[name] = {**(mc.policy.get(name) or {}), **cfg}
+    with pytest.raises(ValueError, match="loss_fn.score_centering"):
+        validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize("cap", [None, 2, 8, -1])
+@pytest.mark.parametrize("top_logprobs", [0, 4])
+def test_token_capture_top_logprobs_reaches_partitions_workers_and_finalizers(
+    patched_factories, top_logprobs, cap
+):
+    from nemo_rl.data_plane.schema import SAMPLER_TOPK_FIELDS
+
+    mc = _make_master_config(
+        backend="vllm",
+        loss_cfg=ClippedPGLossConfig(score_centering=top_logprobs > 0),
+    )
+    mc.policy["generation"].update(
+        {
+            "model_name": "test-model",
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": None,
+            "vllm_cfg": {"async_engine": True},
+            "vllm_kwargs": {} if cap is None else {"max_logprobs": cap},
+        }
+    )
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = top_logprobs
+    mc.env = {"should_use_nemo_gym": True, "nemo_gym": {}}
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(
+            sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+        ) as mock_gym,
+        patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[MagicMock(name="finalizer_0")],
+        ) as mock_finalizers,
+    ):
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+    expected_cap = (
+        (4 if cap is None or (cap != -1 and cap < 4) else cap) if top_logprobs else cap
+    )
+    assert mc.policy["generation"]["vllm_kwargs"].get("max_logprobs") == expected_cap
+    # Rollout and staging partitions carry the sampler columns only when on.
+    partitions = {
+        call.kwargs["partition_id"]: set(call.kwargs["fields"])
+        for call in actor_args.dp_client.register_partition.call_args_list
+    }
+    for partition_id in ("rollout_data", mc.token_capture.staging_partition):
+        assert (set(SAMPLER_TOPK_FIELDS) <= partitions[partition_id]) is (
+            top_logprobs > 0
+        )
+    generation, _ = patched_factories["_build_generation"].return_value
+    assert mock_gym.call_args.kwargs["token_capture"]["top_logprobs"] == top_logprobs
+    _, setup_kwargs = generation.setup_token_capture.call_args
+    assert setup_kwargs.get("top_logprobs", 0) == top_logprobs
+    assert mock_finalizers.call_args.args[1].top_logprobs == top_logprobs
+
+
+@pytest.mark.parametrize("count", [-1, 1.5, True])
+def test_score_centering_rejects_invalid_top_logprobs(count):
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.policy["generation"]["top_logprobs"] = count
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        validate_single_controller_config(mc)
+
+
+def test_generation_top_logprobs_requires_score_centering():
+    mc = _make_master_config()
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = 4
+    with pytest.raises(ValueError, match="only read by loss_fn.score_centering"):
+        validate_single_controller_config(mc)

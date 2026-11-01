@@ -103,6 +103,9 @@ from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
 )
+from nemo_rl.models.generation.score_centering import (
+    build_score_centering_request_overrides,
+)
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.telemetry.instrumentation import (
     accepts_trace_context,
@@ -927,7 +930,11 @@ class NemoGym(EnvironmentInterface):
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
-        from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
+        from nemo_gym.server_utils import (
+            HEAD_SERVER_KEY_NAME,
+            BaseServerConfig,
+            ServerClient,
+        )
         from omegaconf import DictConfig
 
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
@@ -1023,6 +1030,15 @@ Depending on your data shape, you may want to change these values."""
                 .setdefault("vllm_model", {})
             )
             policy_overrides["return_token_id_information"] = False
+            if (
+                _external_staging_backend(token_capture) == "vllm_worker"
+                and token_capture.get("top_logprobs", 0) > 0
+            ):
+                policy_overrides.setdefault("sampling_overrides", {}).update(
+                    build_score_centering_request_overrides(
+                        num_candidates=token_capture["top_logprobs"]
+                    )
+                )
             capture_dir = os.path.abspath(token_capture["capture_dir"])
             initial_global_config_dict["token_id_capture"] = {
                 "enabled": True,
@@ -1079,7 +1095,22 @@ Depending on your data shape, you may want to change these values."""
             host=self.node_ip,
             port=self.head_server_port,
         )
-        self.rch = RolloutCollectionHelper()
+        # Resolve once before dispatch: synchronous config loads during each
+        # rollout can block receipt delivery past its deadline. This helper is
+        # bound to this deployment and replaced on every startup.
+        rollout_client = ServerClient.load_from_global_config(self.head_server_config)
+
+        class DeploymentRolloutCollectionHelper(RolloutCollectionHelper):
+            def setup_server_client(
+                self, head_server_config: BaseServerConfig | None = None
+            ) -> ServerClient:
+                if head_server_config not in (None, rollout_client.head_server_config):
+                    raise ValueError(
+                        "Rollout helper belongs to a different Gym deployment"
+                    )
+                return rollout_client
+
+        self.rch = DeploymentRolloutCollectionHelper()
 
     def set_tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         """Install the tokenizer run_rollouts postprocesses with.
