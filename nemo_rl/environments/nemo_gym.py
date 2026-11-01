@@ -98,6 +98,7 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
+from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -312,6 +313,12 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         return False
 
     generation_config = master_config.policy["generation"]
+    if dynamo_enabled(generation_config):
+        raise ValueError(
+            "policy.generation.dynamo=true does not serve NeMo-Gym rollouts yet. "
+            "Set policy.generation.dynamo=false to run this NeMo-Gym config on "
+            "NeMo RL's vLLM servers."
+        )
     assert should_use_async_rollouts(generation_config), (
         "❌ Error: In order to use NeMo-Gym, you must use a generation "
         "backend with `async_engine: true`!"
@@ -327,10 +334,6 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         ).get("expose_http_server")
     elif generation_config["backend"] == "trtllm":
         should_expose_http_server = generation_config.get("trtllm_cfg", {}).get(
-            "expose_http_server"
-        )
-    elif generation_config["backend"] == "dynamo":
-        should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
             "expose_http_server"
         )
     else:
@@ -2346,8 +2349,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
     # Enable the backend's OpenAI-compatible server.
-    if generation_config["backend"] in ("vllm", "dynamo"):
-        # Dynamo uses these flags to expose its token wrapper to Gym.
+    if generation_config["backend"] == "vllm":
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
     elif generation_config["backend"] == "megatron":
@@ -2363,7 +2365,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         generation_config["trtllm_cfg"]["expose_http_server"] = True
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm, dynamo, megatron, or trtllm "
+            "NeMo-Gym setup supports vllm, megatron, or trtllm "
             f"generation; got {generation_config['backend']!r}"
         )
 

@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Driver-owned lifecycle for a fixed Ray-managed Dynamo deployment."""
+"""Driver-owned Dynamo services: etcd, NATS and the OpenAI frontend.
+
+The vLLM engines are NeMo RL's own workers; each registers itself with these
+services (see ``native_engine``), so the runtime only waits to see them.
+"""
 
 import atexit
 import json
@@ -27,60 +31,102 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Callable
 
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
     DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
     DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
     DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
-    RayVirtualCluster,
     _get_free_port_local,
     _get_node_ip_local,
 )
-from nemo_rl.models.generation.dynamo.arguments import (
-    build_dynamo_frontend_argv,
-    redact_argv,
-    redact_environment,
-)
-from nemo_rl.models.generation.dynamo.config import DynamoConfig
-from nemo_rl.models.generation.dynamo.venv import (
-    get_dynamo_executable,
-    get_dynamo_python,
-)
-from nemo_rl.models.generation.dynamo.worker_pool import FixedDynamoWorkerPool
+from nemo_rl.models.generation.dynamo.config import DynamoCfg
+
+# The engines register on this component and endpoint (see native_engine).
+DYNAMO_COMPONENT = "backend"
+DYNAMO_ENDPOINT = "generate"
 
 LOGGER = logging.getLogger(__name__)
 
 
+def frontend_argv(
+    *, host: str, port: int, namespace: str, dynamo_cfg: DynamoCfg
+) -> list[str]:
+    """The ``dynamo.frontend`` arguments; ``extra_cli_args`` may not repeat one."""
+    argv = [
+        "--http-host",
+        host,
+        "--http-port",
+        str(port),
+        "--namespace-prefix",
+        namespace,
+        "--discovery-backend",
+        "etcd",
+        "--request-plane",
+        "tcp",
+        "--event-plane",
+        "nats",
+        "--router-mode",
+        dynamo_cfg.frontend_args.router_mode,
+    ]
+    extra = dynamo_cfg.frontend_args.extra_cli_args
+    for token in extra:
+        flag = token.split("=", 1)[0].replace("_", "-")
+        if flag.startswith("--") and flag in argv:
+            raise ValueError(
+                f"Dynamo frontend option {flag} is set by both the managed runtime "
+                "and dynamo_cfg.frontend_args.extra_cli_args."
+            )
+    return argv + list(extra)
+
+
+def _service_executable(name: str) -> str:
+    """The etcd or nats-server binary: in NEMO_RL_DYNAMO_BIN_DIR when set, else on PATH."""
+    bin_dir = os.environ.get("NEMO_RL_DYNAMO_BIN_DIR")
+    found = shutil.which(name, path=os.path.expanduser(bin_dir) if bin_dir else None)
+    if found is None:
+        where = f"NEMO_RL_DYNAMO_BIN_DIR={bin_dir}" if bin_dir else "PATH"
+        raise FileNotFoundError(
+            f"{name} is not an executable on {where}. Build the image with "
+            "--build-arg BUILD_DYNAMO=1, or install etcd and nats-server with "
+            "docker/dynamo/install.sh and set NEMO_RL_DYNAMO_BIN_DIR to their "
+            "directory."
+        )
+    return found
+
+
+# The KV router's applied-event counter (Dynamo's kvrouter.KV_CACHE_EVENTS_APPLIED),
+# one sample per label set.
+_KV_EVENTS_APPLIED = re.compile(
+    r'^\w*kv_cache_events_applied(?:_total)?\{(?=[^}]*status="(?P<status>[^"]*)")'
+    r"[^}]*\}\s+(?P<value>\S+)$",
+    re.MULTILINE,
+)
+
+
 def _managed_namespace() -> str:
     raw = f"nemo-rl-{os.environ.get('SLURM_JOB_ID', os.getpid())}"
-    namespace = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(raw)).strip("-_").lower()
-    if not namespace:
-        raise ValueError(f"Could not derive a valid Dynamo namespace from {raw!r}.")
-    return namespace
+    return re.sub(r"[^a-zA-Z0-9_-]+", "-", raw).strip("-_").lower()
 
 
 class ManagedDynamoRuntime:
-    """Own etcd, NATS, frontend, and a fixed Ray actor worker fleet."""
+    """Own etcd, NATS and the frontend that NeMo RL's vLLM engines register with."""
 
     def __init__(
-        self,
-        *,
-        cluster: RayVirtualCluster,
-        config: dict[str, Any],
+        self, *, dynamo_cfg: DynamoCfg, model_name: str, frontend_python: str
     ) -> None:
-        validated_config = DynamoConfig.model_validate(config)
-        self._cluster = cluster
-        self._config = validated_config.model_dump()
-        self._dynamo_cfg = validated_config.dynamo_cfg
-        self._engine_world_size = validated_config.engine_world_size
-        if self._engine_world_size > cluster.num_gpus_per_node:
-            raise ValueError(
-                "Managed Dynamo requires each TP/PP engine group to fit on one "
-                f"node: tp*pp={self._engine_world_size} exceeds "
-                f"cluster.num_gpus_per_node={cluster.num_gpus_per_node}"
-            )
+        """Describe the services; nothing starts until :meth:`start`.
+
+        Args:
+            dynamo_cfg: The validated ``policy.generation.dynamo_cfg``.
+            model_name: The served model; the frontend is ready once it lists it.
+            frontend_python: An interpreter whose environment has ``ai-dynamo``:
+                the vLLM workers' own.
+        """
+        self._dynamo_cfg = dynamo_cfg
+        self._model_name = model_name
+        self._frontend_python = frontend_python
         self._namespace = _managed_namespace()
         self._host = ""
         self._etcd_port = 0
@@ -89,13 +135,15 @@ class ManagedDynamoRuntime:
         self._frontend_port = 0
         self._manager_env: dict[str, str] = {}
         self._started = False
-        self._atexit_registered = False
         self._etcd_process: subprocess.Popen | None = None
         self._nats_process: subprocess.Popen | None = None
         self._frontend_process: subprocess.Popen | None = None
         self._etcd_data_dir: str | None = None
         self._nats_data_dir: str | None = None
-        self._pool: FixedDynamoWorkerPool | None = None
+
+    @property
+    def namespace(self) -> str:
+        return self._namespace
 
     @property
     def frontend_url(self) -> str:
@@ -104,77 +152,59 @@ class ManagedDynamoRuntime:
         host = f"[{self._host}]" if ":" in self._host else self._host
         return f"http://{host}:{self._frontend_port}/v1"
 
+    @property
+    def engine_env(self) -> dict[str, str]:
+        """The environment each engine's Dynamo worker needs to register."""
+        if not self._started:
+            raise RuntimeError("Managed Dynamo runtime has not been started")
+        # An OS-assigned system port makes each engine serve its own model-card
+        # files to a frontend on another node.
+        return {**self._manager_env, "DYN_SYSTEM_PORT": "0"}
+
     def start(self) -> None:
-        """Start the complete managed service fleet."""
+        """Start etcd, NATS and the frontend."""
         if self._started:
             raise RuntimeError("Managed Dynamo runtime is already started")
         # Managed services use new process groups and would survive an
-        # exception that escapes GRPO setup. Keep an interpreter-exit fallback
-        # in addition to the normal explicit shutdown path.
+        # exception that escapes setup. Keep an interpreter-exit fallback in
+        # addition to the normal explicit shutdown path.
         atexit.register(self.shutdown)
-        self._atexit_registered = True
         self._host = _get_node_ip_local()
-        used_ports: set[int] = set()
-
-        def allocate_port(*, low: int, high: int) -> int:
-            port = _get_free_port_local(
-                low,
-                high,
-                max_retries=None,
-                excluded_ports=used_ports,
+        control = (
+            DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
+            DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
+        )
+        http = (DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW, DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH)
+        ports: list[int] = []
+        for low, high in (control, control, control, http):
+            ports.append(
+                _get_free_port_local(
+                    low, high, max_retries=None, excluded_ports=set(ports)
+                )
             )
-            used_ports.add(port)
-            return port
-
-        self._etcd_port = allocate_port(
-            low=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
-            high=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
-        )
-        self._etcd_peer_port = allocate_port(
-            low=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
-            high=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
-        )
-        self._nats_port = allocate_port(
-            low=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
-            high=DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
-        )
-        self._frontend_port = allocate_port(
-            low=DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
-            high=DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
+        self._etcd_port, self._etcd_peer_port, self._nats_port, self._frontend_port = (
+            ports
         )
         self._manager_env = {
             "ETCD_ENDPOINTS": f"http://{self._host}:{self._etcd_port}",
             "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
             "DYN_NAMESPACE": self._namespace,
             "DYN_DISCOVERY_BACKEND": "etcd",
-            # Dynamo 1.3.0's legacy tool jail rebuilds response chunks with
-            # nvext=None. Its qwen3/deepseek v2 path preserves engine_data,
-            # which NeMo-Gym needs for exact token IDs and log probabilities.
-            "DYN_ENABLE_EXPERIMENTAL_PARSERS_V2": "1",
             "DYN_REQUEST_PLANE": "tcp",
             "DYN_EVENT_PLANE": "nats",
+            # A canary request would stall behind a refit pause; engine liveness
+            # is the Ray actor's, as for every other vLLM worker.
             "DYN_HEALTH_CHECK_ENABLED": "false",
             "DYN_SDK_DISABLE_ANSI_LOGGING": "1",
-            "DYN_RL_INIT_WEIGHTS_TIMEOUT_S": str(self._dynamo_cfg.control_timeout_s),
         }
         print(
-            f"  [Dynamo] managed environment={redact_environment(self._manager_env)!r}",
+            f"  [Dynamo] managed environment={self._manager_env!r}",
             flush=True,
         )
         try:
             self._start_etcd()
             self._start_nats()
-            self._pool = FixedDynamoWorkerPool(
-                cluster=self._cluster,
-                config=self._config,
-                namespace=self._namespace,
-                engine_world_size=self._engine_world_size,
-                manager_env=self._manager_env,
-                startup_timeout_s=self._dynamo_cfg.startup_timeout_s,
-            )
-            self._pool.start()
             self._start_frontend()
-            self._wait_for_frontend(self._pool.size)
             self._started = True
         except Exception:
             self.shutdown()
@@ -210,20 +240,11 @@ class ManagedDynamoRuntime:
         env.update(self._manager_env)
         return env
 
-    def _frontend_env(self) -> dict[str, str]:
-        env = self._service_env()
-        frontend_args = self._dynamo_cfg.frontend_args
-        env["DYN_TOKENIZER"] = frontend_args.tokenizer
-        if frontend_args.tokenizer_cache:
-            env["DYN_TOKENIZER_CACHE"] = "1"
-            env["DYN_TOKENIZER_CACHE_BYTES"] = str(frontend_args.tokenizer_cache_bytes)
-        return env
-
     def _start_etcd(self) -> None:
         self._etcd_data_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_etcd_")
         peer_url = f"http://{self._host}:{self._etcd_peer_port}"
         command = [
-            get_dynamo_executable("etcd"),
+            _service_executable("etcd"),
             "--listen-client-urls",
             f"http://0.0.0.0:{self._etcd_port}",
             "--advertise-client-urls",
@@ -263,7 +284,7 @@ class ManagedDynamoRuntime:
         self._nats_data_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_nats_")
         self._nats_process = subprocess.Popen(
             [
-                get_dynamo_executable("nats-server"),
+                _service_executable("nats-server"),
                 "-js",
                 "-sd",
                 self._nats_data_dir,
@@ -291,130 +312,86 @@ class ManagedDynamoRuntime:
         raise RuntimeError(f"{label} did not open port {port}.")
 
     def _start_frontend(self) -> None:
-        argv = build_dynamo_frontend_argv(
+        argv = frontend_argv(
             host="0.0.0.0",
             port=self._frontend_port,
             namespace=self._namespace,
             dynamo_cfg=self._dynamo_cfg,
         )
         command = [
-            get_dynamo_python(),
+            self._frontend_python,
             "-m",
             "dynamo.frontend",
             *argv,
         ]
-        print(
-            f"  [Dynamo] launching frontend argv={redact_argv(command)!r}", flush=True
-        )
-        frontend_env = self._frontend_env()
-        tokenizer_env = {
-            key: value
-            for key, value in frontend_env.items()
-            if key.startswith("DYN_TOKENIZER")
-        }
-        print(
-            f"  [Dynamo] frontend tokenizer environment={tokenizer_env!r}",
-            flush=True,
-        )
+        print(f"  [Dynamo] launching frontend argv={command!r}", flush=True)
+        frontend_env = self._service_env()
+        dynamo_venv = os.path.dirname(os.path.dirname(self._frontend_python))
+        frontend_env["VIRTUAL_ENV"] = dynamo_venv
+        frontend_env["UV_PROJECT_ENVIRONMENT"] = dynamo_venv
         self._frontend_process = subprocess.Popen(
             command, env=frontend_env, start_new_session=True
         )
 
-    def _wait_for_frontend(self, expected_workers: int) -> None:
+    def wait_for_engines(
+        self, expected_engines: int, check_engines: Callable[[], None]
+    ) -> None:
+        """Block until the frontend routes to ``expected_engines`` registered engines.
+
+        ``/health`` lists discovery registrations before the frontend's model
+        watcher has installed its OpenAI routes, so readiness also needs the
+        served model on ``/v1/models``; otherwise an immediate request can race
+        the watcher and get a transient 404.
+
+        ``check_engines`` runs on every poll and raises when an engine exited or
+        its endpoint stopped, so a failed registration fails at once.
+        """
         health_url = f"http://127.0.0.1:{self._frontend_port}/health"
         models_url = f"http://127.0.0.1:{self._frontend_port}/v1/models"
-        expected_model = str(self._config["model_name"])
         deadline = time.monotonic() + self._dynamo_cfg.startup_timeout_s
-        last_counts = (0, 0)
-        last_models: set[str] = set()
+        registered = 0
+        served: set[str] = set()
         while time.monotonic() < deadline:
-            if self._pool is None or not self._pool.is_alive():
-                raise RuntimeError(
-                    "A Ray-managed Dynamo vLLM worker exited while the frontend "
-                    "was waiting for model registration."
-                )
-            if (
-                self._frontend_process is not None
-                and self._frontend_process.poll() is not None
-            ):
-                raise RuntimeError(
-                    f"Dynamo frontend exited with code {self._frontend_process.returncode}."
-                )
+            self._assert_services_alive()
+            check_engines()
             try:
                 with urllib.request.urlopen(health_url, timeout=5) as response:
-                    payload = json.loads(response.read())
+                    health = json.loads(response.read())
+                with urllib.request.urlopen(models_url, timeout=5) as response:
+                    models = json.loads(response.read())
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
                 time.sleep(1)
                 continue
-            generate_ids: set[str] = set()
-            rl_ids: set[str] = set()
-            for instance in payload.get("instances", []):
-                if not isinstance(instance, dict):
-                    continue
-                if instance.get("namespace") != self._namespace:
-                    continue
-                if instance.get("component") != "backend":
-                    continue
-                instance_id = instance.get("instance_id")
-                if instance_id is None:
-                    continue
-                if instance.get("endpoint") == "generate":
-                    generate_ids.add(str(instance_id))
-                elif instance.get("endpoint") == "rl":
-                    rl_ids.add(str(instance_id))
-            last_counts = (len(generate_ids), len(rl_ids))
-            if (
-                last_counts == (expected_workers, expected_workers)
-                and generate_ids == rl_ids
-            ):
-                # /health reflects discovery registrations before the frontend's
-                # model watcher has necessarily installed its OpenAI routes. Do
-                # not expose frontend_url until the served model is visible;
-                # otherwise an immediate /v1/completions request can race with
-                # watcher setup and receive a transient 404.
-                try:
-                    with urllib.request.urlopen(models_url, timeout=5) as response:
-                        models_payload = json.loads(response.read())
-                except (
-                    urllib.error.URLError,
-                    TimeoutError,
-                    json.JSONDecodeError,
-                ):
-                    time.sleep(1)
-                    continue
-                last_models = {
-                    str(model["id"])
-                    for model in models_payload.get("data", [])
-                    if isinstance(model, dict) and model.get("id") is not None
+            registered = len(
+                {
+                    str(instance["instance_id"])
+                    for instance in health.get("instances", [])
+                    if isinstance(instance, dict)
+                    and instance.get("namespace") == self._namespace
+                    and instance.get("component") == DYNAMO_COMPONENT
+                    and instance.get("endpoint") == DYNAMO_ENDPOINT
+                    and instance.get("instance_id") is not None
                 }
-                if expected_model not in last_models:
-                    time.sleep(1)
-                    continue
+            )
+            served = {
+                str(model["id"])
+                for model in models.get("data", [])
+                if isinstance(model, dict) and model.get("id") is not None
+            }
+            if registered >= expected_engines and self._model_name in served:
                 print(
-                    f"  [Dynamo] frontend ready with {expected_workers} generation "
-                    "and RL workers",
+                    f"  [Dynamo] frontend {self.frontend_url} routes to "
+                    f"{registered} engine(s)",
                     flush=True,
                 )
                 return
             time.sleep(1)
         raise RuntimeError(
-            "Dynamo frontend did not observe the fixed worker fleet within "
-            f"{self._dynamo_cfg.startup_timeout_s}s: expected={expected_workers}, "
-            f"last_generate={last_counts[0]}, last_rl={last_counts[1]}, "
-            f"expected_model={expected_model!r}, last_models={sorted(last_models)!r}."
+            "Dynamo frontend did not see every vLLM engine within "
+            f"{self._dynamo_cfg.startup_timeout_s}s: expected={expected_engines}, "
+            f"registered={registered}, model={self._model_name!r}, "
+            f"served={sorted(served)!r}."
         )
-
-    def refit_workers(self) -> list[dict[str, Any]]:
-        self._assert_services_alive()
-        if self._pool is None:
-            raise RuntimeError("Managed Dynamo worker pool is not running.")
-        return self._pool.refit_workers()
-
-    def validate_workers(self, expected: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        self._assert_services_alive()
-        if self._pool is None:
-            raise RuntimeError("Managed Dynamo worker pool is not running.")
-        return self._pool.validate(expected)
 
     def _assert_services_alive(self) -> None:
         for label, process in (
@@ -428,20 +405,42 @@ class ManagedDynamoRuntime:
                     f"Managed Dynamo {label} is not alive (code={code})."
                 )
 
+    def _log_router_kv_events(self) -> None:
+        """Log how many engine KV-cache events the KV router applied, by status.
+
+        Read from the frontend's metrics before it stops. A KV router that never
+        applied one routed on load alone.
+        """
+        if self._frontend_process is None or self._frontend_process.poll() is not None:
+            return
+        url = f"http://127.0.0.1:{self._frontend_port}/metrics"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                metrics = response.read().decode()
+        except (urllib.error.URLError, TimeoutError) as error:
+            print(
+                f"  [Dynamo] router KV events: metrics unavailable ({error})",
+                flush=True,
+            )
+            return
+        applied: dict[str, float] = {}
+        for match in _KV_EVENTS_APPLIED.finditer(metrics):
+            applied[match["status"]] = applied.get(match["status"], 0.0) + float(
+                match["value"]
+            )
+        print(f"  [Dynamo] router applied KV events: {json.dumps(applied)}", flush=True)
+
     def shutdown(self) -> None:
         """Best-effort, idempotent teardown of every owned resource."""
+        try:
+            self._log_router_kv_events()
+        except Exception:
+            LOGGER.exception("Failed to read the Dynamo router's KV-event metrics")
         try:
             self._stop_process(self._frontend_process, "frontend")
         except Exception:
             LOGGER.exception("Failed to stop the managed Dynamo frontend")
         self._frontend_process = None
-        pool = self._pool
-        self._pool = None
-        if pool is not None:
-            try:
-                pool.shutdown()
-            except Exception:
-                LOGGER.exception("Failed to stop the managed Dynamo worker pool")
         try:
             self._stop_process(self._nats_process, "NATS")
         except Exception:
@@ -458,7 +457,5 @@ class ManagedDynamoRuntime:
         if self._nats_data_dir is not None:
             shutil.rmtree(self._nats_data_dir, ignore_errors=True)
             self._nats_data_dir = None
-        if self._atexit_registered:
-            atexit.unregister(self.shutdown)
-            self._atexit_registered = False
+        atexit.unregister(self.shutdown)
         self._started = False

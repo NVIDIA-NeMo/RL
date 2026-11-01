@@ -51,6 +51,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.experience.route_assembly import boundary_route_rows
+from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -67,14 +68,19 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.vllm.request_pipeline import (
+    RolloutResult,
+    rollout_output,
+    rollout_result,
+)
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
     format_prompt_for_vllm_generation,
+    off_policy_sampling_error,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
-    pad_and_align_routed_expert_indices,
     remap_multimodal_placeholders,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
@@ -293,6 +299,8 @@ class VllmAsyncGenerationWorkerImpl(
         self.http_server = None
         self._engine_loop = None
         self._http_engine_client = None
+        # The task serving this engine through Dynamo, when it is registered.
+        self._dynamo_endpoint_task: Optional[asyncio.Task] = None
 
         # Ledger-authoritative token capture (dormant until the
         # setup_token_capture fan-out runs). The weight
@@ -430,13 +438,36 @@ class VllmAsyncGenerationWorkerImpl(
                     stacklevel=1,
                 )
             llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
-
-        self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.stat_loggers = (
             [PrometheusStatLogger]
             if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
             else []
         )
+        if dynamo_enabled(self.cfg):
+            from nemo_rl.models.generation.dynamo.native_engine import (
+                SnapshotStatLogger,
+                dynamo_kv_events_config,
+            )
+
+            # Dynamo's KV-aware router indexes the engine's own KV-cache events;
+            # the stat logger feeds its per-engine load signal.
+            llm_kwargs.setdefault(
+                "kv_events_config",
+                dynamo_kv_events_config(
+                    dynamo_cfg(self.cfg),
+                    prefix_caching=llm_kwargs["enable_prefix_caching"],
+                ),
+            )
+            self.stat_loggers.append(SnapshotStatLogger)
+        # AsyncEngineArgs leaves kv_events_config dicts unconverted.
+        if isinstance(llm_kwargs.get("kv_events_config"), dict):
+            from vllm.config import KVEventsConfig
+
+            llm_kwargs["kv_events_config"] = KVEventsConfig(
+                **llm_kwargs["kv_events_config"]
+            )
+
+        self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.llm = AsyncLLM.from_engine_args(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
@@ -616,6 +647,37 @@ class VllmAsyncGenerationWorkerImpl(
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
+
+    async def start_dynamo_endpoint_async(
+        self, *, namespace: str, engine_env: dict[str, str], leader_worker_idx: int
+    ) -> None:
+        """Register this engine with Dynamo and serve it from this actor's loop.
+
+        The loop is the one that owns the AsyncLLM, so Dynamo requests, refit,
+        pause and sleep interleave exactly as this worker's own requests do.
+        ``leader_worker_idx`` is this worker's index in its group; rollouts the
+        engine serves report it, as ``generate_async`` results do.
+        """
+        from nemo_rl.models.generation.dynamo.native_engine import (
+            start_dynamo_endpoint,
+        )
+
+        self._dynamo_endpoint_task = start_dynamo_endpoint(
+            self,
+            namespace=namespace,
+            engine_env=engine_env,
+            leader_worker_idx=leader_worker_idx,
+        )
+
+    async def dynamo_endpoint_error(self) -> Optional[str]:
+        """Why this engine's Dynamo endpoint stopped serving; None while it serves."""
+        task = self._dynamo_endpoint_task
+        if task is None or not task.done():
+            return None
+        if task.cancelled():
+            return "cancelled"
+        error = task.exception()
+        return "exited" if error is None else repr(error)
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -1617,46 +1679,19 @@ class VllmAsyncGenerationWorkerImpl(
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
-            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            # Right now we explicitly assert set this to -1.
-            assert request.top_k in (None, -1), (
-                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
-            )
-            request.top_k = -1
-
             # The request sampling params need to exactly match those as are set in NeMo RL.
             # If they do not match, the inference will be off policy and destroy training
-            # stability. Validation rollouts are the one exception: they are stamped with
-            # the validation sampling profile (generation.val_temperature / val_top_p),
-            # which is metric-only and safe to serve — grpo.validate() is the only
-            # caller that constructs a non-train GenerationSamplingParams. Multi-turn
-            # agents issue their own requests, so this server-side check is the one
-            # chokepoint they all pass.
-            # vLLM resolves an unset top_p from the model's generation_config.json
-            # (ModelConfig.generation_config defaults to "auto"), NOT to 1.0, so a
-            # request omitting it would sample off-policy while passing this check.
-            assert request.top_p is not None, (
-                "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
-                "resolved by vLLM from the model's generation_config.json and would "
-                "bypass the on-policy sampling check."
+            # stability. grpo.validate() is the only caller that constructs a non-train
+            # GenerationSamplingParams, and the validation profile it stamps is accepted.
+            sampling_error = off_policy_sampling_error(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                top_k=request.top_k,
+                generation_config=generation_config,
             )
-            request_top_p = request.top_p
-            is_train_sampling = (
-                request.temperature == generation_config["temperature"]
-                and request_top_p == generation_config["top_p"]
-            )
-            is_val_sampling = (
-                request.temperature == generation_config["val_temperature"]
-                and request_top_p == generation_config["val_top_p"]
-            )
-            assert is_train_sampling or is_val_sampling, (
-                f"request sampling (temperature={request.temperature}, "
-                f"top_p={request.top_p}) matches neither the train sampling params "
-                f"(temperature={generation_config['temperature']}, "
-                f"top_p={generation_config['top_p']}) nor the validation sampling "
-                f"params (val_temperature={generation_config['val_temperature']}, "
-                f"val_top_p={generation_config['val_top_p']})"
-            )
+            assert sampling_error is None, sampling_error
+            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
+            request.top_k = -1
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
@@ -1978,19 +2013,95 @@ class VllmAsyncGenerationWorkerImpl(
             ),
         )
 
+    def _rollout_max_new_tokens(self, input_length: int) -> int:
+        """Token budget for one rollout prompt; 0 means nothing fits.
+
+        The configured cap, clipped to the context window and to speculative
+        decoding's lookahead.
+        """
+        max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+        allowed_new_tokens = max(
+            0, min(self.cfg["max_new_tokens"], max_model_len - input_length)
+        )
+        spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
+        spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
+        if allowed_new_tokens > 0 and spec_lookahead > 0:
+            allowed_new_tokens = self._request_max_new_tokens(
+                configured_max_new_tokens=allowed_new_tokens,
+                input_length=input_length,
+                max_model_len=max_model_len,
+                cap_to_context=False,
+                spec_lookahead=spec_lookahead,
+            )
+        return allowed_new_tokens
+
+    async def _serve_rollout(
+        self,
+        prompt: Any,
+        *,
+        prompt_token_ids: list[int],
+        greedy: bool,
+        stop_strings: Optional[list[str]],
+        request_id: str,
+        device: torch.device,
+    ) -> tuple[RolloutResult, Optional[Any]]:
+        """Serve one rollout from this engine: its budget, sampling, generation and result.
+
+        Every path that serves a rollout from this engine calls this, so a rollout
+        step added here runs on all of them.
+
+        Args:
+            prompt: The vLLM prompt to generate from.
+            prompt_token_ids: The learner's prompt tokens, which vLLM must have run.
+            greedy: Greedy decoding instead of the configured sampling.
+            stop_strings: The rollout's own stop strings, merged with the
+                configured ones.
+            request_id: The vLLM request ID.
+            device: Where to place the routed-experts tensor.
+
+        Returns:
+            The result, and vLLM's final RequestOutput (None when no new token fits).
+        """
+        max_new_tokens = self._rollout_max_new_tokens(len(prompt_token_ids))
+        if max_new_tokens == 0:
+            return RolloutResult.nothing_generated(), None
+        sampling_params = self._build_sampling_params(
+            greedy=greedy,
+            stop_strings=self._merge_stop_strings(
+                [stop_strings] if stop_strings else None
+            ),
+            max_new_tokens=max_new_tokens,
+        )
+        final_output = None
+        async for output in self.llm.generate(
+            prompt=prompt, sampling_params=sampling_params, request_id=request_id
+        ):
+            final_output = output
+        if final_output is None:
+            raise RuntimeError(f"No output received for request {request_id}")
+        validate_rollout_prompt(prompt_token_ids, final_output.prompt_token_ids)
+        result = rollout_result(
+            final_output,
+            input_length=len(prompt_token_ids),
+            return_routed_experts=self._return_routed_experts_enabled(),
+            routed_experts_dtype=self.routed_experts_dtype,
+            device=device,
+        )
+        return result, final_output
+
     async def generate_async(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         greedy: bool = False,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
-        """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
+        """Generate one sample with vLLM's AsyncLLM, yielding it when it is ready.
 
         Args:
-            data: BatchedDataDict with input_ids and input_lengths
-            greedy: Whether to use greedy decoding instead of sampling
+            data: BatchedDataDict with input_ids and input_lengths for one sample.
+            greedy: Whether to use greedy decoding instead of sampling.
 
         Yields:
-            Tuple of (original_index, BatchedDataDict conforming to GenerationOutputSpec for the single sequence)
+            (0, the sample's output conforming to GenerationOutputSpec).
         """
         if not self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError(
@@ -2003,274 +2114,26 @@ class VllmAsyncGenerationWorkerImpl(
 
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
-        input_ids_batch = data["input_ids"]
-        input_lengths_batch = data["input_lengths"]
-        batch_size = input_ids_batch.shape[0]
-
-        # Ensure generate_async only receives single samples (batch_size = 1)
+        batch_size = data["input_ids"].shape[0]
         assert batch_size == 1, (
             f"generate_async is restricted to handle only single samples, "
             f"but received batch_size={batch_size}. Please handle batching outside this method."
         )
 
-        batch_specific_stop_strings_list = data.get(
-            "stop_strings", [[] for _ in range(batch_size)]
+        input_ids = data["input_ids"][0]
+        input_length = int(data["input_lengths"][0].item())
+        prompt = self._tokenize_prompt_with_bos(
+            format_prompt_for_vllm_generation(data, 0)
         )
-
-        # Create tasks for each sample in the batch
-        async def process_single_sample(sample_idx):
-            """Process a single sample and return the result."""
-            current_input_actual_length = input_lengths_batch[sample_idx].item()
-            prompt = format_prompt_for_vllm_generation(data, sample_idx)
-            prompt = self._tokenize_prompt_with_bos(prompt)
-
-            per_sample_stop_strings = None
-            if batch_specific_stop_strings_list and sample_idx < len(
-                batch_specific_stop_strings_list
-            ):
-                per_sample_stop_strings = batch_specific_stop_strings_list[sample_idx]
-
-            final_stop_strings_for_sample = self._merge_stop_strings(
-                [per_sample_stop_strings] if per_sample_stop_strings else None
-            )
-
-            max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
-            remaining_ctx = max_model_len - current_input_actual_length
-            allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
-
-            spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
-            spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
-            if allowed_new_tokens > 0 and spec_lookahead > 0:
-                allowed_new_tokens = self._request_max_new_tokens(
-                    configured_max_new_tokens=allowed_new_tokens,
-                    input_length=current_input_actual_length,
-                    max_model_len=max_model_len,
-                    cap_to_context=False,
-                    spec_lookahead=spec_lookahead,
-                )
-
-            # Handle case where no tokens can be generated due to length constraints
-            if allowed_new_tokens == 0:
-                # Access the input data directly from the function parameters
-                input_ids_single_row = input_ids_batch[sample_idx]
-
-                # Create output tensors with just the input (no generated tokens)
-                output_ids_single_item_batched = input_ids_single_row[
-                    :current_input_actual_length
-                ].unsqueeze(0)
-
-                logprobs_single_item = torch.zeros(
-                    (1, current_input_actual_length),
-                    dtype=torch.float32,
-                    device=input_ids_single_row.device,
-                )
-
-                generation_lengths_tensor = torch.tensor(
-                    [0], dtype=torch.long, device=input_ids_single_row.device
-                )
-
-                unpadded_sequence_lengths_tensor = torch.tensor(
-                    [current_input_actual_length],
-                    dtype=torch.long,
-                    device=input_ids_single_row.device,
-                )
-
-                # Not truncated since no generation was attempted (length constraint)
-                truncated_tensor = torch.tensor(
-                    [False], dtype=torch.bool, device=input_ids_single_row.device
-                )
-
-                result_batch = BatchedDataDict[GenerationOutputSpec](
-                    {
-                        "output_ids": output_ids_single_item_batched,
-                        "logprobs": logprobs_single_item,
-                        "generation_lengths": generation_lengths_tensor,
-                        "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
-                        "truncated": truncated_tensor,
-                    }
-                )
-
-                return (sample_idx, result_batch)
-
-            sampling_params_for_request = self._build_sampling_params(
-                greedy=greedy,
-                stop_strings=final_stop_strings_for_sample,
-                max_new_tokens=allowed_new_tokens,
-            )
-
-            request_id = str(uuid.uuid4())
-
-            # Generate using vLLM async engine
-            vllm_request_generator = self.llm.generate(
-                prompt=prompt,
-                sampling_params=sampling_params_for_request,
-                request_id=request_id,
-            )
-
-            # Get the final result from the generator
-            final_request_output = None
-            async for req_output in vllm_request_generator:
-                final_request_output = req_output
-
-            if final_request_output is None:
-                raise RuntimeError(f"No output received for request {request_id}")
-
-            validate_rollout_prompt(
-                input_ids_batch[sample_idx, :current_input_actual_length].tolist(),
-                final_request_output.prompt_token_ids,
-            )
-
-            # Process the output
-            generation_details = final_request_output.outputs[0]
-            generated_token_ids = list(generation_details.token_ids)
-            num_generated_tokens = len(generated_token_ids)
-            return_routed_experts = self._return_routed_experts_enabled()
-
-            original_input_ids_single_row = input_ids_batch[sample_idx]
-            final_output_tensor_len = current_input_actual_length + num_generated_tokens
-
-            # Create output_ids tensor for this single item
-            output_ids_single_item = torch.full(
-                (final_output_tensor_len,),
-                self.cfg["_pad_token_id"],
-                dtype=original_input_ids_single_row.dtype,
-                device=original_input_ids_single_row.device,
-            )
-            # Copy original input (up to its actual length)
-            output_ids_single_item[:current_input_actual_length] = (
-                original_input_ids_single_row[:current_input_actual_length]
-            )
-            # Add generated tokens after the actual input
-            output_ids_single_item[
-                current_input_actual_length : current_input_actual_length
-                + num_generated_tokens
-            ] = torch.tensor(
-                generated_token_ids,
-                dtype=original_input_ids_single_row.dtype,
-                device=original_input_ids_single_row.device,
-            )
-
-            # Reshape to (1, seq_len) for BatchedDataDict
-            output_ids_single_item_batched = output_ids_single_item.unsqueeze(0)
-
-            # Create logprobs tensor for this single item
-            logprobs_single_item = torch.zeros(
-                (1, final_output_tensor_len),
-                dtype=torch.float32,
-                device=original_input_ids_single_row.device,
-            )
-            if hasattr(generation_details, "logprobs") and generation_details.logprobs:
-                for idx, logprob_dict_per_token in enumerate(
-                    generation_details.logprobs
-                ):
-                    if logprob_dict_per_token and idx < len(generated_token_ids):
-                        token_id_at_idx = generated_token_ids[idx]
-                        if token_id_at_idx in logprob_dict_per_token:
-                            logprob_value = logprob_dict_per_token[
-                                token_id_at_idx
-                            ].logprob
-                            position_in_output_tensor = (
-                                current_input_actual_length + idx
-                            )
-                            if position_in_output_tensor < final_output_tensor_len:
-                                logprobs_single_item[0, position_in_output_tensor] = (
-                                    logprob_value
-                                )
-
-            # Generation lengths
-            generation_lengths_tensor = torch.tensor(
-                [num_generated_tokens],
-                dtype=torch.long,
-                device=original_input_ids_single_row.device,
-            )
-
-            # Unpadded sequence lengths (actual_input + actual_generated)
-            unpadded_total_length = current_input_actual_length + num_generated_tokens
-            unpadded_sequence_lengths_tensor = torch.tensor(
-                [unpadded_total_length],
-                dtype=torch.long,
-                device=original_input_ids_single_row.device,
-            )
-
-            # Check if response was truncated (hit max_tokens length limit)
-            is_truncated = generation_details.finish_reason == "length"
-            truncated_tensor = torch.tensor(
-                [is_truncated],
-                dtype=torch.bool,
-                device=original_input_ids_single_row.device,
-            )
-
-            result_dict = {
-                "output_ids": output_ids_single_item_batched,
-                "logprobs": logprobs_single_item,
-                "generation_lengths": generation_lengths_tensor,
-                "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
-                "truncated": truncated_tensor,
-            }
-            routed_experts, r3_stats = pad_and_align_routed_expert_indices(
-                final_request_output,
-                generation_details,
-                valid_length=unpadded_total_length,
-                padded_length=final_output_tensor_len,
-                device=original_input_ids_single_row.device,
-                require_complete_routed_experts=return_routed_experts,
-                return_stats=True,
-                routed_experts_dtype=self.routed_experts_dtype,
-            )
-            if return_routed_experts and routed_experts is None:
-                raise RuntimeError(
-                    "vLLM was asked to return routed experts but the generation output "
-                    "did not include routed_experts."
-                )
-            if return_routed_experts:
-                if r3_stats["missing_routes"] > 0:
-                    LOGGER.warning(
-                        "R3 router replay fallback: vLLM returned incomplete "
-                        "routed_experts for sample_idx=%d, missing_token_routes=%d, "
-                        "actual_routes=%d, expected_routes=%d. Megatron will use its "
-                        "own router for those missing token routes.",
-                        sample_idx,
-                        r3_stats["missing_routes"],
-                        r3_stats["actual_routes"],
-                        r3_stats["expected_routes"],
-                    )
-                result_dict["r3_routed_experts_missing_routes"] = torch.tensor(
-                    [r3_stats["missing_routes"]],
-                    dtype=torch.long,
-                    device=original_input_ids_single_row.device,
-                )
-                result_dict["r3_routed_experts_expected_routes"] = torch.tensor(
-                    [r3_stats["expected_routes"]],
-                    dtype=torch.long,
-                    device=original_input_ids_single_row.device,
-                )
-                result_dict["r3_routed_experts_actual_routes"] = torch.tensor(
-                    [r3_stats["actual_routes"]],
-                    dtype=torch.long,
-                    device=original_input_ids_single_row.device,
-                )
-            if routed_experts is not None:
-                result_dict["routed_experts"] = routed_experts.unsqueeze(0)
-
-            result_batch = BatchedDataDict[GenerationOutputSpec](result_dict)
-
-            return (sample_idx, result_batch)
-
-        # Create tasks for all samples and yield results as they complete
-        sample_tasks = [
-            asyncio.create_task(process_single_sample(i)) for i in range(batch_size)
-        ]
-
-        # Yield results as they become available
-        try:
-            for completed_task in asyncio.as_completed(sample_tasks):
-                result = await completed_task
-                yield result
-        finally:
-            for task in sample_tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*sample_tasks, return_exceptions=True)
+        result, _ = await self._serve_rollout(
+            prompt,
+            prompt_token_ids=input_ids[:input_length].tolist(),
+            greedy=greedy,
+            stop_strings=(data.get("stop_strings") or [None])[0],
+            request_id=str(uuid.uuid4()),
+            device=input_ids.device,
+        )
+        yield 0, rollout_output(result, input_ids=input_ids, input_length=input_length)
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

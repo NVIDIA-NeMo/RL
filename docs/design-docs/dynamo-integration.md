@@ -1,63 +1,97 @@
-# Managed Dynamo generation design
+# Dynamo integration design
 
-The managed Dynamo backend owns a fixed vLLM fleet inside the Ray allocation.
-It is deliberately narrower than Dynamo itself: there is no external-runtime,
-Kubernetes, DGD, multi-node engine-group, or non-vLLM mode.
+`policy.generation.dynamo: true` serves NeMo RL's own vLLM engines through
+Dynamo's frontend and KV-aware router. Two requirements shape the design:
 
-## Ownership and placement
+- A vLLM bump must never be blocked by Dynamo.
+- Dynamo CI coverage must stay consistent with native vLLM's.
 
-Constructing `ManagedDynamoRuntime` is inert. Its explicit `start()` method
-allocates ports, launches etcd and NATS JetStream, creates one Ray-managed
-`dynamo.vllm` process per model-parallel group, and starts the frontend. A
-worker group must fit on one node. Its world size is derived from vLLM tensor
-parallelism times pipeline parallelism; expert parallelism must be either one
-or equal to tensor parallelism.
+Both hold only if the engine process contains no Dynamo-owned vLLM code. A vLLM
+bump can then break Dynamo serving only in NeMo RL's own adapter
+(`native_engine.py`), which calls a few vLLM APIs native NeMo RL does not: the
+`get_kv_cache_group_metadata` engine utility and `KVCacheSpecKind` at
+registration, and `StatLoggerBase` for the router's load signal. A renamed import
+fails the vLLM-lane unit tests at collection, and the Dynamo functional overlays
+run registration.
 
-Startup completes only after the frontend sees the same fixed membership at
-the generation and RL endpoints and advertises the configured model. Worker
-handles are recorded before readiness checks so partial startup failures can
-be torn down. Shutdown is idempotent and guards the frontend, worker pool,
-NATS, etcd, and temporary state independently.
+## Engine hosting
 
-## Generation state
+`VllmGeneration` builds its workers exactly as without Dynamo. Each data-parallel
+leader (`VllmAsyncGenerationWorkerImpl`) owns an `AsyncLLM`. With Dynamo on, it
+also runs `dynamo.common.backend.Worker` as a task on its own actor event loop,
+which is the loop that owns the `AsyncLLM`.
 
-Both GRPO trainers use `DynamoGeneration.generate_async()` against the managed
-frontend. NeMo-Gym traffic passes through a process-local token wrapper. It
-uses the policy tokenizer, preserves caller `nvext.extra_fields`, adds Dynamo
-engine metadata, and translates rendered multi-turn prefixes back to the exact
-caller token IDs.
+`dynamo.common.backend` is Dynamo's engine-agnostic backend SDK and imports no
+vLLM. The adapter, `nemo_rl/models/generation/dynamo/native_engine.py`,
+implements its `LLMEngine` over the worker's `AsyncLLM`:
 
-Serialized rollout copies contain only frontend URLs, immutable worker admin
-endpoints, and the prepared refit metadata. They cannot own or stop services.
-That is enough for the SingleController actor to issue weight updates and for
-AREAL-style post-refit cache invalidation; Magistral keeps its existing
-driver-side invalidation lifecycle.
+- `generate` serves only the rollouts NeMo RL itself sends, which carry an
+  annotation, and refuses other requests. The worker's own `_serve_rollout` runs
+  each rollout exactly as native `generate_async` does, and
+  `request_pipeline.rollout_result` builds its result, routed experts included.
+  The result travels in `engine_data`, and the driver assembles the same output
+  with `request_pipeline.rollout_output`.
+- `abort` cancels the vLLM request on client disconnect.
+- Registration advertises the context length, the KV block size (from vLLM's
+  KV-cache group metadata), the block count and the scheduler limits. It
+  publishes no token budget. The engine owns the context check and the output
+  cap, as the native server does. With a budget, the frontend would refuse NeMo
+  RL's own rollouts that fill the context.
+- `kv_event_sources` points Dynamo at the engine's own vLLM KV-event ZMQ
+  publisher. It is set only when the engine caches prefixes. Each engine binds
+  its own Linux abstract-namespace socket (`ipc://@...`), so engines on one node
+  need no port and cannot collide. The name is random rather than the pid,
+  because containers that share the host network share these names. vLLM refuses
+  `ipc://` only above data-parallel rank 0, and vLLM data parallelism is rejected
+  at startup with Dynamo. A vLLM stat logger publishes the router's per-engine
+  load signal.
 
-## Weight refit
+Because the Worker runs on the actor's own loop, the worker's other methods
+interleave with Dynamo requests exactly as with native requests:
+- refit (every transport);
+- `pause_generation_async` / `resume_generation_async`.
 
-Dynamo uses `CollectiveWeightSynchronizer`. If each engine has world size `E`,
-worker `i` starts at rank `training_world_size + i * E`. The policy sender uses
-vLLM's peer initialization and a packed transfer with two 1-GiB buffers. vLLM
-reads the packing mode and geometry once, from the init info that NeMo-RL sends
-to `init_weight_transfer_engine`; each update round carries only tensor names,
-dtypes, and shapes. Before a worker starts, the isolated vLLM environment checks
-that its weight-transfer API accepts that init and update shape.
+Colocated generation is rejected at startup: a sleeping engine stays
+registered, so the frontend would keep routing to it.
 
-Generation is drained before refit. The worker then runs vLLM's native
-`start_weight_update`, `update_weights`, and `finish_weight_update` transaction.
-KV-cache invalidation stays outside the generic synchronizer because GRPO's
-cache mode determines where it runs.
+No HTTP control routes are involved. The Rust Worker installs a SIGTERM handler
+that chains to Ray's, so actor shutdown is unchanged, and discovery drops an
+engine when its process exits.
 
-## Dependency isolation
+## Driver
 
-`BUILD_DYNAMO=1` adds a Python 3.12 `/opt/dynamo_venv` to the standard image.
-It contains only `ai-dynamo[vllm]==1.5.1`, its pinned vLLM 0.28.0, etcd,
-and NATS. NeMo-RL's normal Ray and engine environments are unchanged; the
-standard NeMo-RL vLLM environment currently uses vLLM 0.29.0.
+`VllmGeneration` starts `ManagedDynamoRuntime`, which runs etcd, NATS and
+`dynamo.frontend`. After the engines load, it asks every DP leader to register
+and waits until the frontend routes to all of them. Each poll also asks the
+leaders whether their endpoint task stopped, so a failed registration fails
+with its cause instead of a timeout.
 
-Layerwise reload depends on vLLM PR #44814, which fixes reload accounting for
-composed loaders. vLLM 0.28.0 includes it, and the installer fails if the
-installed vLLM does not.
+`generate_async` on text prompts posts a token-prompt completion to the frontend
+(`dynamo/rollout_client.py`). It sets top-level `ignore_eos` and a context-sized
+`max_tokens`, so the frontend's own stop rules never end a stream before the
+engine reports its result. Everything else keeps native dispatch; the guide
+lists what goes where.
 
-See [Managed Dynamo generation on Slurm](../guides/dynamo-generation.md) for
-build, configuration, and launch instructions.
+## Dependency coupling
+
+The vLLM workers' venv (the `vllm` extra) carries the released `ai-dynamo` and
+`ai-dynamo-runtime` wheels, never `ai-dynamo[vllm]`. The engine process only
+imports `dynamo.common.backend`, `dynamo.llm.exceptions` and `dynamo._core`.
+
+What a Dynamo upgrade has to re-check:
+- the `dynamo.common.backend` contract (`LLMEngine`, `Worker`, `WorkerConfig`,
+  publisher);
+- the request fields of Dynamo's preprocessed request;
+- the frontend's `nvext` extensions and annotation forwarding.
+
+The one vLLM↔Dynamo wire coupling is vLLM's KV-event msgpack, which Dynamo's
+router decodes. A change there degrades routing, not serving. The managed
+runtime logs the router's applied-event counts at shutdown, and the Dynamo
+functional overlays fail if the engines published events but none were
+applied (`tests/functional/check_dynamo_overlay.sh`).
+
+ai-dynamo's own dependency bounds (`ai-dynamo-runtime` caps pydantic, for
+example) can still block a vLLM bump, and the import guard does not see them.
+Until a Dynamo release lifts a bound, override it under
+`[tool.uv] override-dependencies` (as `aisimulate` and `kubernetes` are), and
+let the vLLM-lane Dynamo unit tests catch a real break.

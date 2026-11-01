@@ -33,8 +33,10 @@ run_test() {
     fi
 }
 
-run_test fast uv run --no-sync bash ./tests/functional/grpo_dynamo.sh
-run_test uv run --no-sync bash ./tests/functional/grpo_dynamo_single_controller.sh
+# Dynamo overlays: native SingleController tests rerun with policy.generation.dynamo=true.
+# Each keeps the native test's checks and adds check_dynamo_overlay.sh's.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh ++policy.generation.dynamo=true
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh ++policy.generation.dynamo=true
 
 cd "${PROJECT_ROOT}/tests"
 if compgen -G ".coverage*" > /dev/null; then

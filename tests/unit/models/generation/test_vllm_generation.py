@@ -380,7 +380,7 @@ def test_vllm_generation_rejects_unregistered_worker_extension(
     cluster._init_placement_groups.assert_not_called()
 
 
-@pytest.mark.parametrize("backend", ["sglang", "megatron", "trtllm", "dynamo"])
+@pytest.mark.parametrize("backend", ["sglang", "megatron", "trtllm"])
 def test_generation_config_rejects_worker_extension_for_other_backends(
     backend: str,
 ) -> None:
@@ -392,7 +392,7 @@ def test_generation_config_rejects_worker_extension_for_other_backends(
         configure_generation_config(config, MagicMock())
 
 
-@pytest.mark.parametrize("backend", ["vllm", "sglang", "megatron", "trtllm", "dynamo"])
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "megatron", "trtllm"])
 @pytest.mark.parametrize("include_null", [False, True])
 def test_generation_config_allows_no_worker_extension(
     backend: str,
@@ -472,6 +472,138 @@ async def test_async_vllm_worker_gpu_profiling_awaits_collective_rpc(
     worker.llm.collective_rpc.reset_mock()
     await worker.stop_gpu_profiling()
     worker.llm.collective_rpc.assert_awaited_once_with("stop_gpu_profiling", args=())
+
+
+class _ScriptedAsyncLLM:
+    """Yields one scripted final RequestOutput and records what it was asked to generate."""
+
+    def __init__(self, generated: list[int], finish_reason: str = "stop") -> None:
+        self.generated = generated
+        self.finish_reason = finish_reason
+        self.calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+    async def generate(self, prompt, sampling_params, request_id):
+        self.calls.append((prompt, sampling_params))
+        yield types.SimpleNamespace(
+            prompt_token_ids=prompt["prompt_token_ids"],
+            prompt_routed_experts=None,
+            num_cached_tokens=0,
+            outputs=[
+                types.SimpleNamespace(
+                    token_ids=self.generated,
+                    # The second token has no reported logprob.
+                    logprobs=[
+                        {} if i == 1 else {t: types.SimpleNamespace(logprob=-0.5)}
+                        for i, t in enumerate(self.generated)
+                    ],
+                    finish_reason=self.finish_reason,
+                    routed_experts=None,
+                )
+            ],
+        )
+
+
+def _rollout_worker(llm: _ScriptedAsyncLLM, **cfg) -> VllmAsyncGenerationWorkerImpl:
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "max_new_tokens": 8,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": None,
+        "stop_token_ids": [2],
+        "stop_strings": ["</done>"],
+        "_pad_token_id": 0,
+        "vllm_cfg": {"async_engine": True, "max_model_len": 16},
+        **cfg,
+    }
+    # Records the sampling kwargs instead of building vLLM's SamplingParams.
+    worker.SamplingParams = dict
+    worker.routed_experts_dtype = torch.int16
+    worker.llm = llm
+    return worker
+
+
+async def _generate_one(
+    worker: VllmAsyncGenerationWorkerImpl,
+    prompt: list[int],
+    stop_strings: list[str] | None = None,
+) -> BatchedDataDict:
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([prompt]),
+            "input_lengths": torch.tensor([len(prompt)]),
+            "stop_strings": [stop_strings],
+        }
+    )
+    ((sample_idx, output),) = [item async for item in worker.generate_async(data)]
+    assert sample_idx == 0
+    return output
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_generate_async_samples_and_returns_the_rollout() -> None:
+    llm = _ScriptedAsyncLLM([10, 11, 2], finish_reason="stop")
+    worker = _rollout_worker(llm)
+
+    output = await _generate_one(worker, [1, 2, 3, 4, 5], stop_strings=["</x>"])
+
+    ((prompt, sampling),) = llm.calls
+    assert prompt == {"prompt_token_ids": [1, 2, 3, 4, 5]}
+    assert sampling["max_tokens"] == 8
+    assert sampling["temperature"] == 0.7
+    assert sampling["top_k"] == -1
+    assert sorted(sampling["stop"]) == ["</done>", "</x>"]
+    assert output["output_ids"].tolist() == [[1, 2, 3, 4, 5, 10, 11, 2]]
+    # A position without a reported logprob stays 0.0, aligned with its token.
+    assert output["logprobs"].tolist() == [[0.0] * 5 + [-0.5, 0.0, -0.5]]
+    assert output["generation_lengths"].tolist() == [3]
+    assert output["unpadded_sequence_lengths"].tolist() == [8]
+    assert output["truncated"].tolist() == [False]
+    # No router replay keys when R3 is off.
+    assert set(output) == {
+        "output_ids",
+        "logprobs",
+        "generation_lengths",
+        "unpadded_sequence_lengths",
+        "truncated",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt_length", "speculative_config", "expected_max_tokens"),
+    [
+        # min(max_new_tokens=8, max_model_len 16 - prompt 12)
+        (12, None, 4),
+        # The drafter reads 2 tokens ahead: 16 - 12 - (2 + 1)
+        (12, {"num_speculative_tokens": 2}, 1),
+        # Nothing fits: the prompt comes back without calling vLLM.
+        (16, None, 0),
+        # The spec-decode clamp floors at 1 token; a full context must not reach it.
+        (16, {"num_speculative_tokens": 2}, 0),
+    ],
+)
+async def test_async_vllm_generate_async_budget(
+    prompt_length, speculative_config, expected_max_tokens
+) -> None:
+    llm = _ScriptedAsyncLLM([10], finish_reason="length")
+    worker = _rollout_worker(
+        llm, vllm_kwargs={"speculative_config": speculative_config}
+    )
+    prompt = list(range(1, prompt_length + 1))
+
+    output = await _generate_one(worker, prompt)
+
+    if expected_max_tokens == 0:
+        assert llm.calls == []
+        assert output["output_ids"].tolist() == [prompt]
+        assert output["logprobs"].tolist() == [[0.0] * prompt_length]
+        assert output["generation_lengths"].tolist() == [0]
+        assert output["truncated"].tolist() == [False]
+    else:
+        ((_, sampling),) = llm.calls
+        assert sampling["max_tokens"] == expected_max_tokens
+        assert output["truncated"].tolist() == [True]
 
 
 @pytest.mark.asyncio
@@ -1363,6 +1495,25 @@ async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
     error = json.loads(response.body)["error"]
     assert error["code"] == "retained_media_changed"
     assert error["param"] == "messages"
+
+
+@pytest.mark.asyncio
+async def test_chat_handler_rejects_off_policy_sampling_and_pins_top_k(monkeypatch):
+    """The route asserts on-policy sampling, then hands vLLM top_k=-1."""
+    _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    serving_chat.create_chat_completion = AsyncMock(return_value=iter(()))
+
+    off_policy = _fake_chat_request()
+    off_policy.temperature = 0.5
+    with pytest.raises(AssertionError, match="matches neither"):
+        await chat_handler(off_policy, MagicMock())
+    serving_chat.create_chat_completion.assert_not_awaited()
+
+    request = _fake_chat_request()
+    request.top_k = None
+    await chat_handler(request, MagicMock())
+    serving_chat.create_chat_completion.assert_awaited_once()
+    assert request.top_k == -1
 
 
 @pytest.mark.asyncio
@@ -2504,6 +2655,103 @@ def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
     master_config = types.SimpleNamespace(policy={"generation": vllm_config})
 
     VllmGeneration.validate_settings(master_config)
+
+
+def _dynamo_master_config(*, fleet_health=False):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["dynamo"] = True
+    vllm_config["vllm_cfg"]["async_engine"] = True
+    vllm_config["vllm_cfg"]["expose_http_server"] = True
+    return types.SimpleNamespace(
+        policy={"generation": vllm_config},
+        async_rl=types.SimpleNamespace(
+            generation_fleet_health=types.SimpleNamespace(enabled=fleet_health),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("settings", "error"),
+    [
+        ({}, None),
+        ({"fleet_health": True}, "Disable fleet health"),
+    ],
+)
+def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error):
+    master_config = _dynamo_master_config(**settings)
+    if error is None:
+        VllmGeneration.validate_settings(master_config)
+        return
+    with pytest.raises(ValueError, match=error):
+        VllmGeneration.validate_settings(master_config)
+
+
+def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
+    from nemo_rl.experience.failures import GenerationUnavailable
+    from nemo_rl.models.generation.dynamo import rollout_client
+    from nemo_rl.models.generation.vllm.request_pipeline import (
+        RolloutResult,
+        rollout_output,
+        rollout_result_to_wire,
+    )
+
+    result = RolloutResult([7, 8], [-0.5, -0.25], False, None, None)
+    responses = [
+        {"rollout": rollout_result_to_wire(result), "gen_leader_worker_idx": 3},
+        RuntimeError("Dynamo rollout request to frontend failed: HTTP 503"),
+    ]
+    requests = []
+
+    async def frontend(url, payload, timeout_s):
+        requests.append((url, payload, timeout_s))
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(rollout_client, "post_rollout", frontend)
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {
+        "model_name": "model",
+        "_pad_token_id": 0,
+        "vllm_cfg": {"max_model_len": 16},
+    }
+    generation.dynamo_frontend_url = "http://frontend/v1"
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[5, 6, 0]]),
+            "input_lengths": torch.tensor([2]),
+            "stop_strings": [["</answer>"]],
+        }
+    )
+    # The frontend request carries token IDs only, so media prompts stay native.
+    media = BatchedDataDict({**data, "vllm_content": [None]})
+    assert generation._dynamo_serves(data) and not generation._dynamo_serves(media)
+
+    _, output = asyncio.run(anext(generation.generate_async(data, greedy=True)))
+
+    ((url, payload, timeout_s),) = requests
+    assert (url, timeout_s) == ("http://frontend/v1/completions", None)
+    # The unpadded prompt; the engine samples it from the generation config, and
+    # the frontend's own stop rules never end the stream before the engine does.
+    assert payload["prompt"] == [5, 6]
+    assert payload["ignore_eos"] is True and payload["max_tokens"] == 14
+    assert "stop" not in payload and "temperature" not in payload
+    (annotation,) = payload["nvext"]["annotations"]
+    assert json.loads(annotation.removeprefix(rollout_client.ROLLOUT_ANNOTATION)) == {
+        "greedy": True,
+        "stop_strings": ["</answer>"],
+    }
+    assert payload["nvext"]["extra_fields"] == ["engine_data"]
+    # The driver returns what native dispatch returns.
+    native = rollout_output(result, input_ids=data["input_ids"][0], input_length=2)
+    assert output["gen_leader_worker_idx"] == [3]
+    for key in native:
+        assert torch.equal(output[key], native[key]), key
+    # An infrastructure failure is re-dispatched; an unmapped RuntimeError would
+    # count as a DATA failure against the prompt.
+    with pytest.raises(GenerationUnavailable, match="HTTP 503"):
+        asyncio.run(anext(generation.generate_async(data)))
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):

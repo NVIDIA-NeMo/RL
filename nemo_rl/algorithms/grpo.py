@@ -127,7 +127,6 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
-from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
@@ -639,19 +638,6 @@ def _needs_hf_refit_handshake(
     return not (nccl_reshard_refit_enabled and not colocated_inference)
 
 
-def _uses_managed_noncolocated_refit(
-    generation_backend: str,
-    nccl_reshard_refit_enabled: bool,
-    offload_policy_before_refit: bool,
-) -> bool:
-    """Whether non-colocated setup must attach a weight synchronizer."""
-    return (
-        nccl_reshard_refit_enabled
-        or generation_backend == "dynamo"
-        or offload_policy_before_refit
-    )
-
-
 def _shutdown_completed_nemo_gym_startup(
     future: Future[tuple[NemoGymShardSet, float]] | None,
 ) -> None:
@@ -732,20 +718,6 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
-    elif generation_config["backend"] == "dynamo":
-        # Validate the complete managed-Dynamo boundary before allocating Ray
-        # placement groups or starting any external services.
-        if grpo_config.async_grpo.in_flight_weight_updates:
-            raise ValueError(
-                "grpo.async_grpo.in_flight_weight_updates must be false when "
-                "policy.generation.backend='dynamo'; managed Dynamo drains "
-                "rollouts before layerwise weight refit"
-            )
-        generation_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            policy_config.get("hf_config_overrides") or {}
-        )
-        generation_config = DynamoConfig.model_validate(generation_config).model_dump()
-        policy_config["generation"] = generation_config
 
     # generation.disaggregation is written in backend-agnostic terms, but only
     # the TRT-LLM backend implements it today: every other backend would
@@ -1296,10 +1268,6 @@ def setup(
                     gpus_per_instance = replica_width(
                         cast(TrtllmConfig, generation_config)
                     )
-                elif generation_config["backend"] == "dynamo":
-                    gpus_per_instance = DynamoConfig.model_validate(
-                        generation_config
-                    ).engine_world_size
                 else:
                     sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
@@ -1373,10 +1341,6 @@ def setup(
                 MegatronGeneration.init_cluster_placement_groups(
                     inference_cluster, policy_config
                 )
-            elif generation_config["backend"] == "dynamo":
-                # Managed Dynamo creates one single-node engine per placement
-                # group and does not need a backend-specific PG strategy.
-                inference_cluster.get_placement_groups()
             else:
                 {
                     "vllm": VllmGeneration,
@@ -1931,37 +1895,6 @@ def setup(
             )
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
-    elif backend == "dynamo":
-        # Managed Dynamo owns a fixed worker fleet on the inference virtual cluster.
-
-        def init_dynamo():
-            t0 = time.perf_counter()
-            generation = DynamoGeneration(
-                cluster=inference_cluster,
-                config=generation_config,
-                tokenizer=tokenizer,
-                tokenizer_config=policy_config["tokenizer"],
-            )
-            return generation, time.perf_counter() - t0
-
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_dynamo,
-            colocated_inference=False,
-            setup_timing_metrics=setup_timing_metrics,
-        )
-
-        if enable_nemo_gym:
-            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                policy_generation.dp_openai_server_base_urls,
-                generation_config["model_name"],
-            )
-            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
-
-        print(
-            f"  ✓ Using Dynamo backend (frontend: {policy_generation.frontend_url})",
-            flush=True,
-        )
-
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -2001,12 +1934,8 @@ def setup(
         and checkpoint_engine_config is None
     ):
         t0 = time.perf_counter()
-        # init collective
-        if _uses_managed_noncolocated_refit(
-            generation_backend=backend,
-            nccl_reshard_refit_enabled=nccl_reshard_refit_enabled,
-            offload_policy_before_refit=offload_policy_before_refit,
-        ):
+        # init collective; these refits need an attached weight synchronizer.
+        if nccl_reshard_refit_enabled or offload_policy_before_refit:
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
@@ -5180,17 +5109,17 @@ def async_grpo_train(
             media to NeMo Gym prompt rows.
     """
     # Ensure we are running with a compatible async generation backend.
-    # Async GRPO supports vLLM, Megatron, TRT-LLM, and Dynamo;
+    # Async GRPO supports vLLM, Megatron, and TRT-LLM;
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron", "trtllm", "dynamo"), (
-        "Async GRPO supports the vLLM, Megatron, TRT-LLM, and Dynamo generation backends; "
+    assert backend in ("vllm", "megatron", "trtllm"), (
+        "Async GRPO supports the vLLM, Megatron, and TRT-LLM generation backends; "
         f"got policy.generation.backend={backend!r}."
     )
     assert should_use_async_rollouts(generation_config), (
-        "Async GRPO requires Dynamo, Megatron, or an async vLLM or TRT-LLM "
-        "generation engine. Set policy.generation.backend=dynamo, "
+        "Async GRPO requires Megatron, or an async vLLM or TRT-LLM "
+        "generation engine. Set "
         "policy.generation.vllm_cfg.async_engine=true (vLLM), or "
         "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM). "
         "Megatron Inference always uses its async engine."
@@ -5487,7 +5416,7 @@ def async_grpo_train(
             raise
 
     # Generation must hold the policy's real weights before any backend starts
-    # collecting. In particular, vLLM and Dynamo start with dummy weights when
+    # collecting. In particular, vLLM starts with dummy weights when
     # the first refit supplies model parameters.
     ray.get(trajectory_collector.set_weight_version.remote(weight_version))
     ray.get(trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader)))
