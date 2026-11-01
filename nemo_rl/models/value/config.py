@@ -14,6 +14,8 @@
 
 from typing import Any, NotRequired, TypedDict
 
+from pydantic import BaseModel, Field, PositiveInt
+
 from nemo_rl.models.policy import (
     AutomodelConfig,
     AutomodelConfigDisabled,
@@ -30,6 +32,42 @@ from nemo_rl.models.policy import (
     SinglePytorchSchedulerConfig,
     TokenizerConfig,
 )
+
+
+class SwePrivilegedCriticCaps(BaseModel, extra="forbid"):
+    """Per-field token ceilings within the reference block's total budget.
+
+    They stop one pathological field from consuming the budget (one corpus
+    instance carries a 323k-token golden patch, and pass_to_pass reaches 125k)
+    and deliberately sum to more than the default total, so the total stays the
+    binding constraint.
+    """
+
+    golden_patch: PositiveInt = 24576
+    test_patch: PositiveInt = 16384
+    pass_to_pass: PositiveInt = 4096
+    fail_to_pass: PositiveInt = 4096
+
+
+class SwePrivilegedCriticConfig(BaseModel, extra="forbid"):
+    """``value.swe_privileged_critic``: prefix the critic input with a reference block.
+
+    The block carries the accepted fix and the grading tests of the rollout's SWE
+    instance (see ``nemo_rl.algorithms.swe_privileged_critic``). Keep
+    ``max_total_tokens`` and ``caps`` identical to the critic-pretrain run a critic
+    is warm-started from: they change which content is truncated, a distribution
+    shift the warm start was not trained on.
+    """
+
+    # Build privileged critic inputs. False leaves the critic blind.
+    enabled: bool = False
+    # Token budget for the whole block, spent in priority order fail_to_pass >
+    # golden_patch > test_patch > pass_to_pass. Measured over 400 instances (real
+    # tokenizer) the untruncated block is median 5467 / p90 17683 / p99 77911
+    # tokens, so 32768 truncates ~4.8% of them; privilege/frac_truncated reports
+    # the share a run actually cuts.
+    max_total_tokens: PositiveInt = 32768
+    caps: SwePrivilegedCriticCaps = Field(default_factory=SwePrivilegedCriticCaps)
 
 
 class ValueConfig(TypedDict):
@@ -67,6 +105,11 @@ class ValueConfig(TypedDict):
     # Sequence length settings
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
+
+    # SWE privileged critic: prefix the critic's input with a reference block
+    # (accepted fix + grading tests). max_total_sequence_length and the packing
+    # token budgets must then cover policy length + the block budget.
+    swe_privileged_critic: NotRequired[SwePrivilegedCriticConfig]
 
     # Gradient clipping
     max_grad_norm: NotRequired[float | int | None]

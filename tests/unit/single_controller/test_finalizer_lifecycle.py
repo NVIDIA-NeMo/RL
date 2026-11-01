@@ -23,7 +23,9 @@ from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
+import torch
 
+from nemo_rl.algorithms import swe_privileged_critic as spc
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
@@ -114,6 +116,7 @@ def _controller(actor: object) -> Any:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
+    ctrl._buffer.drop_committed_group = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
@@ -331,8 +334,210 @@ def test_below_threshold_group_releases_pending_finalizer_state() -> None:
     asyncio.run(_below_threshold_branch())
 
     ctrl._buffer.abort.assert_called_once_with("group")
+    ctrl._buffer.drop_committed_group.assert_awaited_once_with(ANY, "group")
     assert "group" not in ctrl._finalizer_metrics_by_group
     assert "group" not in ctrl._finalizer_rewards_by_group
+
+
+def test_below_threshold_group_leaves_the_replay_buffer() -> None:
+    """A discarded group must not stay selectable with its rows cleared."""
+    result = FinalizedGroup(
+        meta=KVBatchMeta(
+            partition_id="canonical",
+            task_name="train",
+            sample_ids=["group_g0"],
+            fields=["input_ids"],
+            sequence_lengths=[3],
+            tags=[{"weight_version": 3}],
+        ),
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    ctrl._buffer = TQReplayBuffer(
+        ctrl._dp_client,
+        partition_id="canonical",
+        staging_partition_id="staging",
+        pad_value_dict={"token_ids": 0},
+        include_message_violation_fields=False,
+    )
+    ctrl._buffer.set_data_plane_checkpoint_barrier(ctrl._data_plane_checkpoint_barrier)
+    ctrl._buffer.reserve(weight_version=3, group_id="group")
+    request = _request()
+
+    async def _below_threshold_branch() -> None:
+        assert await ctrl._finalize_with_actor(request) is result
+        assert ctrl._buffer.ready_list == [True]
+        await ctrl._discard_committed_group(request)
+
+    asyncio.run(_below_threshold_branch())
+
+    assert ctrl._buffer.group_ids == ()
+    assert ctrl._dp_client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+
+
+class _CharTokenizer:
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) for c in text]
+
+    def decode(self, ids):
+        return "".join(chr(i) for i in ids)
+
+    def apply_chat_template(self, messages, **kwargs):
+        return "".join(m["content"] for m in messages)
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=False):
+        return {"input_ids": torch.tensor([self.encode(text)])}
+
+
+def _privileged(ctrl: Any, env_info: dict[str, Any]) -> None:
+    """Give the controller a real replay buffer enriched by a real privilege store,
+    and a dataset prompt lookup returning ``env_info`` for prompt 17."""
+    ctrl._buffer = TQReplayBuffer(
+        ctrl._dp_client,
+        partition_id="canonical",
+        staging_partition_id="staging",
+        pad_value_dict={"token_ids": 0},
+        include_message_violation_fields=False,
+    )
+    ctrl._buffer.set_data_plane_checkpoint_barrier(ctrl._data_plane_checkpoint_barrier)
+    ctrl._buffer.reserve(weight_version=3, group_id="group")
+    ctrl._privilege_store = spc.SwePrivilegePrefixStore(
+        _CharTokenizer(), spc.SwePrivilegedCriticConfig(enabled=True)
+    )
+    ctrl._buffer.set_post_write_enricher(ctrl._privilege_store.enrich)
+    ctrl._load_recovery_prompt = AsyncMock(
+        return_value={"idx": 17, "extra_env_info": env_info}
+    )
+
+
+_PRIVILEGED_ENV_INFO = {"instance_id": "repo__9", "patch": "diff --git a/z b/z\n+fix"}
+
+
+def _finalized_group() -> FinalizedGroup:
+    return FinalizedGroup(
+        meta=KVBatchMeta(
+            partition_id="canonical",
+            task_name="train",
+            sample_ids=["group_g0", "group_g1"],
+            fields=["input_ids"],
+            sequence_lengths=[3, 2],
+            tags=[{"weight_version": 3}, {"weight_version": 3}],
+        ),
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+
+
+def test_privileged_critic_stamps_finalized_rows_before_readiness() -> None:
+    result = _finalized_group()
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    _privileged(ctrl, _PRIVILEGED_ENV_INFO)
+
+    assert asyncio.run(ctrl._finalize_with_actor(_request("agent"))) is result
+
+    ctrl._load_recovery_prompt.assert_awaited_once_with(
+        group_id="group", sample_id="17"
+    )
+    assert ctrl._buffer.ready_list == [True]
+    committed_meta = ctrl._buffer.meta_list[0]
+    # Every row of the group references the instance's prefix.
+    assert [tag[spc.PRIVILEGE_KEY_TAG] for tag in committed_meta.tags] == [
+        "repo__9",
+        "repo__9",
+    ]
+    assert "repo__9" in ctrl._privilege_store.prefixes_for(committed_meta)
+
+
+def test_privileged_critic_without_golden_patch_cleans_up_and_never_commits() -> None:
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_finalized_group()))
+    )
+    _privileged(ctrl, {"instance_id": "repo__9"})
+
+    with pytest.raises(PostWriteEnrichmentError) as error:
+        asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    assert "no golden patch" in str(error.value.__cause__)
+    assert ctrl._buffer.group_ids == ()
+    assert ctrl._dp_client.clear_calls
+    assert len(ctrl._privilege_store) == 0
+    ctrl._rollout_manager.record_canonical_publication.assert_not_called()
+
+
+def test_privileged_critic_releases_a_below_threshold_group_prefix() -> None:
+    result = _finalized_group()
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    _privileged(ctrl, _PRIVILEGED_ENV_INFO)
+    request = _request()
+
+    async def _below_threshold_branch() -> None:
+        # The calls the rollout pump makes when the group falls below
+        # min_valid_fraction_per_group.
+        assert await ctrl._finalize_with_actor(request) is result
+        assert len(ctrl._privilege_store) == 1
+        await ctrl._discard_committed_group(request)
+
+    asyncio.run(_below_threshold_branch())
+
+    assert ctrl._buffer.group_ids == ()
+    assert len(ctrl._privilege_store) == 0
+
+
+def test_privileged_critic_rejects_a_dataset_position_holding_another_prompt() -> None:
+    ctrl = _controller(SimpleNamespace())
+    _privileged(ctrl, _PRIVILEGED_ENV_INFO)
+    ctrl._load_recovery_prompt.return_value = {
+        "idx": 18,
+        "extra_env_info": _PRIVILEGED_ENV_INFO,
+    }
+
+    with pytest.raises(ValueError, match="holds prompt idx=18"):
+        asyncio.run(ctrl._finalized_env_info(_request()))
+
+
+def test_eviction_releases_the_prefixes_of_groups_that_can_no_longer_train() -> None:
+    ctrl = _controller(SimpleNamespace())
+    _privileged(ctrl, _PRIVILEGED_ENV_INFO)
+    store = ctrl._privilege_store
+    for group_id in ("evicted", "buffered", "selected"):
+        asyncio.run(
+            store.enrich(
+                KVBatchMeta(
+                    partition_id="canonical",
+                    task_name="train",
+                    sample_ids=[f"{group_id}_g0"],
+                    tags=[{"prompt_idx": 17}],
+                ),
+                _PRIVILEGED_ENV_INFO,
+            )
+        )
+    ctrl._buffer = SimpleNamespace(group_ids=("buffered",))
+    ctrl._finalizer_metrics_by_group = {}
+    ctrl._finalizer_rewards_by_group = {}
+
+    ctrl._prune_finalizer_state({"selected"})
+
+    assert set(store._group_keys) == {"buffered", "selected"}
+    # The instance's prefix stays while a live group references it.
+    assert len(store) == 1
+
+
+@pytest.mark.parametrize("agent", [None, "agent"])
+def test_a_blind_critic_passes_only_the_routing_agent(agent: str | None) -> None:
+    ctrl = _controller(SimpleNamespace())
+    ctrl._load_recovery_prompt = AsyncMock()
+
+    env_info = asyncio.run(ctrl._finalized_env_info(_request(agent)))
+
+    assert env_info == (None if agent is None else {"agent_ref": {"name": agent}})
+    ctrl._load_recovery_prompt.assert_not_awaited()
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:

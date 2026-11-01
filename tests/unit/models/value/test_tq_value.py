@@ -28,6 +28,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from nemo_rl.algorithms.swe_privileged_critic import (
+    PRIVILEGE_KEY_TAG,
+    PRIVILEGE_PREFIX_LEN_TAG,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     DP_VALUE_TRAIN_FIELDS,
@@ -35,6 +39,7 @@ from nemo_rl.data_plane.schema import (
     VALUE_SEED_FIELDS,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.value.tq_value import TQValue
 
 
@@ -251,3 +256,157 @@ class TestPadTargetIsolation:
         assert dispatched.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] != 4096
         # The caller's value survives for whoever minted it.
         assert meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == 4096
+
+
+class TestPrivilegedCritic:
+    """SWE privileged critic: the critic runs on ``prefix + policy row`` while
+    ``values`` reaches TQ in the policy layout GAE reads."""
+
+    _PREFIX = torch.tensor([9, 9, 9, 9], dtype=torch.int32)
+
+    @classmethod
+    def _tags(cls) -> list[dict]:
+        tag = {PRIVILEGE_KEY_TAG: "repo__1", PRIVILEGE_PREFIX_LEN_TAG: 4}
+        return [dict(tag), dict(tag)]
+
+    def test_dispatch_plans_on_critic_lengths_and_ships_the_prefixes(self):
+        v, wg = _make_tq_value()
+        v.use_dynamic_batches = False
+        v.use_sequence_packing = False
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["g_g0", "g_g1"],
+            sequence_lengths=[3, 2],
+            tags=self._tags(),
+        )
+        prefixes = {"repo__1": self._PREFIX}
+        with (
+            patch(
+                "nemo_rl.models.value.tq_value.ray.put",
+                side_effect=lambda obj: ("ref", obj),
+            ),
+            patch(
+                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            v.get_values_from_meta(meta, privilege_prefixes=prefixes)
+
+        dispatched = mock_shard.call_args.args[0]
+        assert dispatched.sequence_lengths == [7, 6]
+        # The pad target covers the longest critic row, not the policy row.
+        assert dispatched.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == 7
+        common = wg.run_all_workers_sharded_data.call_args.kwargs["common_kwargs"]
+        assert common["privilege_prefixes"][1] is prefixes
+        assert meta.sequence_lengths == [3, 2]
+
+    def test_train_dispatch_ships_the_prefixes(self):
+        v, wg = _make_tq_value()
+        v.use_dynamic_batches = False
+        v.use_sequence_packing = False
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["g_g0", "g_g1"],
+            sequence_lengths=[3, 2],
+            tags=self._tags(),
+        )
+        wg.get_all_worker_results.return_value = [
+            {"global_loss": 1.0, "grad_norm": 0.5, "all_mb_metrics": {}}
+        ]
+        with (
+            patch(
+                "nemo_rl.models.value.tq_value.ray.put",
+                side_effect=lambda obj: ("ref", obj),
+            ),
+            patch(
+                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            v.train_from_meta(meta, loss_fn="LF", privilege_prefixes={"repo__1": 1})
+
+        assert mock_shard.call_args.args[0].sequence_lengths == [7, 6]
+        common = wg.run_all_workers_sharded_data.call_args.kwargs["common_kwargs"]
+        assert common["privilege_prefixes"] == ("ref", {"repo__1": 1})
+
+    @staticmethod
+    def _fetched() -> dict:
+        # Fetched in the policy layout, padded to the critic pad target (7).
+        return BatchedDataDict(
+            {
+                "input_ids": torch.tensor(
+                    [[1, 2, 3, 0, 0, 0, 0], [4, 5, 0, 0, 0, 0, 0]], dtype=torch.int32
+                ),
+                "input_lengths": torch.tensor([3, 2]),
+                "token_mask": torch.tensor(
+                    [[0, 1, 1, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0]]
+                ),
+                "returns": torch.tensor(
+                    [[0.0, 0.5, 0.5, 0, 0, 0, 0], [0.0, 1.0, 0, 0, 0, 0, 0]]
+                ),
+            }
+        )
+
+    def _critic_meta(self) -> KVBatchMeta:
+        return KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="value_fwd",
+            sample_ids=["g_g0", "g_g1"],
+            sequence_lengths=[7, 6],
+            tags=self._tags(),
+        )
+
+    def test_worker_values_land_in_the_policy_layout(self):
+        class _Worker(_ValueStubWorker):
+            def _fetch(self, meta):
+                return TestPrivilegedCritic._fetched()
+
+            def get_values(self, data, micro_batch_size=None):
+                self.calls.append(("get_values", data, micro_batch_size))
+                # V(position) = token id there, so any misalignment shows.
+                return {"values": data["input_ids"].to(torch.float32)}
+
+        w = _Worker()
+        with patch("nemo_rl.data_plane.column_io.write_columns") as write_columns:
+            w.get_values_presharded(
+                meta=self._critic_meta(),
+                privilege_prefixes={"repo__1": self._PREFIX},
+            )
+
+        forward = w.calls[-1][1]
+        assert forward["input_ids"].tolist() == [
+            [9, 9, 9, 9, 1, 2, 3],
+            [9, 9, 9, 9, 4, 5, 0],
+        ]
+        assert forward["input_lengths"].tolist() == [7, 6]
+        write_meta, written = write_columns.call_args.args[1:3]
+        # Jagged write-back sized by the policy rows, not the critic rows.
+        assert write_meta.sequence_lengths == [3, 2]
+        assert written["values"][:, :3].tolist() == [[1, 2, 3], [4, 5, 0]]
+
+    def test_worker_training_shifts_the_targets_past_the_prefix(self):
+        class _Worker(_ValueStubWorker):
+            def _fetch(self, meta):
+                return TestPrivilegedCritic._fetched()
+
+            def train(self, data, **kwargs):
+                self.calls.append(("train", data))
+                return {}
+
+        w = _Worker()
+        w.train_presharded(
+            meta=self._critic_meta(),
+            loss_fn="LF",
+            privilege_prefixes={"repo__1": self._PREFIX},
+        )
+
+        data = w.calls[-1][1]
+        # The loss sees exactly the policy's response positions.
+        assert data["token_mask"].tolist() == [
+            [0, 0, 0, 0, 0, 1, 1],
+            [0, 0, 0, 0, 0, 1, 0],
+        ]
+        assert data["returns"][0].tolist() == [0, 0, 0, 0, 0.0, 0.5, 0.5]
+        assert data["returns"][1].tolist() == [0, 0, 0, 0, 0.0, 1.0, 0]
