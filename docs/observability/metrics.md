@@ -68,6 +68,26 @@ rollout_checkpointing:
 ```
 
 This records one throughput and controller-pressure sample every 30 seconds.
+For vLLM engine metrics, also enable the async generation worker's sampler:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 1.0
+```
+
+The rollout series then includes prompt and generation tokens per second,
+completed requests per second, running and waiting requests, KV-cache usage,
+prefix-cache hit rate, and speculative-decoding mean acceptance length when
+drafts exist. Per-engine values are under `rollout/throughput/vllm/engine_*`;
+the top-level values aggregate the engines. Counter rates are omitted on the
+first sample and after a counter reset. Router outstanding requests and
+dispatches per second are present only when `async_rl.generation_router.enabled`
+is true. These are fleet-level measurements, not per-trace model or sandbox
+timings.
+
 Set the value back to `null` to disable the sampler. Detailed per-interval
 metric dictionaries are printed to the controller log only when
 `async_rl.diagnostics: true`; configured metric backends receive them either

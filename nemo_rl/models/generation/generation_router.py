@@ -102,6 +102,7 @@ class GenerationRouterImpl:
         # would be permanent and a few transient blips would drain the fleet to nothing.
         self._health_managed = health_managed
         self._requests_total = 0
+        self._dispatches_total = 0
         self._no_backend_total = 0
         self._backend_error_total = 0
         self._thread: Optional[threading.Thread] = None
@@ -175,6 +176,8 @@ class GenerationRouterImpl:
     def metrics(self) -> dict[str, float]:
         return {
             "router/requests_total": float(self._requests_total),
+            "router/dispatches_total": float(self._dispatches_total),
+            "router/requests_outstanding": float(sum(self._inflight.values())),
             "router/no_healthy_backend_total": float(self._no_backend_total),
             "router/backend_error_total": float(self._backend_error_total),
             "router/serving_backends": float(len(self._serving)),
@@ -216,6 +219,8 @@ class GenerationRouterImpl:
                 status=self._no_healthy_backend_status,
             )
 
+        # Count selected backends, excluding probes and requests with no backend.
+        self._dispatches_total += 1
         self._inflight[backend] = self._inflight.get(backend, 0) + 1
         try:
             return await self._forward(request, backend)

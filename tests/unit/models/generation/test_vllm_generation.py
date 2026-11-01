@@ -784,6 +784,12 @@ def test_vllm_latest_metric_drain_prunes_worker_histories():
     worker.num_pending_samples = [3, 4]
     worker.kv_cache_usage_perc = [0.2, 0.6]
     worker.generation_tokens = [10, 30]
+    worker.prompt_tokens = [20, 40]
+    worker.request_success = [2, 5]
+    worker.prefix_cache_queries = [10, 30]
+    worker.prefix_cache_hits = [3, 15]
+    worker.spec_decode_num_drafts = [1, 4]
+    worker.spec_decode_num_accepted_tokens = [2, 9]
 
     latest = worker.drain_latest_vllm_logger_metrics()
 
@@ -792,12 +798,96 @@ def test_vllm_latest_metric_drain_prunes_worker_histories():
         "num_pending_samples": [4],
         "kv_cache_usage_perc": [0.6],
         "generation_tokens": [30],
+        "prompt_tokens": [40],
+        "request_success": [5],
+        "prefix_cache_queries": [30],
+        "prefix_cache_hits": [15],
+        "spec_decode_num_drafts": [4],
+        "spec_decode_num_accepted_tokens": [9],
     }
     assert worker.inflight_batch_sizes == [2]
     assert worker.num_pending_samples == [4]
     assert worker.kv_cache_usage_perc == [0.6]
     assert worker.generation_tokens == [30]
+    assert worker.prompt_tokens == [40]
+    assert worker.request_success == [5]
+    assert worker.prefix_cache_queries == [30]
+    assert worker.prefix_cache_hits == [15]
+    assert worker.spec_decode_num_drafts == [4]
+    assert worker.spec_decode_num_accepted_tokens == [9]
     assert latest["generation_tokens"] is not worker.generation_tokens
+
+
+def test_vllm_metric_sampler_sums_labeled_counters_once_per_tick():
+    """The engine sampler publishes one cumulative value per labeled counter."""
+    from vllm.v1.metrics.reader import Counter, Gauge
+
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "vllm_cfg": {
+            "async_engine": True,
+            "enable_vllm_metrics_logger": True,
+            "vllm_metrics_logger_interval": 0.5,
+        }
+    }
+    worker.is_model_owner = True
+    worker._vllm_metrics_lock = threading.Lock()
+
+    class EndSample(BaseException):
+        pass
+
+    class OneTickThread:
+        def __init__(self, target, **kwargs):
+            self.target = target
+
+        def start(self):
+            try:
+                self.target()
+            except EndSample:
+                pass
+
+    sleeps = 0
+
+    def sleep_once(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 1:
+            raise EndSample
+
+    samples = [
+        Gauge(name="vllm:num_requests_running", labels={}, value=3),
+        Counter(name="vllm:prompt_tokens", labels={}, value=100),
+        Counter(
+            name="vllm:request_success", labels={"finished_reason": "stop"}, value=5
+        ),
+        Counter(
+            name="vllm:request_success", labels={"finished_reason": "length"}, value=7
+        ),
+        Counter(name="vllm:prefix_cache_queries", labels={}, value=20),
+        Counter(name="vllm:prefix_cache_hits", labels={}, value=8),
+        Counter(name="vllm:spec_decode_num_drafts", labels={}, value=4),
+        Counter(name="vllm:spec_decode_num_accepted_tokens", labels={}, value=9),
+    ]
+    with (
+        patch("vllm.v1.metrics.reader.get_metrics_snapshot", return_value=samples),
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_worker_async.threading.Thread",
+            OneTickThread,
+        ),
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_worker_async.time.sleep", sleep_once
+        ),
+    ):
+        worker._start_vllm_metrics_logger()
+
+    values = worker.get_vllm_logger_metrics()
+    assert values["inflight_batch_sizes"] == [3]
+    assert values["prompt_tokens"] == [100]
+    assert values["request_success"] == [12]
+    assert values["prefix_cache_queries"] == [20]
+    assert values["prefix_cache_hits"] == [8]
+    assert values["spec_decode_num_drafts"] == [4]
+    assert values["spec_decode_num_accepted_tokens"] == [9]
 
 
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):

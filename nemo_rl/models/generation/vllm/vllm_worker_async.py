@@ -491,12 +491,19 @@ class VllmAsyncGenerationWorkerImpl(
         self.num_pending_samples: list[int] = []
         self.kv_cache_usage_perc: list[float] = []
         self.generation_tokens: list[int] = []
+        self.prompt_tokens: list[int] = []
+        self.request_success: list[int] = []
+        self.prefix_cache_queries: list[int] = []
+        self.prefix_cache_hits: list[int] = []
+        self.spec_decode_num_drafts: list[int] = []
+        self.spec_decode_num_accepted_tokens: list[int] = []
 
         def _logger_loop():
             # Delay a little to let engine settle
             time.sleep(min(2.0, interval_s))
             while True:
                 try:
+                    counters: dict[str, int] = {}
                     for m in get_metrics_snapshot():
                         with self._vllm_metrics_lock:
                             if isinstance(m, Gauge):
@@ -510,8 +517,33 @@ class VllmAsyncGenerationWorkerImpl(
                                 elif m.name == "vllm:kv_cache_usage_perc":
                                     self.kv_cache_usage_perc.append(float(m.value))
                             elif isinstance(m, Counter):
-                                if m.name == "vllm:generation_tokens":
-                                    self.generation_tokens.append(int(m.value))
+                                name = m.name.removeprefix("vllm:")
+                                if name in {
+                                    "generation_tokens",
+                                    "prompt_tokens",
+                                    "request_success",
+                                    "prefix_cache_queries",
+                                    "prefix_cache_hits",
+                                    "spec_decode_num_drafts",
+                                    "spec_decode_num_accepted_tokens",
+                                }:
+                                    # Request-success and cache counters may carry labels.
+                                    # Sum their series once per sampling tick.
+                                    counters[name] = counters.get(name, 0) + int(
+                                        m.value
+                                    )
+                    with self._vllm_metrics_lock:
+                        histories = {
+                            "generation_tokens": self.generation_tokens,
+                            "prompt_tokens": self.prompt_tokens,
+                            "request_success": self.request_success,
+                            "prefix_cache_queries": self.prefix_cache_queries,
+                            "prefix_cache_hits": self.prefix_cache_hits,
+                            "spec_decode_num_drafts": self.spec_decode_num_drafts,
+                            "spec_decode_num_accepted_tokens": self.spec_decode_num_accepted_tokens,
+                        }
+                        for name, value in counters.items():
+                            histories[name].append(value)
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -540,6 +572,14 @@ class VllmAsyncGenerationWorkerImpl(
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
+                "prompt_tokens": copy.deepcopy(self.prompt_tokens),
+                "request_success": copy.deepcopy(self.request_success),
+                "prefix_cache_queries": copy.deepcopy(self.prefix_cache_queries),
+                "prefix_cache_hits": copy.deepcopy(self.prefix_cache_hits),
+                "spec_decode_num_drafts": copy.deepcopy(self.spec_decode_num_drafts),
+                "spec_decode_num_accepted_tokens": copy.deepcopy(
+                    self.spec_decode_num_accepted_tokens
+                ),
             }
         return metric
 
@@ -554,6 +594,12 @@ class VllmAsyncGenerationWorkerImpl(
                 "num_pending_samples": self.num_pending_samples,
                 "kv_cache_usage_perc": self.kv_cache_usage_perc,
                 "generation_tokens": self.generation_tokens,
+                "prompt_tokens": self.prompt_tokens,
+                "request_success": self.request_success,
+                "prefix_cache_queries": self.prefix_cache_queries,
+                "prefix_cache_hits": self.prefix_cache_hits,
+                "spec_decode_num_drafts": self.spec_decode_num_drafts,
+                "spec_decode_num_accepted_tokens": self.spec_decode_num_accepted_tokens,
             }
             latest = {
                 name: [values[-1]] if values else []
@@ -565,6 +611,14 @@ class VllmAsyncGenerationWorkerImpl(
             self.num_pending_samples = list(latest["num_pending_samples"])
             self.kv_cache_usage_perc = list(latest["kv_cache_usage_perc"])
             self.generation_tokens = list(latest["generation_tokens"])
+            self.prompt_tokens = list(latest["prompt_tokens"])
+            self.request_success = list(latest["request_success"])
+            self.prefix_cache_queries = list(latest["prefix_cache_queries"])
+            self.prefix_cache_hits = list(latest["prefix_cache_hits"])
+            self.spec_decode_num_drafts = list(latest["spec_decode_num_drafts"])
+            self.spec_decode_num_accepted_tokens = list(
+                latest["spec_decode_num_accepted_tokens"]
+            )
             return {name: list(values) for name, values in latest.items()}
 
     def clear_vllm_logger_metrics(self) -> None:
@@ -576,6 +630,12 @@ class VllmAsyncGenerationWorkerImpl(
             self.num_pending_samples = []
             self.kv_cache_usage_perc = []
             self.generation_tokens = []
+            self.prompt_tokens = []
+            self.request_success = []
+            self.prefix_cache_queries = []
+            self.prefix_cache_hits = []
+            self.spec_decode_num_drafts = []
+            self.spec_decode_num_accepted_tokens = []
 
     async def post_init_async(self):
         self._engine_loop = asyncio.get_running_loop()
