@@ -1871,16 +1871,23 @@ def get_distillation_topk_logprobs_from_logits(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
+    *,
+    defer_fp32_upcast: bool = False,
 ):
-    """Compute top-k log probabilities from logits."""
+    """Compute top-k log probabilities from logits.
+
+    With defer_fp32_upcast, local subset logits are gathered before upcasting.
+    Valid top-k columns must be distinct, and duplicated padding columns must
+    receive zero gradients. The loss-input adapter opts in when both masks are
+    available. Direct callers default to the full fp32 upcast, as do distributed
+    and Automodel token-layout paths even when the flag is enabled.
+    """
     if teacher_topk_indices.shape[-1] <= 0:
         raise ValueError(
             f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
             "topk=0 is not supported as it would result in empty tensor operations."
         )
 
-    # Ensure float32 for stability
-    student_logits = student_logits.to(torch.float32)
     # Move teacher topk indices to the same device as student logits
     teacher_topk_indices = teacher_topk_indices.to(student_logits.device)
 
@@ -1916,6 +1923,18 @@ def get_distillation_topk_logprobs_from_logits(
     else:
         student_logits = student_logits
         parallel_group = None
+
+    # Keep the full upcast for full-vocabulary and distributed computations.
+    # The local subset path gathers K columns before widening instead of
+    # retaining an fp32 [B, S, V] activation through backward.
+    if (
+        not defer_fp32_upcast
+        or zero_outside_topk
+        or parallel_group is not None
+        or cp_size > 1
+        or cp_sharder is not None
+    ):
+        student_logits = student_logits.to(torch.float32)
 
     # Automodel owns the sequence layout: shard the teacher indices into the model's
     # local layout, then gather back to canonical order through the sharder once the
@@ -2004,9 +2023,11 @@ def get_distillation_topk_logprobs_from_logits(
 
         # Non-distributed processing
         else:
+            # Valid top-k indices are distinct; duplicated padding indices must
+            # have zero upstream gradient when deferred upcasting is enabled.
             student_topk_logits = student_logits.gather(
                 dim=-1, index=indices_for_logits
-            )
+            ).to(torch.float32)
 
         student_topk_logprobs = torch.nn.functional.log_softmax(
             student_topk_logits, dim=-1
