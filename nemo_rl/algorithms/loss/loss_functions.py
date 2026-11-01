@@ -42,6 +42,7 @@ from nemo_rl.algorithms.loss.interfaces import (
     LossType,
     MetricNormalizer,
 )
+from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
 from nemo_rl.algorithms.utils import (
     calculate_kl,
     compute_seq_logprob_errors,
@@ -55,6 +56,8 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     get_sparse_projection_matrix,
     next_token_accuracy,
     project_student_to_teacher_vocab,
+    same_tokenizer_full_vocab_kl,
+    same_tokenizer_topk_kl,
     select_teacher_topk_indices,
     slice_sparse_projection_cols,
     student_next_token_ce,
@@ -62,12 +65,10 @@ from nemo_rl.algorithms.x_token.loss_utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    cp_shift_next,
     group_all_reduce_sum,
     group_all_reduce_sum_with_grad,
     to_local_if_dtensor,
     vocab_parallel_full_log_softmax,
-    vocab_parallel_gather_columns,
     vocab_parallel_log_softmax,
 )
 from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
@@ -251,6 +252,11 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # Compile the tensor-only actor objective when supported by the active
     # backend. The eager implementation remains the default path.
     enable_torch_compile: bool = False
+    # Score centering (arXiv:2609.20807): per token, add A * sum_v sg(c_v) log p_v
+    # over the sampler's top-k ids so the update subtracts the sampler-expected
+    # weighted score. Needs policy.generation.top_logprobs > 0; supports IS off,
+    # token-level untruncated IS, TIS and ICEPOP.
+    score_centering: bool = False
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -263,6 +269,8 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    sampler_topk_token_ids: NotRequired[torch.Tensor]
+    sampler_topk_logprobs: NotRequired[torch.Tensor]
     __extra__: Any
 
 
@@ -506,6 +514,32 @@ class ClippedPGLossFn(LossFunction):
             0.0 if self.has_adaptive_loss_state() else None
         )
 
+        self.score_centering = cfg.score_centering
+        if self.score_centering:
+            assert self.opd_full is None and not use_fused_linear_logprobs, (
+                "score_centering needs the policy-gradient loss on full logits"
+            )
+            assert not self.sequence_level_importance_ratios and (
+                not self.use_importance_sampling_correction
+                or self.truncated_importance_sampling_type in (None, "tis", "icepop")
+            ), (
+                "score_centering composes only with importance sampling off or "
+                "token-level untruncated IS, 'tis', or 'icepop'"
+            )
+        self._score_centering_is_mode = (
+            (self.truncated_importance_sampling_type or "is")
+            if self.use_importance_sampling_correction
+            else "off"
+        )
+        # Bounds set the effective head and tail masses for TIS/ICEPOP.
+        self._score_centering_is_bounds: tuple[float, float] | None = None
+        if self.score_centering and self._score_centering_is_mode in ("tis", "icepop"):
+            assert self.truncated_importance_sampling_ratio is not None
+            self._score_centering_is_bounds = (
+                self.truncated_importance_sampling_ratio_min or 0.0,
+                self.truncated_importance_sampling_ratio,
+            )
+
         # Advertise, per returned metric, the global denominator it was
         # normalized by (see MetricNormalizer). Built here — next to the flags
         # that pick the denominators — so split-API trainers can undo the
@@ -582,6 +616,10 @@ class ClippedPGLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
+        if self.score_centering:
+            self.metric_normalizations["score_centering_head_mass"] = (
+                MetricNormalizer.TOKENS
+            )
         if self.opd_full is not None:
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
@@ -652,6 +690,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_entropy: Optional[Tensor] = None,
         opd_full_cross_entropy: Optional[Tensor] = None,
         policy_support_mask: Optional[Tensor] = None,
+        policy_logprobs_at_sampler_topk: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
 
@@ -661,6 +700,8 @@ class ClippedPGLossFn(LossFunction):
             next_token_logprobs: Sampled-token log-probabilities ``[B, S - 1]``.
                 Required on the policy-gradient branch; on the ``opd_full``
                 branch only when ``reference_policy_kl_penalty`` is non-zero.
+            policy_logprobs_at_sampler_topk: Log-probabilities at the sampler's top-k
+                ids ``[B, S - 1, k]``, required when ``score_centering`` is on.
             data: Microbatch with masks, advantages, and prior log-probabilities.
             global_valid_seqs: Global valid-sequence count for normalization.
             global_valid_toks: Global valid-token count for normalization.
@@ -782,6 +823,8 @@ class ClippedPGLossFn(LossFunction):
         curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
         prev_logprobs = torch.where(mask.bool(), prev_logprobs, 0.0)
         generation_logprobs = torch.where(mask.bool(), generation_logprobs, 0.0)
+        if self.score_centering:
+            advantages = torch.where(mask.bool(), advantages.detach(), 0.0)
         if self.seq_logprob_error_in_loss:
             seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
             seq_error_metrics["seq_logprob_error_valid_seqs"] = sample_mask.sum().item()
@@ -1020,6 +1063,33 @@ class ClippedPGLossFn(LossFunction):
             token_level_loss=self.loss_type == LossType.TOKEN_LEVEL,
         )
 
+        score_centering_metrics: dict[str, Tensor] = {}
+        if self.score_centering:
+            assert policy_logprobs_at_sampler_topk is not None, (
+                "score_centering requires policy_logprobs_at_sampler_topk from prepare_loss_input"
+            )
+            centering, head_mass = compute_score_centering_term(
+                policy_logprobs_at_sampler_topk,
+                sampler_topk_logprobs=data["sampler_topk_logprobs"][:, 1:],
+                importance_sampling_mode=self._score_centering_is_mode,
+                is_bounds=self._score_centering_is_bounds,
+                token_mask=mask,
+            )
+            correction = advantages * centering
+            if self.loss_type == LossType.TOKEN_LEVEL:
+                actor_loss = actor_loss + masked_mean(
+                    correction, mask, global_normalization_factor=global_valid_toks
+                )
+            else:
+                actor_loss = actor_loss + masked_mean(
+                    masked_mean(correction, token_mask, dim=-1),
+                    sample_mask,
+                    global_normalization_factor=global_valid_seqs,
+                )
+            score_centering_metrics["score_centering_head_mass"] = masked_mean(
+                head_mass, mask, global_normalization_factor=global_valid_toks
+            )
+
         # Metric: sampling importance ratio (mean over samples)
         # See: docs/guides/grpo.md#sampling-importance-ratio
         if need_importance_weights:
@@ -1097,6 +1167,7 @@ class ClippedPGLossFn(LossFunction):
                 "num_valid_samples": sample_mask.sum(),
                 "positive_nll_loss": nll_loss,
                 **_is_filter_metrics,
+                **score_centering_metrics,
             }
         )
         metric_tensors["policy_support_excluded_tokens"] = (kl_mask - mask).sum()
@@ -2205,9 +2276,11 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             still contribute exact maps. Requires ``gold_loss=True``.
         temperature: Softmax temperature applied symmetrically to student
             and teacher logits before KL.
-        vocab_topk: Microbatch-global top-k size used by the P-KL path
-            (``gold_loss=False``). Computed inside the loss fn from full
-            teacher logits. Inert when ``gold_loss=True``.
+        vocab_topk: Microbatch-global top-k size. Used by the P-KL path
+            (``gold_loss=False``) and by every same-tokenizer teacher, whatever
+            ``gold_loss`` is, except the all-same-tokenizer ``averaged_logits``
+            path, which uses the full vocab. Computed inside the loss fn from
+            full teacher logits.
         uncommon_topk: Cap on the L1 uncommon-tail sort in the gold path.
             Defaults to 8192. Inert when ``gold_loss=False``.
         reverse_kl: If True, compute KL(student || teacher) instead of
@@ -2674,138 +2747,21 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         matches CE: masked next-token mean normalized by ``global_valid_toks``,
         scaled by ``T**2``.
         """
-        kd = self._direct_topk_kl(
+        assert align.student_token_mask is not None
+        kd = same_tokenizer_topk_kl(
             student_logits_contig,
             teacher_full_logits,
-            align,
-            global_valid_toks,
+            kd_mask=align.student_token_mask,
+            sample_mask=align.sample_mask,
+            num_kd_tokens=global_valid_toks,
+            vocab_size=self.student_vocab_size,
+            vocab_topk=self.vocab_topk,
+            temperature=self.temperature,
+            reverse_kl=self.reverse_kl,
             tp_group=tp_group,
             cp_group=cp_group,
         )
         return kd, {"kl_loss": kd.item()}
-
-    def _direct_topk_kl(
-        self,
-        student_logits: torch.Tensor,
-        teacher_full_logits: torch.Tensor,
-        align: LocalizedAlignment,
-        global_valid_toks: torch.Tensor,
-        *,
-        tp_group: Optional[torch.distributed.ProcessGroup],
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> torch.Tensor:
-        """Top-K per-position KL on a shared vocab (same tokenizer), TP/CP-aware.
-
-        Top-K columns are selected at the student from the reassembled full-vocab
-        teacher logits (``select_teacher_topk_indices`` MAX-reduces across CP so
-        every CP rank agrees on the same columns). The student's K columns are
-        gathered TP-aware (``vocab_parallel_gather_columns``) and softmaxed
-        within the subset directly: because both sides renormalize within K,
-        the full-vocab partition function cancels, so
-        ``log_softmax_K(logits[..., idx] / T)`` equals the previous
-        full-vocab-log-softmax-then-renorm form exactly — without materializing
-        the all-gathered ``[B, T, V]`` student log-probs. The masked next-token
-        mean is normalized by the CP/DP-global valid-token count, exactly like
-        the CE term; at CP=1 the ``cp_shift_next`` mask reduces to the
-        ``token_mask[:, 1:]`` next-token shift.
-        """
-        T = self.temperature
-        # Drop HF lm_head padding beyond the shared tokenizer vocab.
-        v_s = self.student_vocab_size
-        teacher = teacher_full_logits
-        if teacher.shape[-1] > v_s:
-            teacher = teacher[..., :v_s]
-        vocab_topk = min(self.vocab_topk, teacher.shape[-1])
-        topk_idx = select_teacher_topk_indices(teacher, vocab_topk, cp_group=cp_group)
-
-        # [B, T, K] instead of the all-gathered [B, T, V]: the K-subset
-        # renormalization cancels the full-vocab partition function, so the
-        # subset log_softmax is exactly equivalent (see docstring).
-        student_topk_logits = vocab_parallel_gather_columns(
-            student_logits, topk_idx, tp_group=tp_group
-        )
-        student_log_probs_k = torch.log_softmax(student_topk_logits / T, dim=-1)
-        teacher_log_probs_k = torch.log_softmax(
-            teacher[..., topk_idx].float() / T, dim=-1
-        )
-        if self.reverse_kl:
-            per_pos = torch.nn.functional.kl_div(
-                teacher_log_probs_k,
-                student_log_probs_k,
-                reduction="none",
-                log_target=True,
-            ).sum(dim=-1)
-        else:
-            per_pos = torch.nn.functional.kl_div(
-                student_log_probs_k,
-                teacher_log_probs_k,
-                reduction="none",
-                log_target=True,
-            ).sum(dim=-1)
-        return self._same_vocab_masked_kl(per_pos, align, global_valid_toks, cp_group)
-
-    def _direct_full_vocab_kl(
-        self,
-        student_logits: torch.Tensor,
-        teacher_logits: torch.Tensor,
-        align: LocalizedAlignment,
-        global_valid_toks: torch.Tensor,
-        *,
-        tp_group: Optional[torch.distributed.ProcessGroup],
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> torch.Tensor:
-        """Full-vocab per-position KL on a shared vocab (same tokenizer), TP/CP-aware.
-
-        Used by ``averaged_logits`` over the convex-averaged teacher logits. The
-        student is gathered to full vocab across TP; the teacher (already full
-        vocab) is sliced to the student width to drop HF lm_head padding.
-        """
-        T = self.temperature
-        student_log_probs = vocab_parallel_full_log_softmax(
-            student_logits, T, tp_group=tp_group
-        )
-        v_s = student_log_probs.shape[-1]
-        teacher = teacher_logits.float()
-        if teacher.shape[-1] > v_s:
-            teacher = teacher[..., :v_s]
-        teacher_log_probs = torch.log_softmax(teacher / T, dim=-1)
-        if self.reverse_kl:
-            per_pos = torch.nn.functional.kl_div(
-                teacher_log_probs, student_log_probs, reduction="none", log_target=True
-            ).sum(dim=-1)
-        else:
-            per_pos = torch.nn.functional.kl_div(
-                student_log_probs, teacher_log_probs, reduction="none", log_target=True
-            ).sum(dim=-1)
-        return self._same_vocab_masked_kl(per_pos, align, global_valid_toks, cp_group)
-
-    def _same_vocab_masked_kl(
-        self,
-        per_pos: torch.Tensor,
-        align: LocalizedAlignment,
-        global_valid_toks: torch.Tensor,
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> torch.Tensor:
-        """Masked next-token mean of a per-position KL (same-tokenizer reduction).
-
-        ``per_pos`` is the per-position KL on this CP rank's contiguous window
-        (student and teacher are position-aligned). The CP-aware next-token shift
-        (:func:`cp_shift_next`) selects positions whose target token (p+1) is a
-        valid label — at CP=1 this is the plain ``token_mask[:, 1:]`` shift, the
-        global-last position dropped via ``fill=0``. Reduction matches CE:
-        ``masked_mean`` over ``global_valid_toks``, scaled by ``T**2``.
-        """
-        T = self.temperature
-        next_mask = cp_shift_next(
-            to_local_if_dtensor(align.student_token_mask), cp_group, fill=0
-        )
-        sample_mask = to_local_if_dtensor(align.sample_mask)
-        mask = next_mask.float() * sample_mask.unsqueeze(-1).float()
-        return (
-            masked_mean(per_pos, mask, global_normalization_factor=global_valid_toks)
-            * T
-            * T
-        )
 
     def _sum_kd(
         self,
@@ -2934,11 +2890,17 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             contrib = f.float() * (self.teacher_weights[i] / total_w)
             avg = contrib if avg is None else avg + contrib
         assert avg is not None
-        kd = self._direct_full_vocab_kl(
+        align = aligns_by_idx[0]
+        assert align.student_token_mask is not None
+        kd = same_tokenizer_full_vocab_kl(
             student_logits_contig,
             avg,
-            aligns_by_idx[0],
-            global_valid_toks,
+            kd_mask=align.student_token_mask,
+            sample_mask=align.sample_mask,
+            num_kd_tokens=global_valid_toks,
+            vocab_size=self.student_vocab_size,
+            temperature=self.temperature,
+            reverse_kl=self.reverse_kl,
             tp_group=tp_group,
             cp_group=cp_group,
         )

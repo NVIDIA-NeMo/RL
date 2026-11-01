@@ -371,7 +371,7 @@ are outside this port.
 Other relevant fields:
 
 - `loss_fn.temperature` — softmax temperature applied symmetrically to student and teacher logits before KL.
-- `loss_fn.vocab_topk` — microbatch-global top-k size for the P-KL path (inert when `gold_loss=true`).
+- `loss_fn.vocab_topk` — microbatch-global top-k size for the P-KL path and for same-tokenizer teachers, whatever `gold_loss` is (the all-same-tokenizer `averaged_logits` path uses the full vocab).
 - `loss_fn.uncommon_topk` — cap on the L1 uncommon-tail sort in the gold path (defaults to 8192).
 - `loss_fn.reverse_kl` — compute `KL(student || teacher)` instead of `KL(teacher || student)`.
 
@@ -388,8 +388,8 @@ uv run python examples/run_xtoken_off_policy_distillation.py \
 This run distills a `meta-llama/Llama-3.2-1B` student from two teachers at
 once: `microsoft/Phi-4-mini-instruct` (a cross-tokenizer teacher, projected
 through its projection matrix) and `meta-llama/Llama-3.2-3B` (which shares the
-student's tokenizer, so it contributes a direct full-vocab KL with no
-projection). The per-teacher objectives are summed (`loss_fn.kd_loss_mode=sum`).
+student's tokenizer, so it contributes a direct top-K KL (`loss_fn.vocab_topk`)
+with no projection). The per-teacher objectives are summed (`loss_fn.kd_loss_mode=sum`).
 Config: global batch 96, micro-batch 1, sequence
 length 2048, 100 steps, 2 nodes (8 GPUs each), on the default
 Nemotron-Pretraining-Specialized-v1.1 / Formal-Logic corpus. The distillation
@@ -448,6 +448,6 @@ Listed in the order they run during a training step:
 - Config exemplar: [`examples/configs/xtoken_off_policy_distillation.yaml`](../../examples/configs/xtoken_off_policy_distillation.yaml)
 - Trainer module: `nemo_rl/algorithms/xtoken_off_policy_distillation.py`
 - KD data processor: `nemo_rl/data/processors.py::kd_data_processor`
-- Cross-tokenizer collator: `nemo_rl/data/xtoken/cross_tokenizer_collate.py::CrossTokenizerCollator`
+- Cross-tokenizer collator: `nemo_rl/data/cross_tokenizer/cross_tokenizer_collate.py::CrossTokenizerCollator`
 - Token alignment: `nemo_rl/algorithms/x_token/token_aligner.py::TokenAligner`
 - Loss implementation: `nemo_rl/algorithms/loss/loss_functions.py::CrossTokenizerDistillationLossFn`

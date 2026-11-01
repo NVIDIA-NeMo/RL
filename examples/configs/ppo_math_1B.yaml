@@ -96,6 +96,8 @@ loss_fn:
   positive_example_nll_weight: 0.0  # VAPO: 0.1
   metrics_level: "full"
   enable_torch_compile: false
+  # Score centering (https://arxiv.org/abs/2609.20807); needs policy.generation.top_logprobs > 0.
+  score_centering: false
 
 value_loss_fn:
   scale: 0.4
@@ -158,6 +160,10 @@ policy:
   megatron_cfg:
     enabled: false
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
     # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
@@ -284,11 +290,14 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    top_logprobs: 0  # Sampler candidates per token for score centering; 0 disables collection.
     val_temperature: ${.temperature}
     val_top_p: ${.top_p}
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
+    # LoRA refit representation for vLLM. Use merged only as an explicit opt-in.
+    lora_refit_mode: native
     mcore_generation_config:
       buffer_size_gb: 20
       cuda_graph_sizing_distribution: hybrid
@@ -326,6 +335,8 @@ policy:
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
+      flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
+      output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
     vllm_kwargs: {}
     colocated:
       enabled: true
@@ -381,6 +392,10 @@ value:
   megatron_cfg:
     enabled: false
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
     # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
@@ -523,6 +538,7 @@ env:
 logger:
   log_dir: "logs"
   num_val_samples_to_print: 0
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false
