@@ -543,7 +543,9 @@ class TrtllmAsyncGenerationWorkerImpl:
                 print("Error: TRT-LLM weight update returned no worker results.")
                 return False
             failed_workers = [
-                (rank, result) for rank, result in enumerate(results) if not result
+                (rank, result)
+                for rank, result in enumerate(results)
+                if result is not True
             ]
             if failed_workers:
                 print(
@@ -569,7 +571,9 @@ class TrtllmAsyncGenerationWorkerImpl:
                 print("Error: TRT-LLM IPC weight update returned no worker results.")
                 return False
             failed_workers = [
-                (rank, result) for rank, result in enumerate(results) if not result
+                (rank, result)
+                for rank, result in enumerate(results)
+                if result is not True
             ]
             if failed_workers:
                 print(

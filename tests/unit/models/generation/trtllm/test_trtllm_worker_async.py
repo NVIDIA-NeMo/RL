@@ -230,10 +230,20 @@ async def test_async_lifecycle_resets_cache_before_sleep_and_resumes_selected_ta
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "result",
-    [[True], [], [False], [True, False], [True, True]],
+    ("result", "expected"),
+    [
+        ([True], True),
+        ([True, True], True),
+        ([True, 1], False),
+        ([], False),
+        ([False], False),
+        ([True, False], False),
+        ([True, None], False),
+    ],
 )
-async def test_async_collective_refit_propagates_every_worker_result(result):
+async def test_async_collective_refit_propagates_worker_result(
+    result: list[bool | int | None], expected: bool
+) -> None:
     worker = _worker()
     worker.llm.collective_rpc.return_value = result
 
@@ -242,7 +252,7 @@ async def test_async_collective_refit_propagates_every_worker_result(result):
         recompute_kv=True,
     )
 
-    assert succeeded is (bool(result) and all(result))
+    assert succeeded is expected
     worker.llm.collective_rpc.assert_awaited_once_with(
         "update_weights_from_collective",
         kwargs={"drain": False, "recompute_kv": True},
@@ -250,7 +260,32 @@ async def test_async_collective_refit_propagates_every_worker_result(result):
 
 
 @pytest.mark.asyncio
-async def test_async_refit_surfaces_worker_exception():
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ([True], True),
+        ([True, True], True),
+        ([True, 1], False),
+        ([], False),
+        ([False], False),
+        ([True, False], False),
+        ([True, None], False),
+    ],
+)
+async def test_async_ipc_refit_propagates_every_worker_result(
+    result: list[bool | int | None], expected: bool
+) -> None:
+    worker = _worker()
+    worker.llm.collective_rpc.return_value = result
+
+    succeeded = await worker.update_weights_via_ipc_zmq_async()
+
+    assert succeeded is expected
+    worker.llm.collective_rpc.assert_awaited_once_with("update_weights_via_ipc_zmq")
+
+
+@pytest.mark.asyncio
+async def test_async_refit_surfaces_worker_exception() -> None:
     worker = _worker()
     worker.llm.collective_rpc.side_effect = RuntimeError("worker is poisoned")
 
