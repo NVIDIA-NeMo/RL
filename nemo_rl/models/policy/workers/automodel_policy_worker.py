@@ -70,6 +70,7 @@ from nemo_rl.models.automodel.train import (
 from nemo_rl.models.automodel.utils import release_moe_dispatcher_state
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.deferred import attach_deferred_topk_logits
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -621,6 +622,7 @@ class AutomodelPolicyWorkerImpl(
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
+        deferred_topk_logits: Optional[dict[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         self.timer.start("train")
@@ -628,6 +630,7 @@ class AutomodelPolicyWorkerImpl(
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
             mbs = self.cfg["train_micro_batch_size"]
+        attach_deferred_topk_logits(data, deferred_topk_logits)
         local_gbs = gbs // self.dp_size
         total_dataset_size = torch.tensor(data.size, device="cuda")
         torch.distributed.all_reduce(
