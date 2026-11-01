@@ -23,14 +23,45 @@ from pathlib import Path
 
 import pytest
 import torch
+from omegaconf import OmegaConf
+
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 pytest.importorskip("nemo_automodel")
 pytestmark = pytest.mark.automodel
 
 
+@pytest.fixture
+def tiny_moe_model_path(tiny_llama_model_path, tmp_path):
+    """Native MoE with real expert dispatch; reuse the existing test tokenizer."""
+    from transformers import AutoTokenizer, Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+    tokenizer = AutoTokenizer.from_pretrained(tiny_llama_model_path)
+    config = Qwen3MoeConfig(
+        vocab_size=len(tokenizer),
+        hidden_size=256,
+        intermediate_size=512,
+        moe_intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        num_experts=4,
+        num_experts_per_tok=2,
+        router_aux_loss_coef=0.0,
+        tie_word_embeddings=False,
+    )
+    model = Qwen3MoeForCausalLM(config)
+    path = tmp_path / "tiny_moe"
+    model.save_pretrained(path)
+    tokenizer.save_pretrained(path)
+    return path
+
+
 @pytest.mark.hf_gated
 @pytest.mark.timeout(660)
-def test_full_batch_split_parity(tiny_llama_model_path, tmp_path):
+@pytest.mark.parametrize("expert_parallel_size", [1, 2])
+def test_full_batch_split_parity(request, expert_parallel_size, tmp_path):
     """Exercise real FSDP gradients, updates, metadata fetch, and abort on two ranks.
 
     Reuse the standalone numerical harness so CI and larger model qualification
@@ -41,6 +72,25 @@ def test_full_batch_split_parity(tiny_llama_model_path, tmp_path):
     if torch.cuda.device_count() < 2:
         pytest.skip("Requires two CUDA GPUs")
     root = Path(__file__).resolve().parents[4]
+    model_path = request.getfixturevalue(
+        "tiny_llama_model_path" if expert_parallel_size == 1 else "tiny_moe_model_path"
+    )
+    register_omegaconf_resolvers()
+    config = load_config("examples/configs/grpo_math_1B.yaml")
+    config.policy.automodel_cfg.expert_parallel_size = expert_parallel_size
+    if expert_parallel_size > 1:
+        config.policy.automodel_cfg.automodel_kwargs.backend = {
+            "_target_": "nemo_automodel.components.models.common.utils.BackendConfig",
+            "attn": "te",
+            "linear": "te",
+            "rms_norm": "te",
+            "experts": "gmm",
+            "dispatcher": "hybridep",
+            "rope_fusion": False,
+            "enable_hf_state_dict_adapter": True,
+        }
+    recipe = tmp_path / "recipe.yaml"
+    OmegaConf.save(config, recipe)
     env = os.environ.copy()
     env.update(
         CUBLAS_WORKSPACE_CONFIG=":4096:8",
@@ -54,10 +104,9 @@ def test_full_batch_split_parity(tiny_llama_model_path, tmp_path):
         "--nproc-per-node=2",
         str(root / "tests/functional/automodel_sc_full_batch_parity.py"),
         "--model",
-        str(tiny_llama_model_path),
-        "--force-hf",
+        str(model_path),
         "--recipe",
-        "examples/configs/grpo_math_1B.yaml",
+        str(recipe),
         "--strict-determinism",
         "--rtol",
         "0",
@@ -68,6 +117,8 @@ def test_full_batch_split_parity(tiny_llama_model_path, tmp_path):
         "--source-sha",
         "pytest",
     ]
+    if expert_parallel_size == 1:
+        command.append("--force-hf")
     # Kill the entire torchrun group on timeout, including its CUDA workers.
     log_path = tmp_path / "torchrun.log"
     with log_path.open("w") as log:
