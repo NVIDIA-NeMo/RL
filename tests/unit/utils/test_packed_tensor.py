@@ -236,9 +236,11 @@ def test_packed_broadcast_producer_consumer_roundtrip(
             for name, tensor in result:
                 unpacked_tensors[name] = tensor
 
-        # Target is 2000 B; the two 2400 B tensors are isolated in their own
-        # batches: [800+40], [2400], [80], [2400], [2+80].
-        assert consumer_group.current_index == 5
+        # Readiness token, then the payload batches. Target is 2000 B. The two
+        # 2400 B tensors are isolated in their own batches:
+        # [800+40], [2400], [80], [2400], [2+80].
+        assert consumer_group.current_index == 6
+        assert producer_group.broadcasted_tensors[0].item() == 0
 
     # Verify all parameters were unpacked
     assert len(unpacked_tensors) == len(params)
@@ -278,12 +280,13 @@ def test_packed_broadcast_single_large_tensor():
         )
 
     # Should still broadcast the tensor
-    assert mock_group.broadcast_count == 1
-    assert len(mock_group.broadcasted_tensors) == 1
+    assert mock_group.broadcast_count == 2
+    assert len(mock_group.broadcasted_tensors) == 2
+    assert mock_group.broadcasted_tensors[0].item() == 0
 
     # Verify the size matches the large tensor
     expected_size = large_tensor.numel() * large_tensor.element_size()
-    assert mock_group.broadcasted_tensors[0].numel() == expected_size
+    assert mock_group.broadcasted_tensors[1].numel() == expected_size
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -320,7 +323,8 @@ def test_packed_broadcast_isolates_large_tensor_after_small_tensor():
             post_unpack_func=post_unpack_func,
         )
 
-    assert [tensor.numel() for tensor in producer_group.broadcasted_tensors] == [
+    # Skip the readiness token at index 0.
+    assert [tensor.numel() for tensor in producer_group.broadcasted_tensors[1:]] == [
         params[0][1].nbytes,
         params[1][1].nbytes,
     ]
@@ -346,6 +350,7 @@ def test_packed_broadcast_legacy_packing_keeps_oversized_tensor_in_prefix_buffer
             src=0,
             post_iter_func=lambda x: x[1],
             use_legacy_packing=True,
+            preflight_checked=True,
         )
 
     assert [t.numel() for t in group.broadcasted_tensors] == [
@@ -380,9 +385,147 @@ def test_packed_broadcast_multiple_batches():
     assert mock_group.broadcast_count > 1
 
     # Total size should match sum of all tensors
-    total_broadcasted_size = sum(t.numel() for t in mock_group.broadcasted_tensors)
+    assert mock_group.broadcasted_tensors[0].item() == 0
+    total_broadcasted_size = sum(t.numel() for t in mock_group.broadcasted_tensors[1:])
     expected_total_size = sum(t.numel() * t.element_size() for _, t in params)
     assert total_broadcasted_size == expected_total_size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_preflight_failure_stops_before_payload():
+    producer_group = MockCommunicationGroup()
+    iterator_was_consumed = False
+
+    def params():
+        nonlocal iterator_was_consumed
+        iterator_was_consumed = True
+        yield "weight", torch.ones(1, device="cuda")
+
+    with pytest.raises(RuntimeError, match="injected producer preflight failure"):
+        packed_broadcast_producer(
+            iterator=params(),
+            group=producer_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+            preflight_error=RuntimeError("injected producer preflight failure"),
+        )
+
+    assert not iterator_was_consumed
+    assert producer_group.broadcast_count == 1
+    assert producer_group.broadcasted_tensors[0].item() == 1
+
+    consumer_group = MockConsumerCommunicationGroup(producer_group.broadcasted_tensors)
+    with pytest.raises(RuntimeError, match="producer preflight failed"):
+        packed_broadcast_consumer(
+            iterator=iter([("weight", ((1,), torch.float32))]),
+            group=consumer_group,
+            src=0,
+            post_unpack_func=lambda _tensors: pytest.fail(
+                "consumer loaded payload after failed preflight"
+            ),
+        )
+    assert consumer_group.current_index == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_preflight_checked_skips_readiness_token():
+    params = [
+        ("layer1.weight", torch.randn(4, 4, device="cuda")),
+        ("layer1.bias", torch.randn(4, device="cuda")),
+    ]
+
+    default_group = MockCommunicationGroup()
+    packed_broadcast_producer(
+        iterator=iter(params),
+        group=default_group,
+        src=0,
+        post_iter_func=lambda x: x[1],
+    )
+
+    checked_group = MockCommunicationGroup()
+    packed_broadcast_producer(
+        iterator=iter(params),
+        group=checked_group,
+        src=0,
+        post_iter_func=lambda x: x[1],
+        preflight_checked=True,
+    )
+
+    # The caller already sent the token, so a second one would shift every frame.
+    assert checked_group.broadcast_count == default_group.broadcast_count - 1
+    assert all(t.dtype == torch.uint8 for t in checked_group.broadcasted_tensors)
+
+    consumer_group = MockConsumerCommunicationGroup(checked_group.broadcasted_tensors)
+    unpacked = {}
+    packed_broadcast_consumer(
+        iterator=iter(create_mock_state_dict_info(params).items()),
+        group=consumer_group,
+        src=0,
+        post_unpack_func=lambda batch: unpacked.update(batch),
+        preflight_checked=True,
+    )
+    assert consumer_group.current_index == checked_group.broadcast_count
+    for name, tensor in params:
+        assert torch.equal(unpacked[name], tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    ("producer_checked", "consumer_checked"), [(True, False), (False, True)]
+)
+def test_packed_broadcast_preflight_checked_mismatch_is_detected(
+    producer_checked, consumer_checked
+):
+    params = [
+        ("layer1.weight", torch.randn(4, 4, device="cuda")),
+        ("layer1.bias", torch.randn(4, device="cuda")),
+    ]
+    producer_group = MockCommunicationGroup()
+    packed_broadcast_producer(
+        iterator=iter(params),
+        group=producer_group,
+        src=0,
+        post_iter_func=lambda x: x[1],
+        preflight_checked=producer_checked,
+    )
+
+    consumer_group = MockConsumerCommunicationGroup(producer_group.broadcasted_tensors)
+    unpacked = {}
+
+    def consume():
+        packed_broadcast_consumer(
+            iterator=iter(create_mock_state_dict_info(params).items()),
+            group=consumer_group,
+            src=0,
+            post_unpack_func=lambda batch: unpacked.update(batch),
+            preflight_checked=consumer_checked,
+        )
+
+    if producer_checked:
+        # The consumer reads the first payload buffer as the readiness token.
+        with pytest.raises(RuntimeError):
+            consume()
+        return
+
+    # The consumer reads the token as payload and leaves the last frame unread.
+    consume()
+    assert consumer_group.current_index < producer_group.broadcast_count
+    assert not all(torch.equal(unpacked[name], tensor) for name, tensor in params)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_preflight_checked_error_raises_without_broadcast():
+    group = MockCommunicationGroup()
+    with pytest.raises(RuntimeError, match="^local draft export failed$"):
+        packed_broadcast_producer(
+            iterator=iter([("weight", torch.ones(1, device="cuda"))]),
+            group=group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+            preflight_error=ValueError("local draft export failed"),
+            preflight_checked=True,
+        )
+    assert group.broadcast_count == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -437,6 +580,9 @@ def test_packed_broadcast_producer_carries_export_dependency_across_streams(
             src=0,
             post_iter_func=lambda x: x[1],
             num_buffers=2,
+            # The readiness token goes out on the default stream. Skip it so
+            # only payload broadcasts are checked.
+            preflight_checked=True,
         )
 
     broadcasts = [i for i, e in enumerate(events) if e[0] == "broadcast"]
