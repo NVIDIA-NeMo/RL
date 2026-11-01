@@ -107,7 +107,11 @@ class TestGetValuesPresharded:
 def _make_tq_value() -> tuple[TQValue, MagicMock]:
     """Bare TQValue with the attributes the fan-out touches."""
     v = object.__new__(TQValue)
-    v.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
+    v.cfg = {
+        "train_global_batch_size": 8,
+        "train_micro_batch_size": 2,
+        "make_sequence_length_divisible_by": 1,
+    }
     wg = MagicMock()
     v.worker_group = wg
     v.sharding_annotations = MagicMock()

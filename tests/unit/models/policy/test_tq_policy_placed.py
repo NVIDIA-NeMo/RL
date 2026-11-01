@@ -40,7 +40,11 @@ def _meta(rank: int, fields: list[str]) -> KVBatchMeta:
 
 def _policy() -> tuple[TQPolicy, MagicMock]:
     policy = object.__new__(TQPolicy)
-    policy.cfg = {"train_global_batch_size": 4, "train_micro_batch_size": 1}
+    policy.cfg = {
+        "train_global_batch_size": 4,
+        "train_micro_batch_size": 1,
+        "make_sequence_length_divisible_by": 1,
+    }
     policy._router_replay_enabled = False
     policy._opd_full_field = None  # opd_full off, as __init__ leaves it
     policy.flops_tracker = None
@@ -94,6 +98,26 @@ def test_train_placed_microbatches_requires_one_batch_per_dp_rank() -> None:
         policy.train_placed_microbatches([_meta(0, ["input_ids"])])
 
     worker_group.run_all_workers_sharded_data.assert_not_called()
+
+
+@pytest.mark.parametrize("producer_multiple,expected_length", [(1, 2368), (96, 2496)])
+def test_placed_metadata_honors_model_and_producer_alignment(
+    producer_multiple, expected_length
+) -> None:
+    policy, worker_group = _policy()
+    policy.cfg["make_sequence_length_divisible_by"] = 64
+    dp_metas = [_meta(0, ["input_ids"]), _meta(1, ["input_ids"])]
+    for meta in dp_metas:
+        meta.sequence_lengths = [2200, 2336]
+        meta.extra_info["pad_to_multiple"] = producer_multiple
+        meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = 4096
+    policy.train_placed_microbatches(dp_metas)
+    dispatched = worker_group.run_all_workers_sharded_data.call_args.kwargs["meta"]
+    assert [meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] for meta in dispatched] == [
+        expected_length,
+        expected_length,
+    ]
+    assert all(meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == 4096 for meta in dp_metas)
 
 
 def test_train_placed_microbatches_rejects_dynamic_batching() -> None:
