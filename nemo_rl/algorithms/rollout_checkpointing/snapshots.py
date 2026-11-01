@@ -249,15 +249,6 @@ class RolloutSnapshotter(_UsesRolloutParts):
         if self._environment_checkpoint.holds_rollout_state:
             self._wakeup.set()
 
-    async def _call_dp(self, method_name: str, **kwargs: Any) -> Any:
-        """Call a DataPlaneClient method or a Ray actor exposing that method."""
-        return await call_data_plane(
-            self._dp_client,
-            method_name,
-            offload_sync=True,
-            **kwargs,
-        )
-
     async def _save_data_plane_checkpoint(
         self,
         checkpoint_path: PathLike,
