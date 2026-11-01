@@ -2866,7 +2866,6 @@ def test_full_logits_ipc_uses_valid_prefix_slab_and_preserves_logical_indices(
             wrapped = kwargs["post_processing_fn"](
                 data_dict=processed_mb.data_dict,
                 cu_seqlens_padded=processed_mb.cu_seqlens_padded,
-                packed_seq_params=processed_mb.packed_seq_params,
             )
             _, output = wrapped(output_tensor)
             outputs.append(output)
@@ -3023,7 +3022,6 @@ def test_full_logits_ipc_releases_and_grows_slab_before_forward(monkeypatch):
         wrapped = kwargs["post_processing_fn"](
             data_dict=processed_mb.data_dict,
             cu_seqlens_padded=processed_mb.cu_seqlens_padded,
-            packed_seq_params=processed_mb.packed_seq_params,
         )
         _, output = wrapped(torch.ones(1, sum(input_lengths), 2))
         return [output]

@@ -2905,6 +2905,41 @@ def test_pack_sequences_with_context_parallel(pack_sequences_setup):
 
 
 @pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("pad_individual", "expected_padded"),
+    [(1, [0, 5, 12, 16]), (2, [0, 6, 14, 18])],
+    ids=["no_filler", "filler"],
+)
+def test_pack_sequences_note_shares_one_boundary_tensor(
+    pad_individual, expected_padded
+):
+    """Every PackedSeqParams boundary field is the same padded tensor object.
+
+    TE treats a THD batch as having no inter-sequence padding only when the
+    padded and unpadded fields are the same object, which keeps FlashAttention
+    eligible. The raw boundaries are still returned separately.
+    """
+    from nemo_rl.models.megatron.data import _pack_sequences_for_megatron
+
+    lengths = (5, 7, 4)
+    input_ids = torch.ones(len(lengths), max(lengths), dtype=torch.long)
+    _, _, packed_seq_params, cu_seqlens, cu_seqlens_padded = (
+        _pack_sequences_for_megatron(
+            input_ids, lengths, pad_individual_seqs_to_multiple_of=pad_individual
+        )
+    )
+
+    assert cu_seqlens.tolist() == [0, 5, 12, 16]
+    assert cu_seqlens_padded.tolist() == expected_padded
+    # Left unset so TE infers the flag from the boundary objects.
+    assert packed_seq_params.pad_between_seqs is None
+    assert packed_seq_params.cu_seqlens_q is cu_seqlens_padded
+    assert packed_seq_params.cu_seqlens_kv is cu_seqlens_padded
+    assert packed_seq_params.cu_seqlens_q_padded is cu_seqlens_padded
+    assert packed_seq_params.cu_seqlens_kv_padded is cu_seqlens_padded
+
+
+@pytest.mark.mcore
 @pytest.mark.parametrize("cp_size", [1, 2], ids=["cp1", "cp2"])
 def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
     """_shard_routed_experts_for_cp selects the SAME tokens as the input_ids zigzag.
@@ -2956,13 +2991,13 @@ def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
         cp_size=cp_size,
     )
 
-    # Raw boundaries drive logical sequence semantics (e.g. MTP and packed
-    # loss slicing); padded boundaries drive THD/CP physical placement.
+    # Raw boundaries are returned separately; every PackedSeqParams boundary
+    # field is the one padded tensor that drives THD/CP physical placement.
     assert not torch.equal(cu_seqlens, cu_seqlens_padded)
-    assert torch.equal(packed_seq_params.cu_seqlens_q, cu_seqlens)
-    assert torch.equal(packed_seq_params.cu_seqlens_kv, cu_seqlens)
-    assert torch.equal(packed_seq_params.cu_seqlens_q_padded, cu_seqlens_padded)
-    assert torch.equal(packed_seq_params.cu_seqlens_kv_padded, cu_seqlens_padded)
+    assert packed_seq_params.cu_seqlens_q is cu_seqlens_padded
+    assert packed_seq_params.cu_seqlens_kv is cu_seqlens_padded
+    assert packed_seq_params.cu_seqlens_q_padded is cu_seqlens_padded
+    assert packed_seq_params.cu_seqlens_kv_padded is cu_seqlens_padded
 
     (
         routed_packed,
@@ -3100,7 +3135,14 @@ def test_process_microbatch_validates_and_materializes_lockstep_geometry():
         )
 
     assert processed.input_ids.shape == (1, 12)
-    assert processed.packed_seq_params.cu_seqlens_q.tolist() == [0, 3, 5]
+    assert (
+        processed.packed_seq_params.cu_seqlens_q
+        is processed.packed_seq_params.cu_seqlens_q_padded
+    )
+    assert (
+        processed.packed_seq_params.cu_seqlens_kv
+        is processed.packed_seq_params.cu_seqlens_kv_padded
+    )
     assert processed.packed_seq_params.cu_seqlens_q_padded.tolist() == [0, 4, 12]
     assert processed.padding_mask.tolist() == [
         [False, False, False, True, True, True, True, True, True, True, True, True]
