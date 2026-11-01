@@ -1178,6 +1178,13 @@ class AsyncNemoGymRolloutImpl:
                 # derives the id from the run body and stamps /ng-rollout/<id>
                 # on every model call, so the TQ sample id IS the capture key.
                 row["_ng_rollout_id"] = rollout_ids[i]
+            elif "_ng_rollout_id" not in row:
+                # Without the ledger the agent still needs a per-rollout id: Gym-side
+                # token capture (env.nemo_gym.token_id_capture) keys its store by it,
+                # and cookie-less harnesses (Claude Code) are pinned to one engine by
+                # it. The legacy batch path stamps "<group>-<generation>" the same way
+                # (rollouts.py); the attempt keeps a redispatched group's ids distinct.
+                row["_ng_rollout_id"] = f"{group_id}-{group_attempt}-{i}"
             rows.append(row)
         return rows
 
