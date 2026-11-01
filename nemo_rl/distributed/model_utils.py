@@ -298,7 +298,6 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         chunk_size = ctx.chunk_size
         tp_group = ctx.tp_group
 
-        partition_vocab_size = int(vocab_parallel_logits.shape[-1])
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
@@ -308,31 +307,36 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             chunk_start = chunk_idx * chunk_size
             chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
 
-            logits = vocab_parallel_logits[:, chunk_start:chunk_end, :]
-            logits = logits.to(dtype=torch.float32)
-
-            softmax_output = _compute_distributed_log_softmax(
-                logits,
-                group=tp_group,
+            # Own one fp32 buffer even when the saved logits are already fp32.
+            # Reuse it for normalization and gradients; never mutate saved logits.
+            softmax_output = vocab_parallel_logits[:, chunk_start:chunk_end, :].to(
+                dtype=torch.float32, copy=True
             )
-            softmax_output = softmax_output.exp()
-
-            # 1 if it's the chosen log prob, 0 otherwise
-            is_chosen = (~(target_mask[:, chunk_start:chunk_end])).unsqueeze(
-                -1
-            ) * torch.nn.functional.one_hot(
-                masked_target[:, chunk_start:chunk_end],
-                num_classes=partition_vocab_size,
+            logits_max = softmax_output.amax(dim=-1, keepdim=True)
+            torch.distributed.all_reduce(
+                logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
             )
-
-            chunk_grad_fp32 = is_chosen.float().sub_(softmax_output)
-            chunk_grad_fp32.mul_(
-                grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1)
+            softmax_output.sub_(logits_max).exp_()
+            sum_exp_logits = softmax_output.sum(dim=-1, keepdim=True)
+            torch.distributed.all_reduce(
+                sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
             )
-            grad_input[:, chunk_start:chunk_end, :].copy_(chunk_grad_fp32)
+            softmax_output.div_(sum_exp_logits).neg_()
 
-            # Explicitly free before next iteration allocates
-            del softmax_output, is_chosen, logits, chunk_grad_fp32
+            # Add the chosen-token term directly, avoiding an int64 [B, S, V]
+            # one-hot allocation and a second full-vocabulary gradient buffer.
+            softmax_output.scatter_add_(
+                -1,
+                masked_target[:, chunk_start:chunk_end].unsqueeze(-1),
+                (~target_mask[:, chunk_start:chunk_end])
+                .unsqueeze(-1)
+                .to(dtype=softmax_output.dtype),
+            )
+            softmax_output.mul_(grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1))
+            grad_input[:, chunk_start:chunk_end, :].copy_(softmax_output)
+
+            # Explicitly free before next iteration allocates.
+            del softmax_output, logits_max, sum_exp_logits
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
