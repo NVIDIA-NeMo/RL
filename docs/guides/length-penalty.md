@@ -578,8 +578,12 @@ Semantics:
   global `reasoning`/`answer` blocks if those are configured).
 - The global band also feeds profile-gated group-relative penalties
   (`group_length_penalty_profile_gate`) when rows lack metadata.
-- A malformed channel block (missing `a`/`b`/`f`, `b <= a`, or `f` outside `[0, 1]`) is a
-  config error and is rejected when the config is loaded.
+- Global channel blocks require finite `a`, `b`, and `f`, with `b > a` and `f` in
+  `[0, 1]`; malformed blocks are rejected when the config is loaded.
+- Per-row channel blocks follow the same numeric bounds. Missing, nonnumeric,
+  boolean, or nonfinite fields, `b <= a`, and `f` outside `[0, 1]` disable that row's
+  channel multiplier (a no-op), so malformed metadata cannot introduce
+  nonfinite or out-of-range multipliers.
 
 ### 7. Profile-Gated Group Relative-Length Scaling
 
