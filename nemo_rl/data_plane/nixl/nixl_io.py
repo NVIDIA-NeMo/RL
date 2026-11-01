@@ -41,7 +41,6 @@ from nemo_rl.utils.checkpoint_engines.nixl import (
     _create_nixl_agent,
 )
 
-
 log = logging.getLogger(__name__)
 
 # UCX transport names that carry bytes off the host over RDMA verbs.
@@ -284,7 +283,7 @@ class NixlEndpoint:
             for (_, a), (_, b) in zip(local, remote):
                 if a != b:
                     raise ValueError("descriptor lengths differ")
-        errs: list[TransferError | None] = [None] * len(ops)
+        errs: list[TransferError | None] = [None for _ in ops]
         live: dict[int, tuple[Any, Any, Any]] = {}  # op index -> (h, ldesc, rdesc)
         try:
             for i, (op, local, remote, remote_agent) in enumerate(ops):

@@ -22,6 +22,7 @@ one-sided RDMA over UCX, with an optional SSD tier on each unit.
 
 from __future__ import annotations
 
+import contextlib
 import time
 import uuid
 from typing import Any
@@ -105,10 +106,14 @@ class UnitSlabStore:
         namespace: str,
         timeout_s: float,
         ssd: bool = False,
+        lock: Any = None,
     ) -> None:
         self.ep = ep
         # SSD tier on the units: a put that RAM cannot take spills to disk.
         self.ssd = ssd
+        # The caller's lock (TimedLock), released while a put sleeps on Busy or
+        # a pending commit, so the process's other ops do not wait on a disk write.
+        self.idle = lock.released if lock is not None else contextlib.nullcontext
         self.directory = directory
         self.namespace = namespace
         self.timeout_s = timeout_s
@@ -159,7 +164,7 @@ class UnitSlabStore:
         unit_id: int,
         blob_id: str | None = None,
         deadline: float | None = None,
-    ) -> str:
+    ) -> str:  # pyrefly: ignore[bad-return]  the retry loop only returns or raises
         """Write one blob of ``nbytes`` to unit ``unit_id``; return its id.
 
         ``segments`` are ``(local_addr, blob_off, n)``: a value sent zero-copy
@@ -238,7 +243,8 @@ class UnitSlabStore:
                     continue
                 return blob_id
             if any(isinstance(e, DataPlaneBusy) for e in errs):
-                backoff = busy_wait(deadline, backoff)
+                with self.idle():  # nothing is posted
+                    backoff = busy_wait(deadline, backoff)
                 continue
             if not refreshed:
                 self._refresh_units()  # the unit's address may have changed; one retry
@@ -279,7 +285,8 @@ class UnitSlabStore:
                     continue  # no reply: ask again until the deadline
                 if status != "pending":
                     break
-                backoff = busy_wait(deadline, backoff)
+                with self.idle():  # the WRITE is done
+                    backoff = busy_wait(deadline, backoff)
             ok = status == "done"
             if not ok:
                 errs.append(TransferError(f"unit {u['unit_id']} lost the blob"))
@@ -289,6 +296,94 @@ class UnitSlabStore:
             if not ok:  # every failure, including a deadline: free the region
                 self.ctl.notify(u["zmq"], "abort", blob_id=blob_id, in_flight=False)
         return bool(ok)
+
+    def put_many(
+        self,
+        blobs: list[tuple[list[tuple[int, int, int]], int, int, int, str]],
+        deadline: float | None = None,
+    ) -> None:
+        """``put_segments`` for several ``(segments, nbytes, n_entries, unit_id, blob_id)``.
+
+        The first blob of each unit goes out in one round over all units (alloc,
+        one WRITE batch, commit), so a put waits for the slowest unit, not the
+        sum. A blob that does not finish that round (busy, full, spill, no reply,
+        lost) and any further blob of a unit take ``put_segments``, one by one.
+        """
+        first = {b[3]: b for b in reversed(blobs)}
+        done = self._put_round(first, deadline) if len(first) > 1 else set()
+        for segments, nbytes, n_entries, unit_id, blob_id in blobs:
+            if blob_id not in done:
+                self.put_segments(
+                    segments, nbytes, n_entries, unit_id, blob_id, deadline
+                )
+
+    def _put_round(self, by_unit: dict[int, tuple], deadline: float | None) -> set[str]:
+        """One alloc / WRITE / commit round, one blob per unit; the blob ids committed."""
+        offs, failed = self._call_units(
+            "alloc",
+            {
+                u: {
+                    "blob_id": b[4],
+                    "nbytes": int(b[1]),
+                    "n_entries": int(b[2]),
+                    "spill": not self.ssd,
+                }  # with the SSD tier, RAM first
+                for u, b in by_unit.items()
+            },
+            deadline,
+        )
+
+        def abort(u: int, in_flight: bool = False) -> None:
+            self.ctl.notify(
+                self._addr(u), "abort", blob_id=by_unit[u][4], in_flight=in_flight
+            )
+
+        for u, e in failed:
+            if isinstance(e, TransferError):  # no reply: the unit may still allocate
+                abort(u)
+        ops, infos = [], {}
+        for u, off in offs.items():
+            try:
+                infos[u] = info = self._unit(u)
+            except LostBlobs:  # NIXL cannot reach it: nothing was posted
+                abort(u)
+                continue
+            base, segs = int(info["slab_base"]) + off, by_unit[u][0]
+            remote = [(base + bo, n) for _, bo, n in segs]
+            ops.append(
+                ("WRITE", [(a, n) for a, _, n in segs], remote, info["agent_name"])
+            )
+        try:
+            left = remaining(deadline, self.timeout_s)
+        except DataPlaneTimeout:  # nothing was posted: free the regions at once
+            for u in infos:
+                abort(u)
+            raise
+        written = []
+        for u, e in zip(
+            infos, self.ep.transfer_many(ops, timeout_s=left) if ops else []
+        ):
+            if e is None:
+                written.append(u)
+            else:
+                abort(u, e.in_flight)
+        if not written:
+            return set()
+        try:
+            status, _ = self._call_units(
+                "commit", {u: {"blob_id": by_unit[u][4]} for u in written}, deadline
+            )
+        except BaseException:
+            for u in written:
+                abort(u)
+            raise
+        stored: set[str] = set()
+        for u in written:
+            blob_id = by_unit[u][4]
+            # Not "done" in the round (a spill still pending, no reply): commit's own polling.
+            if status.get(u) == "done" or self._commit(infos[u], blob_id, deadline, []):
+                stored.add(blob_id)
+        return stored
 
     def _failed(self, unit_id: int, blobs: list[str], e: Exception) -> Exception:
         """Classify a failed read: lost if the unit is dead, else retryable."""
@@ -330,24 +425,9 @@ class UnitSlabStore:
         resolved are unpinned before the error is raised (``blob_ids`` of the
         error are the keys).
         """
-        timeout_s = remaining(deadline, self.ctl.timeout_ms / 1000)
-        unit_of: dict[str, int] = {}
-        for u in by_unit:
-            try:
-                unit_of[self._addr(u)] = u
-            except LostBlobs as e:  # unknown to the directory: nothing pinned yet
-                raise self._failed(u, by_unit[u], e) from e
-        replies = self.ctl.call_many(
-            "resolve_keys",
-            {a: {"keys": by_unit[u]} for a, u in unit_of.items()},
-            timeout_s=timeout_s,
+        resolved, failed = self._call_units(
+            "resolve_keys", {u: {"keys": k} for u, k in by_unit.items()}, deadline
         )
-        resolved = {
-            unit_of[a]: r for a, r in replies.items() if not isinstance(r, Exception)
-        }
-        failed = [
-            (unit_of[a], r) for a, r in replies.items() if isinstance(r, Exception)
-        ]
         if failed:
             self.unpin_all(resolved)
             u, e = failed[0]
@@ -389,24 +469,46 @@ class UnitSlabStore:
     def release_rows(
         self, by_unit: dict[int, list[int]], deadline: float | None
     ) -> None:
-        """Awaited row-wide clear: one ``release_rows`` per unit.
+        """Awaited row-wide clear: one ``release_rows`` per unit, all units at once.
 
         Rows on a dead unit are already gone, so clearing them succeeds; a live
         unit that does not answer fails the clear (retryable).
         """
-        for u, gidxs in by_unit.items():
-            try:
-                self.ctl.call(
-                    self._addr(u),
-                    "release_rows",
-                    timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
-                    gidxs=gidxs,
-                )
-            except (TransferError, LostBlobs) as e:
-                err = self._failed(u, [str(g) for g in gidxs], e)
-                if isinstance(err, LostBlobs):
-                    continue
+        _, failed = self._call_units(
+            "release_rows", {u: {"gidxs": g} for u, g in by_unit.items()}, deadline
+        )
+        for u, e in failed:
+            if not isinstance(e, (TransferError, LostBlobs)):
+                raise e
+            err = self._failed(u, [str(g) for g in by_unit[u]], e)
+            if not isinstance(err, LostBlobs):
                 raise err from e
+
+    def _call_units(
+        self, op: str, args_by_unit: dict[int, dict[str, Any]], deadline: float | None
+    ) -> tuple[dict[int, Any], list[tuple[int, Exception]]]:
+        """``op`` on every unit at once: results by unit, and ``(unit, error)`` failures.
+
+        A unit unknown to the directory fails without being asked.
+        """
+        unit_of: dict[str, int] = {}
+        failed: list[tuple[int, Exception]] = []
+        for u in args_by_unit:
+            try:
+                unit_of[self._addr(u)] = u
+            except LostBlobs as e:
+                failed.append((u, e))
+        replies = self.ctl.call_many(
+            op,
+            {a: args_by_unit[u] for a, u in unit_of.items()},
+            timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
+        )
+        failed += [
+            (unit_of[a], r) for a, r in replies.items() if isinstance(r, Exception)
+        ]
+        return {
+            unit_of[a]: r for a, r in replies.items() if not isinstance(r, Exception)
+        }, failed
 
     def close(self) -> None:
         self.ctl.close()

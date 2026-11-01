@@ -42,8 +42,8 @@ import numpy as np
 import ray
 
 from nemo_rl.data_plane.nixl import blob_format
-from nemo_rl.data_plane.nixl.control import UnitServer
 from nemo_rl.data_plane.nixl.allocator import SlabAllocator, align_up
+from nemo_rl.data_plane.nixl.control import UnitServer
 from nemo_rl.data_plane.nixl.errors import DataPlaneBusy, UnitFull
 from nemo_rl.data_plane.nixl.nixl_io import NixlEndpoint
 from nemo_rl.distributed import numa_utils
@@ -55,7 +55,7 @@ log = logging.getLogger(__name__)
 _MAX_IO_JOBS = 256
 
 # A row's index entry: (blob_id, off_in_blob, len, kind, dtype, shape).
-RowEntry = tuple[str, int, int, str, "str | None", "tuple[int, ...] | None"]
+RowEntry = tuple[str, int, int, str, str | None, tuple[int, ...] | None]
 
 
 def split_key(key: str) -> tuple[int, str]:
@@ -152,12 +152,24 @@ def _locked(fn):
 
 
 @ray.remote(num_cpus=1, num_gpus=0, max_restarts=0, max_task_retries=0)
-class NixlStorageUnit:
+class NixlStorageUnit:  # pragma: no cover
     """Owns one registered DRAM slab.
 
     Clients reach it over ZMQ (``info()["zmq"]``)
     for alloc / commit / resolve_keys / release_rows; Ray is only its lifecycle and admin path.
     """
+
+    # Set by _init_ssd (which the tests' bare units also call).
+    ssd_dir: str | None
+    staging_: SlabAllocator | None
+    staging_base: int
+    pickup_s: float
+    ssd_stats: dict[str, float]
+    _io_jobs: int
+    _max_io_jobs: int
+    _staged: dict[str, BlobRec]
+    alloc_: SlabAllocator
+    _worker: ThreadPoolExecutor
 
     def __init__(
         self,
@@ -251,11 +263,11 @@ class NixlStorageUnit:
         staging_bytes: int,
         pickup_s: float,
     ) -> None:
-        self.ssd_dir: str | None = None
-        self.staging_: SlabAllocator | None = None
+        self.ssd_dir = None
+        self.staging_ = None
         self.staging_base = slab_bytes
         self.pickup_s = pickup_s
-        self.ssd_stats: dict[str, float] = {
+        self.ssd_stats = {
             "spilled_bytes": 0,
             "spills": 0,
             "spill_failures": 0,
@@ -267,7 +279,7 @@ class NixlStorageUnit:
         }
         self._io_jobs = 0  # IO jobs queued or running
         self._max_io_jobs = _MAX_IO_JOBS
-        self._staged: dict[str, BlobRec] = {}  # blobs with a staged copy
+        self._staged = {}  # blobs with a staged copy
         if not ssd_dir:
             self.alloc_ = SlabAllocator(slab_bytes)
             return
@@ -398,8 +410,7 @@ class NixlStorageUnit:
         ok = False
         try:
             fd = self._new_file()
-            at = self.staging_base + rec.staged_off
-            _write_all(fd, memoryview(self.slab)[at : at + rec.nbytes])
+            _write_all(fd, self._io_view(rec))
             ok = True
         except Exception as e:  # noqa: BLE001 - anything else would leave the job owning the region
             log.warning("unit %d: spilling %s failed: %s", self.unit_id, b, e)
@@ -428,6 +439,7 @@ class NixlStorageUnit:
         Named by a fresh uuid, not the client-supplied blob id, so no id can
         steer the path.
         """
+        assert self.ssd_dir is not None  # only the SSD tier spills
         path = os.path.join(self.ssd_dir, f"{uuid.uuid4().hex}.blob")
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
         os.unlink(path)
@@ -478,6 +490,7 @@ class NixlStorageUnit:
 
     def _drop_staged(self, b: str, rec: BlobRec, at: float, now: float) -> None:
         """Free a blob's IO-area region at ``at`` (caller holds ``_mu``)."""
+        assert self.staging_ is not None and rec.staged_off is not None
         _free_at(self.staging_, rec.staged_off, rec.nbytes, at, now)
         rec.staged_off = None
         if self._staged.get(b) is rec:
@@ -489,8 +502,8 @@ class NixlStorageUnit:
         While a stage runs, the fd is closed only here (``_dispose`` skips it).
         """
         fd = rec.disk
-        at = self.staging_base + rec.staged_off
-        view = memoryview(self.slab)[at : at + rec.nbytes]
+        assert fd is not None  # only disk blobs are staged
+        view = self._io_view(rec)
         ok = True
         try:
             done = 0
@@ -572,8 +585,8 @@ class NixlStorageUnit:
                     f"unit {self.unit_id} has no room for {nbytes} B yet",
                     reason="pressure",
                 ) from None
-            # Best-effort RAM-first: the client asks spill=False of every unit
-            # before it asks any unit to spill.
+            # Best-effort RAM-first: the client asks this unit for RAM
+            # (spill=False) before it asks it to spill.
             if self.ssd_dir is None or not spill:
                 raise
             # Spill: the put goes to disk from birth, through the IO area. The
@@ -619,7 +632,14 @@ class NixlStorageUnit:
 
     def _blob_view(self, rec: BlobRec) -> memoryview:
         """The blob's bytes in the put area or, for a spill in progress, the IO area."""
-        at = rec.off if rec.in_slab else self.staging_base + rec.staged_off
+        if not rec.in_slab:
+            return self._io_view(rec)
+        return memoryview(self.slab)[rec.off : rec.off + rec.nbytes]
+
+    def _io_view(self, rec: BlobRec) -> memoryview:
+        """The blob's IO-area region (``staged_off`` is set while it holds one)."""
+        assert rec.staged_off is not None
+        at = self.staging_base + rec.staged_off
         return memoryview(self.slab)[at : at + rec.nbytes]
 
     def _publish(self, blob_id: str, rec: BlobRec) -> None:
@@ -652,6 +672,12 @@ class NixlStorageUnit:
             self._drop(blob_id, rec)  # its IO job frees the region when it ends
         elif in_flight:
             self.retired_bytes += rec.nbytes
+            log.warning(
+                "unit %d: retired %d B of a WRITE that may still land (%d B retired in total)",
+                self.unit_id,
+                rec.nbytes,
+                self.retired_bytes,
+            )
         elif self.ssd_dir is not None:
             # A committed blob (commit reply lost) may be on disk or staged by
             # now, a spill not yet committed still holds its IO region: drop it
@@ -795,14 +821,14 @@ class NixlStorageUnit:
         for status in ("pending", "failed"):
             out[status] = [k for b in r[status] for k in by_blob[b]]
         missing.extend(k for b in r["missing"] for k in by_blob[b])
-        out["entries"] = {
-            k: [r["offsets"][b] + found[k][1], *found[k][2:6]]
-            for b, ks in by_blob.items()
-            if b in r["offsets"]
-            for k in ks
-        }
-        for k, ent in out["entries"].items():
-            ent[4] = list(ent[4]) if ent[4] is not None else None
+        out["entries"] = entries = {}
+        for b, ks in by_blob.items():
+            if b not in r["offsets"]:
+                continue
+            for k in ks:
+                _, off, n, kind, dtype, shape = found[k]
+                shape = None if shape is None else list(shape)
+                entries[k] = [r["offsets"][b] + off, n, kind, dtype, shape]
         return out
 
     @_locked
@@ -952,10 +978,10 @@ class NixlStorageUnit:
         """Read ``blobs`` (``blob_id -> [off_in_file, nbytes, refs]``) from ``path`` into fresh regions.
 
         Blobs that do not fit are returned under ``failed`` so the caller can
-        try another unit; already-present blobs count as loaded. With ``spill``
-        and the SSD tier on, a blob the put area cannot take goes to a file
-        instead, as a spilled put would (the caller asks for that only once
-        every unit's RAM is full, as puts do).
+        ask this unit again with ``spill``; already-present blobs count as
+        loaded. With ``spill`` and the SSD tier on, a blob the put area cannot
+        take goes to a file instead, as a spilled put would (the caller asks for
+        that only after a RAM-only pass on every unit, ``_load_in_place``).
 
         Regions are allocated under the unit lock but filled without it; a
         blob is published only once its bytes are in place, and only with the

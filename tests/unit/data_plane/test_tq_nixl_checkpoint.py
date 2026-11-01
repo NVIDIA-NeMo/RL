@@ -20,10 +20,9 @@ NeMo-RL's TransferQueue adapter drives them.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
-
-import json
 import uuid
 from pathlib import Path
 
@@ -33,8 +32,6 @@ import torch
 from tensordict import NonTensorStack, TensorDict
 
 from tests.unit.data_plane._nixl_helpers import dense, make_tq_conf
-
-pytestmark = pytest.mark.nixl
 
 REPO = Path(os.environ.get("NRL_NIXL_TEST_DIR", tempfile.gettempdir()))
 NS = "nvdp-ckpt"
@@ -85,6 +82,7 @@ def _check(tq, keys, expected: TensorDict):
     assert list(got["text"]) == list(expected["text"])
 
 
+@pytest.mark.nixl
 @pytest.mark.parametrize("restore_units", [3, 2], ids=["same_units", "fewer_units"])
 def test_save_on_3_restore(ray_cluster, tmp_path_factory, restore_units):
     """Same unit count restores each shard in place; a different count re-puts
@@ -198,6 +196,7 @@ def test_in_place_restore_sends_every_shard_before_waiting_then_spills(monkeypat
     assert ("send", 0, True) in events and ("send", 1, True) not in events
 
 
+@pytest.mark.nixl
 def test_ssd_on_save_on_2_restore_on_1_spills_and_reads_back(
     ray_cluster, tmp_path_factory
 ):
@@ -217,7 +216,7 @@ def test_ssd_on_save_on_2_restore_on_1_spills_and_reads_back(
         conf.backend.NixlStore.op_timeout_s = 60.0
         conf.backend.NixlStore.ssd = {
             "enabled": True,
-            "dir": str(tmp_path_factory.mktemp("ssd")),
+            "path": str(tmp_path_factory.mktemp("ssd")),
             "staging_bytes": 4 * MiB,
         }
         tq.init(conf)

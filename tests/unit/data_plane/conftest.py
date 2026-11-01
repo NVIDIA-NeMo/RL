@@ -29,6 +29,8 @@ smoke / smoke-backend / smoke-1d / obj-backend / mix-e2e today).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
@@ -125,6 +127,8 @@ def _isolate_codec_timer():
 # NIXL data plane refuses TCP), e.g. ``UCX_TLS=rc,self,sm
 # UCX_NET_DEVICES=<rdma dev>:1``; tests marked ``gpu`` need a CUDA device. Both
 # are skipped otherwise, so CPU-only runners execute only the pure tests.
+# CI sets NEMO_RL_REQUIRE_NIXL=1 (and UCX_TLS) on runners with an RDMA device,
+# which turns a nixl skip into a failure there, as NEMO_RL_REQUIRE_MOONCAKE does.
 
 
 def _nixl_ready() -> str | None:
@@ -140,6 +144,17 @@ def _nixl_ready() -> str | None:
     except TransportPolicyError as e:
         return f"UCX not restricted to RDMA: {e}"
     return None
+
+
+def _require_nixl() -> bool:
+    return os.environ.get("NEMO_RL_REQUIRE_NIXL") == "1"
+
+
+def pytest_runtest_setup(item):
+    if item.get_closest_marker("nixl") and _require_nixl():
+        why = _nixl_ready()
+        if why:
+            pytest.fail(f"NEMO_RL_REQUIRE_NIXL=1 but {why}")
 
 
 def _has_cuda() -> bool:
@@ -166,7 +181,7 @@ def pytest_collection_modifyitems(config, items):
     if nixl:
         ids = {id(it) for it in nixl}
         items[:] = nixl + [it for it in items if id(it) not in ids]
-    why = _nixl_ready()
+    why = None if _require_nixl() else _nixl_ready()  # required: fails in setup
     cuda = _has_cuda()
     for item in marked:
         if item.get_closest_marker("nixl") and why:

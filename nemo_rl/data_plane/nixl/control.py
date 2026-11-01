@@ -15,7 +15,7 @@
 
 Same shape as TransferQueue's SimpleStorage: each storage unit binds a ZMQ
 ROUTER on ``node_ip:<free port>`` and serves small control messages from one
-thread; clients talk to it over a DEALER socket per unit. Ray is used only to
+thread; clients talk to it over DEALER sockets lent by TQ's socket pool. Ray is used only to
 start the units and to publish their addresses once (bootstrap).
 
 Messages are msgpack ``[op, request_id, args]``; replies ``[request_id, ok,
@@ -29,7 +29,7 @@ same way:
 ======== =================================== ==========================
 kind     client exception                    meaning
 ======== =================================== ==========================
-UnitFull ``UnitFull``                        try the next unit
+UnitFull ``UnitFull``                        put fails (SSD on: spills here)
 Busy     ``DataPlaneBusy(reason)``           retry this unit later
 Missing  ``LostBlobs(blobs)``                the unit no longer has them
 Protocol ``TransferError``                   any other server exception
@@ -38,6 +38,7 @@ Protocol ``TransferError``                   any other server exception
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import socket
 import threading
@@ -47,6 +48,8 @@ from typing import Any, Callable
 
 import msgspec
 import zmq
+from transfer_queue.utils.enum_utils import Role
+from transfer_queue.utils.zmq_utils import ZMQServerInfo, ZMQSocketPool
 
 from nemo_rl.data_plane.nixl.errors import (
     DataPlaneBusy,
@@ -77,18 +80,18 @@ def error_reply(e: BaseException) -> dict[str, Any]:
     return out
 
 
-def raise_reply(address: str, op: str, err: Any) -> None:
-    """Rebuild and raise the exception behind an error reply."""
+def reply_error(address: str, op: str, err: Any) -> Exception:
+    """Rebuild the exception behind an error reply."""
     if not isinstance(err, dict):  # pre-structured peer: [type_name, msg]
         err = {"kind": "Protocol", "msg": ": ".join(map(str, err))}
     kind, msg = err.get("kind"), err.get("msg", "")
     if kind == "UnitFull":
-        raise UnitFull(msg)
+        return UnitFull(msg)
     if kind == "Busy":
-        raise DataPlaneBusy(f"unit {address} {op}: {msg}", reason=err.get("reason"))
+        return DataPlaneBusy(f"unit {address} {op}: {msg}", reason=err.get("reason"))
     if kind == "Missing":
-        raise LostBlobs(list(err.get("blobs") or []), msg or "blob not on unit")
-    raise TransferError(f"unit {address} {op}: {msg}")
+        return LostBlobs(list(err.get("blobs") or []), msg or "blob not on unit")
+    return TransferError(f"unit {address} {op}: {msg}")
 
 
 def node_ip() -> str:
@@ -101,9 +104,10 @@ def node_ip() -> str:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
+            ip = s.getsockname()[0]
         finally:
             s.close()
+        return ip
 
 
 class UnitServer:
@@ -172,29 +176,16 @@ class UnitServer:
 
 
 class UnitClient:
-    """DEALER sockets to every unit this client talks to.
+    """Requests to storage units over DEALER sockets lent by TransferQueue's pool.
 
-    Not thread-safe: callers serialise use (the KV client holds its lock around store calls).
+    A socket goes back to the pool only after a complete reply with its
+    request's id; after anything else a late reply may still arrive, so it is closed.
     """
 
     def __init__(self, timeout_s: float = 30.0) -> None:
         self.ctx = zmq.Context()
         self.timeout_ms = int(timeout_s * 1000)
-        self._socks: dict[str, zmq.Socket] = {}
-
-    def _sock(self, address: str) -> zmq.Socket:
-        s = self._socks.get(address)
-        if s is None:
-            s = self.ctx.socket(zmq.DEALER)
-            s.setsockopt(zmq.LINGER, 0)
-            s.connect(address)
-            self._socks[address] = s
-        return s
-
-    def _drop(self, address: str) -> None:
-        s = self._socks.pop(address, None)
-        if s is not None:
-            s.close(0)
+        self._pool = ZMQSocketPool(self.ctx, "nvdp_unit_client", "ctl")
 
     def call(
         self, address: str, op: str, *, timeout_s: float | None = None, **args: Any
@@ -205,9 +196,12 @@ class UnitClient:
         ``TransferError`` when no reply comes within ``timeout_s`` (default: the
         client's timeout; callers pass their remaining operation budget).
         """
-        timeout_ms = self._timeout_ms(timeout_s)
-        rid = self._send(address, op, args, timeout_ms)
-        return self._recv(address, op, rid, time.monotonic() + timeout_ms / 1000)
+        end = time.monotonic() + self._timeout_ms(timeout_s) / 1000
+        with self._pool.lease(_peer(address)) as s:
+            ok, result = self._recv(s, address, op, self._send(s, op, args), end)
+        if not ok:  # a complete reply: raised outside the lease, which keeps the socket
+            raise reply_error(address, op, result)
+        return result
 
     def call_many(
         self,
@@ -222,20 +216,27 @@ class UnitClient:
         caller decides what one failure means for the others. ``timeout_s``
         bounds the whole batch, not each call.
         """
-        timeout_ms = self._timeout_ms(timeout_s)
-        end = time.monotonic() + timeout_ms / 1000
+        end = time.monotonic() + self._timeout_ms(timeout_s) / 1000
         out: dict[str, Any] = {}
-        rids: dict[str, str] = {}
-        for address, args in args_by_address.items():
-            try:
-                rids[address] = self._send(address, op, args, timeout_ms)
-            except Exception as e:  # noqa: BLE001 - reported per address
-                out[address] = e
-        for address, rid in rids.items():
-            try:
-                out[address] = self._recv(address, op, rid, end)
-            except Exception as e:  # noqa: BLE001 - reported per address
-                out[address] = e
+        sent: dict[str, tuple[zmq.Socket, str]] = {}
+        with contextlib.ExitStack() as leases:
+            for address, args in args_by_address.items():
+                s = None
+                try:
+                    s = leases.enter_context(self._pool.lease(_peer(address)))
+                    sent[address] = (s, self._send(s, op, args))
+                except Exception as e:  # noqa: BLE001 - reported per address
+                    if s is not None:  # caught, so the lease would keep it: close
+                        s.close(linger=0)
+                    out[address] = e
+            for address, (s, rid) in sent.items():
+                try:
+                    ok, result = self._recv(s, address, op, rid, end)
+                except Exception as e:  # noqa: BLE001 - reported per address
+                    s.close(linger=0)
+                    out[address] = e
+                    continue
+                out[address] = result if ok else reply_error(address, op, result)
         return out
 
     def _timeout_ms(self, timeout_s: float | None) -> int:
@@ -243,46 +244,41 @@ class UnitClient:
             return self.timeout_ms
         return max(1, min(self.timeout_ms, int(timeout_s * 1000)))
 
-    def _send(
-        self, address: str, op: str, args: dict[str, Any], timeout_ms: int
-    ) -> str:
+    @staticmethod
+    def _send(s: zmq.Socket, op: str, args: dict[str, Any]) -> str:
         rid = uuid.uuid4().hex[:12]
-        s = self._sock(address)
-        # A unit that stopped reading fills the send queue: wait no longer
-        # than the reply would be waited for.
-        s.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        try:
-            s.send(_enc.encode([op, rid, args]))
-        except zmq.Again:
-            raise TransferError(
-                f"unit {address} send queue stayed full for {op} "
-                f"({timeout_ms / 1000:.1f}s)"
-            ) from None
+        try:  # TQ's DEALER has no send high-water mark, so this does not block
+            s.send(_enc.encode([op, rid, args]), flags=zmq.NOBLOCK)
+        except zmq.ZMQError as e:
+            raise TransferError(f"could not send {op}: {e}") from None
         return rid
 
-    def _recv(self, address: str, op: str, rid: str, end: float) -> Any:
-        s = self._sock(address)
-        while True:
-            wait_ms = max(0, int((end - time.monotonic()) * 1000))
-            if not s.poll(wait_ms, zmq.POLLIN):
-                self._drop(address)  # a late reply must not reach the next caller
-                raise TransferError(f"unit {address} did not answer {op} in time")
-            got_rid, ok, result = _dec.decode(s.recv())
-            if got_rid != rid:
-                continue  # stale reply from an earlier timed-out call
-            if ok:
-                return result
-            raise_reply(address, op, result)
+    @staticmethod
+    def _recv(s: zmq.Socket, address: str, op: str, rid: str, end: float) -> Any:
+        if not s.poll(max(0, int((end - time.monotonic()) * 1000)), zmq.POLLIN):
+            raise TransferError(f"unit {address} did not answer {op} in time")
+        got_rid, ok, result = _dec.decode(s.recv())
+        if got_rid != rid:
+            raise TransferError(
+                f"unit {address} answered {op} with another request's id"
+            )
+        return ok, result
 
     def notify(self, address: str, op: str, **args: Any) -> None:
         """Fire-and-forget (no reply is sent for ``NO_REPLY`` ops)."""
         assert op in NO_REPLY, op
-        try:
-            self._sock(address).send(_enc.encode([op, "", args]), flags=zmq.NOBLOCK)
-        except zmq.ZMQError:
-            pass
+        with self._pool.lease(_peer(address)) as s:
+            try:
+                s.send(_enc.encode([op, "", args]), flags=zmq.NOBLOCK)
+            except zmq.ZMQError:
+                pass
 
     def close(self) -> None:
-        for a in list(self._socks):
-            self._drop(a)
+        self._pool.close()
         self.ctx.term()
+
+
+def _peer(address: str) -> ZMQServerInfo:
+    """A unit's ``tcp://ip:port`` as the ``ZMQServerInfo`` TQ's pool dials."""
+    ip, port = address.removeprefix("tcp://").rsplit(":", 1)
+    return ZMQServerInfo(Role.STORAGE, address, ip, {"ctl": int(port)})

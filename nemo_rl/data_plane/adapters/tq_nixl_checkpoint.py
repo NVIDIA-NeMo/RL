@@ -37,7 +37,9 @@ guard, so no put/get/clear is in flight while a shard is written.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -48,9 +50,19 @@ from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.blobstore import UnitSlabStore
 from nemo_rl.data_plane.nixl.directory import ACTIVE
 from nemo_rl.data_plane.nixl.errors import UnitFull
+from nemo_rl.telemetry.instrumentation import managed_span
+from nemo_rl.telemetry.span_groups import RLSpanGroup
+
+log = logging.getLogger(__name__)
 
 SUBDIR = "nixl_store"
 MANIFEST = "manifest.json"
+# Checkpoint layout version: written to manifest.json, and load rejects any other
+# value. Bump it when an older build could not read a new checkpoint correctly:
+# a manifest key added, renamed or given a new meaning; a change to how
+# unit-<id>.shard or its .rows file is laid out; or a change to where rows live
+# (row gidx on unit_ids[gidx % N]). Changes inside one blob are covered by
+# blob_format.VERSION instead.
 VERSION = 2
 
 
@@ -126,10 +138,20 @@ def load_storage_checkpoint(
             f"unsupported nixl_store checkpoint version {manifest.get('version')!r} "
             f"(this build reads version {VERSION})"
         )
-    if list(manifest["unit_ids"]) == list(client.unit_ids):
-        _load_in_place(client.store, root, manifest)
-    else:
-        _load_rerouted(client, root, manifest)
+    in_place = list(manifest["unit_ids"]) == list(client.unit_ids)
+    attrs: dict[str, Any] = {
+        "rl.data_plane.restore_path": "in_place" if in_place else "rerouted",
+        "rl.data_plane.saved_units": len(manifest["unit_ids"]),
+        "rl.data_plane.current_units": len(client.unit_ids),
+        "rl.data_plane.bytes": sum(int(s["nbytes"]) for s in manifest["shards"]),
+    }
+    t0 = time.monotonic()
+    with managed_span(RLSpanGroup.DATA_PLANE, "rl.data_plane.restore_shards", **attrs):
+        if in_place:
+            _load_in_place(client.store, root, manifest)
+        else:
+            _load_rerouted(client, root, manifest)
+    log.info("nixl_store restore %s took %.1fs", attrs, time.monotonic() - t0)
     return manifest
 
 
@@ -151,7 +173,7 @@ def _load_in_place(store: UnitSlabStore, root: Path, manifest: dict[str, Any]) -
     for u, left in pending.items():
         if left:
             raise UnitFull(
-                f"{len(left)} blob(s) of {shards[u]['file']} fit on unit {u}"
+                f"{len(left)} blob(s) of {shards[u]['file']} do not fit on unit {u}"
             )
 
 

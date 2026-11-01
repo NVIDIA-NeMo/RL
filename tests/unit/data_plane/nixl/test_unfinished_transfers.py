@@ -240,7 +240,9 @@ def _client_with(store_put):
     c = object.__new__(NixlKVClient)
     c.ep, c._lock = ep, threading.RLock()
     c.pool = BufferPool(ep, c._lock, base_bytes=1 << 20, base_count=1)
-    c.store = SimpleNamespace(put_segments=store_put)
+    c.store = SimpleNamespace(
+        put_many=lambda puts, deadline: [store_put(*b, deadline) for b in puts]
+    )
     c.zero_copy_min, c.zero_copy_max = 1 << 20, 32 << 20
     c.parallel_copy_min = 16 << 20
     c.retained_sources, c.retained_source_bytes = [], 0
@@ -267,7 +269,7 @@ def test_zero_copy_source_of_in_flight_write_stays_registered_and_alive():
     c, ep = _client_with(put_segments)
     p, zc = _plan_with_zero_copy_value()
     with pytest.raises(UnitFull):
-        c._put_segments(p, "b", time.monotonic() + 60, 0)
+        c._put_blobs([(0, "b", p, c._layout(p))], time.monotonic() + 60)
     zc_addr = zc.data_ptr()
     assert zc_addr in ep.registered  # never deregistered
     assert [a for a, _, _ in c.retained_sources] == [zc_addr]
@@ -284,7 +286,7 @@ def test_zero_copy_source_is_deregistered_after_a_clean_put():
 
     c, ep = _client_with(put_segments)
     p, zc = _plan_with_zero_copy_value()
-    c._put_segments(p, "b", time.monotonic() + 60, 0)
+    c._put_blobs([(0, "b", p, c._layout(p))], time.monotonic() + 60)
     assert zc.data_ptr() not in ep.registered
     assert c.retained_sources == [] and c.pool.retired == []
 
@@ -301,7 +303,7 @@ def test_put_over_max_blob_bytes_is_split_at_key_boundaries():
     c, _ = _client_with(put_segments)
     c.max_blob_bytes = 10_000  # 4 KiB values: at most 2 per blob
     keys = [f"k{i}" for i in range(5)]
-    c._put_split(0, keys, [torch.ones(1024)] * 5, time.monotonic() + 60)
+    c._put_blobs(c._plan(0, keys, [torch.ones(1024)] * 5), time.monotonic() + 60)
     assert len(blobs) == 3
     assert all(n <= c.max_blob_bytes for _, n, _ in blobs)
     assert sum(k for _, _, k in blobs) == 5
@@ -325,7 +327,9 @@ def test_failed_part_of_a_split_put_keeps_the_parts_written():
     c, _ = _client_with(put_segments)
     c.max_blob_bytes = 5_000  # one 4 KiB value per blob
     with pytest.raises(UnitFull):
-        c._put_split(0, ["a", "b"], [torch.ones(1024)] * 2, time.monotonic() + 60)
+        c._put_blobs(
+            c._plan(0, ["a", "b"], [torch.ones(1024)] * 2), time.monotonic() + 60
+        )
     assert len(calls) == 2
 
 
@@ -385,6 +389,7 @@ def _unit_abort():
     alloc = SlabAllocator(1 << 20)
     off = alloc.alloc(4096)
     unit = SimpleNamespace(
+        unit_id=0,
         _mu=threading.RLock(),
         alloc_=alloc,
         retired_bytes=0,

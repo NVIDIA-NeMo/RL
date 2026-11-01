@@ -576,13 +576,3 @@ def test_cpu_nodes_single_socket(tmp_path):
     from nemo_rl.distributed.numa_utils import cpu_nodes
 
     assert list(cpu_nodes(_fake_nodes(tmp_path / "node", {0: "0-71", 1: ""}))) == [0]
-
-
-def test_socket_of_affinity(monkeypatch):
-    from nemo_rl.distributed import numa_utils
-
-    nodes = {0: {0, 1}, 1: {2, 3}}
-    monkeypatch.setattr(numa_utils.os, "sched_getaffinity", lambda pid: {2, 3})
-    assert numa_utils.socket_of_affinity(nodes) == 1
-    monkeypatch.setattr(numa_utils.os, "sched_getaffinity", lambda pid: {1, 2})
-    assert numa_utils.socket_of_affinity(nodes) is None

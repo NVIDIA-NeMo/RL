@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 
 def make_tq_conf(
     *,
@@ -111,6 +113,7 @@ def stub_store(ctl, ep=None, dead=False, monkeypatch=None, ssd=False):
 
     s = object.__new__(UnitSlabStore)
     s.ssd = ssd
+    s.idle = contextlib.nullcontext
     s.ep = ep or StubEp()
     s.ctl = ctl
     s.timeout_s = 5.0
