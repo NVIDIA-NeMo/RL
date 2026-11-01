@@ -35,6 +35,21 @@ def materialize_scalar_metrics(
     return dict(zip(metrics, values, strict=True))
 
 
+def adaptive_ppo_clip_kept_mask(
+    importance_weights: torch.Tensor,
+    *,
+    advantages: torch.Tensor,
+    lower_bound: float,
+    upper_bound: float,
+    outer_bound: float,
+) -> torch.Tensor:
+    return (
+        (importance_weights <= outer_bound)
+        & ((advantages >= 0) | (importance_weights >= lower_bound))
+        & ((advantages <= 0) | (importance_weights <= upper_bound))
+    )
+
+
 @torch.no_grad()
 def clipped_pg_diagnostic_metrics(
     *,
