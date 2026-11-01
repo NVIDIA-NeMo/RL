@@ -619,38 +619,30 @@ class GymCheckpointCoordinator:
             # or actor-local validation error is an uncertain outcome, so the
             # remote restore may have succeeded before the failure reached this
             # coordinator.
-            cleanup_errors: list[BaseException] = []
-            try:
-                cleanup_deadline_ts = self._deadline()
-                await self._collect(
-                    "restore_retire",
-                    {
-                        instance_id: self._handles[
-                            instance_id
-                        ].checkpoint_retire.remote(
-                            restore_id,
-                            tuple(
-                                episode.next_attempt()
-                                for episode in inventory[instance_id]
-                            ),
-                            deadline_ts=cleanup_deadline_ts,
-                        )
-                        for instance_id in inventory
-                    },
-                    deadline_ts=cleanup_deadline_ts,
-                )
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-            try:
-                await self.resume(restore_id)
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-            for cleanup_error in cleanup_errors:
-                error.add_note(
-                    "Gym cross-instance restore cleanup also failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
+            await self._discard_restore(restore_id, manifest, error)
             raise
+
+    async def _discard_restore(
+        self,
+        restore_id: str,
+        manifest: GymCheckpointManifest,
+        error: BaseException,
+    ) -> None:
+        """Retire the restored attempts, then reopen Gym, noting failures on ``error``."""
+        try:
+            await self.retire_restored(restore_id, manifest)
+        except Exception as cleanup_error:
+            error.add_note(
+                "Gym retire of restored attempts also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        try:
+            await self.resume(restore_id)
+        except Exception as cleanup_error:
+            error.add_note(
+                "Gym restore cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
 
     @asynccontextmanager
     async def restored(
@@ -669,20 +661,7 @@ class GymCheckpointCoordinator:
         try:
             yield
         except BaseException as error:
-            try:
-                await self.retire_restored(restore_id, manifest)
-            except Exception as retire_error:
-                error.add_note(
-                    "Gym retire of restored attempts also failed: "
-                    f"{type(retire_error).__name__}: {retire_error}"
-                )
-            try:
-                await self.resume(restore_id)
-            except Exception as resume_error:
-                error.add_note(
-                    "Gym restore cleanup also failed: "
-                    f"{type(resume_error).__name__}: {resume_error}"
-                )
+            await self._discard_restore(restore_id, manifest, error)
             raise
         else:
             await self.resume(restore_id)
