@@ -1,8 +1,9 @@
 # AutoModel SingleController exemplar. Run with:
 # uv run examples/run_grpo_single_controller.py --config examples/configs/grpo_math_1B_automodel_single_controller.yaml
 #
-# Supported scope: text GRPO, full-parameter FSDP2 with TP=CP=EP=1,
+# Supported scope: text GRPO, full-parameter FSDP2 with TP=CP=1,
 # fixed microbatches, and one full-batch SC dispatch per optimizer update.
+# Expert parallelism uses AutoModel's existing MoE mesh and dispatcher.
 # Model-specific recipes inherit this file and override workload/resource sizes.
 defaults: grpo_math_1B.yaml
 
