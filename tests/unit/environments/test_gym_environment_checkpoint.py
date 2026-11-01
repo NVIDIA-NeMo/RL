@@ -17,12 +17,10 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -57,53 +55,15 @@ from nemo_rl.experience.rollout_recovery import (
     RecoveryTargetLevel,
     RolloutRecoveryLedger,
 )
-from tests.unit.environments.gym_checkpoint_fakes import FakeGymActor, gym_coordinator
+from tests.unit.environments.gym_checkpoint_fakes import (
+    FakeGymActor,
+    deadline_pausing_manager,
+    gym_coordinator,
+    gym_environment_checkpoint,
+    snapshot_commit,
+)
 
 _ASYNC_TEST_TIMEOUT_S = 10.0
-
-
-async def _no_staging_keys() -> list[str]:
-    return []
-
-
-def _deadline_pausing_manager(
-    registry: Optional[RequestDeadlineRegistry] = None,
-) -> SimpleNamespace:
-    """Rollout-manager stand-in for the deadline pause a Gym checkpoint takes."""
-    registry = registry if registry is not None else RequestDeadlineRegistry()
-    return SimpleNamespace(
-        suspend_request_deadlines=registry.suspend,
-        resume_request_deadlines=registry.resume,
-    )
-
-
-def _gym_checkpoint(
-    coordinator: GymCheckpointCoordinator,
-    ledger: Optional[RolloutRecoveryLedger] = None,
-    *,
-    manager: Optional[Any] = None,
-    list_staging_keys: Callable[[], Awaitable[list[str]]] = _no_staging_keys,
-    allow_restart_only_servers: bool = False,
-) -> GymEnvironmentCheckpoint:
-    """Gym's checkpoint over ``coordinator``, with a stand-in rollout manager."""
-    return GymEnvironmentCheckpoint(
-        coordinator,
-        ledger=ledger if ledger is not None else RolloutRecoveryLedger(),
-        rollout_manager=(
-            manager if manager is not None else _deadline_pausing_manager()
-        ),
-        list_staging_keys=list_staging_keys,
-        allow_restart_only_servers=allow_restart_only_servers,
-    )
-
-
-@contextlib.asynccontextmanager
-async def _gym_commit(
-    gym: GymEnvironmentCheckpoint, checkpoint_path: Path, *, checkpoint_id: str
-) -> AsyncIterator[GymCheckpointCommitResult]:
-    """Gym's commit for one snapshot, while Gym is parked."""
-    async with gym.snapshot(checkpoint_path, checkpoint_id=checkpoint_id) as snapshot:
-        yield snapshot.commit
 
 
 def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> None:
@@ -114,7 +74,7 @@ def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> N
             group = _dispatched_turn_group(ledger, cut, generations=1)
 
         actor = FakeGymActor(exported_episodes=())
-        gym = _gym_checkpoint(gym_coordinator(actor), ledger)
+        gym = gym_environment_checkpoint(gym_coordinator(actor), ledger)
 
         async def complete_on_wire_reply() -> None:
             while "commit" not in actor.operations():
@@ -134,7 +94,7 @@ def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> N
                 )
 
         completion = asyncio.create_task(complete_on_wire_reply())
-        async with _gym_commit(
+        async with snapshot_commit(
             gym,
             tmp_path,
             checkpoint_id="save-1",
@@ -168,10 +128,10 @@ def test_completion_callback_can_run_while_gym_commit_is_pending(
             group = _dispatched_turn_group(ledger, cut, generations=1)
 
         actor = FakeGymActor(exported_episodes=(), block_commit=True)
-        gym = _gym_checkpoint(gym_coordinator(actor), ledger)
+        gym = gym_environment_checkpoint(gym_coordinator(actor), ledger)
 
         async def checkpoint() -> GymCheckpointCommitResult:
-            async with _gym_commit(
+            async with snapshot_commit(
                 gym,
                 tmp_path,
                 checkpoint_id="save-1",
@@ -227,10 +187,12 @@ def test_turn_checkpoint_aborts_when_candidate_is_neither_exported_nor_drained(
             group = _dispatched_turn_group(ledger, cut, generations=1)
 
         actor = FakeGymActor(exported_episodes=())
-        gym = _gym_checkpoint(gym_coordinator(actor, control_timeout_s=0.01), ledger)
+        gym = gym_environment_checkpoint(
+            gym_coordinator(actor, control_timeout_s=0.01), ledger
+        )
 
         with pytest.raises(TimeoutError, match="neither|classify every candidate"):
-            async with _gym_commit(
+            async with snapshot_commit(
                 gym,
                 tmp_path,
                 checkpoint_id="save-1",
@@ -256,10 +218,12 @@ def test_turn_checkpoint_fails_fast_on_parked_session_without_an_owner(
             "tools/replica-0"
         ]
         actor = FakeGymActor(exported_episodes=(), unowned_live_episodes=(stranded,))
-        gym = _gym_checkpoint(gym_coordinator(actor, control_timeout_s=60.0), ledger)
+        gym = gym_environment_checkpoint(
+            gym_coordinator(actor, control_timeout_s=60.0), ledger
+        )
 
         async def checkpoint() -> None:
-            async with _gym_commit(
+            async with snapshot_commit(
                 gym,
                 tmp_path,
                 checkpoint_id="save-1",
@@ -327,9 +291,9 @@ def test_turn_checkpoint_retires_abandoned_attempts_gym_is_still_running(
             ledger.abandon_unsealed(cut, group.group_id)
 
         actor = FakeGymActor(live=abandoned)
-        gym = _gym_checkpoint(gym_coordinator(actor), ledger)
+        gym = gym_environment_checkpoint(gym_coordinator(actor), ledger)
 
-        async with _gym_commit(
+        async with snapshot_commit(
             gym,
             tmp_path,
             checkpoint_id="save-1",
@@ -372,10 +336,10 @@ def test_turn_checkpoint_retires_each_dropped_attempt_only_once(
             ledger.abandon_unsealed(cut, group.group_id)
 
         actor = FakeGymActor(live=_gym_episodes(group))
-        gym = _gym_checkpoint(gym_coordinator(actor), ledger)
+        gym = gym_environment_checkpoint(gym_coordinator(actor), ledger)
         for checkpoint_id in ("save-1", "save-2"):
             (tmp_path / checkpoint_id).mkdir()
-            async with _gym_commit(
+            async with snapshot_commit(
                 gym,
                 tmp_path / checkpoint_id,
                 checkpoint_id=checkpoint_id,
@@ -414,11 +378,13 @@ def test_turn_checkpoint_retires_again_and_forgets_a_rollout_gym_refused_to_forg
             live=abandoned,
             forget_errors=(RuntimeError("retire_incomplete"),) * forget_failures,
         )
-        gym = _gym_checkpoint(gym_coordinator(actor), ledger)
+        gym = gym_environment_checkpoint(gym_coordinator(actor), ledger)
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            async with _gym_commit(gym, tmp_path, checkpoint_id="save-1") as gym_commit:
+            async with snapshot_commit(
+                gym, tmp_path, checkpoint_id="save-1"
+            ) as gym_commit:
                 assert gym_commit is not None
 
         operations = actor.operations()
@@ -458,9 +424,9 @@ def test_turn_checkpoint_retires_only_the_abandoned_attempts_of_a_retried_group(
         assert replacements.isdisjoint(abandoned)
 
         actor = FakeGymActor(live=abandoned | replacements)
-        gym = _gym_checkpoint(gym_coordinator(actor), ledger)
+        gym = gym_environment_checkpoint(gym_coordinator(actor), ledger)
 
-        async with _gym_commit(
+        async with snapshot_commit(
             gym,
             tmp_path,
             checkpoint_id="save-1",
@@ -493,9 +459,9 @@ def test_turn_checkpoint_leaves_gym_restarts_out_and_records_them(
             group = _dispatched_turn_group(ledger, cut)
         saved, restart = sorted(_gym_episodes(group))
         actor = FakeGymActor(live={saved, restart}, restarts=(restart,))
-        gym = _gym_checkpoint(gym_coordinator(actor), ledger)
+        gym = gym_environment_checkpoint(gym_coordinator(actor), ledger)
 
-        async with _gym_commit(
+        async with snapshot_commit(
             gym,
             tmp_path,
             checkpoint_id="save-1",
@@ -524,10 +490,10 @@ def test_turn_checkpoint_rejects_missing_gym_staging_key(tmp_path: Path) -> None
         episode = group.environment_episode(0)
         actor = FakeGymActor(staging_keys_by_episode={episode: ("missing-call-row",)})
         # TQ holds no staging rows, so the one Gym references is missing.
-        gym = _gym_checkpoint(gym_coordinator(actor), ledger)
+        gym = gym_environment_checkpoint(gym_coordinator(actor), ledger)
 
         with pytest.raises(RuntimeError, match="staging rows missing"):
-            async with _gym_commit(
+            async with snapshot_commit(
                 gym,
                 tmp_path,
                 checkpoint_id="save-1",
@@ -550,9 +516,9 @@ def test_turn_checkpoint_commits_owned_gym_episode_before_tq_cut(
             group = _dispatched_turn_group(ledger, cut, generations=1)
 
         actor = FakeGymActor()
-        gym = _gym_checkpoint(gym_coordinator(actor), ledger)
+        gym = gym_environment_checkpoint(gym_coordinator(actor), ledger)
 
-        async with _gym_commit(
+        async with snapshot_commit(
             gym,
             tmp_path,
             checkpoint_id="save-1",
@@ -578,9 +544,9 @@ class TestGymCheckpointPausesRolloutDeadlines:
         self, tmp_path: Path
     ) -> None:
         registry = RequestDeadlineRegistry()
-        gym = _gym_checkpoint(
+        gym = gym_environment_checkpoint(
             gym_coordinator(FakeGymActor(exported_episodes=())),
-            manager=_deadline_pausing_manager(registry),
+            manager=deadline_pausing_manager(registry),
         )
 
         async def exercise() -> None:
@@ -595,7 +561,7 @@ class TestGymCheckpointPausesRolloutDeadlines:
 
             rollout = asyncio.create_task(parked_rollout())
             await entered.wait()
-            async with _gym_commit(gym, tmp_path, checkpoint_id="save-1"):
+            async with snapshot_commit(gym, tmp_path, checkpoint_id="save-1"):
                 assert registry.suspended
                 # Twice the rollout's whole budget.
                 await asyncio.sleep(0.4)
@@ -610,15 +576,15 @@ class TestGymCheckpointPausesRolloutDeadlines:
         self, tmp_path: Path
     ) -> None:
         registry = RequestDeadlineRegistry()
-        gym = _gym_checkpoint(
+        gym = gym_environment_checkpoint(
             gym_coordinator(FakeGymActor(exported_episodes=())),
-            manager=_deadline_pausing_manager(registry),
+            manager=deadline_pausing_manager(registry),
         )
 
         async def exercise() -> None:
             # The colocated engine is training; its own pause must outlast ours.
             registry.suspend()
-            async with _gym_commit(gym, tmp_path, checkpoint_id="save-1"):
+            async with snapshot_commit(gym, tmp_path, checkpoint_id="save-1"):
                 pass
             assert registry.suspended
             registry.resume()
@@ -630,14 +596,14 @@ class TestGymCheckpointPausesRolloutDeadlines:
         self, tmp_path: Path
     ) -> None:
         registry = RequestDeadlineRegistry()
-        gym = _gym_checkpoint(
+        gym = gym_environment_checkpoint(
             gym_coordinator(FakeGymActor(prepared=False)),
-            manager=_deadline_pausing_manager(registry),
+            manager=deadline_pausing_manager(registry),
         )
 
         async def exercise() -> None:
             with pytest.raises(GymCheckpointNotReady):
-                async with _gym_commit(gym, tmp_path, checkpoint_id="save-1"):
+                async with snapshot_commit(gym, tmp_path, checkpoint_id="save-1"):
                     raise AssertionError("unreachable")
             assert not registry.suspended
 
@@ -702,7 +668,7 @@ class TestDrainScalesWithPendingRepliesNotTheLedger:
         commit = await coordinator.commit(
             "save-1", tmp_path, candidates, restarts={"tools/replica-0": ()}
         )
-        gym = _gym_checkpoint(coordinator, ledger)
+        gym = gym_environment_checkpoint(coordinator, ledger)
         return SimpleNamespace(
             ledger=ledger,
             barrier=barrier,
@@ -819,7 +785,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
     async def _save(
         gym: Any, barrier: DataPlaneCheckpointBarrier, tmp_path: Path
     ) -> None:
-        async with _gym_commit(gym, tmp_path, checkpoint_id="save-1") as gym_commit:
+        async with snapshot_commit(gym, tmp_path, checkpoint_id="save-1") as gym_commit:
             assert gym_commit is not None
             async with barrier.checkpoint() as cut:
                 await gym.validate_cut(cut, gym_commit, checkpoint_path=tmp_path)
@@ -854,7 +820,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                     ),
                 )
             )
-            gym = _gym_checkpoint(coordinator, ledger)
+            gym = gym_environment_checkpoint(coordinator, ledger)
 
             await asyncio.wait_for(
                 self._save(gym, barrier, tmp_path), _ASYNC_TEST_TIMEOUT_S
@@ -879,7 +845,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             # Row 0 is parked in Gym and exported; row 1's reply is on the wire.
             actor = FakeGymActor(live={row_0})
             coordinator = gym_coordinator(actor)
-            gym = _gym_checkpoint(coordinator, ledger)
+            gym = gym_environment_checkpoint(coordinator, ledger)
 
             async def fail_the_on_wire_reply() -> None:
                 while "commit" not in actor.operations():
@@ -926,7 +892,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                 # The dropped row's staging is gone by the time the cut looks.
                 return [key_0]
 
-            gym = _gym_checkpoint(
+            gym = gym_environment_checkpoint(
                 coordinator, ledger, list_staging_keys=list_staging_keys
             )
 
@@ -952,9 +918,11 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                 group = _dispatched_turn_group(ledger, cut)
             row_0, row_1 = (group.environment_episode(index) for index in (0, 1))
             coordinator = gym_coordinator(FakeGymActor(live={row_0, row_1}))
-            gym = _gym_checkpoint(coordinator, ledger)
+            gym = gym_environment_checkpoint(coordinator, ledger)
 
-            async with _gym_commit(gym, tmp_path, checkpoint_id="save-1") as gym_commit:
+            async with snapshot_commit(
+                gym, tmp_path, checkpoint_id="save-1"
+            ) as gym_commit:
                 assert gym_commit is not None
                 await self._drop(ledger, barrier, group.group_id, [0])
                 # Take the drop off the retire queue, as if RL never queued it.
@@ -972,7 +940,9 @@ def _restart_only_check(
     restart_only_servers: tuple[str, ...], *, allowed: bool
 ) -> tuple[Any, FakeGymActor]:
     actor = FakeGymActor(restart_only_servers=restart_only_servers)
-    gym = _gym_checkpoint(gym_coordinator(actor), allow_restart_only_servers=allowed)
+    gym = gym_environment_checkpoint(
+        gym_coordinator(actor), allow_restart_only_servers=allowed
+    )
     return gym, actor
 
 

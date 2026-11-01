@@ -32,7 +32,7 @@ import asyncio
 import contextlib
 import hashlib
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -69,13 +69,11 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
 )
 from nemo_rl.environments.gym_checkpoint_coordinator import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
-    GymCheckpointCommitResult,
     GymCheckpointCoordinator,
     GymCheckpointManifest,
     write_gym_checkpoint_manifest,
 )
 from nemo_rl.experience.rollout_manager import (
-    RequestDeadlineRegistry,
     RolloutOutcome,
 )
 from nemo_rl.experience.rollout_recovery import (
@@ -87,7 +85,14 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     build_rollout_recovery_state,
 )
-from tests.unit.environments.gym_checkpoint_fakes import FakeGymActor, gym_coordinator
+from tests.unit.environments.gym_checkpoint_fakes import (
+    FakeGymActor,
+    deadline_pausing_manager,
+    gym_coordinator,
+    gym_environment_checkpoint,
+    no_staging_keys,
+    snapshot_commit,
+)
 from tests.unit.single_controller._checkpoint_scenarios import (
     _record,
     patch_converter,
@@ -286,41 +291,26 @@ class _RecoveryRolloutManager:
         del reused, redispatched
 
 
-def _deadline_pausing_manager(
-    registry: Optional[RequestDeadlineRegistry] = None,
-) -> SimpleNamespace:
-    """Rollout-manager stand-in for the deadline pause a Gym checkpoint takes."""
-    registry = registry if registry is not None else RequestDeadlineRegistry()
-    return SimpleNamespace(
-        suspend_request_deadlines=registry.suspend,
-        resume_request_deadlines=registry.resume,
-    )
-
-
-async def _no_staging_keys() -> list[str]:
-    return []
-
-
 def _controller_for(
     coordinator: GymCheckpointCoordinator,
     ledger: Optional[RolloutRecoveryLedger] = None,
     *,
     manager: Optional[Any] = None,
-    list_staging_keys: Callable[[], Awaitable[list[str]]] = _no_staging_keys,
+    list_staging_keys: Callable[[], Awaitable[list[str]]] = no_staging_keys,
     allow_restart_only_servers: bool = False,
 ) -> Any:
     """A bare controller wired for Gym checkpoint coordination, and nothing else."""
     controller = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
     controller._rollout_manager = (
-        manager if manager is not None else _deadline_pausing_manager()
+        manager if manager is not None else deadline_pausing_manager()
     )
     controller._rollout_recovery_ledger = (
         ledger if ledger is not None else RolloutRecoveryLedger()
     )
-    controller._environment_checkpoint = GymEnvironmentCheckpoint(
+    controller._environment_checkpoint = gym_environment_checkpoint(
         coordinator,
-        ledger=controller._rollout_recovery_ledger,
-        rollout_manager=controller._rollout_manager,
+        controller._rollout_recovery_ledger,
+        manager=controller._rollout_manager,
         list_staging_keys=list_staging_keys,
         allow_restart_only_servers=allow_restart_only_servers,
     )
@@ -331,23 +321,11 @@ def _gym_environment_for(
     controller: Any, coordinator: GymCheckpointCoordinator
 ) -> GymEnvironmentCheckpoint:
     """The Gym checkpoint a turn-level controller builds, over ``coordinator``."""
-    return GymEnvironmentCheckpoint(
+    return gym_environment_checkpoint(
         coordinator,
-        ledger=controller._rollout_manager.recovery_ledger,
-        rollout_manager=controller._rollout_manager,
-        list_staging_keys=_no_staging_keys,
+        controller._rollout_manager.recovery_ledger,
+        manager=controller._rollout_manager,
     )
-
-
-@contextlib.asynccontextmanager
-async def _gym_commit(
-    controller: Any, checkpoint_path: Path, *, checkpoint_id: str
-) -> AsyncIterator[GymCheckpointCommitResult]:
-    """Gym's commit for one snapshot, while Gym is parked."""
-    async with controller._environment_checkpoint.snapshot(
-        checkpoint_path, checkpoint_id=checkpoint_id
-    ) as snapshot:
-        yield snapshot.commit
 
 
 class _BlockingRolloutManager:
@@ -791,7 +769,11 @@ def test_gym_phase_stops_when_a_train_step_starts_committing(
             phase = asyncio.create_task(
                 controller._rollout_snapshots._enter_environment_phase_unless_a_step_commits(
                     stack,
-                    _gym_commit(controller, tmp_path, checkpoint_id="save-1"),
+                    snapshot_commit(
+                        controller._environment_checkpoint,
+                        tmp_path,
+                        checkpoint_id="save-1",
+                    ),
                 )
             )
             await asyncio.wait_for(

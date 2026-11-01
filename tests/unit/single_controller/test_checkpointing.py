@@ -116,7 +116,6 @@ from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
-from nemo_rl.environments.checkpointing.nemo_gym import GymEnvironmentCheckpoint
 from nemo_rl.environments.gym_checkpoint_coordinator import (
     GymCheckpointNotReady,
     GymCheckpointOperationError,
@@ -137,7 +136,11 @@ from nemo_rl.utils.logger import LoggerConfig
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
-from tests.unit.environments.gym_checkpoint_fakes import FakeGymActor, gym_coordinator
+from tests.unit.environments.gym_checkpoint_fakes import (
+    FakeGymActor,
+    gym_coordinator,
+    gym_environment_checkpoint,
+)
 from tests.unit.experience.test_rollout_recovery import _forest_sealed_ledger
 from tests.unit.single_controller._rollout_checkpoints import (
     attach_rollout_checkpointing,
@@ -189,20 +192,6 @@ class _FakeEnvironmentCheckpoint(NoEnvironmentCheckpoint):
     def snapshot(self, checkpoint_path: Path):  # type: ignore[override]
         assert self._snapshot_factory is not None
         return self._snapshot_factory(checkpoint_path)
-
-
-async def _no_staging_keys() -> list[str]:
-    return []
-
-
-def _gym_environment_checkpoint(actor: Any) -> GymEnvironmentCheckpoint:
-    """A turn-level Gym checkpoint over one fake Gym actor."""
-    return GymEnvironmentCheckpoint(
-        gym_coordinator(FakeGymActor()),
-        ledger=RolloutRecoveryLedger(),
-        rollout_manager=actor._rollout_manager,
-        list_staging_keys=_no_staging_keys,
-    )
 
 
 _PARTITION_ID = "rollout_data"
@@ -2911,7 +2900,9 @@ class TestPeriodicRolloutCheckpoint:
         actor._logger = MagicMock()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         actor._train_steps = 1
-        actor._environment_checkpoint = _gym_environment_checkpoint(actor)
+        actor._environment_checkpoint = gym_environment_checkpoint(
+            gym_coordinator(FakeGymActor()), manager=actor._rollout_manager
+        )
         attach_rollout_checkpointing(actor)
 
         async def _main() -> None:
@@ -2948,7 +2939,9 @@ class TestPeriodicRolloutCheckpoint:
         actor._logger = MagicMock()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         actor._train_steps = 1
-        actor._environment_checkpoint = _gym_environment_checkpoint(actor)
+        actor._environment_checkpoint = gym_environment_checkpoint(
+            gym_coordinator(FakeGymActor()), manager=actor._rollout_manager
+        )
         attach_rollout_checkpointing(actor)
         calls = 0
 
