@@ -96,6 +96,8 @@ loss_fn:
   positive_example_nll_weight: 0.0  # VAPO: 0.1
   metrics_level: "full"
   enable_torch_compile: false
+  # Score centering (https://arxiv.org/abs/2609.20807); needs policy.generation.top_logprobs > 0.
+  score_centering: false
 
 value_loss_fn:
   scale: 0.4
@@ -288,6 +290,7 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    top_logprobs: 0  # Sampler candidates per token for score centering; 0 disables collection.
     val_temperature: ${.temperature}
     val_top_p: ${.top_p}
     val_top_k: ${.top_k}
