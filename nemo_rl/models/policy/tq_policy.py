@@ -35,6 +35,7 @@ import warnings
 from collections import Counter, defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
+from math import lcm
 from pathlib import Path
 from typing import Any, Optional
 
@@ -769,10 +770,12 @@ class TQPolicy(TQDriverMixin, Policy):
             if dynamic_args is not None
             else 1
         )
-        pad_multiple = max(
-            [int(meta.extra_info.get("pad_to_multiple", 1)) for meta in dp_metas]
+        pad_multiple = lcm(
+            int(self.cfg["make_sequence_length_divisible_by"]),
+            sequence_round,
+            *(int(meta.extra_info.get("pad_to_multiple", 1)) for meta in dp_metas),
         )
-        target = round_up(max(sequence_lengths), max(pad_multiple, sequence_round))
+        target = round_up(max(sequence_lengths), pad_multiple)
         return [
             replace(
                 meta,

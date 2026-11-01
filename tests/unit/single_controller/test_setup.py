@@ -1028,7 +1028,14 @@ class TestSetup:
 
         patched_factories["_build_generation"].side_effect = build_generation
 
-        setup_single_controller(mc, MagicMock(pad_token_id=0))
+        # Test shared LoRA setup ordering independently of backend execution
+        # capabilities. AutoModel SC currently rejects LoRA before allocation;
+        # that restriction is covered by test_automodel_config.
+        with patch(
+            "nemo_rl.algorithms.single_controller_utils.config."
+            "_validate_automodel_single_controller_config"
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert captured == {"load_format": "auto", "enable_lora": True}
         generation_config = mc.policy["generation"]

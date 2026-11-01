@@ -1457,6 +1457,69 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_automodel_single_controller_config(master_config: MasterConfig) -> None:
+    """Fail before allocating workers for unsupported AutoModel SC combinations."""
+    policy = master_config.policy
+    automodel = policy.get("automodel_cfg")
+    if automodel is None or not automodel["enabled"]:
+        return
+    automodel = cast(AutomodelConfig, automodel)
+    prefix = "AutoModel SC "
+    if is_ppo_run(master_config) or master_config.on_policy_distillation is not None:
+        raise ValueError(prefix + "supports text GRPO only")
+    async_cfg = master_config.async_rl
+    sampler = async_cfg.sampler
+    if (
+        not isinstance(sampler, InOrderSamplerConfig)
+        or sampler.max_lookahead_versions != 0
+        or sampler.warmup_lookahead_versions is not None
+    ):
+        raise ValueError(prefix + "requires in_order with max_lookahead_versions=0")
+    if (
+        async_cfg.min_groups_for_streaming_train
+        != master_config.grpo.num_prompts_per_step
+    ):
+        raise ValueError(prefix + "requires the full-batch streaming threshold")
+    if (
+        async_cfg.rollout_failure.max_skipped_prompts
+        or async_cfg.rollout_failure.max_consecutive_dropped_prompts
+    ):
+        raise ValueError(prefix + "requires zero prompt-drop budgets")
+    generation = policy["generation"]
+    if (
+        generation["backend"] != "vllm"
+        or generation["colocated"]["enabled"]
+        or not cast(VllmConfig, generation)["vllm_cfg"]["async_engine"]
+    ):
+        raise ValueError(prefix + "requires disaggregated async vLLM")
+    if policy["sequence_packing"]["enabled"] or policy["dynamic_batching"]["enabled"]:
+        raise ValueError(
+            prefix + "requires fixed microbatches (no packing or dynamic batching)"
+        )
+    if (
+        automodel["tensor_parallel_size"] != 1
+        or automodel["context_parallel_size"] != 1
+        or automodel.get("dp_replicate_size") not in (None, 1)
+        or automodel["cpu_offload"]
+        or automodel.get("custom_parallel_plan") is not None
+        or automodel["sequence_parallel"]
+    ):
+        raise ValueError(prefix + "requires FSDP2 with TP=CP=1 and no CPU offload")
+    lora = automodel.get("lora_cfg")
+    draft = policy.get("draft")
+    quant = policy.get("quant_cfg")
+    if (
+        policy["tokenizer"].get("use_processor")
+        or (lora is not None and lora["enabled"])
+        or (draft is not None and draft.enabled)
+        or quant is not None
+        or policy["precision"] not in ("bfloat16", "float32")
+    ):
+        raise ValueError(
+            prefix + "requires unquantized text full-parameter training without a draft"
+        )
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
@@ -1466,6 +1529,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "Use the non-streaming GRPO trainer."
         )
     _validate_algo_settings(master_config)
+    _validate_automodel_single_controller_config(master_config)
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
