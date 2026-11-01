@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from math import lcm
 from typing import Any, Optional
 
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
@@ -68,8 +69,13 @@ class TQDriverMixin:
         _, dba = self._packing_args("train_mb_tokens")
         seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
         pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
+        # Rollout metadata need not carry the consuming model's alignment.
+        # Honor it here so driver reads and every worker forward agree.
+        alignment = lcm(
+            int(self.cfg["make_sequence_length_divisible_by"]), pad_mult, seq_round
+        )
         meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = round_up(
-            max(meta.sequence_lengths), max(pad_mult, seq_round)
+            max(meta.sequence_lengths), alignment
         )
 
     def _isolated_meta(
