@@ -876,12 +876,11 @@ class AutomodelPolicyWorkerImpl(
             or self.draft_model is not None
             or self.enable_seq_packing
             or self.cfg["dynamic_batching"]["enabled"]
-            or self.cfg["automodel_cfg"].get("expert_parallel_size") not in (None, 1)
             or self.cfg["automodel_cfg"].get("dp_replicate_size") not in (None, 1)
         ):
             raise ValueError(
                 "AutoModel SC requires text full-parameter training, "
-                "TP=CP=EP=1, fixed microbatches, no CPU offload or draft model"
+                "TP=CP=1, fixed microbatches, no CPU offload or draft model"
             )
         if self.optimizer is None or self.scheduler is None:
             raise RuntimeError("an SC step requires an optimizer and scheduler")

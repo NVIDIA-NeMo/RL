@@ -139,6 +139,31 @@ def test_single_commit_and_retained_gradients(worker):
         worker.finish_train_step()
 
 
+@pytest.mark.parametrize("expert_parallel_size", [2, 16])
+def test_expert_parallel_commit_and_abort(worker, monkeypatch, expert_parallel_size):
+    worker.cfg["automodel_cfg"]["expert_parallel_size"] = expert_parallel_size
+    worker.moe_mesh = SimpleNamespace(mesh_dim_names=("ep", "ep_shard"))
+    clip = Mock(wraps=implementation.scale_grads_and_clip_grad_norm)
+    cleanup = Mock()
+    monkeypatch.setattr(implementation, "scale_grads_and_clip_grad_norm", clip)
+    monkeypatch.setattr(implementation, "release_moe_dispatcher_state", cleanup)
+    worker.begin_train_step(Mock())
+    dispatch(worker)
+    worker.finish_train_step()
+    assert clip.call_args.kwargs["moe_mesh"] is worker.moe_mesh
+    assert clip.call_args.kwargs["ep_axis_name"] == "ep"
+    cleanup.assert_called_once_with(worker.model)
+    assert worker.scheduler.last_epoch == 1
+    committed = worker.model.weight.detach().clone()
+    worker.begin_train_step(Mock())
+    dispatch(worker)
+    worker.abort_train_step()
+    torch.testing.assert_close(worker.model.weight, committed)
+    assert worker.model.weight.grad is None
+    assert worker.scheduler.last_epoch == 1
+    assert cleanup.call_count == 2
+
+
 @pytest.mark.parametrize("backward", [False, True])
 def test_abort_restores_buffers_and_does_not_update(worker, backward):
     before = worker.model.weight.detach().clone()

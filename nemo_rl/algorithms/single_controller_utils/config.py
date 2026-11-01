@@ -1393,13 +1393,12 @@ def _validate_automodel_single_controller_config(master_config: MasterConfig) ->
     if (
         automodel["tensor_parallel_size"] != 1
         or automodel["context_parallel_size"] != 1
-        or automodel.get("expert_parallel_size") not in (None, 1)
         or automodel.get("dp_replicate_size") not in (None, 1)
         or automodel["cpu_offload"]
         or automodel.get("custom_parallel_plan") is not None
         or automodel["sequence_parallel"]
     ):
-        raise ValueError(prefix + "requires FSDP2 with TP=CP=EP=1 and no CPU offload")
+        raise ValueError(prefix + "requires FSDP2 with TP=CP=1 and no CPU offload")
     lora = automodel.get("lora_cfg")
     draft = policy.get("draft")
     quant = policy.get("quant_cfg")

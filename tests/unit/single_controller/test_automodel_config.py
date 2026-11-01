@@ -38,6 +38,15 @@ def test_supported(config):
     validate_single_controller_config(MasterConfig(**config))
 
 
+@pytest.mark.parametrize("expert_parallel_size", [2, 16])
+def test_expert_parallel_full_batch_supported(config, expert_parallel_size):
+    # Sixteen training GPUs and eight rollout GPUs accommodate both EP sizes.
+    config["policy"]["automodel_cfg"]["expert_parallel_size"] = expert_parallel_size
+    config["cluster"].update(num_nodes=3, gpus_per_node=8)
+    config["policy"]["generation"]["colocated"]["resources"]["gpus_per_node"] = 8
+    validate_single_controller_config(MasterConfig(**config))
+
+
 @pytest.mark.parametrize("prompts,generations", [(2, 4), (8, 2)])
 def test_base_batch_settings_follow_prompt_overrides(prompts, generations):
     register_omegaconf_resolvers()
@@ -52,12 +61,16 @@ def test_base_batch_settings_follow_prompt_overrides(prompts, generations):
     assert config.async_rl.max_buffered_rollouts == prompts
 
 
-def test_full_batch_regression_recipe():
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        "grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch.yaml",
+        "grpo-qwen3.5-35ba3b-base-3n8g-automodel-ep16-single-controller-full-batch.yaml",
+    ],
+)
+def test_full_batch_regression_recipe(recipe):
     register_omegaconf_resolvers()
-    raw = load_config(
-        "examples/configs/recipes/llm/"
-        "grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch.yaml"
-    )
+    raw = load_config("examples/configs/recipes/llm/" + recipe)
     config = MasterConfig(**OmegaConf.to_container(raw, resolve=True))
     validate_single_controller_config(config)
     assert config.policy["train_global_batch_size"] == (
