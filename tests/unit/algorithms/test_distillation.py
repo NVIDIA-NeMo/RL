@@ -1415,6 +1415,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         enable_router_replay=False,
         use_fastokens=False,
         policy_api_key="k",
+        turn_checkpointing_enabled=False,
     )
     # Building the actor leaves the configured keys alone. setup() adds only the
     # Gym log dir, under this run's log dir.

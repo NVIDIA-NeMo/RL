@@ -18,6 +18,7 @@ RUN_LOG=$EXP_DIR/run.log
 CHECKPOINT_DIR=$EXP_DIR/checkpoints
 DATA_DIR=$EXP_DIR/data
 SC_ENTRYPOINT=${SC_TEST_ENTRYPOINT:-$PROJECT_ROOT/examples/run_grpo_single_controller.py}
+SC_CONFIG=${SC_TEST_CONFIG:-$PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml}
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
 rm -rf $EXP_DIR $LOG_DIR
@@ -87,7 +88,7 @@ jq -c "$DATA_FILTER" 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validat
 
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $SC_ENTRYPOINT \
-    --config $PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
+    --config "$SC_CONFIG" \
     policy.model_name=Qwen/Qwen3-0.6B \
     policy.automodel_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
