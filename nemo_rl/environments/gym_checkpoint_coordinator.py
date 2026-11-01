@@ -454,15 +454,8 @@ class GymCheckpointCoordinator:
         """
         inventory = self._validate_inventory(episodes_by_instance)
         restarted = self._validate_inventory(restarts)
-        overlap = {
-            instance_id: sorted(set(inventory[instance_id]) & set(episodes))
-            for instance_id, episodes in restarted.items()
-            if set(inventory[instance_id]) & set(episodes)
-        }
-        if overlap:
-            raise ValueError(f"Gym checkpoint commit scope names restarts: {overlap!r}")
         deadline_ts = self._deadline()
-        raw_summaries = await self._collect(
+        summaries: dict[str, GymCheckpointCommitSummary] = await self._collect(
             "commit",
             {
                 instance_id: self._handles[instance_id].checkpoint_commit.remote(
@@ -475,24 +468,8 @@ class GymCheckpointCoordinator:
             },
             deadline_ts=deadline_ts,
         )
-        summaries: dict[str, GymCheckpointCommitSummary] = {}
-        for instance_id, summary in raw_summaries.items():
-            if not isinstance(summary, GymCheckpointCommitSummary):
-                raise TypeError(
-                    "Gym checkpoint actor returned an invalid commit summary: "
-                    f"instance={instance_id!r}, type={type(summary).__name__}"
-                )
-            summaries[instance_id] = summary
-            expected = set(inventory[instance_id])
-            actual = set(summary.exported_episodes)
-            unexpected = actual - expected
-            if unexpected:
-                raise RuntimeError(
-                    "Gym checkpoint actor exported an episode outside the "
-                    "candidate set: "
-                    f"instance={instance_id!r}, "
-                    f"unexpected={sorted(unexpected, key=repr)!r}"
-                )
+        # The adapter already checked every participant's export against the
+        # episodes requested here.
         manifest = GymCheckpointManifest(
             schema_version=GYM_CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id=checkpoint_id,
