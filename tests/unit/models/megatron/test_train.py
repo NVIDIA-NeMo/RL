@@ -1760,10 +1760,8 @@ class TestLossPostProcessor:
         import nemo_rl.models.megatron.train as megatron_train
         from nemo_rl.algorithms.loss.csd import CSDLossFn
 
-        packed_params = MagicMock(
-            cu_seqlens_q=torch.tensor([0, 3], dtype=torch.int32),
-            cu_seqlens_q_padded=torch.tensor([0, 4], dtype=torch.int32),
-        )
+        padded_cu = torch.tensor([0, 4], dtype=torch.int32)
+        packed_params = MagicMock(cu_seqlens_q=padded_cu, cu_seqlens_q_padded=padded_cu)
         with (
             patch.object(
                 megatron_train, "get_tensor_model_parallel_rank", return_value=0
@@ -1794,11 +1792,92 @@ class TestLossPostProcessor:
                 cp_normalize=False,
             )
 
-            processor(data_dict=MagicMock(), packed_seq_params=packed_params)
+            processor(
+                data_dict=BatchedDataDict({"input_lengths": torch.tensor([3])}),
+                packed_seq_params=packed_params,
+            )
 
         mock_csd_wrapper.assert_called_once()
+        assert mock_csd_wrapper.call_args.kwargs["cu_seqlens_q"] == (0, 3)
         mock_fused_wrapper.assert_not_called()
         mock_generic_wrapper.assert_not_called()
+
+    def test_csd_packing_wrapper_takes_raw_boundaries_from_input_lengths(self):
+        """The CSD wrapper gets raw boundaries from input_lengths, not the note."""
+        import nemo_rl.models.megatron.train as megatron_train
+        from nemo_rl.algorithms.loss.csd import CSDLossFn
+
+        padded_cu = torch.tensor([0, 4, 12], dtype=torch.int32)
+        packed_params = MagicMock(cu_seqlens_q=padded_cu, cu_seqlens_q_padded=padded_cu)
+        data = BatchedDataDict({"input_lengths": torch.tensor([3, 5])})
+        with (
+            patch.object(
+                megatron_train, "get_tensor_model_parallel_rank", return_value=0
+            ),
+            patch.object(
+                megatron_train,
+                "get_tensor_model_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch.object(
+                megatron_train,
+                "get_context_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch.object(
+                megatron_train, "CSDSequencePackingLossWrapper"
+            ) as mock_csd_wrapper,
+        ):
+            processor = megatron_train.LossPostProcessor(
+                loss_fn=object.__new__(CSDLossFn),
+                cfg={"sequence_packing": {"enabled": True}},
+                cp_normalize=False,
+            )
+            processor(data_dict=data, packed_seq_params=packed_params)
+
+        wrapper_kwargs = mock_csd_wrapper.call_args.kwargs
+        assert wrapper_kwargs["cu_seqlens_q"] == (0, 3, 8)
+        assert wrapper_kwargs["cu_seqlens_q_padded"] == (0, 4, 12)
+
+    @pytest.mark.parametrize("fuse_loss", [False, True], ids=["generic", "fused"])
+    def test_non_csd_packing_wrapper_reads_boundaries_from_the_note(self, fuse_loss):
+        """Non-CSD packed losses keep taking both boundary lists from the note."""
+        import nemo_rl.models.megatron.train as megatron_train
+
+        padded_cu = torch.tensor([0, 4, 12], dtype=torch.int32)
+        packed_params = MagicMock(cu_seqlens_q=padded_cu, cu_seqlens_q_padded=padded_cu)
+        data = BatchedDataDict({"input_lengths": torch.tensor([3, 5])})
+        wrapper_name = (
+            "SequencePackingFusionLossWrapper"
+            if fuse_loss
+            else "SequencePackingLossWrapper"
+        )
+        with (
+            patch.object(
+                megatron_train, "get_tensor_model_parallel_rank", return_value=0
+            ),
+            patch.object(
+                megatron_train,
+                "get_tensor_model_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch.object(
+                megatron_train,
+                "get_context_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch.object(megatron_train, wrapper_name) as mock_wrapper,
+        ):
+            processor = megatron_train.LossPostProcessor(
+                loss_fn=MagicMock(),
+                cfg={"sequence_packing": {"enabled": True, "fuse_loss": fuse_loss}},
+                cp_normalize=False,
+            )
+            processor(data_dict=data, packed_seq_params=packed_params)
+
+        wrapper_kwargs = mock_wrapper.call_args.kwargs
+        assert wrapper_kwargs["cu_seqlens_q"] == (0, 4, 12)
+        assert wrapper_kwargs["cu_seqlens_q_padded"] == (0, 4, 12)
 
 
 def test_direct_model_loss_normalizes_target_aligned_tokens_and_schedule_scaling():
@@ -2747,6 +2826,59 @@ class TestSparseTeacherLogitsPostProcessor:
 class TestFullLogitsPostProcessor:
     """Tests for CP-aware full-vocabulary teacher-logit export."""
 
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_forward_dispatch_passes_padded_boundaries_without_the_note(
+        self, mock_model_forward
+    ):
+        """The dispatch hands the exporter cu_seqlens_padded, never the packing note."""
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            FullLogitsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        mock_model_forward.return_value = torch.randn(1, 8, 4)
+        padded_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+        data_dict = MagicMock()
+        processed_mb = ProcessedMicrobatch(
+            data_dict=data_dict,
+            input_ids=torch.zeros(1, 8, dtype=torch.long),
+            input_ids_cp_sharded=torch.zeros(1, 8, dtype=torch.long),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=padded_cu,
+                cu_seqlens_kv=padded_cu,
+                cu_seqlens_q_padded=padded_cu,
+                cu_seqlens_kv_padded=padded_cu,
+            ),
+            cu_seqlens_padded=padded_cu,
+            original_seq_length=8,
+        )
+        post_processor = FullLogitsPostProcessor(
+            cfg={
+                "sequence_packing": {"enabled": True},
+                "megatron_cfg": {"context_parallel_size": 1},
+            }
+        )
+        with patch.object(
+            FullLogitsPostProcessor, "__call__", return_value=MagicMock()
+        ) as mock_call:
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=post_processor,
+            )
+
+        mock_call.assert_called_once()
+        call_kwargs = mock_call.call_args.kwargs
+        assert set(call_kwargs) == {"data_dict", "cu_seqlens_padded"}
+        assert call_kwargs["data_dict"] is data_dict
+        assert call_kwargs["cu_seqlens_padded"] is padded_cu
+
     def test_context_parallel_logits_are_relaid_to_contiguous_window(self):
         import nemo_rl.models.megatron.train as megatron_train
 
@@ -2783,8 +2915,6 @@ class TestFullLogitsPostProcessor:
         assert relayout_args.kwargs == {"cp_group": cp_group, "seq_dim": 1}
 
     def test_packed_cp1_restores_dense_logical_rows(self):
-        from megatron.core.packed_seq_params import PackedSeqParams
-
         import nemo_rl.models.megatron.train as megatron_train
 
         data = BatchedDataDict(
@@ -2793,15 +2923,7 @@ class TestFullLogitsPostProcessor:
                 "input_lengths": torch.tensor([3, 2]),
             }
         )
-        raw_cu = torch.tensor([0, 3, 5], dtype=torch.int32)
         padded_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
-        packed_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=raw_cu,
-            cu_seqlens_kv=raw_cu,
-            cu_seqlens_q_padded=padded_cu,
-            cu_seqlens_kv_padded=padded_cu,
-        )
         output = torch.tensor(
             [
                 [
@@ -2829,7 +2951,6 @@ class TestFullLogitsPostProcessor:
             )(
                 data_dict=data,
                 cu_seqlens_padded=padded_cu,
-                packed_seq_params=packed_params,
             )
             loss, result = wrapped(output)
 
@@ -2840,8 +2961,6 @@ class TestFullLogitsPostProcessor:
         assert restored[1, :, 0].tolist() == [10.0, 11.0, 0.0, 0.0, 0.0, 0.0]
 
     def test_packed_cp1_streams_valid_prefixes_without_retaining_tensors(self):
-        from megatron.core.packed_seq_params import PackedSeqParams
-
         import nemo_rl.models.megatron.train as megatron_train
 
         data = BatchedDataDict(
@@ -2850,15 +2969,7 @@ class TestFullLogitsPostProcessor:
                 "input_lengths": torch.tensor([3, 2]),
             }
         )
-        raw_cu = torch.tensor([0, 3, 5], dtype=torch.int32)
         padded_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
-        packed_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=raw_cu,
-            cu_seqlens_kv=raw_cu,
-            cu_seqlens_q_padded=padded_cu,
-            cu_seqlens_kv_padded=padded_cu,
-        )
         output = torch.tensor(
             [
                 [
@@ -2898,7 +3009,6 @@ class TestFullLogitsPostProcessor:
             wrapped = processor(
                 data_dict=data,
                 cu_seqlens_padded=padded_cu,
-                packed_seq_params=packed_params,
             )
             _, result = wrapped(output)
 
@@ -2917,8 +3027,6 @@ class TestFullLogitsPostProcessor:
         )
 
     def test_packed_cp2_uses_per_sequence_head_tail_boundaries(self):
-        from megatron.core.packed_seq_params import PackedSeqParams
-
         import nemo_rl.models.megatron.train as megatron_train
 
         cp_group = MagicMock()
@@ -2928,15 +3036,7 @@ class TestFullLogitsPostProcessor:
                 "input_lengths": torch.tensor([3, 5]),
             }
         )
-        raw_cu = torch.tensor([0, 3, 8], dtype=torch.int32)
         padded_cu = torch.tensor([0, 4, 12], dtype=torch.int32)
-        packed_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=raw_cu,
-            cu_seqlens_kv=raw_cu,
-            cu_seqlens_q_padded=padded_cu,
-            cu_seqlens_kv_padded=padded_cu,
-        )
         local_output = torch.arange(6, dtype=torch.float32).reshape(1, 6, 1)
         gathered = [
             torch.tensor([[[1.0], [2.0], [3.0], [99.0]]]),
@@ -2967,7 +3067,6 @@ class TestFullLogitsPostProcessor:
             )(
                 data_dict=data,
                 cu_seqlens_padded=padded_cu,
-                packed_seq_params=packed_params,
             )
             _, result = wrapped(local_output)
 
@@ -2980,8 +3079,6 @@ class TestFullLogitsPostProcessor:
         assert mock_allgather.call_args_list[1].args[0].shape == (1, 4, 1)
 
     def test_packed_cp2_streams_zero_overlap_rows_and_keeps_collective_order(self):
-        from megatron.core.packed_seq_params import PackedSeqParams
-
         import nemo_rl.models.megatron.train as megatron_train
 
         cp_group = MagicMock()
@@ -2991,15 +3088,7 @@ class TestFullLogitsPostProcessor:
                 "input_lengths": torch.tensor([3, 5]),
             }
         )
-        raw_cu = torch.tensor([0, 3, 8], dtype=torch.int32)
         padded_cu = torch.tensor([0, 4, 12], dtype=torch.int32)
-        packed_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=raw_cu,
-            cu_seqlens_kv=raw_cu,
-            cu_seqlens_q_padded=padded_cu,
-            cu_seqlens_kv_padded=padded_cu,
-        )
         local_output = torch.arange(6, dtype=torch.float32).reshape(1, 6, 1)
         gathered = [
             torch.tensor([[[1.0], [2.0], [3.0], [99.0]]]),
@@ -3033,7 +3122,6 @@ class TestFullLogitsPostProcessor:
             wrapped = processor(
                 data_dict=data,
                 cu_seqlens_padded=padded_cu,
-                packed_seq_params=packed_params,
             )
             _, result = wrapped(local_output)
 
