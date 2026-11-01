@@ -66,6 +66,15 @@ def main():
     if missing_keys:
         print(f"Warning: skipping keys not found in history: {missing_keys}")
     keys = [key for key in keys if key in raw_history.columns]
+    # The wandb row index (_step) also advances on non-training logs (e.g. ray
+    # metrics), so index by the trainer's own step when it is logged.
+    if "nemo_rl/step" in raw_history.columns:
+        raw_history = (
+            raw_history.dropna(subset=["nemo_rl/step"])
+            .astype({"nemo_rl/step": int})
+            .groupby("nemo_rl/step")
+            .first()
+        )
     history = raw_history.loc[min_step:max_step, keys]
 
     # get average of the history
