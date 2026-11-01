@@ -212,11 +212,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         # placement_bundle_indices / per_worker_gpu_share named params that
         # unconditionally overwrite kwargs["ray_placement_config"] — so we
         # must pass these as top-level kwargs, not via ray_placement_config.
-        print(
-            f"[TrtllmAsyncWorker] bundle_indices={self._bundle_indices}, "
-            f"pg={pg}, bundle_specs={pg.bundle_specs}",
-            flush=True,
-        )
+        print(f"[TrtllmAsyncWorker] bundle_indices={self._bundle_indices}", flush=True)
 
         # TRT-LLM expects one bundle-index list per placement group. A unified
         # PG can contain bundles on multiple nodes, allowing one TP replica to
@@ -229,6 +225,11 @@ class TrtllmAsyncGenerationWorkerImpl:
             backend="pytorch",
             tensor_parallel_size=tp_size,
             dtype=engine_cfg["precision"],
+            # "dummy" during training: the initial refit lands before the
+            # first request, so loading the checkpoint here is wasted startup
+            # time. configure_generation_config decides; "auto" is TRT-LLM's
+            # own default and the value evaluation gets.
+            load_format=engine_cfg.get("load_format", "auto"),
             max_seq_len=engine_cfg["max_model_len"],
             max_batch_size=engine_cfg["max_batch_size"],
             max_num_tokens=engine_cfg["max_num_tokens"],
@@ -427,6 +428,14 @@ class TrtllmAsyncGenerationWorkerImpl:
         if self._http_base_url is not None:
             return self._http_base_url
 
+        from nemo_rl.utils.fastokens import (
+            check_fastokens_applied,
+            maybe_patch_fastokens,
+        )
+
+        # Apply fastokens inside this Ray actor before constructing the tokenizer.
+        maybe_patch_fastokens(False)
+
         from transformers import AutoTokenizer
 
         from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
@@ -435,6 +444,8 @@ class TrtllmAsyncGenerationWorkerImpl:
             self.model_name,
             trust_remote_code=True,
         )
+        tokenizer_backend = check_fastokens_applied(tokenizer)
+        print(f"[TrtllmAsyncWorker] HTTP tokenizer backend: {tokenizer_backend}")
         self._http_thread, self._http_base_url, self._http_server = start_server(
             llm=self.llm,
             tokenizer=tokenizer,
@@ -448,6 +459,12 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "temperature": self.cfg["temperature"],
                 "top_p": self.cfg["top_p"],
                 "top_k": self.cfg["top_k"],
+            },
+            # grpo.validate() stamps validation rollouts with this profile.
+            val_sampling_config={
+                "temperature": self.cfg["val_temperature"],
+                "top_p": self.cfg["val_top_p"],
+                "top_k": self.cfg["val_top_k"],
             },
             stop_token_ids=list(self.cfg.get("stop_token_ids") or []),
             default_chat_template_kwargs=self.engine_cfg.get(
