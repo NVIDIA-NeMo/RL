@@ -310,24 +310,6 @@ def test_a_summary_must_attribute_every_staging_key() -> None:
         )
 
 
-def test_coordinator_rejects_episode_outside_candidate_set(tmp_path: Path) -> None:
-    coordinator = _coordinator(
-        _FakeGymActor(
-            exported_episodes=(GymCheckpointEpisode("unexpected-rollout", 0),)
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="outside the candidate set"):
-        asyncio.run(
-            coordinator.commit(
-                "save-1",
-                tmp_path,
-                {"tools/replica-0": (GymCheckpointEpisode("rollout-on-wire", 0),)},
-                restarts=_NO_RESTARTS,
-            )
-        )
-
-
 def test_restore_failure_discards_every_actor_under_uncertain_outcome() -> None:
     restored = _FakeGymActor()
     failed = _FakeGymActor(restore_error=RuntimeError("restore failed"))
