@@ -104,8 +104,8 @@ class ProfileBandChannel(BaseModel, extra="forbid"):
     or larger for longer rollouts.
     """
 
-    a: float
-    b: float
+    a: float = Field(allow_inf_nan=False)
+    b: float = Field(allow_inf_nan=False)
     f: float = Field(ge=0, le=1)
 
     @model_validator(mode="after")
@@ -982,7 +982,19 @@ def _band_multiplier(rl: int, ch: dict[str, Any] | None) -> float:
     a = ch.get("a")
     b = ch.get("b")
     f = ch.get("f")
-    if a is None or b is None or f is None or b <= a:
+    if (
+        not isinstance(a, (int, float))
+        or not isinstance(b, (int, float))
+        or not isinstance(f, (int, float))
+    ):
+        return 1.0
+    if any(
+        isinstance(value, bool)
+        or (isinstance(value, float) and not math.isfinite(value))
+        for value in (a, b, f)
+    ):
+        return 1.0
+    if b <= a or not 0 <= f <= 1:
         return 1.0
     if rl <= a:
         return 1.0
