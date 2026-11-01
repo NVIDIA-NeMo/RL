@@ -87,6 +87,7 @@ def mock_loss_fn():
     loss_fn = MagicMock()
     loss_fn.return_value = (torch.tensor(0.5), {"loss": 0.5})
     loss_fn.input_type = LossInputType.LOGIT
+    loss_fn.score_centering = False
     return loss_fn
 
 

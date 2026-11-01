@@ -68,7 +68,7 @@ from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
 )
-from nemo_rl.models.policy import MegatronConfig, PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -1502,6 +1502,83 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "reward_penalties require the NeMo-Gym rollout path "
             "(env.should_use_nemo_gym=true) on SingleController"
         )
+
+    generation_cfg = master_config.policy["generation"]
+    top_logprobs = generation_cfg.get("top_logprobs", 0)
+    if (
+        isinstance(top_logprobs, bool)
+        or not isinstance(top_logprobs, int)
+        or top_logprobs < 0
+    ):
+        raise ValueError("policy.generation.top_logprobs must be a nonnegative integer")
+    if top_logprobs > 0 and not master_config.loss_fn.score_centering:
+        raise ValueError(
+            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering; "
+            "set it to 0 or enable score centering"
+        )
+    if top_logprobs > 0:
+        if master_config.policy["generation"]["backend"] != "vllm":
+            raise ValueError(
+                "policy.generation.top_logprobs requires the vllm generation backend"
+            )
+        if not master_config.token_capture.enabled:
+            raise ValueError(
+                "policy.generation.top_logprobs requires token_capture.enabled=true"
+            )
+    if master_config.loss_fn.score_centering:
+        if top_logprobs == 0:
+            raise ValueError(
+                "loss_fn.score_centering requires policy.generation.top_logprobs > 0"
+            )
+        generation_cfg = master_config.policy["generation"]
+        temperature = generation_cfg["temperature"]
+        logprobs_mode = (generation_cfg.get("vllm_cfg") or {}).get("logprobs_mode")
+        if logprobs_mode is None:
+            logprobs_mode = (generation_cfg.get("vllm_kwargs") or {}).get(
+                "logprobs_mode"
+            )
+        if temperature <= 0 or not math.isfinite(temperature):
+            raise ValueError(
+                "loss_fn.score_centering requires a finite positive sampling temperature"
+            )
+        if logprobs_mode not in (None, "raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                "loss_fn.score_centering requires log probabilities, not raw/processed logits"
+            )
+        if logprobs_mode != "processed_logprobs" and temperature != 1.0:
+            raise ValueError(
+                "loss_fn.score_centering requires policy.generation.vllm_cfg.logprobs_mode="
+                "processed_logprobs when policy.generation.temperature != 1.0"
+            )
+        if (
+            generation_cfg.get("top_p") != 1.0
+            or generation_cfg.get("top_k") is not None
+        ):
+            raise ValueError(
+                "loss_fn.score_centering needs unfiltered sampling "
+                "(policy.generation.top_p=1, top_k=null) so the captured top-k is "
+                "the sampling distribution"
+            )
+
+        automodel_cfg = master_config.policy.get("automodel_cfg")
+        if automodel_cfg is not None and automodel_cfg["enabled"]:
+            enabled_automodel_cfg = cast(AutomodelConfig, automodel_cfg)
+            if (
+                enabled_automodel_cfg["tensor_parallel_size"] > 1
+                or enabled_automodel_cfg["context_parallel_size"] > 1
+            ):
+                raise ValueError(
+                    "loss_fn.score_centering supports Automodel only with "
+                    "tensor_parallel_size=1 and context_parallel_size=1; use Megatron for TP/CP"
+                )
+        megatron_cfg = master_config.policy.get("megatron_cfg") or {}
+        if megatron_cfg.get("enabled") and megatron_cfg.get(
+            "use_fused_linear_logprobs"
+        ):
+            raise ValueError(
+                "loss_fn.score_centering needs vocabulary logits; disable "
+                "policy.megatron_cfg.use_fused_linear_logprobs"
+            )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(

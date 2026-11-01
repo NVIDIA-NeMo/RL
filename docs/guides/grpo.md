@@ -498,6 +498,9 @@ policy:
 - The `fused_linear_logprobs_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
 
 ## Loss
+For the optional correction based on the sampler's captured top-k distribution,
+see [Score Centering](score-centering.md).
+
 We use the [ClippedPGLossFn](../../nemo_rl/algorithms/loss/loss_functions.py) to calculate the loss for GRPO. Formally,
 
 $$

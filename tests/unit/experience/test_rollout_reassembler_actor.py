@@ -147,6 +147,7 @@ def test_actor_forwards_capture_media_to_the_reassembler(
         router_replay_enabled=False,
         defer_routed_experts_to_policy=False,
         max_seq_len=4096,
+        top_logprobs=0,
         capture_media=capture_media,
         media_columns=(
             MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=16)
@@ -264,6 +265,7 @@ def test_factory_selects_gym_environment_and_waits_for_dependencies(
         max_seq_len=4096,
         capture_media=False,
         media_columns=None,
+        top_logprobs=0,
     )
     dp_config = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
     actors = [MagicMock(), MagicMock()]
