@@ -19,28 +19,32 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 ### AutoModel full-batch baseline
 
 AutoModel supports the initial text GRPO baseline: dense and MoE full-parameter FSDP2,
-TP=CP=EP=1, fixed microbatches, disaggregated async vLLM, `in_order` with
+TP=CP=1, fixed microbatches, disaggregated async vLLM, `in_order` with
 `max_lookahead_versions: 0`, and a streaming threshold equal to
 `grpo.num_prompts_per_step`. Packing, dynamic batching, CPU offload, HSDP,
 LoRA, draft training, VLM, PPO, and distillation are not enabled in this stage.
 Both prompt-drop budgets must be zero. Explicit unsupported settings fail at
 setup; the worker also rejects unsupported model properties before training.
 
+Expert parallelism uses the existing AutoModel MoE path; SC does not impose
+EP=1. Configure `policy.automodel_cfg.expert_parallel_size` and a compatible
+dispatcher for the model and allocated training GPUs. The same full-batch
+lifecycle and gradient clipping operate on AutoModel's expert mesh.
+
 One full-batch dispatch still runs multiple backend forward/backward passes.
 The optimizer and scheduler advance once, in `finish_train_step`; abort clears
 pending gradients without an update. The existing synchronous AutoModel training
 path retains its broader configuration support.
 
-Run the five-step Gemma4 E2B integration smoke on one eight-GPU node:
+Run the checkpoint/resume integration smoke on two GPUs:
 
 ```bash
 bash tests/functional/automodel_sc_full_batch_smoke.sh
 ```
 
-The script uses the existing Gemma recipe with SC-specific overrides, splits four
-GPUs each for training and generation, and enables W&B. Append normal config
-overrides for a local model path, W&B name, or log directory. It disables the
-DAPO sampling/reward transformations that SC does not implement.
+The script uses the Qwen2.5-1.5B SC recipe with one training GPU and one rollout
+GPU. It saves after step 1 and resumes through step 4. Append normal config
+overrides for a local model path, W&B logging, or log directory.
 
 For numerical parity, run the fixed-data test in the AutoModel environment:
 

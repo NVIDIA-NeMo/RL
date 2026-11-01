@@ -8,10 +8,13 @@ synchronous `AutomodelPolicyWorkerImpl.train()` remains byte-for-byte unchanged.
 The previous experimental branch is preserved separately; its validation results
 are not evidence for this revised implementation.
 
-Supported scope is text GRPO, full-parameter FSDP2, TP=CP=EP=1, fixed
+Supported scope is text GRPO, full-parameter FSDP2, TP=CP=1, fixed
 microbatches, disaggregated async vLLM, `in_order`, and lookahead zero. Dense and
-MoE models use the same lifecycle. EP>1 is a parallelism extension, not a
-prerequisite for MoE. Validation targets Gemma4 E2B and Qwen3-30B-A3B at EP=1.
+MoE models use the same lifecycle. Expert parallelism uses AutoModel's existing
+MoE mesh, dispatcher, gradient synchronization, and distributed clipping.
+The SC lifecycle does not impose an EP=1 restriction. Model and parallelism
+qualification is recorded separately below; removing a guard does not establish
+correctness for every expert layout or dispatcher.
 Model-specific numerical/refit support remains subject to the existing backend.
 
 Packing, dynamic batching, HSDP, CPU offload, LoRA, draft training, VLM,
@@ -123,8 +126,9 @@ capability-specific tests rather than dense-versus-MoE implementations.
    sequence-normalized losses over multiple updates. Exercise metadata fetch,
    retained-gradient logprob transitions, and abort. Use `rtol=1e-5`, `atol=1e-6`;
    report observed errors, not only a pass flag.
-4. Run dense and MoE EP=1 initialization, generation/refit, loss/KL and checkpoint
-   resume gates before matched 100-step integration runs. Record source hashes,
+4. Run dense and MoE initialization, generation/refit, loss/KL and checkpoint
+   resume gates at the parallelism layout being qualified before matched
+   100-step integration runs. Record source hashes,
    resolved configuration, environment differences, Slurm status and W&B links.
 5. Independent rollout curves establish integration behavior, not exact numerical
    parity or learning-quality equivalence. Disclose transport differences if the
@@ -138,7 +142,7 @@ wrapper tests remain backend independent.
 | Layer | AutoModel coverage | Discovery |
 | --- | --- | --- |
 | Worker unit tests | `tests/unit/models/policy/test_automodel_split_state.py`: lifecycle, guards, failure cleanup, buffer and MoE hook behavior | Existing AutoModel L0 policy shards |
-| GPU numerical parity | `tests/unit/models/policy/test_automodel_split_parity.py`: tiny Llama, two FSDP ranks, two updates for each loss normalization, masks and gradient accumulation | Existing AutoModel L0 policy shards; HF-gated marker, like MCore's tiny-model fixture |
+| GPU numerical parity | `tests/unit/models/policy/test_automodel_split_parity.py`: tiny Llama at EP=1 and native Qwen3 MoE at EP=2, two ranks, two updates for each loss normalization, masks and gradient accumulation | Existing AutoModel L0 policy shards; HF-gated marker, like MCore's tiny-model fixture |
 | Configuration | `tests/unit/single_controller/test_automodel_config.py`: base exemplar, prompt-count overrides, derived regression recipe, and unsupported configurations | Shared L0 controller suite |
 | Live integration | `tests/functional/automodel_sc_full_batch_smoke.sh`: Qwen2.5-1.5B, one training and one rollout GPU, timeout checkpoint at step 1, resume through step 4 | `L1_Functional_Tests_Automodel_SingleController.sh`, including FAST |
 | Longer regression | `grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch` recipe and matching driver: 100 updates, finite metrics, zero lag, logprob health and final checkpoint | `tests/test_suites/nightly.txt` |
@@ -149,8 +153,11 @@ gradients, returned metrics, model parameters/buffers, optimizer and scheduler
 state. It also checks retained gradients across logprob inference and rollback
 after an aborted backward. Its local metadata transport isolates worker
 numerics; L1 exercises Ray dispatch, network TransferQueue, async vLLM and refit.
-The tiny model uses the Hugging Face implementation inside AutoModel. Native
-dense/MoE architecture qualification remains separate from this small CI test.
+The dense test uses the Hugging Face implementation inside AutoModel. A second
+parameterization uses native Qwen3 MoE with four experts, two selected per token,
+and EP=2 with the HybridEP dispatcher. It exercises the same parity and lifecycle
+checks with actual expert communication. Large-model and multi-node qualification
+remains separate from these small CI tests.
 
 L1 checks checkpoint artifacts and restore messages, and requires exactly step 1
 before restart and steps 2–4 afterward. It tests save/resume mechanics, not
@@ -268,3 +275,112 @@ For TP=4 MoE generation, the validation launcher starts one explicit Ray head
 and exports `RAY_ADDRESS` to all children. Without that address, vLLM's spawned
 EngineCore started a second cluster and failed to find the original placement
 group. This launcher adjustment is shared by the upstream and SC MoE runs.
+
+## Expert-parallel worker qualification
+
+The EP=1-only SC checks have been removed from configuration validation and
+`begin_train_step`. The existing V1 `train()` method remains unchanged.
+EP dispatch, synchronization, and clipping continue to use the existing
+AutoModel numerical primitives.
+
+The live EP=16 gate also exposed an existing TQ padding omission: the metadata
+logprob path ignored the consuming model's `make_sequence_length_divisible_by`
+when the producer supplied no padding hint. A 2336-token forward then failed
+HybridEP's 64-token alignment assertion before training. TQ now includes the
+model's configured alignment when minting its shared driver/worker forward
+target, for ordinary and pre-placed metadata. This is a backend-independent
+padding correction; the AutoModel forward/backward and optimizer code is unchanged.
+
+The regression suite passed 99 tests, including exact distributed V1/SC
+comparisons on a tiny dense model at EP=1 and native Qwen3 MoE at EP=2.
+Both use two training ranks. The MoE test uses four experts, top-2 routing,
+and HybridEP; both loss normalization modes, gradient accumulation, masked
+samples, metadata fetch, retained gradients, and abort are covered.
+Shared TQ regressions additionally verify configured sequence alignment for
+driver reads, worker fetches, and pre-placed metadata, including combinations
+with producer hints and dynamic batching.
+
+Qwen3.5-35B-A3B Base additionally passed six consecutive real GRPO updates
+on sixteen training GPUs with EP=16 and HybridEP. Under strict deterministic
+execution, all 96 rank/update comparisons matched exactly with `rtol=atol=0`:
+pre-clipping gradients,
+returned metrics, model parameters/buffers, raw FusedAdam state, scheduler,
+and RNG state. Each rank accumulated two microbatches per update.
+Retained-gradient logprob inference, finish/abort dispatcher cleanup, abort
+state restoration, and restoration of the V1 producer trajectory also passed.
+These six real batches contained no masked rows; masking coverage comes from
+the distributed tiny-model test.
+[EP=16 replay run](https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/49e86fc5).
+
+The initial sixteen-rank logprob check also passed: mean KL was 0.0003923
+for HF/vLLM, 0.0003598 for HF/AutoModel, and 0.0004114 for vLLM/AutoModel,
+using sixteen prompts and a 0.01 threshold. The HF reference was available.
+This qualification uses the unmodified AutoModel revision already pinned by
+the PR, `b916107a5ce8e77a3f18682f8b0eaa46a4b54389`. It does not use the
+external dtype-grouping patch needed by the earlier Qwen3.5 EP=1 experiment.
+
+The live EP=16 V1 and SC checkpoint gates both saved at update 1, restored
+in a fresh process, and completed updates 2–3 with finalized model and optimizer
+checkpoints. SC policy lag remained zero; resumed updates had nonzero gradients
+and finite training metrics. The existing two-GPU dense SC smoke test also
+passed save-at-1/resume-through-4 on the shared TQ padding correction.
+[EP=16 SC checkpoint run](https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/30751deb).
+
+## Matched 100-update training curves
+
+The following figures compare the newer Gemma4 E2B IT pair and the Qwen3.5
+35B-A3B Base EP=16 pair in the `nemo-rl-automodel-sc` W&B project. They are
+separate from the earlier runs in `nemorl-gemma4` described above and from the
+Qwen3.5 EP=1 experiment that required an external AutoModel patch. The EP=16
+pair uses the unmodified pinned AutoModel source.
+
+Each pair uses seed 42, global batch size 32, microbatch size 1, and matched
+model, optimizer, and sampling settings. SC uses full-batch dispatch, in-order
+sampling, and lookahead zero. V1 uses legacy Ray data transport; SC uses TQ.
+Rollouts are sampled independently, so the curves describe training behavior
+rather than exact numerical parity or a statistically established quality
+difference. Identical-input worker replay provides the separate numerical
+equivalence evidence.
+
+All five panels use the original NeMo RL metric names: `train/reward`,
+`train/mean_gen_tokens_per_sample`, `train/loss`, `train/gen_kl_error`, and
+`train/approx_entropy`. Every metric has 100 finite values per run. Plotted
+values come from the complete exported W&B histories and were checked against
+the native TensorBoard records. Faint lines show every raw update; solid lines
+show trailing 10-update means, starting at update 10. No updates are removed.
+
+### Gemma4 E2B IT
+
+Each run uses four training and four rollout H100 GPUs, with EP=1.
+[V1 run](https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/cf9668ea) and
+[SC run](https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/afadd4ca).
+
+![Gemma4 E2B IT: V1 versus full-batch SC over 100 updates, showing reward, mean generated tokens per sample, loss, generation KL error, and approximate entropy.](../assets/automodel-sc/gemma4-e2b-v1-vs-sc-100steps.png)
+
+### Qwen3.5-35B-A3B Base, EP=16
+
+Each run uses sixteen training H100 GPUs with HybridEP and eight rollout H100
+GPUs with TP=8. Both completed 100 updates and saved final checkpoints.
+The V1 run resumed from update 20 after a storage-quota interruption; the SC
+run resumed from update 94 at its allocation boundary. Each plotted history
+contains updates 1–100 once, and SC policy-version lag stayed zero.
+[V1 run](https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/2a121400) and
+[SC run](https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/c926b37d).
+
+![Qwen3.5-35B-A3B Base at EP=16: V1 versus full-batch SC over 100 updates, showing reward, mean generated tokens per sample, loss, generation KL error, and approximate entropy.](../assets/automodel-sc/qwen3.5-35ba3b-ep16-v1-vs-sc-100steps.png)
+
+The curves do not resolve the outstanding SC logprob-error outlier at update
+74: `train/token_mult_prob_error` reached 1.62247 and
+`train/max_seq_mult_prob_error` reached 17.41849. Those diagnostics are distinct
+from the plotted `train/gen_kl_error`, which remained finite. The outlier needs
+investigation before treating this live comparison as fully qualified.
+
+For reference, the means over all 100 updates are:
+
+| Native metric | Gemma4 V1 | Gemma4 SC | Qwen3.5 EP16 V1 | Qwen3.5 EP16 SC |
+| --- | ---: | ---: | ---: | ---: |
+| `train/reward` | 0.339375 | 0.352188 | 0.291875 | 0.276563 |
+| `train/mean_gen_tokens_per_sample` | 1734.29 | 1710.88 | 1755.90 | 1801.75 |
+| `train/loss` | 0.019315 | 0.017606 | 0.023737 | 0.021416 |
+| `train/gen_kl_error` | 0.00038688 | 0.00038830 | 0.00091623 | 0.00090550 |
+| `train/approx_entropy` | 0.177857 | 0.186579 | 0.478026 | 0.479710 |
