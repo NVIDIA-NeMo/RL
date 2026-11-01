@@ -270,7 +270,10 @@ def _spinup_gym_behind_policy_proxy(
         hold_first_tool_result=os.environ.get("SC_TURN_RECOVERY_HOLD_FIRST_TOOL_RESULT")
         == "1",
         follow_up_tool=os.environ.get("SC_TURN_RECOVERY_FOLLOW_UP_TOOL") or None,
-        events_path=Path(os.environ["SC_TURN_RECOVERY_TEST_EVENTS"]),
+        events_path=Path(
+            os.environ.get("SC_GYM_RECOVERY_TEST_EVENTS")
+            or os.environ["SC_TURN_RECOVERY_TEST_EVENTS"]
+        ),
     ).start()
     _policy_proxies.append(proxy)
     return _original_spinup_gym(*args, base_urls=proxy.base_urls, **kwargs)
