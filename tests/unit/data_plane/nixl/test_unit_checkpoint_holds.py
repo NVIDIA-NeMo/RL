@@ -19,9 +19,8 @@ every exit drops exactly the holds taken. CPU-only, no Ray actor.
 import os
 import threading
 
-import pytest
-
 import msgspec
+import pytest
 
 from nemo_rl.data_plane import nixl_storage_unit
 from nemo_rl.data_plane.nixl import blob_format

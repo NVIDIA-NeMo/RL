@@ -47,7 +47,6 @@ import numpy as np
 
 from nemo_rl.data_plane.nixl import nixl_io
 
-
 log = logging.getLogger(__name__)
 
 

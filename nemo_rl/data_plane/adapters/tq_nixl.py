@@ -55,18 +55,18 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 import ray
 import torch
-from ray.util.placement_group import placement_group_table
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
 from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
 from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
 
 from nemo_rl.data_plane.adapters import tq_nixl_checkpoint
+from nemo_rl.data_plane.interfaces import NixlStoreConfig
 from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.blobstore import (
     BUSY_RETRY_MAX_S,
@@ -103,9 +103,12 @@ def _as_dict(cfg: Any) -> dict[str, Any]:
     return dict(cfg or {})
 
 
-# Default lease_margin_s: a pinned read's lease is transfer_timeout_s + this
-# margin (design §3.2).
-LEASE_MARGIN_S = 30.0
+def _config(cfg: Any) -> dict[str, Any]:
+    """The NixlStore block checked by ``NixlStoreConfig``.
+
+    Its defaults fill what is unset, and a misspelled ``ssd`` / ``nixl`` key fails.
+    """
+    return NixlStoreConfig.model_validate(_as_dict(cfg)).model_dump()
 
 
 def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
@@ -115,9 +118,10 @@ def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
     for ``transfer_timeout_s`` needs ``read_pin_s`` to cover it with margin
     (design §3.3); anything shorter is rejected.
     """
-    timeout_s = float(cfg.get("transfer_timeout_s", 120.0))
-    margin = float(cfg.get("lease_margin_s", LEASE_MARGIN_S))
-    pin = cfg.get("read_pin_s")
+    cfg = _config(cfg)
+    timeout_s = float(cfg["transfer_timeout_s"])
+    margin = float(cfg["lease_margin_s"])
+    pin = cfg["read_pin_s"]
     read_pin_s = timeout_s + margin if pin is None else float(pin)
     if read_pin_s < timeout_s + margin:
         raise ValueError(
@@ -126,7 +130,7 @@ def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
             "for transfer_timeout_s, and its source region must not be reused "
             "before it ends"
         )
-    op = cfg.get("op_timeout_s")
+    op = cfg["op_timeout_s"]
     op_timeout_s = 2 * timeout_s if op is None else float(op)
     return timeout_s, read_pin_s, op_timeout_s
 
@@ -134,8 +138,8 @@ def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
 def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
     """Unit kwargs for the SSD tier, or None when ``ssd.enabled`` is off.
 
-    ``ssd: {enabled, dir, staging_bytes, pickup_s}``: when a unit's put area cannot
-    take a put, the put goes to a file under ``dir`` (node-local NVMe) from birth,
+    ``ssd: {enabled, path, staging_bytes, pickup_s}``: when a unit's put area cannot
+    take a put, the put goes to a file under ``path`` (node-local NVMe) from birth,
     through an IO area of ``staging_bytes`` carved from the slab; reads of such
     blobs are staged back into the same area. Data already in the put area never
     moves.
@@ -145,12 +149,13 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
     and the newest goes to disk. The ``windowed`` sampler with freshest-first
     selection works but spills the data it reads next.
     """
-    ssd = _as_dict(cfg.get("ssd") or {})
-    if not ssd.get("enabled", False):
+    cfg = _config(cfg)
+    ssd = cfg["ssd"]
+    if not ssd["enabled"]:
         return None
-    slab = int(cfg.get("unit_slab_bytes", 1 << 30))
-    staging = int(ssd.get("staging_bytes", slab // 4))
-    pickup_s = float(ssd.get("pickup_s", 10.0))
+    slab = int(cfg["unit_slab_bytes"])
+    staging = int(ssd["staging_bytes"] or slab // 4)
+    pickup_s = float(ssd["pickup_s"])
     if not 0 < staging < slab:
         raise ValueError(
             f"NixlStore ssd.staging_bytes={staging} must be in (0, unit_slab_bytes={slab})"
@@ -162,7 +167,7 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
             f"NixlStore ssd.pickup_s={pickup_s} must be >= {2 * BUSY_RETRY_MAX_S}"
         )
     return {
-        "ssd_dir": str(ssd.get("dir", "/tmp/nvdp-ssd")),
+        "ssd_dir": ssd["path"],
         "staging_bytes": staging,
         "pickup_s": pickup_s,
     }
@@ -239,6 +244,15 @@ class TimedLock:
     def __exit__(self, *exc: Any) -> None:
         self._lock.release()
 
+    @contextlib.contextmanager
+    def released(self):
+        """Let other threads use the client while the holder sleeps."""
+        self._lock.release()
+        try:
+            yield
+        finally:
+            self.__enter__()
+
     def snapshot(self) -> tuple[int, float, float]:
         """``(waits, wait_ms_sum, wait_ms_max)``; plain reads, so it never waits itself."""
         return self.waits, self.wait_ms_sum, self.wait_ms_max
@@ -247,18 +261,16 @@ class TimedLock:
 @StorageClientFactory.register("NixlStoreClient")
 class NixlKVClient(StorageKVClient):
     def __init__(self, config: dict[str, Any]):
-        cfg = _as_dict(config)
+        cfg = _config(config)
         super().__init__(cfg)
         self.namespace = cfg.get("namespace", DEFAULT_NAMESPACE)
         directory = ray.get_actor(
             cfg.get("directory_name", "BlobDirectory"), namespace=self.namespace
         )
-        nixl_cfg = _as_dict(cfg.get("nixl") or {})
-        init_params = dict(nixl_cfg.get("backend_init_params") or {})
         self.ep = NixlEndpoint(
             f"client-{os.getpid()}-{uuid.uuid4().hex[:6]}",
-            backend=nixl_cfg.get("backend_name", "UCX"),
-            init_params=init_params,
+            backend=cfg["nixl"]["backend_name"],
+            init_params=dict(cfg["nixl"]["backend_init_params"]),
             prog_thread=False,
         )
         # Serialises every NIXL agent call (the agent is not thread-safe) and
@@ -270,7 +282,8 @@ class NixlKVClient(StorageKVClient):
         # process every 30 s while they change, to judge lock contention.
         self._op_mu = threading.Lock()
         self._ops, self._op_ms = 0, 0.0
-        self._stats_at, self._stats_last = time.monotonic(), None
+        self._stats_at = time.monotonic()
+        self._stats_last: tuple | None = None
         try:
             ctx = ray.get_runtime_context()
             self._who = f"pid={os.getpid()} node={ctx.get_node_id()[:8]} actor={ctx.get_actor_name() or '-'}"
@@ -279,50 +292,51 @@ class NixlKVClient(StorageKVClient):
         self.pool = BufferPool(
             self.ep,
             self._lock,
-            base_bytes=int(cfg.get("client_staging_bytes", 256 << 20)),
-            base_count=int(cfg.get("client_staging_buffers", 2)),
-            max_oversize_bytes=int(cfg.get("client_pool_max_bytes", 8 << 30)),
+            base_bytes=int(cfg["client_staging_bytes"]),
+            base_count=int(cfg["client_staging_buffers"]),
+            max_oversize_bytes=int(cfg["client_pool_max_bytes"]),
         )
         # Zero-copy put: register the caller's own value memory and RDMA from it.
         # Pays off only where registration is cheap (UCX caches reused heap
         # ranges): ~0.02 ms at 16 MB, but ~70 ms per fresh 1 GiB mapping, where a
         # parallel copy into a pooled buffer takes ~10 ms. Hence a size window.
         # Zero-copy sources of WRITEs that failed short of DONE, kept registered
-        # and referenced until the process exits (see _put_segments).
+        # and referenced until the process exits (see _put_blobs).
         self.retained_sources: list[tuple[int, np.ndarray, Any]] = []
         self.retained_source_bytes = 0
-        self.zero_copy_min = int(cfg.get("zero_copy_min_bytes", 1 << 20))
-        self.zero_copy_max = int(cfg.get("zero_copy_max_bytes", 32 << 20))
-        self.parallel_copy_min = int(cfg.get("parallel_copy_min_bytes", 16 << 20))
+        self.zero_copy_min = int(cfg["zero_copy_min_bytes"])
+        self.zero_copy_max = int(cfg["zero_copy_max_bytes"])
+        self.parallel_copy_min = int(cfg["parallel_copy_min_bytes"])
         # read_pin_s must match the units' pin TTL: a READ that completes after
         # its pin expired may have observed a reused region and is discarded.
         # Every put / get also has one deadline, op_timeout_s, that bounds all
         # of its waits (pool, ZMQ replies, transfers, Busy retries).
         self.timeout_s, self.read_pin_s, self.op_timeout_s = check_timeouts(cfg)
-        GRAVEYARD.max_bytes = int(cfg.get("graveyard_max_bytes", GRAVEYARD.max_bytes))
+        GRAVEYARD.max_bytes = int(cfg["graveyard_max_bytes"])
         self._check = (
-            bool(cfg.get("debug_check_finite", False))
-            or os.environ.get("NVDP_CHECK_FINITE") == "1"
+            cfg["debug_check_finite"] or os.environ.get("NVDP_CHECK_FINITE") == "1"
         )
         ssd = ssd_config(cfg)
         # A blob is one region of one unit's put area (the slab minus SSD
         # staging); a put bigger than max_blob_bytes is split at key
         # boundaries into several blobs, so it fits a unit with room to spare.
-        area = int(cfg.get("unit_slab_bytes", 1 << 30))
+        area = int(cfg["unit_slab_bytes"])
         area -= ssd["staging_bytes"] if ssd else 0
-        self.max_blob_bytes = int(cfg.get("max_blob_bytes", area // 4))
+        self.max_blob_bytes = int(cfg["max_blob_bytes"] or area // 4)
         self.store = UnitSlabStore(
             self.ep,
             directory,
             namespace=self.namespace,
             timeout_s=self.timeout_s,
             ssd=ssd is not None,
+            lock=self._lock,
         )
         # The unit table every client routes by: all units registered at
         # bootstrap, in id order, whatever their state, so routing never moves.
         self.unit_ids = sorted(self.store._units)
         if not self.unit_ids:
             raise RuntimeError("NixlStore has no storage units")
+        self._unit_handles: list[Any] | None = None  # retired_bytes' actor handles
 
     def owner(self, gidx: int) -> int:
         """The unit that owns row ``gidx`` (TQ global index)."""
@@ -358,24 +372,30 @@ class NixlKVClient(StorageKVClient):
             _check_finite("put", keys, values)
         deadline = time.monotonic() + self.op_timeout_s
         with self._errors(keys):
-            for u, idx in self._by_owner(keys).items():
-                self._put_split(
-                    u, [keys[i] for i in idx], [values[i] for i in idx], deadline
-                )
+            blobs = [
+                b
+                for u, idx in self._by_owner(keys).items()
+                for b in self._plan(u, [keys[i] for i in idx], [values[i] for i in idx])
+            ]
+            # All units at once through one pool buffer when their packed parts
+            # fit a base buffer (no new pinned memory); else one blob at a time.
+            if sum(b[3][-1] for b in blobs) <= self.pool.base_bytes:
+                self._put_blobs(blobs, deadline)
+            else:
+                for b in blobs:
+                    self._put_blobs([b], deadline)
         return None
 
-    def _put_split(
-        self, unit_id: int, keys: list[str], values: list[Any], deadline: float
-    ) -> None:
-        """Put as one blob on ``unit_id``, halving at key boundaries while over max_blob_bytes."""
+    def _plan(self, unit_id: int, keys: list[str], values: list[Any]) -> list[tuple]:
+        """``unit_id``'s keys as one blob, halved at key boundaries while over max_blob_bytes."""
         blob_id = uuid.uuid4().hex
         p = blob_format.plan(keys, values, tag=bytes.fromhex(blob_id))
         if p.nbytes > self.max_blob_bytes and len(keys) > 1:
             h = len(keys) // 2
-            self._put_split(unit_id, keys[:h], values[:h], deadline)
-            self._put_split(unit_id, keys[h:], values[h:], deadline)
-            return
-        self._put_segments(p, blob_id, deadline, unit_id)
+            return self._plan(unit_id, keys[:h], values[:h]) + self._plan(
+                unit_id, keys[h:], values[h:]
+            )
+        return [(unit_id, blob_id, p, self._layout(p))]
 
     def _acquire(self, nbytes: int, deadline: float):
         """A pool buffer, waiting no longer than the operation's deadline."""
@@ -435,12 +455,11 @@ class NixlKVClient(StorageKVClient):
             and mv.c_contiguous
         )
 
-    def _put_segments(
-        self, p: blob_format.BlobPlan, blob_id: str, deadline: float, unit_id: int
-    ) -> str:
-        """Lay out a blob without building it.
+    def _layout(self, p: blob_format.BlobPlan) -> tuple:
+        """A blob without building it: zero-copy values, and the packed part's layout.
 
-        Big values go zero-copy, the rest (small values, the index and the footer) is packed into one pool buffer.
+        Big values go zero-copy, the rest (small values, the index and the footer)
+        is packed; returns ``(zero, layout, tail_off, tail, packed_bytes)``.
         """
         zero = [
             (e, mv, owner)
@@ -448,44 +467,42 @@ class NixlKVClient(StorageKVClient):
             if e.len and self._zero_copy_ok(e, mv, owner)
         ]
         zero_ids = {id(e) for e, _, _ in zero}
-        packed = [
-            (e, mv)
-            for e, mv in zip(p.entries, p.buffers)
-            if e.len and id(e) not in zero_ids
-        ]
-        tail = len(p.index_bytes) + blob_format.FOOTER_SIZE
         layout, cur = [], 0
-        for e, mv in packed:
-            layout.append((e, mv, cur))
-            cur = blob_format._align_up(cur + e.len)
-        tail_off = cur
-        packed_bytes = tail_off + tail
+        for e, mv in zip(p.entries, p.buffers):
+            if e.len and id(e) not in zero_ids:
+                layout.append((e, mv, cur))
+                cur = blob_format._align_up(cur + e.len)
+        tail = len(p.index_bytes) + blob_format.FOOTER_SIZE
+        return zero, layout, cur, tail, blob_format._align_up(cur + tail)
 
+    def _put_blobs(self, blobs: list[tuple], deadline: float) -> None:
+        """Pack ``(unit_id, blob_id, plan, layout)`` blobs back to back into one pool buffer and put them."""
         regs: list[tuple[int, np.ndarray, Any]] = []
         try:
-            with self._acquire(packed_bytes, deadline) as (base, buf):
-                segments: list[tuple[int, int, int]] = []
-                for e, mv, at in layout:
-                    _copy_into(
-                        buf[at : at + e.len], mv.cast("B"), self.parallel_copy_min
-                    )
-                    segments.append((base + at, e.off, e.len))
-                blob_format.write_tail(p, memoryview(buf)[tail_off : tail_off + tail])
-                segments.append((base + tail_off, p.index_off, tail))
+            with self._acquire(sum(b[3][-1] for b in blobs), deadline) as (base, buf):
+                puts, at = [], 0
+                for unit_id, blob_id, p, (zero, layout, tail_off, tail, size) in blobs:
+                    segments: list[tuple[int, int, int]] = []
+                    for e, mv, off in layout:
+                        _copy_into(
+                            buf[at + off : at + off + e.len],
+                            mv.cast("B"),
+                            self.parallel_copy_min,
+                        )
+                        segments.append((base + at + off, e.off, e.len))
+                    t = at + tail_off
+                    blob_format.write_tail(p, memoryview(buf)[t : t + tail])
+                    segments.append((base + t, p.index_off, tail))
+                    puts.append((segments, p.nbytes, len(p.entries), unit_id, blob_id))
+                    at += size
                 with self._lock:
-                    for e, mv, owner in zero:
-                        arr = np.frombuffer(mv.cast("B"), dtype=np.uint8)
-                        addr = self.ep.register(arr)
-                        regs.append((addr, arr, owner))
-                        segments.append((addr, e.off, e.len))
-                    return self.store.put_segments(
-                        segments,
-                        p.nbytes,
-                        len(p.entries),
-                        unit_id,
-                        blob_id=blob_id,
-                        deadline=deadline,
-                    )
+                    for (segments, *_), (*_, (zero, *_)) in zip(puts, blobs):
+                        for e, mv, owner in zero:
+                            arr = np.frombuffer(mv.cast("B"), dtype=np.uint8)
+                            addr = self.ep.register(arr)
+                            regs.append((addr, arr, owner))
+                            segments.append((addr, e.off, e.len))
+                    self.store.put_many(puts, deadline)
         finally:
             if regs:
                 with self._lock:
@@ -504,9 +521,10 @@ class NixlKVClient(StorageKVClient):
     ) -> list[Any]:
         t0 = time.monotonic()
         try:
-            return self._get(keys)
+            out = self._get(keys)
         finally:
             self._op_done(t0)
+        return out
 
     def _get(self, keys: list[str]) -> list[Any]:
         if not keys:
@@ -642,6 +660,21 @@ class NixlKVClient(StorageKVClient):
                 flush=True,
             )
 
+    def retired_bytes(self) -> list[int]:
+        """Each unit's ``retired_bytes`` (one Ray call per unit).
+
+        Memory lost to WRITEs that may still land, gone until the unit restarts.
+        """
+        if self._unit_handles is None:  # looked up once: this runs every step
+            self._unit_handles = [
+                ray.get_actor(_unit_name(u), namespace=self.namespace)
+                for u in self.unit_ids
+            ]
+        return [
+            int(s["retired_bytes"])
+            for s in ray.get([h.stats.remote() for h in self._unit_handles])
+        ]
+
     # ------------------------------------------------------------------ lifecycle
     def close(self) -> None:
         self._log_stats()
@@ -649,6 +682,24 @@ class NixlKVClient(StorageKVClient):
         with self._lock:
             self.store.close()
             self.ep.close()
+
+
+def retired_metrics() -> dict[str, float]:
+    """``retired_mb_sum`` / ``retired_mb_max`` over the units.
+
+    Read through this process's TQ client; ``{}`` when it has no nixl client.
+    A rising line is a slow leak.
+    """
+    import transfer_queue as tq
+
+    try:
+        client = tq.get_client().storage_manager.storage_client
+    except Exception:  # noqa: BLE001 - no TQ client in this process
+        return {}
+    if not isinstance(client, NixlKVClient):
+        return {}
+    mb = [b / 2**20 for b in client.retired_bytes()]
+    return {"retired_mb_sum": sum(mb), "retired_mb_max": max(mb, default=0.0)}
 
 
 # ============================================================================ bootstrap
@@ -672,27 +723,9 @@ def alive_node_ids(required_node_resource: str | None = None) -> list[str]:
     return ids
 
 
-def placement_group_node_ids(placement_groups: Iterable[Any]) -> list[str]:
-    """Ray node ids occupied by the given placement groups (one GCS read).
-
-    Pass the inference and/or train clusters' placement groups to implement
-    ``storage_unit_placement: all | inference | train``.
-    """
-    table = placement_group_table()
-    return sorted(
-        {
-            node_id
-            for pg in placement_groups
-            for node_id in table[pg.id.hex()]["bundles_to_node_id"].values()
-        }
-    )
-
-
 def unit_node_ids(cfg: dict[str, Any]) -> list[str]:
     """One node id per unit to create, from the backend config block."""
-    nodes = list(cfg.get("node_ids") or []) or alive_node_ids(
-        cfg.get("required_node_resource")
-    )
+    nodes = list(cfg.get("node_ids") or []) or alive_node_ids()
     per_node = cfg.get("storage_units_per_node")
     if per_node:
         return [n for n in nodes for _ in range(int(per_node))]
@@ -729,12 +762,12 @@ def shutdown(conf_or_backend_cfg: Any) -> None:
 
 @StorageBootstrapProvider.register_provider("NixlStore")
 def initialize_nixl_storage(conf: Any) -> dict[str, Any]:
-    cfg = _as_dict(conf.backend.NixlStore)
+    cfg = _config(conf.backend.NixlStore)
     timeout_s, read_pin_s, op_timeout_s = check_timeouts(cfg)  # fail before any actor
     ssd = ssd_config(cfg) or {}
     namespace = cfg.get("namespace", DEFAULT_NAMESPACE)
     dir_name = cfg.get("directory_name", "BlobDirectory")
-    nixl_cfg = _as_dict(cfg.get("nixl") or {})
+    nixl_cfg = cfg["nixl"]
 
     # A fresh TQ controller means a fresh data plane: stale named actors from a
     # previous system in the same namespace would otherwise block creation.
@@ -758,11 +791,11 @@ def initialize_nixl_storage(conf: Any) -> dict[str, Any]:
             ),
         ).remote(
             i,
-            int(cfg.get("unit_slab_bytes", 1 << 30)),
+            int(cfg["unit_slab_bytes"]),
             read_pin_s=read_pin_s,
-            nixl_backend=nixl_cfg.get("backend_name", "UCX"),
-            nixl_init_params=nixl_cfg.get("backend_init_params") or {},
-            numa_mode=str(cfg.get("numa", "auto")),
+            nixl_backend=nixl_cfg["backend_name"],
+            nixl_init_params=nixl_cfg["backend_init_params"],
+            numa_mode=str(cfg["numa"]),
             numa_index=numa_index,
             directory=directory,
             alloc_lease_s=op_timeout_s + timeout_s,

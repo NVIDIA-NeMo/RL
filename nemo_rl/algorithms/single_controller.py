@@ -441,7 +441,8 @@ class SingleControllerActor:
             reference_logprobs_required=self._reference_logprobs_required,
         )
         self._dp_client = actor_args.dp_client
-        if master_config.data_plane["backend"] == "mooncake_cpu":
+        self._dp_backend = master_config.data_plane["backend"]
+        if self._dp_backend == "mooncake_cpu":
             if actor_args.last_checkpoint_path is not None or (
                 master_config.checkpointing["enabled"]
                 and master_config.checkpointing.get("save_data_plane")
@@ -2143,7 +2144,18 @@ class SingleControllerActor:
         under what the job actually moved. ``grpo_sync`` gets a cluster view by
         fanning out over its policy worker group; this loop has no such group to
         fan out over, so driver scope is all there is here.
+
+        nixl's retired unit memory is logged even with observability off: it is
+        a leak that only shows over a long run, in the runs that need it.
         """
+        if self._dp_backend == "nixl":
+            from nemo_rl.data_plane.adapters.tq_nixl import retired_metrics
+
+            retired = retired_metrics()
+            if retired:
+                self._logger.log_metrics(
+                    retired, self._train_steps, prefix="data_plane/nixl"
+                )
         if not is_metrics_client(self._dp_client):
             return  # observability disabled -> plain adapter
 

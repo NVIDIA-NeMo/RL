@@ -78,8 +78,9 @@ def _group_batch(seed: int):
 @ray.remote(num_cpus=1)
 class Producer:
     def __init__(self):
-        import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
         import transfer_queue as tq
+
+        import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
         tq.init()
         self.tq = tq

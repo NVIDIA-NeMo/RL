@@ -32,7 +32,7 @@ DEAD = "DEAD"
 # No restarts: all state is in memory and units register only at bootstrap, so
 # a restarted directory would be empty and fail every op without saying why.
 @ray.remote(num_cpus=0, max_restarts=0, max_task_retries=0)
-class BlobDirectory:
+class BlobDirectory:  # pragma: no cover
     def __init__(self) -> None:
         self._epoch = 0
         self._units: dict[int, dict[str, Any]] = {}

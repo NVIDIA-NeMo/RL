@@ -206,16 +206,6 @@ def cpu_nodes(root: str = NODE_ROOT) -> dict[int, set[int]]:
     return out
 
 
-def socket_of_affinity(nodes: dict[int, set[int]] | None = None) -> int | None:
-    """The socket this process is pinned inside, or ``None`` if it spans several."""
-    nodes = cpu_nodes() if nodes is None else nodes
-    aff = os.sched_getaffinity(0)
-    for node, cpus in nodes.items():
-        if aff and aff <= cpus:
-            return node
-    return None
-
-
 def bind_process(cpus: set[int]) -> None:
     """Pin every thread of this process (and threads it creates later) to ``cpus``."""
     for tid in os.listdir("/proc/self/task"):

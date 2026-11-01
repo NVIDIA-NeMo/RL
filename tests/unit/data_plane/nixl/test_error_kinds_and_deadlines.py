@@ -148,9 +148,51 @@ def test_malformed_op_does_not_stop_the_unit_serving(server):
         ctx.term()
 
 
+def _count_connects(cli):
+    n = []
+    connect = cli._pool._connect
+    cli._pool._connect = lambda *a: (n.append(1), connect(*a))[1]
+    return n
+
+
+def test_unit_error_reply_keeps_the_pooled_socket(server):
+    cli = control.UnitClient(timeout_s=5)
+    n = _count_connects(cli)
+    try:
+        for _ in range(2):
+            with pytest.raises(UnitFull):
+                cli.call(server.address, "full")
+        assert len(n) == 1  # a complete error reply returns the socket
+    finally:
+        cli.close()
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_late_reply_never_reaches_the_next_call(server, batch):
+    cli = control.UnitClient(timeout_s=5)
+    n = _count_connects(cli)
+    try:
+        if batch:
+            got = cli.call_many("slow", {server.address: {}}, timeout_s=0.2)
+            assert isinstance(got[server.address], TransferError)
+        else:
+            with pytest.raises(TransferError, match="did not answer"):
+                cli.call(server.address, "slow", timeout_s=0.2)
+        # The unit still answers "slow" (1) later; this call must get its own reply.
+        with pytest.raises(UnitFull):
+            cli.call(server.address, "full")
+        assert (
+            cli.call_many("full", {server.address: {}})[server.address].__class__
+            is UnitFull
+        )
+        assert len(n) == 2  # the timed-out socket was discarded, not reused
+    finally:
+        cli.close()
+
+
 def test_pre_structured_error_replies_still_raise():
     with pytest.raises(TransferError, match="KeyError"):
-        control.raise_reply("tcp://x", "op", ["KeyError", "oops"])
+        raise control.reply_error("tcp://x", "op", ["KeyError", "oops"])
 
 
 # ------------------------------------------------------------------ adapter mapping (§6)
@@ -219,6 +261,70 @@ def test_a_failed_resolve_unpins_the_units_already_resolved():
     assert ("unpin", {"pin_id": "p"}) in ctl.notified
 
 
+def test_resolve_with_an_unknown_unit_unpins_the_units_resolved():
+    pin = {"pin_id": "p", "entries": {}, "missing": [], "pending": [], "failed": []}
+    ctl = _Ctl({"resolve_keys": lambda a: pin})
+    with pytest.raises(TransferFailed):  # unit 5 is unknown, and not confirmed dead
+        _store(ctl).resolve_keys({0: ["1@x"], 5: ["2@x"]}, None)
+    assert ("unpin", {"pin_id": "p"}) in ctl.notified
+
+
+def test_clear_asks_every_unit_and_skips_dead_ones():
+    ctl = _Ctl({"release_rows": lambda a: 1})
+    _store(ctl, dead=True).release_rows({0: [1], 1: [2], 5: [3]}, None)  # 5: gone
+    assert ctl.calls == ["release_rows", "release_rows"]
+
+
+def test_clear_raises_a_live_failure_after_asking_every_unit():
+    ctl = _Ctl({"release_rows": lambda a: TransferError("x") if a == "tcp://u0" else 1})
+    with pytest.raises(TransferFailed):
+        _store(ctl).release_rows({0: [1], 1: [2]}, None)
+    assert ctl.calls == ["release_rows", "release_rows"]
+
+
+class _WriteEp(_Ep):
+    """Per-op WRITE results: ``fail`` maps remote agent -> error."""
+
+    def __init__(self, fail):
+        super().__init__()
+        self.fail_by_agent, self.batches = fail, []
+
+    def transfer_many(self, ops, *, timeout_s):
+        self.batches.append(len(ops))
+        return [self.fail_by_agent.get(agent) for _, _, _, agent in ops]
+
+
+def _blob(u):
+    return ([(1000, 0, 8)], 8, 1, u, f"b{u}")
+
+
+def test_put_many_overlaps_units_in_one_round():
+    ctl = _Ctl({"alloc": lambda a: 0})
+    ep = _WriteEp({})
+    _store(ctl, ep=ep).put_many([_blob(0), _blob(1)])
+    assert ctl.calls == ["alloc", "alloc", "commit", "commit"]
+    assert ep.batches == [2]  # both WRITEs in one batch
+
+
+def test_put_many_sends_a_unit_that_missed_the_round_down_the_one_by_one_path():
+    busy = {"tcp://u1": 1}
+
+    def alloc(addr):
+        if busy.get(addr):
+            busy[addr] -= 1
+            return DataPlaneBusy("pressure")
+        return 0
+
+    ctl = _Ctl({"alloc": alloc})
+    # Unit 0's batched WRITE fails (may still run); unit 1 is busy in the round.
+    ep = _WriteEp({"unit-0-abc": TransferError("x", in_flight=True)})
+    _store(ctl, ep=ep).put_many([_blob(0), _blob(1)])
+    assert ep.batches == [1]  # only unit 0 was allocated in the round
+    assert ctl.notified[0] == ("abort", {"blob_id": "b0", "in_flight": True})
+    assert ctl.calls.count("alloc") == 4  # round (2) + each unit once more
+    assert ctl.calls.count("commit") == 2  # only the one-by-one puts commit
+
+
 def test_failed_read_on_a_live_unit_is_retryable():
     s = _store(_Ctl({}), ep=_Ep(fail=TransferError("timed out", in_flight=True)))
     with pytest.raises(TransferFailed) as ei:
@@ -262,6 +368,28 @@ def test_put_succeeds_once_busy_clears(monkeypatch):
     s = _store(_Ctl({"alloc": alloc}))
     assert s.put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b") == "b"
     assert n["alloc"] == 4
+
+
+def test_put_lets_go_of_the_client_lock_while_it_waits_out_busy():
+    lock, seen = tq_nixl.TimedLock(), []
+
+    def other():
+        with lock:
+            seen.append("other")
+
+    def alloc(addr):
+        if not seen:
+            seen.append("busy")
+            threading.Thread(target=other).start()  # blocks on the put's lock
+            return DataPlaneBusy("pressure")
+        seen.append("retry")
+        return 64
+
+    s = _store(_Ctl({"alloc": alloc}))
+    s.idle = lock.released
+    with lock:
+        assert s.put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b") == "b"
+    assert seen == ["busy", "other", "retry"]
 
 
 def test_ram_only_unit_is_busy_while_a_reader_pins_the_freed_room():

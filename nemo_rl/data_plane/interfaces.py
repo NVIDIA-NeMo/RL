@@ -193,6 +193,35 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
         return 0 if self.storage_unit_segment_size else self.global_segment_size
 
 
+class NixlSsdConfig(BaseModel, extra="forbid"):
+    """SSD tier of the nixl storage units (see ``tq_nixl.ssd_config``).
+
+    A put the unit's RAM cannot take goes to a file under ``path`` (node-local,
+    absolute) through an IO area of ``staging_bytes`` carved from the slab.
+    """
+
+    enabled: bool = False
+    path: str | None = None  # absolute; required when enabled
+    staging_bytes: PositiveInt | None = None  # None: unit_slab_bytes // 4
+    pickup_s: float = 10.0
+
+    @model_validator(mode="after")
+    def _require_absolute_path_when_enabled(self) -> "NixlSsdConfig":
+        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+            raise ValueError(
+                "data_plane.nixl.ssd.enabled=true requires data_plane.nixl.ssd.path "
+                f"to be an absolute node-local SSD directory, got {self.path!r}."
+            )
+        return self
+
+
+class NixlAgentConfig(BaseModel, extra="forbid"):
+    """The NIXL agent every nixl client and unit creates."""
+
+    backend_name: str = "UCX"
+    backend_init_params: dict[str, Any] = Field(default_factory=dict)
+
+
 class NixlStoreConfig(BaseModel, extra="allow"):
     """Sizing and placement for ``backend="nixl"``. Ignored otherwise.
 
@@ -208,9 +237,10 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     backend honours those env vars over its own params.
 
     Unit placement, as in SimpleStorage or the Mooncake storage units:
-    ``num_storage_units`` round-robins units over Ray nodes (``None``: one per
-    node); ``storage_units_per_node`` + ``storage_unit_placement`` puts that
-    many on each node of the selected virtual clusters instead. One unit per
+    ``storage_unit_placement`` picks the nodes (``all``: every alive GPU node,
+    or a list of clusters, ``train`` / ``inference``); ``num_storage_units``
+    round-robins units over them (``None``: one per node), or
+    ``storage_units_per_node`` puts that many on each of them. One unit per
     node is enough: a unit's CPU only serves small control calls while RDMA
     moves the bytes, and 2x the units measured no faster at 86 nodes. With
     ``numa="auto"`` the k-th unit on a multi-socket node is pinned (CPUs + slab
@@ -219,8 +249,15 @@ class NixlStoreConfig(BaseModel, extra="allow"):
 
     num_storage_units: PositiveInt | None = None
     storage_units_per_node: PositiveInt | None = None
-    storage_unit_placement: Literal["inference", "train", "all"] = "all"
+    storage_unit_placement: list[Literal["train", "inference"]] | Literal["all"] = (
+        "all"
+    )
+    # Explicit unit nodes; when unset, _init_tq resolves storage_unit_placement.
+    node_ids: list[str] | None = None
     unit_slab_bytes: int = 17179869184  # 16 GiB pinned per unit
+    # A put over this is split at key boundaries; None: a quarter of the put
+    # area (the slab minus SSD staging).
+    max_blob_bytes: PositiveInt | None = None
     numa: Literal["auto", "off"] = "auto"
     # Client registered-buffer pool: base buffers plus kept-registered oversize ones.
     client_staging_bytes: int = 1073741824  # 1 GiB per base buffer
@@ -242,12 +279,10 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     # Unfinished NIXL transfers may retain this much memory before the
     # process refuses further transfers (DataPlaneFatal).
     graveyard_max_bytes: int = 4294967296
-    # SSD tier: {enabled, dir, staging_bytes, pickup_s}; puts the put area cannot take go to disk;
-    # see tq_nixl.ssd_config.
-    ssd: dict[str, Any] = Field(default_factory=lambda: {"enabled": False})
-    nixl: dict[str, Any] = Field(
-        default_factory=lambda: {"backend_name": "UCX", "backend_init_params": {}}
-    )
+    # Debug: report non-finite floats and all-False masks on put and get.
+    debug_check_finite: bool = False
+    ssd: NixlSsdConfig = Field(default_factory=NixlSsdConfig)
+    nixl: NixlAgentConfig = Field(default_factory=NixlAgentConfig)
 
 
 class DataPlaneConfig(TypedDict):

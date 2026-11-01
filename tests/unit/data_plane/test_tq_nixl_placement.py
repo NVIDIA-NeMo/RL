@@ -20,8 +20,6 @@ import ray
 import torch
 from tensordict import TensorDict
 
-pytestmark = pytest.mark.nixl
-
 
 @pytest.fixture(scope="module")
 def per_node_spread_system(ray_cluster):
@@ -50,6 +48,7 @@ def _stats(conf, n):
     ]
 
 
+@pytest.mark.nixl
 def test_units_per_node_and_spread(per_node_spread_system):
     import transfer_queue as tq
 

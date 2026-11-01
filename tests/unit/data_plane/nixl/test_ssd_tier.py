@@ -23,12 +23,11 @@ import time
 
 import pytest
 
-from nemo_rl.data_plane.adapters import tq_nixl
-from nemo_rl.data_plane.nixl import blobstore
-from nemo_rl.data_plane.nixl.errors import DataPlaneBusy, UnitFull
 from nemo_rl.data_plane import nixl_storage_unit
+from nemo_rl.data_plane.adapters import tq_nixl
+from nemo_rl.data_plane.nixl import blob_format, blobstore
+from nemo_rl.data_plane.nixl.errors import DataPlaneBusy, UnitFull
 from tests.unit.data_plane._nixl_helpers import StubCtl as _Ctl
-from nemo_rl.data_plane.nixl import blob_format
 from tests.unit.data_plane._nixl_helpers import (
     bare_unit,
     gidx_of,
@@ -517,13 +516,27 @@ def test_deadline_during_commit_aborts_the_blob():
 # ------------------------------------------------------------------ config
 def test_ssd_config_validation():
     assert tq_nixl.ssd_config({}) is None
-    on = {"unit_slab_bytes": 1 << 30, "ssd": {"enabled": True, "dir": "/x"}}
+    ssd = {"enabled": True, "path": "/x"}
+    on = {"unit_slab_bytes": 1 << 30, "ssd": ssd}
     assert tq_nixl.ssd_config(on) == {
         "ssd_dir": "/x",
         "staging_bytes": 1 << 28,
         "pickup_s": 10.0,
     }
     with pytest.raises(ValueError, match="pickup_s"):
-        tq_nixl.ssd_config({**on, "ssd": {"enabled": True, "pickup_s": 1.0}})
+        tq_nixl.ssd_config({**on, "ssd": {**ssd, "pickup_s": 1.0}})
     with pytest.raises(ValueError, match="staging_bytes"):
-        tq_nixl.ssd_config({**on, "ssd": {"enabled": True, "staging_bytes": 1 << 30}})
+        tq_nixl.ssd_config({**on, "ssd": {**ssd, "staging_bytes": 1 << 30}})
+
+
+@pytest.mark.parametrize(
+    "ssd, match",
+    [
+        ({"enabled": True}, "absolute"),  # no default dir on a small root disk
+        ({"enabled": True, "path": "ssd"}, "absolute"),
+        ({"enabled": True, "path": "/x", "dri": "/y"}, "dri"),  # a typo
+    ],
+)
+def test_ssd_config_rejects_what_it_would_silently_ignore(ssd, match):
+    with pytest.raises(ValueError, match=match):
+        tq_nixl.ssd_config({"ssd": ssd})

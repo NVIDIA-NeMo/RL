@@ -42,7 +42,7 @@ import weakref
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import psutil
 import torch
@@ -875,31 +875,32 @@ def _pin_simple_storage_units(node_ids: list[str]) -> None:
     )
 
 
-def _nixl_storage_node_ids(placement: str) -> list[str]:
-    """Ray node IDs for a NIXL storage_unit_placement: train | inference | gym (= neither) | all."""
-    import ray
+def _nixl_storage_node_ids(
+    placement: list[Literal["train", "inference"]] | Literal["all"],
+) -> list[str]:
+    """Ray node IDs for a NIXL storage_unit_placement.
+
+    ``all``: every alive GPU node; else the union of the named clusters
+    (``train`` / ``inference``).
+    """
     from ray.util.placement_group import placement_group_table
 
-    def pg_nodes(prefix: str) -> set[str]:
-        return {
-            node_id
-            for pg in placement_group_table().values()
-            if pg["name"].startswith(prefix) and pg["state"] == "CREATED"
-            for node_id in pg["bundles_to_node_id"].values()
-        }
+    from nemo_rl.data_plane.adapters.tq_nixl import alive_node_ids
 
-    train = pg_nodes("sc_train_cluster") | pg_nodes("sc_policy_cluster")
-    inference = pg_nodes("sc_inference_cluster") | pg_nodes("sc_policy_cluster")
-    alive = {
-        n["NodeID"] for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU")
+    if placement == "all":
+        return alive_node_ids("GPU")
+    prefixes = {
+        "train": ("sc_train_cluster", "sc_policy_cluster"),
+        "inference": ("sc_inference_cluster", "sc_policy_cluster"),
     }
+    wanted = tuple(p for name in placement for p in prefixes[name])
     return sorted(
         {
-            "train": train,
-            "inference": inference,
-            "gym": alive - train - inference,
-            "all": alive,
-        }[placement]
+            node_id
+            for pg in placement_group_table().values()
+            if pg["name"].startswith(wanted) and pg["state"] == "CREATED"
+            for node_id in pg["bundles_to_node_id"].values()
+        }
     )
 
 
@@ -1053,8 +1054,8 @@ def _init_tq(
 
         nixl_cfg = backend_config(cfg)
         block = nixl_cfg.model_dump()
-        placement = block.pop("storage_unit_placement", "all")
-        if placement != "all" and not block.get("node_ids"):
+        placement = block.pop("storage_unit_placement")
+        if not block.get("node_ids"):
             block["node_ids"] = _nixl_storage_node_ids(placement)
             if not block["node_ids"]:
                 raise RuntimeError(f"no nodes for storage_unit_placement={placement!r}")

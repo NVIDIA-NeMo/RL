@@ -42,7 +42,7 @@ def ssd_sys(ray_cluster, tmp_path_factory):
     nixl = conf.backend.NixlStore
     nixl.op_timeout_s = 60.0
     # 4 MiB for puts, 4 MiB staging: a 1 MiB value per blob, three staged at once.
-    nixl.ssd = {"enabled": True, "dir": root, "staging_bytes": 4 * MiB}
+    nixl.ssd = {"enabled": True, "path": root, "staging_bytes": 4 * MiB}
     tq.init(conf)
     yield tq, conf, root
     tq.close()

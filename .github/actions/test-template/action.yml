@@ -165,10 +165,15 @@ runs:
         # which sets it only on a RoCE-only fabric. Passing it here overrides that
         # gate (an already-set value is left alone) and also covers processes that
         # never run the data-plane factory, e.g. a bare pytest invocation.
+        # The nixl data plane refuses an unset or tcp UCX_TLS; this is the list
+        # maybe_configure_data_plane_env sets in production, and
+        # NEMO_RL_REQUIRE_NIXL turns the nixl tests' skip into a failure.
         if [[ "${{ inputs.is_doc_test }}" != "true" ]] && rdma_device_available; then
           RDMA_FLAGS=(--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1
                       --env NEMO_RL_REQUIRE_MOONCAKE=1
-                      --env MC_ENABLE_DEST_DEVICE_AFFINITY=1)
+                      --env MC_ENABLE_DEST_DEVICE_AFFINITY=1
+                      --env UCX_TLS=rc,cuda_copy,cuda_ipc,self,sm
+                      --env NEMO_RL_REQUIRE_NIXL=1)
         fi
         echo -e "\033[1;34m│  rdma      : ${RDMA_FLAGS[*]:-none}\033[0m"
         echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
