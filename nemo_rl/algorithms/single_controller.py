@@ -614,7 +614,8 @@ class SingleControllerActor:
         )
         self._timer = Timer()
         self._throughput_sample_time: Optional[float] = None
-        self._throughput_generation_tokens_by_worker: Optional[dict[int, int]] = None
+        self._throughput_vllm_counters_by_name: dict[str, dict[int, int]] = {}
+        self._throughput_router_dispatches_total: Optional[float] = None
         self._throughput_rollout_counters: Optional[dict[str, int]] = None
         self._rollout_telemetry_lock = asyncio.Lock()
         self._rollout_completion_durations_s: deque[float] = deque(maxlen=10_000)
@@ -5140,7 +5141,11 @@ class SingleControllerActor:
     async def _collect_and_log_rollout_throughput_metrics(
         self, *, emit: bool = True
     ) -> None:
-        """Compare generation-engine output with canonical TQ publication."""
+        """Compare engine output with tokens committed to the training data plane.
+
+        Keep the existing generation-token rate and apply its per-worker reset
+        guard to the additional vLLM counters.
+        """
         now = time.monotonic()
         counters = self._rollout_manager.telemetry_snapshot()
         barrier = await self._data_plane_checkpoint_barrier.drain_telemetry()
@@ -5156,19 +5161,42 @@ class SingleControllerActor:
                 stacklevel=2,
             )
 
-        generated_values = _latest_generation_values(
-            generation_metrics, "generation_tokens"
+        # These cumulative vLLM counters need two samples; gauges are read below.
+        vllm_counter_names = (
+            "generation_tokens",
+            "prompt_tokens",
+            "request_success",
+            "prefix_cache_queries",
+            "prefix_cache_hits",
+            "spec_decode_num_drafts",
+            "spec_decode_num_accepted_tokens",
         )
-        generated_by_worker = (
-            {worker_id: int(value) for worker_id, value in generated_values.items()}
-            if generated_values
-            else None
-        )
+        vllm_counters = {
+            name: {worker_id: int(value) for worker_id, value in values.items()}
+            for name in vllm_counter_names
+            if (values := _latest_generation_values(generation_metrics, name))
+        }
+        generated_by_worker = vllm_counters.get("generation_tokens")
         generated_tokens = (
             sum(generated_by_worker.values())
             if generated_by_worker is not None
             else None
         )
+        router_dispatches_total: Optional[float] = None
+        router_outstanding: Optional[float] = None
+        if self._generation_router is not None:
+            try:
+                router_metrics = await self._ray_get(
+                    self._generation_router.metrics.remote()
+                )
+                router_dispatches_total = router_metrics.get("router/dispatches_total")
+                router_outstanding = router_metrics.get("router/requests_outstanding")
+            except Exception as error:  # noqa: BLE001 - telemetry is advisory
+                warnings.warn(
+                    "Failed to collect router throughput telemetry: "
+                    f"{type(error).__name__}: {error}",
+                    stacklevel=2,
+                )
         metrics: dict[str, float] = {
             key: float(value) for key, value in counters.items()
         }
@@ -5216,12 +5244,20 @@ class SingleControllerActor:
         kv_usage = _latest_generation_values(generation_metrics, "kv_cache_usage_perc")
         if running:
             metrics["vllm_requests_running"] = sum(running.values())
+            for worker_id, value in running.items():
+                metrics[f"vllm/engine_{worker_id}/requests_running"] = value
         if waiting:
             metrics["vllm_requests_waiting"] = sum(waiting.values())
+            for worker_id, value in waiting.items():
+                metrics[f"vllm/engine_{worker_id}/requests_waiting"] = value
         if kv_usage:
             metrics["vllm_kv_cache_usage_mean"] = sum(kv_usage.values()) / len(kv_usage)
+            for worker_id, value in kv_usage.items():
+                metrics[f"vllm/engine_{worker_id}/kv_cache_usage"] = value
         if generated_tokens is not None:
             metrics["generation_output_tokens"] = float(generated_tokens)
+        if router_outstanding is not None:
+            metrics["router/requests_outstanding"] = float(router_outstanding)
 
         completion_durations = list(self._rollout_completion_durations_s)
         queue_wait_durations = list(self._rollout_queue_wait_durations_s)
@@ -5248,7 +5284,7 @@ class SingleControllerActor:
 
         previous_time = self._throughput_sample_time
         previous_counters = self._throughput_rollout_counters
-        previous_generated = self._throughput_generation_tokens_by_worker
+        previous_vllm_counters = self._throughput_vllm_counters_by_name
         if previous_time is not None and previous_counters is not None:
             elapsed = now - previous_time
             if elapsed > 0:
@@ -5260,27 +5296,100 @@ class SingleControllerActor:
                     counters["committed_output_tokens"]
                     - previous_counters["committed_output_tokens"]
                 ) / elapsed
-                if generated_by_worker is not None and previous_generated is not None:
-                    current_workers = set(generated_by_worker)
-                    previous_workers = set(previous_generated)
-                    monotonic = all(
-                        generated_by_worker[worker_id] >= previous_generated[worker_id]
-                        for worker_id in current_workers & previous_workers
-                    )
-                    if current_workers == previous_workers and monotonic:
-                        generated_delta = sum(
-                            generated_by_worker[worker_id]
-                            - previous_generated[worker_id]
-                            for worker_id in current_workers
-                        )
-                        metrics["generation_output_tokens_per_second"] = (
-                            generated_delta / elapsed
-                        )
+                previous_dispatches = self._throughput_router_dispatches_total
+                if (
+                    router_dispatches_total is not None
+                    and previous_dispatches is not None
+                ):
+                    # A restarted router needs a new counter baseline.
+                    if router_dispatches_total >= previous_dispatches:
+                        metrics["router/dispatches_per_second"] = (
+                            router_dispatches_total - previous_dispatches
+                        ) / elapsed
                     else:
-                        metrics["generation_counter_discontinuity"] = 1.0
+                        metrics["router/dispatch_counter_discontinuity"] = 1.0
+                deltas: dict[str, dict[int, int]] = {}
+                for name, current in vllm_counters.items():
+                    previous = previous_vllm_counters.get(name)
+                    if previous is None:
+                        continue
+                    # Compare workers individually; a replacement can reset one
+                    # counter while the fleet total still increases.
+                    if set(current) != set(previous) or any(
+                        current[worker_id] < previous[worker_id]
+                        for worker_id in current
+                    ):
+                        if name == "generation_tokens":
+                            metrics["generation_counter_discontinuity"] = 1.0
+                        continue
+                    deltas[name] = {
+                        worker_id: current[worker_id] - previous[worker_id]
+                        for worker_id in current
+                    }
+
+                for name, key, engine_key in (
+                    (
+                        "generation_tokens",
+                        "generation_output_tokens_per_second",
+                        "generation_tokens_per_second",
+                    ),
+                    (
+                        "prompt_tokens",
+                        "vllm_prompt_tokens_per_second",
+                        "prompt_tokens_per_second",
+                    ),
+                    (
+                        "request_success",
+                        "vllm_requests_completed_per_second",
+                        "requests_completed_per_second",
+                    ),
+                ):
+                    if name in deltas:
+                        metrics[key] = sum(deltas[name].values()) / elapsed
+                        for worker_id, delta in deltas[name].items():
+                            metrics[f"vllm/engine_{worker_id}/{engine_key}"] = (
+                                delta / elapsed
+                            )
+
+                queries = deltas.get("prefix_cache_queries")
+                hits = deltas.get("prefix_cache_hits")
+                if (
+                    queries is not None
+                    and hits is not None
+                    and set(queries) == set(hits)
+                ):
+                    total_queries = sum(queries.values())
+                    if total_queries > 0:
+                        metrics["vllm_prefix_cache_hit_rate_pct"] = (
+                            100 * sum(hits.values()) / total_queries
+                        )
+                    for worker_id, query_count in queries.items():
+                        if query_count > 0:
+                            metrics[
+                                f"vllm/engine_{worker_id}/prefix_cache_hit_rate_pct"
+                            ] = 100 * hits[worker_id] / query_count
+
+                drafts = deltas.get("spec_decode_num_drafts")
+                accepted = deltas.get("spec_decode_num_accepted_tokens")
+                if (
+                    drafts is not None
+                    and accepted is not None
+                    and set(drafts) == set(accepted)
+                ):
+                    total_drafts = sum(drafts.values())
+                    if total_drafts > 0:
+                        metrics["vllm_mean_acceptance_length"] = (
+                            1 + sum(accepted.values()) / total_drafts
+                        )
+                    for worker_id, draft_count in drafts.items():
+                        if draft_count > 0:
+                            metrics[
+                                f"vllm/engine_{worker_id}/mean_acceptance_length"
+                            ] = 1 + accepted[worker_id] / draft_count
 
         self._throughput_sample_time = now
-        self._throughput_generation_tokens_by_worker = generated_by_worker
+        self._throughput_vllm_counters_by_name = vllm_counters
+        self._throughput_router_dispatches_total = router_dispatches_total
         self._throughput_rollout_counters = counters
         if emit:
             self._log_telemetry_metrics(

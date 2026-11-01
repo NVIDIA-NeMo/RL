@@ -2193,9 +2193,23 @@ class TestPeriodicRolloutCheckpoint:
         actor._rollout_manager.telemetry_snapshot = lambda: next(snapshots)
         generation_snapshots = iter(
             [
-                {"generation_tokens": {0: [60], 1: [40]}},
+                {
+                    "generation_tokens": {0: [60], 1: [40]},
+                    "prompt_tokens": {0: [100], 1: [200]},
+                    "request_success": {0: [20], 1: [30]},
+                    "prefix_cache_queries": {0: [100], 1: [100]},
+                    "prefix_cache_hits": {0: [40], 1: [50]},
+                    "spec_decode_num_drafts": {0: [10], 1: [20]},
+                    "spec_decode_num_accepted_tokens": {0: [15], 1: [40]},
+                },
                 {
                     "generation_tokens": {0: [180], 1: [120]},
+                    "prompt_tokens": {0: [300], 1: [500]},
+                    "request_success": {0: [30], 1: [50]},
+                    "prefix_cache_queries": {0: [200], 1: [200]},
+                    "prefix_cache_hits": {0: [100], 1: [130]},
+                    "spec_decode_num_drafts": {0: [20], 1: [30]},
+                    "spec_decode_num_accepted_tokens": {0: [35], 1: [70]},
                     "inflight_batch_sizes": {0: [2], 1: [1]},
                     "num_pending_samples": {0: [1], 1: [3]},
                     "kv_cache_usage_perc": {0: [0.5], 1: [0.7]},
@@ -2204,6 +2218,15 @@ class TestPeriodicRolloutCheckpoint:
         )
         actor._gen = SimpleNamespace(
             drain_latest_logger_metrics=lambda: next(generation_snapshots)
+        )
+        actor._generation_router = SimpleNamespace(
+            metrics=SimpleNamespace(remote=lambda: None)
+        )
+        actor._ray_get = AsyncMock(
+            side_effect=[
+                {"router/dispatches_total": 100.0, "router/requests_outstanding": 12.0},
+                {"router/dispatches_total": 160.0, "router/requests_outstanding": 7.0},
+            ]
         )
 
         async def sample_twice() -> None:
@@ -2223,6 +2246,16 @@ class TestPeriodicRolloutCheckpoint:
 
         logged = actor._logger.log_metrics.call_args.args[0]
         assert logged["generation_output_tokens_per_second"] == pytest.approx(20.0)
+        assert logged["vllm_prompt_tokens_per_second"] == pytest.approx(50.0)
+        assert logged["vllm_requests_completed_per_second"] == pytest.approx(3.0)
+        assert logged["vllm_prefix_cache_hit_rate_pct"] == pytest.approx(70.0)
+        assert logged["vllm_mean_acceptance_length"] == pytest.approx(3.5)
+        assert logged["router/dispatches_per_second"] == pytest.approx(6.0)
+        assert logged["router/requests_outstanding"] == 7.0
+        assert logged["vllm/engine_0/prompt_tokens_per_second"] == pytest.approx(20.0)
+        assert logged["vllm/engine_1/prompt_tokens_per_second"] == pytest.approx(30.0)
+        assert logged["vllm/engine_0/requests_running"] == 2
+        assert logged["vllm/engine_1/requests_waiting"] == 3
         assert logged["committed_output_tokens_per_second"] == pytest.approx(4.0)
         assert logged["committed_groups_per_second"] == pytest.approx(0.2)
         assert logged["vllm_requests_running"] == 3
@@ -2256,8 +2289,14 @@ class TestPeriodicRolloutCheckpoint:
         }
         generation_snapshots = iter(
             [
-                {"generation_tokens": {0: [100], 1: [100]}},
-                {"generation_tokens": second_generation_tokens},
+                {
+                    "generation_tokens": {0: [100], 1: [100]},
+                    "prompt_tokens": {0: [100], 1: [200]},
+                },
+                {
+                    "generation_tokens": second_generation_tokens,
+                    "prompt_tokens": {0: [200], 1: [250]},
+                },
             ]
         )
         actor._gen = SimpleNamespace(
@@ -2280,6 +2319,49 @@ class TestPeriodicRolloutCheckpoint:
         logged = actor._logger.log_metrics.call_args.args[0]
         assert logged["generation_counter_discontinuity"] == 1.0
         assert "generation_output_tokens_per_second" not in logged
+        assert logged["vllm_prompt_tokens_per_second"] == pytest.approx(15.0)
+        assert "vllm_mean_acceptance_length" not in logged
+
+    def test_router_dispatch_counter_reset_suppresses_invalid_rate(
+        self, tmp_path: Path
+    ) -> None:
+        """A restarted router publishes no dispatch rate until a new baseline exists."""
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._rollout_manager.telemetry_snapshot = lambda: {
+            "committed_groups": 0,
+            "committed_output_tokens": 0,
+            "recovery_siblings_reused": 0,
+            "recovery_siblings_rerun": 0,
+        }
+        actor._gen = SimpleNamespace(drain_latest_logger_metrics=lambda: {})
+        actor._generation_router = SimpleNamespace(
+            metrics=SimpleNamespace(remote=lambda: None)
+        )
+        actor._ray_get = AsyncMock(
+            side_effect=[
+                {"router/dispatches_total": 100.0, "router/requests_outstanding": 3.0},
+                {"router/dispatches_total": 5.0, "router/requests_outstanding": 1.0},
+            ]
+        )
+
+        async def sample_twice() -> None:
+            await actor._log_rollout_throughput_metrics(emit=False)
+            await actor._log_rollout_throughput_metrics()
+
+        try:
+            with patch(
+                "nemo_rl.algorithms.single_controller.time.monotonic",
+                new=_SteppingClock(start=10.0, step=10.0),
+            ):
+                asyncio.run(sample_twice())
+        finally:
+            actor._checkpointer.shutdown()
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["router/dispatch_counter_discontinuity"] == 1.0
+        assert "router/dispatches_per_second" not in logged
+        assert logged["router/requests_outstanding"] == 1.0
 
     def _saved_snapshot(self, actor, tmp_path: Path) -> Path:
         try:
