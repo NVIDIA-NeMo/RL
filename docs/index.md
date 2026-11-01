@@ -128,6 +128,13 @@ Create custom reward environments and integrate them with NeMo RL training pipel
 Configure offline and online Eagle3 draft-model workflows to accelerate rollout generation with vLLM.
 :::
 
+:::{grid-item-card} {octicon}`iterations` DFlash and DSpark Co-Training
+:link: guides/dflash-dspark-speculative-decoding
+:link-type: doc
+
+Train block-parallel DFlash and DSpark draft models with packed TP2 and context-parallel Megatron policies.
+:::
+
 :::{grid-item-card} {octicon}`rocket` Automodel Speculative Decoding
 :link: guides/automodel-speculative-decoding
 :link-type: doc
@@ -343,6 +350,7 @@ guides/single-controller.md
 guides/context-compaction.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
+guides/dflash-dspark-speculative-decoding.md
 guides/automodel-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
@@ -408,6 +416,8 @@ design-docs/dspark-auxiliary-heads.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
 design-docs/token-capture-ledger.md
+design-docs/dflash-draft-body.md
+design-docs/dspark-objectives.md
 ```
 
 ```{toctree}
