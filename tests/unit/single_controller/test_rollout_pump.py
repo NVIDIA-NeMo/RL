@@ -109,6 +109,10 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._finalizer_actors = []
     ctrl._replacement_reserve = deque()
     ctrl._rollout_recovery_enabled = False
+    # Dynamic sampling off: the filter never fires, so no test here draws on its
+    # budget unless it opts in.
+    ctrl._dynamic_sampling_enabled = False
+    ctrl._dynamic_sampling_max_replacements = 0
     ctrl._rollout_slot_waiters = 0
     ctrl._rollout_permitted_waiters = 0
     ctrl._buffer_capacity_waiters = 0
@@ -175,8 +179,9 @@ class _RecordingRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        replacement_index: int = 0,
     ) -> None:
-        del prompt, inflight_registry
+        del prompt, inflight_registry, replacement_index
         self._buffer.reserve(target_step=target_step)
 
 
@@ -254,8 +259,9 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, Any] | None = None,
+            replacement_index: int = 0,
         ) -> RolloutOutcome:
-            del prompt, target_step, inflight_registry
+            del prompt, target_step, inflight_registry, replacement_index
             return outcome
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -345,8 +351,9 @@ class _SkippingRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
-        del prompt, target_step, inflight_registry
+        del prompt, target_step, inflight_registry, replacement_index
         return RolloutOutcome.SKIPPED
 
 
@@ -415,8 +422,9 @@ class _ScriptedRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
-        del target_step, inflight_registry
+        del target_step, inflight_registry, replacement_index
         self.prompts_seen.append(prompt["message_log"][0]["content"])
         if self._outcomes:
             return self._outcomes.pop(0)
@@ -439,7 +447,13 @@ def _pump_controller(
     num_prompts_per_step: int = 1,
     buffer: _RecordingBuffer | None = None,
     trainer_version: int = 0,
+    dynamic_sampling_max_replacements: int | None = None,
 ):
+    """A hand-built controller for the rollout pump.
+
+    ``dynamic_sampling_max_replacements`` None leaves dynamic sampling off; an int
+    turns it on with that per-slot budget.
+    """
     buffer = _RecordingBuffer() if buffer is None else buffer
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -471,8 +485,96 @@ def _pump_controller(
     ctrl._trainer_version = trainer_version
     ctrl._current_epoch = 0
     _init_pump_ledgers(ctrl)
+    ctrl._dynamic_sampling_enabled = dynamic_sampling_max_replacements is not None
+    ctrl._dynamic_sampling_max_replacements = dynamic_sampling_max_replacements or 0
     ctrl._sampler_stamps_target_steps = False
     return ctrl
+
+
+class TestDynamicSamplingReplacement:
+    """A filtered group spends its own budget, not the fault-tolerance one."""
+
+    def test_a_filtered_group_is_replaced_even_under_shrink(self):
+        # on_dropped_prompt governs infrastructure failures. Training on a group whose
+        # generations all scored the same is never right, so the filter replaces it
+        # regardless -- which also means it is the only thing filling the spare pool.
+        manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0"), _batch("spare")],
+            on_dropped_prompt="shrink",
+            dynamic_sampling_max_replacements=2,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step0", "spare"]
+        assert ctrl._batch_shortfall == {}
+        assert ctrl._batch_replacements == {0: 1}
+
+    def test_a_filtered_group_does_not_spend_the_failure_budget(self):
+        # max_replacement_attempts=0 bars every fault-tolerance substitution. The
+        # filtered group is still replaced, which is the whole point of the split.
+        manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0"), _batch("spare")],
+            max_replacement_attempts=0,
+            dynamic_sampling_max_replacements=2,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step0", "spare"]
+        assert ctrl._batch_shortfall == {}
+
+    def test_a_failure_does_not_spend_the_filter_budget(self):
+        # The reverse direction: a generous filter budget must not rescue a slot whose
+        # fault-tolerance budget is spent, or an infra failure would never shrink.
+        manager = _ScriptedRolloutManager([RolloutOutcome.SKIPPED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0"), _batch("spare")],
+            max_replacement_attempts=0,
+            dynamic_sampling_max_replacements=10,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert ctrl._batch_replacements == {}, "no substitution attempted"
+        assert ctrl._batch_shortfall == {0: 1}
+
+    def test_exhausting_the_filter_budget_raises_rather_than_shrinking(self):
+        # v1 raises past dynamic_sampling_max_gen_batches. Shrinking instead would hide
+        # a mis-tuned filter behind min_step_batch_fraction.
+        manager = _ScriptedRolloutManager(
+            [RolloutOutcome.FILTERED, RolloutOutcome.FILTERED]
+        )
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0"), _batch("spare")],
+            dynamic_sampling_max_replacements=1,
+        )
+
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            asyncio.run(ctrl._rollout_pump())
+
+        assert exc_info.value.subgroup(RuntimeError) is not None
+        assert ctrl._batch_shortfall == {}
+
+    def test_an_empty_pool_shrinks_the_step_instead_of_raising(self):
+        # The dataloader running out is the end of the run, not a mis-tuned filter.
+        manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0")],
+            dynamic_sampling_max_replacements=10,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step0"]
+        assert ctrl._batch_shortfall == {0: 1}
 
 
 class TestReplaceDroppedPrompt:
@@ -688,6 +790,7 @@ class TestTakeReplacement:
         on_dropped_prompt: str = "replace",
         max_replacement_attempts: int = 1,
         spares: int = 0,
+        stamps_target_steps: bool = True,
     ):
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
@@ -698,6 +801,7 @@ class TestTakeReplacement:
             )
         )
         ctrl._replacement_reserve = deque(_batch(f"spare{i}") for i in range(spares))
+        ctrl._sampler_stamps_target_steps = stamps_target_steps
         return ctrl
 
     def test_a_spare_is_handed_out_and_leaves_the_pool(self):
@@ -710,9 +814,12 @@ class TestTakeReplacement:
         assert ctrl._take_replacement(0, 0) is None
         assert len(ctrl._replacement_reserve) == 2, "pool left untouched"
 
-    def test_an_unstamped_prompt_has_no_short_step_to_repair(self):
-        ctrl = self._controller(spares=2)
-        assert ctrl._take_replacement(None, 0) is None
+    def test_a_non_stamping_sampler_has_no_short_step_to_repair(self):
+        # The sampler's capability decides, not this call's target_step: a sampler
+        # that stamps no steps has nothing waiting on a replacement, so even a valid
+        # target_step with spares on hand still shrinks.
+        ctrl = self._controller(spares=2, stamps_target_steps=False)
+        assert ctrl._take_replacement(0, 0) is None
 
     def test_the_per_slot_budget_stops_substituting(self):
         ctrl = self._controller(max_replacement_attempts=2, spares=5)
@@ -746,6 +853,9 @@ class TestTargetGroupsForStep:
             rollout_failure=SimpleNamespace(min_step_batch_fraction=fraction)
         )
         ctrl._batch_shortfall = dict(shortfall)
+        # Read by the short-step error, which names the spare pool as a third cause
+        # when filtering is on.
+        ctrl._dynamic_sampling_enabled = False
         return ctrl
 
     def test_an_untouched_step_waits_for_the_configured_batch(self):
@@ -783,6 +893,19 @@ class TestTargetGroupsForStep:
         ctrl = self._controller(128, {0: 1}, fraction=1.0)
         with pytest.raises(RuntimeError, match="below the floor of 128"):
             ctrl._target_groups_for_step(0)
+
+    def test_the_error_names_the_spare_pool_only_under_dynamic_sampling(self):
+        # The two generic causes send the reader to the cluster. Under filtering an
+        # empty spare pool is the likelier one, and it is fixed by a config change.
+        quiet = self._controller(128, {0: 128})
+        with pytest.raises(RuntimeError) as without_filtering:
+            quiet._target_groups_for_step(0)
+        assert "spare pool" not in str(without_filtering.value)
+
+        filtering = self._controller(128, {0: 128})
+        filtering._dynamic_sampling_enabled = True
+        with pytest.raises(RuntimeError, match="an empty spare pool"):
+            filtering._target_groups_for_step(0)
 
 
 def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
@@ -977,8 +1100,9 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+            replacement_index: int = 0,
         ) -> None:
-            del target_step, inflight_registry
+            del target_step, inflight_registry, replacement_index
             self._started += 1
             if self._started == 2:
                 self._both_started.set()
@@ -1053,8 +1177,9 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+            replacement_index: int = 0,
         ) -> None:
-            del prompt, target_step, inflight_registry
+            del prompt, target_step, inflight_registry, replacement_index
             raise AssertionError("cancelled child unexpectedly started")
 
     class _CancelBeforeStartTaskGroup:
@@ -1219,6 +1344,9 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             self.two_generated = asyncio.Event()
             self.stats = SimpleNamespace(committed=0)
 
+        def record_group_rewards(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
         async def generate_for_finalization(
             self,
             prompt: Any,
@@ -1246,7 +1374,11 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             del request, target_step
             finalizers_started += 1
             await release_finalizers.wait()
-            return True
+            return SimpleNamespace(
+                valid_row_count=1,
+                total_row_count=1,
+                reward_observations=[],
+            )
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
@@ -1308,6 +1440,9 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         def __init__(self) -> None:
             self.recovery_ledger = RolloutRecoveryLedger()
             self.stats = SimpleNamespace(committed=0)
+
+        def record_group_rewards(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
 
         def reserve_prompt_group(
             self,
@@ -1409,7 +1544,11 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
                 manager.recovery_ledger.discard_group(cut, request.group_id)
             if not committed:
                 return None
-            return SimpleNamespace(valid_row_count=1, total_row_count=1)
+            return SimpleNamespace(
+                valid_row_count=1,
+                total_row_count=1,
+                reward_observations=[],
+            )
 
         ctrl._finalize_with_actor = _finalize
 
