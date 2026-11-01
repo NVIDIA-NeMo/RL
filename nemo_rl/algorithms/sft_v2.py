@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
+from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX, SetupTimingMetrics
 from nemo_rl.algorithms.sft import SFTConfig
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
@@ -141,6 +142,8 @@ class SFTV2ActorArgs:
     placement_plan: DataLoaderPlacementPlan
     save_state: SFTV2SaveState
     loader_states: list[dict[str, Any]] | None
+    # Measured on the driver but logged by the actor, which owns the Logger.
+    setup_timing: SetupTimingMetrics
 
 
 def _initial_save_state(placement_hash: str) -> SFTV2SaveState:
@@ -210,6 +213,7 @@ class SFTSingleControllerActor:
         self._loader_states = actor_args.loader_states
         self._logger = Logger(master_config.logger)  # type: ignore[arg-type]
         self._logger.log_hyperparams(master_config.model_dump())
+        self._log_setup_timing(actor_args.setup_timing)
         self._checkpointer = CheckpointManager(master_config.checkpointing)
         # Also built here, not on the driver: TimeoutChecker starts its
         # wall clock in __init__, so a driver-built one would count the
@@ -442,41 +446,66 @@ class SFTSingleControllerActor:
             )
         return {metric_name: float(metrics[key])}
 
+    def _log_setup_timing(self, setup_timing: SetupTimingMetrics) -> None:
+        """Log the driver's setup phases, which only this actor's Logger can.
+
+        The prefix tees them to ``rl.setup.duration``, whose ``phase=total_setup``
+        is the one value that cannot double-count: the phases nest and the worker
+        builds run concurrently, so summing across phases multiplies startup
+        rather than measuring it.
+
+        Not routed through ``print_setup_timing_summary``: that asserts a
+        generation-init phase, which this algorithm has no backend for.
+        """
+        self._logger.log_metrics(
+            setup_timing.to_metrics_dict(), step=0, prefix=SETUP_TIMING_PREFIX
+        )
+
     def _save_checkpoint(self, metric: dict[str, float]) -> None:
         # The workers would wait for a still-pending save anyway; publish it first.
         self._finish_pending_save(blocking=True)
         step = self._save_state.total_steps
-        loader_states = self._loader_state_dicts()
-        if len(loader_states) != self._placement_plan.logical_world_size:
-            raise RuntimeError("Refusing to save without every logical loader state.")
-        # CheckpointManager ranks keep_top_k on metric_name read back out of
-        # training_info, so the metric travels with the save state.
-        training_info = vars(self._save_state) | metric
-        checkpoint_path = self._checkpointer.init_tmp_checkpoint(
-            step, training_info, self._master_config
-        )
-        self._trainer.save_checkpoint(
-            weights_path=os.path.join(checkpoint_path, "policy", "weights"),
-            optimizer_path=(
-                os.path.join(checkpoint_path, "policy", "optimizer")
-                if self._checkpointer.save_optimizer
-                else None
-            ),
-            tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-            is_final_checkpoint=step == self._max_steps,
-        )
-        save_checkpoint_object(
-            loader_states, os.path.join(checkpoint_path, "sft_v2_loaders.pt")
-        )
-        # Keep this last: the rename it leads to waits only for the policy's async
-        # weight write, so anything written into checkpoint_path after it races
-        # the rename.
-        if self._defer_checkpoint_finalize:
-            self._pending_checkpoint_path = checkpoint_path
-        else:
-            self._checkpointer.begin_finalization(
-                checkpoint_path, wait_fn=self._trainer.finalize_async_save
+        # Covers the save's loop-blocking part: with async_save off that is all of
+        # it, so the span is the gap between two rl.sft_v2.step spans. The durable
+        # tail is rl.checkpoint.finalize, and under defer_async_checkpoint_finalize
+        # the handoff moves out to _finish_pending_save too. rl.iteration comes from
+        # the caller's iteration_scope.
+        with managed_span(
+            RLSpanGroup.CHECKPOINT, "rl.sft_v2.checkpointing", tracer=self._tracer
+        ):
+            loader_states = self._loader_state_dicts()
+            if len(loader_states) != self._placement_plan.logical_world_size:
+                raise RuntimeError(
+                    "Refusing to save without every logical loader state."
+                )
+            # CheckpointManager ranks keep_top_k on metric_name read back out of
+            # training_info, so the metric travels with the save state.
+            training_info = vars(self._save_state) | metric
+            checkpoint_path = self._checkpointer.init_tmp_checkpoint(
+                step, training_info, self._master_config
             )
+            self._trainer.save_checkpoint(
+                weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+                optimizer_path=(
+                    os.path.join(checkpoint_path, "policy", "optimizer")
+                    if self._checkpointer.save_optimizer
+                    else None
+                ),
+                tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+                is_final_checkpoint=step == self._max_steps,
+            )
+            save_checkpoint_object(
+                loader_states, os.path.join(checkpoint_path, "sft_v2_loaders.pt")
+            )
+            # Keep this last: the rename it leads to waits only for the policy's
+            # async weight write, so anything written into checkpoint_path after it
+            # races the rename.
+            if self._defer_checkpoint_finalize:
+                self._pending_checkpoint_path = checkpoint_path
+            else:
+                self._checkpointer.begin_finalization(
+                    checkpoint_path, wait_fn=self._trainer.finalize_async_save
+                )
 
     def _finish_pending_save(self, *, blocking: bool) -> None:
         """Finalize and publish an async save deferred by defer_async_checkpoint_finalize.
@@ -506,6 +535,7 @@ def setup_sft_v2(
     master_config: MasterConfig, tokenizer_or_processor: Any
 ) -> SFTV2ActorArgs:
     """Build the V2 cluster, TQPolicy, placement, and resume state."""
+    setup_started = time.monotonic()
     set_seed(master_config.sft.seed)
     pretrained_checkpoint = master_config.checkpointing.get("pretrained_checkpoint")
     if pretrained_checkpoint is not None:
@@ -624,6 +654,7 @@ def setup_sft_v2(
     num_nodes = cluster_config.num_nodes
     segment_size = cluster_config.segment_size
     node_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
+    cluster_started = time.monotonic()
     cluster = RayVirtualCluster(
         name="sft_v2_cluster",
         bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
@@ -635,8 +666,16 @@ def setup_sft_v2(
         segment_size=segment_size,
         node_resource_constraints=node_constraints,
     )
+    # Placement is lazy: __init__ only stores fields, and the bundles are
+    # scheduled on the first get_placement_groups(), which blocks on
+    # pg.ready(). Called here so the wait is measured rather than charged to
+    # policy_init, where RayWorkerGroup would otherwise trigger it. Idempotent,
+    # so RayWorkerGroup reuses these groups.
+    cluster.get_placement_groups()
+    cluster_seconds = time.monotonic() - cluster_started
     megatron_config = cast(dict[str, Any], master_config.policy["megatron_cfg"])
     megatron_config["train_iters"] = _max_train_steps(master_config)
+    policy_started = time.monotonic()
     trainer = TQPolicy(
         cluster=cluster,
         config=master_config.policy,
@@ -650,6 +689,7 @@ def setup_sft_v2(
         ),
         dp_cfg=master_config.data_plane,
     )
+    policy_seconds = time.monotonic() - policy_started
     mapper_name = master_config.data["energon"].topology_mapper
     placement_plan = resolve_topology_mapper(mapper_name).map(
         trainer.sharding_annotations
@@ -673,6 +713,21 @@ def setup_sft_v2(
     loss_fn = NLLLossFn(
         use_fused_linear_logprobs=megatron_config["use_fused_linear_logprobs"]
     )
+    # cluster_init is the placement-group wait; policy_init covers the worker
+    # builds and the model load, the bulk of a large-MoE start. What is left of
+    # total_setup is this function's own validation and resume reads.
+    #
+    # policy_init is not comparable with the other algorithms', which exclude the
+    # placement wait only when a config pre-creates the groups for a different
+    # reason -- node constraints in grpo/ppo, a segment size in single_controller
+    # -- and report no cluster_init either way. There the wait is inside
+    # policy_init or in no phase at all; here it is always its own. total_setup is
+    # the only phase that means the same thing across algorithms.
+    setup_timing = SetupTimingMetrics(
+        policy_init_time_s=policy_seconds,
+        total_setup_time_s=time.monotonic() - setup_started,
+        extras={"cluster_init_time_s": cluster_seconds},
+    )
     return SFTV2ActorArgs(
         trainer=trainer,
         loss_fn=loss_fn,
@@ -680,6 +735,7 @@ def setup_sft_v2(
         placement_plan=placement_plan,
         save_state=save_state,
         loader_states=loader_states,
+        setup_timing=setup_timing,
     )
 
 
