@@ -117,6 +117,7 @@ from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig, WandbConfig
@@ -1045,11 +1046,13 @@ def mock_grpo_components():
             "loss_fn": ClippedPGLossConfig(
                 use_importance_sampling_correction=True  # Required for async mode
             ),
-            "checkpointing": {
-                "enabled": False,
-                "checkpoint_must_save_by": None,
-                "save_period": 10,
-            },
+            "checkpointing": CheckpointingConfig.model_construct(
+                **{
+                    "enabled": False,
+                    "checkpoint_must_save_by": None,
+                    "save_period": 10,
+                }
+            ),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
             "logger": LoggerConfig.model_construct(num_val_samples_to_print=5),
             "data": {
@@ -2391,9 +2394,9 @@ def test_async_checkpoint_rollouts_state_frontier_key_contract(
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
     master_config.policy["generation"]["colocated"]["enabled"] = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 1
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 1
+    master_config.checkpointing.metric_name = None
     checkpointer = mock_grpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
     checkpointer.checkpoint_dir = tmp_path
@@ -2464,9 +2467,9 @@ def test_async_checkpoint_persists_lowered_cut_not_trained_frontier(
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
     master_config.policy["generation"]["colocated"]["enabled"] = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 1
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 1
+    master_config.checkpointing.metric_name = None
     checkpointer = mock_grpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
     checkpointer.checkpoint_dir = tmp_path
@@ -5448,9 +5451,9 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 1000
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 1000
+    master_config.checkpointing.metric_name = None
 
     single_batch_dataloader = MagicMock(spec=StatefulDataLoader)
     single_batch_dataloader.__iter__ = lambda self: iter([mock_batch])
@@ -5521,7 +5524,7 @@ def test_grpo_train_without_epoch_limit_cycles_until_max_num_steps(
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
-    master_config.checkpointing["enabled"] = False
+    master_config.checkpointing.enabled = False
 
     single_batch_dataloader = MagicMock(spec=StatefulDataLoader)
     single_batch_dataloader.__iter__ = lambda self: iter([mock_batch])
@@ -5580,10 +5583,10 @@ def test_grpo_ft_save_period_triggers_periodic_saves(
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 100  # only the final step saves
-    master_config.checkpointing["ft_save_period"] = 2
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 100  # only the final step saves
+    master_config.checkpointing.ft_save_period = 2
+    master_config.checkpointing.metric_name = None
 
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/checkpoint"
     # Both paths write latest_checkpoint_status.json under checkpoint_dir; give
@@ -5671,10 +5674,10 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
-    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing.enabled = True
     # Step 2 saves via save_period; step 3 saves as the last step.
-    master_config.checkpointing["save_period"] = 2
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.save_period = 2
+    master_config.checkpointing.metric_name = None
     master_config.policy["generation"]["colocated"]["enabled"] = True
 
     events = []
@@ -6655,10 +6658,10 @@ def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp
     master_config.grpo.stop_at_validation_metric = "accuracy"
     master_config.grpo.stop_at_validation_threshold = 0.5
     master_config.grpo.val_at_end = False
-    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing.enabled = True
     # save_period alone can never fire, so only the early stop saves.
-    master_config.checkpointing["save_period"] = 1000
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.save_period = 1000
+    master_config.checkpointing.metric_name = None
     checkpointer = mock_grpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
     checkpointer.checkpoint_dir = tmp_path
@@ -6725,9 +6728,9 @@ def test_adaptive_ppo_clip_state_advances_and_is_checkpointed(
     master_config.grpo.val_period = 0
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 2
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 2
+    master_config.checkpointing.metric_name = None
     checkpointer = mock_grpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
     checkpointer.checkpoint_dir = tmp_path
@@ -7025,9 +7028,9 @@ def test_async_grpo_exit_on_max_epochs(mock_grpo_components, tmp_path):
     master_config.grpo.max_num_epochs = 2
     master_config.grpo.max_num_steps = 100
     master_config.policy["generation"]["colocated"]["enabled"] = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 100
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 100
+    master_config.checkpointing.metric_name = None
 
     checkpointer = mock_grpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/checkpoint"
@@ -7083,8 +7086,8 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys, tmp_path
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 100
     master_config.grpo.max_num_epochs = 10
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.metric_name = None
     mock_grpo_components["checkpointer"].init_tmp_checkpoint.return_value = str(
         tmp_path / "tmp_step"
     )

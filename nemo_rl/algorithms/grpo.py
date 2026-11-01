@@ -713,9 +713,11 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+        # PolicyConfig is still TypedDict-shaped; hand off a plain dict so the
+        # Megatron setup path keeps its key-style access.
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained.model_dump()
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
@@ -3487,7 +3489,7 @@ def _grpo_train_impl(
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -3586,7 +3588,7 @@ def _grpo_train_impl(
             "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
         )
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while (
         max_num_epochs is None or current_epoch < max_num_epochs
@@ -4442,8 +4444,7 @@ def _grpo_train_impl(
                     is_last_step
                     # Early stop saves the final state like a last step.
                     or early_stop_message is not None
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -4453,7 +4454,7 @@ def _grpo_train_impl(
                 should_save_by_timeout = timeout.check_save()
 
                 memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     policy.prepare_for_training()
@@ -4470,7 +4471,7 @@ def _grpo_train_impl(
                     grpo_save_state.consumed_samples = consumed_samples
                     _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
@@ -5227,7 +5228,7 @@ def async_grpo_train(
     _tracer = _telemetry.tracer if _telemetry is not None else None
     training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -5313,7 +5314,7 @@ def async_grpo_train(
         replay_buffer_restore_metadata = _maybe_restore_async_replay_buffer_checkpoint(
             replay_buffer,
             last_checkpoint_path,
-            load_replay_buffer=master_config.checkpointing.get("load_replay_buffer"),
+            load_replay_buffer=master_config.checkpointing.load_replay_buffer,
             num_prompts_per_step=num_prompts_per_step,
             current_training_step=step,
             max_age_steps=max_trajectory_age_steps,
@@ -5646,7 +5647,7 @@ def async_grpo_train(
         init_total_s = timer.stop(INIT_TOTAL_CATEGORY)
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     # Main training loop
     try:
@@ -6126,13 +6127,13 @@ def async_grpo_train(
                 is_last_step = step + 1 == max_num_steps
                 should_save_by_step = (
                     is_last_step
-                    or (step + 1) % master_config.checkpointing["save_period"] == 0
+                    or (step + 1) % master_config.checkpointing.save_period == 0
                     or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
                 )
                 # Checked pre-validation so the wake-deferral below can see it.
                 # A crossing during refit/validation is caught by the lookahead in check_save.
                 should_save_by_timeout = timeout.check_save()
-                will_save_checkpoint = master_config.checkpointing["enabled"] and (
+                will_save_checkpoint = master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 )
                 # An early stop (known only after validation) also saves.
@@ -6263,7 +6264,7 @@ def async_grpo_train(
                             stop_at_validation_metric,
                         )
                         saving_this_step = will_save_checkpoint or (
-                            master_config.checkpointing["enabled"]
+                            master_config.checkpointing.enabled
                             and early_stop_message is not None
                         )
                         # Save-bound steps need the GPUs for checkpointing,
@@ -6393,7 +6394,7 @@ def async_grpo_train(
                     grpo_save_state.consumed_samples = consumed_samples
                     _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics

@@ -1183,16 +1183,16 @@ def setup_single_controller(
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     if (
-        master_config.checkpointing.get("save_data_plane")
+        master_config.checkpointing.save_data_plane
         or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
     ) and not data_plane_checkpointing_supported:
         raise NotImplementedError(
             "SingleController data-plane checkpointing is not supported for "
             f"data_plane.backend={dp_config['backend']!r}."
         )
-    if master_config.checkpointing["enabled"]:
+    if master_config.checkpointing.enabled:
         if (
-            master_config.checkpointing.get("save_data_plane")
+            master_config.checkpointing.save_data_plane
             and dp_config["backend"] == "mooncake_cpu"
             and master_config.async_rl.generation_fleet_health.restart_dead_shards
         ):
@@ -1211,12 +1211,10 @@ def setup_single_controller(
         )
         # msc:// checkpoints cannot hold data-plane snapshots, so the replay-capable
         # sampler falls back to the same cursor-only recovery as the others.
-        checkpoint_dir_is_msc = is_msc_path(
-            master_config.checkpointing["checkpoint_dir"]
-        )
+        checkpoint_dir_is_msc = is_msc_path(master_config.checkpointing.checkpoint_dir)
         if (
             sampler_supports_replay_recovery
-            and not master_config.checkpointing.get("save_data_plane")
+            and not master_config.checkpointing.save_data_plane
             and not checkpoint_dir_is_msc
         ):
             error_message = (
@@ -1293,9 +1291,11 @@ def setup_single_controller(
             "to reuse the rollout's captured media for teacher scoring."
         )
 
-    checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
+    checkpointing_pretrained = master_config.checkpointing.pretrained_checkpoint
     if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+        # PolicyConfig is still TypedDict-shaped; hand off a plain dict so the
+        # Megatron setup path keeps its key-style access.
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained.model_dump()
 
     if generation_config["backend"] == "dynamo":
         # Validate the complete managed-Dynamo boundary before allocating Ray
@@ -1338,11 +1338,11 @@ def setup_single_controller(
         if token_capture_cfg.defer_routed_experts_to_policy:
             raise ValueError("VLM token capture requires direct router replay assembly")
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
-        if not master_config.checkpointing["enabled"]:
+        if not master_config.checkpointing.enabled:
             raise ValueError(
                 "rollout checkpointing requires checkpointing.enabled=true"
             )
-        if not master_config.checkpointing.get("save_data_plane"):
+        if not master_config.checkpointing.save_data_plane:
             raise ValueError(
                 "rollout checkpointing requires checkpointing.save_data_plane=true"
             )
@@ -1360,10 +1360,10 @@ def setup_single_controller(
                 "rollout checkpointing requires a sampler that explicitly "
                 "supports training-claim ownership"
             )
-        if master_config.checkpointing["save_period"] != 1:
+        if master_config.checkpointing.save_period != 1:
             warnings.warn(
                 "rollout checkpointing is enabled with "
-                f"checkpointing.save_period={master_config.checkpointing['save_period']}; "
+                f"checkpointing.save_period={master_config.checkpointing.save_period}; "
                 "periodic rollout snapshots can only be saved while a matching "
                 "trainer checkpoint exists. Set checkpointing.save_period=1 for "
                 "continuous post-step coverage.",
@@ -1779,8 +1779,8 @@ def setup_single_controller(
             checkpointing=bool(
                 recovery_checkpoint_path is not None
                 or (
-                    master_config.checkpointing["enabled"]
-                    and master_config.checkpointing.get("save_data_plane")
+                    master_config.checkpointing.enabled
+                    and master_config.checkpointing.save_data_plane
                 )
             ),
             storage_unit_node_ids=storage_unit_node_ids,
