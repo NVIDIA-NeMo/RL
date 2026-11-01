@@ -86,6 +86,7 @@ def _cut(privilege_state: dict[str, Any] | None) -> _RolloutCheckpointCut:
     return _RolloutCheckpointCut(
         dataloader_state={},
         sampler_dispatch_index=0,
+        next_nemo_gym_task_index=0,
         replacement_reserve=[],
         replay_metadata=None,
         privilege_state=privilege_state,
