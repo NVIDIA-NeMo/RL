@@ -1904,6 +1904,52 @@ def test_teacher_full_payload_cpu_boundaries(
         assert call.kwargs == {"seq_dim": 1}
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("keep_payload_on_gpu", [False, True])
+def test_teacher_full_payload_stays_on_gpu_only_when_asked(
+    keep_payload_on_gpu: bool,
+) -> None:
+    """A GPU-sourced PUT needs the payload on the device it was produced on."""
+    from nemo_rl.models.megatron.train import TeacherFullPayloadPostProcessor
+
+    cfg = {
+        "sequence_packing": {"enabled": False},
+        "megatron_cfg": {"context_parallel_size": 1},
+    }
+    hidden_states = torch.randn(4, 2, 3, device="cuda")  # [S, B, H]
+    data = {
+        "input_ids": torch.zeros(2, 4, dtype=torch.long),
+        "input_lengths": torch.tensor([4, 4]),
+    }
+    with patch("nemo_rl.models.megatron.train.LogprobsPostProcessor") as logprob_cls:
+        logprob_cls.return_value.return_value.return_value = (
+            torch.tensor(0.0),
+            {"logprobs": torch.zeros(2, 4)},
+        )
+        processor = TeacherFullPayloadPostProcessor(
+            cfg,
+            "hidden_states",
+            torch.bfloat16,
+            keep_payload_on_gpu=keep_payload_on_gpu,
+        )
+        wrapped_fn = processor(
+            data_dict=data,
+            input_ids=data["input_ids"],
+            cu_seqlens_padded=None,
+            original_seq_length=4,
+            hidden_states=hidden_states,
+        )
+        _, result = wrapped_fn(torch.randn(2, 4, 8, device="cuda"))
+
+    payload = result["teacher_full_payload"]
+    assert payload.dtype == torch.bfloat16
+    expected_device = hidden_states.device if keep_payload_on_gpu else "cpu"
+    assert payload.device == torch.device(expected_device)
+    torch.testing.assert_close(
+        payload.cpu(), hidden_states.transpose(0, 1).to(torch.bfloat16).cpu()
+    )
+
+
 class TestTopkLogitsPostProcessor:
     """Tests for TopkLogitsPostProcessor class."""
 
