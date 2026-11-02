@@ -1567,7 +1567,16 @@ def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
         ),
     ],
 )
-def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
+@pytest.mark.parametrize(
+    "actor_cfg",
+    [{}, {"decode_prompt_strs": True}],
+    ids=["decode_prompt_strs_omitted", "decode_prompt_strs_true"],
+)
+def test_nemo_gym_postprocess_uses_batch_decode(
+    token_fields, expected_count, actor_cfg
+):
+    """Omitted and explicit decode_prompt_strs=true both decode prompt_str."""
+
     class _Tokenizer:
         def __init__(self):
             self.batch_decode_calls = []
@@ -1605,7 +1614,7 @@ def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     nemo_gym_result.update(token_fields)
 
     class _MockSelf:
-        cfg = {}
+        cfg = actor_cfg
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
@@ -1633,6 +1642,65 @@ def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
+
+
+def test_nemo_gym_postprocess_can_skip_prompt_decode():
+    """decode_prompt_strs: false skips the prompt decode but keeps generation_str."""
+
+    class _Tokenizer:
+        def __init__(self):
+            self.batch_decode_calls = []
+
+        def batch_decode(self, batch):
+            self.batch_decode_calls.append([list(token_ids) for token_ids in batch])
+            return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+    tokenizer = _Tokenizer()
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                },
+                {
+                    "prompt_token_ids": [1, 2, 3, 4, 5],
+                    "generation_token_ids": [6, 7],
+                    "generation_log_probs": [-0.2, -0.3],
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+    class _MockSelf:
+        cfg = {"decode_prompt_strs": False}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, nemo_gym_result, tokenizer
+        )
+    )
+
+    assert tokenizer.batch_decode_calls == [[[3], [6, 7]]]
+    assert [m["token_ids"].tolist() for m in result["message_log"]] == [
+        [1, 2],
+        [3],
+        [4, 5],
+        [6, 7],
+    ]
+    for assistant_message, expected_logprobs in zip(
+        result["message_log"][1::2], [[-0.1], [-0.2, -0.3]]
+    ):
+        assert torch.equal(
+            assistant_message["generation_logprobs"], torch.tensor(expected_logprobs)
+        )
+    for item, generation_str in zip(
+        nemo_gym_result["response"]["output"], ["3", "6 7"]
+    ):
+        assert "prompt_str" not in item
+        assert item["generation_str"] == generation_str
 
 
 @pytest.mark.parametrize("include_initial_multimodal_data", [False, True])
