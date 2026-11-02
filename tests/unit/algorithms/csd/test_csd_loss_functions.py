@@ -30,6 +30,7 @@ from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
     cp_load_balanced_to_contiguous,
 )
+from tests.unit.algorithms.csd.test_csd_loss_parity import _build_case
 
 _CT_V_STUDENT = 6
 _CT_V_TEACHER = 5
@@ -814,6 +815,156 @@ def test_same_vocab_kd_on_megatron_cp2_matches_cp1(tmp_path):
     mp.spawn(
         _run_same_vocab_megatron_cp,
         args=(2, os.fspath(tmp_path / "gloo_init")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _automodel_cp_cfg(fx, cross_tokenizer):
+    cfg = _ct_loss_cfg(None)
+    cfg.update(dynamic_loss_scaling=True, student_vocab_size=fx["v_s"])
+    if cross_tokenizer:
+        cfg.update(
+            teacher_vocab_sizes=[fx["v_t"]],
+            common_indices_from_subtoks=True,
+            student_to_teacher_table_paths=[
+                fx["knobs"]["student_to_teacher_table_path"]
+            ],
+            teacher_to_student_table_paths=[
+                fx["knobs"]["teacher_to_student_table_path"]
+            ],
+        )
+    else:
+        cfg["teacher_vocab_sizes"] = [fx["v_s"]]
+    return cfg
+
+
+def _automodel_cp_loss(loss_fn, fx, student, window, *, cp_group, cp_size):
+    """Loss on one contiguous student window, called as the Automodel worker does.
+
+    Chunk spans stay global, the worker counts every chunk once per CP rank,
+    and the caller does not divide by the CP size. The full window with
+    ``cp_group=None`` is the CP=1 reference.
+    """
+    ids = fx["student_ids"]
+    token_mask = torch.ones_like(ids)
+    sample_mask = torch.ones(ids.shape[0])
+    data = BatchedDataDict(
+        {
+            "input_ids": ids,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "teacher_0_token_mask": torch.ones_like(fx["teacher_ids"]),
+        }
+    )
+    chunk_fields = {}
+    global_valid_chunks_by_idx = None
+    if not loss_fn._teacher_is_same_vocab(0):
+        chunk_fields = {
+            "pair_valid": fx["pair_valid"],
+            "teacher_input_ids": fx["teacher_ids"][:, window],
+            "student_spans": fx["s_spans"],
+            "teacher_spans": fx["t_spans"],
+            "num_chunks": fx["num_chunks"],
+        }
+        global_valid_chunks_by_idx = {
+            0: torch.tensor(fx["global_valid_chunks"] * cp_size)
+        }
+    align = LocalizedAlignment(
+        sample_mask=sample_mask,
+        student_input_ids=ids[:, window],
+        student_token_mask=token_mask[:, window],
+        student_kd_token_mask=token_mask[:, window],
+        **chunk_fields,
+    )
+    # CE reads this window of the full-sequence next-token log-probabilities.
+    next_ids = torch.cat([ids[:, 1:], torch.zeros_like(ids[:, :1])], dim=1)
+    next_mask = token_mask.roll(shifts=-1, dims=1)
+    next_mask[:, -1] = 0
+    next_logprobs = (
+        torch.log_softmax(student, dim=-1)
+        .gather(-1, next_ids[:, window].unsqueeze(-1))
+        .squeeze(-1)
+    )
+    return loss_fn(
+        data,
+        sample_mask.sum(),
+        token_mask[:, 1:].sum().float(),
+        student,
+        student,
+        {0: fx["teacher_logits"][:, window]},
+        {0: align},
+        student_next_token_logprobs=next_logprobs,
+        student_next_token_mask=next_mask[:, window],
+        global_valid_chunks_by_idx=global_valid_chunks_by_idx,
+        cp_group=cp_group,
+        cp_normalized_by_caller=False,
+    )
+
+
+def _run_automodel_cp(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    fixture_path: str,
+    cross_tokenizer: bool,
+) -> None:
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        cp_group = dist.new_group(ranks=list(range(world_size)))
+        fx = torch.load(fixture_path, weights_only=False)
+        loss_fn = CSDLossFn(_automodel_cp_cfg(fx, cross_tokenizer))
+
+        reference = fx["student_logits"].clone().requires_grad_(True)
+        ref_loss, ref_metrics = _automodel_cp_loss(
+            loss_fn, fx, reference, slice(None), cp_group=None, cp_size=1
+        )
+        ref_loss.backward()
+
+        width = reference.shape[1] // world_size
+        window = slice(rank * width, (rank + 1) * width)
+        local = fx["student_logits"][:, window].clone().requires_grad_(True)
+        loss, metrics = _automodel_cp_loss(
+            loss_fn, fx, local, window, cp_group=cp_group, cp_size=world_size
+        )
+        # Automodel sums the CP ranks' gradients without dividing by CP.
+        loss.backward()
+        gathered = [torch.empty_like(local.grad) for _ in range(world_size)]
+        dist.all_gather(gathered, local.grad)
+
+        for key in ("kl_loss_scale", "kl_loss", "ce_loss", "loss"):
+            assert metrics[key] == pytest.approx(ref_metrics[key], rel=1e-5), (
+                f"{key}: CP2 {metrics[key]} vs CP1 {ref_metrics[key]}"
+            )
+        torch.testing.assert_close(
+            torch.cat(gathered, dim=1), reference.grad, rtol=1e-5, atol=1e-6
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend unavailable")
+@pytest.mark.parametrize(
+    "cross_tokenizer", [True, False], ids=["cross_tokenizer", "same_tokenizer"]
+)
+def test_dynamic_scaling_on_automodel_cp2_matches_cp1(tmp_path, cross_tokenizer):
+    """Each Automodel CP rank holds a KD share; the scale and kl_loss use its CP sum."""
+    fixture_path = tmp_path / "fixture.pt"
+    torch.save(_build_case("with_mismatch", os.fspath(tmp_path)), fixture_path)
+    mp.spawn(
+        _run_automodel_cp,
+        args=(
+            2,
+            os.fspath(tmp_path / "gloo_init"),
+            os.fspath(fixture_path),
+            cross_tokenizer,
+        ),
         nprocs=2,
         join=True,
     )

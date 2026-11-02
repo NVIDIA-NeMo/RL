@@ -654,8 +654,16 @@ class CSDLossFn(LossFunction):
             raise ValueError(f"Unknown kd_loss_mode: {self.kd_loss_mode!r}")
 
         # Combine the aggregated KD term with the single student CE term.
-        loss, _, kl_scale = self._combine_kd_and_ce(
-            total_kd, ce_loss, total_kd.detach(), ce_loss.detach()
+        # Without caller-side CP division (Automodel CP) each rank's KD is its
+        # CP share while CE is complete, so the dynamic scale and the reported
+        # KD use the CP sum, as on the owner-local path.
+        reported_kd = (
+            total_kd.detach()
+            if self._sum_window_kd_over_cp
+            else self._detached_cp_sum(total_kd, cp_group)
+        )
+        loss, reported_loss, kl_scale = self._combine_kd_and_ce(
+            total_kd, ce_loss, reported_kd, ce_loss.detach()
         )
 
         # Next-token accuracy on the student side (quick per-step signal), masked
@@ -676,8 +684,8 @@ class CSDLossFn(LossFunction):
 
         metrics = self._loss_metrics(
             data,
-            loss=loss,
-            kd=total_kd,
+            loss=reported_loss,
+            kd=reported_kd,
             ce=ce_loss,
             kl_scale=kl_scale,
             accuracy=accuracy,
