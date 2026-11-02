@@ -37,6 +37,7 @@ from nemo_rl.telemetry.host_memory import (
 )
 from nemo_rl.telemetry.vocabulary import WORKER_GROUP_ENV
 from nemo_rl.utils.venvs import (
+    nrl_timing,
     add_hf_modules_cache_to_pythonpath,
     create_local_venv_on_each_node,
 )
@@ -525,6 +526,8 @@ class RayWorkerGroup:
                                 specifies a tied group with its node and local bundle indices. If the local_bundle_indices
                                 spans multiple nodes, the node_idx will be the first node's index in the tied group.
         """
+        _t_enter = time.time()
+        nrl_timing(f"worker_group enter group={self.name_prefix}")
         self.master_address, self.master_port = (
             self.cluster.get_master_address_and_port()
         )
@@ -554,6 +557,8 @@ class RayWorkerGroup:
         # can join the venv instead of landing in the driver's environment.
         self.py_executable = py_executable
 
+        nrl_timing(f"worker_group venv_resolved group={self.name_prefix} secs_since_enter={time.time() - _t_enter:.2f}")
+
         # Count total workers
         self.world_size = sum(len(indices) for _, indices in bundle_indices_list)
         global_rank = 0
@@ -562,8 +567,13 @@ class RayWorkerGroup:
         worker_futures = []
         worker_info = []  # Store metadata for each worker
 
-        # Get all placement groups
+        # Get all placement groups (creates them on first use: this is where a cluster's per-node PGs are built)
+        _t = time.time()
         placement_groups = self.cluster.get_placement_groups()
+        nrl_timing(
+            f"worker_group placement_groups group={self.name_prefix} n={len(placement_groups)} "
+            f"secs={time.time() - _t:.2f}"
+        )
 
         # Get available address and port for each worker
         pg_bundle_pairs = [
@@ -571,8 +581,13 @@ class RayWorkerGroup:
             for pg_idx, local_bundle_indices in bundle_indices_list
             for bundle_idx in local_bundle_indices
         ]
+        _t = time.time()
         addr_port_results = self.cluster.get_available_addresses_and_ports_batch(
             pg_bundle_pairs
+        )
+        nrl_timing(
+            f"worker_group addr_port_batch group={self.name_prefix} n={len(pg_bundle_pairs)} "
+            f"secs={time.time() - _t:.2f}"
         )
         available_addresses = [addr for addr, _ in addr_port_results]
         available_ports = [port for _, port in addr_port_results]
@@ -607,6 +622,11 @@ class RayWorkerGroup:
                 )
             )
 
+        nrl_timing(
+            f"worker_group initializers_created group={self.name_prefix} n={len(self._initializer_pool)} "
+            f"secs_since_enter={time.time() - _t_enter:.2f}"
+        )
+        _t_submit = time.time()
         for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
             current_group = []
 
@@ -725,6 +745,12 @@ class RayWorkerGroup:
         num_workers = len(worker_futures)
         worker_refs = worker_futures
 
+        nrl_timing(
+            f"worker_group workers_submitted group={self.name_prefix} n={len(worker_futures)} "
+            f"submit_loop_secs={time.time() - _t_submit:.2f} secs_since_enter={time.time() - _t_enter:.2f}"
+        )
+        _t_wait = time.time()
+        _done_at: list[float] = []
         start_time = time.perf_counter()
 
         # Use ray.wait() to track individual worker completion times
@@ -745,10 +771,18 @@ class RayWorkerGroup:
                 # Update progress bar for each ready worker
                 for _ in ready_refs:
                     pbar.update(1)
+                    _done_at.append(time.time() - _t_wait)
 
         # Get all worker results
         workers = ray.get(worker_refs)
         total_init_time = time.perf_counter() - start_time
+        if _done_at:
+            _d = sorted(_done_at)
+            nrl_timing(
+                f"worker_group workers_ready group={self.name_prefix} n={len(_d)} "
+                f"first={_d[0]:.2f} p50={_d[len(_d) // 2]:.2f} p90={_d[int(.9 * len(_d))]:.2f} last={_d[-1]:.2f} "
+                f"total_secs_since_enter={time.time() - _t_enter:.2f}"
+            )
 
         print(
             f"  ✓ {num_workers} workers initialized in {total_init_time:.2f}s",

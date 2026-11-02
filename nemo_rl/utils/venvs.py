@@ -137,6 +137,15 @@ def create_local_venv(
     return python_path
 
 
+def nrl_timing(msg: str) -> None:
+    """One greppable, timestamped line. Driver-side only; NRL_TIMING=0 turns it off."""
+    if os.environ.get("NRL_TIMING", "1") == "0":
+        return
+    import datetime
+
+    print(f"[NRL_TIMING] {datetime.datetime.now().astimezone().isoformat(timespec='milliseconds')} {msg}", flush=True)
+
+
 # Ray-based helper to create a virtual environment on each Ray node
 @ray.remote(num_cpus=1)  # pragma: no cover
 def _env_builder(
@@ -183,6 +192,19 @@ def _env_builder(
             started_file.unlink()
 
 
+
+@ray.remote(num_cpus=1)  # pragma: no cover
+def _env_builder_timed(
+    py_executable: str, venv_name: str, node_idx: int, force_rebuild: bool = False
+):
+    """_env_builder plus this task's own wall-clock span, so the driver can tell a slow node from a slow fan-out."""
+    import socket
+
+    t_start = time.time()
+    path = _env_builder._function(py_executable, venv_name, node_idx, force_rebuild)
+    return path, t_start, time.time(), socket.gethostname()
+
+
 def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     """Create a virtual environment on each Ray node.
 
@@ -201,21 +223,49 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
         if n.get("Alive", False) and n.get("Resources", {}).get("CPU", 0) > 0
     ]
     num_nodes = len(nodes)
+    t0 = time.time()
+    nrl_timing(f"venv_prep start venv={venv_name} nodes={num_nodes}")
     # Reserve one CPU on each node using a STRICT_SPREAD placement group
     bundles = [{"CPU": 1} for _ in range(num_nodes)]
     pg = placement_group(bundles=bundles, strategy="STRICT_SPREAD")
     ray.get(pg.ready())
+    t_pg = time.time()
+    nrl_timing(f"venv_prep pg_ready venv={venv_name} secs={t_pg - t0:.2f}")
 
     force_rebuild = os.environ.get("NRL_FORCE_REBUILD_VENVS", "false").lower() == "true"
-    # Launch one actor per node
-    actors = [
-        _env_builder.options(placement_group=pg).remote(
+    # Launch one task per node
+    refs = [
+        _env_builder_timed.options(placement_group=pg).remote(
             py_executable, venv_name, i, force_rebuild
         )
         for i, _ in enumerate(nodes)
     ]
-    # ensure setup runs on each node
-    paths = ray.get([actor for actor in actors])
+    t_sub = time.time()
+    nrl_timing(f"venv_prep submitted venv={venv_name} tasks={len(refs)} secs={t_sub - t_pg:.2f}")
+    # Collect as they finish, recording when each did
+    done_at = []
+    remaining = list(refs)
+    while remaining:
+        ready, remaining = ray.wait(remaining, num_returns=min(len(remaining), 64), timeout=None)
+        done_at.extend([time.time() - t_sub] * len(ready))
+    results = ray.get(refs)
+    t_done = time.time()
+    paths = [r[0] for r in results]
+    spans = sorted(r[2] - r[1] for r in results)
+    # Task start lag = how long after submission each task actually began running on its node
+    lags = sorted(r[1] - t_sub for r in results)
+
+    def q(v, f):
+        return v[min(len(v) - 1, int(f * len(v)))]
+
+    nrl_timing(
+        f"venv_prep tasks_done venv={venv_name} secs_since_submit={t_done - t_sub:.2f} "
+        f"task_wall p50={q(spans, .5):.2f} p90={q(spans, .9):.2f} max={spans[-1]:.2f} "
+        f"task_start_lag p50={q(lags, .5):.2f} p90={q(lags, .9):.2f} max={lags[-1]:.2f} "
+        f"completion_offset p50={q(sorted(done_at), .5):.2f} max={max(done_at):.2f}"
+    )
+    slow = sorted(results, key=lambda r: r[2] - r[1], reverse=True)[:3]
+    nrl_timing("venv_prep slowest " + " ".join(f"{r[3]}={r[2] - r[1]:.2f}s" for r in slow))
     # Normalize paths to handle double slashes and other path inconsistencies
     normalized_paths = [os.path.normpath(p) for p in paths]
     assert len(set(normalized_paths)) == 1, (
@@ -223,7 +273,12 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     )
 
     # Clean up the placement group
+    t_rm = time.time()
     ray.util.remove_placement_group(pg)
+    nrl_timing(
+        f"venv_prep end venv={venv_name} remove_pg_secs={time.time() - t_rm:.2f} "
+        f"total_secs={time.time() - t0:.2f}"
+    )
     # Return mapping from node IP to venv python path
     return paths[0]
 
