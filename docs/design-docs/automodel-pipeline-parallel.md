@@ -112,7 +112,7 @@ normalized exactly as without PP.
 
 ### 4.1 Batch Planning
 
-`plan_execution_batches` (`nemo_rl/models/automodel/pipeline_batch.py`) turns the data
+`plan_execution_batches` (`nemo_rl/models/automodel/pipeline_parallel.py`) turns the data
 of one global batch (or one logprob request) into execution batches of `mbs * M` samples. The
 tail is padded with copies of the first sample whose `sample_mask` and `token_mask` are
 zero, and the number of execution batches is all-reduced (max) over the DP group, so
