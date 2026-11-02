@@ -685,7 +685,6 @@ def _get_teacher_logits_ipc(
             temperature=float(loss_fn.cfg.temperature),
             vocab_size=int(loss_fn.teacher_vocab_sizes[teacher_idx]),
             micro_batch_size=micro_batch_size,
-            support_mode=str(loss_fn.cfg.teacher_topk_ipc_support_mode),
             gt_filter_topk=(noise_filter_topk if noise_filter_topk > 0 else None),
             timer=timer,
         )
@@ -1287,18 +1286,18 @@ def validate_csd_packing_setup(master_config: MasterConfig) -> Optional[int]:
             f"{dict(zip((label for label, _ in side_configs), algorithms, strict=True))}."
         )
 
-    loss_config = _loss_config_dict(master_config)
-    if int(loss_config.get("teacher_topk_ipc_k", 0)) != 0:
+    loss_config = master_config.loss_fn
+    if loss_config.teacher_topk_ipc_k != 0:
         raise ValueError(
             "CSD lockstep packing currently supports dense teacher IPC only; "
             "set loss_fn.teacher_topk_ipc_k=0."
         )
-    if loss_config.get("kd_loss_mode") != "sum":
+    if loss_config.kd_loss_mode != "sum":
         raise ValueError(
             "CSD lockstep packing currently supports static additive teacher "
             "aggregation only; set loss_fn.kd_loss_mode='sum'."
         )
-    if loss_config.get("sum_weights_metric") is not None:
+    if loss_config.sum_weights_metric is not None:
         raise ValueError(
             "CSD lockstep packing does not support per-batch teacher scoring; "
             "set loss_fn.sum_weights_metric=null."
@@ -1558,24 +1557,10 @@ def setup(
     configured_packing_dp = validate_csd_packing_setup(master_config)
 
     teacher_topk_ipc_k = (
-        int(loss_config["teacher_topk_ipc_k"])
-        if master_config.algorithm == "csd"
+        master_config.loss_fn.teacher_topk_ipc_k
+        if isinstance(master_config.loss_fn, CSDLossConfig)
         else 0
     )
-    if teacher_topk_ipc_k < 0:
-        raise ValueError(
-            f"loss_fn.teacher_topk_ipc_k must be >= 0, got {teacher_topk_ipc_k}"
-        )
-    teacher_topk_support_mode = (
-        str(loss_config["teacher_topk_ipc_support_mode"])
-        if master_config.algorithm == "csd"
-        else "row_topk"
-    )
-    if teacher_topk_support_mode != "row_topk":
-        raise ValueError(
-            "loss_fn.teacher_topk_ipc_support_mode currently supports only "
-            f"'row_topk', got {teacher_topk_support_mode!r}"
-        )
     if teacher_topk_ipc_k > 0:
         has_sparse_teacher = any(
             _teacher_is_cross_tokenizer(master_config, teacher) for teacher in teachers
@@ -1611,7 +1596,7 @@ def setup(
     owner_local = False
     if master_config.algorithm == "csd":
         owner_local_reasons = csd_owner_local_ineligibility(
-            master_config, CSDLossConfig.model_validate(loss_config)
+            master_config, master_config.loss_fn
         )
         if _megatron_enabled(policy_config):
             if teacher_topk_ipc_k > 0 and owner_local_reasons:

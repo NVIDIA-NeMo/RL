@@ -224,7 +224,6 @@ def _make_master_config(
                     "kl_chunk_shift": False,
                     "csd_noise_filter_topk": 0,
                     "teacher_topk_ipc_k": 0,
-                    "teacher_topk_ipc_support_mode": "row_topk",
                     "teacher_topk_ipc_keep_realized": True,
                 }
             ),
@@ -334,7 +333,6 @@ def mock_csd_components():
             "kl_chunk_shift": False,
             "csd_noise_filter_topk": 0,
             "teacher_topk_ipc_k": 0,
-            "teacher_topk_ipc_support_mode": "row_topk",
             "teacher_topk_ipc_keep_realized": True,
         }
     )
@@ -1270,7 +1268,6 @@ class _FakeLossFn(CSDLossFn):
                 "kl_chunk_shift": False,
                 "csd_noise_filter_topk": 0,
                 "teacher_topk_ipc_k": teacher_topk_ipc_k,
-                "teacher_topk_ipc_support_mode": "row_topk",
                 "teacher_topk_ipc_keep_realized": True,
                 "owner_local": owner_local,
             }
@@ -1841,7 +1838,6 @@ def test_export_teacher_logits_mixes_sparse_cross_and_dense_same_vocab():
     assert sparse_kwargs["temperature"] == 1.0
     assert sparse_kwargs["vocab_size"] == 151669
     assert sparse_kwargs["micro_batch_size"] == 1
-    assert sparse_kwargs["support_mode"] == "row_topk"
     assert sparse_kwargs["gt_filter_topk"] is None
     force = t0.get_topk_logits_ipc.call_args.args[0]["force_include_token_ids"]
     assert force.shape == (1, 4, csd_mod.SPARSE_TEACHER_FORCE_WIDTH)

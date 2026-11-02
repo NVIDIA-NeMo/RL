@@ -194,7 +194,6 @@ class CSDLossConfig(BaseModel, extra="allow"):
     # Positive k sends each teacher row's top-k logits plus its full-vocab logZ
     # (the KD then compares top-k plus a REST bucket); zero sends dense logits.
     teacher_topk_ipc_k: Annotated[int, Field(ge=0)] = 128
-    teacher_topk_ipc_support_mode: Literal["row_topk"] = "row_topk"
     # Keep each chunk's realized (student, teacher) pair in the compared
     # support (1-to-1 chunks drop common pairs sharing only one token with
     # it), for dense and sparse transport alike; sparse transport keeps at

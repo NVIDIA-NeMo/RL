@@ -1556,7 +1556,6 @@ class XtokenShardTestActor:
                 "csd_jsd_beta": 0.5,
                 "csd_noise_filter_topk": 0,
                 "teacher_topk_ipc_k": 0,
-                "teacher_topk_ipc_support_mode": "row_topk",
                 "teacher_topk_ipc_keep_realized": True,
             }
             loss_fn = CrossTokenizerDistillationLossFn(cfg)
