@@ -941,7 +941,7 @@ def _validate_shared_prefix_model_capability(
     if model_cfg.softmax_type != "vanilla":
         raise NotImplementedError(
             f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
-            "model_cfg.softmax_type='vanilla'; fused shared-prefix attention "
+            "model_cfg.softmax_type='vanilla'; shared-prefix forest attention "
             "does not implement softmax offsets."
         )
 
@@ -958,8 +958,8 @@ def _validate_shared_prefix_model_capability(
         raise NotImplementedError(
             f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
             "model_cfg.qk_clip=false and model_cfg.log_max_attention_logit=false; "
-            "the fused forest-attention branch bypasses MCore's core-attention "
-            "maximum-logit statistics."
+            "the shared-prefix forest attention branch bypasses MCore's "
+            "core-attention maximum-logit statistics."
         )
 
     num_moe_experts = getattr(model_cfg, "num_moe_experts", None)
