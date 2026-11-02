@@ -67,4 +67,4 @@ Not after schema validation either. Entrypoints call `check_outdated_config(conf
 
 ## Exemptions
 
-`examples/run_eval.py` and `examples/configs/evals/` are exempt: eval configs have a different structure from training configs. Both exemptions carry a written reason. If a new entrypoint needs one, add it to `_EXEMPT` with a reason — do not encode the special case inside the check itself.
+`examples/run_eval.py` and `examples/configs/evals/` are exempt: eval configs have a different structure from training configs. Both exemptions carry a written reason. If a new entrypoint needs one, add a `pytest.skip` with the reason in `test_every_entrypoint_checks_outdated_config` (`tests/unit/utils/test_outdated_config_checks.py`) — do not encode the special case inside the check itself.

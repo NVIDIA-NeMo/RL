@@ -87,7 +87,7 @@ When adding a new config key to a `BaseModel` or `TypedDict` subclass, document:
 - Valid values/types
 - Recommended default (if applicable)
 
-Reflect the default in the exemplar YAMLs under `examples/configs/*.yaml`. If the change affects an exemplar covered by `tests/unit/test_config_v2.py`, also update the matching `tests/unit/reference_configs/*.yaml` so the v1→v2 migration check stays green.
+Reflect the default in every base config YAML under `examples/configs/` (the ones without `defaults:`) that carries the key's block, and update every `tests/unit/reference_configs/*.yaml` whose resolved config gains the key, so the v1→v2 migration check in `tests/unit/test_config_v2.py` stays green. A base config may have no twin of its own: `ppo_math_1B.yaml` feeds `ppo_math_1B_megatron.yaml`.
 
 ## Recipe YAMLs Must Set `defaults`
 

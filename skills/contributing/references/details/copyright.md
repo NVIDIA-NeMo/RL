@@ -1,6 +1,6 @@
 # NVIDIA Copyright Header
 
-Add the following NVIDIA copyright header to all Python files and shell scripts. The header should include the current year. Exclude test files (files under `tests/` or test-only scripts).
+Add the following NVIDIA copyright header to all Python files and shell scripts. The header should include the current year. Test files need it too; only `__init__.py` is exempt.
 
 The header must appear at the top of the file. **Always use the current year** (not a hardcoded year):
 
