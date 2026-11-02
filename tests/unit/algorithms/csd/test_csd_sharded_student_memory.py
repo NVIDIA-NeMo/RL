@@ -51,7 +51,6 @@ def _loss_config(fx):
         "csd_mismatch_loss_beta": knobs["csd_mismatch_loss_beta"],
         "csd_noise_filter_topk": knobs["csd_noise_filter_topk"],
         "teacher_topk_ipc_k": 0,
-        "teacher_topk_ipc_support_mode": "row_topk",
         "teacher_topk_ipc_keep_realized": False,
     }
 

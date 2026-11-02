@@ -1360,7 +1360,6 @@ class AutomodelPolicyWorkerImpl(
         temperature: float,
         vocab_size: Optional[int] = None,
         micro_batch_size: Optional[int] = None,
-        support_mode: str,
         gt_filter_topk: Optional[int] = None,
     ) -> dict[str, Any]:
         """Run a teacher forward and expose row-top-k + logZ via CUDA IPC."""
@@ -1369,11 +1368,6 @@ class AutomodelPolicyWorkerImpl(
         if temperature <= 0.0:
             raise ValueError(
                 f"temperature must be > 0 for get_topk_logits_ipc, got {temperature}"
-            )
-        if support_mode != "row_topk":
-            raise NotImplementedError(
-                "Automodel sparse teacher IPC currently supports only "
-                f"support_mode='row_topk', got {support_mode!r}."
             )
         gt_filter_topk_value = int(gt_filter_topk or 0)
         if gt_filter_topk_value < 0:
@@ -1499,7 +1493,6 @@ class AutomodelPolicyWorkerImpl(
         print(
             "Sparse teacher IPC buffer: "
             f"shape={tuple(final_logits.shape)} "
-            f"support_mode={support_mode} "
             f"bytes={sparse_bytes / (1024**3):.2f}GiB "
             f"full_est={full_bytes_estimate / (1024**3):.2f}GiB",
             flush=True,

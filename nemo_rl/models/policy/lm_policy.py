@@ -1090,7 +1090,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         temperature: float,
         vocab_size: Optional[int] = None,
         micro_batch_size: Optional[int] = None,
-        support_mode: str,
         gt_filter_topk: Optional[int] = None,
         timer: Optional[Timer] = None,
     ) -> list[dict[str, Any]]:
@@ -1131,7 +1130,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "temperature": temperature,
                     "vocab_size": vocab_size,
                     "micro_batch_size": micro_batch_size,
-                    "support_mode": support_mode,
                     "gt_filter_topk": gt_filter_topk,
                 },
             )
