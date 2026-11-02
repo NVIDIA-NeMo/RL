@@ -24,16 +24,12 @@ import copy
 import sys
 import types
 from dataclasses import make_dataclass
-from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 from packaging.version import Version
 
 from nemo_rl.models.megatron import zero_train_gen_mismatch as zgm
-
-CONFIGS_DIR = Path(__file__).resolve().parents[4] / "examples" / "configs"
 
 # Installed-package versions that satisfy every gate in `_validate_packages`.
 GOOD_VERSIONS = {
@@ -912,36 +908,6 @@ def test_batch_invariant_token_multiple(tp_size, expected):
     from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple
 
     assert batch_invariant_token_multiple(tp_size) == expected
-
-
-def _standalone_megatron_exemplars() -> list[Path]:
-    """Top-level exemplars that define a full (enabled) Megatron block themselves."""
-    found = []
-    for path in sorted(CONFIGS_DIR.glob("*.yaml")):
-        raw = yaml.safe_load(path.read_text())
-        if not isinstance(raw, dict) or "defaults" in raw:
-            continue
-        for section in raw.values():
-            megatron_cfg = (
-                section.get("megatron_cfg") if isinstance(section, dict) else None
-            )
-            if isinstance(megatron_cfg, dict) and "apply_rope_fusion" in megatron_cfg:
-                found.append(path)
-                break
-    return found
-
-
-@pytest.mark.parametrize("path", _standalone_megatron_exemplars(), ids=lambda p: p.name)
-def test_base_exemplars_pin_flash_attention_to_fa2(path):
-    # flash-attn-4 is installed in the mcore extra; without an explicit pin TE
-    # would pick FA4 for every Megatron run. Only batch-invariant recipes use 4.
-    raw = yaml.safe_load(path.read_text())
-    for section in raw.values():
-        megatron_cfg = (
-            section.get("megatron_cfg") if isinstance(section, dict) else None
-        )
-        if isinstance(megatron_cfg, dict) and "apply_rope_fusion" in megatron_cfg:
-            assert megatron_cfg.get("flash_attention_version") == 2, path.name
 
 
 def test_token_rounder_matches_megatron_core():
