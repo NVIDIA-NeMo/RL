@@ -205,6 +205,10 @@ def test_disabled_opd_full_leaves_the_logprob_path_intact():
     assert loss_fn.input_type is LossInputType.LOGPROB
 
 
+def test_enabled_opd_full_switches_to_the_opd_full_input():
+    assert _loss_fn().input_type is LossInputType.OPD_FULL
+
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [

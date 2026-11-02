@@ -27,7 +27,7 @@ def remote_eval(batch):
 
 ## What Not to Unit-Test
 
-- **Do not test recipe settings: a unit test that only asserts a key of an existing config has a given value.** A recipe change always has a reason, so such a test only fails CI for the next intentional change. A test that keeps every config away from a known issue is fine, for example `test_all_config_no_tp_size_accuracy_issues`, which stops a new config from hitting the known TP>=4 accuracy issue. (#5009)
+- **Do not test recipe or test-script settings: a unit test that only asserts a key of an existing config, or an argument of an existing functional or nightly test script, has a given value. Do not unit-test functional test scripts at all; running them is their test.** A recipe or script change always has a reason, so such a test only fails CI for the next intentional change. A test that keeps every config away from a known issue is fine, for example `test_all_config_no_tp_size_accuracy_issues`, which stops a new config from hitting the known TP>=4 accuracy issue. (#5009)
 - **Do not add a unit test that only checks a config under `examples/configs/` loads or validates.** `test_all_config_files_have_required_keys` in `tests/unit/test_config_validation.py` already loads every one with inheritance and validates it against its algorithm's `MasterConfig`, and `test_single_controller_configs_pass_single_controller_validation` runs `validate_single_controller_config` on every SingleController config. If a new kind of config needs a check, extend those tests. (#5009)
 
 ## Nightly Tests for New Model Support
