@@ -94,6 +94,9 @@ class VllmSpecificArgs(TypedDict):
     # Supports exact names, substrings, and fnmatch wildcards.
     quantization_ignore_patterns: NotRequired[list[str]]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
+    # Opt into dynamic FP8 scales per (token, head), with Triton attention.
+    # Absent or false preserves kv_cache_dtype and the configured backend.
+    fp8_per_token_head: NotRequired[bool]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
     # Collect vLLM request, cache, and cumulative token counters in a model-owner
@@ -264,11 +267,31 @@ class VllmConfig(GenerationConfig):
     worker_extension_cls_fqn: NotRequired[str | None]
 
 
+def resolve_vllm_kv_cache_dtype(vllm_cfg: VllmSpecificArgs) -> str:
+    """Resolve the cache format, validating the optional dynamic FP8 flag."""
+    enabled = vllm_cfg.get("fp8_per_token_head")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError("fp8_per_token_head must be a boolean")
+    if enabled:
+        if vllm_cfg.get("precision") != "fp8":
+            raise ValueError("fp8_per_token_head requires precision='fp8'")
+        if vllm_cfg.get("kv_cache_dtype") not in ("auto", "fp8", "fp8_e4m3"):
+            raise ValueError(
+                "fp8_per_token_head requires kv_cache_dtype=auto, fp8, or fp8_e4m3"
+            )
+        return "fp8_per_token_head"
+    return vllm_cfg["kv_cache_dtype"]
+
+
 def validate_vllm_quantization_config(config: VllmConfig) -> None:
     """Reject quantization options that would otherwise be silently ignored."""
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    if vllm_cfg.get("fp8_per_token_head") is not None:
+        resolve_vllm_kv_cache_dtype(vllm_cfg)
+    if vllm_cfg.get("fp8_per_token_head") and config.get("real_quant"):
+        raise ValueError("fp8_per_token_head does not support real_quant")
     refit_prequantize = vllm_cfg.get("refit_prequantize")
     if refit_prequantize is not None and not isinstance(refit_prequantize, bool):
         raise ValueError(

@@ -30,6 +30,32 @@ The following workflow + quantization recipe combinations have been validated en
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The Nano3 `nano3_nvfp4_weightonly.yaml` recipe applies the same W4A16 weight-only format to the supported MLP/MoE weights while keeping Nano3-sensitive Mamba, attention, gate/router, shared-expert, norm, and selected layer paths in BF16 through the model-specific `real_quant_ignore` list in the example config.
 
+## Dynamic FP8 KV Cache
+
+For vLLM rollouts with `precision: fp8` (including MXFP8 weights), enable:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      fp8_per_token_head: true
+```
+
+The flag defaults to false. When enabled, it selects vLLM's
+`fp8_per_token_head` cache format and `TRITON_ATTN`, replacing the configured
+attention backend. K and V scales are computed independently for each token
+and KV head when writing the cache, and stored alongside the FP8 cache.
+Static policy KV scales are not synchronized during weight refits.
+This requires a vLLM build supporting `fp8_per_token_head`.
+It accepts `kv_cache_dtype: auto`, `fp8`, or `fp8_e4m3`; DeepSeek's
+specialized MLA cache and ModelOpt `real_quant` rollout are not supported.
+Mamba state caches are unaffected. This flag configures rollout cache storage;
+it does not change policy training attention.
+
+For command-line overrides, use
+`++policy.generation.vllm_cfg.fp8_per_token_head=true`.
+Disabling the flag preserves the existing cache dtype and attention backend.
+
 ## Simulated KV-Cache Quantization
 
 QARL can apply ModelOpt fake quantization to the attention K/V tensors in both

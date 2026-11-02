@@ -21,9 +21,55 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
+    resolve_vllm_kv_cache_dtype,
     validate_vllm_async_actor_settings,
     validate_vllm_quantization_config,
 )
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "fp8", "fp8_e4m3"])
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_fp8_per_token_head(cache_dtype, enabled):
+    cfg = {"precision": "fp8", "kv_cache_dtype": cache_dtype}
+    if enabled is not None:
+        cfg["fp8_per_token_head"] = enabled
+    assert resolve_vllm_kv_cache_dtype(cfg) == (
+        "fp8_per_token_head" if enabled else cache_dtype
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"fp8_per_token_head": "false"}, "must be a boolean"),
+        ({"fp8_per_token_head": 1}, "must be a boolean"),
+        ({"precision": "bfloat16"}, "requires precision"),
+        ({"kv_cache_dtype": "fp8_ds_mla"}, "requires kv_cache_dtype"),
+    ],
+)
+def test_fp8_per_token_head_rejects_invalid_config(overrides, message):
+    cfg = {
+        "precision": "fp8",
+        "kv_cache_dtype": "auto",
+        "fp8_per_token_head": True,
+        **overrides,
+    }
+    with pytest.raises(ValueError, match=message):
+        validate_vllm_quantization_config({"vllm_cfg": cfg})
+
+
+def test_fp8_per_token_head_rejects_real_quant():
+    with pytest.raises(ValueError, match="does not support real_quant"):
+        validate_vllm_quantization_config(
+            {
+                "real_quant": True,
+                "vllm_cfg": {
+                    "precision": "fp8",
+                    "kv_cache_dtype": "auto",
+                    "fp8_per_token_head": True,
+                },
+            }
+        )
 
 
 @pytest.mark.parametrize(

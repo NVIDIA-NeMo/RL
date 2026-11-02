@@ -1874,4 +1874,7 @@ class VllmGeneration(GenerationInterface):
         k_scale/v_scale parameters.
         """
         kv_cache_dtype = self.cfg["vllm_cfg"].get("kv_cache_dtype")
-        return kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES
+        return (
+            not self.cfg["vllm_cfg"].get("fp8_per_token_head")
+            and kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES
+        )
