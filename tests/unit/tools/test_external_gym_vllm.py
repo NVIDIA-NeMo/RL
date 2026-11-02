@@ -1260,7 +1260,6 @@ def test_serve_mode_requires_a_pool_dir_and_rejects_unknown_modes(tmp_path):
     assert "EXTERNAL_VLLM_MODE must be inline or serve, got: attach" in result.stderr
 
 
-
 def test_serve_mode_publishes_the_manifest_before_the_pools_are_healthy(tmp_path):
     pool_dir = tmp_path / "pool"
     env = _serve_env(tmp_path)
@@ -1559,7 +1558,6 @@ def test_attach_and_run_resolves_urls_and_the_readiness_gate_from_the_manifest(
         "timeout_seconds:900,poll_interval_seconds:5,request_timeout_seconds:10}'"
     )
     assert not (pool_dir / "attached" / "900").exists()
-
 
 
 def test_attach_and_run_early_starts_ray_sub_once_the_manifest_is_published(tmp_path):
