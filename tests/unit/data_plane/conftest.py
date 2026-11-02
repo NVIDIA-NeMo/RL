@@ -124,11 +124,11 @@ def _isolate_codec_timer():
 
 # ----------------------------------------------------------------------------- nixl backend
 # Tests marked ``nixl`` need NIXL importable and UCX restricted to RDMA (the
-# NIXL data plane refuses TCP), e.g. ``UCX_TLS=rc,self,sm
-# UCX_NET_DEVICES=<rdma dev>:1``; tests marked ``gpu`` need a CUDA device. Both
-# are skipped otherwise, so CPU-only runners execute only the pure tests.
-# CI sets NEMO_RL_REQUIRE_NIXL=1 (and UCX_TLS) on runners with an RDMA device,
-# which turns a nixl skip into a failure there, as NEMO_RL_REQUIRE_MOONCAKE does.
+# NIXL data plane refuses TCP); the RDMA-only UCX env is set up here as the
+# driver does in production. Tests marked ``gpu`` need a CUDA device. Both are
+# skipped otherwise, so CPU-only runners execute only the pure tests.
+# CI sets NEMO_RL_REQUIRE_NIXL=1 on runners with an RDMA device, which turns a
+# nixl skip into a failure there, as NEMO_RL_REQUIRE_MOONCAKE does.
 
 
 def _nixl_ready() -> str | None:
@@ -136,10 +136,12 @@ def _nixl_ready() -> str | None:
         from nixl._api import nixl_agent  # noqa: F401
     except Exception as e:  # noqa: BLE001
         return f"nixl not importable: {e}"
+    from nemo_rl.data_plane.adapters.transfer_queue_env import configure_engine_env
     from nemo_rl.data_plane.nixl.errors import TransportPolicyError
     from nemo_rl.data_plane.nixl.nixl_io import check_rdma_only
 
     try:
+        configure_engine_env({"backend": "nixl"})
         check_rdma_only()
     except TransportPolicyError as e:
         return f"UCX not restricted to RDMA: {e}"
