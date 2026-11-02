@@ -670,3 +670,47 @@ partial file is not proof of a completed training step.
 The per-step `timing/train/train_data_dump` metric reports wall-clock seconds
 summed across chunk preparation/writes and final-file publication. Chunk dump
 time is also included in `advantage_calculation`; these timings overlap.
+
+
+### Background prefix cleanup
+
+With vLLM generation-prefix recovery, completed calls can retire their obsolete
+prefix chunks in a bounded background queue instead of waiting for a separate
+TQ CLEAR on every terminal response. This is independent of terminal PUT batching:
+
+```yaml
+rollout_recovery:
+  target_level: prefix
+  generation_prefix_cleanup:
+    enabled: true
+    batch_size: 32
+    max_pending: 128
+    wait_seconds: 0.01
+```
+
+Cleanup is disabled by default. `batch_size` is the maximum number of completed
+calls grouped into one CLEAR, not the number of chunk keys. `max_pending` bounds
+the completed calls waiting in the queue per generation owner; a completion blocks
+while the queue is full. It must be at least `batch_size`. `wait_seconds` is a
+finite, nonnegative collection window that starts when a batch takes its first
+call; a full batch flushes immediately. These are runtime settings and do not
+change the rollout-checkpoint bootstrap fingerprint.
+
+The worker queues a call's obsolete keys only after its terminal write finishes
+and after it leaves the terminal snapshot gate, so a full queue never holds a
+permit that a checkpoint fence waits for. Generation-cut rows are retired whether
+or not the terminal row staged, because a failed call restarts from its task or
+previous boundary, never from them. Only generation-cut keys are deleted, inline or
+in the background; canonical keys carried through terminal-completion restore
+remain live. The cleanup thread holds a snapshot-gate permit for each CLEAR, like a terminal write: a
+checkpoint fence waits for a running CLEAR, no CLEAR starts while the gate is
+closed, and queued deletes run once the checkpoint succeeds or is aborted.
+
+A failed CLEAR is logged and its batch dropped; the worker keeps serving. It is
+not retried, because a transport failure may represent a partially completed
+CLEAR. The queue is process-local and is not restored from a checkpoint. Losing
+queued work leaves extra obsolete rows; it does not delete required recovery
+state. The cleanup thread is a daemon and is never joined. As with synchronous
+cleanup, a stalled delete can still delay actor shutdown when completions are
+waiting on a full queue. This does not add orphan collection or change the TQ
+checkpoint format.

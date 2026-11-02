@@ -3576,3 +3576,31 @@ def test_minf_image_preprocessing_emits_float32_pixels():
     assert tuple(imgs.shape) == (1, 4, 3 * 2 * 2)
     assert imgs_sizes.dtype == torch.int32
     assert imgs_sizes.tolist() == [[4, 4]]
+
+
+@pytest.mark.parametrize("target_level", ["sibling", "turn", "prompt_group"])
+def test_background_prefix_cleanup_requires_prefix_target(target_level):
+    with pytest.raises(ValueError, match="requires target_level=prefix"):
+        RolloutRecoveryConfig.model_validate(
+            {
+                "target_level": target_level,
+                "generation_prefix_cleanup": {"enabled": True},
+            }
+        )
+
+
+def test_background_prefix_cleanup_defaults_and_prefix_override():
+    assert not RolloutRecoveryConfig().generation_prefix_cleanup.enabled
+    config = RolloutRecoveryConfig.model_validate(
+        {
+            "target_level": "prefix",
+            "generation_prefix_cleanup": {
+                "enabled": True,
+                "batch_size": 8,
+                "max_pending": 16,
+                "wait_seconds": 0.002,
+            },
+        }
+    )
+    assert config.generation_prefix_cleanup.batch_size == 8
+    assert config.generation_prefix_cleanup.max_pending == 16

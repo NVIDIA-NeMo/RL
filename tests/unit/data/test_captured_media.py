@@ -974,6 +974,7 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
     worker._completed_capture_calls = {}
     worker._capture_registry_lock = threading.Lock()
     worker._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
+    worker._prefix_cleanup = None
     sink = TQTokenSink(
         dp,
         staging_partition="staging",

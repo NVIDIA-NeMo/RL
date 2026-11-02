@@ -20,6 +20,7 @@ import ray
 import torch
 from pydantic import BaseModel
 
+from nemo_rl.data_plane.background_prefix_cleanup import GenerationPrefixCleanupConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
 
@@ -679,6 +680,7 @@ class GenerationInterface(ABC):
         generation_cut_control_timeout_s: float | None = None,
         generation_prefix_batch_size: int,
         generation_prefix_batch_max_tokens: int,
+        generation_prefix_cleanup: GenerationPrefixCleanupConfig,
     ) -> "Optional[MediaColumnSpec]":
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -702,6 +704,8 @@ class GenerationInterface(ABC):
                 and maximum prefix keys per restore-time TQ get.
             generation_prefix_batch_max_tokens: Maximum token rows accumulated in
                 one cut-time TQ put; a single larger row is not split.
+            generation_prefix_cleanup: Checkpoint-coordinated background deletion
+                of obsolete prefix keys; only vLLM prefix recovery may enable it.
 
         Returns:
             With ``capture_media``, the pixel dtype and patch size the workers

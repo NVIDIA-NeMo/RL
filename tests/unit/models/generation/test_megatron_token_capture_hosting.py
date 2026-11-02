@@ -15,6 +15,9 @@ nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 pytest.importorskip("megatron.core")
 
 from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
+from nemo_rl.data_plane.background_prefix_cleanup import (  # noqa: E402
+    GenerationPrefixCleanupConfig,
+)
 from nemo_rl.models.generation.megatron.megatron_generation import (  # noqa: E402
     MegatronGeneration,
 )
@@ -67,7 +70,10 @@ def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
     dp_cfg = {"backend": "simple"}
     assert (
         generation.setup_token_capture(
-            dp_cfg, "rollout_staging", **_PREFIX_BATCH_LIMITS
+            dp_cfg,
+            "rollout_staging",
+            generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
+            **_PREFIX_BATCH_LIMITS,
         )
         is None
     )
@@ -101,6 +107,7 @@ def test_generation_setup_token_capture_returns_the_coordinators_media_spec(
             {"backend": "simple"},
             "rollout_staging",
             capture_media=True,
+            generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
             **_PREFIX_BATCH_LIMITS,
         )
         is spec
@@ -115,7 +122,10 @@ def test_generation_setup_token_capture_requires_exposed_http_server() -> None:
 
     with pytest.raises(ValueError, match="expose_http_server=true"):
         generation.setup_token_capture(
-            {"backend": "simple"}, "rollout_staging", **_PREFIX_BATCH_LIMITS
+            {"backend": "simple"},
+            "rollout_staging",
+            generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
+            **_PREFIX_BATCH_LIMITS,
         )
 
     # The driver-side guard fires before any worker is asked to install hooks.
