@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextvars
 import contextlib
 import importlib.util
 import inspect
@@ -62,6 +63,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     _GENERATION_CUT_ROUTE,
+    _PENDING_ENGINE_REQUEST_CAPTURE,
     VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
 )
@@ -1315,16 +1317,18 @@ def test_clamp_max_tokens_sets_the_limit_the_request_uses(
 
 
 @pytest.mark.parametrize(
-    ("stream", "expected_kind"), [(False, "cumulative"), (True, "delta")]
+    ("stream", "expected_kind"), [(False, "final_only"), (True, "delta")]
 )
-def test_captured_requests_report_cumulative_progress_unless_streaming(
+def test_captured_requests_keep_vllm_output_kind_and_note_their_capture(
     monkeypatch, stream, expected_kind
 ):
-    """Cuts need per-step progress; a stream keeps the DELTA vLLM gave it."""
+    """Cuts read progress from vLLM's request state, not from its outputs."""
     worker, _, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
     worker._generation_prefix_cuts_enabled = True
     worker._record_request_effective_output_limit = MagicMock()
     worker._record_request_cut_constraints = MagicMock()
+    capture_state = object()
+    worker._get_request_capture = MagicMock(return_value=capture_state)
     monkeypatch.setattr(
         sys.modules[
             "vllm.entrypoints.openai.chat_completion.protocol"
@@ -1341,7 +1345,27 @@ def test_captured_requests_report_cumulative_progress_unless_streaming(
     request.stream = stream
     request.ng_capture = {"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
 
-    assert request.to_sampling_params().output_kind == expected_kind
+    def build_in_own_context():
+        sampling_params = request.to_sampling_params()
+        return sampling_params, _PENDING_ENGINE_REQUEST_CAPTURE.get()
+
+    sampling_params, pending = contextvars.copy_context().run(build_in_own_context)
+
+    assert sampling_params.output_kind == expected_kind
+    assert pending is capture_state
+
+
+def test_http_client_reports_each_submitted_request_id():
+    submitted = []
+    engine_loop = asyncio.new_event_loop()
+    client = _AsyncLLMHTTPClient(
+        MagicMock(), engine_loop, flat_logprobs=False, on_generate=submitted.append
+    )
+
+    client.generate("prompt", types.SimpleNamespace(logprobs=None), "chatcmpl-1")
+    engine_loop.close()
+
+    assert submitted == ["chatcmpl-1"]
 
 
 def _generation_cut_route(

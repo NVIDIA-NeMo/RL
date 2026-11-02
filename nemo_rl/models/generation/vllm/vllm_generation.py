@@ -23,6 +23,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     AsyncGenerator,
+    Literal,
     Optional,
     Union,
     cast,
@@ -1856,40 +1857,28 @@ class VllmGeneration(GenerationInterface):
         self, *, timeout_s: Optional[float] = None
     ) -> bool:
         """Fence terminal staging while vLLM keeps decoding into live buffers."""
-        if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError(
-                "begin_token_capture_snapshot_fence requires async_engine=True"
-            )
-        if not self.worker_group or not self.worker_group.workers:
-            raise RuntimeError("Worker group is not initialized")
-        futures = self.worker_group.run_all_workers_single_data(
-            "begin_token_capture_snapshot_fence_async",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        if not all(ray.get(futures, timeout=timeout_s)):
-            raise RuntimeError(
-                "Failed to fence terminal staging on every async vLLM engine"
-            )
-        return True
+        return self._run_token_capture_snapshot_fence("begin", timeout_s)
 
     def end_token_capture_snapshot_fence(
         self, *, timeout_s: Optional[float] = None
     ) -> bool:
         """Release terminal capture writes after the coordinated TQ snapshot."""
+        return self._run_token_capture_snapshot_fence("end", timeout_s)
+
+    def _run_token_capture_snapshot_fence(
+        self, phase: Literal["begin", "end"], timeout_s: Optional[float]
+    ) -> bool:
+        method = f"{phase}_token_capture_snapshot_fence"
         if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError(
-                "end_token_capture_snapshot_fence requires async_engine=True"
-            )
+            raise RuntimeError(f"{method} requires async_engine=True")
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
         futures = self.worker_group.run_all_workers_single_data(
-            "end_token_capture_snapshot_fence_async",
+            f"{method}_async",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         if not all(ray.get(futures, timeout=timeout_s)):
-            raise RuntimeError(
-                "Failed to release every async vLLM token-capture snapshot fence"
-            )
+            raise RuntimeError(f"{method} failed on an async vLLM engine")
         return True
 
     def get_generation_prefix_restore_counts(self) -> dict[str, int]:
