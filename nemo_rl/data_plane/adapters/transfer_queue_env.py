@@ -30,6 +30,7 @@ the ordering violation into an error rather than a silent misconfiguration.
 from __future__ import annotations
 
 import glob
+import logging
 import os
 import sys
 from pathlib import Path
@@ -37,6 +38,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
+
+log = logging.getLogger(__name__)
 
 # Importing either loads mooncake's extension (transfer_queue's storage.clients
 # package eagerly imports mooncake_client, which does `from mooncake.store
@@ -111,11 +114,13 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     ``UCX_TLS`` reaches every Ray worker, and the refit needs ``cuda_copy`` /
     ``cuda_ipc`` to move GPU memory. Neither carries the data plane's CPU
     bytes off the node, so its cross-node traffic stays on ``rc``. RDMA is
-    required, with no opt-out: a launcher's non-RDMA ``UCX_TLS`` fails here on
-    the driver, not minutes later when the storage units start.
+    required, with no opt-out: an unset or non-RDMA ``UCX_TLS`` becomes that
+    list and netdevs such as ``eth0`` are dropped from ``UCX_NET_DEVICES``, so
+    a launcher never has to set them (some clusters inject ``UCX_TLS=tcp`` and
+    an ``eth0`` into every job). Replacing a set value logs a warning.
     ``mooncake_cpu``: the MC_* knobs
     below. ``simple`` has no engine.
-    Values already present in the environment are left alone, so a launcher can
+    MC_* values already present in the environment are left alone, so a launcher can
     override any of them — except ``MC_ENABLE_DEST_DEVICE_AFFINITY``, which
     mooncake reads presence-only, so a launcher trying to override it to
     ``"0"`` enables it instead; unsetting it is the only way to disable it.
@@ -125,16 +130,34 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     the driver before ``init_ray``, and Ray hands the result to every worker.
 
     Raises:
-        TransportPolicyError: nixl with a non-RDMA UCX env.
+        TransportPolicyError: nixl, only if the UCX swap failed to make the
+            env RDMA-only (an internal invariant, not a launcher error).
         RuntimeError: if a variable still needs setting but the engine is
             already imported, i.e. the value can no longer reach it. Fatal on
             purpose — the alternative is a run that looks configured and is not.
     """
     if cfg["backend"] == "nixl":
-        os.environ.setdefault("UCX_TLS", "rc,cuda_copy,cuda_ipc,self,sm")
+        from nemo_rl.data_plane.nixl.errors import TransportPolicyError
         from nemo_rl.data_plane.nixl.nixl_io import check_rdma_only
 
-        check_rdma_only()
+        tls = os.environ.get("UCX_TLS", "")
+        try:
+            check_rdma_only({"UCX_TLS": tls})
+        except TransportPolicyError:
+            if tls:
+                log.warning("Replacing UCX_TLS=%s: NIXL data plane is RDMA-only", tls)
+            os.environ["UCX_TLS"] = "rc,cuda_copy,cuda_ipc,self,sm"
+        devs = os.environ.get("UCX_NET_DEVICES", "all").split(",")
+        if devs != ["all"] and any(d and ":" not in d for d in devs):
+            log.warning(
+                "Dropping network interfaces from UCX_NET_DEVICES=%s", ",".join(devs)
+            )
+            rdma_devs = [d for d in devs if ":" in d]
+            if rdma_devs:
+                os.environ["UCX_NET_DEVICES"] = ",".join(rdma_devs)
+            else:
+                del os.environ["UCX_NET_DEVICES"]
+        check_rdma_only()  # asserts the swap above left UCX RDMA-only
         return
     if cfg["backend"] != "mooncake_cpu":
         return

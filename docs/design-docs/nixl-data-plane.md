@@ -59,12 +59,17 @@ The transport is RDMA only. Every client and unit checks the UCX environment
 before creating a NIXL backend and refuses TCP:
 
 ```bash
-export UCX_TLS=rc,cuda_copy,cuda_ipc,self,sm      # the default when unset
+export UCX_TLS=rc,cuda_copy,cuda_ipc,self,sm      # what the driver sets
 export UCX_NET_DEVICES=<rdma dev>:1,<rdma dev>:1   # RDMA devices, never eth0
 ```
 
 NIXL's UCX backend honours `UCX_*` env vars over its own parameters, so the
 environment is the only reliable lever.
+
+You do not need to set either one. Before it starts Ray, the driver sets an
+unset or non-RDMA `UCX_TLS` to the list above and drops netdevs such as `eth0`
+from `UCX_NET_DEVICES`, warning when it replaces a value. Some clusters (OCI
+GB200) inject `UCX_TLS=tcp` and an `eth0` into every job.
 
 The `UCX_TLS` default is the list the NIXL checkpoint-engine refit uses
 (`refit_transport: nixl`, see the checkpoint-engine refit guide). The driver's
