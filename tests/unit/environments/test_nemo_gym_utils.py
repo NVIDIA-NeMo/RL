@@ -400,6 +400,7 @@ def _stub_gym_spinup(run_helper):
     server_utils = types.ModuleType("nemo_gym.server_utils")
     server_utils.HEAD_SERVER_KEY_NAME = "head_server"
     server_utils.BaseServerConfig = MagicMock
+    server_utils.ServerClient = MagicMock
     with (
         patch.dict(
             sys.modules,

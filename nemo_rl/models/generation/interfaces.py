@@ -246,6 +246,9 @@ class GenerationConfig(TypedDict):
     temperature: float
     top_p: float
     top_k: int | None
+    top_logprobs: NotRequired[
+        int
+    ]  # Sampler candidates per token; 0 disables collection.
     # Validation-only sampling. The exemplar YAMLs default these to the train
     # values above via interpolation (${.temperature}, ...), so validation
     # samples exactly like training unless overridden. Only honored on the
@@ -675,6 +678,7 @@ class GenerationInterface(ABC):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        top_logprobs: int = 0,
     ) -> "Optional[MediaColumnSpec]":
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -685,6 +689,8 @@ class GenerationInterface(ABC):
         Args:
             dp_cfg: Data-plane config the workers use to build their in-worker client.
             staging_partition: Data-plane partition that captured rows are staged in.
+            top_logprobs: Number of sampler candidates to stage per generated token;
+                zero disables collection. Unsupported backends reject a positive count.
             capture_media: Whether the staging partition carries media columns and
                 the workers must stage the media the engine consumed beside each
                 call's tokens.
