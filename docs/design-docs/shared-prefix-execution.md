@@ -27,7 +27,7 @@ Prompt boundaries come from the rollout, not from padded tokens. The rollout rea
 
 ## Execution contract
 
-- Rows share a prefix only when they have the same group identity and identical prompt token IDs. Other rows become dense fallbacks.
+- Rows share a prefix only when they have the same group identity and identical prompt token IDs. Other rows become dense fallbacks. Without `pack_groups`, each execution slot is one forward, so a row that cannot share, such as a reassembler placeholder with prompt length 0, makes its whole slot dense. With `pack_groups`, the other rows of that slot keep their star and only that row runs dense. An aligned dense training bin (`training_dense_bins`) is also one forward: rows without a sibling run in it as single-row forest roots, but a row with an empty prompt or completion keeps the whole bin dense.
 - Each completion attends to its prompt and its own causal history. Sibling completions cannot attend to each other.
 - The Mamba backend forks the recurrent state at a scan-chunk boundary. It replays the remaining prompt tail per branch and supplies each branch's convolution halo. Branch gradients accumulate into the shared prefix. Not every kernel reads each prompt token only once.
 - Megatron defaults to the ragged Mamba backend (`ragged_state_fork`) at every topology. No environment variable is needed. `NRL_SP_MAMBA_IMPL` remains a Megatron-side override for diagnostics; see the Megatron documentation for its values.
@@ -155,7 +155,7 @@ The supported scope is the guarded hybrid model path with PP=1, TP with sequence
 
 NeMo RL tests in this repository:
 
-- `tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py` compares shared logprobs, loss and gradients with dense rows through the worker's entry points. It uses a table-lookup model whose logits depend only on causal history, so a correct consumer must match dense exactly. Cases cover stars, forests, a group split past the branch limit, dense bins and dense fallbacks, with and without temperature. The TP1/CP1 cases need one GPU. The TP1/CP2, TP2/CP1 and TP2/CP2 variants need up to four: `CUDA_VISIBLE_DEVICES=0,1,2,3 pytest --mcore-only tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py -k distributed`.
+- `tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py` compares shared logprobs, loss and gradients with dense rows through the worker's entry points. It uses a table-lookup model whose logits depend only on causal history, so a correct consumer must match dense exactly. Cases cover stars, forests, a group split past the branch limit, dense bins, and placeholders that run dense while their siblings share, with and without temperature. The TP1/CP1 cases need one GPU. The TP1/CP2, TP2/CP1 and TP2/CP2 variants need up to four: `CUDA_VISIBLE_DEVICES=0,1,2,3 pytest --mcore-only tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py -k distributed`.
 - `tests/unit/models/megatron/test_megatron_imports_without_shared_prefix.py` checks that the default Megatron path imports without `megatron.rl`.
 - `tests/unit/data_plane/test_shared_prefix_preshard.py`, `tests/unit/single_controller/test_shared_prefix_controller.py`, `tests/unit/models/policy/test_shared_prefix_config.py`, `test_shared_prefix_stage_weights.py`, `test_megatron_worker_shared_prefix.py` and `tests/unit/models/megatron/test_shared_prefix_setup_capability.py` cover sharding, the train pump, configuration rules, dispatch plumbing, worker gating and setup checks.
 

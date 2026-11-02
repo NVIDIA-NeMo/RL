@@ -156,7 +156,8 @@ class _Case:
     numpy_group_ids: bool = False
     mtp_loss_mask: bool = False
     # Structure the case must exercise beyond at least one shared unit: "stars",
-    # "forest", "fallback", "fragments" (a prompt split across shared units) or
+    # "forest", "partial_stars" (only placeholders and single-row groups run
+    # dense), "fragments" (a prompt split across shared units) or
     # "forest_fragments" (a prompt split across roots of one forest).
     expect: Optional[str] = None
 
@@ -178,8 +179,10 @@ _CASES = {
     "split_group": _Case(_SPEC_B, 21, {"mode": "train"}, 1024, expect="fragments"),
     "split_group_packed": _Case(_SPEC_B, 24, _PACK, 1024, expect="forest_fragments"),
     "dense_bins": _Case(_SPEC_A, 14, _DENSE_BINS, 160),
+    # With pack_groups, the placeholder runs dense on its own; the rest of its
+    # group keeps the star it shares.
     "fallbacks": _Case(
-        _SPEC_B, 22, _PACK, 1024, placeholders=("g4",), expect="fallback"
+        _SPEC_B, 22, _PACK, 1024, placeholders=("g4",), expect="partial_stars"
     ),
     "fallbacks_dense_bins": _Case(_SPEC_B, 23, _DENSE_BINS, 256),
 }
@@ -642,8 +645,23 @@ def _check_case(
         assert all(count == 1 for count in roots), roots
     elif case.expect == "forest":
         assert any(count is not None and count > 1 for count in roots), roots
-    elif case.expect == "fallback":
-        assert None in roots, roots
+    elif case.expect == "partial_stars":
+        prompt_lengths = batch[SHARED_PREFIX_PROMPT_LENGTHS].tolist()
+        sharing_rows = Counter(
+            group for group, length in zip(group_ids, prompt_lengths) if length
+        )
+        dense_rows = sorted(
+            row
+            for microbatch in seen
+            if microbatch.shared_prefix is None
+            for row in microbatch.data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX].tolist()
+        )
+        assert 0 in prompt_lengths, prompt_lengths
+        assert dense_rows == [
+            row
+            for row, (group, length) in enumerate(zip(group_ids, prompt_lengths))
+            if length == 0 or sharing_rows[group] == 1
+        ], dense_rows
     elif case.expect == "fragments":
         units_per_group = Counter(
             group
