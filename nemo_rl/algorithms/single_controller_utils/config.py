@@ -1331,10 +1331,12 @@ def _validate_reward_shaping(shaping_cfg: RewardShapingConfig) -> None:
     The advantage stage applies the block, so it is supported -- but
     ``apply_reward_shaping`` only rejects a bad one at the first advantage
     call, a whole round of rollouts and logprobs later. Each check here mirrors
-    one there and admits exactly what it admits, with one deliberate
-    exception: ``overlong_buffer_length`` must be positive, which that function
-    never asserts. It is the penalty's divisor, so a non-positive one is a
-    crash or an inverted penalty rather than a config it can honour.
+    one there and admits exactly what it admits, with two deliberate
+    exceptions that function never asserts: ``overlong_buffer_length`` must be
+    positive -- it is the penalty's divisor, so a non-positive one is a crash
+    or an inverted penalty rather than a config it can honour -- and the
+    penalty must be finite, since an infinite one clears its ``>= 0`` assert
+    and turns every overlong row's reward into ``-inf``.
 
     The two modes are mutually exclusive: ``stop_properly_penalty_coef``
     short-circuits, and the DAPO trio is only read when it is unset.
@@ -1380,11 +1382,15 @@ def _validate_reward_shaping(shaping_cfg: RewardShapingConfig) -> None:
             f"reward_shaping.overlong_buffer_length={buffer_length} must be "
             "positive. The overlong penalty divides by it."
         )
-    if buffer_penalty < 0:
+    # Finiteness ahead of the sign: neither non-finite case is rejected by the
+    # >= 0 assert in apply_reward_shaping -- nan compares False and fails there
+    # a rollout later, and inf passes it and makes every overlong row -inf.
+    if not math.isfinite(buffer_penalty) or buffer_penalty < 0:
         raise ValueError(
             f"reward_shaping.overlong_buffer_penalty={buffer_penalty} must be "
-            ">= 0. It is subtracted from the reward, so a negative one rewards "
-            "overlong responses."
+            "finite and >= 0. It is subtracted from the reward, so a negative "
+            "one rewards overlong responses and a non-finite one makes every "
+            "overlong row's reward non-finite."
         )
 
 

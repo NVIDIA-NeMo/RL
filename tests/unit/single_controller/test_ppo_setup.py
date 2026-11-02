@@ -22,6 +22,7 @@ training cluster after the policy has stepped off it.
 
 from __future__ import annotations
 
+import math
 import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -495,6 +496,18 @@ class TestPPOValidation:
         shaping.max_response_length = 4096
 
         validate_single_controller_config(mc)
+
+    def test_rejects_a_non_finite_penalty_on_a_ppo_run(self):
+        """The same declaration, read for a rejection rather than an accept."""
+        mc = _ppo_master_config()
+        shaping = mc.ppo.reward_shaping
+        shaping.enabled = True
+        shaping.overlong_buffer_length = 512
+        shaping.overlong_buffer_penalty = math.inf
+        shaping.max_response_length = 4096
+
+        with pytest.raises(ValueError, match="overlong_buffer_penalty"):
+            validate_single_controller_config(mc)
 
     def test_rejects_length_penalty_until_sc_applies_it(self):
         # The SC path has no length-penalty hook yet; fail at setup rather

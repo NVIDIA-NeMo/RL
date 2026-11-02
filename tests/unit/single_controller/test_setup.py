@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import math
 import threading
 import warnings
 from pathlib import Path
@@ -4366,6 +4367,30 @@ class TestRewardShapingValidation:
 
         validate_single_controller_config(config)
 
+    @pytest.mark.parametrize(
+        "penalty",
+        [math.nan, math.inf, -math.inf],
+        ids=["nan", "inf", "neg_inf"],
+    )
+    def test_rejects_a_non_finite_overlong_penalty(self, penalty: float):
+        # The `>= 0` assert in apply_reward_shaping stops neither usefully: nan
+        # compares False and fails there a whole rollout later, and inf clears
+        # it and gives every overlong row a -inf reward.
+        config = self._dapo_config()
+        config.grpo.reward_shaping.overlong_buffer_penalty = penalty
+
+        with pytest.raises(ValueError, match="overlong_buffer_penalty"):
+            validate_single_controller_config(config)
+
+    @pytest.mark.parametrize("coef", [0.0, 0.5, 1.0], ids=["zero", "half", "one"])
+    def test_the_stop_properly_mode_ignores_a_non_finite_penalty(self, coef: float):
+        """It short-circuits, so the DAPO penalty is never read -- or checked."""
+        config = self._dapo_config()
+        config.grpo.reward_shaping.stop_properly_penalty_coef = coef
+        config.grpo.reward_shaping.overlong_buffer_penalty = math.nan
+
+        validate_single_controller_config(config)
+
     @pytest.mark.parametrize("coef", [-0.1, 1.1], ids=["below_zero", "above_one"])
     def test_rejects_a_stop_properly_coef_outside_the_unit_interval(self, coef: float):
         config = _make_master_config()
@@ -4389,6 +4414,7 @@ class TestRewardShapingValidation:
         config = self._dapo_config()
         config.grpo.reward_shaping.enabled = False
         config.grpo.reward_shaping.overlong_buffer_length = 0
+        config.grpo.reward_shaping.overlong_buffer_penalty = math.nan
 
         validate_single_controller_config(config)
 

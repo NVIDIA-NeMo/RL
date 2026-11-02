@@ -1046,13 +1046,11 @@ class TestRewardShaping:
         )
 
     def test_scaling_is_applied_before_shaping(self) -> None:
-        # The penalty is subtracted, so it is only meaningful against the
-        # scaled range. With source [0, 1] -> target [0, 10], scaling first
-        # gives 10 * reward + penalty. Shaping first would hand reward +
-        # penalty to the scale, whose clamp to [0, 1] drops the penalty
-        # entirely on a reward of 0 (0 - 1.5 -> 0) and whose map multiplies it
-        # by 10 on a reward of 1 (-0.5 -> -5). Both means are spelled out
-        # below, so swapping the two calls in the stage fails here.
+        # The penalty is subtracted, so it only means anything against the
+        # scaled range. Shaping first would hand reward + penalty to the
+        # scale, which clamps to the source interval before it maps: every
+        # negative shaped reward comes back as the target floor, dropping the
+        # penalty. Both means are below, so swapping the calls fails here.
         scaling = RewardScalingConfig(
             enabled=True,
             source_min=0.0,
