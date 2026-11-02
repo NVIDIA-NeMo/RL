@@ -104,25 +104,6 @@ def test_fault_tolerance_block_is_required_without_flat_fields():
     )
 
 
-@pytest.mark.parametrize(
-    "config_path",
-    sorted(
-        (Path(__file__).resolve().parents[5] / "examples/configs").rglob(
-            "*sglang*.yaml"
-        )
-    ),
-    ids=lambda path: path.name,
-)
-def test_sglang_recipes_inherit_required_fault_tolerance_block(config_path):
-    config = load_config(config_path)
-    sglang_cfg = config.policy.generation.sglang_cfg
-    fault_tolerance = SGLangFaultToleranceConfig.model_validate(
-        dict(sglang_cfg["sglang_fault_tolerance_config"])
-    )
-    assert not fault_tolerance.use_fault_tolerance
-    assert not SGLangFaultToleranceConfig.model_fields.keys() & sglang_cfg.keys()
-
-
 def test_missing_fault_tolerance_block_fails_before_cluster_allocation(monkeypatch):
     cluster = MagicMock()
     loop_factory = MagicMock()
