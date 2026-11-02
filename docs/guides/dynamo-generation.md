@@ -54,7 +54,7 @@ shows them all:
 | `worker_args.tool_call_parser`, `reasoning_parser` | null | Dynamo's built-in parser names. null follows the native server's settings; see [NeMo-Gym](#nemo-gym) |
 | `worker_args.custom_jinja_template` | null | A chat template that replaces the model's own. null follows the native server's |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
-| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it. Dynamo keeps at most 65,536 sessions and answers a new one past that with HTTP 529 |
+| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym rollout on one engine while it is idle for up to this many seconds; null disables it. Dynamo keeps at most 65,536 sessions and answers a new one past that with HTTP 529 |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags |
 
 The etcd and nats-server binaries are found in `NEMO_RL_DYNAMO_BIN_DIR` when it
@@ -109,27 +109,34 @@ same vLLM workers stage each call's tokens, log probabilities, routed experts an
 processed media from their own process, exactly as the native endpoint does, and
 only the commit coordinates travel back through the frontend.
 
+Gym names each call's rollout, and the frontend keeps a rollout on one engine
+(`session_affinity_ttl_secs`), as the native backend pins each Gym session to
+one server. The engine splices the echoed prefix after the frontend has routed
+the call, so the KV router alone cannot see where that prefix is cached.
+
 The native server's chat settings carry over:
 
 | Native setting (`vllm_cfg`) | Under Dynamo |
 |---|---|
 | `http_server_serving_chat_kwargs.tool_parser`, `reasoning_parser` | The frontend's parsers, under Dynamo's names: NeMo RL's `nano_v3` plugin is `nemotron_v3`, vLLM's `openai` tool parser is `harmony` |
-| `tool_parser_plugin`, `reasoning_parser_plugin` | Python plugins cannot run in the Rust frontend. Startup asks for `dynamo_cfg.worker_args` to name a Dynamo parser, unless the plugin has a rename above |
+| `tool_parser_plugin`, `reasoning_parser_plugin` | Python plugins cannot run in the Rust frontend. A parser name the plugin provides fails engine registration, which asks for `dynamo_cfg.worker_args` to name a Dynamo parser, unless the name has a rename above. A vLLM built-in selected beside a plugin carries over |
 | `http_server_serving_chat_kwargs.chat_template` | The frontend's template, as a file, a vLLM template name or literal Jinja |
-| `http_server_serving_chat_kwargs.default_chat_template_kwargs` | Sent by Gym under its own `chat_template_kwargs` |
-| `http_server_serving_chat_kwargs.enable_auto_tools`, `chat_template_content_format` | The frontend always parses `tool_choice: auto` calls and has no content-format setting, so only the defaults (`true`, `auto`) are accepted |
+| `http_server_serving_chat_kwargs.default_chat_template_kwargs` | Gym's `vllm_model.default_chat_template_kwargs`, which Gym applies under every other source of template kwargs, as the native server applies them under the request's |
+| `http_server_serving_chat_kwargs.chat_template_content_format` | The frontend detects the format itself: string content stays a string, and content arrays go to the template. For text, and for one media item per message, that renders what vLLM's `auto`, `string` and `openai` render. `string` needs `vllm_kwargs.limit_mm_per_prompt` to allow at most one item of each modality, because with several, vLLM puts their placeholders first while the template places them |
+| `http_server_serving_chat_kwargs.enable_auto_tools` | The frontend always parses `tool_choice: auto` calls, so only `true` is accepted |
 
 Where the behavior differs from the native endpoint:
 
 - The engine sees the rendered prompt, not the messages. It finds where the
   echoed prefix ends by counting the prefix's EOS tokens, not by rendering the
-  history.
+  history. The two agree unless an agent edits the history before the last
+  tokenized assistant turn, or the template closes an assistant turn with a
+  token other than EOS.
+- A message that mixes media with several text parts reaches the template as an
+  array, where vLLM's `string` format joins the text with newlines.
 - When a request sets `chat_template_kwargs.force_nonempty_content`, Dynamo
-  reports a reasoning-only turn as content.
-- `default_chat_template_kwargs` sit under the template kwargs set in
-  `env.nemo_gym` only. A key that a Gym YAML also sets loses to the default, and
-  template kwargs sent through `extra_body` from a Gym YAML or a row's
-  `metadata.extra_body` are dropped.
+  reports a reasoning-only turn as content for every reasoning parser. Natively,
+  only NeMo RL's `nano_v3` parser does.
 - The frontend refuses more than 4 `stop` strings or `stop_token_ids` (HTTP 500).
 
 ## Not supported
@@ -154,10 +161,17 @@ Startup rejects these with `dynamo: true`:
   on 0.0.0.0 and checks no bearer token.
 - `frontend_args.router_mode: direct`: it needs a worker ID on every request, and
   NeMo RL's rollouts name none.
-- Parser plugins with no Dynamo parser, and the chat settings above that the
-  frontend has no counterpart for.
+- The chat settings above that the frontend would not reproduce:
+  `enable_auto_tools: false`, and `chat_template_content_format: string` with
+  more than one media item of a modality allowed.
+- `reasoning_parser: deepseek_r1` with `default_chat_template_kwargs`
+  `enable_thinking: false`: vLLM's parser returns a non-thinking turn as
+  reasoning, and Dynamo's return it as content. NeMo RL's `nano_v3` parser
+  returns it as content on both.
 - `dynamo: true` on a backend other than vLLM, and a `dynamo_cfg` block without
   `dynamo: true`.
+
+Engine registration refuses a parser name that a parser plugin provides.
 
 ## Build the image
 

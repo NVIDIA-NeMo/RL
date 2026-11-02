@@ -21,7 +21,6 @@ from nemo_rl.models.generation.dynamo.config import (
     check_dynamo_serving_chat_kwargs,
     dynamo_cfg,
     dynamo_enabled,
-    dynamo_parsers,
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
 from nemo_rl.models.generation.trtllm.config import (
@@ -186,10 +185,9 @@ def configure_generation_config(
         # vision parameters; freezing alone does not exclude them from refit.
         config["vllm_cfg"].setdefault("load_format", "auto" if is_eval else "dummy")
         if dynamo_enabled(config):
-            # Validate before any Ray allocation; dynamo_parsers also rejects
-            # parser plugins that Dynamo's Rust frontend cannot run.
+            # Validate before any Ray allocation. Parser plugins are checked at
+            # engine registration, where vLLM shows which names they provide.
             dynamo_cfg(config)
-            dynamo_parsers(config)
             check_dynamo_serving_chat_kwargs(config)
             if config["vllm_cfg"].get("http_server_api_key_required"):
                 raise ValueError(

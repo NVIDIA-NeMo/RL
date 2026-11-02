@@ -65,12 +65,13 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
         "device-aware-weighted",
     ] = "kv"
     # Idle TTL in seconds for keeping one session on one engine, or None to
-    # disable it. NeMo-Gym names the session on token-capture calls only (its
-    # capture key), as the native backend pins each Gym session to one server; the
-    # engine splices a call's staged prefix after routing, so the KV router alone
-    # cannot see where that prefix is cached. Dynamo keeps at most 65,536 sessions
-    # and answers a new one past that with HTTP 529, so keep (captured rollouts
-    # started per second) x TTL below 65,536. The bound is the frontend's own.
+    # disable it. NeMo-Gym names the session on every call (its capture key, else
+    # its own session), as the native backend pins each Gym session to one
+    # server; the engine splices a call's echoed or staged prefix after routing,
+    # so the KV router alone cannot see where that prefix is cached. Dynamo keeps
+    # at most 65,536 sessions and answers a new one past that with HTTP 529, so
+    # keep (rollouts started per second) x TTL below 65,536. The bound is the
+    # frontend's own.
     session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = 300
     extra_cli_args: list[str] = Field(default_factory=list)
 
@@ -97,27 +98,11 @@ _DYNAMO_REASONING_PARSER_NAMES = {"nano_v3": "nemotron_v3"}
 _DYNAMO_TOOL_PARSER_NAMES = {"openai": "harmony"}
 
 
-def _dynamo_parser(
-    configured: str | None,
-    native: str | None,
-    plugin: str | None,
-    renames: Mapping[str, str],
-    *,
-    kind: str,
-    worker_arg: str,
-) -> str | None:
-    if configured is not None or native is None:
-        return configured
-    if native in renames:
-        return renames[native]
-    if plugin:
-        raise ValueError(
-            f"policy.generation.vllm_cfg.{kind}_parser_plugin loads a Python parser "
-            "into vLLM's OpenAI server, which Dynamo's Rust frontend cannot run. Set "
-            f"policy.generation.dynamo_cfg.worker_args.{worker_arg} to the Dynamo "
-            f"built-in parser for {native!r}."
-        )
-    return native
+# (kind, the dynamo_cfg.worker_args field naming it, Dynamo's renames).
+_PARSER_KINDS = (
+    ("tool", "tool_call_parser", _DYNAMO_TOOL_PARSER_NAMES),
+    ("reasoning", "reasoning_parser", _DYNAMO_REASONING_PARSER_NAMES),
+)
 
 
 def dynamo_parsers(
@@ -127,50 +112,94 @@ def dynamo_parsers(
 
     ``dynamo_cfg.worker_args`` names them explicitly. Otherwise they follow the
     native server's ``vllm_cfg.http_server_serving_chat_kwargs``, renamed where
-    Dynamo calls the same parser differently. A parser plugin without such a
-    rename has no Dynamo equivalent and is rejected.
+    Dynamo calls the same parser differently. A name that a parser plugin
+    provides has no Dynamo equivalent; the engine refuses it at registration
+    (see ``plugin_parser_names``).
+    """
+    worker_args = dynamo_cfg(generation_config).worker_args
+    serving = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs") or {}
+    names = []
+    for kind, worker_arg, renames in _PARSER_KINDS:
+        configured = getattr(worker_args, worker_arg)
+        native = serving.get(f"{kind}_parser")
+        if configured is not None or native is None:
+            names.append(configured)
+        else:
+            names.append(renames.get(native, native))
+    tool_call_parser, reasoning_parser = names
+    return tool_call_parser, reasoning_parser
+
+
+def plugin_parser_names(
+    generation_config: Mapping[str, Any],
+) -> list[tuple[str, str, str, str]]:
+    """``(kind, name, plugin, worker_arg)`` for each parser to check against a plugin.
+
+    These are the native parser names Dynamo takes as they are while
+    ``vllm_cfg.<kind>_parser_plugin`` is set. The plugin may provide the name,
+    and then Dynamo's Rust frontend cannot run it, or the name may be a vLLM
+    built-in that Dynamo also ships. Only the engine has vLLM to tell which, so
+    it checks these at registration.
     """
     worker_args = dynamo_cfg(generation_config).worker_args
     vllm_cfg = generation_config["vllm_cfg"]
     serving = vllm_cfg.get("http_server_serving_chat_kwargs") or {}
-    tool_call_parser = _dynamo_parser(
-        worker_args.tool_call_parser,
-        serving.get("tool_parser"),
-        vllm_cfg.get("tool_parser_plugin"),
-        _DYNAMO_TOOL_PARSER_NAMES,
-        kind="tool",
-        worker_arg="tool_call_parser",
+    checks = []
+    for kind, worker_arg, renames in _PARSER_KINDS:
+        native = serving.get(f"{kind}_parser")
+        plugin = vllm_cfg.get(f"{kind}_parser_plugin")
+        if (
+            getattr(worker_args, worker_arg) is None
+            and native is not None
+            and native not in renames
+            and plugin
+        ):
+            checks.append((kind, native, plugin, worker_arg))
+    return checks
+
+
+def _media_items_allowed(generation_config: Mapping[str, Any]) -> int | None:
+    """The most items of one modality a prompt may carry; None when unbounded.
+
+    vLLM allows 999 of a modality ``vllm_kwargs.limit_mm_per_prompt`` leaves
+    out, so an unset limit is unbounded.
+    """
+    limits = (generation_config.get("vllm_kwargs") or {}).get("limit_mm_per_prompt")
+    if not limits:
+        return None
+    return max(
+        limit["count"] if isinstance(limit, Mapping) else limit
+        for limit in limits.values()
     )
-    reasoning_parser = _dynamo_parser(
-        worker_args.reasoning_parser,
-        serving.get("reasoning_parser"),
-        vllm_cfg.get("reasoning_parser_plugin"),
-        _DYNAMO_REASONING_PARSER_NAMES,
-        kind="reasoning",
-        worker_arg="reasoning_parser",
-    )
-    return tool_call_parser, reasoning_parser
 
 
 def check_dynamo_serving_chat_kwargs(generation_config: Mapping[str, Any]) -> None:
-    """Reject native chat-server settings Dynamo's frontend has no counterpart for.
+    """Reject native chat-server settings Dynamo's frontend would not reproduce.
 
-    The frontend renders templates and parses tool calls itself: it always
-    parses ``tool_choice="auto"`` calls when a tool parser is set, and has no
-    content-format setting. The native defaults (``enable_auto_tools: true``,
-    ``chat_template_content_format: auto``) match it; other values would
-    silently change what the policy sees.
+    The frontend renders templates and parses output itself. Its renderer keeps
+    string content as strings and passes content arrays to the template, which
+    for text and for one media item renders what vLLM's ``string`` and
+    ``openai`` formats do. It differs only for several media items in one
+    message: vLLM's ``string`` puts their placeholders first, while the template
+    places them. It always parses ``tool_choice="auto"`` calls when a tool parser
+    is set. And its reasoning parsers return a non-thinking turn as content,
+    where vLLM's ``deepseek_r1`` returns it as reasoning.
     """
     serving = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs") or {}
-    content_format = serving.get("chat_template_content_format")
-    if content_format not in (None, "auto"):
-        raise ValueError(
-            "policy.generation.vllm_cfg.http_server_serving_chat_kwargs."
-            f"chat_template_content_format={content_format!r} is not supported "
-            "with policy.generation.dynamo=true: Dynamo's frontend renders chat "
-            "templates itself and has no content-format setting. Remove it or "
-            "set it to 'auto'."
-        )
+    if serving.get("chat_template_content_format") == "string":
+        items = _media_items_allowed(generation_config)
+        if items is None or items > 1:
+            raise ValueError(
+                "policy.generation.vllm_cfg.http_server_serving_chat_kwargs."
+                "chat_template_content_format='string' with "
+                "policy.generation.dynamo=true needs "
+                "policy.generation.vllm_kwargs.limit_mm_per_prompt to allow at "
+                "most one item of each modality (vLLM allows 999 of a modality it "
+                "leaves out). With several items in one message, vLLM's 'string' "
+                "format puts their placeholders first, while Dynamo's frontend "
+                "lets the chat template place them. Lower the limits, or remove "
+                "the content format."
+            )
     if serving.get("enable_auto_tools") is False:
         raise ValueError(
             "policy.generation.vllm_cfg.http_server_serving_chat_kwargs."
@@ -178,6 +207,18 @@ def check_dynamo_serving_chat_kwargs(generation_config: Mapping[str, Any]) -> No
             "policy.generation.dynamo=true: Dynamo's frontend always parses "
             "tool_choice='auto' calls when a tool parser is set. Remove it, or "
             "remove the tool parser."
+        )
+    thinking = native_default_chat_template_kwargs(generation_config).get(
+        "enable_thinking"
+    )
+    if serving.get("reasoning_parser") == "deepseek_r1" and thinking is False:
+        raise ValueError(
+            "http_server_serving_chat_kwargs.reasoning_parser='deepseek_r1' with "
+            "default_chat_template_kwargs.enable_thinking=false is not supported "
+            "with policy.generation.dynamo=true: vLLM's deepseek_r1 parser returns "
+            "a non-thinking turn as reasoning, and Dynamo's reasoning parsers "
+            "return it as content. Use the nano_v3 reasoning parser, which returns "
+            "it as content natively too, or enable thinking."
         )
 
 

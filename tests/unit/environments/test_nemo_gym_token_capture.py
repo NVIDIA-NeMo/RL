@@ -912,29 +912,22 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
 
 
 @pytest.mark.parametrize(
-    ("vllm_model", "expected"),
+    ("vllm_model", "refused"),
     [
-        ({}, {"enable_thinking": True, "truncate_history_thinking": False}),
-        (
-            {"chat_template_kwargs": {"enable_thinking": False}},
-            {"enable_thinking": False, "truncate_history_thinking": False},
-        ),
+        ({}, False),
+        ({"chat_template_kwargs": {"enable_thinking": False}}, False),
         (
             {"extra_body": {"chat_template_kwargs": {"force_nonempty_content": True}}},
-            {
-                "enable_thinking": True,
-                "truncate_history_thinking": False,
-                "force_nonempty_content": True,
-            },
+            False,
         ),
         # The frontend answers every request carrying bad_words with a 400.
-        ({"extra_body": {"bad_words": ["x"]}}, None),
+        ({"extra_body": {"bad_words": ["x"]}}, True),
     ],
 )
 def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
-    vllm_model: dict, expected: dict | None
+    vllm_model: dict, refused: bool
 ) -> None:
-    """The native server's default template kwargs sit under the ones Gym sends."""
+    """The native server's default template kwargs go under every kwargs Gym has."""
     from responses_api_models.vllm_model.app import VLLMModelConfig
 
     from nemo_rl.algorithms.grpo import MasterConfig
@@ -983,7 +976,7 @@ def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
             use_fastokens=False,
         )["initial_global_config_dict"]
 
-    if expected is None:
+    if refused:
         with pytest.raises(ValueError, match="bad_words"):
             build()
         return
@@ -1005,7 +998,14 @@ def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
     assert gym_model.dynamo_frontend is True
     # The frontend refuses reasoning under both of Gym's keys.
     assert gym_model.reasoning_field == "reasoning_content"
-    assert gym_model.chat_template_kwargs == expected
+    assert gym_model.default_chat_template_kwargs == {
+        "enable_thinking": True,
+        "truncate_history_thinking": False,
+    }
+    # Gym applies the defaults under its own kwargs, which stay as written; its
+    # config merge would let a value written into them override a Gym YAML's.
+    for key in ("chat_template_kwargs", "extra_body"):
+        assert composed.get(key) == vllm_model.get(key)
     assert "dynamo_dialect" not in gym_config
     # The user's overlay is left as written.
     assert vllm_model == user_vllm_model
