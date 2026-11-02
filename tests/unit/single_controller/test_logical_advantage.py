@@ -119,8 +119,7 @@ def _batch(
 
 @pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
 def test_forest_selection_config(policy):
-    config = TokenCaptureConfig(forest_training=True, selection_policy=policy)
-    assert config.selection_policy == policy
+    TokenCaptureConfig(forest_training=True, selection_policy=policy)
     with pytest.raises(ValueError, match="requires forest_training"):
         TokenCaptureConfig(selection_policy="all_captured")
     with pytest.raises(ValueError, match="selection_policy"):

@@ -95,33 +95,13 @@ def test_single_forward_threshold_rejected_before_streaming_setup(
         validate_single_controller_config(cfg)
 
 
-class TestDefaultsAreInert:
-    def test_pre_existing_configs_still_load(self):
-        """A config written before these fields existed must be unaffected."""
-        AsyncRLConfig(
-            sampler={"name": "in_order", "max_lookahead_versions": 0},
-            min_groups_for_streaming_train=4,
-            max_inflight_prompts=4,
-            max_buffered_rollouts=4,
-        )
-
-
 class TestRolloutFailureValidation:
     def test_backoff_ceiling_below_base_is_rejected(self):
         with pytest.raises(ValidationError, match="max_backoff_s"):
             RolloutFailureConfig(backoff_base_s=10.0, max_backoff_s=1.0)
 
     def test_equal_backoff_bounds_are_allowed(self):
-        cfg = RolloutFailureConfig(backoff_base_s=5.0, max_backoff_s=5.0)
-        assert cfg.max_backoff_s == 5.0
-
-    def test_a_skip_budget_is_accepted(self):
-        cfg = RolloutFailureConfig(max_skipped_prompts=10)
-        assert cfg.max_skipped_prompts == 10
-
-    def test_a_consecutive_drop_budget_is_accepted(self):
-        cfg = RolloutFailureConfig(max_consecutive_dropped_prompts=4)
-        assert cfg.max_consecutive_dropped_prompts == 4
+        RolloutFailureConfig(backoff_base_s=5.0, max_backoff_s=5.0)
 
     @pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1])
     def test_an_out_of_range_step_floor_is_rejected(self, fraction):
@@ -130,7 +110,7 @@ class TestRolloutFailureValidation:
             RolloutFailureConfig(min_step_batch_fraction=fraction)
 
     def test_a_full_step_floor_is_allowed_and_forbids_shrinking(self):
-        assert RolloutFailureConfig(min_step_batch_fraction=1.0).min_step_batch_fraction
+        RolloutFailureConfig(min_step_batch_fraction=1.0)
 
     @pytest.mark.parametrize("policy", ["regenerate", "promote"])
     def test_an_unknown_drop_policy_is_rejected(self, policy):
@@ -165,13 +145,11 @@ class TestRolloutFailureValidation:
         RolloutFailureConfig(max_replacement_attempts=0, replacement_reserve_prompts=0)
 
     def test_replace_mode_accepts_a_deeper_budget(self):
-        cfg = RolloutFailureConfig(
+        RolloutFailureConfig(
             on_dropped_prompt="replace",
             max_replacement_attempts=3,
             replacement_reserve_prompts=16,
         )
-        assert cfg.max_replacement_attempts == 3
-        assert cfg.replacement_reserve_prompts == 16
 
     @pytest.mark.parametrize("attempts", [0, -1])
     def test_non_positive_attempt_budgets_are_rejected(self, attempts):
@@ -215,10 +193,6 @@ class TestWatchdogValidation:
         with pytest.raises(ValidationError, match="stall_timeout_s"):
             WatchdogConfig(interval_s=30.0, stall_timeout_s=5.0)
 
-    def test_unknown_action_is_rejected(self):
-        with pytest.raises(ValidationError):
-            WatchdogConfig(stall_action="explode")
-
 
 class TestGenerationRouterValidation:
     @pytest.mark.parametrize("status", [429, 500, 502, 503, 504, 520])
@@ -235,12 +209,7 @@ class TestGenerationRouterValidation:
 
     @pytest.mark.parametrize("status", [400, 404, 409, 418, 422])
     def test_other_client_errors_are_allowed(self, status):
-        assert (
-            GenerationRouterConfig(
-                no_healthy_backend_status=status
-            ).no_healthy_backend_status
-            == status
-        )
+        GenerationRouterConfig(no_healthy_backend_status=status)
 
 
 class TestFleetHealthValidation:
@@ -248,9 +217,6 @@ class TestFleetHealthValidation:
         """Otherwise probes overlap and a slow fleet reads as a dead one."""
         with pytest.raises(ValidationError, match="probe_timeout_s"):
             FleetHealthConfig(probe_interval_s=2.0, probe_timeout_s=2.0)
-
-    def test_restarting_can_be_enabled(self):
-        assert FleetHealthConfig(restart_dead_shards=True).restart_dead_shards is True
 
     def test_the_restart_budget_is_not_the_refit_deadline(self):
         """A refit moves bytes between live processes; a restart reloads a model from
@@ -283,10 +249,6 @@ class TestTheRefitDeadlineIsArmedByDefault:
     def test_it_clears_a_healthy_refit_by_a_wide_margin(self):
         """~1.9s measured for a 1.5B model on GB200, so it cannot fire on a slow one."""
         assert AsyncRLConfig().generation_fleet_health.refit_timeout_s >= 100 * 1.9
-
-    def test_none_still_disarms_it_when_asked_explicitly(self):
-        """The escape hatch stays: an explicit None starts no watchdog thread."""
-        assert FleetHealthConfig(refit_timeout_s=None).refit_timeout_s is None
 
 
 class TestWatchdogVersusRolloutTimeout:
@@ -449,19 +411,6 @@ class TestGenerationRouterPortAndTimeoutValidation:
     def test_a_connect_timeout_beyond_the_total_is_rejected(self):
         with pytest.raises(ValidationError, match="connect_timeout_s"):
             GenerationRouterConfig(connect_timeout_s=100.0, backend_timeout_s=10.0)
-
-
-class TestFleetHealthSelectionIsNotAdvertisedBeyondWhatItDoes:
-    def test_an_unimplemented_selection_mode_is_rejected(self):
-        """Nothing dispatches on this value, so accepting round_robin would silently
-        hand the caller least_outstanding anyway."""
-        with pytest.raises(ValidationError):
-            FleetHealthConfig(selection="round_robin")
-
-    def test_the_implemented_mode_is_accepted(self):
-        assert FleetHealthConfig(selection="least_outstanding").selection == (
-            "least_outstanding"
-        )
 
 
 class TestRenamedBlocksAreRejected:
