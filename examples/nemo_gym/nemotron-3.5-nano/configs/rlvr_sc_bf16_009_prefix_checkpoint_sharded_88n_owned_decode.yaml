@@ -1,0 +1,9 @@
+# Scale the decoder-copy experiment to the existing 88-node training topology.
+# Fresh lineage: batch 8192, lag 16, router replay and five-minute snapshots.
+defaults: rlvr_sc_bf16_009_prefix_checkpoint_sharded_88n_direct_tokens_slots4.yaml
+policy:
+  generation:
+    vllm_cfg:
+      copy_decoded_arrays: true
+    generation_cut_control:
+      batch_inventory_writes: true

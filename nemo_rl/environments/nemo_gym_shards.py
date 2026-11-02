@@ -72,7 +72,7 @@ class ShardSpec:
     """One shard: a slice of the Gym config that gets its own actor.
 
     ``replicas`` instances are created from a single merge, so replicas are
-    identical apart from the node they land on.
+    identical apart from their node, log directory and explicit port subrange.
     """
 
     name: str
@@ -242,6 +242,22 @@ def find_gym_config_entries(nemo_gym_config: Mapping[str, Any]) -> list[str]:
         and key not in NEMO_RL_DICT_CONFIG_KEYS
         and (isinstance(value, Mapping) or OmegaConf.is_dict(value))
     )
+
+
+def actor_concurrency_options(nemo_gym_config: Mapping[str, Any]) -> dict[str, int]:
+    """Read the optional positive Ray actor concurrency limit.
+
+    Absent or null preserves Ray's own default. The factory consumes this
+    setting before forwarding the remaining configuration to Gym servers.
+    """
+    value = nemo_gym_config.get("max_concurrency")
+    if value is None:
+        return {}
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ShardConfigError(
+            "env.nemo_gym.max_concurrency must be a positive integer"
+        )
+    return {"max_concurrency": value}
 
 
 def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
@@ -489,6 +505,36 @@ def apply_shard_overlay(
         merged["port_range_low"] = shard.port_range_low
         merged["port_range_high"] = shard.port_range_high
     return merged
+
+
+def apply_replica_port_range(
+    config: Mapping[str, Any], shard: ShardSpec, *, replica_index: int
+) -> dict[str, Any]:
+    """Split an explicit shard port range across its replicas.
+
+    A local vLLM backend may be placed on another replica's node, so distinct
+    Gym hosts do not by themselves isolate server ports. Configurations without
+    an explicit range keep their existing Gym default behavior.
+    """
+    if not 0 <= replica_index < shard.replicas:
+        raise ShardConfigError("replica index is outside the shard replica count")
+    result = dict(config)
+    if shard.replicas == 1:
+        return result
+    low = config.get("port_range_low")
+    high = config.get("port_range_high")
+    if low is None and high is None:
+        return result
+    if type(low) is not int or type(high) is not int or not 1 <= low < high <= 65535:
+        raise ShardConfigError("replicated shard requires a valid explicit port range")
+    width = high - low + 1
+    if width < 2 * shard.replicas:
+        raise ShardConfigError(
+            "replicated shard port range needs at least two ports per replica"
+        )
+    result["port_range_low"] = low + width * replica_index // shard.replicas
+    result["port_range_high"] = low + width * (replica_index + 1) // shard.replicas - 1
+    return result
 
 
 def build_route_shard_map(

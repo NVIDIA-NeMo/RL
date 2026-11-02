@@ -68,6 +68,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.prefix_cut_diagnostics import CaptureLifecycleLock
 
 model_name = "Qwen/Qwen3-0.6B"
 # Define basic vLLM test config
@@ -1030,7 +1031,9 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     make_module(
         "vllm.sampling_params",
         RequestOutputKind=type(
-            "RequestOutputKind", (), {"DELTA": "delta", "CUMULATIVE": "cumulative"}
+            "RequestOutputKind",
+            (),
+            {"DELTA": "delta", "CUMULATIVE": "cumulative", "FINAL_ONLY": "final_only"},
         ),
     )
     make_module(
@@ -1215,7 +1218,7 @@ def _track_request_capture(worker, request):
     call = types.SimpleNamespace(model_call_id="call")
     worker._capture_calls[id(request)] = types.SimpleNamespace(
         call=call,
-        lifecycle_lock=threading.Lock(),
+        lifecycle_lock=CaptureLifecycleLock(),
         terminal_started=False,
         generation_cut_staging_keys=[],
     )
@@ -1324,12 +1327,12 @@ def test_clamp_max_tokens_sets_the_limit_the_request_uses(
 
 
 @pytest.mark.parametrize(
-    ("stream", "expected_kind"), [(False, "cumulative"), (True, "delta")]
+    ("stream", "expected_kind"), [(False, "final_only"), (True, "delta")]
 )
-def test_captured_requests_report_cumulative_progress_unless_streaming(
+def test_captured_requests_use_final_only_unless_streaming(
     monkeypatch, stream, expected_kind
 ):
-    """Cuts need per-step progress; a stream keeps the DELTA vLLM gave it."""
+    """Engine probes replace per-step capture; streaming keeps its own mode."""
     worker, _, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
     worker._generation_prefix_cuts_enabled = True
     worker._record_request_effective_output_limit = MagicMock()
@@ -1371,24 +1374,37 @@ def _generation_cut_route(
     worker._generation_cut_control_timeout_s = timeout_s
     cuts = []
 
-    def checkpoint_generation_cut(inventory, *, deadline):
-        cuts.append((inventory, deadline))
-        return types.SimpleNamespace(model_dump=lambda mode: {"acked": inventory})
+    async def checkpoint_generation_cut(inventory, *, deadline):
+        typed = ("typed", inventory.original)
+        cuts.append((typed, deadline))
+        return types.SimpleNamespace(
+            prefixes=(), model_dump=lambda mode: {"acked": typed}
+        )
 
-    async def run_generation_cut_control(operation, *args):
-        return operation(*args)
-
-    worker._checkpoint_generation_cut = checkpoint_generation_cut
-    worker._run_generation_cut_control = run_generation_cut_control
+    worker._checkpoint_generation_cut_control = checkpoint_generation_cut
     # nemo_gym is an optional extra; the route only uses it to type the inventory.
     generation_cut = types.ModuleType("nemo_gym._checkpoint.generation_cut")
     generation_cut.GenerationCutInventory = types.SimpleNamespace(
-        model_validate=lambda inventory: ("typed", inventory)
+        model_validate=lambda inventory: types.SimpleNamespace(
+            checkpoint_id=inventory["checkpoint_id"],
+            inventory_digest="test",
+            active_prefixes=(),
+            original=inventory,
+        )
     )
     monkeypatch.setitem(
         sys.modules, "nemo_gym._checkpoint.generation_cut", generation_cut
     )
-    return _route_handler(app, _GENERATION_CUT_ROUTE), cuts
+    actual_route = _route_handler(app, _GENERATION_CUT_ROUTE)
+
+    async def invoke(inventory, *, authorization):
+        async def receive():
+            await asyncio.Event().wait()
+
+        raw_request = types.SimpleNamespace(headers={}, receive=receive)
+        return await actual_route(inventory, raw_request, authorization=authorization)
+
+    return invoke, cuts
 
 
 @pytest.mark.asyncio

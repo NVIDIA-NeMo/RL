@@ -22,12 +22,81 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from nemo_rl.utils.prefix_cut_diagnostics import prefix_cut_count
+from nemo_rl.utils.prefix_cut_diagnostics import (
+    PrefixCutProbe,
+    current_prefix_cut_probe,
+    prefix_cut_count,
+    prefix_cut_wait,
+)
+
+_ADMISSION_SAMPLE_SECONDS = 5.0
+
+
+def generation_cut_deadline(
+    timeout_s: float | None, caller_deadline_ts: str | None
+) -> float | None:
+    """Bound a cut by both its worker timeout and the caller's Unix deadline.
+
+    The caller deadline stays fixed across HTTP retries and transit delays.
+    Convert it to the worker's monotonic clock before admission.
+    """
+    now = time.monotonic()
+    deadline = None if timeout_s is None else now + timeout_s
+    if caller_deadline_ts is not None:
+        try:
+            caller_deadline = float(caller_deadline_ts)
+        except ValueError as error:
+            raise ValueError(
+                "generation-cut deadline must be a finite Unix timestamp"
+            ) from error
+        if not math.isfinite(caller_deadline):
+            raise ValueError("generation-cut deadline must be a finite Unix timestamp")
+        caller_bound = now + (caller_deadline - time.time())
+        deadline = caller_bound if deadline is None else min(deadline, caller_bound)
+    if deadline is not None and deadline <= time.monotonic():
+        raise TimeoutError("generation-cut caller deadline has expired")
+    return deadline
+
+
+async def run_generation_cut_request(
+    operation: Callable[[], Awaitable[Any]],
+    receive: Callable[[], Awaitable[dict[str, Any]]],
+) -> Any:
+    """Cancel a cut waiter when its already-parsed HTTP request disconnects.
+
+    GenerationCutControl shields active executor work. Cancelling this waiter
+    removes queued work, but never releases a running thread's reservation.
+    All watcher tasks are also cleaned up if the HTTP handler is cancelled.
+    """
+
+    async def disconnected() -> None:
+        while (await receive())["type"] != "http.disconnect":
+            pass
+
+    work = asyncio.create_task(operation())
+    watcher = asyncio.create_task(disconnected())
+    try:
+        done, _ = await asyncio.wait(
+            (work, watcher), return_when=asyncio.FIRST_COMPLETED
+        )
+        if work in done:
+            return work.result()
+        watcher.result()
+        prefix_cut_count("control_http_disconnected", 1)
+        # Match vLLM's HTTP-disconnect behavior: finish the route normally
+        # after cancelling its waiter, so middleware sees no missing response.
+        return None
+    finally:
+        for task in (work, watcher):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(work, watcher, return_exceptions=True)
 
 
 @dataclass(eq=False)
@@ -37,6 +106,8 @@ class _Inventory:
     task: asyncio.Task[Any] | None
     active: bool
     waiters: int
+    probe: PrefixCutProbe | None
+    queued_at: float
 
 
 class GenerationCutControl:
@@ -52,8 +123,8 @@ class GenerationCutControl:
     """
 
     def __init__(self, *, max_workers: int) -> None:
-        if type(max_workers) is not int or max_workers not in (1, 2):
-            raise ValueError("generation-cut max_workers must be 1 or 2")
+        if type(max_workers) is not int or not 1 <= max_workers <= 4:
+            raise ValueError("generation-cut max_workers must be between 1 and 4")
         self._max_workers = max_workers
         self._loop: asyncio.AbstractEventLoop | None = None
         self._changed = asyncio.Event()
@@ -90,7 +161,16 @@ class GenerationCutControl:
                 del self._jobs[key]
                 job = None
         if job is None:
-            job = _Inventory(key, call_ids, task=None, active=False, waiters=0)
+            probe = current_prefix_cut_probe()
+            job = _Inventory(
+                key,
+                call_ids,
+                task=None,
+                active=False,
+                waiters=0,
+                probe=probe,
+                queued_at=time.perf_counter() if probe is not None else 0.0,
+            )
             self._jobs[key] = job
             self._pending.append(job)
             job.task = loop.create_task(self._execute(job, operation, deadline))
@@ -113,19 +193,54 @@ class GenerationCutControl:
                 prefix_cut_count("control_cancelled_before_start", 1)
                 job.task.cancel()
 
-    def _can_start(self, job: _Inventory) -> bool:
+    def _blocking_reason(self, job: _Inventory) -> str | None:
+        """Report the first unsatisfied admission predicate, in admission order."""
         if len(self._active) >= self._max_workers:
-            return False
+            return "capacity"
         if any(active.key[0] != job.key[0] for active in self._active):
-            return False
+            return "active_checkpoint"
         if any(active.call_ids & job.call_ids for active in self._active):
-            return False
+            return "active_call_overlap"
         for earlier in self._pending:
             if earlier is job:
-                return True
+                return None
             if earlier.key[0] != job.key[0] or earlier.call_ids & job.call_ids:
-                return False
-        return False
+                return "pending_barrier"
+        return "not_pending"
+
+    def _observe_queue(self) -> None:
+        """Sample bounded gauges only for telemetry-enabled cut requests."""
+        prefix_cut_count("admission_max_pending", len(self._pending), maximum=True)
+        prefix_cut_count("admission_max_active", len(self._active), maximum=True)
+        tq_ages = [
+            age
+            for active in self._active
+            if active.probe is not None
+            and (age := active.probe.active_phase_age("tq_put_ack")) is not None
+        ]
+        prefix_cut_count("admission_max_active_tq_puts", len(tq_ages), maximum=True)
+        writer_ages = [
+            age
+            for active in self._active
+            if active.probe is not None
+            and (age := active.probe.active_phase_age("inventory_write_batch_wait"))
+            is not None
+        ]
+        prefix_cut_count(
+            "admission_max_active_write_batch_waiters", len(writer_ages), maximum=True
+        )
+        if writer_ages:
+            prefix_cut_count(
+                "admission_max_active_write_batch_wait_age_ms",
+                int(1000 * max(writer_ages)),
+                maximum=True,
+            )
+        if tq_ages:
+            prefix_cut_count(
+                "admission_max_active_tq_put_age_ms",
+                int(1000 * max(tq_ages)),
+                maximum=True,
+            )
 
     async def _execute(
         self,
@@ -133,6 +248,11 @@ class GenerationCutControl:
         operation: Callable[[], Awaitable[Any]],
         deadline: float | None,
     ) -> Any:
+        admitted_at: float | None = None
+        if job.probe is not None:
+            prefix_cut_wait(
+                "control_admission_task_dispatch", time.perf_counter() - job.queued_at
+            )
         try:
             while True:
                 if self._closed:
@@ -146,7 +266,10 @@ class GenerationCutControl:
                     raise TimeoutError(
                         "generation-cut deadline expired before admission"
                     )
-                if self._can_start(job):
+                reason = self._blocking_reason(job)
+                if job.probe is not None:
+                    self._observe_queue()
+                if reason is None:
                     if self._checkpoint_id != job.key[0]:
                         if self._checkpoint_id is not None:
                             self._retired_checkpoints.add(self._checkpoint_id)
@@ -154,24 +277,62 @@ class GenerationCutControl:
                     self._pending.remove(job)
                     self._active.append(job)
                     job.active = True
+                    if job.probe is not None:
+                        admitted_at = time.perf_counter()
                     break
                 # No await separates the predicate and clear: another operation
                 # cannot release its reservation between them on this loop.
                 self._changed.clear()
+                # A bounded sampling tick observes active TQ writes and HTTP-loop
+                # timer lag. Without telemetry retain the original deadline wait.
+                wait_s = remaining
+                if job.probe is not None:
+                    wait_s = (
+                        _ADMISSION_SAMPLE_SECONDS
+                        if remaining is None
+                        else min(remaining, _ADMISSION_SAMPLE_SECONDS)
+                    )
+                started = time.perf_counter() if job.probe is not None else 0.0
+                cpu_started = time.thread_time() if job.probe is not None else 0.0
+                process_started = time.process_time() if job.probe is not None else 0.0
+                timed_out = False
                 try:
-                    async with asyncio.timeout(remaining):
+                    async with asyncio.timeout(wait_s):
                         await self._changed.wait()
                 except TimeoutError:
-                    prefix_cut_count("control_admission_deadline_expired", 1)
-                    raise TimeoutError(
-                        "generation-cut deadline expired before admission"
-                    ) from None
+                    timed_out = True
+                    if deadline is not None and time.monotonic() >= deadline:
+                        prefix_cut_count("control_admission_deadline_expired", 1)
+                        raise TimeoutError(
+                            "generation-cut deadline expired before admission"
+                        ) from None
+                finally:
+                    if job.probe is not None:
+                        elapsed = time.perf_counter() - started
+                        # Inclusive of HTTP-loop scheduling delays, not pure
+                        # semaphore wait. Reason is sampled before each wait;
+                        # CPU covers all work on this loop/thread while waiting.
+                        prefix_cut_wait(
+                            f"admission_blocked_{reason}",
+                            elapsed,
+                            thread_cpu_s=time.thread_time() - cpu_started,
+                            process_cpu_s=time.process_time() - process_started,
+                        )
+                        if timed_out and wait_s is not None:
+                            prefix_cut_wait(
+                                "admission_http_loop_timer_lag",
+                                max(0.0, elapsed - wait_s),
+                            )
             return await operation()
         finally:
             if job in self._pending:
                 self._pending.remove(job)
             if job in self._active:
                 self._active.remove(job)
+            if admitted_at is not None:
+                prefix_cut_wait(
+                    "control_admission_slot_hold", time.perf_counter() - admitted_at
+                )
             self._changed.set()
 
     def _finished(self, job: _Inventory, task: asyncio.Task[Any]) -> None:

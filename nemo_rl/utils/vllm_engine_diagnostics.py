@@ -133,14 +133,29 @@ class EngineLoopDiagnostics:
         self._counts[name] = self._counts.get(name, 0) + value
 
     def _record(
-        self, name: str, wall_s: float, cpu_s: float, error: bool = False
+        self,
+        name: str,
+        wall_s: float,
+        cpu_s: float,
+        error: bool = False,
+        *,
+        process_cpu_s: float = 0.0,
     ) -> None:
         total = self._phases.setdefault(
-            name, dict(calls=0, wall_s=0, thread_cpu_s=0, max_wall_s=0, errors=0)
+            name,
+            dict(
+                calls=0,
+                wall_s=0,
+                thread_cpu_s=0,
+                process_cpu_s=0,
+                max_wall_s=0,
+                errors=0,
+            ),
         )
         total["calls"] += 1
         total["wall_s"] += wall_s
         total["thread_cpu_s"] += cpu_s
+        total["process_cpu_s"] += process_cpu_s
         total["max_wall_s"] = max(total["max_wall_s"], wall_s)
         total["errors"] += int(error)
 
@@ -263,11 +278,30 @@ class EngineLoopDiagnostics:
         last_report = loop.time()
         while True:
             expected_at = loop.time() + _LOOP_SAMPLE_INTERVAL_S
+            cpu_started, process_started = time.thread_time(), time.process_time()
             await asyncio.sleep(_LOOP_SAMPLE_INTERVAL_S)
             lag = max(0.0, loop.time() - expected_at)
+            owner_cpu_s = time.thread_time() - cpu_started
+            process_cpu_s = time.process_time() - process_started
             try:
                 self._record("owner_loop_lag", lag, 0.0)
-                self._slow("owner_loop_lag", lag)
+                # CPU accumulated over the entire sampling interval (sleep +
+                # lateness), not just the lag. Other-thread CPU includes native
+                # parallel work and does not directly measure GIL ownership.
+                self._record(
+                    "owner_loop_sample",
+                    _LOOP_SAMPLE_INTERVAL_S + lag,
+                    owner_cpu_s,
+                    process_cpu_s=process_cpu_s,
+                )
+                self._slow(
+                    "owner_loop_lag",
+                    lag,
+                    sample_elapsed_s=_LOOP_SAMPLE_INTERVAL_S + lag,
+                    owner_thread_cpu_s=owner_cpu_s,
+                    process_cpu_s=process_cpu_s,
+                    other_threads_cpu_s=max(0.0, process_cpu_s - owner_cpu_s),
+                )
                 if loop.time() - last_report >= _REPORT_INTERVAL_S:
                     self._report("periodic")
                     last_report = loop.time()

@@ -32,7 +32,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -45,6 +45,7 @@ class _Timing:
     thread_cpu_s: float = 0.0
     max_wall_s: float = 0.0
     errors: int = 0
+    process_cpu_s: float = 0.0
 
 
 @dataclass
@@ -60,8 +61,17 @@ class PrefixCutProbe:
     timings: dict[str, _Timing] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    active_phases: dict[tuple[int, str], float] = field(default_factory=dict)
 
-    def record(self, name: str, wall_s: float, cpu_s: float, error: bool) -> None:
+    def record(
+        self,
+        name: str,
+        wall_s: float,
+        cpu_s: float,
+        error: bool,
+        *,
+        process_cpu_s: float = 0.0,
+    ) -> None:
         """Accumulate one phase without keeping per-call records."""
         with self.lock:
             timing = self.timings.setdefault(name, _Timing())
@@ -70,6 +80,18 @@ class PrefixCutProbe:
             timing.thread_cpu_s += cpu_s
             timing.max_wall_s = max(timing.max_wall_s, wall_s)
             timing.errors += int(error)
+            timing.process_cpu_s += process_cpu_s
+
+    def active_phase_age(self, name: str) -> float | None:
+        """Inspect an executing cut without retaining tensors or call identities."""
+        now = time.perf_counter()
+        with self.lock:
+            starts = [
+                start
+                for (_, phase), start in self.active_phases.items()
+                if phase == name
+            ]
+        return None if not starts else max(0.0, now - min(starts))
 
     def summary(self, outcome: str) -> dict:
         """Copy a JSON-safe snapshot, including deadline and CPU attribution."""
@@ -93,6 +115,9 @@ class PrefixCutProbe:
                         "calls": timing.calls,
                         "wall_s": round(timing.wall_s, 6),
                         "thread_cpu_s": round(timing.thread_cpu_s, 6),
+                        # All threads in this process; may exceed wall time.
+                        # This is supporting evidence, not a GIL measurement.
+                        "process_cpu_s": round(timing.process_cpu_s, 6),
                         "non_thread_cpu_wall_s": round(
                             max(0.0, timing.wall_s - timing.thread_cpu_s), 6
                         ),
@@ -109,9 +134,175 @@ _CURRENT: ContextVar[PrefixCutProbe | None] = ContextVar(
 )
 
 
+@dataclass
+class _LifecycleOwner:
+    operation: str
+    model_call_id: str
+    checkpoint_id: str | None
+    thread_id: int
+    acquired_at: float
+    active_phases: dict[tuple[int, str], float] = field(default_factory=dict)
+    slowest_phase: str | None = None
+    slowest_phase_s: float = 0.0
+    finished_at: float | None = None
+    guard: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def snapshot(self) -> dict:
+        now = time.perf_counter()
+        with self.guard:
+            return {
+                "operation": self.operation,
+                "model_call_id": self.model_call_id,
+                "checkpoint_id": self.checkpoint_id,
+                "thread_id": self.thread_id,
+                "held_s": (self.finished_at or now) - self.acquired_at,
+                "active_phases": [
+                    {"phase": phase, "thread_id": thread_id, "elapsed_s": now - start}
+                    for (thread_id, phase), start in self.active_phases.items()
+                ],
+                "slowest_phase": self.slowest_phase,
+                "slowest_phase_s": self.slowest_phase_s,
+            }
+
+
+_LIFECYCLE_OWNER: ContextVar[_LifecycleOwner | None] = ContextVar(
+    "capture_lifecycle_owner", default=None
+)
+_LIFECYCLE_SLOW_SECONDS = 1.0
+_LIFECYCLE_LOG_INTERVAL_SECONDS = 10.0
+_LIFECYCLE_LAST_LOG: dict[tuple[str, str], float] = {}
+_LIFECYCLE_LOG_GUARD = threading.Lock()
+
+
+def _log_lifecycle(event: str, operation: str, values: dict) -> None:
+    """Rate-limit payload-free slow samples; diagnostics never fail a call."""
+    try:
+        now = time.monotonic()
+        with _LIFECYCLE_LOG_GUARD:
+            key = (event, operation)
+            if (
+                now - _LIFECYCLE_LAST_LOG.get(key, float("-inf"))
+                < _LIFECYCLE_LOG_INTERVAL_SECONDS
+            ):
+                return
+            _LIFECYCLE_LAST_LOG[key] = now
+        logger.info(
+            "capture_lifecycle_lock %s",
+            json.dumps(
+                {"event": event, "pid": os.getpid(), "unix_s": time.time(), **values},
+                sort_keys=True,
+            ),
+        )
+    except Exception:
+        pass
+
+
+class CaptureLifecycleLock:
+    """Keep native Lock semantics and observe labelled lifecycle operations.
+
+    Direct acquire/release remains available, including cross-thread release.
+    Only telemetry-enabled hold() scopes collect owner and phase information.
+    """
+
+    def __init__(self, *, enabled: bool = False) -> None:
+        self._lock = threading.Lock()
+        self._guard = threading.Lock()
+        self._owner: _LifecycleOwner | None = None
+        self.enabled = enabled
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *args: object) -> None:
+        self.release()
+
+    @contextmanager
+    def hold(
+        self,
+        operation: Literal["cut", "terminal", "abort"],
+        *,
+        model_call_id: str,
+        blocking: bool = True,
+    ) -> Iterator[bool]:
+        if not self.enabled:
+            acquired = self.acquire(blocking)
+            try:
+                yield acquired
+            finally:
+                if acquired:
+                    self.release()
+            return
+        with self._guard:
+            previous_owner = self._owner
+        started = time.perf_counter()
+        acquired = self.acquire(blocking)
+        waited = time.perf_counter() - started
+        prefix_cut_wait(f"lifecycle_lock_wait_{operation}", waited)
+        if waited >= _LIFECYCLE_SLOW_SECONDS:
+            _log_lifecycle(
+                "wait",
+                operation,
+                {
+                    "operation": operation,
+                    "model_call_id": model_call_id,
+                    "wait_s": waited,
+                    "acquired": acquired,
+                    "owner_at_wait_start": None
+                    if previous_owner is None
+                    else previous_owner.snapshot(),
+                },
+            )
+        if not acquired:
+            yield False
+            return
+        probe = current_prefix_cut_probe()
+        owner = _LifecycleOwner(
+            operation,
+            model_call_id,
+            None if probe is None else probe.checkpoint_id,
+            threading.get_ident(),
+            time.perf_counter(),
+        )
+        with self._guard:
+            self._owner = owner
+        # Cut generators hold several locks across yields, so a ContextVar
+        # scoped to a cut would leak into another suspended transaction.
+        # Their phases already belong to the inventory's prefix-cut probe.
+        token = _LIFECYCLE_OWNER.set(owner) if operation != "cut" else None
+        try:
+            yield True
+        finally:
+            finished = time.perf_counter()
+            with owner.guard:
+                owner.finished_at = finished
+            with self._guard:
+                self._owner = None
+            if token is not None:
+                _LIFECYCLE_OWNER.reset(token)
+            self.release()
+            held = finished - owner.acquired_at
+            prefix_cut_wait(f"lifecycle_lock_hold_{operation}", held)
+            if held >= _LIFECYCLE_SLOW_SECONDS:
+                _log_lifecycle("hold", operation, owner.snapshot())
+
+
 def prefix_cut_probe_active() -> bool:
     """Whether this context belongs to a measured cut inventory."""
     return _CURRENT.get() is not None
+
+
+def current_prefix_cut_probe() -> PrefixCutProbe | None:
+    """Return the shared probe for admission's bounded blocker observations."""
+    return _CURRENT.get()
 
 
 def prefix_cut_count(name: str, value: int, *, maximum: bool = False) -> None:
@@ -123,11 +314,19 @@ def prefix_cut_count(name: str, value: int, *, maximum: bool = False) -> None:
             probe.counts[name] = max(previous, value) if maximum else previous + value
 
 
-def prefix_cut_wait(name: str, elapsed_s: float) -> None:
-    """Record a cross-thread scheduling wait without attributing thread CPU."""
+def prefix_cut_wait(
+    name: str,
+    elapsed_s: float,
+    *,
+    thread_cpu_s: float = 0.0,
+    process_cpu_s: float = 0.0,
+) -> None:
+    """Record a wait; optional CPU covers the whole observed interval."""
     probe = _CURRENT.get()
     if probe is not None:
-        probe.record(name, max(0.0, elapsed_s), 0.0, False)
+        probe.record(
+            name, max(0.0, elapsed_s), thread_cpu_s, False, process_cpu_s=process_cpu_s
+        )
 
 
 def run_engine_snapshot(
@@ -202,10 +401,21 @@ def prefix_cut_timing(
 ) -> Iterator[None]:
     """Time one operation; do nothing outside a measured cut inventory."""
     probe = _CURRENT.get()
-    if probe is None:
+    owner = _LIFECYCLE_OWNER.get()
+    if probe is None and owner is None:
         yield
         return
     wall_started, cpu_started = time.perf_counter(), time.thread_time()
+    process_started = time.process_time()
+    active_key = (threading.get_ident(), name)
+    if probe is not None:
+        with probe.lock:
+            previous_start = probe.active_phases.get(active_key)
+            probe.active_phases[active_key] = wall_started
+    if owner is not None:
+        with owner.guard:
+            previous_owner_start = owner.active_phases.get(active_key)
+            owner.active_phases[active_key] = wall_started
     error = True
     try:
         yield
@@ -214,12 +424,55 @@ def prefix_cut_timing(
         error = not expected_stop_iteration
         raise
     finally:
-        probe.record(
-            name,
-            time.perf_counter() - wall_started,
-            time.thread_time() - cpu_started,
-            error,
-        )
+        elapsed = time.perf_counter() - wall_started
+        if probe is not None:
+            with probe.lock:
+                if previous_start is None:
+                    probe.active_phases.pop(active_key, None)
+                else:
+                    probe.active_phases[active_key] = previous_start
+            probe.record(
+                name,
+                elapsed,
+                time.thread_time() - cpu_started,
+                error,
+                process_cpu_s=time.process_time() - process_started,
+            )
+        if owner is not None:
+            with owner.guard:
+                if previous_owner_start is None:
+                    owner.active_phases.pop(active_key, None)
+                else:
+                    owner.active_phases[active_key] = previous_owner_start
+                if elapsed > owner.slowest_phase_s:
+                    owner.slowest_phase, owner.slowest_phase_s = name, elapsed
+
+
+@contextmanager
+def prefix_write_batch_probe(
+    *, enabled: bool, checkpoint_id: str, batch_id: str, inventories: int, rows: int
+) -> Iterator[None]:
+    """Measure a shared put separately from the inventories waiting for it."""
+    if not enabled:
+        yield
+        return
+    probe = PrefixCutProbe(checkpoint_id, batch_id, rows, None)
+    token = _CURRENT.set(probe)
+    outcome = "interrupted"
+    try:
+        yield
+        outcome = "completed"
+    finally:
+        _CURRENT.reset(token)
+        try:
+            summary = probe.summary(outcome)
+            summary["batch_id"] = summary.pop("inventory_digest")
+            summary["inventories"] = inventories
+            logger.info(
+                "prefix_write_batch_probe %s", json.dumps(summary, sort_keys=True)
+            )
+        except Exception:
+            logger.warning("Could not log shared prefix-write timing", exc_info=True)
 
 
 @contextmanager

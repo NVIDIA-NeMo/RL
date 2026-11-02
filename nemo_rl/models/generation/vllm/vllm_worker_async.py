@@ -58,6 +58,9 @@ from nemo_rl.data_plane.background_prefix_cleanup import (
     BackgroundPrefixCleanup,
     GenerationPrefixCleanupConfig,
 )
+from nemo_rl.data_plane.generation_prefix_write_batcher import (
+    GenerationPrefixWriteBatcher,
+)
 from nemo_rl.data_plane.tq_token_sink import (
     GENERATION_CUT_STAGING_PREFIX,
     MediaMetadataIntegrityError,
@@ -99,12 +102,27 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import (
+    CompactOutputConfig,
     GenerationCutControlConfig,
     parse_nvfp4_pertoken_rollout,
 )
-from nemo_rl.models.generation.generation_cut_control import GenerationCutControl
+from nemo_rl.models.generation.vllm.compact_output import (
+    CompactOutputPipeline,
+    NumericCaptureLogprobs,
+    install_compact_output_pipeline,
+)
+from nemo_rl.models.generation.generation_cut_grouping import GenerationCutGrouper
+from nemo_rl.models.generation.generation_cut_control import (
+    GenerationCutControl,
+    generation_cut_deadline,
+    run_generation_cut_request,
+)
 from nemo_rl.models.generation.vllm.utils import (
+    _extract_selected_token_logprobs,
     attach_routed_experts_to_chat_response_choices,
+    without_native_chat_routed_experts,
+    own_routed_expert_fragments,
+    install_owned_numpy_array_decode,
     attach_token_information_to_chat_response_choices,
     extract_published_generation,
     format_prompt_for_vllm_generation,
@@ -120,9 +138,11 @@ from nemo_rl.models.generation.openai_server_utils import (
 from nemo_rl.telemetry.runtime import monitor_app_event_loop, run_in_thread
 from nemo_rl.telemetry.setup import shutdown_telemetry, telemetry_metrics_exporting
 from nemo_rl.utils.prefix_cut_diagnostics import (
+    CaptureLifecycleLock,
     prefix_cut_count,
     prefix_cut_probe,
     prefix_cut_timing,
+    prefix_cut_wait,
     run_engine_snapshot,
 )
 from nemo_rl.utils.routed_experts_codec import (
@@ -534,6 +554,25 @@ from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 # ``RequestState.routed_experts_chunks``). Re-check those fields on a bump.
 _ROUTE_SNAPSHOT_VLLM_RELEASE = (0, 29, 0)
 
+_G_ENGINE_CAPTURE_STATE: contextvars.ContextVar[_RequestCaptureState | None] = (
+    contextvars.ContextVar("nrl_engine_capture_state", default=None)
+)
+
+
+@dataclass(frozen=True)
+class _EngineTokenSnapshot:
+    token_ids: list[int]
+    logprobs: list[float]
+    finish_reason: str | None
+    stop_reason: str | int | None
+
+
+@dataclass(frozen=True)
+class _RetainedEngineTokens:
+    request_state: Any
+    finish_reason: str | None
+    stop_reason: str | int | None
+
 
 class _AsyncLLMHTTPClient:
     """Keep HTTP generation on the loop that owns AsyncLLM request state.
@@ -549,6 +588,8 @@ class _AsyncLLMHTTPClient:
         *,
         flat_logprobs: bool,
         disable_direct_route_snapshot: bool | None = None,
+        numeric_capture_logprobs: bool = False,
+        packed_capture_logprobs: bool = False,
     ):
         self._engine_client = engine_client
         self._engine_loop = engine_loop
@@ -560,10 +601,24 @@ class _AsyncLLMHTTPClient:
         self._completed_route_pieces: dict[str, dict[str, list[Any]]] = {}
         self._route_finish_original: Callable[..., Any] | None = None
         self._route_finish_wrapper: Callable[..., Any] | None = None
+        self._token_snapshots_enabled = False
+        self._token_snapshot_lock = threading.RLock()
+        self._completed_token_states: dict[str, dict[str, _RetainedEngineTokens]] = {}
+        self._token_process_original: Callable[..., Any] | None = None
+        self._token_process_wrapper: Callable[..., Any] | None = None
         self.model_config = engine_client.model_config
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
         self.vllm_config = engine_client.vllm_config
+        self._numeric_capture_hook = (
+            NumericCaptureLogprobs(
+                engine_client.output_processor,
+                lambda: _G_ENGINE_CAPTURE_STATE.get() is not None,
+                packed=packed_capture_logprobs,
+            )
+            if numeric_capture_logprobs
+            else None
+        )
 
     async def _run_on_engine_loop(self, operation: Callable[[], Awaitable[Any]]) -> Any:
         if asyncio.get_running_loop() is self._engine_loop:
@@ -601,6 +656,10 @@ class _AsyncLLMHTTPClient:
         request_id: str,
         kwargs: dict[str, Any],
     ) -> AsyncGenerator[Any, None]:
+        capture_state = _G_ENGINE_CAPTURE_STATE.get()
+        if capture_state is not None:
+            with capture_state.lock:
+                capture_state.engine_request_id = request_id
         terminal = (
             prompt.get(_RESTORED_PREFIX_TERMINAL_PROMPT_KEY)
             if isinstance(prompt, dict)
@@ -651,9 +710,13 @@ class _AsyncLLMHTTPClient:
                     with self._route_retention_lock:
                         self._route_retention_requests.discard(request_id)
                         released = self._completed_route_pieces.pop(request_id, None)
+                        released_tokens = self._completed_token_states.pop(
+                            request_id, None
+                        )
                     # Freeing thousands of arrays must not hold the lock the
                     # engine's synchronous completion hook needs.
                     del released
+                    del released_tokens
 
     # These members only read engine status or immutable configuration. Running
     # them on the engine loop added a cross-thread wait to each HTTP request.
@@ -735,15 +798,32 @@ class _AsyncLLMHTTPClient:
             raise RuntimeError("vLLM OutputProcessor._finish_request must be callable")
 
         def finish(state: Any) -> Any:
-            with self._route_retention_lock:
-                if state.external_req_id in self._route_retention_requests:
-                    pieces = getattr(state, "routed_experts_chunks", None)
-                    if type(pieces) is list:
-                        retained = self._completed_route_pieces.setdefault(
-                            state.external_req_id, {}
-                        )
-                        retained[state.request_id] = pieces
-            return original(state)
+            with self._token_snapshot_lock:
+                with self._route_retention_lock:
+                    if state.external_req_id in self._route_retention_requests:
+                        pieces = getattr(state, "routed_experts_chunks", None)
+                        if type(pieces) is list:
+                            retained = self._completed_route_pieces.setdefault(
+                                state.external_req_id, {}
+                            )
+                            retained[state.request_id] = pieces
+                        if self._token_snapshots_enabled:
+                            # vLLM publishes the final output before removing its
+                            # state. Keep references and terminal metadata only;
+                            # copying long token/logprob arrays belongs to cuts.
+                            output = getattr(
+                                getattr(state, "queue", None), "output", None
+                            )
+                            choices = getattr(output, "outputs", ())
+                            choice = choices[0] if len(choices) == 1 else None
+                            self._completed_token_states.setdefault(
+                                state.external_req_id, {}
+                            )[state.request_id] = _RetainedEngineTokens(
+                                state,
+                                getattr(choice, "finish_reason", None),
+                                getattr(choice, "stop_reason", None),
+                            )
+                return original(state)
 
         self._route_finish_original = original
         self._route_finish_wrapper = finish
@@ -751,7 +831,17 @@ class _AsyncLLMHTTPClient:
 
     def close_route_snapshots(self) -> None:
         """Remove the instance-local completion hook and release retained lists."""
+        if self._numeric_capture_hook is not None:
+            self._numeric_capture_hook.close()
         processor = self._engine_client.output_processor
+        if (
+            self._token_process_wrapper is not None
+            and processor.process_outputs is self._token_process_wrapper
+        ):
+            processor.process_outputs = self._token_process_original
+        self._token_snapshots_enabled = False
+        self._token_process_original = None
+        self._token_process_wrapper = None
         with self._route_retention_lock:
             if (
                 self._route_finish_original is not None
@@ -761,10 +851,122 @@ class _AsyncLLMHTTPClient:
             self._route_retention_requests.clear()
             released = self._completed_route_pieces
             self._completed_route_pieces = {}
+            released_tokens = self._completed_token_states
+            self._completed_token_states = {}
             self._route_finish_original = None
             self._route_finish_wrapper = None
             self._route_snapshot_state_verified = False
         released.clear()
+        released_tokens.clear()
+
+    def enable_token_snapshots(self) -> None:
+        """Enable direct reads at complete engine output-processing boundaries.
+
+        The publication lock covers one output chunk. A cut holds it only to
+        copy token IDs and pin logprob references/counts, never during encoding
+        or TQ I/O. This also makes terminal status atomic with the last tokens.
+        """
+        if self._token_snapshots_enabled:
+            return
+        self.check_route_snapshot_support()
+        if not self._direct_route_snapshot_enabled():
+            raise RuntimeError(
+                "direct token snapshots require the verified GIL-enabled CPython layout"
+            )
+        processor = self._engine_client.output_processor
+        original = processor.process_outputs
+
+        def process_outputs(
+            engine_core_outputs: list[Any], *args: Any, **kwargs: Any
+        ) -> Any:
+            # These fragments are not published yet. Copy outside the cut lock
+            # so buffer ownership work cannot extend its critical section.
+            own_routed_expert_fragments(engine_core_outputs)
+            with self._token_snapshot_lock:
+                return original(engine_core_outputs, *args, **kwargs)
+
+        self._token_process_original = original
+        self._token_process_wrapper = process_outputs
+        processor.process_outputs = process_outputs
+        self._token_snapshots_enabled = True
+        LOGGER.info(
+            "generation_token_snapshot mode=direct_state output_kind=FINAL_ONLY "
+            "route_buffer_ownership=owned_fragments"
+        )
+
+    def snapshot_generation_tokens(
+        self, request_id: str, *, deadline: float | None
+    ) -> _EngineTokenSnapshot | None:
+        """Copy a published token/logprob prefix without an engine-loop RPC."""
+        if not self._token_snapshots_enabled:
+            raise RuntimeError("direct token snapshots are not enabled")
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("generation token snapshot deadline passed")
+        started = time.perf_counter()
+        acquired = self._token_snapshot_lock.acquire(
+            timeout=-1 if remaining is None else remaining
+        )
+        if not acquired:
+            prefix_cut_wait(
+                "engine_token_snapshot_lock_wait", time.perf_counter() - started
+            )
+            raise TimeoutError("generation token snapshot publication lock timed out")
+        try:
+            # Every operation after acquisition, including diagnostics, must
+            # be covered by the release below: the engine also needs this lock.
+            prefix_cut_wait(
+                "engine_token_snapshot_lock_wait", time.perf_counter() - started
+            )
+            processor = self._engine_client.output_processor
+            internal_ids = list(processor.external_req_ids.get(request_id, ()))
+            with self._route_retention_lock:
+                retained = dict(self._completed_token_states.get(request_id, {}))
+            all_ids = set(internal_ids) | retained.keys()
+            if not all_ids:
+                return None
+            if len(all_ids) != 1:
+                raise ValueError("token snapshots require exactly one engine request")
+            internal_id = next(iter(all_ids))
+            completed = retained.get(internal_id)
+            state = (
+                completed.request_state
+                if completed is not None
+                else processor.request_states.get(internal_id)
+            )
+            if state is None:
+                return None
+            if completed is not None and completed.finish_reason not in (
+                "stop",
+                "length",
+            ):
+                raise ValueError(
+                    "completed engine request has no supported terminal metadata"
+                )
+            prefix_cut_count(
+                "engine_token_snapshot_retained_reads"
+                if completed is not None
+                else "engine_token_snapshot_live_reads",
+                1,
+            )
+            token_ids = list(state.detokenizer.output_token_ids)
+            logprobs = state.logprobs_processor.logprobs
+            # Pin the fully published length while the engine is between
+            # chunks. Decode FlatLogprobs positions outside the lock.
+            count = len(logprobs) if logprobs is not None else 0
+            if len(token_ids) != count:
+                raise ValueError(
+                    "published engine tokens and logprobs differ in length"
+                )
+            finish_reason = completed.finish_reason if completed is not None else None
+            stop_reason = completed.stop_reason if completed is not None else None
+        finally:
+            self._token_snapshot_lock.release()
+        with prefix_cut_timing("engine_token_snapshot_copy"):
+            selected = _extract_selected_token_logprobs(token_ids, logprobs, stop=count)
+        prefix_cut_count("engine_token_snapshot_calls", 1)
+        prefix_cut_count("engine_token_snapshot_tokens", count)
+        return _EngineTokenSnapshot(token_ids, selected, finish_reason, stop_reason)
 
     def _direct_route_snapshot_enabled(self) -> bool:
         """Allow reference-only reads for the verified GIL-owned state layout."""
@@ -959,6 +1161,9 @@ class VllmAsyncGenerationWorkerImpl(
         self._capture_registry_lock = threading.Lock()
         self._capture_sink: Any | None = None
         self._prefix_cleanup: BackgroundPrefixCleanup | None = None
+        self._generation_prefix_write_batcher: GenerationPrefixWriteBatcher | None = (
+            None
+        )
         self._generation_prefix_cuts_enabled = False
         self._generation_cut_control_token: str | None = None
         self._generation_cut_control_timeout_s: float | None = None
@@ -977,6 +1182,19 @@ class VllmAsyncGenerationWorkerImpl(
         )
         self._generation_cut_control = GenerationCutControl(
             max_workers=cut_control_config.max_workers
+        )
+        self._generation_cut_control_config = cut_control_config
+        self._generation_cut_grouper = (
+            GenerationCutGrouper(
+                max_groups=cut_control_config.max_workers,
+                max_inventories=cut_control_config.group_max_inventories,
+                max_calls=cut_control_config.group_max_calls,
+                wait_seconds=cut_control_config.group_wait_seconds,
+                max_payload_bytes=cut_control_config.write_batch_max_payload_bytes,
+                execute=self._checkpoint_generation_cut_group,
+            )
+            if cut_control_config.group_pending_inventories
+            else None
         )
         self._generation_cut_control_executor = ThreadPoolExecutor(
             max_workers=cut_control_config.max_workers,
@@ -1007,6 +1225,8 @@ class VllmAsyncGenerationWorkerImpl(
         self._staging_source: Any | None = None
         self._generation_prefix_reader: PrefixReadBatcher | None = None
         self._engine_loop_diagnostics: EngineLoopDiagnostics | None = None
+        self._owned_array_decode_stats: dict[str, int] = {}
+        self._compact_output_pipeline: CompactOutputPipeline | None = None
         # Resolved staging-chain prefixes, shared implementation with the Megatron
         # preparer. Installed by setup_token_capture; fetch runs on executor threads.
         # Deferred import: tq_token_sink pulls in the data-plane stack.
@@ -1134,6 +1354,15 @@ class VllmAsyncGenerationWorkerImpl(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
+        if self.cfg["vllm_cfg"].get("copy_decoded_arrays", False):
+            self._owned_array_decode_stats = install_owned_numpy_array_decode(
+                self.llm.engine_core.decoder
+            )
+            LOGGER.info(
+                "vllm_owned_array_decode enabled; numpy=copy_once_before_queue "
+                "tensor_ipc=unchanged"
+            )
+
         output_loop_yield_budget_ms = self.cfg["vllm_cfg"].get(
             "output_loop_yield_budget_ms"
         )
@@ -1149,6 +1378,24 @@ class VllmAsyncGenerationWorkerImpl(
             LOGGER.info(
                 "vllm_output_loop_yield enabled reader_budget_ms=%s",
                 output_loop_yield_budget_ms,
+            )
+
+        compact = CompactOutputConfig.model_validate(
+            self.cfg["vllm_cfg"].get("compact_output", {})
+        )
+        if compact.enabled:
+            self._compact_output_pipeline = install_compact_output_pipeline(
+                self.llm.engine_core,
+                max_bytes=compact.max_queued_bytes,
+                max_messages=compact.max_queued_messages,
+            )
+            LOGGER.info(
+                "vllm_compact_output enabled max_bytes=%d max_messages=%d "
+                "numeric_capture_logprobs=%s packed_capture_logprobs=%s",
+                compact.max_queued_bytes,
+                compact.max_queued_messages,
+                compact.numeric_capture_logprobs,
+                compact.packed_capture_logprobs,
             )
 
         # vLLM Metrics Logger
@@ -1325,6 +1572,9 @@ class VllmAsyncGenerationWorkerImpl(
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
         if self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
+            compact = CompactOutputConfig.model_validate(
+                self.cfg["vllm_cfg"].get("compact_output", {})
+            )
             self._http_engine_client = _AsyncLLMHTTPClient(
                 self.llm,
                 self._engine_loop,
@@ -1332,6 +1582,10 @@ class VllmAsyncGenerationWorkerImpl(
                 disable_direct_route_snapshot=self.cfg.get(
                     "disable_direct_route_snapshot"
                 ),
+                numeric_capture_logprobs=(
+                    compact.enabled and compact.numeric_capture_logprobs
+                ),
+                packed_capture_logprobs=compact.packed_capture_logprobs,
             )
             LOGGER.info(
                 "vllm_flat_logprobs enabled=%s",
@@ -1410,6 +1664,28 @@ class VllmAsyncGenerationWorkerImpl(
         # Before the sink below: a cut requires the sink, then reads these.
         self._generation_prefix_batch_max_rows = generation_prefix_batch_size
         self._generation_prefix_batch_max_tokens = generation_prefix_batch_max_tokens
+        write_config = self._generation_cut_control_config
+        if write_config.direct_prefix_batch_encoding:
+            if not generation_prefix_cuts_enabled:
+                raise ValueError(
+                    "direct prefix batch encoding requires generation-prefix cuts"
+                )
+            sink.enable_direct_prefix_batch_encoding()
+        if write_config.batch_inventory_writes:
+            if not generation_prefix_cuts_enabled:
+                raise ValueError(
+                    "inventory write batching requires generation-prefix cuts"
+                )
+            if self._generation_prefix_write_batcher is not None:
+                raise RuntimeError("inventory write batching is already configured")
+            self._generation_prefix_write_batcher = GenerationPrefixWriteBatcher(
+                sink,
+                max_rows=generation_prefix_batch_size,
+                max_tokens=generation_prefix_batch_max_tokens,
+                max_payload_bytes=write_config.write_batch_max_payload_bytes,
+                max_pending=write_config.write_batch_max_pending,
+                wait_seconds=write_config.write_batch_wait_seconds,
+            )
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,
@@ -1461,13 +1737,13 @@ class VllmAsyncGenerationWorkerImpl(
             dp_client, staging_partition=staging_partition, capture_media=capture_media
         )
         self._staging_source = source
-        if generation_prefix_cuts_enabled and self._return_routed_experts_enabled():
-            # A cut reads the active request's routes through it.
+        if generation_prefix_cuts_enabled:
+            # Cuts read tokens, logprobs and (when enabled) routes directly.
             if self._http_engine_client is None:
                 raise RuntimeError(
-                    "router-replay prefix capture requires the vLLM HTTP client"
+                    "generation-prefix capture requires the vLLM HTTP client"
                 )
-            self._http_engine_client.check_route_snapshot_support()
+            self._http_engine_client.enable_token_snapshots()
         if self._generation_prefix_reader is not None:
             await self._generation_prefix_reader.aclose()
         # Restores read routes and media with their prefix rows, so the
@@ -1555,7 +1831,9 @@ class VllmAsyncGenerationWorkerImpl(
             stream=bool(getattr(request, "stream", False)),
         )
         state = _RequestCaptureState(
+            lifecycle_lock=CaptureLifecycleLock(enabled=telemetry_metrics_exporting()),
             call=call,
+            engine_token_snapshot=self._generation_prefix_cuts_enabled,
             prompt_token_ids=list(prompt_token_ids),
             capture_routed_experts=self._return_routed_experts_enabled(),
             routed_experts_dtype=self.routed_experts_dtype,
@@ -1593,7 +1871,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
     def _observe_request_capture(self, request: Any, request_output: Any) -> None:
-        """Observe the tokens one cumulative vLLM output adds."""
+        """Consume final output, or incremental output for legacy capture hosts."""
         state = self._get_request_capture(request)
         if state is None:
             return
@@ -1601,7 +1879,8 @@ class VllmAsyncGenerationWorkerImpl(
         if not outputs:
             return
         with state.lock:
-            observed = state.observed_generation_token_count
+            direct_tokens = state.engine_token_snapshot
+            observed = 0 if direct_tokens else state.observed_generation_token_count
         try:
             output = outputs[0]
             # Cumulative output: slice off what earlier steps already observed.
@@ -1644,7 +1923,16 @@ class VllmAsyncGenerationWorkerImpl(
             if state.engine_request_id is None:
                 # A cut reads the request's active routes by this ID.
                 state.engine_request_id = getattr(request_output, "request_id", None)
-            state.observe(generation_token_ids, generation_logprobs)
+            if direct_tokens:
+                # A cut can have populated an older prefix while the terminal
+                # output was handed over. Replace it, never append it twice.
+                if finish_reason is None:
+                    return
+                state.generated_token_ids = generation_token_ids
+                state.generated_logprobs = generation_logprobs
+                state.engine_token_snapshot = False
+            else:
+                state.observe(generation_token_ids, generation_logprobs)
             if complete_routed_experts is not None:
                 state.terminal_routed_experts = complete_routed_experts
             if finish_reason is not None:
@@ -1667,6 +1955,41 @@ class VllmAsyncGenerationWorkerImpl(
                 else:
                     state.terminal_finish_reason = finish_reason
                     state.terminal_stop_reason = stop_reason
+
+    def _refresh_generation_cut_tokens(
+        self, state: _RequestCaptureState, *, deadline: float | None
+    ) -> None:
+        """Refresh checkpoint buffers from one stable engine prefix."""
+        with state.lock:
+            if not state.engine_token_snapshot:
+                return
+            request_id = state.engine_request_id
+        if request_id is None:
+            raise ValueError("generation has not registered an engine request yet")
+        assert self._http_engine_client is not None
+        with prefix_cut_timing("engine_token_snapshot"):
+            snapshot = self._http_engine_client.snapshot_generation_tokens(
+                request_id, deadline=deadline
+            )
+        with state.lock:
+            # The final HTTP output owns a complete copy before releasing
+            # engine retention. Do not overwrite it with an older live probe.
+            if not state.engine_token_snapshot:
+                return
+            if snapshot is None:
+                raise ValueError(
+                    "generation request has no live or retained engine state"
+                )
+            previous = len(state.generated_token_ids)
+            if (
+                snapshot.token_ids[:previous] != state.generated_token_ids
+                or snapshot.logprobs[:previous] != state.generated_logprobs
+            ):
+                raise ValueError("engine generation prefix changed between cuts")
+            state.generated_token_ids = snapshot.token_ids
+            state.generated_logprobs = snapshot.logprobs
+            state.terminal_finish_reason = snapshot.finish_reason
+            state.terminal_stop_reason = snapshot.stop_reason
 
     def _snapshot_engine_routed_experts(
         self, engine_request_id: str, *, timeout_s: float | None
@@ -2097,7 +2420,9 @@ class VllmAsyncGenerationWorkerImpl(
         state = self._get_request_capture(request)
         if state is None:
             return content, []
-        with state.lifecycle_lock:
+        with state.lifecycle_lock.hold(
+            "terminal", model_call_id=state.call.model_call_id
+        ):
             if state.terminal_started:
                 raise RuntimeError(
                     f"model call {state.call.model_call_id!r} already started "
@@ -2222,6 +2547,7 @@ class VllmAsyncGenerationWorkerImpl(
         )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
+            choice.pop("routed_experts", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
             # remove the serializer's message fields before the worker->gate hop.
             message = choice.get("message")
@@ -2735,12 +3061,12 @@ class VllmAsyncGenerationWorkerImpl(
                     worker_self._generation_prefix_cuts_enabled
                     and self.ng_capture is not None
                 ):
-                    # A cut needs per-step progress, not vLLM's FINAL_ONLY.
-                    # CUMULATIVE outputs reference vLLM's live token and
-                    # logprob lists, so each step costs only its new tokens.
+                    # Cuts read progress directly from the engine; no
+                    # intermediate HTTP outputs are needed for capture.
                     # Streaming keeps vLLM's DELTA, which its stream expects.
                     if not self.stream:
-                        sampling_params.output_kind = RequestOutputKind.CUMULATIVE
+                        sampling_params.output_kind = RequestOutputKind.FINAL_ONLY
+                    _G_ENGINE_CAPTURE_STATE.set(worker_self._get_request_capture(self))
                     worker_self._record_request_effective_output_limit(
                         self, int(sampling_params.max_tokens)
                     )
@@ -2755,6 +3081,7 @@ class VllmAsyncGenerationWorkerImpl(
         @app.post(_GENERATION_CUT_ROUTE)
         async def checkpoint_generation_cut(
             inventory: dict[str, Any],
+            raw_request: Request,
             authorization: str | None = Header(default=None),
         ):
             """Persist one checkpoint's frozen active-call prefixes to TQ."""
@@ -2776,8 +3103,15 @@ class VllmAsyncGenerationWorkerImpl(
                 raise HTTPException(status_code=401, detail="invalid control bearer")
             typed_inventory = GenerationCutInventory.model_validate(inventory)
             # Measured from arrival so time queued behind a stale cut counts.
-            timeout_s = worker_self._generation_cut_control_timeout_s
-            deadline = None if timeout_s is None else time.monotonic() + timeout_s
+            try:
+                deadline = generation_cut_deadline(
+                    worker_self._generation_cut_control_timeout_s,
+                    raw_request.headers.get("x-nemo-gym-cut-deadline"),
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+            except TimeoutError as error:
+                raise HTTPException(status_code=408, detail=str(error)) from error
             with prefix_cut_probe(
                 enabled=telemetry_metrics_exporting(),
                 checkpoint_id=typed_inventory.checkpoint_id,
@@ -2785,9 +3119,18 @@ class VllmAsyncGenerationWorkerImpl(
                 calls=len(typed_inventory.active_prefixes),
                 deadline=deadline,
             ):
-                receipt = await worker_self._checkpoint_generation_cut_control(
-                    typed_inventory, deadline=deadline
-                )
+                try:
+                    receipt = await run_generation_cut_request(
+                        lambda: worker_self._checkpoint_generation_cut_control(
+                            typed_inventory, deadline=deadline
+                        ),
+                        raw_request.receive,
+                    )
+                except TimeoutError as error:
+                    prefix_cut_count("control_request_deadline_expired", 1)
+                    raise HTTPException(status_code=408, detail=str(error)) from error
+                if receipt is None:  # The HTTP client disconnected.
+                    return None
                 for acknowledgement in receipt.prefixes:
                     prefix_cut_count(f"ack_{acknowledgement.disposition}", 1)
             return receipt.model_dump(mode="json")
@@ -2816,6 +3159,9 @@ class VllmAsyncGenerationWorkerImpl(
                         parameter="top_logprobs",
                     )
 
+                captured_response = bool(
+                    not request.stream and id(request) in worker_self._capture_calls
+                )
                 final_res = None
                 cancelled = False
 
@@ -2834,7 +3180,14 @@ class VllmAsyncGenerationWorkerImpl(
                             final_res,
                             tokenizer=self.renderer.tokenizer,
                         )
-                        yield final_res
+                        # Preserve the original routes for aligned capture below.
+                        # Only the upstream serving view omits the unused native
+                        # NumPy/base64 field, which otherwise blocks this loop.
+                        yield (
+                            without_native_chat_routed_experts(final_res)
+                            if captured_response
+                            else final_res
+                        )
                     except asyncio.CancelledError:
                         cancelled = True
                         raise
@@ -2859,10 +3212,7 @@ class VllmAsyncGenerationWorkerImpl(
                 # after the terminal PUT. Skip only their object construction;
                 # changing request.logprobs would also change engine sampling.
                 bypass_logprobs = bool(
-                    not request.stream
-                    and request.logprobs
-                    and return_as_token_id
-                    and id(request) in worker_self._capture_calls
+                    captured_response and request.logprobs and return_as_token_id
                 )
                 with self._bypass_chat_logprobs(enabled=bypass_logprobs):
                     response = await super().chat_completion_full_generator(
@@ -3089,9 +3439,13 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
             try:
-                generator = await openai_serving_chat.create_chat_completion(
-                    request, raw_request
-                )
+                capture_context = _G_ENGINE_CAPTURE_STATE.set(None)
+                try:
+                    generator = await openai_serving_chat.create_chat_completion(
+                        request, raw_request
+                    )
+                finally:
+                    _G_ENGINE_CAPTURE_STATE.reset(capture_context)
             except VLLMValidationError as e:
                 # vLLM raises VLLMValidationError for prompts exceeding
                 # max_model_len during tokenization, instead of returning an
@@ -3361,9 +3715,9 @@ class VllmAsyncGenerationWorkerImpl(
             # Hand the pre-bound listening socket directly to uvicorn's asyncio
             # server via server.serve(sockets=). No close-and-rebind needed.
             def _run_with_socket() -> None:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(server.serve(sockets=[reserved_sock]))
+                # Cancel and drain request tasks before this thread exits, just
+                # as server.run does. Their finally blocks still need cleanup.
+                asyncio.run(server.serve(sockets=[reserved_sock]))
 
             thread = threading.Thread(target=_run_with_socket, daemon=True)
         else:
@@ -4105,12 +4459,23 @@ class VllmAsyncGenerationWorkerImpl(
 
         await self.llm.wake_up(**wake_up_args)
 
+    async def _drain_generation_cut_cleanup(self, *, timeout_s: float = 30.0) -> None:
+        """Drain FIFO abort cleanup after all HTTP request tasks have stopped."""
+        executor = getattr(self, "_generation_cut_cleanup_executor", None)
+        if executor is None:
+            return
+        try:
+            # This executor has one worker: the barrier completes after every
+            # previously submitted abort cleanup. Bound a stalled TQ operation.
+            barrier = executor.submit(lambda: None)
+            await asyncio.wait_for(asyncio.wrap_future(barrier), timeout=timeout_s)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._generation_cut_cleanup_executor = None
+
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
-            generation_prefix_reader = getattr(self, "_generation_prefix_reader", None)
-            if generation_prefix_reader is not None:
-                await generation_prefix_reader.aclose()
             # A terminal write may be waiting at the TQ snapshot fence when the
             # actor is asked to stop. Release it before retiring the isolated
             # cut-control and fence executors; waiting for a wedged TQ write
@@ -4120,21 +4485,42 @@ class VllmAsyncGenerationWorkerImpl(
             )
             if token_capture_snapshot_gate is not None:
                 token_capture_snapshot_gate.reopen()
+            grouper = getattr(self, "_generation_cut_grouper", None)
+            if grouper is not None:
+                grouper.close()
             cut_control = getattr(self, "_generation_cut_control", None)
             if cut_control is not None:
                 cut_control.close()
+            if self.server_thread is not None:
+                # Uvicorn cancels outstanding generation requests at this
+                # deadline. Keep their cleanup executor alive through cancellation.
+                graceful_timeout = self.http_server.config.timeout_graceful_shutdown
+                self.http_server.config.timeout_graceful_shutdown = (
+                    30.0 if graceful_timeout is None else min(graceful_timeout, 30.0)
+                )
+                self.http_server.should_exit = True
+                await asyncio.to_thread(self.server_thread.join, 45.0)
+                if self.server_thread.is_alive():
+                    raise TimeoutError(
+                        "vLLM HTTP server did not stop within 45 seconds"
+                    )
+                self.server_thread = None
+
+            await self._drain_generation_cut_cleanup()
+            prefix_writer = getattr(self, "_generation_prefix_write_batcher", None)
+            if prefix_writer is not None:
+                await asyncio.to_thread(prefix_writer.close)
+                self._generation_prefix_write_batcher = None
+            generation_prefix_reader = getattr(self, "_generation_prefix_reader", None)
+            if generation_prefix_reader is not None:
+                await generation_prefix_reader.aclose()
             for executor_name in (
                 "_generation_cut_control_executor",
                 "_token_capture_fence_executor",
-                "_generation_cut_cleanup_executor",
             ):
                 executor = getattr(self, executor_name, None)
                 if executor is not None:
                     executor.shutdown(wait=False, cancel_futures=True)
-            if self.server_thread is not None:
-                self.http_server.should_exit = True
-                await asyncio.to_thread(self.server_thread.join)
-                self.server_thread = None
 
             if self._http_engine_client is not None:
                 self._http_engine_client.close_route_snapshots()

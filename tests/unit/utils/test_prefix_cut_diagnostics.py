@@ -3,6 +3,8 @@
 import ast
 import asyncio
 import contextvars
+import hashlib
+import io
 import json
 import logging
 import threading
@@ -46,6 +48,7 @@ def test_disabled_probe_does_not_read_clocks_or_log(monkeypatch, caplog):
 
     monkeypatch.setattr(diagnostics.time, "perf_counter", unexpected_clock)
     monkeypatch.setattr(diagnostics.time, "thread_time", unexpected_clock)
+    monkeypatch.setattr(diagnostics.time, "process_time", unexpected_clock)
     with manager, diagnostics.prefix_cut_timing("unused"):
         diagnostics.prefix_cut_count("bytes", 100)
         assert not diagnostics.prefix_cut_probe_active()
@@ -209,6 +212,322 @@ def test_actual_cut_control_wrapper_preserves_queue_context_and_result(caplog):
     assert result["phases"]["control_queue_wait"]["wall_s"] >= 0.03
     assert result["phases"]["control_execution"]["calls"] == 1
     assert result["phases"]["control_result_delivery"]["calls"] == 1
+    assert result["phases"]["control_executor_dispatch_wait"]["wall_s"] >= 0.03
+
+
+def test_active_tq_phase_is_visible_cross_thread_and_clears_on_error(caplog):
+    caplog.set_level(logging.INFO)
+    entered, release = threading.Event(), threading.Event()
+    with probe():
+        observer = diagnostics.current_prefix_cut_probe()
+        context = contextvars.copy_context()
+
+        def write():
+            with diagnostics.prefix_cut_timing("tq_put_ack"):
+                entered.set()
+                assert release.wait(5)
+                raise ValueError("TQ unavailable")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(context.run, write)
+            try:
+                assert entered.wait(2)
+                assert observer.active_phase_age("tq_put_ack") is not None
+            finally:
+                release.set()
+            with pytest.raises(ValueError, match="TQ unavailable"):
+                future.result(timeout=5)
+        assert observer.active_phase_age("tq_put_ack") is None
+    timing = summary(caplog)["phases"]["tq_put_ack"]
+    assert timing["errors"] == 1
+    assert timing["process_cpu_s"] >= 0
+
+
+def test_timing_records_process_and_thread_cpu_for_actual_cpu_work(caplog):
+    caplog.set_level(logging.INFO)
+    with probe(), diagnostics.prefix_cut_timing("cpu_work"):
+        assert sum(i * i for i in range(100000)) > 0
+    timing = summary(caplog)["phases"]["cpu_work"]
+    assert timing["thread_cpu_s"] > 0
+    assert timing["process_cpu_s"] >= timing["thread_cpu_s"] - 0.001
+
+
+def test_lifecycle_lock_reports_terminal_owner_and_tq_phase(caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(diagnostics, "_LIFECYCLE_SLOW_SECONDS", 0.005)
+    monkeypatch.setattr(diagnostics, "_LIFECYCLE_LOG_INTERVAL_SECONDS", 0)
+    lock = diagnostics.CaptureLifecycleLock(enabled=True)
+    entered, release = threading.Event(), threading.Event()
+
+    def terminal():
+        with lock.hold("terminal", model_call_id="call"):
+            with diagnostics.prefix_cut_timing("tq_kv_batch_put_api"):
+                entered.set()
+                assert release.wait(5)
+
+    def cut():
+        with lock.hold("cut", model_call_id="call"):
+            return 42
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(terminal)
+        assert entered.wait(2)
+        with lock.hold("abort", model_call_id="call", blocking=False) as acquired:
+            assert not acquired
+        second = executor.submit(cut)
+        try:
+            time.sleep(0.03)
+            assert not second.done()
+        finally:
+            release.set()
+        first.result(2)
+        assert second.result(2) == 42
+    assert not lock.locked()
+    samples = [
+        json.loads(r.message.split(" ", 1)[1])
+        for r in caplog.records
+        if r.message.startswith("capture_lifecycle_lock ")
+    ]
+    wait = next(x for x in samples if x["event"] == "wait")
+    assert wait["owner_at_wait_start"]["operation"] == "terminal"
+    assert wait["owner_at_wait_start"]["model_call_id"] == "call"
+    assert wait["owner_at_wait_start"]["slowest_phase"] == "tq_kv_batch_put_api"
+    assert wait["wait_s"] >= 0.02
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_lifecycle_lock_preserves_cross_thread_release_and_errors(caplog, enabled):
+    lock = diagnostics.CaptureLifecycleLock(enabled=enabled)
+    assert lock.acquire(False)
+    thread = threading.Thread(target=lock.release)
+    thread.start()
+    thread.join(2)
+    assert not lock.locked()
+    with pytest.raises(ValueError, match="body failed"):
+        with lock.hold("terminal", model_call_id="call"):
+            raise ValueError("body failed")
+    assert not lock.locked()
+    assert diagnostics._LIFECYCLE_OWNER.get() is None
+    assert not caplog.records
+
+
+def test_cut_lock_context_does_not_leak_across_suspended_generators():
+    locks = [diagnostics.CaptureLifecycleLock(enabled=True) for _ in range(2)]
+
+    def transaction(lock):
+        with lock.hold("cut", model_call_id="call"):
+            yield
+
+    first, second = [transaction(lock) for lock in locks]
+    next(first)
+    next(second)
+    assert diagnostics._LIFECYCLE_OWNER.get() is None
+    first.close()
+    second.close()
+    assert not any(lock.locked() for lock in locks)
+
+
+@pytest.mark.parametrize("slow_phase", ["preprocess", "api", "postprocess"])
+def test_actual_put_adapter_separates_preparation_api_and_return(caplog, slow_phase):
+    caplog.set_level(logging.INFO)
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "nemo_rl/data_plane/adapters/transfer_queue.py"
+    )
+    tree = ast.parse(path.read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "TQDataPlaneClient"
+    )
+    method = next(n for n in cls.body if getattr(n, "name", None) == "put_samples")
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    events = []
+
+    class Fields:
+        def detach(self):
+            events.append("detach")
+            if slow_phase == "preprocess":
+                time.sleep(0.03)
+            return self
+
+        def keys(self):
+            return ["tokens"]
+
+    fields = Fields()
+
+    def put(**kwargs):
+        events.append("put")
+        assert kwargs["keys"] == ["key"] and kwargs["fields"] is fields
+        if slow_phase == "api":
+            time.sleep(0.03)
+
+    def meta(**kwargs):
+        events.append("return")
+        if slow_phase == "postprocess":
+            time.sleep(0.03)
+        return SimpleNamespace(**kwargs)
+
+    namespace = dict(
+        cast=cast,
+        TensorDict=Fields,
+        KVBatchMeta=meta,
+        tq=SimpleNamespace(kv_batch_put=put),
+        prefix_cut_timing=diagnostics.prefix_cut_timing,
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[future, method], type_ignores=[])
+            ),
+            str(path),
+            "exec",
+        ),
+        namespace,
+    )
+    client = SimpleNamespace(
+        _gdr_requested=False,
+        _gdr_put_confirmed=False,
+        _mark_data_operation_started=lambda: None,
+    )
+    tags = [{"task": "test"}]
+    with probe():
+        result = namespace["put_samples"](client, ["key"], "staging", fields, tags)
+    assert result.sample_ids == ["key"] and result.fields == ["tokens"]
+    assert result.tags == tags and result.tags[0] is not tags[0]
+    assert events == ["detach", "put", "return"]
+    phase = {
+        "preprocess": "tq_put_preprocess",
+        "api": "tq_kv_batch_put_api",
+        "postprocess": "tq_put_postprocess",
+    }[slow_phase]
+    times = summary(caplog)["phases"]
+    assert times[phase]["wall_s"] >= 0.02
+    for name in ["tq_put_preprocess", "tq_kv_batch_put_api", "tq_put_postprocess"]:
+        assert times[name]["calls"] == 1 and times[name]["errors"] == 0
+        if name != phase:
+            assert times[name]["wall_s"] < times[phase]["wall_s"]
+
+
+def test_capture_phase_split_preserves_serialized_recovery_and_save_order():
+    torch = pytest.importorskip("torch")
+    path = (
+        Path(__file__).resolve().parents[3] / "nemo_rl/algorithms/single_controller.py"
+    )
+    tree = ast.parse(path.read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "SingleControllerActor"
+    )
+    method = next(
+        n
+        for n in cls.body
+        if getattr(n, "name", None) == "_capture_rollout_checkpoint_cut"
+    )
+    method.decorator_list = []
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    phases, calls = [], []
+
+    class Phase:
+        def __init__(self, name):
+            self.name = name
+
+        def __enter__(self):
+            phases.append(self.name)
+
+        def __exit__(self, *args):
+            pass
+
+    saved = {}
+
+    async def validate_replay(metadata):
+        calls.append("validate_replay")
+
+    async def validate_staging(*args, **kwargs):
+        calls.append("validate_staging")
+        return 7
+
+    async def save(*args, **kwargs):
+        calls.append("save")
+        saved.update(kwargs)
+
+    ledger_state = {"groups": [{"id": "group", "tokens": [1, 2, 3]}]}
+    namespace = dict(
+        asyncio=asyncio,
+        io=io,
+        hashlib=hashlib,
+        torch=torch,
+        time=time,
+        checkpoint_phase=Phase,
+        build_rollout_recovery_state=lambda *a, **kw: ledger_state,
+        _RolloutCheckpointCut=lambda **kw: SimpleNamespace(**kw),
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[future, method], type_ignores=[])
+            ),
+            str(path),
+            "exec",
+        ),
+        namespace,
+    )
+    meta = {
+        "groups": [
+            {"group_id": "group", "meta": SimpleNamespace(sample_ids=["a", "b"])}
+        ]
+    }
+    controller = SimpleNamespace(
+        _dataloader=SimpleNamespace(state_dict=lambda: {"cursor": 1}),
+        _replacement_reserve=[],
+        _buffer=SimpleNamespace(
+            training_owned_replay_groups=lambda: [],
+            metadata_state_dict=lambda **kw: meta,
+        ),
+        _async_cfg=SimpleNamespace(max_buffered_rollouts=10),
+        _validate_replay_inventory=validate_replay,
+        _rollout_manager=SimpleNamespace(recovery_ledger=object()),
+        _batch_shortfall=0,
+        _sampler_stamps_target_steps={},
+        _finalizer_metrics_by_group={},
+        _finalizer_rewards_by_group={},
+        _capture_reward_settings=lambda: None,
+        _master_config=SimpleNamespace(token_capture=SimpleNamespace(enabled=True)),
+        _validate_rollout_recovery_inventory=validate_staging,
+        _save_data_plane_checkpoint=save,
+        _train_steps=4,
+        _trainer_version=4,
+        _current_epoch=0,
+        _sampler=SimpleNamespace(dispatch_index=20),
+        _data_plane_checkpoint_barrier=SimpleNamespace(mutation_version=10),
+    )
+    result = asyncio.run(
+        namespace["_capture_rollout_checkpoint_cut"](
+            controller, SimpleNamespace(require_live=lambda: None), "/snapshot"
+        )
+    )
+    assert calls == ["validate_replay", "validate_staging", "save"]
+    assert (
+        torch.load(io.BytesIO(result.rollout_recovery_payload), weights_only=True)
+        == ledger_state
+    )
+    assert (
+        saved["rollout_recovery_payload_sha256"]
+        == hashlib.sha256(result.rollout_recovery_payload).hexdigest()
+    )
+    assert result.replay_row_count == 2 and result.staging_row_count == 7
+    assert phases == [
+        "capture_replay_metadata",
+        "capture_validate_replay_inventory",
+        "capture_build_recovery_state",
+        "capture_serialize_recovery_state",
+        "capture_hash_recovery_payload",
+    ]
 
 
 @pytest.fixture

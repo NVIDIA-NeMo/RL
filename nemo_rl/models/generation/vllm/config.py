@@ -53,6 +53,17 @@ class VllmVideoConfig(BaseModel):
     temporal_patch_size: PositiveInt
 
 
+class CompactOutputConfig(BaseModel, extra="forbid"):
+    """Opt-in vLLM 0.29 DP=1 encoded output queue and numeric capture path."""
+
+    enabled: bool = False
+    max_queued_bytes: Annotated[int, Field(gt=0, strict=True)] = 512 * 1024 * 1024
+    max_queued_messages: Annotated[int, Field(gt=0, strict=True)] = 8192
+    numeric_capture_logprobs: bool = True
+    # Three packed numeric buffers for eligible captured FINAL_ONLY requests.
+    packed_capture_logprobs: bool = False
+
+
 class VllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
     pipeline_parallel_size: int
@@ -96,6 +107,10 @@ class VllmSpecificArgs(TypedDict):
     # Flat per-request logprob storage avoids long GC pauses over per-token
     # objects. Requires async_engine and expose_http_server; default off.
     flat_logprobs: NotRequired[bool]
+    # Copy decoded NumPy payloads before queueing engine outputs. This releases
+    # received-buffer wrappers early. Async-engine diagnostic option; default off.
+    copy_decoded_arrays: NotRequired[bool]
+    compact_output: NotRequired[CompactOutputConfig]
     # Positive output-reader work budget in ms, e.g. 20. Also yields between
     # output-handler steps. Requires async_engine; null disables the patch.
     output_loop_yield_budget_ms: NotRequired[float | None]
@@ -220,7 +235,22 @@ class VllmRefitConfig(BaseModel, extra="allow"):
 class GenerationCutControlConfig(BaseModel, extra="forbid"):
     """Bound concurrent independent checkpoint inventories per generation worker."""
 
-    max_workers: Annotated[int, Field(ge=1, le=2, strict=True)] = 1
+    # One to four independent inventories; overlapping calls still serialize.
+    max_workers: Annotated[int, Field(ge=1, le=4, strict=True)] = 1
+    # Merge prepared writes across admitted inventories on a dedicated thread.
+    batch_inventory_writes: bool = False
+    # Construct text prefix columns directly, avoiding intermediate row tensors.
+    direct_prefix_batch_encoding: bool = False
+    # Group a bounded FIFO prefix before reserving one admission slot.
+    group_pending_inventories: bool = False
+    group_max_inventories: Annotated[int, Field(ge=1, le=32, strict=True)] = 8
+    group_max_calls: Annotated[int, Field(gt=0, strict=True)] = 256
+    group_wait_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.01
+    write_batch_wait_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.01
+    write_batch_max_pending: Annotated[int, Field(gt=0, strict=True)] = 16
+    write_batch_max_payload_bytes: Annotated[int, Field(gt=0, strict=True)] = (
+        256 * 1024 * 1024
+    )
 
 
 class VllmConfig(GenerationConfig):
@@ -229,7 +259,7 @@ class VllmConfig(GenerationConfig):
     # Optional diagnostic opt-out: true forces owner-loop route snapshots.
     # False/absent retains the guarded direct-reference path (recommended).
     disable_direct_route_snapshot: NotRequired[bool]
-    # Absent uses GenerationCutControlConfig defaults. Two overlaps independent
+    # Absent uses GenerationCutControlConfig defaults. Up to four independent
     # inventories only; duplicate/overlapping calls and checkpoint epochs serialize.
     generation_cut_control: NotRequired[GenerationCutControlConfig]
     # Per-token NVFP4 W4A4 rollout (TE-training flow; no ModelOpt training).
@@ -265,6 +295,24 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    compact = CompactOutputConfig.model_validate(vllm_cfg.get("compact_output", {}))
+    if compact.packed_capture_logprobs and not (
+        compact.enabled and compact.numeric_capture_logprobs
+    ):
+        raise ValueError("packed capture requires compact output and numeric capture")
+    if compact.enabled:
+        if not vllm_cfg.get("async_engine"):
+            raise ValueError("compact_output requires async_engine: true")
+        if vllm_cfg.get("copy_decoded_arrays"):
+            raise ValueError(
+                "compact_output cannot be combined with copy_decoded_arrays"
+            )
+        if compact.numeric_capture_logprobs and not vllm_cfg.get("flat_logprobs"):
+            raise ValueError("numeric compact capture requires flat_logprobs: true")
+    if vllm_cfg.get("copy_decoded_arrays") and not vllm_cfg.get("async_engine"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.copy_decoded_arrays requires async_engine: true."
+        )
     if vllm_cfg.get("flat_logprobs") and not (
         vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
     ):

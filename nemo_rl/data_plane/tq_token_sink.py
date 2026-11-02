@@ -34,12 +34,13 @@ use.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
 import math
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -59,6 +60,10 @@ if TYPE_CHECKING:
     )
 
 from nemo_rl.data_plane.codec import stack_or_nest
+from nemo_rl.data_plane.direct_prefix_batch import (
+    EncodedPrefixBatch,
+    encode_text_generation_prefix_batch,
+)
 from nemo_rl.data_plane.schema import (
     PER_TOKEN_STAGING_FIELDS,
     ROUTE_ENCODING_ENVELOPE,
@@ -510,6 +515,19 @@ class TQTokenSink:
         # model dtype). Fixes the ``media_imgs`` column dtype so text-call
         # sentinels and real rows agree; see ``_media_sentinels``.
         self._media_pixel_dtype = media_pixel_dtype
+        self._generation_prefix_encoder: (
+            Callable[[Sequence[StagedCallRecord]], EncodedPrefixBatch] | None
+        ) = None
+
+    def enable_direct_prefix_batch_encoding(self) -> None:
+        """Use owned batch columns for text-only generation-prefix writes.
+
+        The general encoder continues to handle media and routed-expert rows.
+        Ordinary terminal-call staging is unaffected.
+        """
+        self._generation_prefix_encoder = functools.partial(
+            encode_text_generation_prefix_batch, mode_codes=_MODE_TO_CODE
+        )
 
     @property
     def media_pixel_dtype(self) -> torch.dtype | None:
@@ -766,6 +784,30 @@ class TQTokenSink:
         ]
         if len(set(keys)) != len(keys):
             raise ValueError("generation-prefix batch contains duplicate staging keys")
+        if (
+            records
+            and self._generation_prefix_encoder is not None
+            and not self._capture_media
+            and not any(attachments)
+            and not any(
+                record.extras is not None and "routed_experts" in record.extras
+                for record in records
+            )
+        ):
+            batch = self._generation_prefix_encoder(records)
+            prefix_cut_count("direct_batch_encoder_batches", 1)
+            prefix_cut_count("direct_batch_encoder_rows", len(records))
+            prefix_cut_count("tq_batches", 1)
+            prefix_cut_count("tensor_payload_bytes", batch.payload_bytes)
+            prefix_cut_count(
+                "max_batch_tensor_payload_bytes", batch.payload_bytes, maximum=True
+            )
+            try:
+                self._store.put_many(keys, batch.fields, tags=batch.tags)
+            except Exception:
+                self._discard_failed_writes(keys)
+                raise
+            return keys
         groups: dict[
             tuple[Any, ...],
             list[tuple[int, dict[str, torch.Tensor], dict[str, Any]]],

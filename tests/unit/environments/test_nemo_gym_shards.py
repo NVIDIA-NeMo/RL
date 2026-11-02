@@ -22,6 +22,8 @@ from nemo_rl.environments.nemo_gym_shards import (
     ShardPlan,
     ShardSetupError,
     ShardSpec,
+    actor_concurrency_options,
+    apply_replica_port_range,
     apply_shard_log_dir,
     apply_shard_overlay,
     build_route_shard_map,
@@ -46,6 +48,61 @@ def _sharded_config(**overrides):
 def test_unsharded_config_returns_no_plan():
     """config_paths without shards is the pre-sharding path and must stay working."""
     assert parse_shard_plan({"config_paths": ["gym.yaml"], "num_gpu_nodes": 1}) is None
+
+
+def test_replica_port_ranges_are_disjoint_even_when_backends_move_nodes():
+    config = {
+        "port_range_low": 5000,
+        "port_range_high": 5999,
+        "policy_model": {"workers": 8},
+    }
+    shard = ShardSpec(
+        name="all",
+        config_paths=["policy.yaml"],
+        inherited_overlays=frozenset(),
+        replicas=4,
+    )
+    replicas = [
+        apply_replica_port_range(config, shard, replica_index=i) for i in range(4)
+    ]
+    assert [(c["port_range_low"], c["port_range_high"]) for c in replicas] == [
+        (5000, 5249),
+        (5250, 5499),
+        (5500, 5749),
+        (5750, 5999),
+    ]
+    assert config["port_range_low"] == 5000 and config["port_range_high"] == 5999
+    assert all(c["policy_model"] == config["policy_model"] for c in replicas)
+
+
+def test_replica_port_ranges_cover_nondivisible_windows_without_overlap():
+    shard = ShardSpec(name="all", config_paths=["policy.yaml"], replicas=3)
+    config = {"port_range_low": 5000, "port_range_high": 5010}
+    ranges = [
+        apply_replica_port_range(config, shard, replica_index=i) for i in range(3)
+    ]
+    ports = [
+        p for c in ranges for p in range(c["port_range_low"], c["port_range_high"] + 1)
+    ]
+    assert ports == list(range(5000, 5011))
+
+
+@pytest.mark.parametrize("replicas", [1, 4])
+def test_unconfigured_replica_port_ranges_preserve_defaults(replicas):
+    shard = ShardSpec(name="all", config_paths=["policy.yaml"], replicas=replicas)
+    config = {"policy_model": {}}
+    assert apply_replica_port_range(config, shard, replica_index=0) == config
+
+
+@pytest.mark.parametrize(
+    "low,high", [(5000, 5004), (5000, None), (True, 6000), (6000, 5000)]
+)
+def test_replica_port_ranges_reject_invalid_or_exhausted_windows(low, high):
+    shard = ShardSpec(name="all", config_paths=["policy.yaml"], replicas=4)
+    with pytest.raises(ShardConfigError):
+        apply_replica_port_range(
+            {"port_range_low": low, "port_range_high": high}, shard, replica_index=0
+        )
 
 
 @pytest.mark.parametrize(
@@ -724,3 +781,22 @@ def test_external_service_readiness_reaches_every_shard():
     for shard in plan.shards:
         merged = apply_shard_overlay(config, plan, shard)
         assert merged["external_service_readiness"] == readiness
+
+
+@pytest.mark.parametrize("value", [None, 4096])
+def test_actor_concurrency_preserves_default_or_sets_explicit_limit(value):
+    config = _sharded_config(max_concurrency=value)
+    plan = parse_shard_plan(config)
+    expected = {} if value is None else {"max_concurrency": value}
+    for shard in plan.shards:
+        merged = apply_shard_overlay(config, plan, shard)
+        assert actor_concurrency_options(merged) == expected
+    assert actor_concurrency_options({}) == {}
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "4096", {}])
+def test_actor_concurrency_rejects_invalid_limits(value):
+    with pytest.raises(
+        ShardConfigError, match="max_concurrency must be a positive integer"
+    ):
+        actor_concurrency_options({"max_concurrency": value})

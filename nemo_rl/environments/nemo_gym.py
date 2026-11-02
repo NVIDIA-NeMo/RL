@@ -80,6 +80,8 @@ from nemo_rl.environments.nemo_gym_shards import (
     ShardPlan,
     ShardSetupError,
     ShardSpec,
+    actor_concurrency_options,
+    apply_replica_port_range,
     apply_shard_log_dir,
     apply_shard_overlay,
     build_route_shard_map,
@@ -2183,6 +2185,8 @@ def _build_gym_actor_config(
     for key in SHARDING_CONFIG_KEYS:
         nemo_gym_dict.pop(key, None)
 
+    nemo_gym_dict.pop("max_concurrency", None)
+
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
@@ -2608,7 +2612,8 @@ def _build_single_gym_actor(
     )
 
     actor_options: dict[str, Any] = {
-        "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
+        **actor_concurrency_options(nemo_gym_dict),
+        "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN),
     }
     if nemo_gym_dict.get("num_gpu_nodes", 0):
         actor_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
@@ -2648,6 +2653,7 @@ def _build_sharded_gym_actors(
     pg_ready_timeout: float,
     spinup_timeout: float,
 ) -> NemoGymShardSet:
+    concurrency_options = actor_concurrency_options(nemo_gym_dict)
     instances = _shard_instances(plan)
 
     # num_gpu_nodes normally pins the single actor to the driver node. Under
@@ -2670,8 +2676,8 @@ def _build_sharded_gym_actors(
         for key, value in nemo_gym_dict.items()
         if key not in SHARDING_CONFIG_KEYS
     }
-    # One merge per shard; replicas are identical stamps of it apart from the
-    # log directory, so they must not re-run the merge.
+    # One merge per shard; replicas then receive their own log directories
+    # and port subranges without repeating the merge.
     merged_by_shard = {
         shard.name: apply_shard_overlay(base_gym_dict, plan, shard)
         for shard in plan.shards
@@ -2714,7 +2720,11 @@ def _build_sharded_gym_actors(
                 shard.name,
                 replica_index=replica if shard.replicas > 1 else None,
             )
+            instance_gym_dict = apply_replica_port_range(
+                instance_gym_dict, shard, replica_index=replica
+            )
             actor = NemoGym.options(
+                **concurrency_options,
                 runtime_env=actor_runtime_env,
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,

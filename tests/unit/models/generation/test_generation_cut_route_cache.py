@@ -7,22 +7,27 @@ the actual implementations, not fake hash functions or tensor operations.
 
 import ast
 import asyncio
-from collections import defaultdict
+import contextvars
 import importlib.metadata
 import json
 import logging
 import sys
 import threading
+import time
 import weakref
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
 from packaging.version import Version
+
+from nemo_rl.models.generation.vllm.packed_logprobs import PackedSelectedLogprobs
 
 pytest.importorskip("nemo_gym.token_id_capture.staging.capture")
 
@@ -40,6 +45,9 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StagedCallBaseSnapshot,
 )
 
+from nemo_rl.data_plane.generation_prefix_write_batcher import (  # noqa: E402
+    GenerationPrefixWriteBatcher,
+)
 from nemo_rl.utils.prefix_cut_diagnostics import (  # noqa: E402
     prefix_cut_probe,
     run_engine_snapshot,
@@ -50,6 +58,99 @@ from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
 )
 
 pytestmark = pytest.mark.nemo_gym
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload_limit", [150, 1024 * 1024])
+async def test_grouped_original_receipts_persist_and_restore_two_cuts(
+    grouped_implementation, owner_loop, monkeypatch, payload_limit
+):
+    from nemo_rl.models.generation.generation_cut_grouping import GenerationCutGrouper
+
+    m = grouped_implementation
+    worker, states, processor, whole = enable_engine_tokens(
+        m, owner_loop, monkeypatch, count=16, packed=True
+    )
+    worker._generation_cut_receipts = {}
+    worker._generation_cut_control = m.GenerationCutControl(max_workers=1)
+    worker._generation_cut_grouper = GenerationCutGrouper(
+        max_groups=1,
+        max_inventories=8,
+        max_calls=256,
+        wait_seconds=0.01,
+        max_payload_bytes=payload_limit,
+        execute=worker._checkpoint_generation_cut_group,
+    )
+    puts = []
+    original = worker._capture_sink.stage_generation_prefix_batch
+
+    def put(records, **kwargs):
+        puts.append(len(records))
+        return original(records, **kwargs)
+
+    worker._capture_sink.stage_generation_prefix_batch = put
+
+    def inputs(checkpoint):
+        return [
+            GenerationCutInventory.build(
+                checkpoint_id=checkpoint,
+                server_name=f"participant-{i}",
+                active_prefixes=list(whole.active_prefixes[i * 2 : i * 2 + 2]),
+            )
+            for i in range(8)
+        ]
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        worker._generation_cut_control_executor = executor
+        first_inputs = inputs("grouped-first")
+        first = await asyncio.gather(
+            *(
+                worker._checkpoint_generation_cut_control(item, deadline=None)
+                for item in first_inputs
+            )
+        )
+        for item, answer in zip(first_inputs, first, strict=True):
+            answer.validate_for(item)
+            assert all(ack.disposition == "durable_prefix" for ack in answer.prefixes)
+        assert len(puts) == (1 if payload_limit > 150 else 8)
+        first_count = len(puts)
+        retry = await worker._checkpoint_generation_cut_control(
+            first_inputs[0], deadline=None
+        )
+        assert retry is first[0] and len(puts) == first_count
+        _, restored = restore(
+            worker,
+            first[0].prefixes[0],
+            chunks(m, worker._capture_sink, first[0].prefixes[0]),
+        )
+        assert restored.snapshot.token_ids_delta == [65, 66, 67, 68]
+        for engine in processor.request_states.values():
+            engine.detokenizer.output_token_ids.append(69)
+            engine.logprobs_processor.logprobs.append_arrays(
+                np.array([[69]]), np.array([[-0.3]]), np.array([1])
+            )
+            engine.routed_experts_chunks.append(routes(9))
+        second_inputs = inputs("grouped-second")
+        second = await asyncio.gather(
+            *(
+                worker._checkpoint_generation_cut_control(item, deadline=None)
+                for item in second_inputs
+            )
+        )
+        for item, answer in zip(second_inputs, second, strict=True):
+            answer.validate_for(item)
+            assert all(ack.disposition == "durable_prefix" for ack in answer.prefixes)
+        _, restored = restore(
+            worker,
+            second[0].prefixes[0],
+            chunks(m, worker._capture_sink, second[0].prefixes[0]),
+        )
+        assert restored.routed_experts.flatten().tolist() == [1, 2, 3, 9, -1]
+        assert all(state.staged_token_count == 3 for state in states)
+        assert_group_released(states)
+        assert worker._generation_cut_grouper.stats()["groups"] == 2
+        worker._generation_cut_grouper.close()
+        worker._generation_cut_control.close()
 
 
 @pytest.fixture(scope="module")
@@ -98,6 +199,7 @@ def implementation():
     module.__dict__.update(
         ROUTE_MISSING_SENTINEL=-1,
         checkpoint_phase=lambda *a, **kw: nullcontext(),
+        telemetry_metrics_exporting=lambda: True,
         checkpoint_phase_sync=lambda *a, **kw: lambda function: function,
     )
     path = root / "models/generation/generation_cut_capture.py"
@@ -166,6 +268,7 @@ def make_worker(m, *, sink=None, admission=None, resolved=None, prompt=(65, 66))
             return self.pieces
 
     worker = Worker()
+    worker._generation_prefix_cuts_enabled = False
     worker._capture_sink = sink or Sink()
     worker.token_capture = RolloutTokenCapture(
         sink=worker._capture_sink, weight_version_fn=lambda: 7
@@ -646,6 +749,8 @@ def grouped_implementation(implementation):
             "snapshot_routed_experts",
             "snapshot_routed_experts_many",
             "_routed_expert_chunks",
+            "enable_token_snapshots",
+            "snapshot_generation_tokens",
         }
     ]
     worker = next(
@@ -658,7 +763,11 @@ def grouped_implementation(implementation):
         for n in worker.body
         if isinstance(n, ast.FunctionDef)
         and n.name
-        in {"_snapshot_engine_routed_experts_many", "_observe_request_capture"}
+        in {
+            "_snapshot_engine_routed_experts_many",
+            "_observe_request_capture",
+            "_refresh_generation_cut_tokens",
+        }
     ]
     utilities = ast.parse((path.parent / "utils.py").read_text())
     extraction = [
@@ -668,10 +777,12 @@ def grouped_implementation(implementation):
         and n.name
         in {
             "extract_published_generation",
-            "_snapshot_generation_logprob_details",
+            "_flat_logprob_arrays",
             "_extract_selected_token_logprobs",
+            "own_routed_expert_fragments",
         }
     ]
+    m.PackedSelectedLogprobs = PackedSelectedLogprobs
     m.VLLM_LOGPROB_FLOOR = -9999.0
     terminal = next(
         n
@@ -684,6 +795,15 @@ def grouped_implementation(implementation):
     m.importlib = importlib
     m.Version = Version
     m._ROUTE_SNAPSHOT_VLLM_RELEASE = (0, 29, 0)
+    m._G_ENGINE_CAPTURE_STATE = contextvars.ContextVar(
+        "test_capture_state", default=None
+    )
+    snapshots = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef)
+        and n.name in {"_EngineTokenSnapshot", "_RetainedEngineTokens"}
+    ]
     future = ast.ImportFrom(
         module="__future__", names=[ast.alias(name="annotations")], level=0
     )
@@ -691,7 +811,7 @@ def grouped_implementation(implementation):
         compile(
             ast.fix_missing_locations(
                 ast.Module(
-                    body=[future, terminal, client, *bridges, *extraction],
+                    body=[future, terminal, *snapshots, client, *bridges, *extraction],
                     type_ignores=[],
                 )
             ),
@@ -795,6 +915,517 @@ def assert_group_released(states):
         assert state.frozen_cut is None
         assert state.lifecycle_lock.acquire(blocking=False)
         state.lifecycle_lock.release()
+
+
+def enable_engine_tokens(m, loop, monkeypatch, *, count=1, packed=False):
+    worker, states, processor, inventory = make_group_worker(m, loop, count=count)
+    client = verified_direct_client(m, worker, processor, monkeypatch)
+    processor.process_outputs = lambda updates: [update.apply() for update in updates]
+    client.enable_token_snapshots()
+    worker._refresh_generation_cut_tokens = m._refresh_generation_cut_tokens.__get__(
+        worker, type(worker)
+    )
+    worker._capture_calls = {}
+    for i, state in enumerate(states):
+        state.engine_token_snapshot = True
+        state.generated_token_ids = []
+        state.generated_logprobs = []
+        engine = processor.request_states[f"internal-{i}"]
+        engine.detokenizer = SimpleNamespace(output_token_ids=[67, 68])
+        engine.logprobs_processor = SimpleNamespace(
+            logprobs=[
+                {67: SimpleNamespace(logprob=-0.1)},
+                {68: SimpleNamespace(logprob=-0.2)},
+            ]
+        )
+        if packed:
+            history = PackedSelectedLogprobs(SimpleNamespace)
+            history.append_arrays(
+                np.array([[67], [68]]), np.array([[-0.1], [-0.2]]), np.array([1, 2])
+            )
+            engine.logprobs_processor.logprobs = history
+        engine.queue = SimpleNamespace(output=None)
+    return worker, states, processor, inventory
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_owned_fragments_preserve_two_cut_restore_integrity(
+    grouped_implementation, owner_loop, monkeypatch, packed
+):
+    m = grouped_implementation
+    worker, states, processor, inventory = enable_engine_tokens(
+        m, owner_loop, monkeypatch, packed=packed
+    )
+    engine = processor.request_states["internal-0"]
+    engine.routed_experts_chunks = [routes(1, 2), routes(3)]
+    first = worker._checkpoint_generation_cut_batched(inventory)[0]
+    assert first.disposition == "durable_prefix"
+    restore(worker, first, chunks(m, worker._capture_sink, first))
+    old_piece = engine.routed_experts_chunks[-1]
+    backing = bytearray(routes(9).tobytes())
+    update = SimpleNamespace(
+        routed_experts=np.frombuffer(backing, dtype=np.int16).reshape(1, 1, 1)
+    )
+
+    def publish():
+        engine.routed_experts_chunks.append(update.routed_experts)
+        engine.detokenizer.output_token_ids.append(69)
+        if packed:
+            engine.logprobs_processor.logprobs.append_arrays(
+                np.array([[69]]), np.array([[-0.3]]), np.array([1])
+            )
+        else:
+            engine.logprobs_processor.logprobs.append(
+                {69: SimpleNamespace(logprob=-0.3)}
+            )
+
+    update.apply = publish
+    processor.process_outputs([update])
+    assert update.routed_experts.flags.owndata
+    assert engine.routed_experts_chunks[-2] is old_piece
+    np.frombuffer(backing, dtype=np.int16)[:] = 42
+    second_inventory = GenerationCutInventory.build(
+        checkpoint_id="owned-cut-2",
+        server_name=inventory.server_name,
+        active_prefixes=inventory.active_prefixes,
+    )
+    second = worker._checkpoint_generation_cut_batched(second_inventory)[0]
+    assert second.disposition == "durable_prefix"
+    _, resolved = restore(worker, second, chunks(m, worker._capture_sink, second))
+    assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, 9, -1]
+    assert states[0].generated_token_ids == [67, 68, 69]
+    assert_group_released(states)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_direct_token_cut_and_restore_without_http_progress(
+    grouped_implementation, owner_loop, monkeypatch, packed
+):
+    m = grouped_implementation
+    worker, states, processor, inventory = enable_engine_tokens(
+        m, owner_loop, monkeypatch, packed=packed
+    )
+    entered, release = threading.Event(), threading.Event()
+    owner_loop.call_soon_threadsafe(lambda: (entered.set(), release.wait(5)))
+    assert entered.wait(5)
+    try:
+        # The engine owner is deliberately unavailable. A direct cut needs
+        # neither its event loop nor intermediate HTTP observations.
+        ack = worker._checkpoint_generation_cut_batched(inventory)[0]
+        assert ack.disposition == "durable_prefix"
+        assert states[0].generated_token_ids == [67, 68]
+        assert states[0].generated_logprobs == [-0.1, -0.2]
+        _, restored = restore(worker, ack, chunks(m, worker._capture_sink, ack))
+        assert restored.snapshot.token_ids_delta == [65, 66, 67, 68]
+        assert states[0].staged_token_count == 2
+        assert processor.request_states
+        assert_group_released(states)
+    finally:
+        release.set()
+
+
+def test_direct_token_probe_waits_for_complete_publication_and_honors_deadline(
+    grouped_implementation, owner_loop, monkeypatch
+):
+    m = grouped_implementation
+    worker, states, processor, inventory = enable_engine_tokens(
+        m, owner_loop, monkeypatch
+    )
+    engine = processor.request_states["internal-0"]
+    entered, release = threading.Event(), threading.Event()
+
+    def partial_update():
+        engine.detokenizer.output_token_ids.append(69)
+        entered.set()
+        assert release.wait(5)
+        engine.logprobs_processor.logprobs.append({69: SimpleNamespace(logprob=-0.3)})
+        engine.routed_experts_chunks.append(routes(4))
+
+    writer = threading.Thread(
+        target=processor.process_outputs,
+        args=([SimpleNamespace(routed_experts=None, apply=partial_update)],),
+    )
+    writer.start()
+    assert entered.wait(5)
+    try:
+        ack = worker._checkpoint_generation_cut_batched(
+            inventory, deadline=time.monotonic() + 0.02
+        )[0]
+        assert ack.disposition == "durable_failure"
+        assert not worker._capture_sink.records
+        assert states[0].frozen_cut is None
+        assert states[0].generated_token_ids == []
+    finally:
+        release.set()
+        writer.join(5)
+        assert not writer.is_alive()
+    ack = worker._checkpoint_generation_cut_batched(inventory)[0]
+    assert ack.disposition == "durable_prefix"
+    assert states[0].generated_token_ids == [67, 68, 69]
+    restore(worker, ack, chunks(m, worker._capture_sink, ack))
+    assert_group_released(states)
+
+
+@pytest.mark.parametrize(
+    "finish_reason,stop_reason", [("stop", "END"), ("length", None)]
+)
+def test_direct_token_retention_preserves_terminal_boundary(
+    grouped_implementation, owner_loop, monkeypatch, finish_reason, stop_reason
+):
+    m = grouped_implementation
+    worker, states, processor, inventory = enable_engine_tokens(
+        m, owner_loop, monkeypatch
+    )
+    client = worker._http_engine_client
+    engine = processor.request_states["internal-0"]
+    final_output = SimpleNamespace(
+        request_id="engine-0",
+        outputs=[
+            SimpleNamespace(
+                token_ids=engine.detokenizer.output_token_ids,
+                logprobs=engine.logprobs_processor.logprobs,
+                finish_reason=finish_reason,
+                stop_reason=stop_reason,
+                routed_experts=np.concatenate(engine.routed_experts_chunks),
+            )
+        ],
+    )
+    request = object()
+    worker._capture_calls[id(request)] = states[0]
+
+    async def generate(*args, **kwargs):
+        # The engine finishes before any output is handed to HTTP.
+        def publish_final():
+            engine.queue.output = final_output
+            processor._finish_request(engine)
+
+        processor.process_outputs(
+            [SimpleNamespace(routed_experts=None, apply=publish_final)]
+        )
+        yield final_output
+
+    client._engine_client.generate = generate
+
+    async def consume():
+        stream = client.generate(None, None, "engine-0")
+        assert await anext(stream) is final_output
+        assert not processor.request_states
+        assert (
+            client._completed_token_states["engine-0"]["internal-0"].request_state
+            is engine
+        )
+        ack = worker._checkpoint_generation_cut_batched(inventory)[0]
+        assert ack.disposition == "durable_prefix"
+        assert ack.terminal_finish_reason == finish_reason
+        assert ack.terminal_stop_reason == stop_reason
+        restore(worker, ack, chunks(m, worker._capture_sink, ack))
+        m._observe_request_capture(worker, request, final_output)
+        assert states[0].generated_token_ids == [67, 68]  # No duplicate append.
+        assert not states[0].engine_token_snapshot
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        assert not client._completed_token_states
+        retry = worker._checkpoint_generation_cut_batched(inventory)[0]
+        assert retry.disposition == "durable_prefix"
+        assert retry.terminal_finish_reason == finish_reason
+        assert_group_released(states)
+
+    asyncio.run(consume())
+
+
+def test_direct_token_reads_only_new_delta_after_previous_cut(
+    grouped_implementation, owner_loop, monkeypatch
+):
+    m = grouped_implementation
+    worker, states, processor, inventory = enable_engine_tokens(
+        m, owner_loop, monkeypatch
+    )
+    first = worker._checkpoint_generation_cut_batched(inventory)[0]
+    assert first.disposition == "durable_prefix"
+    engine = processor.request_states["internal-0"]
+
+    def update():
+        engine.detokenizer.output_token_ids.append(69)
+        engine.logprobs_processor.logprobs.append({69: SimpleNamespace(logprob=-0.3)})
+        engine.routed_experts_chunks.append(routes(4))
+
+    processor.process_outputs([SimpleNamespace(routed_experts=None, apply=update)])
+    second_inventory = GenerationCutInventory.build(
+        checkpoint_id="next-cut",
+        server_name="policy",
+        active_prefixes=list(inventory.active_prefixes),
+    )
+    worker._capture_sink.fail = True
+    failed = worker._checkpoint_generation_cut_batched(second_inventory)[0]
+    assert failed.disposition == "durable_failure"
+    assert states[0].staged_token_count == 2
+    assert_group_released(states)
+    worker._capture_sink.fail = False
+    second = worker._checkpoint_generation_cut_batched(second_inventory)[0]
+    assert second.disposition == "durable_prefix"
+    assert states[0].staged_token_count == 3
+    records = chunks(m, worker._capture_sink, second)
+    assert records[-1].snapshot.token_ids_delta == [69]
+    _, restored = restore(worker, second, records)
+    assert restored.snapshot.token_ids_delta == [65, 66, 67, 68, 69]
+
+
+def test_final_http_handoff_wins_race_with_older_token_probe(
+    grouped_implementation, owner_loop, monkeypatch
+):
+    m = grouped_implementation
+    worker, states, processor, _ = enable_engine_tokens(m, owner_loop, monkeypatch)
+    state = states[0]
+    request = object()
+    worker._capture_calls[id(request)] = state
+    engine = processor.request_states["internal-0"]
+    output = SimpleNamespace(
+        request_id="engine-0",
+        outputs=[
+            SimpleNamespace(
+                token_ids=[67, 68],
+                logprobs=engine.logprobs_processor.logprobs,
+                finish_reason="length",
+                stop_reason=None,
+                routed_experts=np.concatenate(engine.routed_experts_chunks),
+            )
+        ],
+    )
+
+    def snapshot(*args, **kwargs):
+        m._observe_request_capture(worker, request, output)
+        return m._EngineTokenSnapshot([67], [-0.1], None, None)
+
+    monkeypatch.setattr(
+        worker._http_engine_client, "snapshot_generation_tokens", snapshot
+    )
+    worker._refresh_generation_cut_tokens(state, deadline=None)
+    assert state.generated_token_ids == [67, 68]
+    assert state.terminal_finish_reason == "length"
+
+
+def test_engine_request_id_is_bound_before_first_output(
+    grouped_implementation, owner_loop, monkeypatch
+):
+    m = grouped_implementation
+    worker, states, _, _ = enable_engine_tokens(m, owner_loop, monkeypatch, count=2)
+    client = worker._http_engine_client
+    for state in states:
+        state.engine_request_id = None
+
+    async def generate(prompt, sampling_params, request_id, **kwargs):
+        index = int(request_id[-1])
+        assert states[index].engine_request_id == request_id
+        yield "final"
+
+    client._engine_client.generate = generate
+
+    async def consume(index):
+        token = m._G_ENGINE_CAPTURE_STATE.set(states[index])
+        try:
+            assert [
+                x async for x in client.generate(None, None, f"engine-{index}")
+            ] == ["final"]
+        finally:
+            m._G_ENGINE_CAPTURE_STATE.reset(token)
+
+    async def run():
+        await asyncio.gather(consume(0), consume(1))
+
+    asyncio.run(run())
+    assert m._G_ENGINE_CAPTURE_STATE.get() is None
+    assert not client._completed_token_states
+
+
+def test_token_publication_hook_is_idempotent_and_restored(
+    grouped_implementation, owner_loop, monkeypatch
+):
+    m = grouped_implementation
+    worker, _, processor, _ = enable_engine_tokens(m, owner_loop, monkeypatch)
+    client = worker._http_engine_client
+    original = client._token_process_original
+    wrapper = processor.process_outputs
+    client.enable_token_snapshots()
+    assert processor.process_outputs is wrapper
+    client.close_route_snapshots()
+    client.close_route_snapshots()
+    assert processor.process_outputs is original
+    assert not client._token_snapshots_enabled
+    assert not client._completed_token_states
+
+
+def test_direct_token_reader_uses_its_own_diagnostics_imports(
+    grouped_implementation, owner_loop, monkeypatch
+):
+    """The worker must not borrow names imported by the capture-mixin fixture."""
+    m = grouped_implementation
+    worker, _, _, _ = enable_engine_tokens(m, owner_loop, monkeypatch)
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "nemo_rl/models/generation/vllm/vllm_worker_async.py"
+    )
+    tree = ast.parse(path.read_text())
+    method = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "snapshot_generation_tokens"
+    )
+    imports = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.ImportFrom)
+        and n.module == "nemo_rl.utils.prefix_cut_diagnostics"
+    ]
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    namespace = dict(
+        time=time,
+        _EngineTokenSnapshot=m._EngineTokenSnapshot,
+        _extract_selected_token_logprobs=m._extract_selected_token_logprobs,
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[future, *imports, method], type_ignores=[])
+            ),
+            str(path),
+            "exec",
+        ),
+        namespace,
+    )
+    snapshot = namespace["snapshot_generation_tokens"](
+        worker._http_engine_client, "engine-0", deadline=None
+    )
+    assert snapshot.token_ids == [67, 68]
+    assert snapshot.logprobs == [-0.1, -0.2]
+
+
+def test_token_probe_releases_publication_lock_when_diagnostics_raise(
+    grouped_implementation, owner_loop, monkeypatch
+):
+    m = grouped_implementation
+    worker, _, _, _ = enable_engine_tokens(m, owner_loop, monkeypatch)
+    client = worker._http_engine_client
+
+    def broken_timing(*args, **kwargs):
+        raise RuntimeError("timing failure")
+
+    monkeypatch.setattr(m, "prefix_cut_wait", broken_timing)
+    with pytest.raises(RuntimeError, match="timing failure"):
+        client.snapshot_generation_tokens("engine-0", deadline=None)
+
+    def try_lock():
+        acquired = client._token_snapshot_lock.acquire(timeout=0.1)
+        if acquired:
+            client._token_snapshot_lock.release()
+        return acquired
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        assert pool.submit(try_lock).result(timeout=2)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_production_sampling_params_use_final_only_without_changing_sampling(
+    grouped_implementation, monkeypatch, stream
+):
+    m = grouped_implementation
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "nemo_rl/models/generation/vllm/vllm_worker_async.py"
+    )
+    tree = ast.parse(path.read_text())
+    method = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "to_sampling_params"
+    )
+    params = SimpleNamespace(
+        output_kind="delta" if stream else "final_only",
+        max_tokens=128,
+        temperature=0.9,
+        top_p=0.95,
+        seed=42,
+    )
+
+    class Base:
+        def to_sampling_params(self, *args, **kwargs):
+            return params
+
+    capture_state = m._RequestCaptureState(call=None, prompt_token_ids=[])
+    recorded = []
+    worker = SimpleNamespace(
+        _generation_prefix_cuts_enabled=True,
+        _get_request_capture=lambda request: capture_state,
+        _record_request_effective_output_limit=lambda request, limit: recorded.append(
+            limit
+        ),
+        _record_request_cut_constraints=lambda *args: None,
+    )
+    cls = ast.ClassDef(
+        name="Request",
+        bases=[ast.Name(id="Base", ctx=ast.Load())],
+        keywords=[],
+        body=[method],
+        decorator_list=[],
+    )
+    namespace = dict(
+        Base=Base,
+        worker_self=worker,
+        _G_ENGINE_CAPTURE_STATE=m._G_ENGINE_CAPTURE_STATE,
+        RequestOutputKind=SimpleNamespace(FINAL_ONLY="final_only"),
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])),
+            str(path),
+            "exec",
+        ),
+        namespace,
+    )
+    request = namespace["Request"]()
+    request.stream = stream
+    request.ng_capture = {"model_call_id": "c0"}
+    token = m._G_ENGINE_CAPTURE_STATE.set(None)
+    try:
+        assert request.to_sampling_params() is params
+        assert m._G_ENGINE_CAPTURE_STATE.get() is capture_state
+    finally:
+        m._G_ENGINE_CAPTURE_STATE.reset(token)
+    assert params.output_kind == ("delta" if stream else "final_only")
+    assert (params.temperature, params.top_p, params.seed, params.max_tokens) == (
+        0.9,
+        0.95,
+        42,
+        128,
+    )
+    assert recorded == [128]
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing", "mismatched_logprobs", "unknown_terminal"]
+)
+def test_direct_token_probe_rejects_incomplete_evidence(
+    grouped_implementation, owner_loop, monkeypatch, failure
+):
+    m = grouped_implementation
+    worker, states, processor, inventory = enable_engine_tokens(
+        m, owner_loop, monkeypatch
+    )
+    if failure == "missing":
+        processor.request_states.clear()
+        processor.external_req_ids.clear()
+    elif failure == "mismatched_logprobs":
+        processor.request_states["internal-0"].logprobs_processor.logprobs.pop()
+    else:
+        client = worker._http_engine_client
+        client._route_retention_requests.add("engine-0")
+        processor._finish_request(processor.request_states["internal-0"])
+    ack = worker._checkpoint_generation_cut_batched(inventory)[0]
+    assert ack.disposition == "durable_failure"
+    assert not worker._capture_sink.records
+    assert states[0].staged_token_count == 0
+    assert_group_released(states)
 
 
 def test_control_queue_timer_includes_guarded_admission(implementation, caplog):
@@ -1307,8 +1938,9 @@ def test_group_interruption_closes_every_owned_transaction(
     assert not worker._capture_sink.records
 
 
+@pytest.mark.parametrize("shared_writer", [False, True])
 def test_group_failed_batch_put_retries_individual_rows(
-    grouped_implementation, owner_loop
+    grouped_implementation, owner_loop, shared_writer: bool
 ):
     m = grouped_implementation
     worker, states, _, inventory = make_group_worker(m, owner_loop)
@@ -1325,11 +1957,21 @@ def test_group_failed_batch_put_retries_individual_rows(
         return keys
 
     sink.stage_generation_prefix_batch = put
-    acks = worker._checkpoint_generation_cut_batched(inventory)
-    assert puts == [3, 1, 1, 1]
-    assert all(ack.disposition == "durable_prefix" for ack in acks)
-    assert len(sink.records) == 3
-    assert_group_released(states)
+    writer = None
+    if shared_writer:
+        writer = GenerationPrefixWriteBatcher(
+            sink, max_rows=256, max_tokens=4_194_304, wait_seconds=0
+        )
+        worker._generation_prefix_write_batcher = writer
+    try:
+        acks = worker._checkpoint_generation_cut_batched(inventory)
+        assert puts == [3, 1, 1, 1]
+        assert all(ack.disposition == "durable_prefix" for ack in acks)
+        assert len(sink.records) == 3
+        assert_group_released(states)
+    finally:
+        if writer is not None:
+            writer.close()
 
 
 def test_group_snapshot_does_not_submit_empty_or_expired_lookups(
@@ -1770,11 +2412,16 @@ def test_completed_routes_bridge_http_handoff_and_restore(
 
 @pytest.mark.parametrize("abort_error", [False, True])
 @pytest.mark.parametrize("cancel", [False, True], ids=["close", "cancel"])
+@pytest.mark.parametrize("direct_tokens", [False, True])
 def test_completed_route_retention_cleans_up_aborted_http_consumer(
-    grouped_implementation, owner_loop, monkeypatch, abort_error, cancel
+    grouped_implementation, owner_loop, monkeypatch, abort_error, cancel, direct_tokens
 ):
     m = grouped_implementation
-    worker, _, processor, _ = make_group_worker(m, owner_loop, count=1)
+    worker, _, processor, _ = (
+        enable_engine_tokens(m, owner_loop, monkeypatch)
+        if direct_tokens
+        else make_group_worker(m, owner_loop, count=1)
+    )
     client = verified_direct_client(m, worker, processor, monkeypatch)
     state = processor.request_states["internal-0"]
     aborts = []
@@ -1809,6 +2456,7 @@ def test_completed_route_retention_cleans_up_aborted_http_consumer(
             await stream.aclose()
         assert not client._completed_route_pieces
         assert not client._route_retention_requests
+        assert not client._completed_token_states
 
     asyncio.run(consume())
     assert aborts == ["engine-0"]
@@ -1909,3 +2557,116 @@ def test_retention_does_not_hide_multiple_internal_requests(
     assert isinstance(result["engine-0"].error, ValueError)
     assert "found 2" in str(result["engine-0"].error)
     client.close_route_snapshots()
+
+
+def test_shared_inventory_writer_preserves_two_cut_restore_integrity(
+    implementation: Any,
+) -> None:
+    class SharedSink(Sink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batch_sizes = []
+
+        def stage_generation_prefix_batch(
+            self, records: Any, **kwargs: Any
+        ) -> list[str]:
+            self.batch_sizes.append(len(records))
+            return super().stage_generation_prefix_batch(records, **kwargs)
+
+    sink = SharedSink()
+    writer = GenerationPrefixWriteBatcher(
+        sink, max_rows=256, max_tokens=4_194_304, wait_seconds=0.1
+    )
+    workers = [
+        make_worker(
+            implementation,
+            sink=sink,
+            admission=CaptureAdmission(
+                rollout_id=f"r{index}", model_call_id=f"c{index}", mode="text"
+            ),
+        )
+        for index in range(2)
+    ]
+    for worker in workers:
+        worker._generation_prefix_write_batcher = writer
+        worker.state.observe([67, 68], [-0.1, -0.2])
+        worker.pieces = [routes(1, 2), routes(3)]
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for checkpoint in ["cut1", "cut2"]:
+                start = threading.Barrier(2)
+
+                def run(worker: Any) -> Any:
+                    start.wait()
+                    return cut(worker, checkpoint)
+
+                acks = list(pool.map(run, workers))
+                assert all(ack.disposition == "durable_prefix" for ack in acks)
+                if checkpoint == "cut1":
+                    for worker in workers:
+                        worker.state.observe([69], [-0.3])
+                        worker.pieces.append(routes(4))
+        assert sink.batch_sizes == [2, 2]
+        for worker, ack in zip(workers, acks, strict=True):
+            assert len(ack.staging_keys) == 2
+            _, resolved = restore(worker, ack, chunks(implementation, sink, ack))
+            assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, 4, -1]
+            assert len(resolved.chunk_digests) == 2
+    finally:
+        writer.close()
+
+
+def test_shared_put_failure_does_not_advance_unrelated_call_digests(
+    implementation: Any,
+) -> None:
+    class RejectOneSink(Sink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batch_sizes = []
+
+        def stage_generation_prefix_batch(
+            self, records: Any, **kwargs: Any
+        ) -> list[str]:
+            self.batch_sizes.append(len(records))
+            if any(record.model_call_id == "bad" for record in records):
+                raise RuntimeError("injected bad record")
+            return super().stage_generation_prefix_batch(records, **kwargs)
+
+    sink = RejectOneSink()
+    writer = GenerationPrefixWriteBatcher(
+        sink, max_rows=256, max_tokens=4_194_304, wait_seconds=0.1
+    )
+    workers = [
+        make_worker(
+            implementation,
+            sink=sink,
+            admission=CaptureAdmission(
+                rollout_id=f"r{index}", model_call_id=name, mode="text"
+            ),
+        )
+        for index, name in enumerate(["good", "bad"])
+    ]
+    for worker in workers:
+        worker._generation_prefix_write_batcher = writer
+        worker.state.observe([67, 68], [-0.1, -0.2])
+        worker.pieces = [routes(1, 2), routes(3)]
+    start = threading.Barrier(2)
+
+    def run(worker: Any) -> Any:
+        start.wait()
+        return cut(worker, "cut1")
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            good, bad = pool.map(run, workers)
+        assert good.disposition == "durable_prefix"
+        assert bad.disposition == "durable_failure"
+        assert sink.batch_sizes == [2, 1, 1]
+        assert len(workers[0].state.generation_cut_chunk_digests) == 1
+        assert workers[1].state.generation_cut_chunk_digests == []
+        assert workers[1].state.generation_cut_staging_keys == []
+        assert workers[1].state.frozen_cut is None
+        _, resolved = restore(workers[0], good, chunks(implementation, sink, good))
+        assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, -1]
+    finally:
+        writer.close()

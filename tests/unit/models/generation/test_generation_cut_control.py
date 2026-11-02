@@ -17,6 +17,8 @@
 import ast
 import asyncio
 import importlib.util
+import json
+import logging
 import sys
 import threading
 import time
@@ -26,6 +28,8 @@ from typing import Annotated
 
 import pytest
 from pydantic import BaseModel, Field, ValidationError
+
+from nemo_rl.utils import prefix_cut_diagnostics as diagnostics
 
 
 @pytest.fixture(scope="module")
@@ -61,7 +65,7 @@ async def turns():
         await asyncio.sleep(0)
 
 
-@pytest.mark.parametrize("workers", [1, 2])
+@pytest.mark.parametrize("workers", [1, 2, 4])
 def test_independent_inventories_respect_worker_limit(implementation, workers):
     async def scenario():
         control = implementation(max_workers=workers)
@@ -80,7 +84,7 @@ def test_independent_inventories_respect_worker_limit(implementation, workers):
         await asyncio.wait_for(entered_a.wait(), 2)
         second = submit(control, "b", {"y"}, b)
         await turns()
-        assert entered_b.is_set() == (workers == 2)
+        assert entered_b.is_set() == (workers > 1)
         release.set()
         assert await asyncio.wait_for(asyncio.gather(first, second), 2) == ["a", "b"]
         control.close()
@@ -88,9 +92,12 @@ def test_independent_inventories_respect_worker_limit(implementation, workers):
     asyncio.run(scenario())
 
 
-def test_overlapping_lists_serialize_but_independent_work_can_pass(implementation):
+@pytest.mark.parametrize("workers", [2, 4])
+def test_overlapping_lists_serialize_but_independent_work_can_pass(
+    implementation, workers
+):
     async def scenario():
-        control = implementation(max_workers=2)
+        control = implementation(max_workers=workers)
         a_started, b_started, c_started, release = (asyncio.Event() for _ in range(4))
 
         async def a():
@@ -118,9 +125,10 @@ def test_overlapping_lists_serialize_but_independent_work_can_pass(implementatio
     asyncio.run(scenario())
 
 
-def test_checkpoint_barrier_prevents_overtaking(implementation):
+@pytest.mark.parametrize("workers", [2, 4])
+def test_checkpoint_barrier_prevents_overtaking(implementation, workers):
     async def scenario():
-        control = implementation(max_workers=2)
+        control = implementation(max_workers=workers)
         a_started, b_started, late_started, release_a, release_b = (
             asyncio.Event() for _ in range(5)
         )
@@ -397,7 +405,7 @@ def test_duplicate_identity_mismatch_is_rejected(implementation):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("value", [0, 3, -1, True, 1.5, "2"])
+@pytest.mark.parametrize("value", [0, 5, -1, True, 1.5, "2"])
 def test_control_config_rejects_invalid_worker_counts(implementation, value):
     path = (
         Path(__file__).resolve().parents[4] / "nemo_rl/models/generation/vllm/config.py"
@@ -415,5 +423,212 @@ def test_control_config_rejects_invalid_worker_counts(implementation, value):
     config = namespace["GenerationCutControlConfig"]
     assert config().max_workers == 1
     assert config(max_workers=2).max_workers == 2
+    assert config(max_workers=4).max_workers == 4
     with pytest.raises(ValidationError):
         config(max_workers=value)
+
+
+@pytest.mark.parametrize(
+    "workers,pending_calls,checkpoint,reason",
+    [
+        (1, {"y"}, "cp", "capacity"),
+        (2, {"x"}, "cp", "active_call_overlap"),
+        (2, {"y"}, "next", "active_checkpoint"),
+    ],
+)
+def test_telemetry_names_blocker_and_observes_active_tq_write(
+    implementation, caplog, monkeypatch, workers, pending_calls, checkpoint, reason
+):
+    caplog.set_level(logging.INFO)
+    module = sys.modules[implementation.__module__]
+    monkeypatch.setattr(module, "_ADMISSION_SAMPLE_SECONDS", 0.005)
+
+    async def scenario():
+        control = implementation(max_workers=workers)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def blocked_tq():
+            with diagnostics.prefix_cut_timing("tq_put_ack"):
+                entered.set()
+                await release.wait()
+            return "durable"
+
+        async def following():
+            return "following"
+
+        with diagnostics.prefix_cut_probe(
+            enabled=True,
+            checkpoint_id="cp",
+            inventory_digest="test",
+            calls=1,
+            deadline=None,
+        ):
+            first = submit(control, "active", {"x"}, blocked_tq)
+            await entered.wait()
+            second = submit(
+                control, "waiting", pending_calls, following, checkpoint=checkpoint
+            )
+            try:
+                await asyncio.sleep(0.02)
+                assert not second.done()
+            finally:
+                release.set()
+            assert await first == "durable"
+            assert await second == "following"
+        control.close()
+
+    asyncio.run(scenario())
+    report = json.loads(
+        next(
+            r.message.split(" ", 1)[1]
+            for r in caplog.records
+            if r.message.startswith("prefix_cut_probe ")
+        )
+    )
+    assert report["phases"][f"admission_blocked_{reason}"]["wall_s"] >= 0.01
+    assert report["counts"]["admission_max_pending"] >= 1
+    assert report["counts"]["admission_max_active_tq_puts"] == 1
+    assert report["counts"]["admission_max_active_tq_put_age_ms"] > 0
+    assert report["phases"]["admission_http_loop_timer_lag"]["calls"] >= 1
+    assert report["phases"]["control_admission_slot_hold"]["calls"] == 2
+
+
+def test_admission_timer_detects_http_loop_stall(implementation, caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(
+        sys.modules[implementation.__module__], "_ADMISSION_SAMPLE_SECONDS", 0.005
+    )
+
+    async def scenario():
+        control = implementation(max_workers=1)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def blocker():
+            entered.set()
+            await release.wait()
+
+        with diagnostics.prefix_cut_probe(
+            enabled=True,
+            checkpoint_id="cp",
+            inventory_digest="stall",
+            calls=1,
+            deadline=None,
+        ):
+            first = submit(control, "active", {"x"}, blocker)
+            await entered.wait()
+            second = submit(control, "pending", {"y"}, blocker)
+            await turns()
+            try:
+                time.sleep(0.04)
+                await turns()
+            finally:
+                release.set()
+            await asyncio.gather(first, second)
+        control.close()
+
+    asyncio.run(scenario())
+    report = json.loads(
+        next(
+            r.message.split(" ", 1)[1]
+            for r in caplog.records
+            if r.message.startswith("prefix_cut_probe ")
+        )
+    )
+    assert report["phases"]["admission_http_loop_timer_lag"]["max_wall_s"] > 0.02
+
+
+def test_pending_checkpoint_barrier_is_named_and_stale_work_stays_rejected(
+    implementation, caplog
+):
+    caplog.set_level(logging.INFO)
+
+    async def scenario():
+        control = implementation(max_workers=2)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def active():
+            entered.set()
+            await release.wait()
+
+        async def following():
+            return 42
+
+        with diagnostics.prefix_cut_probe(
+            enabled=True,
+            checkpoint_id="old",
+            inventory_digest="barrier",
+            calls=1,
+            deadline=None,
+        ):
+            first = submit(control, "active", {"x"}, active, checkpoint="old")
+            await entered.wait()
+            new = submit(control, "new", {"y"}, following, checkpoint="new")
+            late = submit(control, "late", {"z"}, following, checkpoint="old")
+            await turns()
+            release.set()
+            await first
+            assert await new == 42
+            with pytest.raises(RuntimeError, match="superseded"):
+                await late
+        control.close()
+
+    asyncio.run(scenario())
+    report = json.loads(
+        next(
+            r.message.split(" ", 1)[1]
+            for r in caplog.records
+            if r.message.startswith("prefix_cut_probe ")
+        )
+    )
+    assert report["phases"]["admission_blocked_pending_barrier"]["calls"] >= 1
+
+
+def test_sampling_does_not_extend_admission_deadline(
+    implementation, caplog, monkeypatch
+):
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(
+        sys.modules[implementation.__module__], "_ADMISSION_SAMPLE_SECONDS", 0.005
+    )
+
+    async def scenario():
+        control = implementation(max_workers=1)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def active():
+            entered.set()
+            await release.wait()
+
+        async def forbidden():
+            pytest.fail("expired work was admitted")
+
+        with diagnostics.prefix_cut_probe(
+            enabled=True,
+            checkpoint_id="cp",
+            inventory_digest="deadline",
+            calls=1,
+            deadline=None,
+        ):
+            first = submit(control, "active", {"x"}, active)
+            await entered.wait()
+            second = submit(
+                control, "expired", {"y"}, forbidden, deadline=time.monotonic() + 0.02
+            )
+            try:
+                with pytest.raises(TimeoutError, match="before admission"):
+                    await asyncio.wait_for(second, 1)
+            finally:
+                release.set()
+                await first
+        control.close()
+
+    asyncio.run(scenario())
+    report = json.loads(
+        next(
+            r.message.split(" ", 1)[1]
+            for r in caplog.records
+            if r.message.startswith("prefix_cut_probe ")
+        )
+    )
+    assert report["counts"]["control_admission_deadline_expired"] == 1
+    assert report["phases"]["admission_http_loop_timer_lag"]["calls"] >= 2

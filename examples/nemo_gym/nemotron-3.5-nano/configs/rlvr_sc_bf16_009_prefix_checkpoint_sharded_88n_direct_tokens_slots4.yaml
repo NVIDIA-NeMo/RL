@@ -1,0 +1,7 @@
+# 88-node direct-probing comparison: four cut slots and caller-bound deadlines.
+# Same batch, lag, storage, Gym replicas and snapshot cadence as the two-slot run.
+defaults: rlvr_sc_bf16_009_prefix_checkpoint_sharded_88n_direct_tokens.yaml
+policy:
+  generation:
+    generation_cut_control:
+      max_workers: 4

@@ -1,0 +1,106 @@
+# BF16 Nano 3.5 prefix recovery: 128 nodes, batch 8192, lag 16.
+# One logical Gym shard, four full replicas on distinct nodes. Topology adapted
+# from pipeline b2138541, NT4 Gym smoke; model/data/objective remain inherited.
+# 32 trainer + 64 generation + 4 Gym/safety + 28 external-judge nodes.
+# Safety DP=1 per replica keeps total safety capacity at four TP=4 engines.
+# GenRM/NL2Bash base URLs are supplied by the launcher and shared by all replicas.
+# max_concurrency counts prompt-group RPCs; each group has 16 trajectories.
+# Connector limits are per replica; fleet aggregate matches the unsharded run.
+defaults: rlvr_sc_bf16_009_prefix_checkpoint.yaml
+cluster:
+  num_nodes: 96
+data_plane:
+  simple:
+    # Twice the full 128-node allocation, including Gym and external judges.
+    num_storage_units: 256
+grpo:
+  num_prompts_per_step: 512
+  num_generations_per_prompt: 16
+policy:
+  train_global_batch_size: 8192
+  router_replay:
+    enabled: true
+  generation:
+    colocated:
+      resources:
+        num_nodes: 64
+    vllm_cfg:
+      flat_logprobs: true
+      output_loop_yield_budget_ms: 20
+async_rl:
+  batch_attribution: true
+  sampler:
+    name: ready_first
+    max_staleness_versions: 16
+  max_inflight_prompts: 8192
+  max_buffered_rollouts: 16384
+env:
+  nemo_gym:
+    num_gpu_nodes: 4
+    max_concurrency: 4096
+    config_paths: null
+    placement_strategy: STRICT_SPREAD
+    shards:
+    - name: all
+      replicas: 4
+      actor_cpus: 32
+      config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml
+      - resources_servers/code_gen/configs/code_gen.yaml
+      - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+      - resources_servers/mcqa/configs/mcqa.yaml
+      - resources_servers/instruction_following/configs/instruction_following.yaml
+      - resources_servers/equivalence_llm_judge/configs/lc_judge.yaml
+      - resources_servers/calendar/configs/calendar.yaml
+      - resources_servers/genrm_compare/configs/genrm_compare.yaml
+      - resources_servers/equivalence_llm_judge/configs/nl2bash-equivalency.yaml
+      - resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
+      - resources_servers/terminus_judge/configs/terminus_judge_string_only.yaml
+      - resources_servers/ns_tools/configs/ns_tools.yaml
+      - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
+      - resources_servers/multichallenge/configs/multichallenge.yaml
+      - resources_servers/inverse_if/configs/inverse_if.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/search_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/toolcall_schema_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/abstention/configs/abstention.yaml
+      - resources_servers/nvarc/configs/inductive.yaml
+      - resources_servers/nvarc/configs/transductive.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/droid_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/equivalence_rule/configs/lc.yaml
+      - resources_servers/ether0/configs/ether0.yaml
+      - resources_servers/structured_outputs/configs/structured_outputs_json_yaml_xml_v1.yaml
+      - resources_servers/structured_outputs/configs/structured_outputs_v3.yaml
+      - resources_servers/format_verification/configs/freeform_formatting.yaml
+      - resources_servers/format_verification/configs/citation_format.yaml
+      - resources_servers/jailbreak_detection/configs/jailbreak_detection_nemotron_combined_reward_tp8.yaml
+      - resources_servers/indirect_prompt_injection/configs/indirect_prompt_injection.yaml
+    global_aiohttp_connector_limit: 65536
+    global_aiohttp_connector_limit_per_host: 32768
+    genrm_compare_resources_server:
+      resources_servers:
+        genrm_compare:
+          # Match the controller rollout budget for long generation tails.
+          cohort_collection_timeout_s: 9000
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          vllm_serve_kwargs:
+            data_parallel_size: 1
+checkpointing:
+  ft_keep_latest_k: 3
+  checkpoint_must_save_by: null
+rollout_checkpointing:
+  snapshot_attempt_interval_s: 300.0
+  fallback_to_previous_trainer_checkpoint: true
+  restore_mode: latest
+rollout_recovery:
+  target_level: prefix
+  generation_prefix_cleanup:
+    enabled: true
+    batch_size: 32
+    max_pending: 128
+    wait_seconds: 0.01

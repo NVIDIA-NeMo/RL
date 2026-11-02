@@ -190,6 +190,9 @@ def test_owner_loop_probe_detects_a_block_and_logs_are_bounded(caplog, monkeypat
     reports = messages(caplog, "vllm_engine_probe")
     assert len(reports) == 1
     assert reports[0]["phases"]["owner_loop_lag"]["max_wall_s"] >= 0.02
+    sample = reports[0]["phases"]["owner_loop_sample"]
+    assert sample["wall_s"] >= 0.04
+    assert sample["process_cpu_s"] >= sample["thread_cpu_s"] - 0.001
     assert reports[0]["counts"]["output_chunks"] == 100
 
 

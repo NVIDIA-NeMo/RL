@@ -62,6 +62,7 @@ from nemo_rl.data_plane.interfaces import (
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 from nemo_rl.telemetry.rollout_checkpoint import checkpoint_phase_sync
+from nemo_rl.utils.prefix_cut_diagnostics import prefix_cut_timing
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1421,70 +1422,75 @@ class TQDataPlaneClient(DataPlaneClient):
             return KVBatchMeta(
                 partition_id=partition_id, task_name=None, sample_ids=[], fields=None
             )
-        user_tags = (
-            [{} for _ in sample_ids] if tags is None else [dict(tag) for tag in tags]
-        )
-        wire_fields: TensorDict | None = None
-        field_names: list[str] | None = None
-        if fields is not None:
-            # No ``.contiguous()``: under tensordict==0.12.2 it strips
-            # non-tensor leaves (NonTensorStack stored as LinkedList) to empty
-            # TDs. TQ's encoder forces ``.contiguous()`` per tensor leaf
-            # itself, so the call here was redundant for tensors and
-            # destructive for non-tensors.
-            detached_fields = cast(
-                TensorDict,
-                fields.detach(),  # type: ignore[missing-argument]
+        with prefix_cut_timing("tq_put_preprocess"):
+            user_tags = (
+                [{} for _ in sample_ids]
+                if tags is None
+                else [dict(tag) for tag in tags]
             )
-            wire_fields = detached_fields
-            field_names = [str(key) for key in detached_fields.keys()]
-
-        confirm_gdr_put = bool(
-            self._gdr_requested
-            and not self._gdr_put_confirmed
-            and torch.cuda.is_initialized()
-            and wire_fields is not None
-            and any(
-                isinstance(wire_fields.get(key), torch.Tensor)
-                for key in wire_fields.keys()
-            )
-        )
-        if confirm_gdr_put:
-            # Checked before the put, not after: TQ fixes GDR eligibility when
-            # the client attaches, so this is decidable up front — and once
-            # `kv_batch_put` returns, the rows are already durable and the
-            # controller has been notified, so raising then would strand them.
-            tq_client = tq.get_client()
-            storage_manager = getattr(tq_client, "storage_manager", None)
-            storage_client = getattr(storage_manager, "storage_client", None)
-            gdr_staging = getattr(storage_client, "_gdr_staging", None)
-            if not getattr(storage_client, "use_gdr", False) or gdr_staging is None:
-                raise RuntimeError(
-                    "GDR was requested for a CUDA-initialized TransferQueue "
-                    "client, but TransferQueue selected CPU RDMA for tensor PUTs"
+            wire_fields: TensorDict | None = None
+            field_names: list[str] | None = None
+            if fields is not None:
+                # No ``.contiguous()``: under tensordict==0.12.2 it strips
+                # non-tensor leaves (NonTensorStack stored as LinkedList) to empty
+                # TDs. TQ's encoder forces ``.contiguous()`` per tensor leaf
+                # itself, so the call here was redundant for tensors and
+                # destructive for non-tensors.
+                detached_fields = cast(
+                    TensorDict,
+                    fields.detach(),  # type: ignore[missing-argument]
                 )
+                wire_fields = detached_fields
+                field_names = [str(key) for key in detached_fields.keys()]
 
-        self._mark_data_operation_started()
-        # TQ's wire vocabulary is `keys=` — translation point.
-        tq.kv_batch_put(
-            keys=list(sample_ids),
-            partition_id=partition_id,
-            fields=wire_fields,
-            tags=user_tags,
-        )
-        if confirm_gdr_put:
-            LOGGER.info(
-                "TransferQueue GDR tensor PUT active (partition=%s)", partition_id
+            confirm_gdr_put = bool(
+                self._gdr_requested
+                and not self._gdr_put_confirmed
+                and torch.cuda.is_initialized()
+                and wire_fields is not None
+                and any(
+                    isinstance(wire_fields.get(key), torch.Tensor)
+                    for key in wire_fields.keys()
+                )
             )
-            self._gdr_put_confirmed = True
+            if confirm_gdr_put:
+                # Checked before the put, not after: TQ fixes GDR eligibility when
+                # the client attaches, so this is decidable up front — and once
+                # `kv_batch_put` returns, the rows are already durable and the
+                # controller has been notified, so raising then would strand them.
+                tq_client = tq.get_client()
+                storage_manager = getattr(tq_client, "storage_manager", None)
+                storage_client = getattr(storage_manager, "storage_client", None)
+                gdr_staging = getattr(storage_client, "_gdr_staging", None)
+                if not getattr(storage_client, "use_gdr", False) or gdr_staging is None:
+                    raise RuntimeError(
+                        "GDR was requested for a CUDA-initialized TransferQueue "
+                        "client, but TransferQueue selected CPU RDMA for tensor PUTs"
+                    )
 
-        return KVBatchMeta(
-            partition_id=partition_id,
-            task_name=None,
-            sample_ids=list(sample_ids),
-            fields=field_names,
-            tags=user_tags if user_tags else None,
-        )
+            self._mark_data_operation_started()
+            wire_keys = list(sample_ids)
+        with prefix_cut_timing("tq_kv_batch_put_api"):
+            tq.kv_batch_put(
+                keys=wire_keys,
+                partition_id=partition_id,
+                fields=wire_fields,
+                tags=user_tags,
+            )
+        with prefix_cut_timing("tq_put_postprocess"):
+            if confirm_gdr_put:
+                LOGGER.info(
+                    "TransferQueue GDR tensor PUT active (partition=%s)", partition_id
+                )
+                self._gdr_put_confirmed = True
+
+            return KVBatchMeta(
+                partition_id=partition_id,
+                task_name=None,
+                sample_ids=list(sample_ids),
+                fields=field_names,
+                tags=user_tags if user_tags else None,
+            )
 
     def get_samples(
         self,

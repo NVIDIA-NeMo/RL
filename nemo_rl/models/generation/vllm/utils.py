@@ -14,8 +14,10 @@
 
 from collections import defaultdict
 from collections.abc import Sequence
+from copy import copy
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from nemo_rl.data.multimodal_utils import (
@@ -44,6 +46,7 @@ from nemo_rl.models.generation.vllm.metric_names import (
     PROMPT_TOKENS_KEY,
     REQUEST_SUCCESS_COUNTERS,
 )
+from nemo_rl.models.generation.vllm.packed_logprobs import PackedSelectedLogprobs
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
@@ -54,46 +57,95 @@ VLLM_LOGPROB_FLOOR = -9999.0
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
 
 
+def _flat_logprob_arrays(
+    logprobs: Any,
+) -> tuple[list[int], list[int], list[int], list[float]] | None:
+    """Recognize vLLM's append-only flat storage without requiring its import.
+
+    vLLM appends an end index only after publishing all values at a position.
+    Other containers retain their ordinary per-position mapping interface.
+    """
+    starts = getattr(logprobs, "start_indices", None)
+    ends = getattr(logprobs, "end_indices", None)
+    token_ids = getattr(logprobs, "token_ids", None)
+    values = getattr(logprobs, "logprobs", None)
+    if all(isinstance(array, list) for array in (starts, ends, token_ids, values)):
+        return starts, ends, token_ids, values
+    return None
+
+
 def _extract_selected_token_logprobs(
-    generation_token_ids: list[int],
-    generation_logprob_details: list[Any],
+    generation_token_ids: Sequence[int],
+    generation_logprob_details: Any,
     *,
     where: str = "",
+    start: int = 0,
+    stop: int | None = None,
 ) -> list[float]:
     """Extract the sampled token's log probability at every output position.
 
     Args:
         generation_token_ids: The sampled token at each output position.
-        generation_logprob_details: vLLM's per-position logprob mapping.
+        generation_logprob_details: vLLM's flat arrays or per-position mappings.
         where: Context prepended to the token in a missing-token error.
+        start: First published logprob position represented by the token IDs.
+        stop: Exclusive frozen position bound, even if the engine later appends.
     """
+    if stop is None:
+        stop = len(generation_logprob_details)
+    if start < 0 or stop < start or stop - start != len(generation_token_ids):
+        raise ValueError(
+            "token IDs and selected logprob positions must have equal lengths"
+        )
+    if generation_logprob_details is None and start == stop == 0:
+        return []
+
+    if isinstance(generation_logprob_details, PackedSelectedLogprobs):
+        return generation_logprob_details.selected_values(
+            generation_token_ids, start=start, stop=stop, floor=VLLM_LOGPROB_FLOOR
+        )
     selected_logprobs: list[float] = []
-    for token_id, position_logprobs in zip(
-        generation_token_ids, generation_logprob_details, strict=True
-    ):
-        selected = position_logprobs.get(token_id)
-        if selected is None:
-            raise RuntimeError(
-                "vLLM generation log probabilities did not include the selected "
-                f"token: {where}token_id={token_id}"
+    flat = _flat_logprob_arrays(generation_logprob_details)
+    if flat is not None:
+        starts, ends, token_ids, values = flat
+        if stop > min(len(starts), len(ends)):
+            raise RuntimeError("vLLM flat logprob positions are not fully published")
+        flat_size = min(len(token_ids), len(values))
+        for position, token_id in enumerate(generation_token_ids, start):
+            begin, end = starts[position], ends[position]
+            if not 0 <= begin <= end <= flat_size:
+                raise RuntimeError(
+                    "vLLM flat logprob position has invalid published bounds"
+                )
+            # __getitem__ constructs a dict, so the last repeated token wins.
+            # Scan from the end to retain exactly that behavior without making
+            # dictionaries or Logprob objects for every generated position.
+            selected_index = end - 1
+            while selected_index >= begin and token_ids[selected_index] != token_id:
+                selected_index -= 1
+            if selected_index < begin:
+                raise RuntimeError(
+                    "vLLM generation log probabilities did not include the selected "
+                    f"token: {where}token_id={token_id}"
+                )
+            selected_logprobs.append(
+                max(float(values[selected_index]), VLLM_LOGPROB_FLOOR)
             )
-        selected_logprobs.append(max(float(selected.logprob), VLLM_LOGPROB_FLOOR))
+    else:
+        # Bound reads explicitly: a live container may append after the cut.
+        if stop > len(generation_logprob_details):
+            raise ValueError(
+                "selected logprob positions exceed the published container"
+            )
+        for position, token_id in enumerate(generation_token_ids, start):
+            selected = generation_logprob_details[position].get(token_id)
+            if selected is None:
+                raise RuntimeError(
+                    "vLLM generation log probabilities did not include the selected "
+                    f"token: {where}token_id={token_id}"
+                )
+            selected_logprobs.append(max(float(selected.logprob), VLLM_LOGPROB_FLOOR))
     return selected_logprobs
-
-
-def _snapshot_generation_logprob_details(
-    generation_logprob_details: Any, start: int
-) -> list[Any]:
-    """Copy the fully published positions past ``start`` from an append-only container.
-
-    Positions are read one at a time: slicing a live ``FlatLogprobs`` reads its
-    start and end indices separately and can catch a position half-appended.
-    """
-    position_count = len(generation_logprob_details)
-    end_indices = getattr(generation_logprob_details, "end_indices", None)
-    if end_indices is not None:
-        position_count = min(position_count, len(end_indices))
-    return [generation_logprob_details[index] for index in range(start, position_count)]
 
 
 def extract_published_generation(
@@ -121,15 +173,20 @@ def extract_published_generation(
                 "vLLM generation output with token IDs did not include logprobs"
             )
         return [], []
-    details = _snapshot_generation_logprob_details(logprobs, start)
-    generation_token_ids = list(token_ids[start : start + len(details)])
-    if len(generation_token_ids) != len(details):
+    position_count = len(logprobs)
+    end_indices = getattr(logprobs, "end_indices", None)
+    if end_indices is not None:
+        position_count = min(position_count, len(end_indices))
+    if start >= position_count:
+        return [], []
+    generation_token_ids = list(token_ids[start:position_count])
+    if len(generation_token_ids) != position_count - start:
         raise RuntimeError(
             "vLLM returned mismatched generation token IDs and log probabilities: "
-            f"token_count={len(generation_token_ids)}, logprob_count={len(details)}"
+            f"token_count={len(generation_token_ids)}, logprob_count={position_count - start}"
         )
     return generation_token_ids, _extract_selected_token_logprobs(
-        generation_token_ids, details
+        generation_token_ids, logprobs, start=start, stop=position_count
     )
 
 
@@ -410,6 +467,58 @@ def pad_and_align_routed_expert_indices(
     if routes_to_copy > 0:
         full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
     return (full, stats) if return_stats else full
+
+
+def install_owned_numpy_array_decode(decoder: Any) -> dict[str, int]:
+    """Detach decoded NumPy payloads before vLLM queues engine outputs.
+
+    The live decoder's dec_hook resolves _decode_ndarray on each invocation.
+    Copy after shaping so router publication recognizes owned arrays and avoids
+    a second copy. Tensor IPC and all non-NumPy fields keep upstream behavior.
+    Install once per engine before serving requests; counters are cumulative.
+    """
+    if not decoder.share_mem:
+        raise RuntimeError("Expected vLLM's original shared-buffer decoder")
+    original_array_decode = decoder._decode_ndarray
+    stats = {"arrays": 0, "bytes": 0}
+
+    def decode_owned(encoded: Any) -> np.ndarray:
+        owned = original_array_decode(encoded).copy()
+        stats["arrays"] += 1
+        stats["bytes"] += owned.nbytes
+        return owned
+
+    decoder._decode_ndarray = decode_owned
+    return stats
+
+
+def own_routed_expert_fragments(engine_core_outputs: Sequence[Any]) -> None:
+    """Detach newly received route views before vLLM retains them.
+
+    Inline msgspec arrays keep GC-tracked memoryviews and received message
+    buffers alive. An owned ndarray retains the same dtype and route values
+    without those backing wrappers. Never rewrite already-published history;
+    the direct cut cache depends on its append-only identities and offsets.
+    """
+    for output in engine_core_outputs:
+        routes: np.ndarray | None = output.routed_experts
+        if routes is not None and not routes.flags.owndata:
+            output.routed_experts = routes.copy()
+
+
+def without_native_chat_routed_experts(request_output: Any) -> Any:
+    """Give the upstream formatter a route-free view of a captured output.
+
+    vLLM serializes completion routes into a choice-level NumPy/base64 field.
+    Capture consumes NeMo's aligned message-level envelope instead. Copy only
+    the output wrappers, retaining original arrays for capture and router replay;
+    never clear routes on objects shared with the engine or capture state.
+    """
+    serving_output = copy(request_output)
+    serving_output.outputs = [copy(output) for output in request_output.outputs]
+    for output in serving_output.outputs:
+        output.routed_experts = None
+    return serving_output
 
 
 def attach_routed_experts_to_chat_response_choices(

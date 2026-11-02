@@ -1,0 +1,11 @@
+# Direct token/logprob probing smoke test: 88 nodes, fresh lineage.
+# 32 trainer + 32 generation + 4 Gym/safety + 20 external judges.
+# Keep batch 8192, lag 16, 256 storage units and five-minute snapshots.
+defaults: rlvr_sc_bf16_009_prefix_checkpoint_sharded.yaml
+cluster:
+  num_nodes: 64
+policy:
+  generation:
+    colocated:
+      resources:
+        num_nodes: 32

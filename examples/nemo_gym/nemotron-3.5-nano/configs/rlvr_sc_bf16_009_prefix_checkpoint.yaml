@@ -45,6 +45,14 @@ policy:
       fp32_lm_head: false
     generation_cut_control:
       max_workers: 2
+      # Opt-in: combine a FIFO cohort before reserving one executor slot.
+      group_pending_inventories: false
+      # Opt-in bool: direct text prefix columns; media/router rows use the general encoder.
+      direct_prefix_batch_encoding: false
+      group_max_inventories: 8  # 1..32; overlapping calls/tickets do not merge.
+      group_max_calls: 256  # Larger existing inventories run alone.
+      group_wait_seconds: 0.01  # Collection window, counted against deadlines.
+      write_batch_max_payload_bytes: 268435456  # Grouped puts; oversized rows fail safely.
 
 env:
   nemo_gym:
@@ -73,12 +81,13 @@ checkpointing:
   save_period: 10
   keep_top_k: 1000000
   ft_save_period: 1
-  ft_keep_latest_k: 1
-  # 75-minute stop/save deadline within each 90-minute allocation.
-  checkpoint_must_save_by: "00:01:15:00"
+  # Retain fallback trainer anchors until matching rollout snapshots commit.
+  ft_keep_latest_k: 3
+  # Keep periodic rollout/Gym snapshots running until the allocation ends.
+  checkpoint_must_save_by: null
 
 rollout_checkpointing:
-  snapshot_attempt_interval_s: 120.0
+  snapshot_attempt_interval_s: 300.0
   telemetry_interval_s: 30.0
   max_consecutive_failures: 3
   keep_latest_k: 2

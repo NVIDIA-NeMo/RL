@@ -4925,33 +4925,40 @@ class SingleControllerActor:
         replay index but remain in TQ. Re-index them only in this persisted cut;
         the live trainer keeps accumulating gradients without modification.
         """
-        cut.require_live()
-        dataloader_state = self._dataloader.state_dict()
-        replacement_reserve = list(self._replacement_reserve)
-        training_owned_groups = self._buffer.training_owned_replay_groups()
-        replay_metadata = self._buffer.metadata_state_dict(
-            saved_capacity=self._async_cfg.max_buffered_rollouts,
-            additional_groups=training_owned_groups,
-        )
-        await self._validate_replay_inventory(replay_metadata)
+        with checkpoint_phase("capture_replay_metadata"):
+            cut.require_live()
+            dataloader_state = self._dataloader.state_dict()
+            replacement_reserve = list(self._replacement_reserve)
+            training_owned_groups = self._buffer.training_owned_replay_groups()
+            replay_metadata = self._buffer.metadata_state_dict(
+                saved_capacity=self._async_cfg.max_buffered_rollouts,
+                additional_groups=training_owned_groups,
+            )
+        with checkpoint_phase("capture_validate_replay_inventory"):
+            await self._validate_replay_inventory(replay_metadata)
         replay_row_count = sum(
             len(group["meta"].sample_ids) for group in replay_metadata["groups"]
         )
 
-        canonical_group_ids = {group["group_id"] for group in replay_metadata["groups"]}
-        recovery_state = build_rollout_recovery_state(
-            self._rollout_manager.recovery_ledger,
-            batch_shortfall=self._batch_shortfall,
-            sampler_stamps_target_steps=self._sampler_stamps_target_steps,
-            finalizer_metrics_by_group=self._finalizer_metrics_by_group,
-            finalizer_rewards_by_group=self._finalizer_rewards_by_group,
-            reward_settings=self._capture_reward_settings(),
-            canonical_group_ids=canonical_group_ids,
-        )
-        payload_buffer = io.BytesIO()
-        await asyncio.to_thread(torch.save, recovery_state, payload_buffer)
-        recovery_payload = payload_buffer.getvalue()
-        recovery_digest = hashlib.sha256(recovery_payload).hexdigest()
+        with checkpoint_phase("capture_build_recovery_state"):
+            canonical_group_ids = {
+                group["group_id"] for group in replay_metadata["groups"]
+            }
+            recovery_state = build_rollout_recovery_state(
+                self._rollout_manager.recovery_ledger,
+                batch_shortfall=self._batch_shortfall,
+                sampler_stamps_target_steps=self._sampler_stamps_target_steps,
+                finalizer_metrics_by_group=self._finalizer_metrics_by_group,
+                finalizer_rewards_by_group=self._finalizer_rewards_by_group,
+                reward_settings=self._capture_reward_settings(),
+                canonical_group_ids=canonical_group_ids,
+            )
+        with checkpoint_phase("capture_serialize_recovery_state"):
+            payload_buffer = io.BytesIO()
+            await asyncio.to_thread(torch.save, recovery_state, payload_buffer)
+            recovery_payload = payload_buffer.getvalue()
+        with checkpoint_phase("capture_hash_recovery_payload"):
+            recovery_digest = hashlib.sha256(recovery_payload).hexdigest()
 
         staging_row_count = 0
         if self._master_config.token_capture.enabled:

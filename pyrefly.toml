@@ -24,6 +24,8 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/data_plane/direct_prefix_batch.py",
+  "nemo_rl/data_plane/generation_prefix_write_batcher.py",
   "nemo_rl/data_plane/background_prefix_cleanup.py",
   "nemo_rl/models/generation/prefix_read_batcher.py",
   "nemo_rl/data/captured_media.py",
@@ -245,6 +247,7 @@ project-includes = [
   "nemo_rl/models/generation/fleet_health.py",
   "nemo_rl/models/generation/generation_cut_capture.py",
   "nemo_rl/models/generation/generation_cut_control.py",
+  "nemo_rl/models/generation/generation_cut_grouping.py",
   "nemo_rl/models/generation/generation_router.py",
   "nemo_rl/models/generation/interfaces.py",
   "nemo_rl/models/generation/megatron/__init__.py",
@@ -266,6 +269,8 @@ project-includes = [
   "nemo_rl/models/generation/vllm/captured_chat_logprobs.py",
   "nemo_rl/models/generation/vllm/checkpoint_engine.py",
   "nemo_rl/models/generation/vllm/collective_rpc.py",
+  "nemo_rl/models/generation/vllm/compact_output.py",
+  "nemo_rl/models/generation/vllm/packed_logprobs.py",
   "nemo_rl/models/generation/vllm/config.py",
   "nemo_rl/models/generation/vllm/metric_names.py",
   "nemo_rl/models/generation/vllm/output_loop_yield.py",
