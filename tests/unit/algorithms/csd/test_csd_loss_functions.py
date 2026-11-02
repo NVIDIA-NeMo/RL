@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from typing import Any
 
 import pytest
 import torch
@@ -964,6 +965,257 @@ def test_dynamic_scaling_on_automodel_cp2_matches_cp1(tmp_path, cross_tokenizer)
             os.fspath(tmp_path / "gloo_init"),
             os.fspath(fixture_path),
             cross_tokenizer,
+        ),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _two_teacher_cfg(
+    fx: dict[str, Any], *, kd_loss_mode: str, sum_weights_metric: str | None
+) -> dict[str, Any]:
+    """Teacher 0 is the fixture's cross-tokenizer teacher, teacher 1 a same-vocab one."""
+    cfg = _ct_loss_cfg(None)
+    cfg.update(
+        dynamic_loss_scaling=True,
+        kd_loss_mode=kd_loss_mode,
+        sum_weights_metric=sum_weights_metric,
+        student_vocab_size=fx["v_s"],
+        projection_matrix_paths=[None, None],
+        teacher_vocab_sizes=[fx["v_t"], fx["v_s"]],
+        teacher_weights=[1.0, 1.0],
+        common_indices_from_subtoks=True,
+        student_to_teacher_table_paths=[
+            fx["knobs"]["student_to_teacher_table_path"],
+            None,
+        ],
+        teacher_to_student_table_paths=[
+            fx["knobs"]["teacher_to_student_table_path"],
+            None,
+        ],
+    )
+    return cfg
+
+
+def _two_teacher_inputs(
+    fx: dict[str, Any], window: slice
+) -> tuple[BatchedDataDict, dict[int, torch.Tensor], dict[int, LocalizedAlignment]]:
+    """Batch, per-teacher logits and alignments for one contiguous window."""
+    ids = fx["student_ids"]
+    token_mask = torch.ones_like(ids)
+    sample_mask = torch.ones(ids.shape[0])
+    teacher_mask = fx["teacher_token_mask"]
+    # The batch carries the full teacher sequence, as the collator emits it.
+    data = BatchedDataDict(
+        {
+            "input_ids": ids,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "teacher_0_input_ids": fx["teacher_ids"],
+            "teacher_0_token_mask": teacher_mask,
+        }
+    )
+    student_fields = {
+        "sample_mask": sample_mask,
+        "student_input_ids": ids[:, window],
+        "student_token_mask": token_mask[:, window],
+        "student_kd_token_mask": token_mask[:, window],
+    }
+    aligns = {
+        0: LocalizedAlignment(
+            **student_fields,
+            pair_valid=fx["pair_valid"],
+            teacher_input_ids=fx["teacher_ids"][:, window],
+            teacher_token_mask=teacher_mask[:, window],
+            student_spans=fx["s_spans"],
+            teacher_spans=fx["t_spans"],
+            num_chunks=fx["num_chunks"],
+        ),
+        1: LocalizedAlignment(**student_fields),
+    }
+    teacher_logits = {
+        0: fx["teacher_logits"][:, window],
+        1: fx["same_vocab_logits"][:, window],
+    }
+    return data, teacher_logits, aligns
+
+
+def _two_teacher_cp_loss(
+    loss_fn: CSDLossFn,
+    fx: dict[str, Any],
+    student: torch.Tensor,
+    window: slice,
+    *,
+    cp_group: dist.ProcessGroup | None,
+    cp_size: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Two-teacher loss on one contiguous window, called as the Automodel worker does.
+
+    The full window with ``cp_group=None`` is the CP=1 reference.
+    """
+    data, teacher_logits, aligns = _two_teacher_inputs(fx, window)
+    ids, token_mask = data["input_ids"], data["token_mask"]
+    next_ids = torch.cat([ids[:, 1:], torch.zeros_like(ids[:, :1])], dim=1)
+    next_mask = token_mask.roll(shifts=-1, dims=1)
+    next_mask[:, -1] = 0
+    next_logprobs = (
+        torch.log_softmax(student, dim=-1)
+        .gather(-1, next_ids[:, window].unsqueeze(-1))
+        .squeeze(-1)
+    )
+    return loss_fn(
+        data,
+        data["sample_mask"].sum(),
+        token_mask[:, 1:].sum().float(),
+        student,
+        student,
+        teacher_logits,
+        aligns,
+        student_next_token_logprobs=next_logprobs,
+        student_next_token_mask=next_mask[:, window],
+        global_valid_chunks_by_idx={
+            0: torch.tensor(fx["global_valid_chunks"] * cp_size)
+        },
+        cp_group=cp_group,
+        cp_normalized_by_caller=False,
+    )
+
+
+def _expected_teacher_scores(fx: dict[str, Any], metric: str) -> torch.Tensor:
+    """Each teacher's score over the whole sequence, computed without CP."""
+    cases = [
+        (fx["teacher_logits"], fx["teacher_ids"], fx["teacher_token_mask"]),
+        (
+            fx["same_vocab_logits"],
+            fx["student_ids"],
+            torch.ones_like(fx["student_ids"]),
+        ),
+    ]
+    scores = []
+    for logits, ids, mask in cases:
+        mask = mask.float()
+        if metric == "ce":
+            ce = torch.nn.functional.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.shape[-1]),
+                ids[:, 1:].reshape(-1),
+                reduction="none",
+            )
+            target_mask = mask[:, 1:].reshape(-1)
+            scores.append(-(ce * target_mask).sum() / target_mask.sum())
+            continue
+        probs = torch.softmax(logits, dim=-1)
+        if metric == "entropy":
+            value = (probs * torch.log(probs + 1e-10)).sum(dim=-1)
+        else:
+            value = probs.max(dim=-1).values
+        scores.append((value * mask).sum() / mask.sum())
+    return torch.stack(scores)
+
+
+def _run_teacher_scoring_cp(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    fixture_path: str,
+    kd_loss_mode: str,
+    metric: str | None,
+) -> None:
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        cp_group = dist.new_group(ranks=list(range(world_size)))
+        fx = torch.load(fixture_path, weights_only=False)
+        loss_fn = CSDLossFn(
+            _two_teacher_cfg(fx, kd_loss_mode=kd_loss_mode, sum_weights_metric=metric)
+        )
+
+        reference = fx["student_logits"].clone().requires_grad_(True)
+        ref_loss, ref_metrics = _two_teacher_cp_loss(
+            loss_fn, fx, reference, slice(None), cp_group=None, cp_size=1
+        )
+        ref_loss.backward()
+
+        width = reference.shape[1] // world_size
+        window = slice(rank * width, (rank + 1) * width)
+        local = fx["student_logits"][:, window].clone().requires_grad_(True)
+        loss, metrics = _two_teacher_cp_loss(
+            loss_fn, fx, local, window, cp_group=cp_group, cp_size=world_size
+        )
+        loss.backward()
+        gathered = [torch.empty_like(local.grad) for _ in range(world_size)]
+        dist.all_gather(gathered, local.grad)
+
+        if kd_loss_mode == "select_teacher":
+            # Lowest next-token CE wins; scores are negated CEs.
+            expected = int(torch.argmax(_expected_teacher_scores(fx, "ce")))
+            assert ref_metrics["selected_teacher"] == expected
+            assert metrics["selected_teacher"] == expected
+        else:
+            expected = torch.softmax(_expected_teacher_scores(fx, metric), dim=0)
+            for group, part in ((None, slice(None)), (cp_group, window)):
+                data, teacher_logits, aligns = _two_teacher_inputs(fx, part)
+                weights = loss_fn._compute_dynamic_weights(
+                    data, teacher_logits, aligns, cp_group=group
+                )
+                torch.testing.assert_close(
+                    torch.stack(weights), expected, rtol=1e-5, atol=1e-6
+                )
+        for key in ("loss", "kl_loss", "ce_loss", "kl_loss_scale"):
+            assert metrics[key] == pytest.approx(ref_metrics[key], rel=1e-5), (
+                f"{key}: CP2 {metrics[key]} vs CP1 {ref_metrics[key]}"
+            )
+        torch.testing.assert_close(
+            torch.cat(gathered, dim=1), reference.grad, rtol=1e-5, atol=1e-6
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend unavailable")
+@pytest.mark.parametrize(
+    ("kd_loss_mode", "metric"),
+    [
+        ("select_teacher", None),
+        ("sum", "ce"),
+        ("sum", "entropy"),
+        ("sum", "max_prob"),
+    ],
+    ids=["select_teacher", "weights_ce", "weights_entropy", "weights_max_prob"],
+)
+def test_teacher_scoring_on_cp2_matches_cp1(tmp_path, kd_loss_mode, metric):
+    """Teacher selection and dynamic weights on CP=2 match the unsharded batch.
+
+    Each CP rank holds its window of every teacher's logits. The window's last
+    position is scored against the first token of the next rank's window, so a
+    valid token sits on the CP boundary (position 3) in both samples.
+    """
+    fixture = _build_case("with_mismatch", os.fspath(tmp_path))
+    generator = torch.Generator().manual_seed(1)
+    fixture["same_vocab_logits"] = torch.randn(
+        fixture["student_logits"].shape, generator=generator
+    )
+    # The same-vocab teacher predicts the boundary token (id 9 at position 3) from
+    # position 2 with near certainty, so it wins select_teacher only when the
+    # pair across the CP boundary is scored.
+    fixture["same_vocab_logits"][:, 2, 9] += 20.0
+    fixture["teacher_token_mask"] = torch.tensor(
+        [[1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 0, 0]]
+    )
+    fixture_path = tmp_path / "fixture.pt"
+    torch.save(fixture, fixture_path)
+    mp.spawn(
+        _run_teacher_scoring_cp,
+        args=(
+            2,
+            os.fspath(tmp_path / "gloo_init"),
+            os.fspath(fixture_path),
+            kd_loss_mode,
+            metric,
         ),
         nprocs=2,
         join=True,
