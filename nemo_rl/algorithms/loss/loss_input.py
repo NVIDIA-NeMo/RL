@@ -572,8 +572,10 @@ def prepare_packed_loss_input(
         target_is_pre_rolled=not input_is_prepacked,
         return_packed_layout=input_is_prepacked,
         # The grad may overwrite these logits only on the chunked path. The
-        # unfiltered KL call below reads them again, but only with chunking off.
-        reuse_logits_storage=use_chunking,
+        # unfiltered KL call below reads them again, but only with chunking off;
+        # score centering reads them again on every path.
+        reuse_logits_storage=use_chunking
+        and not getattr(loss_fn, "score_centering", False),
     )
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:

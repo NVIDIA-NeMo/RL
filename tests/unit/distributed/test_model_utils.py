@@ -2355,3 +2355,103 @@ def test_score_centering_packed_tp_cp_gloo(tmp_path, tp_size, cp_size):
         nprocs=tp_size * cp_size,
         join=True,
     )
+
+
+def _score_centering_packed_inputs():
+    torch.manual_seed(13)
+    full = torch.randn(2, 8, 12, requires_grad=True)
+    ids = torch.randint(0, 12, (2, 8, 3))
+    packed = torch.cat(
+        [
+            torch.cat([full[i : i + 1, :n], full.new_zeros(1, p - n, 12)], dim=1)
+            for i, (n, p) in enumerate([(5, 8), (7, 12)])
+        ],
+        dim=1,
+    )
+    data = {
+        "input_ids": ids[..., 0],
+        "sampler_topk_token_ids": ids,
+        "sampler_topk_logprobs": torch.zeros_like(ids, dtype=torch.float32),
+    }
+    return full, ids, packed * 1.0, data  # non-leaf logits, as in training
+
+
+@pytest.fixture
+def single_rank_gloo_group(tmp_path):
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'init'}", rank=0, world_size=1
+    )
+    yield torch.distributed.group.WORLD
+    torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("score_centering", [False, True])
+def test_packed_logits_reuse_is_off_under_score_centering(
+    single_rank_gloo_group, monkeypatch, score_centering
+):
+    """Score centering reads the packed logits a second time, so the chunked logprob
+    must not be allowed to write its grad into their storage."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.loss import loss_input as loss_input_module
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+
+    seen = []
+    original = loss_input_module.from_parallel_logits_to_logprobs_packed_sequences
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["reuse_logits_storage"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        loss_input_module, "from_parallel_logits_to_logprobs_packed_sequences", spy
+    )
+    _, _, logits, data = _score_centering_packed_inputs()
+    loss_fn = SimpleNamespace(
+        input_type=LossInputType.LOGPROB, score_centering=score_centering
+    )
+    loss_input_module.prepare_packed_loss_input(
+        logits,
+        data,
+        loss_fn,
+        (0, 5, 12),
+        (0, 8, 20),
+        vocab_parallel_rank=0,
+        vocab_parallel_group=single_rank_gloo_group,
+        chunk_size=2,
+    )
+    assert seen == [not score_centering]
+
+
+def test_score_centering_chunked_grad_with_activation_logits(single_rank_gloo_group):
+    """Both consumers of the packed logits get their grad from the original values."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+    from nemo_rl.algorithms.loss.loss_input import prepare_packed_loss_input
+
+    full, ids, logits, data = _score_centering_packed_inputs()
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
+    prepared, _ = prepare_packed_loss_input(
+        logits,
+        data,
+        loss_fn,
+        (0, 5, 12),
+        (0, 8, 20),
+        vocab_parallel_rank=0,
+        vocab_parallel_group=single_rank_gloo_group,
+        chunk_size=2,
+    )
+    mask = torch.zeros(2, 7, 1)
+    mask[0, :4] = 1
+    mask[1, :6] = 1
+    actual = (prepared["policy_logprobs_at_sampler_topk"] * mask).sum()
+    actual = actual + (prepared["next_token_logprobs"] * mask[..., 0]).sum()
+    actual.backward()
+
+    ref = full.detach().double().requires_grad_(True)
+    log_p = ref[:, :-1].log_softmax(-1)
+    expected = (log_p.gather(-1, ids[:, 1:]) * mask).sum()
+    expected = expected + (log_p.gather(-1, ids[:, 1:, :1]) * mask).sum()
+    expected.backward()
+    torch.testing.assert_close(full.grad, ref.grad.float(), atol=1e-6, rtol=1e-5)
