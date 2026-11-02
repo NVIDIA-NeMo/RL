@@ -342,7 +342,12 @@ def _register_single_controller_partitions(
             enabled=r3_enabled,
         )
     else:
-        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, SAMPLER_TOPK_FIELDS
+        from nemo_rl.data_plane.schema import (
+            DP_TRAIN_FIELDS,
+            INVALID_TOOL_CALL_MASK,
+            MALFORMED_THINKING_MASK,
+            SAMPLER_TOPK_FIELDS,
+        )
 
         partition_fields = fields_with_optional_routed_experts(
             SC_ROLLOUT_SCHEMA_FIELDS
@@ -352,6 +357,11 @@ def _register_single_controller_partitions(
         )
         if master_config.policy["generation"]["top_logprobs"] > 0:
             partition_fields.extend(SAMPLER_TOPK_FIELDS)
+        if (
+            not token_capture_cfg.forest_training
+            and _message_level_advantage_penalties_enabled(master_config)
+        ):
+            partition_fields.extend([INVALID_TOOL_CALL_MASK, MALFORMED_THINKING_MASK])
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -832,17 +842,30 @@ def _spinup_gym(
         enable_router_replay=enable_router_replay,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         policy_api_key=policy_api_key,
-        # Capture transport config includes the generation request's candidate count.
+        # Capture transport config includes the generation request's candidate count,
+        # and whether Gym records each call's last output item for the finalizer.
         token_capture=(
             {
                 **master_config.token_capture.model_dump(),
                 "top_logprobs": generation_config["top_logprobs"],
+                "record_last_output_item": _message_level_advantage_penalties_enabled(
+                    master_config
+                ),
             }
             if master_config.token_capture.enabled
             else None
         ),
     )
     return shard_set, time.perf_counter() - t0
+
+
+def _message_level_advantage_penalties_enabled(master_config: MasterConfig) -> bool:
+    """Return whether invalid_tool_call_advantage or malformed_thinking_advantage is set."""
+    algo_cfg = algo_config(master_config)
+    return (
+        algo_cfg.invalid_tool_call_advantage is not None
+        or algo_cfg.malformed_thinking_advantage is not None
+    )
 
 
 def _generation_max_seq_len(generation_config) -> int:
@@ -2223,9 +2246,8 @@ def setup_single_controller(
         per_token_multimodal_fields=(
             () if token_capture_cfg.enabled else per_token_multimodal_schema(processor)
         ),
-        include_message_violation_fields=(
-            algo_cfg.invalid_tool_call_advantage is not None
-            or algo_cfg.malformed_thinking_advantage is not None
+        include_message_violation_fields=_message_level_advantage_penalties_enabled(
+            master_config
         ),
         require_routed_experts=router_replay_enabled(policy_config),
         staging_partition_id=(
@@ -2239,6 +2261,7 @@ def setup_single_controller(
             create_rollout_reassembler_actors,
         )
 
+        nemo_gym_env_config = master_config.env.get("nemo_gym") or {}
         finalizer_actors = create_rollout_reassembler_actors(
             dp_config,
             RolloutReassemblerActorConfig(
@@ -2255,6 +2278,14 @@ def setup_single_controller(
                     resolved_reward_penalty_config
                 ),
                 top_logprobs=master_config.policy["generation"]["top_logprobs"],
+                message_violation_masks=_message_level_advantage_penalties_enabled(
+                    master_config
+                ),
+                # The same detector settings the NeMo-Gym actor reads on the echo path.
+                invalid_tool_call_patterns=nemo_gym_env_config.get(
+                    "invalid_tool_call_patterns"
+                ),
+                thinking_tags=nemo_gym_env_config.get("thinking_tags"),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

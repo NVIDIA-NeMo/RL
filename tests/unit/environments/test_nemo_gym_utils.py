@@ -460,6 +460,48 @@ def test_spinup_passes_parent_resolution_to_gym(forest_training, tmp_path, monke
     assert "framework_owned_context" not in config["token_id_capture"]
 
 
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize("record_last_output_item", [False, True])
+def test_spinup_asks_gym_for_last_output_items_only_when_requested(
+    record_last_output_item, tmp_path, monkeypatch
+):
+    from nemo_gym.token_id_capture.config import TokenIdCaptureConfig
+
+    monkeypatch.setenv("NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN", "test-control")
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__(
+        {
+            "model_name": "test-model",
+            "base_urls": [],
+            "initial_global_config_dict": {},
+            "token_capture": {
+                "enabled": True,
+                "generation_backend": "vllm",
+                "capture_dir": str(tmp_path),
+                "control_auth_token": "test-control",
+                "record_last_output_item": record_last_output_item,
+            },
+        }
+    )
+    run_helper = MagicMock()
+    run_helper.start.side_effect = RuntimeError("stop before server startup")
+    with (
+        _stub_gym_spinup(run_helper),
+        pytest.raises(RuntimeError, match="stop before server startup"),
+    ):
+        actor._spinup()
+    config = run_helper.start.call_args.kwargs[
+        "global_config_dict_parser_config"
+    ].initial_global_config_dict
+    capture = TokenIdCaptureConfig.model_validate(dict(config)).token_id_capture
+    assert capture.record_last_output_item is record_last_output_item
+    # Runs without message-level penalties send Gym the same block as before.
+    assert ("record_last_output_item" in config["token_id_capture"]) is (
+        record_last_output_item
+    )
+
+
 def test_spinup_stops_local_gym_servers_when_external_services_time_out():
     """Local Gym servers start first; a missed external deadline must stop them."""
     readiness = nemo_gym_mod.ExternalServiceReadinessConfig(

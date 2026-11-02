@@ -130,6 +130,8 @@ class FinalizedRollout:
     sampler_topk_token_ids: Optional[torch.Tensor] = None
     sampler_topk_logprobs: Optional[torch.Tensor] = None
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
+    # Ordinary rows with message-level penalties: detector counts over chain calls.
+    violation_counts: dict[str, int] = field(default_factory=dict)
     # One length per owned call, even when adjacent generations have no input gap.
     generation_lengths: tuple[int, ...] = ()
 
@@ -380,9 +382,18 @@ class RolloutReassembler:
         capture_media: bool = False,
         media_columns: Optional[MediaColumnSpec] = None,
         top_logprobs: int = 0,
+        message_violation_masks: bool = False,
+        invalid_tool_call_patterns: Optional[list[str]] = None,
+        thinking_tags: Optional[list[str]] = None,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
         self._effort_config = effort_config
+        # Message-level advantage penalties: publish invalid_tool_call_mask and
+        # malformed_thinking_mask. Ordinary rows run the NeMo-Gym detector, with
+        # env.nemo_gym's patterns and tags, on each call's recorded last output item.
+        self._message_violation_masks = message_violation_masks
+        self._invalid_tool_call_patterns = invalid_tool_call_patterns
+        self._thinking_tags = thinking_tags
         self._dp_client = dp_client
         self._partition_id = partition_id
         # Whether the staging partition carries media columns (setup's
@@ -664,6 +675,37 @@ class RolloutReassembler:
         for span in row.weight_version_spans:
             if span.model_call_id in loss_excluded_call_ids:
                 token_mask[span.start : span.end] = [0.0] * (span.end - span.start)
+        violation_counts: dict[str, int] = {}
+        if self._message_violation_masks and not forest_training:
+            # Ordinary capture: Gym records each call's last served output item
+            # (token_id_capture.record_last_output_item), the item the echo path's
+            # detector reads. Missing evidence would silently skip the penalty.
+            last_items = []
+            for call_id, _, _ in row.link_spans:
+                record = records_by_call.get(call_id)
+                if record is None or record.last_output_item is None:
+                    return rejected(f"missing_last_output_item:{call_id}", staging_keys)
+                last_items.append(dict(record.last_output_item))
+            # Deferred: the detector lives with the NeMo-Gym environment.
+            from nemo_rl.environments.nemo_gym import (
+                _detect_invalid_tool_call_and_malformed_thinking,
+            )
+
+            action_flags = tuple(
+                ActionOutputFlags(
+                    *_detect_invalid_tool_call_and_malformed_thinking(
+                        item,
+                        invalid_tool_call_patterns=self._invalid_tool_call_patterns,
+                        thinking_tags=self._thinking_tags,
+                    )
+                )
+                for item in last_items
+            )
+            violation_counts = {
+                "assistant_calls": len(action_flags),
+                "invalid_tool_calls": sum(f.invalid_tool_call for f in action_flags),
+                "malformed_thinking": sum(f.malformed_thinking for f in action_flags),
+            }
         output_masks = {}
         if action_flags is not None:
             if len(action_flags) != len(row.link_spans) or any(
@@ -711,6 +753,7 @@ class RolloutReassembler:
             media=media,
             model_call_ids=tuple(row.model_call_ids),
             output_masks=output_masks,
+            violation_counts=violation_counts,
             penalty_counts=penalty_counts,
             reward_metrics=reward_metrics,
             sampler_topk_token_ids=sampler_topk_token_ids,
@@ -945,6 +988,20 @@ class RolloutReassembler:
                     metrics[f"finalize/penalty_count/{spec.name}"] = float(
                         sum(row.penalty_counts.get(spec.name, 0) for row in valid_rows)
                     )
+        # The echo path's per-step invalid_tool_call_rate / malformed_thinking_rate,
+        # per group over the valid rows' chain calls.
+        assistant_calls = sum(
+            row.violation_counts.get("assistant_calls", 0) for row in valid_rows
+        )
+        if assistant_calls:
+            for name, key in (
+                ("invalid_tool_call_rate", "invalid_tool_calls"),
+                ("malformed_thinking_rate", "malformed_thinking"),
+            ):
+                metrics[f"finalize/{name}"] = (
+                    sum(row.violation_counts.get(key, 0) for row in valid_rows)
+                    / assistant_calls
+                )
         # Ledger-derived admission counters (per group): each manifest row
         # carries its admission mode. token_in_rate near 1.0 is the capture
         # health signal (a text root only opens each chain); this replaces the
@@ -1256,7 +1313,7 @@ class RolloutReassembler:
         if sampler_topk_token_ids is not None:
             train_batch[SAMPLER_TOPK_TOKEN_IDS_FIELD] = sampler_topk_token_ids
             train_batch[SAMPLER_TOPK_LOGPROBS_FIELD] = sampler_topk_logprobs
-        if logical is not None:
+        if logical is not None or self._message_violation_masks:
             for key in (INVALID_TOOL_CALL_MASK, MALFORMED_THINKING_MASK):
                 values = torch.zeros((n, max_len), dtype=torch.bool)
                 for index, row in enumerate(rows):

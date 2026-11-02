@@ -166,8 +166,19 @@ reward substituted after shaping and penalties. This retains one reward
 observation per valid row, plus optional table data, in pending checkpoint state.
 Existing low/high effort means and exact length medians are preserved; `mean_reward_low`
 measures the shaped reward before penalties. Pending statistics survive recovery
-and are consumed once. Malformed-thinking penalties and message-level advantage
-overrides remain unsupported with capture and fail at setup.
+and are consumed once. Malformed-thinking penalties remain unsupported with capture
+and fail at setup.
+
+Message-level advantage overrides (`grpo.invalid_tool_call_advantage` and
+`grpo.malformed_thinking_advantage`) work with capture. Setup asks Gym to record
+each call's last output item in the capture ledger
+(`token_id_capture.record_last_output_item`), and the finalizer runs the same
+detector as the echo path, with `env.nemo_gym.invalid_tool_call_patterns` and
+`env.nemo_gym.thinking_tags`, on each call of the terminal chain. It writes
+`invalid_tool_call_mask` and `malformed_thinking_mask` over that call's generated
+tokens and logs `finalize/invalid_tool_call_rate` and
+`finalize/malformed_thinking_rate`. A chain call without a recorded item rejects
+the rollout as `missing_last_output_item`.
 
 ## Checkpointing and Replay Recovery
 
