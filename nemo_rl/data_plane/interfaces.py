@@ -261,9 +261,7 @@ class NixlStoreConfig(BaseModel, extra="allow"):
 
     num_storage_units: PositiveInt | None = None
     storage_units_per_node: PositiveInt | None = None
-    storage_unit_placement: list[Literal["train", "inference"]] | Literal["all"] = (
-        "all"
-    )
+    storage_unit_placement: list[Literal["train", "inference"]] | Literal["all"] = "all"
     # Explicit unit nodes; when unset, _init_tq resolves storage_unit_placement.
     node_ids: list[str] | None = None
     unit_slab_bytes: int = 17179869184  # 16 GiB pinned per unit

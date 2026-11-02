@@ -660,20 +660,14 @@ class NixlKVClient(StorageKVClient):
                 flush=True,
             )
 
-    def retired_bytes(self) -> list[int]:
-        """Each unit's ``retired_bytes`` (one Ray call per unit).
-
-        Memory lost to WRITEs that may still land, gone until the unit restarts.
-        """
+    def unit_stats(self) -> list[dict[str, Any]]:
+        """Each unit's ``stats()`` (one Ray call per unit)."""
         if self._unit_handles is None:  # looked up once: this runs every step
             self._unit_handles = [
                 ray.get_actor(_unit_name(u), namespace=self.namespace)
                 for u in self.unit_ids
             ]
-        return [
-            int(s["retired_bytes"])
-            for s in ray.get([h.stats.remote() for h in self._unit_handles])
-        ]
+        return ray.get([h.stats.remote() for h in self._unit_handles])
 
     # ------------------------------------------------------------------ lifecycle
     def close(self) -> None:
@@ -684,11 +678,13 @@ class NixlKVClient(StorageKVClient):
             self.ep.close()
 
 
-def retired_metrics() -> dict[str, float]:
-    """``retired_mb_sum`` / ``retired_mb_max`` over the units.
+def unit_metrics() -> dict[str, float]:
+    """Unit health summed over the units, for the driver to log every step.
 
-    Read through this process's TQ client; ``{}`` when it has no nixl client.
-    A rising line is a slow leak.
+    ``retired_mb_sum`` / ``retired_mb_max``, plus ``ssd_spills_sum`` with the
+    SSD tier on. Retired memory is lost to WRITEs that may still land, gone until the unit
+    restarts: a rising line is a slow leak. Read through this process's TQ
+    client; ``{}`` when it has no nixl client.
     """
     import transfer_queue as tq
 
@@ -698,8 +694,12 @@ def retired_metrics() -> dict[str, float]:
         return {}
     if not isinstance(client, NixlKVClient):
         return {}
-    mb = [b / 2**20 for b in client.retired_bytes()]
-    return {"retired_mb_sum": sum(mb), "retired_mb_max": max(mb, default=0.0)}
+    stats = client.unit_stats()
+    mb = [s["retired_bytes"] / 2**20 for s in stats]
+    out = {"retired_mb_sum": sum(mb), "retired_mb_max": max(mb, default=0.0)}
+    if any("spills" in s for s in stats):  # SSD tier on
+        out["ssd_spills_sum"] = float(sum(s.get("spills", 0) for s in stats))
+    return out
 
 
 # ============================================================================ bootstrap
