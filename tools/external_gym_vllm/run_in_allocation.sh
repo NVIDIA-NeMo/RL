@@ -454,9 +454,12 @@ acquire_pool_dir() {
 }
 
 # touch_pool_heartbeat: tell attached jobs the pool job is alive. Serve mode only.
+# A failed write (for example "Disk quota exceeded" on the shared filesystem) is logged and skipped: under set -e it
+# would end the whole persistent pool. Attached jobs stop themselves only if the heartbeat stays stale.
 touch_pool_heartbeat() {
   if (( owns_pool_dir == 1 )); then
-    echo "${pool_generation}" > "${EXTERNAL_VLLM_POOL_DIR}/heartbeat"
+    echo "${pool_generation}" > "${EXTERNAL_VLLM_POOL_DIR}/heartbeat" 2>/dev/null \
+      || echo "[WARN] $(date -Iseconds) could not write ${EXTERNAL_VLLM_POOL_DIR}/heartbeat; will retry" >&2
   fi
 }
 
@@ -935,9 +938,13 @@ if [[ "${EXTERNAL_VLLM_MODE}" == serve ]]; then
 
   ready_published=0
   publish_ready() {
-    echo "${pool_generation} $(date -Iseconds)" > "${EXTERNAL_VLLM_POOL_DIR}/READY.tmp"
-    mv "${EXTERNAL_VLLM_POOL_DIR}/READY.tmp" "${EXTERNAL_VLLM_POOL_DIR}/READY"
-    ready_published=1
+    # Not marked published when the write fails, so the supervision loop retries it on its next pass.
+    if echo "${pool_generation} $(date -Iseconds)" > "${EXTERNAL_VLLM_POOL_DIR}/READY.tmp" 2>/dev/null \
+        && mv "${EXTERNAL_VLLM_POOL_DIR}/READY.tmp" "${EXTERNAL_VLLM_POOL_DIR}/READY" 2>/dev/null; then
+      ready_published=1
+    else
+      echo "[WARN] $(date -Iseconds) could not publish READY in ${EXTERNAL_VLLM_POOL_DIR}; will retry" >&2
+    fi
   }
   publish_ready
   echo "[INFO] External vLLM pools are healthy; published to ${EXTERNAL_VLLM_POOL_DIR}"

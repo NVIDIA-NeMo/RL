@@ -1260,6 +1260,31 @@ def test_serve_mode_requires_a_pool_dir_and_rejects_unknown_modes(tmp_path):
     assert "EXTERNAL_VLLM_MODE must be inline or serve, got: attach" in result.stderr
 
 
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_serve_mode_survives_a_failed_heartbeat_write(tmp_path):
+    pool_dir = tmp_path / "pool"
+    env = _serve_env(tmp_path)
+    process = _start(_WRAPPER, env, tmp_path / "serve.out")
+    try:
+        _wait_for((pool_dir / "READY").exists, 60, "pools never published READY")
+        heartbeat = pool_dir / "heartbeat"
+        # Writes now fail the way they do on a full filesystem. The pool must keep serving.
+        heartbeat.chmod(0o444)
+        time.sleep(1.5)  # several 0.2 s supervision passes
+        assert process.poll() is None, (tmp_path / "serve.out").read_text()
+        assert "could not write" in (tmp_path / "serve.out").read_text()
+        assert (pool_dir / "READY").exists()
+        # Once writes work again the heartbeat resumes.
+        heartbeat.chmod(0o644)
+        before = heartbeat.stat().st_mtime_ns
+        _wait_for(
+            lambda: heartbeat.stat().st_mtime_ns > before, 15, "heartbeat never resumed"
+        )
+    finally:
+        _stop(process)
+
+
 def test_serve_mode_publishes_relaunches_and_withdraws_ready_while_degraded(tmp_path):
     pool_dir = tmp_path / "pool"
     env = _serve_env(tmp_path, STUB_END_TIME="2026-10-14T06:00:00")
