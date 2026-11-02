@@ -3359,6 +3359,7 @@ class TestAsyncTrajectoryCollector:
             {"default": {"total_bonus": 0.1, "top_percentile": 0.5}}
         )
         collector.master_config.grpo.length_penalty = length_penalty_cfg
+        collector.master_config.grpo.masked_reward_policy = "exclude_infra"
         target_weight = 15
         collector._generating_targets.add(target_weight)
         repeated_batch = BatchedDataDict(
@@ -3394,6 +3395,10 @@ class TestAsyncTrajectoryCollector:
             )
             # The collector forwards the typed grpo.length_penalty block.
             assert kwargs["length_penalty_config"] is length_penalty_cfg
+            # exclude_infra: Gym ingestion zeroes infrastructure-failed rows.
+            assert kwargs["policy_failure_kinds"] == frozenset(
+                collector.master_config.grpo.policy_failure_kinds
+            )
             rollout_calls += 1
             task_indices = [
                 row["_ng_task_index"] for row in kwargs["input_batch"]["extra_env_info"]

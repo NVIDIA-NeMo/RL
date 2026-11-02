@@ -14,7 +14,7 @@
 
 """Producer-side payload helpers for the async-RL TQ path."""
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any, cast
 
 import numpy as np
@@ -101,6 +101,7 @@ def record_to_train_batch(
     pad_value_dict: Mapping[str, int],
     include_message_violation_fields: bool,
     per_token_multimodal_fields: tuple[str, ...] = (),
+    policy_failure_kinds: Collection[str] | None = None,
 ) -> BatchedDataDict[Any]:
     """Convert one prompt group's record into a packed BatchedDataDict of N rows.
 
@@ -111,6 +112,11 @@ def record_to_train_batch(
             flags for configured advantage penalties.
         per_token_multimodal_fields: Fixed per-token schema for a multimodal
             run. Missing message fields get text defaults before flattening.
+        policy_failure_kinds: Under ``grpo.masked_reward_policy: exclude_infra``,
+            the ``grpo.policy_failure_kinds``: every other env-masked completion
+            gets a ``sample_mask`` (dataset weight) of 0, so it never votes in
+            the advantage statistics (see ``rollouts.infra_failure_flags``).
+            ``None`` leaves the weights alone.
 
     Returns:
         BatchedDataDict with input IDs and lengths, generation log probabilities,
@@ -130,6 +136,7 @@ def record_to_train_batch(
     from nemo_rl.experience.rollouts import (
         _mask_sample_flags,
         backfill_missing_routed_experts,
+        infra_failure_flags,
     )
 
     completions = record.completions
@@ -170,6 +177,11 @@ def record_to_train_batch(
     mask_sample = _mask_sample_flags(c.env_extras for c in completions)
     truncated = torch.tensor([c.truncated for c in completions], dtype=torch.bool)
     sample_mask = torch.full((n,), float(record.loss_multiplier), dtype=torch.float32)
+    if policy_failure_kinds is not None:
+        infra_failure = infra_failure_flags(
+            (c.env_extras for c in completions), policy_failure_kinds
+        )
+        sample_mask[infra_failure] = 0
 
     train_data: dict[str, Any] = {
         "input_ids": flat["token_ids"],

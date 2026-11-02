@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
@@ -402,6 +403,36 @@ def test_record_to_train_batch_broadcasts_prompt_loss_multiplier() -> None:
         prompt_idx=17,
     )
     assert torch.equal(fields["sample_mask"], expected)
+
+
+@pytest.mark.parametrize(
+    "policy_failure_kinds, expected",
+    [
+        # exclude_infra: the evaluator error (masked, no kind) and the judge
+        # failure lose their dataset weight; the policy-caused timeout keeps it.
+        (frozenset({"agent_timeout"}), [0.25, 0.0, 0.0, 0.25]),
+        # include/exclude: weights untouched.
+        (None, [0.25, 0.25, 0.25, 0.25]),
+    ],
+)
+def test_record_to_train_batch_zeroes_infra_failure_weights(
+    policy_failure_kinds, expected
+) -> None:
+    completions = [_completion(route_start=10 * i, reward=1.0) for i in range(4)]
+    completions[1].env_extras = {"mask_sample": True}
+    completions[2].env_extras = {"mask_sample": True, "failure_kind": "judge_failed"}
+    completions[3].env_extras = {"mask_sample": True, "failure_kind": "agent_timeout"}
+
+    train_batch = record_to_train_batch(
+        _record(completions, loss_multiplier=0.25),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+        policy_failure_kinds=policy_failure_kinds,
+    )
+
+    assert train_batch["sample_mask"].tolist() == expected
+    # The raw environment flag is carried unchanged either way.
+    assert train_batch["mask_sample"].tolist() == [False, True, True, True]
 
 
 def _failed_completion() -> Completion:

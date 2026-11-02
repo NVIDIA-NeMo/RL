@@ -256,9 +256,16 @@ def test_forest_restart_retains_selection_terminal_and_once_only_loss(
     assert (
         attempt.receipt["terminal_model_call_id"] == records[scored_index].model_call_id
     )
-    owners, sample_ids, receipts, rewards, masks, reward_checks, log_contexts = (
-        restored.finalization_inputs("group")
-    )
+    (
+        owners,
+        sample_ids,
+        receipts,
+        rewards,
+        masks,
+        reward_checks,
+        log_contexts,
+        _failure_kinds,
+    ) = restored.finalization_inputs("group")
     assert reward_checks == [checks] and log_contexts == [context]
     result = forest.finalizer.finalize_group(
         "group",
@@ -1316,3 +1323,35 @@ def test_capture_lengths_count_unique_generations_before_padding(
     assert metrics["max_gen_tokens_per_turn/max"] == 1
     assert metrics["total_tokens_per_sample/max"] == max(r.cum_len for r in selected)
     assert result.canonical_output_tokens == len(selected)
+
+
+def test_forest_rows_take_their_rollouts_infra_failure_flag(forest):
+    # Under exclude_infra, every segment row of a flagged rollout gets a
+    # sample_mask of 0; the rate counts rollouts, not rows.
+    receipts, selections = [], []
+    for owner in ("group_g0", "group_g1"):
+        # Two independent roots give each rollout two segment rows.
+        records, _ = forest.capture([None, None], owner=owner)
+        owner_receipt = receipt(records, terminal=records[-1])
+        owner_receipt["capture_key"] = owner
+        receipts.append(owner_receipt)
+        selections.append(selection(records))
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["group_g0", "group_g1"],
+        receipts,
+        [1.0, 0.0],
+        mask_sample=[False, True],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0", "group_g1"],
+        logical_selections=selections,
+        infra_failure=[False, True],
+    )
+    assert result.metrics["infra_failure_sample_rate"] == 0.5
+    assert [tag["logical_slot"] for tag in result.meta.tags] == [0, 0, 1, 1]
+    sample_mask = [
+        forest.plane.rows["canonical", sample_id]["sample_mask"].item()
+        for sample_id in result.meta.sample_ids
+    ]
+    assert sample_mask == [1.0, 1.0, 0.0, 0.0]

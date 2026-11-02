@@ -43,8 +43,16 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
     from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 5
-SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, 3, 4, ROLLOUT_RECOVERY_SCHEMA_VERSION}
+# Version 6 adds each sealed attempt's ``failure_kind``. Older ledgers
+# predate it and load with ``failure_kind=None``.
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 6
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
+    2,
+    3,
+    4,
+    5,
+    ROLLOUT_RECOVERY_SCHEMA_VERSION,
+}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -85,6 +93,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "receipt",
         "reward",
         "mask_sample",
+        "failure_kind",
         "reward_checks",
         "reward_log_context",
         "staging_keys",
@@ -193,6 +202,10 @@ class RolloutAttemptRecord:
     receipt: Optional[dict[str, Any]] = None
     reward: Optional[float] = None
     mask_sample: Optional[bool] = None
+    # The environment's top-level failure_kind, if any. Finalization reads it
+    # to tell infrastructure failures from policy-caused masks under
+    # grpo.masked_reward_policy=exclude_infra.
+    failure_kind: Optional[str] = None
     reward_checks: RewardChecks | None = None
     reward_log_context: RewardLogContext | None = None
     staging_keys: list[str] = field(default_factory=list)
@@ -309,6 +322,7 @@ class SiblingSealResult:
     mask_sample: bool
     reward_checks: RewardChecks | None = None
     reward_log_context: RewardLogContext | None = None
+    failure_kind: Optional[str] = None
     logical_selection: RolloutSelection | None = None
     resolved_agent_name: Optional[str] = field(default=None, kw_only=True)
 
@@ -591,6 +605,7 @@ class RolloutRecoveryLedger:
             attempt.logical_selection = None
             attempt.reward = None
             attempt.mask_sample = None
+            attempt.failure_kind = None
             attempt.reward_checks = None
             attempt.reward_log_context = None
             attempt.staging_keys.clear()
@@ -737,6 +752,7 @@ class RolloutRecoveryLedger:
         resolved_agent_name: Optional[str] = None,
         reward_checks: RewardChecks | None = None,
         reward_log_context: RewardLogContext | None = None,
+        failure_kind: Optional[str] = None,
         logical_selection: RolloutSelection | None = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
@@ -753,6 +769,8 @@ class RolloutRecoveryLedger:
         if not isinstance(mask_sample, bool):
             raise TypeError("mask_sample must be a bool")
         self._validate_agent_name(record, resolved_agent_name)
+        if failure_kind is not None and not isinstance(failure_kind, str):
+            raise TypeError("failure_kind must be a string or None")
         if gate_rollout_id != expected_gate_rollout_id:
             raise ValueError(
                 "streamed rollout identity mismatch: "
@@ -769,6 +787,7 @@ class RolloutRecoveryLedger:
                 and attempt.logical_selection == logical_selection
                 and attempt.reward == float(reward)
                 and attempt.mask_sample is mask_sample
+                and attempt.failure_kind == failure_kind
                 and attempt.reward_checks == reward_checks
                 and attempt.reward_log_context == reward_log_context
                 and attempt.staging_keys == staging_keys
@@ -790,6 +809,7 @@ class RolloutRecoveryLedger:
         attempt.logical_selection = copy.deepcopy(logical_selection)
         attempt.reward = float(reward)
         attempt.mask_sample = mask_sample
+        attempt.failure_kind = failure_kind
         attempt.reward_checks = reward_checks
         attempt.reward_log_context = reward_log_context
         attempt.staging_keys = staging_keys
@@ -859,6 +879,10 @@ class RolloutRecoveryLedger:
                 )
             if not isinstance(result.mask_sample, bool):
                 raise TypeError("mask_sample must be a bool")
+            if result.failure_kind is not None and not isinstance(
+                result.failure_kind, str
+            ):
+                raise TypeError("failure_kind must be a string or None")
             validated.append(
                 (
                     attempt,
@@ -877,6 +901,7 @@ class RolloutRecoveryLedger:
             attempt.logical_selection = copy.deepcopy(result.logical_selection)
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
+            attempt.failure_kind = result.failure_kind
             attempt.reward_checks = result.reward_checks
             attempt.reward_log_context = result.reward_log_context
             attempt.staging_keys = staging_keys
@@ -938,6 +963,7 @@ class RolloutRecoveryLedger:
         list[bool],
         list[RewardChecks | None],
         list[RewardLogContext | None],
+        list[Optional[str]],
     ]:
         """Return sealed finalization inputs in stable sibling order."""
         record = self._require_group(group_id)
@@ -950,6 +976,7 @@ class RolloutRecoveryLedger:
         mask_sample: list[bool] = []
         checks: list[RewardChecks | None] = []
         log_contexts: list[RewardLogContext | None] = []
+        failure_kinds: list[Optional[str]] = []
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             if (
@@ -967,6 +994,7 @@ class RolloutRecoveryLedger:
             mask_sample.append(attempt.mask_sample)
             checks.append(attempt.reward_checks)
             log_contexts.append(attempt.reward_log_context)
+            failure_kinds.append(attempt.failure_kind)
         return (
             record.gate_rollout_ids,
             record.logical_rollout_ids,
@@ -975,6 +1003,7 @@ class RolloutRecoveryLedger:
             mask_sample,
             checks,
             log_contexts,
+            failure_kinds,
         )
 
     def mark_finalization_started(
@@ -1082,6 +1111,7 @@ class RolloutRecoveryLedger:
                                     ),
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
+                                    "failure_kind": attempt.failure_kind,
                                     "reward_checks": dataclasses.asdict(
                                         attempt.reward_checks
                                     )
@@ -1302,6 +1332,10 @@ class RolloutRecoveryLedger:
                 )
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
+                # Absent from ledgers before version 6.
+                failure_kind = attempt_state.get("failure_kind")
+                if failure_kind is not None and not isinstance(failure_kind, str):
+                    raise ValueError("failure_kind must be a string or None")
                 raw_checks = attempt_state.get("reward_checks")
                 if raw_checks is not None and (
                     not isinstance(raw_checks, dict)
@@ -1347,6 +1381,7 @@ class RolloutRecoveryLedger:
                     or selection is not None
                     or reward is not None
                     or mask_sample is not None
+                    or failure_kind is not None
                     or checks is not None
                     or log_context is not None
                     or staging_keys
@@ -1360,6 +1395,7 @@ class RolloutRecoveryLedger:
                         logical_selection=selection,
                         reward=float(reward) if reward is not None else None,
                         mask_sample=mask_sample,
+                        failure_kind=failure_kind,
                         reward_checks=checks,
                         reward_log_context=log_context,
                         staging_keys=list(staging_keys),

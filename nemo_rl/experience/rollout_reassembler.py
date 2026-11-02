@@ -819,6 +819,7 @@ class RolloutReassembler:
         fallback_weight_version: int,
         prompt_idx: int,
         loss_multiplier: float = 1.0,
+        infra_failure: Optional[list[bool]] = None,
         canonical_sample_ids: Optional[list[str]] = None,
         logical_selections: Optional[list[RolloutSelection]] = None,
         execution_row_multiple: int = 1,
@@ -836,13 +837,18 @@ class RolloutReassembler:
         environment masking reads the same field on both paths (placeholder
         rows already train nothing through ``sample_mask`` 0).
         ``loss_multiplier`` supplies the dataset-level weight for every valid
-        row, matching the ordinary ``record_to_train_batch`` path. ``truncated``
+        row, matching the ordinary ``record_to_train_batch`` path, except the
+        rows ``infra_failure`` flags (``grpo.masked_reward_policy:
+        exclude_infra``), which get 0 there too. ``truncated``
         is not carried from the dispatcher -- the receipt path has no real
         tokens to measure it from at dispatch time -- so it is computed here
         instead, from each row's rebuilt length against ``max_seq_len``.
         """
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
+        )
+        assert infra_failure is None or len(infra_failure) == len(rollout_ids), (
+            "infra_failure must be one per rollout"
         )
         if canonical_sample_ids is None:
             canonical_sample_ids = rollout_ids
@@ -906,6 +912,13 @@ class RolloutReassembler:
                 )
             )
             mask_sample = logical.mask_sample
+        # One flag per published row: each Forest segment row takes its
+        # rollout's flag, as it takes its mask_sample.
+        row_infra_failure = (
+            [infra_failure[tag["logical_slot"]] for tag in logical.tags]
+            if logical is not None and infra_failure is not None
+            else infra_failure
+        )
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
         valid_rows = [row for row in rows if row.valid]
         staging_keys = (
@@ -927,6 +940,10 @@ class RolloutReassembler:
                 else 0.0
             ),
         }
+        if infra_failure is not None:
+            # grpo.masked_reward_policy=exclude_infra: the same flags give
+            # these rows a sample_mask of 0 below.
+            metrics["infra_failure_sample_rate"] = sum(infra_failure) / len(rollout_ids)
         if logical is not None:
             metrics["finalize/logical_owner_count"] = float(len(rollout_ids))
             metrics["finalize/valid_logical_owner_count"] = float(
@@ -1076,6 +1093,7 @@ class RolloutReassembler:
             rows,
             rollout_ids,
             mask_sample=mask_sample,
+            infra_failure=row_infra_failure,
             fallback_weight_version=fallback_weight_version,
             prompt_idx=prompt_idx,
             staging_keys=staging_keys,
@@ -1098,6 +1116,7 @@ class RolloutReassembler:
         rollout_ids: list[str],
         *,
         mask_sample: list[bool],
+        infra_failure: Optional[list[bool]],
         fallback_weight_version: int,
         prompt_idx: int,
         staging_keys: list[str],
@@ -1229,7 +1248,11 @@ class RolloutReassembler:
             input_ids[i, :length] = torch.tensor(row.token_ids, dtype=torch.int64)
             token_mask[i, :length] = torch.tensor(row.token_mask, dtype=torch.float32)
             logprobs[i, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
-            sample_mask[i] = float(loss_multiplier)
+            sample_mask[i] = (
+                0.0
+                if infra_failure is not None and infra_failure[i]
+                else float(loss_multiplier)
+            )
             if sampler_topk_token_ids is not None:
                 assert sampler_topk_logprobs is not None
                 assert row.sampler_topk_token_ids is not None
