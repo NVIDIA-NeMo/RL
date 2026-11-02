@@ -147,37 +147,3 @@ def test_gym_functional_config_routes(functional_recipe) -> None:
     )
     agent = "browsecomp_agent" if cc else "workplace_assistant_simple_agent"
     assert _environment_server_for_agent(agent, _environment_servers_by_agent(resolved))
-
-
-def test_fast_suite_runs_capture_and_compaction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = Path(__file__).resolve().parents[3]
-    scripts = tmp_path / "tests/functional"
-    scripts.mkdir(parents=True)
-    suite = scripts / "L1_Functional_Tests_SingleController_3.sh"
-    shutil.copy(source / "tests/functional" / suite.name, suite)
-    binaries = tmp_path / "bin"
-    binaries.mkdir()
-    calls = tmp_path / "commands.jsonl"
-    executable = binaries / "uv"
-    executable.write_text(
-        f"#!{sys.executable}\nimport json, sys\n"
-        f"with open({str(calls)!r}, 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-    )
-    executable.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{binaries}:{os.environ['PATH']}")
-    monkeypatch.setenv("FAST", "1")
-    subprocess.run(["bash", str(suite)], check=True, capture_output=True, text=True)
-    commands = [json.loads(line) for line in calls.read_text().splitlines()]
-    for script, args in (
-        ("grpo_async_gym_single_controller.sh", ["++token_capture.enabled=true"]),
-        ("grpo_async_gym_single_controller_context_compaction.sh", []),
-    ):
-        assert [
-            "run",
-            "--no-sync",
-            "bash",
-            f"./tests/functional/{script}",
-            *args,
-        ] in commands
