@@ -236,20 +236,8 @@ Quality documentation is essential for both the usability of NeMo RL and its abi
 
 ## Pull-request reviews
 
-Comment `/review` on a pull request for the formal review service. Use
-`/review mode=strict` for deeper analysis, or add `model=claude` to select a
-Claude reviewer instead of the default Codex reviewer. `/review help` lists
-all options. Reviews are explicitly requested, not automatically run on
-pull-request events.
+Comment `/review` on a pull request for the formal review service. Use `/review mode=strict` for deeper analysis, or add `model=claude` to select a Claude reviewer instead of the default Codex reviewer. `/review help` lists all options. Reviews are explicitly requested, not automatically run on pull-request events.
 
-The retired `/claude review` and `/claude strict-review` commands only reply
-with migration instructions when posted as an exact command by an
-owner, member, or collaborator. Other commenters, bots, and quoted mentions
-do not trigger a notice. These commands never run or automatically request a review.
+The retired `/claude review` and `/claude strict-review` commands only reply with migration instructions when posted as an exact command by an owner, member, or collaborator. Other commenters, bots, and quoted mentions do not trigger a notice. These commands never run or automatically request a review.
 
-Repository review guidance remains in AGENTS.md and
-[the existing team-review skill](skills/review-pr-team/SKILL.md).
-The local `/review-pr` and `/review-pr-team` workflows are unchanged.
-Before relying on repository-specific formal reviews, verify the service's
-profile registration and a Ready snapshot of the protected-main guidance.
-This migration does not register or activate that integration.
+Repository review guidance remains in AGENTS.md and [the existing team-review skill](skills/review-pr-team/SKILL.md). The local `/review-pr-team` workflow is unchanged. Before relying on repository-specific formal reviews, verify the service's profile registration and a Ready snapshot of the protected-main guidance. This migration does not register or activate that integration.
