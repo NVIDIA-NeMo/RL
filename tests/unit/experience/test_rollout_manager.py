@@ -66,6 +66,7 @@ from nemo_rl.experience.rollout_manager import (
 )
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
+    RecoveryTargetLevel,
     RolloutRecoveryLedger,
 )
 from nemo_rl.experience.rollouts import (
@@ -649,8 +650,8 @@ class TestGenerateAndPushFlow:
         buf = _FakeBuffer()
         mgr = _make_manager(buf, _FakeImpl())
         mgr._rollout_recovery_config = RolloutRecoveryConfig(
-            task_source_granularity_overrides={
-                "genrm_compare": RecoveryGranularity.PROMPT_GROUP
+            task_source_target_level_overrides={
+                "genrm_compare": RecoveryTargetLevel.PROMPT_GROUP
             }
         )
         prompt = {
@@ -668,6 +669,7 @@ class TestGenerateAndPushFlow:
 
         assert group.task_source == "genrm_compare"
         assert group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+        assert group.restore_level is RecoveryTargetLevel.PROMPT_GROUP
 
     def test_recovery_mutation_requires_the_controller_barrier(self):
         mgr = _make_manager(_FakeBuffer(), _FakeImpl())
@@ -727,7 +729,7 @@ class TestGenerateAndPushFlow:
                 target_step=0,
                 start_weight_version=0,
                 task_source=None,
-                recovery_granularity=RecoveryGranularity.SIBLING,
+                restore_level=RecoveryTargetLevel.SIBLING,
                 admitted=True,
             ),
         )
@@ -2158,6 +2160,8 @@ def _make_capture_manager(
             generation_indices=None,
             on_completion=None,
             recovery_granularity=RecoveryGranularity.SIBLING,
+            gym_instance_id=None,
+            dispatch_recorder=None,
         ):
             self.seen_rollout_ids = rollout_ids
             self.seen_generation_indices = list(generation_indices or [])
@@ -2209,7 +2213,7 @@ class TestGenerateForFinalizationFlow:
         }
         first = _make_capture_manager(
             _FakeCaptureBuffer(),
-            recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+            recovery_config=RolloutRecoveryConfig(target_level=granularity),
         )
         request = _run(first.generate_for_finalization(prompt))
         assert request.resolved_agent_name == "resolved-agent"
@@ -2300,6 +2304,39 @@ class TestGenerateForFinalizationFlow:
         # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
 
+    def test_a_row_resent_under_a_fresh_attempt_seals_under_its_new_id(self):
+        """A row re-sent after a broken stream reports the re-minted ID, not the first one."""
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+        base_run = mgr._impl.run_rollout
+
+        async def resend_row_1(sample, *, rollout_ids, generation_indices, **kwargs):
+            # What _replace_unreturned_rows and the re-send's submitting() record.
+            (group_id,) = buf._slots
+            async with mgr._recovery_mutation() as cut:
+                mgr._recovery_ledger.replace_dropped_dispatch(
+                    cut, group_id, generation_indices=[1]
+                )
+                mgr._recovery_ledger.mark_group_dispatched(
+                    cut, group_id, generation_indices=[1]
+                )
+            fresh = mgr._recovery_ledger.get_group(group_id).gate_rollout_ids
+            assert fresh[1] != rollout_ids[1]
+            return await base_run(
+                sample,
+                rollout_ids=fresh,
+                generation_indices=generation_indices,
+                **kwargs,
+            )
+
+        mgr._impl.run_rollout = resend_row_1
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        first_ids = buf.reserve_rollout_ids[0]
+        assert request.rollout_ids[0] == first_ids[0]
+        assert request.rollout_ids[1] != first_ids[1]
+
     def test_failed_dispatch_aborts_the_reservation(self):
         buf = _FakeCaptureBuffer()
 
@@ -2327,6 +2364,8 @@ class TestGenerateForFinalizationFlow:
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
+                gym_instance_id=None,
+                dispatch_recorder=None,
             ):
                 del _sample, recovery_granularity
                 generation_index = generation_indices[0]
@@ -2419,7 +2458,7 @@ class TestGenerateForFinalizationFlow:
         mgr = _make_capture_manager(
             buf,
             recovery_config=RolloutRecoveryConfig(
-                default_granularity=RecoveryGranularity.PROMPT_GROUP
+                target_level=RecoveryTargetLevel.PROMPT_GROUP
             ),
         )
         mgr._retry_policy = RolloutRetryPolicy.single_attempt(
@@ -2440,6 +2479,8 @@ class TestGenerateForFinalizationFlow:
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
+                gym_instance_id=None,
+                dispatch_recorder=None,
             ):
                 indices = list(generation_indices)
                 self.generation_indices.append(indices)
@@ -2485,7 +2526,7 @@ class TestGenerateForFinalizationFlow:
 
     def test_prompt_group_restore_redispatches_every_sibling(self):
         recovery_config = RolloutRecoveryConfig(
-            default_granularity=RecoveryGranularity.PROMPT_GROUP
+            target_level=RecoveryTargetLevel.PROMPT_GROUP
         )
         first = _make_capture_manager(
             _FakeCaptureBuffer(), recovery_config=recovery_config
@@ -2504,7 +2545,7 @@ class TestGenerateForFinalizationFlow:
             _FakeCaptureBuffer(),
             # The saved group policy wins over the new process configuration.
             recovery_config=RolloutRecoveryConfig(
-                default_granularity=RecoveryGranularity.SIBLING
+                target_level=RecoveryTargetLevel.SIBLING
             ),
         )
         _with_cut(
@@ -2578,7 +2619,9 @@ def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
     monkeypatch.setattr(f"{__name__}._receipt_record", with_checks)
     mgr = _make_capture_manager(
         _FakeCaptureBuffer(),
-        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+        recovery_config=RolloutRecoveryConfig(
+            target_level=RecoveryTargetLevel(granularity.value)
+        ),
     )
     request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
     assert request.rewards == (0.5, 0.5)

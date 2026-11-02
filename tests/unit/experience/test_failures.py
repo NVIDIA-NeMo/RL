@@ -20,6 +20,8 @@ retries a doomed prompt; misclassifying infra as data fails a recoverable run.
 """
 
 import asyncio
+import sys
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -28,10 +30,16 @@ from multidict import CIMultiDict, CIMultiDictProxy
 from ray import cloudpickle as ray_cloudpickle
 from yarl import URL
 
-from nemo_rl.environments.nemo_gym import _typed_gym_failure
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    _gym_failure_row_error,
+    _typed_gym_failure,
+)
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
+    GymAdmissionClosed,
+    GymRowFailure,
     GymTransportError,
     NoHealthyShards,
     RolloutDataFailure,
@@ -282,3 +290,248 @@ class TestTheRayActorBoundary:
                 GymTransportError,
             )
             assert at_source is http_status_is_infra(status)
+
+
+def _gym_failure_row(
+    *,
+    status: int | None,
+    body: str | None = None,
+    failure_type: str = "ClientResponseError",
+) -> dict[str, object]:
+    """The ``result`` Gym's ``run_examples`` builds for a failed /run in sidecar mode."""
+    return {
+        "_ng_failure_class": "agent_run_error",
+        "_ng_failure_type": failure_type,
+        "_ng_failure_message": f"synthetic {status}",
+        "_ng_failure_http_status": status,
+        "_ng_failure_response_body": body,
+    }
+
+
+_ADMISSION_CLOSED_BODY = (
+    '{"error":{"code":"checkpoint_admission_closed",'
+    '"detail":"agent admission is closed for a checkpoint"}}'
+)
+
+
+@pytest.mark.nemo_gym
+class TestGymFailureRowsKeepTheirRow:
+    """Sidecar failure rows map to the same typed failures, and a refusal names its row."""
+
+    def test_admission_closed_names_its_row_and_survives_the_boundary(self):
+        failure = _gym_failure_row_error(
+            {"_rowidx": 3}, _gym_failure_row(status=409, body=_ADMISSION_CLOSED_BODY)
+        )
+
+        assert isinstance(failure, GymAdmissionClosed)
+        restored = ray_cloudpickle.loads(ray_cloudpickle.dumps(failure))
+        assert isinstance(restored, GymAdmissionClosed)
+        assert restored.rowidx == 3
+        assert "checkpoint_admission_closed" in str(restored)
+        # A raise without a dispatch recorder is retried, never charged as data.
+        assert classify_rollout_failure(restored) is FailureClass.INFRA
+
+    def test_gym_owns_which_failure_classes_mean_no_result(self, monkeypatch):
+        """A class Gym adds to its no-result set is not mistaken for a row that ran."""
+        from nemo_gym import rollout_collection
+
+        row = {**_gym_failure_row(status=503), "_ng_failure_class": "new_gym_class"}
+        assert _gym_failure_row_error({"_rowidx": 0}, row) is None
+
+        monkeypatch.setattr(
+            rollout_collection,
+            "_NO_RESULT_FAILURE_CLASSES",
+            rollout_collection._NO_RESULT_FAILURE_CLASSES | {"new_gym_class"},
+        )
+        assert isinstance(
+            _gym_failure_row_error({"_rowidx": 0}, row), GymTransportError
+        )
+
+    def test_another_409_stays_a_data_failure(self):
+        body = '{"error":{"code":"checkpoint_stale_attempt","detail":"older attempt"}}'
+        failure = _gym_failure_row_error(
+            {"_rowidx": 0}, _gym_failure_row(status=409, body=body)
+        )
+        assert type(failure) is RolloutDataFailure
+
+    @pytest.mark.parametrize("status", [400, 404, 408, 429, 500, 503])
+    def test_http_failures_match_the_exception_path(self, status):
+        """Sidecar mode must not change how an ordinary /run failure is budgeted."""
+        failure = _gym_failure_row_error(
+            {"_rowidx": 0}, _gym_failure_row(status=status)
+        )
+        assert isinstance(failure, GymTransportError) is http_status_is_infra(status)
+        assert str(status) in str(failure)
+
+    def test_no_http_reply_is_transport_unless_the_reply_was_not_json(self):
+        transport = _gym_failure_row_error(
+            {"_rowidx": 0},
+            _gym_failure_row(status=None, failure_type="ServerDisconnectedError"),
+        )
+        undecodable = _gym_failure_row_error(
+            {"_rowidx": 0},
+            _gym_failure_row(status=None, failure_type="JSONDecodeError"),
+        )
+        assert isinstance(transport, GymTransportError)
+        assert type(undecodable) is RolloutDataFailure
+
+    @pytest.mark.parametrize(
+        ("status", "body", "expected"),
+        [
+            (409, _ADMISSION_CLOSED_BODY.encode(), GymAdmissionClosed),
+            (400, b"bad request", RolloutDataFailure),
+            (503, b"unavailable", GymTransportError),
+            (None, None, GymTransportError),
+        ],
+        ids=["admission-closed", "bad-request", "unavailable", "no-reply"],
+    )
+    def test_rows_built_by_gym_map_like_the_hand_built_ones(
+        self, status, body, expected
+    ):
+        """Fail if Gym renames a ``_ng_failure_*`` key this mapping reads."""
+        from nemo_gym.rollout_collection import _agent_request_failure_row
+
+        if status is None:
+            error: BaseException = aiohttp.ServerDisconnectedError()
+        else:
+            request_info = aiohttp.RequestInfo(
+                URL("http://gym/run"), "POST", CIMultiDictProxy(CIMultiDict())
+            )
+            error = aiohttp.ClientResponseError(
+                request_info, (), status=status, message="synthetic"
+            )
+            error.response_content = body
+
+        failure = _gym_failure_row_error(
+            {"_rowidx": 0}, _agent_request_failure_row(error, status)
+        )
+
+        assert type(failure) is expected
+
+    def test_a_reply_whose_body_broke_off_after_200_is_re_sent(self):
+        """Gym stamps the reply's own 200 when only reading its body failed."""
+        failure = _gym_failure_row_error(
+            {"_rowidx": 0},
+            _gym_failure_row(status=200, failure_type="ClientPayloadError"),
+        )
+        assert isinstance(failure, GymTransportError)
+
+    @pytest.mark.parametrize(
+        ("terminal", "expected"),
+        [(True, RolloutDataFailure), (False, GymTransportError)],
+    )
+    def test_an_environment_server_failure_is_re_sent_unless_terminal(
+        self, terminal, expected
+    ):
+        """Gym says a terminal episode must not be attempted again."""
+        failure = _gym_failure_row_error(
+            {"_rowidx": 0},
+            {
+                "_ng_failure_class": "environment_server_failed",
+                "_ng_failure_terminal": terminal,
+                "_ng_failure_message": "Unhandled environment server error",
+            },
+        )
+        assert type(failure) is expected
+        assert "environment server failed the episode" in str(failure)
+
+    def test_a_refusal_as_the_run_s_last_row_still_closes_the_run(self):
+        """The run's timing rides on the refusal when no completed row is left."""
+        actor = object.__new__(NemoGym.__ray_metadata__.modified_class)
+        actor._require_spinup = lambda: None
+        actor._tokenizer = object()
+        actor.cfg = {}
+        actor.head_server_config = None
+        actor._token_capture_enabled = False
+        actor._forest_training = False
+        rows = [{"_rowidx": 0, "agent_ref": {"name": "agent"}}]
+
+        async def refused():
+            return rows[0], _gym_failure_row(status=409, body=_ADMISSION_CLOSED_BODY)
+
+        actor.rch = SimpleNamespace(run_examples=lambda **_: [refused()])
+
+        async def stream() -> list:
+            return [item async for item in actor._stream_rollouts(rows, "timing/t")]
+
+        (item,) = asyncio.run(stream())
+
+        assert isinstance(item, GymAdmissionClosed)
+        assert item.rowidx == 0
+        assert item.timing_metrics is not None
+        assert "timing/t/await_results" in item.timing_metrics
+        assert "timing/t/postprocess_results_pct" not in item.timing_metrics
+
+    def test_a_failed_row_is_yielded_and_the_stream_goes_on(self):
+        """Raising would end the stream while the other rows still run in Gym."""
+        actor = object.__new__(NemoGym.__ray_metadata__.modified_class)
+        actor._require_spinup = lambda: None
+        actor._tokenizer = object()
+        actor.cfg = {}
+        actor.head_server_config = None
+        actor._token_capture_enabled = False
+        actor._forest_training = False
+        rows = [{"_rowidx": index, "agent_ref": {"name": "agent"}} for index in (0, 1)]
+
+        async def failed(row, status):
+            return row, _gym_failure_row(status=status)
+
+        actor.rch = SimpleNamespace(
+            run_examples=lambda **_: [failed(rows[0], 503), failed(rows[1], 400)]
+        )
+
+        async def stream() -> list:
+            return [item async for item in actor._stream_rollouts(rows, "timing/t")]
+
+        first, last = asyncio.run(stream())
+
+        assert isinstance(first, GymRowFailure) and isinstance(last, GymRowFailure)
+        assert (first.rowidx, last.rowidx) == (0, 1)
+        assert isinstance(first.error, GymTransportError)
+        assert isinstance(last.error, RolloutDataFailure)
+        # The run's timing rides on its last row, failed or not.
+        assert first.timing_metrics is None
+        assert last.timing_metrics is not None
+
+    def test_a_row_that_ran_is_not_a_failure(self):
+        assert _gym_failure_row_error({"_rowidx": 0}, {"reward": 1.0}) is None
+
+    def test_a_judge_failure_is_a_scored_row_not_a_transport_failure(self):
+        """Gym's judge failsafe answers 200 with a masked zero-reward row.
+
+        It carries ``_ng_failure_class`` but ran to completion, so re-sending it
+        would hit the same judge and drop the prompt instead of masking one row.
+        """
+        judge_failed = {
+            "reward": 0.0,
+            "mask_sample": True,
+            "failure_kind": "judge_failed",
+            "_ng_failure_class": "judge_failed",
+            "_ng_failure_judge_error": "judge returned no verdict",
+        }
+        assert _gym_failure_row_error({"_rowidx": 0}, judge_failed) is None
+
+    def test_an_agent_run_error_without_an_http_reply_stays_retryable(self):
+        """An agent may answer 200 with its own run error; it holds no rollout."""
+        failure = _gym_failure_row_error(
+            {"_rowidx": 0},
+            {
+                "reward": None,
+                "response": None,
+                "_ng_failure_class": "agent_run_error",
+                "_ng_failure_message": "Hermes response status: failed",
+            },
+        )
+        assert isinstance(failure, GymTransportError)
+
+
+def test_a_row_that_ran_needs_no_nemo_gym_import(monkeypatch):
+    """Every streamed row is checked, including in environments without the extra."""
+    for module in (
+        "nemo_gym",
+        "nemo_gym._checkpoint.errors",
+        "nemo_gym.rollout_collection",
+    ):
+        monkeypatch.setitem(sys.modules, module, None)
+
+    assert _gym_failure_row_error({"_rowidx": 0}, {"reward": 1.0}) is None
