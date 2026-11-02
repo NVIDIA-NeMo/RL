@@ -1625,7 +1625,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
                 "with top-k sampling require policy.generation.top_logprobs >= "
-                "policy.generation.top_k, so the captured head holds the kept set"
+                "policy.generation.top_k, so the captured head holds the kept set. "
+                "See docs/guides/sampler-replay.md#head-size-and-top-p"
             )
 
         automodel_cfg = master_config.policy.get("automodel_cfg")

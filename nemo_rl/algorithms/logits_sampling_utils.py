@@ -90,7 +90,8 @@ def check_top_p_has_top_k(top_k: int | None, top_p: float | None) -> None:
         raise ValueError(
             "top-p replay requires top_k: top_p < 1 requires a positive top_k "
             f"(got top_p={top_p}, top_k={top_k}), since top-p alone does not bound "
-            "the set of tokens the trainer replays."
+            "the set of tokens the trainer replays. See "
+            "docs/guides/sampler-replay.md#head-size-and-top-p"
         )
 
 

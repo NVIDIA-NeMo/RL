@@ -65,6 +65,32 @@ Replay requires:
 - Vocabulary logits: Megatron without fused linear logprobs, or Automodel
   with `tensor_parallel_size=1` and `context_parallel_size=1`.
 
+## Head Size and Top-p
+
+Replay is exact at a position only when the captured head holds all of `S_q`
+there. The setup checks guarantee this at every position: `top_k` bounds
+`S_q`, and `top_logprobs >= top_k` makes the head at least that large.
+
+For mostly top-p sampling, cap the kept set with `top_k` and capture that many
+candidates, as in the example above (`top_k: 64`, `top_logprobs: 64`). vLLM
+applies top-p to the `top_k` most likely tokens. Where those hold nearly all of
+the probability, this samples close to top-p alone; where the distribution is
+flat, `top_k` caps the kept set and the trainer replays that cap. A larger cap
+adds capture time (see [Cost](#cost)).
+
+Top-p without `top_k`, or `top_logprobs < top_k`, is rejected at setup. The
+head could then miss part of `S_q`, and the trainer cannot score such a
+position over the support the sampler drew from, so it would drop the position
+from the loss. Those are the positions where the distribution is flattest, so
+the loss would skip a systematic subset of tokens rather than a negligible one.
+With top-k alone and `top_logprobs < top_k`, only the most peaked positions,
+where the tokens past the head hold almost no probability, would stay in the
+loss.
+
+A position can still exceed its head at runtime: for small batches, vLLM keeps
+every token tied at the `top_k`-th logit. Such positions are dropped from the
+loss and counted in the `policy_support_excluded_tokens` metric.
+
 ## Cost
 
 Replay needs the top-`K` head captured for every generated token, which adds
