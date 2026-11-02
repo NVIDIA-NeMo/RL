@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections import deque
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock
@@ -33,6 +34,7 @@ from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
 from nemo_rl.algorithms.single_controller import (
     RolloutRuntimeState,
     SingleControllerActor,
+    _BelowValidFraction,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
@@ -119,12 +121,15 @@ def _controller(actor: object) -> Any:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
-    ctrl._buffer.remove_group = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(staging_partition="staging"),
+        token_capture=SimpleNamespace(
+            staging_partition="staging",
+            min_valid_fraction_per_group=None,
+            forest_training=False,
+        ),
         grpo=SimpleNamespace(num_prompts_per_step=1),
     )
     ctrl._trainer_version = 3
@@ -170,7 +175,9 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership(
     ctrl = _controller(actor)
     request = _request(resolved_agent_name, attribution_key=attribution_key)
 
-    committed = asyncio.run(ctrl._finalize_with_actor(request, {}))
+    committed = asyncio.run(
+        ctrl._finalize_with_actor(request, {}, target_step=None, replacements_used=0)
+    )
 
     assert committed is result
     assert finalize.calls == [request]
@@ -213,7 +220,11 @@ def test_capture_rollout_metrics_ride_on_the_committed_meta() -> None:
     ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
     metrics = {"agent/rollout_time_taken/mean": 12.5}
 
-    asyncio.run(ctrl._finalize_with_actor(_request(), metrics))
+    asyncio.run(
+        ctrl._finalize_with_actor(
+            _request(), metrics, target_step=None, replacements_used=0
+        )
+    )
 
     committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
     assert committed_meta.extra_info == {"existing": 1, ROLLOUT_METRICS: [metrics]}
@@ -248,7 +259,11 @@ def test_finalizer_token_metrics_and_rollout_metrics_share_one_sidecar(
     result = _token_metrics_result(token_metrics)
     ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
 
-    asyncio.run(ctrl._finalize_with_actor(_request(), rollout_metrics))
+    asyncio.run(
+        ctrl._finalize_with_actor(
+            _request(), rollout_metrics, target_step=None, replacements_used=0
+        )
+    )
 
     committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
     assert committed_meta.extra_info[ROLLOUT_METRICS] == [
@@ -262,7 +277,12 @@ def test_overlapping_finalizer_and_rollout_metrics_fail_the_commit() -> None:
 
     with pytest.raises(RuntimeError, match="both report"):
         asyncio.run(
-            ctrl._finalize_with_actor(_request(), {"gen_tokens_per_sample/mean": 1.0})
+            ctrl._finalize_with_actor(
+                _request(),
+                {"gen_tokens_per_sample/mean": 1.0},
+                target_step=None,
+                replacements_used=0,
+            )
         )
     ctrl._buffer.commit_finalized.assert_not_awaited()
 
@@ -336,6 +356,8 @@ def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
             ctrl._finalize_with_actor(
                 _request(None if outcome == "missing_route" else "image_agent"),
                 {},
+                target_step=None,
+                replacements_used=0,
             )
         )
         try:
@@ -401,105 +423,139 @@ def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
     asyncio.run(exercise())
 
 
-def test_below_threshold_group_releases_pending_finalizer_state() -> None:
-    """A committed group dropped for min_valid_fraction_per_group leaves no state."""
-    meta = KVBatchMeta(
-        partition_id="canonical",
-        task_name="train",
-        sample_ids=["group_g0"],
-        fields=["input_ids"],
-        sequence_lengths=[3],
-        tags=[{"weight_version": 3}],
-    )
-    result = FinalizedGroup(
-        meta=meta,
+def _below_threshold_result() -> FinalizedGroup:
+    # One of two rollouts verified: 0.5 < the 0.75 bar set by _below_threshold.
+    return FinalizedGroup(
+        meta=KVBatchMeta(
+            partition_id="canonical",
+            task_name="train",
+            sample_ids=["group_g0", "group_g1"],
+            fields=["input_ids"],
+            sequence_lengths=[3, 3],
+            tags=[{"weight_version": 3}, {"weight_version": 3}],
+        ),
         group_min_wv=3,
         group_max_wv=3,
         staging_keys=["group_g0/call"],
-        metrics={"finalize/invalid_row_rate": 0.0},
+        metrics={"finalize/invalid_row_rate": 0.5},
         reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
+        valid_row_count=1,
+        total_row_count=2,
     )
-    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
-    request = _request()
-
-    async def _below_threshold_branch() -> None:
-        # The same calls the rollout pump makes when
-        # valid_row_count / total_row_count < min_valid_fraction_per_group.
-        assert await ctrl._finalize_with_actor(request, {}) is result
-        assert "group" in ctrl._rollout_runtime.finalizer_metrics_by_group
-        assert "group" in ctrl._rollout_runtime.finalizer_rewards_by_group
-        assert await ctrl._discard_committed_group(request) is True
-
-    asyncio.run(_below_threshold_branch())
-
-    ctrl._buffer.remove_group.assert_awaited_once_with("group")
-    ctrl._buffer.abort.assert_called_once_with("group")
-    assert "group" not in ctrl._rollout_runtime.finalizer_metrics_by_group
-    assert "group" not in ctrl._rollout_runtime.finalizer_rewards_by_group
 
 
-def test_discarded_committed_group_leaves_no_ready_slot_in_the_buffer() -> None:
-    """abort() skips ready slots, so discarding must remove the committed slot itself."""
-    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize()))
-    buffer = TQReplayBuffer(
-        ctrl._dp_client,
+def _below_threshold(ctrl: Any, *, spares: list[dict[str, Any]]) -> None:
+    ctrl._master_config.token_capture.min_valid_fraction_per_group = 0.75
+    ctrl._async_cfg = SimpleNamespace(
+        rollout_failure=SimpleNamespace(
+            on_dropped_prompt="replace", max_replacement_attempts=1
+        )
+    )
+    ctrl._rollout_runtime.replacement_reserve = deque(spares)
+    ctrl._rollout_runtime.batch_shortfall = {}
+    ctrl._rollout_runtime.sampler_stamps_target_steps = True
+    ctrl._rollout_recovery_enabled = True
+
+
+class _ReadyWatchingClient(_DataPlaneClient):
+    """Records whether any replay slot was ready while rows were being cleared."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buffer: TQReplayBuffer | None = None
+        self.ready_during_clear: list[bool] = []
+
+    async def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
+        assert self.buffer is not None
+        self.ready_during_clear.append(any(self.buffer.ready_list))
+        await asyncio.sleep(0)  # let any other task run mid-cleanup
+        await super().clear_samples(sample_ids=sample_ids, partition_id=partition_id)
+
+
+def test_below_threshold_group_never_becomes_selectable() -> None:
+    """A rejected group leaves the buffer without ever being marked ready."""
+    enricher_calls: list[str] = []
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_below_threshold_result()))
+    )
+    _below_threshold(ctrl, spares=[])
+    client = _ReadyWatchingClient()
+    ctrl._dp_client = client
+    ctrl._buffer = TQReplayBuffer(
+        client,
         partition_id="canonical",
         pad_value_dict={"token_ids": 0},
         include_message_violation_fields=False,
         require_routed_experts=False,
     )
-    buffer.set_data_plane_checkpoint_barrier(ctrl._data_plane_checkpoint_barrier)
-    ctrl._buffer = buffer
-    request = _request()
-    meta = KVBatchMeta(
-        partition_id="canonical",
-        task_name=None,
-        sample_ids=list(request.canonical_sample_ids),
-        fields=None,
+    client.buffer = ctrl._buffer
+    ctrl._buffer.set_data_plane_checkpoint_barrier(ctrl._data_plane_checkpoint_barrier)
+
+    async def _enrich(meta: KVBatchMeta, extra_env_info: Any) -> None:
+        enricher_calls.append(meta.sample_ids[0])
+
+    ctrl._buffer.set_post_write_enricher(_enrich)
+    ctrl._buffer.reserve(weight_version=3, target_step=3, group_id="group")
+
+    outcome = asyncio.run(
+        ctrl._finalize_with_actor(_request(), {}, target_step=3, replacements_used=0)
     )
 
-    async def _commit_then_discard() -> None:
-        buffer.reserve(
-            weight_version=3,
-            group_id=request.group_id,
-            rollout_ids=list(request.rollout_ids),
-        )
-        async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
-            await buffer.commit_finalized(cut, request.group_id, meta, 3, 3)
-        assert buffer.size() == 1
-        assert await ctrl._discard_committed_group(request) is True
-
-    asyncio.run(_commit_then_discard())
-
-    assert buffer.size() == 0
-
-
-def test_discard_yields_to_a_group_the_train_pump_already_claimed() -> None:
-    """Claiming removes the slot, after which remove_group raises for it.
-
-    Mutation cuts do not exclude one another, so the train pump can claim a ready group
-    while the discard waits on the barrier. Treating that ValueError as a cleanup
-    failure would turn a benign race into a fatal RuntimeError, and clearing the rows
-    anyway would pull them out from under a step that is already running.
-    """
-    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize()))
-    ctrl._buffer.remove_group = AsyncMock(
-        side_effect=ValueError("unknown group_ids=['group']")
+    assert outcome == _BelowValidFraction(
+        valid_count=1,
+        total_count=2,
+        replacement=None,
+        lineage_group_id=None,
+        reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
     )
-    request = _request()
-    ctrl._rollout_runtime.finalizer_metrics_by_group["group"] = {
-        "finalize/invalid_row_rate": 0.0
-    }
-    ctrl._rollout_runtime.finalizer_rewards_by_group["group"] = []
+    assert ctrl._buffer.group_ids == ()
+    assert client.ready_during_clear == [False, False]
+    assert client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+    # Never committed: no enrichment, no pending metrics, and the step was
+    # credited short because no spare was left.
+    assert enricher_calls == []
+    assert "group" not in ctrl._rollout_runtime.finalizer_metrics_by_group
+    assert "group" not in ctrl._rollout_runtime.finalizer_rewards_by_group
+    assert ctrl._rollout_runtime.batch_shortfall == {3: 1}
+    assert ctrl._available_finalizers.qsize() == 1
 
-    assert asyncio.run(ctrl._discard_committed_group(request)) is False
 
-    ctrl._buffer.abort.assert_not_called()
-    assert ctrl._dp_client.clear_calls == [], "rows belong to the claiming step"
-    # The claiming step consumes the group, so its post-step release still reaches
-    # these; popping them here would drop metrics the trainer is about to report.
-    assert "group" in ctrl._rollout_runtime.finalizer_metrics_by_group
-    assert "group" in ctrl._rollout_runtime.finalizer_rewards_by_group
+def test_below_threshold_replacement_is_reserved_in_the_cleanup_cut() -> None:
+    """The rejected group's ledger discard and its spare's reservation share a cut."""
+    spare = {"idx": 99}
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_below_threshold_result()))
+    )
+    _below_threshold(ctrl, spares=[spare])
+    ctrl._rollout_recovery_ledger.__contains__.return_value = True
+    ctrl._rollout_manager.reserve_prompt_group.return_value = "spare-group"
+
+    outcome = asyncio.run(
+        ctrl._finalize_with_actor(_request(), {}, target_step=3, replacements_used=0)
+    )
+
+    assert outcome == _BelowValidFraction(
+        valid_count=1,
+        total_count=2,
+        replacement=spare,
+        lineage_group_id="spare-group",
+        reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
+    )
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    ctrl._buffer.abort.assert_called_once_with("group")
+    (discard_cut, discarded), _ = ctrl._rollout_recovery_ledger.discard_group.call_args
+    (reserve_cut, reserved), kwargs = (
+        ctrl._rollout_manager.reserve_prompt_group.call_args
+    )
+    assert discarded == "group"
+    assert reserved is spare
+    assert kwargs == {"target_step": 3}
+    assert reserve_cut is discard_cut
+    assert not ctrl._rollout_runtime.replacement_reserve
+    assert ctrl._rollout_runtime.batch_shortfall == {}
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:
@@ -509,7 +565,11 @@ def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> Non
     request = _request()
 
     with pytest.raises(RuntimeError, match="actor died after submission"):
-        asyncio.run(ctrl._finalize_with_actor(request, {}))
+        asyncio.run(
+            ctrl._finalize_with_actor(
+                request, {}, target_step=None, replacements_used=0
+            )
+        )
 
     assert finalize.calls == [request]
     assert ctrl._available_finalizers.empty()
@@ -532,7 +592,11 @@ def test_missing_actor_metadata_cleans_known_canonical_and_staging_ownership() -
     ctrl = _controller(actor)
 
     with pytest.raises(RuntimeError, match="no metadata for non-dropped group"):
-        asyncio.run(ctrl._finalize_with_actor(_request(), {}))
+        asyncio.run(
+            ctrl._finalize_with_actor(
+                _request(), {}, target_step=None, replacements_used=0
+            )
+        )
 
     assert ctrl._dp_client.clear_calls == [
         {"sample_ids": ["group_g0"], "partition_id": "canonical"},
@@ -562,7 +626,9 @@ def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
     actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
     ctrl = _controller(actor)
 
-    committed = asyncio.run(ctrl._finalize_with_actor(_request(), {}))
+    committed = asyncio.run(
+        ctrl._finalize_with_actor(_request(), {}, target_step=None, replacements_used=0)
+    )
 
     assert committed is None
     assert ctrl._dp_client.clear_calls == [
