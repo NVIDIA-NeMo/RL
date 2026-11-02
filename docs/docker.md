@@ -33,6 +33,12 @@ docker buildx build --build-context nemo-rl=. -f docker/Dockerfile \
 > [!NOTE]
 > The `--tag <registry>/nemo-rl:latest --push` flags are not necessary if you just want to build locally.
 
+## uv Cache Pruning
+
+The release image ships `uv`'s download cache (`/opt/nemo_rl_cache/uv`) so an unprivileged runtime user can later run `uv run --extra <backend>` fully offline. Each build starts that cache from a BuildKit cache mount (seeded from the `uv-cache` registry image), and `uv` only ever adds to it: it never removes a version a prior `uv.lock` pinned and the current one doesn't. The seed export's `uv cache prune --ci` drops prebuilt wheels but keeps every version ever built from source, and a long-lived builder's cache mount keeps everything.
+
+Right after that cache is restored, before any `uv sync`, `docker/prune_uv_cache.py` removes exactly those superseded entries: index wheels and source builds whose `(package, version)` the current `uv.lock` no longer pins, and git builds/checkouts for commits it no longer pins, across every extra (installed in this build or not). Running first means it only judges restored content, so the build-isolation dependencies the syncs resolve outside `uv.lock` (setuptools, a build-time torch, ...) are kept. It runs in the same layer the syncs fill, because deleting files in a later layer only hides them and the image still ships them, and the result is synced back into the cache mount. It never removes a wheel the offline-install promise depends on, since that promise is itself "every wheel `uv.lock` could need." This runs automatically on every build; there is no flag to disable it.
+
 ## Skipping vLLM or SGLang Dependencies
 
 If you don't need vLLM, SGLang, or TRT-LLM support, you can skip building those dependencies to reduce build time and image size. Use the `SKIP_VLLM_BUILD`, `SKIP_SGLANG_BUILD`, and/or `SKIP_TRTLLM_BUILD` build arguments:
