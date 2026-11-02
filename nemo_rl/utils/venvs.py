@@ -143,7 +143,10 @@ def nrl_timing(msg: str) -> None:
         return
     import datetime
 
-    print(f"[NRL_TIMING] {datetime.datetime.now().astimezone().isoformat(timespec='milliseconds')} {msg}", flush=True)
+    print(
+        f"[NRL_TIMING] {datetime.datetime.now().astimezone().isoformat(timespec='milliseconds')} {msg}",
+        flush=True,
+    )
 
 
 # Ray-based helper to create a virtual environment on each Ray node
@@ -190,7 +193,6 @@ def _env_builder(
         # Clean up the started file
         if started_file.exists():
             started_file.unlink()
-
 
 
 @ray.remote(num_cpus=1)  # pragma: no cover
@@ -241,12 +243,16 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
         for i, _ in enumerate(nodes)
     ]
     t_sub = time.time()
-    nrl_timing(f"venv_prep submitted venv={venv_name} tasks={len(refs)} secs={t_sub - t_pg:.2f}")
+    nrl_timing(
+        f"venv_prep submitted venv={venv_name} tasks={len(refs)} secs={t_sub - t_pg:.2f}"
+    )
     # Collect as they finish, recording when each did
     done_at = []
     remaining = list(refs)
     while remaining:
-        ready, remaining = ray.wait(remaining, num_returns=min(len(remaining), 64), timeout=None)
+        ready, remaining = ray.wait(
+            remaining, num_returns=min(len(remaining), 64), timeout=None
+        )
         done_at.extend([time.time() - t_sub] * len(ready))
     results = ray.get(refs)
     t_done = time.time()
@@ -260,12 +266,14 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
 
     nrl_timing(
         f"venv_prep tasks_done venv={venv_name} secs_since_submit={t_done - t_sub:.2f} "
-        f"task_wall p50={q(spans, .5):.2f} p90={q(spans, .9):.2f} max={spans[-1]:.2f} "
-        f"task_start_lag p50={q(lags, .5):.2f} p90={q(lags, .9):.2f} max={lags[-1]:.2f} "
-        f"completion_offset p50={q(sorted(done_at), .5):.2f} max={max(done_at):.2f}"
+        f"task_wall p50={q(spans, 0.5):.2f} p90={q(spans, 0.9):.2f} max={spans[-1]:.2f} "
+        f"task_start_lag p50={q(lags, 0.5):.2f} p90={q(lags, 0.9):.2f} max={lags[-1]:.2f} "
+        f"completion_offset p50={q(sorted(done_at), 0.5):.2f} max={max(done_at):.2f}"
     )
     slow = sorted(results, key=lambda r: r[2] - r[1], reverse=True)[:3]
-    nrl_timing("venv_prep slowest " + " ".join(f"{r[3]}={r[2] - r[1]:.2f}s" for r in slow))
+    nrl_timing(
+        "venv_prep slowest " + " ".join(f"{r[3]}={r[2] - r[1]:.2f}s" for r in slow)
+    )
     # Normalize paths to handle double slashes and other path inconsistencies
     normalized_paths = [os.path.normpath(p) for p in paths]
     assert len(set(normalized_paths)) == 1, (

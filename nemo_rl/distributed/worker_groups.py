@@ -557,7 +557,9 @@ class RayWorkerGroup:
         # can join the venv instead of landing in the driver's environment.
         self.py_executable = py_executable
 
-        nrl_timing(f"worker_group venv_resolved group={self.name_prefix} secs_since_enter={time.time() - _t_enter:.2f}")
+        nrl_timing(
+            f"worker_group venv_resolved group={self.name_prefix} secs_since_enter={time.time() - _t_enter:.2f}"
+        )
 
         # Count total workers
         self.world_size = sum(len(indices) for _, indices in bundle_indices_list)
@@ -780,7 +782,7 @@ class RayWorkerGroup:
             _d = sorted(_done_at)
             nrl_timing(
                 f"worker_group workers_ready group={self.name_prefix} n={len(_d)} "
-                f"first={_d[0]:.2f} p50={_d[len(_d) // 2]:.2f} p90={_d[int(.9 * len(_d))]:.2f} last={_d[-1]:.2f} "
+                f"first={_d[0]:.2f} p50={_d[len(_d) // 2]:.2f} p90={_d[int(0.9 * len(_d))]:.2f} last={_d[-1]:.2f} "
                 f"total_secs_since_enter={time.time() - _t_enter:.2f}"
             )
 
