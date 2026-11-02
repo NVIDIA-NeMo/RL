@@ -48,7 +48,7 @@ def _request() -> ReassemblyRequest:
         canonical_sample_ids=("group_g0",),
         receipts=(
             {
-                "rollout_id": "group_g0",
+                "capture_key": "group_g0",
                 "manifest": [
                     {
                         "call_id": "call",
@@ -110,6 +110,8 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         loss_multiplier=0.25,
         infra_failure=[True],
         canonical_sample_ids=["group_g0"],
+        logical_selections=None,
+        execution_row_multiple=1,
         reward_checks=None,
         reward_log_contexts=None,
     )
@@ -146,6 +148,7 @@ def test_actor_forwards_capture_media_to_the_reassembler(
         router_replay_enabled=False,
         defer_routed_experts_to_policy=False,
         max_seq_len=4096,
+        top_logprobs=0,
         capture_media=capture_media,
         media_columns=(
             MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=16)
@@ -193,6 +196,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        "logical_selections",
+        "execution_row_multiple",
         "resolved_agent_name",
         "infra_failure",
         "reward_checks",
@@ -262,6 +267,7 @@ def test_factory_selects_gym_environment_and_waits_for_dependencies(
         max_seq_len=4096,
         capture_media=False,
         media_columns=None,
+        top_logprobs=0,
     )
     dp_config = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
     actors = [MagicMock(), MagicMock()]

@@ -23,7 +23,7 @@ import uuid
 import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
+from typing import Literal, TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -37,6 +37,8 @@ from nemo_rl.data.captured_media import (
     MediaCaptureRejected,
     MediaColumnSpec,
     capture_processed_media,
+    verified_media_items,
+    verify_media_geometry,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
@@ -54,6 +56,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.score_centering import validate_score_centering_request
 from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
     CapturedChatLogprobsMixin,
 )
@@ -67,6 +70,7 @@ from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    attach_sampler_topk_logprobs_to_chat_response_choices,
     format_prompt_for_vllm_generation,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
@@ -74,6 +78,7 @@ from nemo_rl.models.generation.vllm.utils import (
     remap_multimodal_placeholders,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+from nemo_rl.models.generation.capture_context import decide_capture_input
 from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
     splice_prefix_tokens,
@@ -143,9 +148,16 @@ class _AsyncLLMHTTPClient:
     Add each new member here and decide whether it must run on the engine loop.
     """
 
-    def __init__(self, engine_client: Any, engine_loop: asyncio.AbstractEventLoop):
+    def __init__(
+        self,
+        engine_client: Any,
+        engine_loop: asyncio.AbstractEventLoop,
+        *,
+        flat_logprobs: bool,
+    ):
         self._engine_client = engine_client
         self._engine_loop = engine_loop
+        self._flat_logprobs = flat_logprobs
         self.model_config = engine_client.model_config
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
@@ -169,6 +181,14 @@ class _AsyncLLMHTTPClient:
         request_id: str,
         **kwargs: Any,
     ) -> AsyncGenerator[Any, None]:
+        # Flat logprobs avoid per-token Logprob objects that cause long GC pauses.
+        # Not for prompt logprobs: vLLM's -inf clamp edits copies of flat storage.
+        if (
+            self._flat_logprobs
+            and sampling_params.logprobs is not None
+            and sampling_params.prompt_logprobs is None
+        ):
+            sampling_params.flat_logprobs = True
         return self._generate(prompt, sampling_params, request_id, kwargs)
 
     async def _generate(
@@ -297,6 +317,9 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache
 
         self._chain_prefix = ChainPrefixCache()
+        # policy.generation.top_logprobs: sampler top-k log-probs staged next to each
+        # captured call's delta; 0 leaves captured calls as they are.
+        self._capture_top_logprobs = 0
 
         super().__init__(
             config,
@@ -417,6 +440,19 @@ class VllmAsyncGenerationWorkerImpl(
         self.llm = AsyncLLM.from_engine_args(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
+        # Keep vLLM's output loops from monopolizing this actor's event loop under a
+        # generation backlog (see install_output_loop_yield).
+        output_loop_yield_budget_ms = self.cfg["vllm_cfg"].get(
+            "output_loop_yield_budget_ms"
+        )
+        if output_loop_yield_budget_ms is not None:
+            from nemo_rl.models.generation.vllm.patches import (
+                install_output_loop_yield,
+            )
+
+            install_output_loop_yield(
+                self.llm, reader_budget_s=output_loop_yield_budget_ms / 1000
+            )
 
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
@@ -572,7 +608,11 @@ class VllmAsyncGenerationWorkerImpl(
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
         if self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
-            self._http_engine_client = _AsyncLLMHTTPClient(self.llm, self._engine_loop)
+            self._http_engine_client = _AsyncLLMHTTPClient(
+                self.llm,
+                self._engine_loop,
+                flat_logprobs=bool(self.cfg["vllm_cfg"].get("flat_logprobs")),
+            )
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
@@ -596,6 +636,7 @@ class VllmAsyncGenerationWorkerImpl(
         staging_partition: str,
         *,
         capture_media: bool = False,
+        top_logprobs: int = 0,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -605,6 +646,7 @@ class VllmAsyncGenerationWorkerImpl(
         vLLM adapter into this worker. Returns the media column spec this
         worker pinned the staging column to (``None`` for text-only capture
         and on non-model-owner ranks, which serve no HTTP and install nothing).
+        ``top_logprobs`` > 0 stages sampler top-k log-probs.
         """
         if not self.is_model_owner:
             return None
@@ -628,6 +670,7 @@ class VllmAsyncGenerationWorkerImpl(
             capture_media=capture_media,
             media_pixel_dtype=pixel_dtype,
         )
+        self._capture_top_logprobs = int(top_logprobs)
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,
@@ -721,12 +764,16 @@ class VllmAsyncGenerationWorkerImpl(
         ``prev_len``; violations raise ``CaptureError`` before any state is kept.
         """
         capture = self.token_capture
-        if capture is None:
+        if capture is None or getattr(request, "ng_measure_only", False):
             return
         if admission is None:
             admission = self._capture_admission(request)
             if admission is None:
                 return
+        if self._capture_top_logprobs:
+            validate_score_centering_request(
+                request, num_candidates=self._capture_top_logprobs
+            )
         call = capture.begin_call(
             admission,
             prefix_token_ids=prefix_token_ids,
@@ -742,6 +789,7 @@ class VllmAsyncGenerationWorkerImpl(
         *,
         admission: Any | None,
         splice: PrefixSplice | None = None,
+        verify_retained_media: bool = False,
     ) -> CapturedMedia | None:
         """Run off-loop: resolve retained geometry and snapshot processed pixels."""
         if admission is None:
@@ -753,6 +801,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
             return None
         retained: tuple[CapturedMediaItem, ...] = ()
+        retained_tensors = () if verify_retained_media else None
         if admission.parent_call_id is not None:
             # Optional Gym dependency: this method only runs on captured calls.
             # Gym owns the media_spans key its adapter copies into the extras.
@@ -766,7 +815,8 @@ class VllmAsyncGenerationWorkerImpl(
             try:
                 if admission.staging_chain:
                     calls = source.fetch_for_finalization(
-                        list(admission.staging_chain), include_route_fragments=False
+                        list(admission.staging_chain),
+                        include_route_fragments=verify_retained_media,
                     )
                 else:
                     # Inline token admissions still have receipt-owned parent keys.
@@ -777,8 +827,8 @@ class VllmAsyncGenerationWorkerImpl(
                             raise MediaCaptureRejected("Cycle in retained media chain")
                         visited.add(parent)
                         call = source.fetch_for_finalization(
-                            [staging_key(admission.rollout_id, parent)],
-                            include_route_fragments=False,
+                            [staging_key(admission.capture_key, parent)],
+                            include_route_fragments=verify_retained_media,
                         )[0]
                         calls.append(call)
                         parent = call.snapshot.parent_call_id
@@ -791,7 +841,7 @@ class VllmAsyncGenerationWorkerImpl(
             for call in calls:
                 snapshot = call.snapshot
                 if (
-                    snapshot.rollout_id != admission.rollout_id
+                    snapshot.capture_key != admission.capture_key
                     or snapshot.parent_call_id != parent
                     or snapshot.prev_len != length
                     or snapshot.chain_hash
@@ -811,18 +861,35 @@ class VllmAsyncGenerationWorkerImpl(
                 raise MediaCaptureRejected(
                     "Retained image chain does not match capture admission"
                 )
-            retained_items = []
+            descriptors = {}
             for call in calls:
-                extras = call.extras or {}
-                if MEDIA_SPANS_FIELD not in extras:
-                    raise MediaCaptureRejected("Retained vLLM media spans are missing")
-                for value in extras[MEDIA_SPANS_FIELD]:
-                    item = CapturedMediaItem.from_dict(value)
-                    item.verify_tokens(
-                        call.snapshot.token_ids_delta, origin=call.snapshot.prev_len
+                if verify_retained_media:
+                    items = verified_media_items(call)
+                else:
+                    extras = call.extras or {}
+                    if MEDIA_SPANS_FIELD not in extras:
+                        raise MediaCaptureRejected(
+                            "Retained vLLM media spans are missing"
+                        )
+                    items = tuple(
+                        CapturedMediaItem.from_dict(value)
+                        for value in extras[MEDIA_SPANS_FIELD]
                     )
-                    retained_items.append(item)
-            retained = tuple(retained_items)
+                    for item in items:
+                        item.verify_tokens(
+                            call.snapshot.token_ids_delta, origin=call.snapshot.prev_len
+                        )
+                descriptors[call.snapshot.model_call_id] = items
+            retained = tuple(item for items in descriptors.values() for item in items)
+            if verify_retained_media:
+                media_calls = [call for call in calls if call.media_present]
+                retained_tensors = (
+                    tuple(source.fetch_media(media_calls)) if media_calls else ()
+                )
+                for call, tensors in zip(media_calls, retained_tensors, strict=True):
+                    verify_media_geometry(
+                        descriptors[call.snapshot.model_call_id], tensors
+                    )
         return capture_processed_media(
             engine_prompt,
             prev_len=admission.prev_len,
@@ -830,6 +897,7 @@ class VllmAsyncGenerationWorkerImpl(
             splice=splice,
             image_token_id=self._capture_image_token_id,
             patch_size=self._capture_patch_size,
+            retained_tensors=retained_tensors,
         )
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
@@ -910,7 +978,19 @@ class VllmAsyncGenerationWorkerImpl(
         coords vouch for both and any failure is ``capture_failed`` at call
         time. Token ids, logprobs, and routes are stripped after staging, so
         the worker->gate hop carries the completion and coords only.
+        Sampler tensors ride as opaque attachments in that same staging write.
         """
+        sampler_topk = None
+        for choice in content.get("choices") or []:
+            message = choice.get("message")
+            if isinstance(message, dict) and (
+                "sampler_topk_token_ids" in message
+                or "sampler_topk_logprobs" in message
+            ):
+                sampler_topk = (
+                    message.pop("sampler_topk_token_ids", None),
+                    message.pop("sampler_topk_logprobs", None),
+                )
         state = self._capture_calls.pop(id(request), None)
         if state is None:
             return content
@@ -939,11 +1019,22 @@ class VllmAsyncGenerationWorkerImpl(
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
-        coords = self.token_capture.complete_call_from_response(
-            call,
-            payload,
-            attachments=state.media.tensors if state.media is not None else None,
-        )
+        attachments = dict(state.media.tensors or {}) if state.media is not None else {}
+        if sampler_topk is not None:
+            attachments.update(
+                sampler_topk_token_ids=sampler_topk[0],
+                sampler_topk_logprobs=sampler_topk[1],
+            )
+        if self._capture_top_logprobs > 0 and sampler_topk is None:
+            coords = self.token_capture.fail_call(
+                call, reason="missing sampler top-k tensors"
+            )
+        else:
+            coords = self.token_capture.complete_call_from_response(
+                call,
+                payload,
+                attachments=attachments or None,
+            )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
@@ -965,6 +1056,16 @@ class VllmAsyncGenerationWorkerImpl(
         state = self._capture_calls.pop(id(request), None)
         if state is not None and self.token_capture is not None:
             self.token_capture.fail_call(state.call, reason=reason)
+
+    def _context_refusal_headers(self, request: Any) -> dict[str, str]:
+        """Acknowledge a validation refusal after draining capture state, before staging."""
+        admission = self._capture_admission(request)
+        if admission is None:
+            return {}
+        # Deferred: Gym is optional outside framework-owned capture.
+        from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
+
+        return {CAPTURE_REFUSAL_HEADER: admission.model_call_id}
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
@@ -999,6 +1100,7 @@ class VllmAsyncGenerationWorkerImpl(
         )
         from vllm.entrypoints.serve.utils.api_utils import with_cancellation
         from vllm.renderers.online_renderer import OnlineRenderer
+        from vllm.renderers.hf import HfRenderer
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
@@ -1155,10 +1257,38 @@ class VllmAsyncGenerationWorkerImpl(
                 # prefix to the request, so the inline-prefix branch below is
                 # the single splice path for staged and inline prefixes.
                 admission = worker_self._capture_admission(request)
+                serving_admission = admission
+                verify_retained_media = False
+                if admission is not None and (
+                    admission.mode == "candidate"
+                    or admission.request_replay is not None
+                ):
+                    # Inline assistant token fields cannot override RL's decision.
+                    request.required_prefix_token_ids = None
+                    decision = decide_capture_input(
+                        admission,
+                        messages=messages_for_replace_prefix_tokens,
+                        # HF/string parsing maps null and empty tool content to
+                        # identical template inputs. Structured content and
+                        # other renderers cannot authorize that equivalence.
+                        allow_empty_tool_content=(
+                            type(self.renderer) is HfRenderer
+                            and bool(res[0])
+                            and all(
+                                isinstance(item.get("content"), str) for item in res[0]
+                            )
+                        ),
+                    )
+                    admission = decision.storage
+                    serving_admission = decision.serving
+                    verify_retained_media = decision.verify_retained_media
                 capture_prefix_token_ids: list[int] | None = None
-                if admission is not None and admission.mode == "token_in":
+                if (
+                    serving_admission is not None
+                    and serving_admission.mode == "token_in"
+                ):
                     capture_prefix_token_ids = await asyncio.to_thread(
-                        worker_self._resolve_admission_prefix, admission
+                        worker_self._resolve_admission_prefix, serving_admission
                     )
                     worker_self._enter_request_prefix(request, capture_prefix_token_ids)
 
@@ -1179,6 +1309,7 @@ class VllmAsyncGenerationWorkerImpl(
                         worker_self._capture_request_media,
                         res[1][0],
                         admission=admission,
+                        verify_retained_media=verify_retained_media,
                     )
                     worker_self._begin_request_capture(
                         request,
@@ -1246,8 +1377,9 @@ class VllmAsyncGenerationWorkerImpl(
                 media = await asyncio.to_thread(
                     worker_self._capture_request_media,
                     engine_prompt,
-                    admission=admission,
+                    admission=serving_admission,
                     splice=splice,
+                    verify_retained_media=verify_retained_media,
                 )
                 # Must precede the reassignment below: the remap reads the
                 # current value of prompt_token_ids as the template-coordinate
@@ -1273,7 +1405,11 @@ class VllmAsyncGenerationWorkerImpl(
                     request,
                     final_prompt_token_ids,
                     admission=admission,
-                    prefix_token_ids=capture_prefix_token_ids,
+                    prefix_token_ids=(
+                        capture_prefix_token_ids
+                        if admission is not None and admission.mode == "token_in"
+                        else None
+                    ),
                     media=media,
                 )
 
@@ -1289,7 +1425,7 @@ class VllmAsyncGenerationWorkerImpl(
         ):
             required_prefix_token_ids: Optional[List[int]] = None
             # Ledger-authoritative token capture: the call identity the ledger
-            # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
+            # attaches (capture_key, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
@@ -1371,6 +1507,14 @@ class VllmAsyncGenerationWorkerImpl(
                         response,
                         final_res,
                     )
+                    if request.ng_capture and worker_self._capture_top_logprobs:
+                        # Extraction scales with completion length and K.
+                        response = await asyncio.to_thread(
+                            attach_sampler_topk_logprobs_to_chat_response_choices,
+                            response,
+                            final_res,
+                            top_k=worker_self._capture_top_logprobs,
+                        )
 
                 if worker_self._return_routed_experts_enabled():
                     response = attach_routed_experts_to_chat_response_choices(
@@ -1534,6 +1678,7 @@ class VllmAsyncGenerationWorkerImpl(
                         }
                     },
                     status_code=400,
+                    headers=worker_self._context_refusal_headers(request),
                 )
             except MediaCaptureRejected as e:
                 # Raised inside preprocess_chat before begin_call, so no capture
@@ -1580,6 +1725,14 @@ class VllmAsyncGenerationWorkerImpl(
                         }
                     },
                     status_code=400,
+                    # Only vLLM's known pre-generation get_max_tokens refusal
+                    # can settle capture; an arbitrary ValueError cannot.
+                    headers=(
+                        worker_self._context_refusal_headers(request)
+                        if str(e).startswith("Input length (")
+                        and "exceeds model's maximum context length" in str(e)
+                        else None
+                    ),
                 )
             except asyncio.CancelledError:
                 # Client disconnected (see with_cancellation above). A cancel
@@ -1631,6 +1784,8 @@ class VllmAsyncGenerationWorkerImpl(
             NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest
         ):
             required_prefix_token_ids: Optional[List[int]] = None
+            ng_capture: Optional[dict[str, Any]] = None
+            ng_measure_only: Literal[True] = True
 
         NeMoRLTokenizeRequest = Union[
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
@@ -1669,6 +1824,16 @@ class VllmAsyncGenerationWorkerImpl(
                     content=generator.model_dump(), status_code=generator.error.code
                 )
             elif isinstance(generator, TokenizeResponse):
+                if (
+                    isinstance(request, NeMoRLTokenizeChatRequest)
+                    and request.ng_capture is not None
+                ):
+                    return JSONResponse(
+                        content={
+                            "prompt_token_count": generator.count,
+                            "ng_context_measured": True,
+                        }
+                    )
                 return JSONResponse(content=generator.model_dump())
 
         ########################################

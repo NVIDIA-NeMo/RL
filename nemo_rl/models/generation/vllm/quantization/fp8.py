@@ -1032,9 +1032,42 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
                 prefer_copy=True,
             )
         else:
-            # Instead of creating new torch.nn.Parameter, we update the data in place.
-            layer.weight.data.copy_(dg_weight)
-            layer.weight_scale_inv.data.copy_(dg_weight_scale)
+            for name, processed_weight in (
+                ("weight", dg_weight),
+                ("weight_scale_inv", dg_weight_scale),
+            ):
+                parameter = getattr(layer, name)
+                if (
+                    parameter.shape == processed_weight.shape
+                    and parameter.dtype == processed_weight.dtype
+                ):
+                    parameter.data.copy_(processed_weight)
+                else:
+                    if name == "weight_scale_inv":
+                        if not hasattr(layer, "_nrl_fp8_checkpoint_scale"):
+                            layer._nrl_fp8_checkpoint_scale = torch.empty_like(
+                                parameter.data
+                            )
+                        runtime_scale = getattr(layer, "_nrl_fp8_runtime_scale", None)
+                        if (
+                            runtime_scale is not None
+                            and runtime_scale.shape == processed_weight.shape
+                            and runtime_scale.dtype == processed_weight.dtype
+                        ):
+                            runtime_scale.copy_(processed_weight)
+                            parameter.data = runtime_scale
+                        else:
+                            parameter.data = processed_weight.data
+                        layer._nrl_fp8_runtime_scale = parameter.data
+                    else:
+                        parameter.data = processed_weight.data
+
+
+def prepare_fp8_linear_refit(model: torch.nn.Module) -> None:
+    for layer in model.modules():
+        checkpoint_scale = getattr(layer, "_nrl_fp8_checkpoint_scale", None)
+        if checkpoint_scale is not None:
+            layer.weight_scale_inv.data = checkpoint_scale
 
 
 def process_weights_after_loading(self, layer) -> None:
@@ -1288,9 +1321,8 @@ def create_weights_mxfp8_moe(
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
-    Compared to the original process_weights_after_loading in vllm, we use .copy_() instead of
-    replace_parameter() to avoid creating new torch.nn.Parameter objects, because that removes
-    the weight_loader attribute which we need for refit.
+    Preserve parameter storage when the converted layout is compatible, and retain
+    weight_loader when the backend requires a different shape or dtype.
 
     Updated for vLLM >= 0.25, which passes a RoutedExperts module as `layer` and
     sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=...); 0.29
@@ -1320,23 +1352,27 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
-    if global_fp8_config.is_deepseek_v4:
-        # DSV4 restores checkpoint layouts before refit. Preserve compatible
-        # storage and retain loaders when converting to a different layout.
-        replace_parameter(layer, "w13_weight", w13, prefer_copy=True)
-        replace_parameter(layer, "w2_weight", w2, prefer_copy=True)
-        replace_parameter(
-            layer, f"w13_{self.weight_scale_name}", w13_scale, prefer_copy=True
-        )
-        replace_parameter(
-            layer, f"w2_{self.weight_scale_name}", w2_scale, prefer_copy=True
-        )
-    else:
-        # Use .copy_() to preserve weight_loader attribute on Parameters.
-        layer.w13_weight.copy_(w13)
-        layer.w2_weight.copy_(w2)
-        getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
-        getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
+    converted_weights = (
+        ("w13_weight", w13),
+        ("w2_weight", w2),
+        (f"w13_{self.weight_scale_name}", w13_scale),
+        (f"w2_{self.weight_scale_name}", w2_scale),
+    )
+    if not global_fp8_config.is_deepseek_v4:
+        for name, converted_weight in converted_weights:
+            parameter = getattr(layer, name)
+            if (
+                parameter.shape != converted_weight.shape
+                or parameter.dtype != converted_weight.dtype
+            ):
+                raise ValueError(
+                    f"FP8 MoE refit does not support {name} layout changes with this model/backend"
+                )
+    for name, converted_weight in converted_weights:
+        if global_fp8_config.is_deepseek_v4:
+            replace_parameter(layer, name, converted_weight, prefer_copy=True)
+        else:
+            getattr(layer, name).copy_(converted_weight)
 
     # Set up the MoE kernel on initial load only (same as upstream _setup_kernel
     # but without replace_parameter). Gate on is None, not hasattr, because

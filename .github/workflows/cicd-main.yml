@@ -589,6 +589,8 @@ jobs:
         BUILD_DYNAMO=1
         TRTLLM_BUILD_JOBS=24
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
+    secrets:
+      APPTAINER_GITHUB_TOKEN: ${{ secrets.APPTAINER_GITHUB_TOKEN }}
 
   build-container-gb200:
     name: Build GB200/GCP container
@@ -637,6 +639,8 @@ jobs:
         MAX_JOBS=4
         TRTLLM_BUILD_JOBS=8
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
+    secrets:
+      APPTAINER_GITHUB_TOKEN: ${{ secrets.APPTAINER_GITHUB_TOKEN }}
 
   cicd-doc-tests:
     strategy:
