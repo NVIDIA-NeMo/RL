@@ -4,7 +4,7 @@ Status: Design and staged qualification criteria
 
 Target: CSD loss and sequence-packing implementation
 
-Last updated: 2026-10-12
+Last updated: 2026-11-02
 
 ## Decision
 
@@ -48,10 +48,9 @@ call is therefore insufficient:
 
 The current scalar packer in
 [`BatchedDataDict.shard_by_batch_size`](../../nemo_rl/distributed/batched_data_dict.py)
-is policy-local and accepts only one `input_lengths` vector. Both teacher IPC
-entry points in [`Policy`](../../nemo_rl/models/policy/lm_policy.py) explicitly
-reject sequence packing. This proposal adds a shared logical control plane and
-keeps backend-specific tensor transformations behind `Policy`.
+is policy-local and accepts only one `input_lengths` vector. This proposal adds
+a shared logical control plane and keeps backend-specific tensor
+transformations behind `Policy`.
 
 ## Goals
 
@@ -599,14 +598,10 @@ For each teacher bin:
 7. Canonicalize results to `LockstepPackingPlan.canonical_batch_item_ids` and
    assert that every real item occurs exactly once.
 
-[`aggregate_per_sample_handles`](../../nemo_rl/models/policy/utils.py) currently
-assumes sorted DP rank plus local position recreates global order. The packed
-path must use explicit IDs instead.
-
 ### Dense IPC
 
-Both DTensor and Megatron full-logit postprocessors currently reject packing.
-Their packed implementations should mirror the existing top-k unpacking paths:
+Packed full-logit export in the DTensor and Megatron postprocessors should
+mirror the existing top-k unpacking paths:
 
 - use the teacher's own boundaries;
 - preserve local vocabulary shards under TP;
