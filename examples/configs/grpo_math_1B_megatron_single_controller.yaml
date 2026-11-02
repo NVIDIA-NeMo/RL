@@ -198,15 +198,17 @@ policy:
   # hybrid models; see docs/design-docs/shared-prefix-execution.md, which also
   # lists the rejected model settings. Omitting the block is the same as
   # mode: disabled, and every key below is shown at its default. Enabled modes
-  # require this single-controller launcher with token_capture.enabled=true,
-  # the Megatron backend with megatron.rl importable in the driver environment
-  # (uv run --extra mcore), sequence packing with a deterministic algorithm
-  # (not first_fit_shuffle) and no pair_grouping_key, top_p=1.0 with top_k
-  # disabled, and make_sequence_length_divisible_by set to a multiple of the
-  # TP/CP alignment M (1 at TP1/CP1, 2*CP at TP1, 2*TP*CP otherwise). They also
-  # require router_replay disabled, no HybridEP input prepadding, zero
+  # require this single-controller launcher with token_capture.enabled=true and
+  # token_capture.forest_training=false, the Megatron backend with megatron.rl
+  # importable in the driver environment (uv run --extra mcore), sequence
+  # packing with a deterministic algorithm (not first_fit_shuffle) and no
+  # pair_grouping_key, top_p=1.0 with top_k disabled, and
+  # make_sequence_length_divisible_by set to a multiple of the TP/CP alignment
+  # M (1 at TP1/CP1, 2*CP at TP1, 2*TP*CP otherwise). They also require
+  # router_replay disabled, no HybridEP input prepadding, zero
   # async_rl.rollout_failure drop budgets, and num_prompts_per_step a multiple
-  # of the policy data-parallel size. At data-parallel size > 1 they require
+  # of the policy data-parallel size. Train mode also requires
+  # loss_fn.score_centering=false. At data-parallel size > 1 they require
   # pack_groups and align_data_parallel. Unknown keys are rejected.
   # shared_prefix_training:
   #   # disabled | dense (conventional packing, comparison control) |
