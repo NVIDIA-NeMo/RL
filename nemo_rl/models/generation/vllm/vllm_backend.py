@@ -274,6 +274,30 @@ class _ReloadWeightPreparer(Protocol):
     def finish(self) -> None: ...
 
 
+class _CheckpointReloadPreparer:
+    """Convert IPC batches with a checkpoint iterator (e.g. FP8 quantization)."""
+
+    def __init__(
+        self,
+        prepare: Callable[
+            [Iterable[tuple[str, torch.Tensor]]], Iterable[tuple[str, torch.Tensor]]
+        ],
+    ):
+        self._prepare = prepare
+
+    def reset(self) -> None:
+        pass
+
+    def process(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]:
+        # Pass-through tensors still view the IPC buffer, which is reused after ACK.
+        return [(name, tensor.clone()) for name, tensor in self._prepare(weights)]
+
+    def finish(self) -> None:
+        pass
+
+
 class NixlVllmWorker(VllmWorker):
     """vLLM worker that establishes NIXL/UCX before vLLM initialization."""
 
@@ -1733,6 +1757,15 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
     def _get_reload_weight_preparer(self) -> _ReloadWeightPreparer | None:
         """Return this worker's transport-neutral checkpoint preparer."""
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        cfg = fp8.global_fp8_config
+        if (
+            cfg is not None
+            and cfg.refit_with_reload_api
+            and fp8.is_fp8_model(self.model_runner.vllm_config)
+        ):
+            return _CheckpointReloadPreparer(self._prepare_reload_weight_iterator)
         return None
 
     def _drain_ipc_reload_sender(self) -> None:

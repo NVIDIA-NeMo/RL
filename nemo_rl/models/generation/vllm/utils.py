@@ -77,10 +77,10 @@ def assert_reload_refit_config_supported(config: VllmConfig) -> None:
     if not vllm_cfg or not vllm_cfg.get("refit_with_reload_api"):
         return
 
-    assert not config["colocated"]["enabled"], (
-        "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
-        "supported yet with colocated vLLM refit. Support for the "
-        "colocated IPC/ZMQ reload-refit path will be added later. Set "
+    # Colocated IPC/ZMQ reload refit is wired up for FP8 rollouts only.
+    assert not config["colocated"]["enabled"] or vllm_cfg.get("precision") == "fp8", (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true with colocated "
+        "vLLM refit is only supported for precision=fp8. Set "
         "refit_with_reload_api=false for now."
     )
     refit_transport = config.get("refit_transport")

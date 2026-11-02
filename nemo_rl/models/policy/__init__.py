@@ -460,6 +460,9 @@ class MegatronConfig(TypedDict):
     freeze_moe_router: bool
     # Quantize-dequantize K/V like vLLM's fp8_per_token_head KV cache (STE).
     kv_fp8_qat: NotRequired[bool]
+    # Also move the distributed optimizer's FP32 master shards to CPU when the
+    # optimizer is offloaded for colocated refit (frees ~4 bytes/param on GPU).
+    offload_optimizer_master_params: NotRequired[bool]
     # Optional multimodal provider controls. These map legacy Omni recipe
     # names onto the canonical NemotronOmniModel provider fields.
     freeze_vision_encoder: NotRequired[bool]
