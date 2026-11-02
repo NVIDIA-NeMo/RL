@@ -13,11 +13,13 @@
 # limitations under the License.
 
 #!/bin/bash
-# Shard: Model tests not covered by mcore/automodel/generation shards
+# Shard: Model tests not covered by mcore/automodel/generation shards.
+# One shard, not split with --shard-id: these tests take about 12 min in total, so
+# per-job setup dominated when they ran across four runners.
 # Picks up base (unmarked) tests from every models/ subdirectory except generation/
 # Tests carrying the mcore or automodel marker are excluded by conftest.py filtering,
 # since this is a base run.
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
-uv run --no-sync bash -x ./tests/run_unit.sh "unit/models/" "--ignore=unit/models/generation/" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=3 --num-shards=4 --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
+uv run --no-sync bash -x ./tests/run_unit.sh "unit/models/" "--ignore=unit/models/generation/" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
