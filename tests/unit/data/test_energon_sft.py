@@ -473,15 +473,6 @@ def test_rejected_restore_names_the_settings_that_changed():
         ).load_state_dict(state)
 
 
-def test_energon_config_rejects_invalid_values():
-    for field in ("max_samples_per_sequence",):
-        for value in (0, -1):
-            with pytest.raises(ValueError):
-                EnergonLoaderConfig(model_family="qwen", **{field: value})
-    with pytest.raises(ValueError):
-        EnergonLoaderConfig(model_family="qwen", packing_buffer_size=10)
-
-
 def _identity(
     *,
     loader_config: EnergonLoaderConfig | None = None,

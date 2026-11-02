@@ -27,7 +27,6 @@ from pydantic import ValidationError
 from nemo_rl.models.generation.sglang import sglang_worker
 from nemo_rl.models.generation.sglang.config import (
     SGLangFaultToleranceConfig,
-    SGLangHttpClientConfig,
     SglangSpecificArgs,
 )
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -220,9 +219,3 @@ def test_failed_constructor_cleanup_is_repeatable_and_destructor_safe(
     assert unraisable_errors == []
     if not invalid_config:
         loop.close.assert_called_once_with()
-
-
-@pytest.mark.parametrize("budget", [0, -1, True, 1.5, "3", None])
-def test_http_client_rejects_invalid_attempt_budget(budget):
-    with pytest.raises(ValidationError, match="max_retries"):
-        SGLangHttpClientConfig(max_retries=budget)

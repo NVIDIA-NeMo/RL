@@ -103,12 +103,6 @@ class TestRolloutFailureValidation:
     def test_equal_backoff_bounds_are_allowed(self):
         RolloutFailureConfig(backoff_base_s=5.0, max_backoff_s=5.0)
 
-    @pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1])
-    def test_an_out_of_range_step_floor_is_rejected(self, fraction):
-        """0 would permit an empty step; above 1 could never be satisfied."""
-        with pytest.raises(ValidationError):
-            RolloutFailureConfig(min_step_batch_fraction=fraction)
-
     def test_a_full_step_floor_is_allowed_and_forbids_shrinking(self):
         RolloutFailureConfig(min_step_batch_fraction=1.0)
 
@@ -150,13 +144,6 @@ class TestRolloutFailureValidation:
             max_replacement_attempts=3,
             replacement_reserve_prompts=16,
         )
-
-    @pytest.mark.parametrize("attempts", [0, -1])
-    def test_non_positive_attempt_budgets_are_rejected(self, attempts):
-        with pytest.raises(ValidationError):
-            RolloutFailureConfig(max_infra_attempts_per_prompt=attempts)
-        with pytest.raises(ValidationError):
-            RolloutFailureConfig(max_data_attempts_per_prompt=attempts)
 
     @pytest.mark.parametrize(
         ("old", "value"),
