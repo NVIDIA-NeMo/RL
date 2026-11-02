@@ -2180,6 +2180,75 @@ def test_lockstep_setup_resolves_character_grouping_for_validation_defaults():
         validate_csd_packing_setup(cfg)
 
 
+def _reuse_student_tokenizer(cfg: CSDMasterConfig) -> TeacherConfig:
+    """Make teacher 0 a same-tokenizer teacher (no CSD tables)."""
+    teacher = cfg.teachers[0]
+    teacher.aligner.student_to_teacher_table_path = None
+    teacher.aligner.teacher_to_student_table_path = None
+    return teacher
+
+
+def _same_tokenizer_teacher_with_coarser_divisor(cfg: CSDMasterConfig) -> None:
+    # 72-token student rows, padded to a multiple of 16 on the teacher: 80.
+    cfg.policy["max_total_sequence_length"] = 72
+    cfg.policy["sequence_packing"]["train_mb_tokens"] = 72
+    teacher = _reuse_student_tokenizer(cfg)
+    teacher.make_sequence_length_divisible_by = 16
+    teacher.sequence_packing["logprob_mb_tokens"] = 72
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda cfg: cfg.policy["sequence_packing"].update(train_mb_tokens=32),
+            r"policy\.sequence_packing\.train_mb_tokens=32 is smaller than the "
+            r"longest row it can receive: policy\.max_total_sequence_length=64",
+        ),
+        (
+            lambda cfg: cfg.teachers[0].sequence_packing.update(logprob_mb_tokens=32),
+            r"teachers\[0\]\.sequence_packing\.logprob_mb_tokens=32 is smaller "
+            r"than the longest row it can receive: "
+            r"teachers\[0\]\.max_total_sequence_length=64",
+        ),
+        (
+            lambda cfg: (
+                cfg.policy.update(max_total_sequence_length=60),
+                cfg.policy["sequence_packing"].update(train_mb_tokens=60),
+            ),
+            r"train_mb_tokens=60 .* rounded up to "
+            r"policy\.make_sequence_length_divisible_by=8 is 64 tokens",
+        ),
+        (
+            _same_tokenizer_teacher_with_coarser_divisor,
+            r"teachers\[0\]\.sequence_packing\.logprob_mb_tokens=72 .* "
+            r"policy\.max_total_sequence_length=72 rounded up to "
+            r"teachers\[0\]\.make_sequence_length_divisible_by=16 is 80 tokens",
+        ),
+    ],
+)
+def test_lockstep_setup_rejects_bins_shorter_than_the_longest_row(mutate, message):
+    """A bin that cannot hold a row the collator admits would fail mid-training."""
+    cfg = _make_master_config()
+    _enable_lockstep_packing(cfg)
+    mutate(cfg)
+
+    with pytest.raises(ValueError, match=message):
+        validate_csd_packing_setup(cfg)
+
+
+def test_lockstep_setup_accepts_bins_that_hold_the_longest_row():
+    cfg = _make_master_config()
+    _enable_lockstep_packing(cfg)
+    # 60 rounds up to 64, exactly the bin.
+    cfg.policy["max_total_sequence_length"] = 60
+    assert validate_csd_packing_setup(cfg) == 1
+    # A same-tokenizer teacher packs the student's rows, so its own longer
+    # context does not need a bigger bin.
+    _reuse_student_tokenizer(cfg).max_total_sequence_length = 128
+    assert validate_csd_packing_setup(cfg) == 1
+
+
 def test_lockstep_plan_assigns_unique_occurrence_ids_after_validation_padding():
     cfg = _make_master_config()
     cfg.cluster = {"num_nodes": 1, "gpus_per_node": 2}
