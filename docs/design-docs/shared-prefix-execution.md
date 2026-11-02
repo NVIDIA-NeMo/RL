@@ -100,7 +100,7 @@ These rules are checked when the configuration is loaded:
 - Work weights must be nonnegative with a positive sum.
 - `repack_groups` is deprecated. It is still accepted in every mode, but it warns and has no effect.
 
-The driver assigns complete prompt groups to data-parallel ranks and checks that every row fits one forward after padding. Each worker then splits its own groups into execution slots under the stage's token budget and the 16-completion branch limit; `repack_groups` used to select this local planning. Forward counts can therefore differ between data-parallel ranks, so at data-parallel size greater than one every shared mode requires `pack_groups` and `align_data_parallel`; `Policy` checks this before it allocates workers.
+The driver assigns complete prompt groups to data-parallel ranks and checks that every row fits one forward after padding. Each worker then plans its own forwards. It splits each of its groups into execution slots under the stage's token budget and the 16-completion branch limit (`repack_groups` used to select this local split), or, with `training_dense_bins`, packs whole rows into dense bins and shares prompts inside each bin. Forward counts can therefore differ between data-parallel ranks, so at data-parallel size greater than one every shared mode requires `pack_groups` and `align_data_parallel`; `Policy` checks this before it allocates workers.
 
 ### Other requirements
 
