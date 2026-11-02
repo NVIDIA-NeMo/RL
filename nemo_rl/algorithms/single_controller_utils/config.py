@@ -68,7 +68,7 @@ from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
 )
-from nemo_rl.models.policy import MegatronConfig, PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -688,9 +688,8 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     num_reassembler_workers: PositiveInt = 2
 
     # Reconstruct selected capture paths as rows of one logical rollout.
-    # Forest groups are single-attempt; ordinary capture keeps its retry policy.
-    # Initially requires unit dataset loss weights and disables both trainer and
-    # rollout checkpointing; support is in https://github.com/NVIDIA-NeMo/RL/pull/4200.
+    # Recovery persists selections across retries and trainer/rollout checkpoints.
+    # Requires unit dataset loss weights.
     forest_training: bool = False
     # returned_history preserves the harness-selected trajectory (default).
     # all_captured includes every captured call, including abandoned attempts.
@@ -1504,6 +1503,83 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "(env.should_use_nemo_gym=true) on SingleController"
         )
 
+    generation_cfg = master_config.policy["generation"]
+    top_logprobs = generation_cfg.get("top_logprobs", 0)
+    if (
+        isinstance(top_logprobs, bool)
+        or not isinstance(top_logprobs, int)
+        or top_logprobs < 0
+    ):
+        raise ValueError("policy.generation.top_logprobs must be a nonnegative integer")
+    if top_logprobs > 0 and not master_config.loss_fn.score_centering:
+        raise ValueError(
+            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering; "
+            "set it to 0 or enable score centering"
+        )
+    if top_logprobs > 0:
+        if master_config.policy["generation"]["backend"] != "vllm":
+            raise ValueError(
+                "policy.generation.top_logprobs requires the vllm generation backend"
+            )
+        if not master_config.token_capture.enabled:
+            raise ValueError(
+                "policy.generation.top_logprobs requires token_capture.enabled=true"
+            )
+    if master_config.loss_fn.score_centering:
+        if top_logprobs == 0:
+            raise ValueError(
+                "loss_fn.score_centering requires policy.generation.top_logprobs > 0"
+            )
+        generation_cfg = master_config.policy["generation"]
+        temperature = generation_cfg["temperature"]
+        logprobs_mode = (generation_cfg.get("vllm_cfg") or {}).get("logprobs_mode")
+        if logprobs_mode is None:
+            logprobs_mode = (generation_cfg.get("vllm_kwargs") or {}).get(
+                "logprobs_mode"
+            )
+        if temperature <= 0 or not math.isfinite(temperature):
+            raise ValueError(
+                "loss_fn.score_centering requires a finite positive sampling temperature"
+            )
+        if logprobs_mode not in (None, "raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                "loss_fn.score_centering requires log probabilities, not raw/processed logits"
+            )
+        if logprobs_mode != "processed_logprobs" and temperature != 1.0:
+            raise ValueError(
+                "loss_fn.score_centering requires policy.generation.vllm_cfg.logprobs_mode="
+                "processed_logprobs when policy.generation.temperature != 1.0"
+            )
+        if (
+            generation_cfg.get("top_p") != 1.0
+            or generation_cfg.get("top_k") is not None
+        ):
+            raise ValueError(
+                "loss_fn.score_centering needs unfiltered sampling "
+                "(policy.generation.top_p=1, top_k=null) so the captured top-k is "
+                "the sampling distribution"
+            )
+
+        automodel_cfg = master_config.policy.get("automodel_cfg")
+        if automodel_cfg is not None and automodel_cfg["enabled"]:
+            enabled_automodel_cfg = cast(AutomodelConfig, automodel_cfg)
+            if (
+                enabled_automodel_cfg["tensor_parallel_size"] > 1
+                or enabled_automodel_cfg["context_parallel_size"] > 1
+            ):
+                raise ValueError(
+                    "loss_fn.score_centering supports Automodel only with "
+                    "tensor_parallel_size=1 and context_parallel_size=1; use Megatron for TP/CP"
+                )
+        megatron_cfg = master_config.policy.get("megatron_cfg") or {}
+        if megatron_cfg.get("enabled") and megatron_cfg.get(
+            "use_fused_linear_logprobs"
+        ):
+            raise ValueError(
+                "loss_fn.score_centering needs vocabulary logits; disable "
+                "policy.megatron_cfg.use_fused_linear_logprobs"
+            )
+
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(
             f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) "
@@ -1595,14 +1671,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
         validate_forest_objective(master_config.grpo, master_config.loss_fn)
-        if master_config.checkpointing["enabled"]:
-            raise ValueError(
-                "Forest checkpoint/resume is not supported initially; accepted-call recovery is in https://github.com/NVIDIA-NeMo/RL/pull/4200"
-            )
-        if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
-            raise ValueError(
-                "Forest rollout checkpoint/resume is not supported initially; accepted-call recovery is in https://github.com/NVIDIA-NeMo/RL/pull/4200"
-            )
         if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
             raise ValueError(
                 "Forest does not support reward penalties or on-policy distillation"

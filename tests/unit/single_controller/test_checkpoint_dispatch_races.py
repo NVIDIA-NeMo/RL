@@ -952,6 +952,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
                     for attempt in sibling["attempts"]:
                         attempt.pop("reward_checks", None)
                         attempt.pop("reward_log_context", None)
+                        attempt.pop("logical_selection", None)
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
         torch.save(saved_state, recovery_path)
         payload_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()
@@ -966,10 +967,12 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(enabled=False)
+            token_capture=SimpleNamespace(enabled=False, forest_training=False)
         )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
+            "forest_training": False,
+            "forest_execution_row_multiple": None,
             "rollout_recovery_schema_version": schema_version,
             "rollout_recovery_payload_sha256": payload_sha256,
             "rollout_recovery_group_count": 1,
@@ -1084,10 +1087,12 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(enabled=False)
+            token_capture=SimpleNamespace(enabled=False, forest_training=False)
         )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
+            "forest_training": False,
+            "forest_execution_row_multiple": None,
             "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "rollout_recovery_payload_sha256": hashlib.sha256(
                 recovery_path.read_bytes()
@@ -1242,10 +1247,12 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         controller._restored_replay_groups_to_regenerate = []
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(enabled=False)
+            token_capture=SimpleNamespace(enabled=False, forest_training=False)
         )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
+            "forest_training": False,
+            "forest_execution_row_multiple": None,
             "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "rollout_recovery_payload_sha256": hashlib.sha256(
                 recovery_path.read_bytes()
@@ -1434,8 +1441,13 @@ def test_recovery_rejects_a_corrupt_ledger_sidecar(tmp_path) -> None:
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._master_config = SimpleNamespace(
+        token_capture=SimpleNamespace(forest_training=False)
+    )
     controller._last_checkpoint_path = str(tmp_path)
     controller._data_plane_checkpoint_metadata = {
+        "forest_training": False,
+        "forest_execution_row_multiple": None,
         "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
         "rollout_recovery_payload_sha256": "0" * 64,
         "rollout_recovery_group_count": 1,
@@ -1452,8 +1464,13 @@ def test_recovery_rejects_a_missing_advertised_ledger_sidecar(tmp_path) -> None:
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._master_config = SimpleNamespace(
+        token_capture=SimpleNamespace(forest_training=False)
+    )
     controller._last_checkpoint_path = str(tmp_path)
     controller._data_plane_checkpoint_metadata = {
+        "forest_training": False,
+        "forest_execution_row_multiple": None,
         "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
         "rollout_recovery_payload_sha256": "0" * 64,
         "rollout_recovery_group_count": 1,

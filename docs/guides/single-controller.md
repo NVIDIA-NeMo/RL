@@ -177,7 +177,7 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
-- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
+- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, including an empty list when none are held. Schema-3 checkpoints may omit an empty reserve.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
 The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
@@ -185,6 +185,12 @@ The TQ snapshot and replay index are captured under the same checkpoint barrier.
 On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
 
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
+
+[Forest-training runs](./context-compaction.md) recover the same way and need no extra settings.
+
+Restart does not resume a Gym tool call that was in progress, and it does not guarantee that external side effects happen exactly once. In token-capture runs, if Gym reports capture writes it could not confirm, the run stops instead of retrying, so no uncertain write is cleared or repeated.
+
+Every Megatron training resume (all algorithms, not only forest training) loads the saved RNG when the parallel layout supports it, and preserves it through reference-model and wrapper setup. Changing `seed` before a resume no longer reseeds the restored Megatron RNG. Fresh runs and PEFT warm starts are unchanged.
 
 ### Periodic rollout snapshots
 
