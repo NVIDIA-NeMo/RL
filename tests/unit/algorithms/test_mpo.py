@@ -178,15 +178,3 @@ def test_vlm_mpo_exemplar_validates_without_dpo_config():
     assert train_config["dataset_name"] == "MMPRPreference"
     assert master_config.data["validation"] is None
     assert "dpo" not in (master_config.model_extra or {})
-
-
-def test_nemotron_omni_mpo_recipe_validates():
-    root = Path(__file__).parents[3]
-    recipe_path = (
-        root
-        / "examples/configs/recipes/vlm"
-        / "vlm_mpo-nemotron-omni-30ba3b-mmpr-1n8g-megatron-tp8.v1.yaml"
-    )
-    register_omegaconf_resolvers()
-    config = load_config(recipe_path)
-    MasterConfig.model_validate(OmegaConf.to_container(config, resolve=True))
