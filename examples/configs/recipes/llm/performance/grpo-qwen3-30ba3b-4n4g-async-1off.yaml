@@ -12,7 +12,7 @@ checkpointing:
 policy:
   train_global_batch_size: 2048
   train_micro_batch_size: 4
-  logprob_batch_size: 2
+  logprob_batch_size: 4
   # Bound full-vocabulary logprob temporaries for the larger training microbatch.
   logprob_chunk_size: 1024
   megatron_cfg:
