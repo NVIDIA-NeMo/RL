@@ -1378,11 +1378,7 @@ def setup_single_controller(
         master_config.rollout_recovery.generation_prefix_cuts_enabled
     )
     if generation_prefix_cuts_enabled:
-        if generation_config["backend"] != "vllm":
-            raise NotImplementedError(
-                "generation-prefix recovery currently supports only the vLLM "
-                f"generation backend; got {generation_config['backend']!r}"
-            )
+        # The vLLM-only check ran above with the other turn/prefix checks.
         if capture_media:
             raise NotImplementedError(
                 "generation-prefix recovery does not yet support multimodal capture"
