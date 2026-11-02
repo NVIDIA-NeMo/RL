@@ -115,9 +115,12 @@ Effect on NCCL collective speed (no SHARP plugin) was not measured.
   rows, and a manifest. With the same units, each shard restores in place;
   with a different count, the live rows are put again through a client.
   It works with the SSD tier on: spilled blobs are saved from their files,
-  and a restore that RAM cannot hold spills the rest to disk. `mooncake_cpu`
-  and `simple` checkpoint with their `ssd_offload` on too; only TQ's own
-  Mooncake offload client (`offload.enabled`) refuses to checkpoint.
+  and a restore that RAM cannot hold spills the rest to disk. `simple` and
+  `mooncake_cpu` also checkpoint with their `ssd_offload` on. For
+  `mooncake_cpu` that is NeMo-RL's own SSD offload, not upstream TQ's:
+  each process that owns Mooncake memory spills to its own node's SSD
+  (`adapters/mooncake_ssd_offload.py`). TQ's `MooncakeStore.offload` (one
+  central SSD client on the driver) stays off, and TQ checkpoints refuse it.
 
 ## Measured (GB300, 2 nodes, 4 RDMA rails; ms, lower is better)
 
