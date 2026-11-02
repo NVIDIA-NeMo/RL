@@ -104,8 +104,10 @@ def _inspect_loaded_head(worker: Any) -> dict[str, str]:
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("enabled", [False, True])
 def test_fp32_head_reaches_initialized_worker(
-    tiny_qwen3_model_path: str, enabled: bool
+    tiny_qwen3_model_path: str, enabled: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # This test process may already have initialized CUDA.
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     # Import the optional inference backend only in the vLLM test lane.
     from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 

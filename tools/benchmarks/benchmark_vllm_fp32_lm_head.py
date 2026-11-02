@@ -23,6 +23,7 @@ using the same BF16 states and live checkpoint weight. It does not train a model
 
 import argparse
 import json
+import os
 import platform
 import statistics
 import subprocess
@@ -248,6 +249,8 @@ def main() -> None:
         llm = worker.llm
     else:
         configure_fp32_lm_head(cfg, engine_kwargs)
+        # Match the NeMo worker's serialization for trusted local RPC callbacks.
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
         llm = vllm.LLM(
             model=args.model,
             dtype="bfloat16",

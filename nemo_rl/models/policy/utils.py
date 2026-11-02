@@ -27,7 +27,7 @@ from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.vllm.config import (
-    VllmSpecificArgs,
+    VllmConfig,
     configure_fp32_lm_head,
     vllm_fp32_lm_head_enabled,
 )
@@ -210,12 +210,14 @@ def validate_fp32_lm_head_config(
     if generation_backend != "vllm":
         return
 
-    vllm_cfg = generation_config.get("vllm_cfg")
+    vllm_generation_config = cast(VllmConfig, generation_config)
+    vllm_cfg = vllm_generation_config.get("vllm_cfg")
     if vllm_cfg is None:
         return
-    vllm_cfg = cast(VllmSpecificArgs | dict[str, Any], vllm_cfg)
 
-    configure_fp32_lm_head(vllm_cfg, dict(generation_config.get("vllm_kwargs") or {}))
+    configure_fp32_lm_head(
+        vllm_cfg, dict(vllm_generation_config.get("vllm_kwargs") or {})
+    )
 
     vllm_fp32 = vllm_fp32_lm_head_enabled(vllm_cfg)
     if automodel_enabled and vllm_fp32:
