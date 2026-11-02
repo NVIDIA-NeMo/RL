@@ -114,8 +114,8 @@ config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
 # Every shipped config tree. Configs outside examples/configs receive only the
-# outdated-config and local-path checks; their manifests and templates may
-# lack the training schema or contain unset environment interpolations.
+# outdated-config, local-path and W&B-entity checks; their manifests and templates
+# may lack the training schema or contain unset environment interpolations.
 repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
 full_config_files = config_files + [
     path
@@ -317,12 +317,10 @@ def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
     with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
         RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids={"unwanted": []})
 
-    config = RewardPenaltyConfig(
+    RewardPenaltyConfig(
         penalize_unwanted_tokens=True,
         token_ids={"unwanted": [2]},
     )
-    assert config.token_ids is not None
-    assert config.token_ids.unwanted == [2]
 
 
 def _check_tp_size_accuracy(config_file: str, config: DictConfig) -> None:

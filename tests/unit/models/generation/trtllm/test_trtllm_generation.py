@@ -409,7 +409,7 @@ def test_ipc_refit_and_missing_worker_group():
 def test_disagg_defaults_come_from_the_schema_not_the_call_sites():
     # Absent and present-but-empty must agree: every default lives on the model,
     # so no consumer has to re-derive one per key.
-    absent, empty = _config(), _config(disaggregation={})
+    absent, empty = _config(), _config(disaggregation={}, disagg_server={})
     assert resolve_disagg_layout(absent) == resolve_disagg_layout(empty)
     assert resolve_disagg_server_config(absent) == resolve_disagg_server_config(empty)
     for cfg in (absent, empty):
