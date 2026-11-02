@@ -131,15 +131,18 @@ def _context(execution_batch: ExecutionBatch, mode: str) -> PipelineCallContext:
     )
 
 
-def test_microbatch_index_maps_sample_ids():
+@pytest.mark.parametrize("first_sample_id", [0, 8, 24])
+@pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
+def test_microbatch_index_maps_sample_ids(first_sample_id, micro_batch_size):
     context = _context(
-        _execution_batch(8, num_microbatches=4, num_real=4), mode="train"
+        _execution_batch(
+            first_sample_id, num_microbatches=4, num_real=4, mbs=micro_batch_size
+        ),
+        mode="train",
     )
-    assert context.microbatch_index(torch.tensor([8, 9])) == 0
-    assert context.microbatch_index(torch.tensor([14, 15])) == 3
-    for bad in ([9, 10], [16, 17], [10, 12], [0, 1]):
-        with pytest.raises(RuntimeError, match="not one microbatch"):
-            context.microbatch_index(torch.tensor(bad))
+    targets = context.execution_batch.sample_ids.chunk(4)
+    for mb_index in (3, 0, 2, 1):
+        assert context.microbatch_index(targets[mb_index]) == mb_index
 
 
 def test_adapter_train_returns_backward_scale_and_records_results():

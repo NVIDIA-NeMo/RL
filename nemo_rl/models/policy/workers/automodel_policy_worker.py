@@ -396,11 +396,7 @@ class AutomodelPolicyWorkerImpl(
             return f"{self.__class__.__qualname__}"
 
     def _get_replica_group(self) -> Optional[Any]:
-        """Replica group = flattened (pp, cp, tp) sub-mesh within this DP rank.
-
-        Every pipeline stage of a DP rank consumes the same data, so the stages
-        share one fetch and one TQ write-back leader, as in the Megatron worker.
-        """
+        """Group sharing input data and one TQ write-back leader within a DP rank."""
         return self.device_mesh[("pp", "cp", "tp")]._flatten().get_group()
 
     def _local_coords(self) -> dict[str, int]:
@@ -552,10 +548,6 @@ class AutomodelPolicyWorkerImpl(
         # Set instance attributes from model and optimizer state. Access by
         # field name (not positional unpacking) so optional fields appended to
         # ModelAndOptimizerState stay backward compatible across workers.
-        # Under pipeline parallelism, model, optimizer, and scheduler are this
-        # rank's pipeline stage and its optimizer state, and pipeline is
-        # Automodel's AutoPipeline that drives the stages; pipeline is None
-        # otherwise.
         self.pipeline = model_and_optimizer_state.pipeline
         self.model = model_and_optimizer_state.model
         self.optimizer = model_and_optimizer_state.optimizer
@@ -598,7 +590,6 @@ class AutomodelPolicyWorkerImpl(
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
 
-        # Built on first refit under pipeline parallelism.
         self._weight_exporter: Optional[PipelineWeightExporter] = None
 
         if defer_checkpoint_load:
@@ -749,14 +740,11 @@ class AutomodelPolicyWorkerImpl(
                         cp_size=self.cp_size,
                         num_global_batches=num_global_batches,
                     )
-                    # Only the last stage has results; real samples come
-                    # first, so the valid microbatches are a prefix.
                     iterator_len = sum(
                         execution_batch.num_real_microbatches
                         for execution_batch in execution_batches
                     )
                 else:
-                    # Get microbatch iterator based on batching strategy
                     processed_iterator, iterator_len = get_microbatch_iterator(
                         batch,
                         self.cfg,
@@ -765,7 +753,6 @@ class AutomodelPolicyWorkerImpl(
                         tokenizer=self.tokenizer,
                     )
 
-                    # Use automodel_forward_backward for the training loop
                     mb_results = automodel_forward_backward(
                         model=self.model,
                         data_iterator=processed_iterator,
@@ -820,10 +807,8 @@ class AutomodelPolicyWorkerImpl(
                     # The policy is clipped on its own (Megatron-path parity):
                     # a shared global clip let the draft's larger gradients
                     # scale down the policy's updates on every step. The draft
-                    # is clipped separately below. num_label_tokens=None keeps
-                    # the helper from rescaling gradients under pipeline
-                    # parallelism: the loss already carries the global
-                    # normalization.
+                    # is clipped separately below. num_label_tokens=None avoids
+                    # rescaling gradients already normalized by the loss.
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
                         [self.model],
@@ -871,7 +856,6 @@ class AutomodelPolicyWorkerImpl(
                 losses.append(torch.tensor(mb_losses).sum().item())
 
             if self.pipeline is not None:
-                # The loss runs on the last stage only.
                 losses, all_mb_metrics = broadcast_object_from_last_stage(
                     self.pipeline, (losses, all_mb_metrics)
                 )
@@ -1051,11 +1035,7 @@ class AutomodelPolicyWorkerImpl(
         sequence_dim: int,
         seq_dim_size: int,
     ) -> torch.Tensor:
-        """Token logprobs [data.size, seq_dim_size] through the pipeline schedule.
-
-        The last stage computes them and broadcasts them to the rest of the
-        pipeline group, so every rank returns the same tensor.
-        """
+        """Compute logprobs [data.size, seq_dim_size] and broadcast them to all PP ranks."""
         pipeline = self.pipeline
         data.to("cuda")
         execution_batches = self._plan_execution_batches(data, micro_batch_size)
@@ -1069,7 +1049,6 @@ class AutomodelPolicyWorkerImpl(
         )
         local_logprobs = None
         if pipeline.info.has_last_stage:
-            # Microbatches hold real samples first; drop the padding rows.
             local_logprobs = pad_and_concat(token_logprobs, target_len=seq_dim_size)[
                 : data.size
             ]
@@ -1749,8 +1728,6 @@ class AutomodelPolicyWorkerImpl(
             self.move_optimizer_to_device("cpu")
 
         if self.pipeline is not None:
-            # Pipeline receive buffers outlive the schedule call; free them
-            # before the rollout engine needs the memory.
             release_pipeline_runtime_state(self.pipeline)
         # Release recompute activations that MoE dispatch state keeps alive;
         # otherwise they pin cached segments and empty_cache() cannot free them.

@@ -173,11 +173,7 @@ def configure_lora_refit(policy_config: "PolicyConfig") -> None:
 
 
 def automodel_pipeline_parallel_size(automodel_cfg: Mapping[str, Any]) -> int:
-    """Return ``automodel_cfg.pipeline_parallel_size``.
-
-    The key is optional: configs written before Automodel supported pipeline
-    parallelism do not set it, and for them pipeline parallelism is off.
-    """
+    """Return the pipeline size; older configs omit the key and use PP=1."""
     if "pipeline_parallel_size" not in automodel_cfg:
         return 1
     return automodel_cfg["pipeline_parallel_size"]
@@ -189,21 +185,10 @@ def validate_automodel_pipeline_config(
     is_vlm: bool,
     model_config: object | None,
 ) -> "AutomodelPipelineConfig | None":
-    """Validate an Automodel policy config for pipeline parallelism.
+    """Reject unsupported PP settings on the driver before creating workers.
 
-    Runs on the driver before any worker exists, so every unsupported
-    combination fails with an actionable error instead of inside a worker.
-
-    Args:
-        config: The policy config; ``automodel_cfg`` must be enabled.
-        is_vlm: Whether the policy is built with a multimodal processor.
-        model_config: The Hugging Face model config, used to reject models whose
-            embedding and LM head share one weight. ``None`` skips that check
-            (Automodel repeats it when it splits the model).
-
-    Returns:
-        The parsed ``automodel_cfg.pipeline`` block, or ``None`` when
-        ``pipeline_parallel_size`` is 1.
+    Returns the parsed pipeline config, or None for PP=1. model_config=None
+    defers the tied-embedding check to Automodel.
     """
     from nemo_rl.models.policy import AutomodelPipelineConfig
     from nemo_rl.models.policy.draft_config import draft_refit_enabled

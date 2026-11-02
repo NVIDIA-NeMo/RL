@@ -12,23 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pipeline-parallel batching, execution, and weight export for Automodel.
-
-Automodel's ``AutoPipeline`` splits the model into stages and builds the
-PyTorch schedule, which runs the forward and backward passes and the
-inter-stage communication. This module plans NeMo RL's execution batches
-and feeds them through that schedule.
-
-One schedule call (an execution batch) runs ``microbatches_per_step`` (M)
-microbatches of ``micro_batch_size`` samples. The planning unit is whatever data
-one call hands over -- a global batch or a logprob request -- so nothing here
-assumes it equals ``gbs / dp`` or that DP ranks hold the same amount.
-
-The RL loss runs on the last stage inside the schedule's loss callback,
-``PipelineOutputAdapter``, which delegates to the same post-processors as the
-non-pipelined path. ``PipelineWeightExporter`` separately assembles each stage's
-weights into the full-model stream consumed by refit.
-"""
+"""Pipeline-parallel batching, execution, and weight export for Automodel."""
 
 import inspect
 import math
@@ -71,51 +55,30 @@ from nemo_rl.models.automodel.train import (
     shard_model_batch_for_cp,
 )
 
-# Masks that make a padding sample contribute nothing to losses or metrics.
 _DUMMY_SAMPLE_MASK_KEYS = ("sample_mask", "token_mask")
 
 
 @dataclass
 class ExecutionBatch:
-    """The inputs of one pipeline schedule call.
+    """Inputs for one pipeline schedule call.
 
-    ``sample_ids`` is passed to the schedule as the loss target. The schedule
-    splits it along dim 0 exactly like the model inputs, so the last stage can
-    tell which microbatch each loss call belongs to no matter how often or in
-    which order the schedule calls the loss.
+    The schedule splits CPU ``sample_ids`` with the model inputs along dim 0,
+    allowing the loss callback to identify each microbatch. Real samples
+    precede padding samples.
     """
 
-    # The call's microbatches in schedule order. The first
-    # ``num_real_microbatches`` hold at least one real sample; the rest are
-    # fully masked padding.
     microbatches: list[ProcessedMicrobatch]
     num_real_microbatches: int
-    # Position of every row in the planned data, real rows first. Shape [E] on
-    # CPU, where E = micro_batch_size * microbatches_per_step.
     sample_ids: torch.Tensor
-    # Model-facing inputs for the whole call. Tensors are [E, ...], the
-    # row-wise concatenation of each microbatch's model batch; the schedule
-    # splits them back into the same microbatches. Under context parallelism
-    # ``cp_sharder`` has prepared them, and entering ``model_context_factory()``
-    # may shard them along the sequence in place.
     model_inputs: dict[str, Any]
-    # The context the schedule call runs in: Automodel's context-parallel
-    # attention context, or ``nullcontext`` without context parallelism.
     model_context_factory: Callable[[], AbstractContextManager[Any]]
-    # Maps a microbatch's token tensors between the canonical sequence layout
-    # and this rank's context-parallel shard; None without context
-    # parallelism. One sharder serves every microbatch of the call because the
-    # layout depends only on the sequence position.
     cp_sharder: Optional[ContextParallelSharder]
 
 
 def _forward_names_padding_mask(model: nn.Module) -> bool:
-    """Return whether ``model.forward`` names a ``padding_mask`` parameter.
+    """Check whether forward explicitly accepts padding_mask.
 
-    Automodel's MoE models name it next to ``**kwargs`` and route only tokens
-    it leaves unmasked into the auxiliary loss and expert load. Models that
-    only take ``**kwargs`` (e.g. Hugging Face models) would forward an unknown
-    ``padding_mask`` to their layers, so they do not get one.
+    Models with only **kwargs may forward it to layers that do not support it.
     """
     try:
         parameters = inspect.signature(type(model).forward).parameters
@@ -125,20 +88,7 @@ def _forward_names_padding_mask(model: nn.Module) -> bool:
 
 
 def _check_batch_major_inputs(model: nn.Module, model_batch: dict[str, Any]) -> None:
-    """Reject model inputs whose batch dimension is not dim 0.
-
-    Execution batches concatenate microbatch inputs along dim 0 and the schedule
-    splits them back along dim 0. A model whose
-    ``get_pipeline_kwargs_chunk_dims`` hook places the batch on another axis for
-    these inputs (for example multimodal M-RoPE position IDs of shape
-    ``[3, B, S]``) would be split wrongly, so it fails here. Text-only inputs of
-    such models (the hook returns no exceptions) are batch-major and run.
-
-    Args:
-        model: A local model part.
-        model_batch: One microbatch's model-facing inputs, or a whole call's
-            once a context-parallel hook has prepared them.
-    """
+    """Reject inputs that the schedule cannot split along batch dimension 0."""
     chunk_dims_hook = getattr(model, "get_pipeline_kwargs_chunk_dims", None)
     if chunk_dims_hook is None:
         return
@@ -166,39 +116,11 @@ def plan_execution_batches(
     cp_size: int,
     padding_token_id: int,
 ) -> list[ExecutionBatch]:
-    """Split ``data`` into pipeline execution batches.
+    """Pad and split data into fixed-size pipeline schedule calls.
 
-    The local data becomes ``ceil(size / (micro_batch_size * M))`` execution
-    batches. The tail, and any extra execution batches needed to match the DP
-    rank with the most, are filled with copies of the first sample whose
-    ``sample_mask`` and ``token_mask`` are zero. Every DP rank therefore issues
-    the same number of schedule calls and FSDP collectives. Models whose
-    ``forward`` takes a ``padding_mask`` (Automodel's MoE models) also receive
-    one that marks the padding rows, so their routers leave them out of the
-    auxiliary loss and the expert load, which zeroing the loss cannot cancel.
-    All execution batches keep ``data``'s sequence length, so one training
-    update never re-initializes the pipeline stages (which would drop
-    accumulated gradients).
-    Under context parallelism each execution batch is sharded once for all of
-    its microbatches, as Automodel's own pipeline trainer does.
-
-    Args:
-        data: The rows to plan, already on the training device.
-        model: A local model part, used to build its model-facing batch.
-        micro_batch_size: Samples per pipeline microbatch.
-        microbatches_per_step: Microbatches per schedule call (M).
-        dp_group: Group whose ranks must issue the same number of calls.
-        tokenizer: Tokenizer used to process microbatches.
-        cfg: Policy config used to process microbatches.
-        allow_flash_attn_args: Whether the model accepts flash-attention kwargs.
-        device_mesh: Device mesh with the ``cp`` axis.
-        cp_size: Context-parallel size.
-        padding_token_id: Token used to pad ``input_ids`` to the
-            context-parallel granularity.
-
-    Returns:
-        The execution batches in order. Real rows keep their order, so row
-        ``i`` of ``data`` has sample ID ``i``.
+    Match the maximum call count across DP ranks to keep FSDP collectives aligned.
+    Padding rows have zero loss masks and, where supported, a router padding mask.
+    Keep sequence lengths fixed across calls: resizing stages clears gradients.
     """
     num_samples = data.size
     if num_samples == 0:
@@ -254,8 +176,7 @@ def plan_execution_batches(
             for key, value in model_batches[0].items()
         }
         if mark_padding_rows:
-            # True marks a padding row. Real rows stay unmasked, matching the
-            # all-ones attention mask they get without pipeline parallelism.
+            # Exclude padding rows from MoE routing as well as the loss.
             input_ids = model_inputs["input_ids"]
             row_ids = torch.arange(
                 start, start + samples_per_call, device=input_ids.device
@@ -264,8 +185,7 @@ def plan_execution_batches(
                 (row_ids >= num_samples).unsqueeze(1).expand_as(input_ids).contiguous()
             )
         if cp_size > 1:
-            # ``torch.cat`` gave the inputs their own storage, so sharding them
-            # in place cannot reach the canonical microbatch data.
+            # Concatenation isolates loss-side data from in-place CP sharding.
             cp_sharder, model_context_factory, model_inputs = shard_model_batch_for_cp(
                 model,
                 model_inputs,
@@ -291,8 +211,6 @@ def plan_execution_batches(
     return execution_batches
 
 
-# "train" returns the loss for the schedule's backward pass, "eval" records the
-# loss and metrics without a backward pass, "logprobs" records token logprobs.
 PipelineCallMode = Literal["train", "eval", "logprobs"]
 
 
@@ -305,66 +223,32 @@ class PipelineCallContext:
     post_processing_fn: LossPostProcessor | LogprobsPostProcessor
     sampling_params: Optional[TrainingSamplingParams]
     sequence_dim: int
-    # Loss normalization recorded when the update was opened. The adapter only
-    # reads them. None in logprobs mode.
     global_valid_seqs: Optional[torch.Tensor]
     global_valid_toks: Optional[torch.Tensor]
-    # Factor on the returned training loss: dp_size * cp_size /
-    # cp_gradient_fanout, the same backward scale as automodel_forward_backward.
     loss_scale: float
-    # Results by microbatch index within the execution batch: (loss, metrics) in
-    # train/eval mode, token logprobs [B, S] in logprobs mode.
+    # Microbatch index -> (loss, metrics) or token logprobs [B, S].
     results: dict[int, Any]
 
     def microbatch_index(self, target: torch.Tensor) -> int:
-        """Map the sample IDs the schedule passed as ``target`` to a microbatch.
-
-        Args:
-            target: One microbatch's slice of ``ExecutionBatch.sample_ids``.
-
-        Returns:
-            Index of that microbatch in ``execution_batch.microbatches``.
-        """
-        sample_ids = target.tolist()
-        num_microbatches = len(self.execution_batch.microbatches)
-        micro_batch_size = len(sample_ids)
-        offset = sample_ids[0] - int(self.execution_batch.sample_ids[0])
-        mb_index = offset // micro_batch_size
-        if (
-            offset % micro_batch_size != 0
-            or not 0 <= mb_index < num_microbatches
-            or sample_ids
-            != list(range(sample_ids[0], sample_ids[0] + micro_batch_size))
-        ):
-            raise RuntimeError(
-                f"Pipeline loss received sample IDs {sample_ids}, which are not one "
-                f"microbatch of this schedule call (sample IDs "
-                f"{self.execution_batch.sample_ids.tolist()})."
-            )
-        return mb_index
+        """Map a schedule target slice to its microbatch index."""
+        offset = int(target[0]) - int(self.execution_batch.sample_ids[0])
+        return offset // target.numel()
 
 
 def _free_logits_storage(logits: torch.Tensor) -> None:
-    """Free the last stage's logits once a forward-only loss call has used them.
+    """Release logits retained in the forward-only schedule's cache.
 
-    A forward-only schedule call keeps every microbatch's output in the stage's
-    forward cache until the next call; without this the last stage would hold
-    the fp32 logits of all microbatches at once.
+    Otherwise the last stage holds every microbatch's fp32 logits until the
+    next schedule call.
     """
     to_local_if_dtensor(logits).untyped_storage().resize_(0)
 
 
 class PipelineOutputAdapter:
-    """The pipeline schedule's loss callback (``PipelineConfig.loss_fn``).
+    """Compute last-stage losses or logprobs using the shared post-processors.
 
-    The schedule calls it on the last stage once per microbatch as
-    ``loss_fn(logits, target, **loss_kwargs)``, where ``target`` holds the
-    microbatch's sample IDs and ``loss_kwargs`` is
-    ``{"context": PipelineCallContext}``. It is stateless: everything it needs
-    and everything it produces lives in the context. Results are written by
-    microbatch index, so a repeated call for the same microbatch (for example
-    during dynamic stage-metadata inference) overwrites instead of
-    double-counting.
+    Results are keyed by microbatch index so repeated callbacks overwrite
+    rather than double-count results.
     """
 
     def __call__(
@@ -374,17 +258,7 @@ class PipelineOutputAdapter:
         *,
         context: PipelineCallContext,
     ) -> torch.Tensor:
-        """Compute the RL loss or token logprobs of one microbatch.
-
-        Args:
-            logits: The last stage's output for the microbatch, [B, S, V].
-            target: The microbatch's sample IDs, [B].
-            context: State of the current schedule call.
-
-        Returns:
-            The scaled loss to backpropagate in train mode; a value the schedule
-            only records otherwise.
-        """
+        """Record results and return the scaled loss for backward in train mode."""
         mb_index = context.microbatch_index(target)
         result, metrics = post_process_logits(
             logits,
@@ -402,8 +276,7 @@ class PipelineOutputAdapter:
             return result.new_zeros(())
 
         if mb_index >= context.execution_batch.num_real_microbatches:
-            # Padding microbatch: run the backward pass for the schedule's
-            # sake, but contribute nothing.
+            # Padding must still participate in the schedule's backward pass.
             result = result * 0
         context.results[mb_index] = (result.detach(), metrics)
         if context.mode == "eval":
@@ -419,12 +292,7 @@ def _run_schedule_call(
     *,
     forward_only: bool,
 ) -> None:
-    """Run one execution batch through the pipeline schedule.
-
-    Calls the PyTorch schedule directly instead of ``AutoPipeline.step`` so that
-    ``return_outputs`` and ``loss_kwargs`` reach the schedule rather than the
-    model inputs, and so that forward-only calls can use ``schedule.eval``.
-    """
+    """Call the schedule directly to support eval, loss_kwargs, and return_outputs."""
     info = pipeline.info
     model_inputs = dict(execution_batch.model_inputs)
     input_ids = model_inputs.pop("input_ids")
@@ -432,10 +300,7 @@ def _run_schedule_call(
     target = execution_batch.sample_ids if info.has_last_stage else None
     run = info.schedule.eval if forward_only else info.schedule.step
     with execution_batch.model_context_factory():
-        # Context parallelism may shard the inputs in place on entering the
-        # context, so the stage shapes follow the length inside it. Models
-        # that shard inside their own forward keep full-length inputs here and
-        # describe their local activations through their stage-metadata hook.
+        # CP may change the sequence length on context entry.
         pipeline.update_seq_len(input_ids.shape[1])
         run(
             *args,
@@ -466,34 +331,14 @@ def pipeline_forward_backward(
     cp_size: int,
     num_global_batches: int,
 ) -> list[tuple[torch.Tensor, dict[str, Any]]]:
-    """Pipeline-parallel counterpart of ``automodel_forward_backward``.
+    """Accumulate gradients over one update's execution batches.
 
-    Runs every execution batch of one optimizer update through the schedule;
-    gradients accumulate across calls and no optimizer step happens here.
-
-    Args:
-        pipeline: The AutoPipeline that drives this rank's stage.
-        execution_batches: The update's planned schedule calls.
-        post_processing_fn: The loss post-processor.
-        autocast_context_factory: Worker-owned precision context factory.
-        forward_only: Compute losses and metrics without a backward pass.
-        global_valid_seqs: Global valid sequence count for loss normalization.
-        global_valid_toks: Global valid token count for loss normalization.
-        sampling_params: Sampling parameters (top-k, top-p, temperature).
-        sequence_dim: Sequence dimension.
-        dp_size: Data parallel size.
-        cp_size: Context parallel size.
-        num_global_batches: Number of global batches (for metric scaling).
-
-    Returns:
-        ``(loss, metrics)`` per microbatch in order, including padding
-        microbatches (zero loss, unscaled metrics), on the rank that owns the
-        last stage; an empty list on other ranks.
+    Returns (loss, metrics) per microbatch, including padding, on the last stage;
+    other stages return an empty list. The caller owns the optimizer step.
     """
     loss_scale = dp_size * cp_size / post_processing_fn.cp_gradient_fanout
     if not forward_only:
-        # Automodel defers MoE expert-gradient sync to the final backward of
-        # the update, as its own pipeline trainer does.
+        # Defer MoE expert-gradient synchronization until the final backward.
         prepare_for_grad_accumulation(pipeline.parts, pp_enabled=True)
     results: list[tuple[torch.Tensor, dict[str, Any]]] = []
     for call_idx, execution_batch in enumerate(execution_batches):
@@ -568,11 +413,7 @@ def pipeline_forward_logprobs(
 def pipeline_optimizer_part_ids(
     pipeline: Optional[AutoPipeline],
 ) -> Optional[list[int]]:
-    """Global stage index of this rank's pipeline stage, or None without PP.
-
-    Optimizer checkpoints namespace their state by it, as Automodel's own
-    pipeline trainer does, so stages cannot write overlapping keys.
-    """
+    """Global stage indices used to namespace optimizer checkpoints, or None without PP."""
     if pipeline is None:
         return None
     return [stage.stage_index for stage in pipeline.info.stages]
@@ -598,18 +439,7 @@ def _materialize_for_object_broadcast(value: Any) -> Any:
 
 
 def broadcast_object_from_last_stage(pipeline: AutoPipeline, obj: Any) -> Any:
-    """Broadcast a picklable payload from the last pipeline stage to the PP group.
-
-    Tensors are converted to host values first, on every rank, so all PP ranks
-    return identical payloads.
-
-    Args:
-        pipeline: The AutoPipeline that drives this rank's stage.
-        obj: The payload on the last stage; ignored on other ranks.
-
-    Returns:
-        The last stage's payload with tensors materialized on the host.
-    """
+    """Broadcast the last stage's payload, converting tensors to host values."""
     payload = [
         _materialize_for_object_broadcast(obj) if pipeline.info.has_last_stage else None
     ]
@@ -628,17 +458,7 @@ def broadcast_tensor_from_last_stage(
     shape: tuple[int, ...],
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Broadcast a CUDA tensor of known shape from the last stage to the PP group.
-
-    Args:
-        pipeline: The AutoPipeline that drives this rank's stage.
-        tensor: The tensor on the last stage; ignored on other ranks.
-        shape: The tensor's shape, known on every rank.
-        dtype: The tensor's dtype.
-
-    Returns:
-        The last stage's tensor on every PP rank.
-    """
+    """Broadcast the last stage's CUDA tensor with shape and dtype known on every rank."""
     if pipeline.info.has_last_stage:
         buffer = tensor.to(dtype).contiguous()
         if tuple(buffer.shape) != shape:
@@ -656,12 +476,9 @@ def broadcast_tensor_from_last_stage(
 
 
 def release_pipeline_runtime_state(pipeline: AutoPipeline) -> None:
-    """Free pipeline buffers before the GPU is handed to the rollout engine.
+    """Release stage caches and communication buffers before rollout.
 
-    Drops each stage's forward cache and its per-microbatch activation and
-    gradient receive buffers, and marks the stages uninitialized so the next
-    schedule call reallocates them. Gradients must already be zero: the
-    re-initialization clears them.
+    Gradients must already be zero: stage re-initialization clears them.
     """
     info = pipeline.info
     for stage in info.stages:
@@ -674,12 +491,10 @@ def release_pipeline_runtime_state(pipeline: AutoPipeline) -> None:
         pipeline.pp_seq_len,
         tensor_dtype=pipeline.dtype,
     )
-    # The stages now describe pp_seq_len; keep AutoPipeline's record in sync so
-    # the next update_seq_len() re-describes them for the next batch's length.
+    # Keep AutoPipeline's cached length consistent with the reset stage shapes.
     pipeline.update_seq_len(pipeline.pp_seq_len)
 
 
-# Yields this rank's pipeline stage as its (Hugging Face name, full tensor) stream.
 LocalParamsFn = Callable[[], Iterator[tuple[str, torch.Tensor]]]
 
 
@@ -690,30 +505,18 @@ class _ManifestEntry:
     name: str
     shape: tuple[int, ...]
     dtype: torch.dtype
-    # Rank within the pipeline group whose stage produces the tensor.
     owner_pp_rank: int
 
 
 class PipelineWeightExporter:
-    """Produce the whole model's ``(name, tensor)`` stream on every PP rank.
+    """Stream full-model weights on every PP rank for CUDA IPC and NCCL refit.
 
-    Refit consumers expect every training rank to stream the complete model, as
-    without pipeline parallelism, but a pipeline rank holds only its stage.
-    Each tensor is produced by the ranks of the stage that owns it (the same
-    per-module stream the non-pipelined refit uses: full tensors, Hugging Face
-    names, refit dtypes) and broadcast within the pipeline group. Under 1F1B
-    PP rank ``i`` owns stage ``i``, so the stream visits the stages in PP rank
-    order, an order every rank agrees on. The stream does not assume its
-    consumer, so colocated CUDA IPC and NCCL broadcast refits both iterate it.
+    Broadcast each stage's tensors in PP rank order, preserving Hugging Face
+    names and refit dtypes from the local parameter stream.
     """
 
     def __init__(self, pipeline: AutoPipeline, *, local_params: LocalParamsFn):
-        """Initialize the exporter.
-
-        Args:
-            pipeline: The AutoPipeline that drives this rank's stage.
-            local_params: Yields the refit stream of this rank's stage.
-        """
+        """Initialize with a factory for this stage's refit parameter stream."""
         self._local_params = local_params
         self._pp_group = pipeline.pp_mesh.get_group()
         self._manifest: Optional[list[_ManifestEntry]] = None
@@ -724,7 +527,6 @@ class PipelineWeightExporter:
             (name, tuple(tensor.shape), tensor.dtype)
             for name, tensor in self._local_params()
         ]
-        # all_gather_object fills every slot with one PP rank's entries.
         gathered: list[Any] = [None] * torch.distributed.get_world_size(self._pp_group)
         torch.distributed.all_gather_object(
             gathered, local_entries, group=self._pp_group
@@ -757,11 +559,9 @@ class PipelineWeightExporter:
         }
 
     def iter_params(self) -> Iterator[tuple[str, torch.Tensor]]:
-        """Yield the full model's ``(name, tensor)`` pairs on every PP rank.
+        """Yield full-model (name, tensor) pairs in manifest order.
 
-        Collective over the pipeline group (and, through the per-module stream,
-        over each stage's data-parallel group): every rank must consume the
-        whole stream.
+        Every PP and DP rank must consume the whole stream to complete collectives.
         """
         manifest = self.manifest()
         pp_rank = torch.distributed.get_rank(self._pp_group)

@@ -204,25 +204,11 @@ def shard_model_batch_for_cp(
 ) -> tuple[
     ContextParallelSharder, Callable[[], AbstractContextManager[Any]], dict[str, Any]
 ]:
-    """Resolve Automodel's context-parallel sharder for a model batch and shard it.
+    """Prepare CP inputs and return their sharder, context factory, and batch.
 
-    Automodel pads and shards the batch's tensors in place, some strategies
-    only once the returned context is entered, so ``model_batch`` must not
-    share storage with the canonical loss-side data.
-
-    Args:
-        model: The model, or under pipeline parallelism a local model part,
-            whose attention backend and CP hook select the strategy.
-        model_batch: Model-facing inputs with full-length sequences.
-        device_mesh: Device mesh with the ``cp`` axis.
-        padding_token_id: Token used to pad ``input_ids`` to the CP granularity.
-        num_chunks: Number of microbatches the batch is split into after
-            sharding (1 outside pipeline parallelism).
-
-    Returns:
-        The sharder, which maps token tensors between the canonical and local
-        sequence layouts; the context factory the forward and backward passes
-        must run in; and the sharded batch.
+    Inputs must not share storage with loss-side data: Automodel pads or shards
+    them in place, possibly on context entry. num_chunks is the number of
+    pipeline microbatches, or 1 without PP.
     """
     # Automodel's generic CP prep reads ``batch["labels"]`` unconditionally and
     # shards it alongside input_ids/position_ids (see ``shard_batch_load_balanced``).
@@ -427,25 +413,10 @@ def post_process_logits(
     sampling_params: Optional[TrainingSamplingParams],
     sequence_dim: int,
 ) -> Tuple[Any, dict[str, Any]]:
-    """Apply sampling-parameter scaling and a post-processor to model logits.
+    """Apply sampling parameters and compute (result, metrics) from logits.
 
-    Shared by the per-microbatch forward above and the pipeline-parallel loss
-    adapter, which receives the last stage's logits from the schedule.
-
-    Args:
-        logits: Model output logits for one microbatch; scaled in place by the
-            sampling temperature.
-        post_processing_fn: Post-processing function to apply to the logits
-        processed_mb: The microbatch the logits belong to
-        cp_sharder: Per-microbatch Automodel sequence-layout owner, or None
-            when context parallelism is inactive.
-        global_valid_seqs: Global valid sequence count for loss normalization
-        global_valid_toks: Global valid token count for loss normalization
-        sampling_params: Sampling parameters (top-k, top-p, temperature)
-        sequence_dim: Sequence dimension
-
-    Returns:
-        tuple: (result, metrics) as returned by forward_with_post_processing_fn.
+    Shared by the regular forward path and the pipeline loss callback.
+    Temperature scaling modifies logits in place.
     """
     data_dict = processed_mb.data_dict
     processed_inputs = processed_mb.processed_inputs
@@ -530,11 +501,7 @@ def post_process_logits(
 def scale_metrics_for_global_batches(
     metrics: dict[str, Any], num_global_batches: int
 ) -> None:
-    """Scale a microbatch's loss metrics in place by ``1 / num_global_batches``.
-
-    Summing the scaled metrics over every microbatch of a ``train()`` call then
-    gives the per-global-batch value. Min/max metrics are left unscaled.
-    """
+    """Average additive metrics over global batches in place, leaving min/max unchanged."""
     for k in metrics.keys():
         if "_min" in k or "_max" in k:
             continue

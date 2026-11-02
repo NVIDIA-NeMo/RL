@@ -36,8 +36,6 @@ class DistributedContext(NamedTuple):
     dp_size: int
     tp_size: int
     cp_size: int
-    # Appended with a default so existing constructors that predate pipeline
-    # parallelism keep working; setup_distributed always sets it.
     pp_size: int = 1
 
 
@@ -101,6 +99,5 @@ class ModelAndOptimizerState(NamedTuple):
     # Draft co-training runtime (loss, hidden capture, grad-norm reporting);
     # built alongside draft_model, None when draft co-training is disabled.
     draft_runtime: Optional[Any] = None
-    # Automodel's AutoPipeline under pipeline parallelism, None otherwise. It
-    # drives model, which is then this rank's pipeline stage.
+    # AutoPipeline owning this rank's model stage, or None without PP.
     pipeline: Optional[Any] = None

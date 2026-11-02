@@ -559,9 +559,7 @@ def setup_distributed(
             "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
         )
 
-    # Create device meshes (dp_size is derived from world_size / (pp * tp * cp));
-    # the mesh order (pp, dp_replicate, dp_shard, cp, tp) matches the Ray
-    # worker layout [PP, DP, CP, TP] in lm_policy.py.
+    # Mesh order (pp, dp_replicate, dp_shard, cp, tp) matches the Ray worker layout.
     mesh_context = MeshContext.build(
         fsdp2_config,
         ParallelismSizes(
@@ -941,8 +939,6 @@ def setup_model_and_optimizer(
     # r0.6.0's from_pretrained rejects the old separate distributed kwargs
     # (moe_mesh/distributed_config/moe_config/activation_checkpointing/pipeline_config/tp_plan
     # -- see _reject_separate_distributed_kwargs) and requires them via distributed_setup.
-    # With pipeline parallelism from_pretrained returns an AutoPipeline instead of
-    # a module.
     pp_enabled = distributed_context.pp_size > 1
     distributed_setup = DistributedSetup(
         mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
@@ -970,8 +966,7 @@ def setup_model_and_optimizer(
 
     pipeline = None
     if pp_enabled:
-        # 1F1B places one stage per pipeline rank; the rest of setup and the
-        # worker treat this rank's stage as the model.
+        # 1F1B returns one model stage per rank.
         pipeline = model
         (model,) = pipeline.parts
 
@@ -981,8 +976,7 @@ def setup_model_and_optimizer(
     model_state_dict_keys = list(model.state_dict().keys())
     is_moe_model = any(["expert" in key for key in model_state_dict_keys])
     if pipeline is not None:
-        # A stage may hold only dense layers of an MoE model, so decide over the
-        # whole pipeline group: every stage must agree on autocast.
+        # Dense-only stages of an MoE model must use the same autocast setting.
         has_experts = torch.tensor([is_moe_model], device="cuda")
         torch.distributed.all_reduce(
             has_experts,
@@ -1216,19 +1210,10 @@ def setup_model_and_optimizer(
 def build_pipeline_config(
     config: PolicyConfig, fsdp2_config: FSDP2Config
 ) -> PipelineConfig:
-    """Build Automodel's ``PipelineConfig`` from ``policy.automodel_cfg.pipeline``.
+    """Build a 1F1B schedule with one stage per rank.
 
-    NeMo RL owns the runtime values:
-
-    - The schedule is 1F1B, which places one stage on each pipeline rank.
-    - Each schedule call runs ``microbatches_per_step`` microbatches of
-      ``train_micro_batch_size`` samples.
-    - The schedule does not scale gradients: the loss adapter already returns
-      the non-pipelined path's backward scale.
-    - Stage shapes are precomputed for ``max_total_sequence_length``, so the
-      schedule uses static stage metadata instead of shape inference.
-    - Activations between stages carry FSDP's mixed-precision output dtype,
-      not the parameter dtype.
+    The loss adapter owns gradient scaling. Stage metadata uses the maximum
+    sequence length and FSDP's output dtype for inter-stage activations.
     """
     pipeline_cfg = AutomodelPipelineConfig.model_validate(
         config["automodel_cfg"]["pipeline"]
