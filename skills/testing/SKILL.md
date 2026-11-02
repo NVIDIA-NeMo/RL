@@ -1,7 +1,7 @@
 ---
 name: testing
-description: Testing conventions for NeMo-RL. Covers Ray actor coverage pragmas, nightly test requirements, and recipe naming rules.
-when_to_use: Writing or reviewing tests; adding a nightly test; naming a recipe; 'coverage pragma', 'Ray actor test', 'nightly test requirement', 'how to name recipes', during code review of test files.
+description: Testing conventions for NeMo-RL. Covers what not to unit-test, Ray actor coverage pragmas, nightly test requirements, and recipe naming rules.
+when_to_use: Writing or reviewing tests; adding a nightly test; naming a recipe; 'what not to unit-test', 'coverage pragma', 'Ray actor test', 'nightly test requirement', 'how to name recipes', during code review of test files.
 ---
 
 # Testing Conventions
@@ -24,6 +24,10 @@ class RolloutActor:
 def remote_eval(batch):
     ...
 ```
+
+## What Not to Unit-Test
+
+- **Do not test recipe settings: a unit test that only asserts a key of an existing config has a given value.** A recipe change always has a reason, so such a test only fails CI for the next intentional change. A test that keeps every config away from a known issue is fine, for example `test_all_config_no_tp_size_accuracy_issues`, which stops a new config from hitting the known TP>=4 accuracy issue. (#5009)
 
 ## Nightly Tests for New Model Support
 
