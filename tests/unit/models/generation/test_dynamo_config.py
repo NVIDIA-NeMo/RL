@@ -108,6 +108,8 @@ def test_dynamo_true_alone_is_a_complete_config(dynamo: bool) -> None:
             ),
             "checks no bearer token",
         ),
+        # Dynamo's token capture stages no sampler top-k for score centering.
+        (_vllm_config(dynamo=True, top_logprobs=4), "sampler top-k"),
         # Direct routing needs a worker ID that rollouts never carry.
         (
             _vllm_config(

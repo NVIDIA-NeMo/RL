@@ -198,6 +198,14 @@ def configure_generation_config(
                     "frontend serves the same engines on 0.0.0.0 and checks no "
                     "bearer token."
                 )
+            if config.get("top_logprobs"):
+                raise ValueError(
+                    "policy.generation.top_logprobs > 0 (loss_fn.score_centering) is "
+                    "not supported with policy.generation.dynamo=true yet: the "
+                    "Dynamo engine's token capture does not stage sampler top-k "
+                    "log-probs. Set top_logprobs to 0 and turn off "
+                    "loss_fn.score_centering, or remove policy.generation.dynamo."
+                )
             colocated = config.get("colocated")
             if colocated is not None and colocated["enabled"]:
                 raise ValueError(

@@ -152,6 +152,8 @@ Startup rejects these with `dynamo: true`:
   rank 0, vLLM rejects each engine's `ipc://` KV-event endpoint.
 - `vllm_cfg.http_server_api_key_required`: the frontend serves the same engines
   on 0.0.0.0 and checks no bearer token.
+- `top_logprobs > 0` (`loss_fn.score_centering`): the engine's token capture
+  does not stage sampler top-k log-probs yet.
 - `frontend_args.router_mode: direct`: it needs a worker ID on every request, and
   NeMo RL's rollouts name none.
 - Parser plugins with no Dynamo parser, and the chat settings above that the
