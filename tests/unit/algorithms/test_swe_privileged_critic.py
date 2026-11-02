@@ -19,6 +19,7 @@ import torch
 
 from nemo_rl.algorithms import swe_privileged_critic as spc
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -53,7 +54,7 @@ def _meta(group_id, n, lengths):
         fields=["input_ids"],
         sequence_lengths=list(lengths),
         extra_info={},
-        tags=[{"weight_version": 0} for _ in range(n)],
+        tags=[{"weight_version": 0, GROUP_ID_TAG: group_id} for _ in range(n)],
     )
 
 
@@ -140,6 +141,47 @@ def test_restore_fails_loudly_when_a_restored_group_has_no_saved_prefix():
 
     with pytest.raises(ValueError, match="does not contain"):
         _store().restore({"prefixes": {}, "stats": {}}, [meta])
+
+
+def test_restore_rejects_a_prefix_over_the_resumed_budget():
+    # Saved under max_total_tokens=64, resumed with 8: the saved prefix no longer
+    # fits the sequence lengths startup validated for this run.
+    store = _store()
+    meta = asyncio.run(store.enrich(_meta("ga", 1, [4]), _env_info("a")))
+    state = store.state_dict()
+    budget = spc.privilege_budget_tokens(
+        spc.SwePrivilegedCriticConfig(enabled=True, max_total_tokens=8)
+    )
+    state["prefixes"]["a"] = torch.zeros(budget + 1, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="over this run's budget"):
+        _store(max_total_tokens=8).restore(state, [meta])
+
+
+def test_release_resolves_forest_padding_rows_by_their_group_tag():
+    # Forest rows name their group in dispatch_group_id. A group id containing
+    # "_g" and a padding row "{group}_pad0" cannot be parsed back reliably from
+    # the sample ids, so the store must not try.
+    def forest_meta(group_id):
+        return KVBatchMeta(
+            partition_id="p",
+            task_name="train",
+            sample_ids=[f"{group_id}_g0_s0", f"{group_id}_pad0"],
+            fields=["input_ids"],
+            sequence_lengths=[4, 1],
+            tags=[{"dispatch_group_id": group_id}, {"dispatch_group_id": group_id}],
+        )
+
+    store = _store()
+    owned = asyncio.run(store.enrich(forest_meta("x_gfoo"), _env_info("a")))
+    asyncio.run(store.enrich(_meta("x", 1, [4]), _env_info("c")))
+
+    store.release([owned])
+
+    # Only x_gfoo's prefix goes; group "x" keeps instance c's.
+    assert len(store) == 1
+    store.release_groups(["x"])
+    assert len(store) == 0
 
 
 def test_enrich_fails_loudly_without_a_golden_patch():

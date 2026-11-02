@@ -55,6 +55,7 @@ from typing import Any, Collection, Iterable, Mapping, Optional, Sequence
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.grouping import prompt_group_ids
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.value.config import SwePrivilegedCriticConfig
 
@@ -465,8 +466,14 @@ def render_reference_prefix(
     return ids.to(dtype=torch.int32), stats
 
 
-def _group_id_of(sample_id: str) -> str:
-    return sample_id.rsplit("_g", 1)[0]
+def _only_group_id(meta: KVBatchMeta) -> str:
+    group_ids = prompt_group_ids(meta)
+    if len(group_ids) != 1:
+        raise ValueError(
+            "SWE privileged critic: expected the rows of one prompt group, got "
+            f"{len(group_ids)} group(s)."
+        )
+    return group_ids[0]
 
 
 class SwePrivilegePrefixStore:
@@ -500,7 +507,7 @@ class SwePrivilegePrefixStore:
             ValueError: No golden patch resolves for the instance. Training on
                 would silently produce a blind critic under a privileged label.
         """
-        group_id = _group_id_of(meta.sample_ids[0])
+        group_id = _only_group_id(meta)
         prompt_idx = (meta.tags[0] if meta.tags else {}).get(_PROMPT_IDX_TAG)
         fields = resolve_privilege_fields(extra_env_info or {})
         if not fields["golden_patch"]:
@@ -563,8 +570,9 @@ class SwePrivilegePrefixStore:
 
     def release(self, metas: Sequence[KVBatchMeta]) -> None:
         """Drop the references of the groups ``metas`` belong to (they trained)."""
-        sample_ids = (sample_id for meta in metas for sample_id in meta.sample_ids)
-        self.release_groups(_group_id_of(s) for s in sample_ids)
+        self.release_groups(
+            group_id for meta in metas for group_id in prompt_group_ids(meta)
+        )
 
     def release_groups(self, group_ids: Iterable[str]) -> None:
         """Drop the references of ``group_ids``; a prefix goes with its last one."""
@@ -608,8 +616,12 @@ class SwePrivilegePrefixStore:
         holds exactly one reference and nothing else does.
 
         Raises:
-            ValueError: A restored group references a prefix the checkpoint lacks.
+            ValueError: A restored group references a prefix the checkpoint
+                lacks, or a saved prefix is longer than this run's budget (the
+                run resumed with a smaller ``max_total_tokens``), which the
+                startup sequence-length checks did not size for.
         """
+        budget = privilege_budget_tokens(self._cfg)
         self._prefixes.clear()
         self._stats.clear()
         self._group_keys.clear()
@@ -627,9 +639,17 @@ class SwePrivilegePrefixStore:
                     f"SWE privileged critic: restored group references prefix {key!r}, "
                     "which the checkpoint does not contain."
                 )
-            self._prefixes[key] = state["prefixes"][key]
+            prefix = state["prefixes"][key]
+            if prefix.numel() > budget:
+                raise ValueError(
+                    f"SWE privileged critic: restored prefix {key!r} has "
+                    f"{prefix.numel()} tokens, over this run's budget of {budget} "
+                    "(max_total_tokens plus template slack). Resume with the "
+                    "max_total_tokens the checkpoint was written with."
+                )
+            self._prefixes[key] = prefix
             self._stats[key] = state["stats"][key]
-            group_id = _group_id_of(meta.sample_ids[0])
+            group_id = _only_group_id(meta)
             if group_id not in self._group_keys:
                 self._group_keys[group_id] = key
                 self._refcounts[key] = self._refcounts.get(key, 0) + 1

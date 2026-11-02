@@ -34,7 +34,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.experience.reward_penalties import FinalizedReward
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
@@ -459,7 +459,10 @@ def _finalized_group() -> FinalizedGroup:
             sample_ids=["group_g0", "group_g1"],
             fields=["input_ids"],
             sequence_lengths=[3, 2],
-            tags=[{"weight_version": 3}, {"weight_version": 3}],
+            tags=[
+                {"weight_version": 3, GROUP_ID_TAG: "group"},
+                {"weight_version": 3, GROUP_ID_TAG: "group"},
+            ],
         ),
         group_min_wv=3,
         group_max_wv=3,
@@ -545,7 +548,7 @@ def test_eviction_releases_the_prefixes_of_groups_that_can_no_longer_train() -> 
                     partition_id="canonical",
                     task_name="train",
                     sample_ids=[f"{group_id}_g0"],
-                    tags=[{"prompt_idx": 17}],
+                    tags=[{"prompt_idx": 17, GROUP_ID_TAG: group_id}],
                 ),
                 _PRIVILEGED_ENV_INFO,
             )

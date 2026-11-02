@@ -31,6 +31,7 @@ from nemo_rl.algorithms.single_controller import (
     _RolloutCheckpointCut,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 
 
 class _CharTokenizer:
@@ -78,7 +79,7 @@ def _group_meta(group_id: str) -> KVBatchMeta:
         sample_ids=[f"{group_id}_g0", f"{group_id}_g1"],
         fields=["input_ids"],
         sequence_lengths=[3, 2],
-        tags=[{}, {}],
+        tags=[{GROUP_ID_TAG: group_id}, {GROUP_ID_TAG: group_id}],
     )
 
 
