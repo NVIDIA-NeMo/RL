@@ -97,6 +97,29 @@ def _require_cut_coverage(
         )
 
 
+def _require_every_active_call_cut(snapshot: Path, phase_log: str) -> None:
+    """Reject a snapshot in which Gym failed or skipped an active call's cut.
+
+    Such a call quietly regenerates from its last boundary after the restore,
+    and the snapshot records only the cuts that succeeded, so the trainer's
+    save line for this snapshot is the only place the shortfall shows.
+    """
+    saves = re.findall(
+        rf"rollout checkpoint save completed: \S*/{re.escape(snapshot.name)} "
+        r"\(([^)]*)\)",
+        phase_log,
+    )
+    if not saves:
+        raise FileNotFoundError("snapshot save is not logged yet")
+    figures = dict(item.split("=", 1) for item in saves[-1].split(", "))
+    uncut = {
+        name: figures.get(name)
+        for name in ("generation_cut_failed_calls", "generation_cut_skipped_calls")
+    }
+    if any(value is None or float(value) != 0.0 for value in uncut.values()):
+        raise AssertionError(f"snapshot left active calls uncut: {uncut}")
+
+
 def inspect_snapshot(
     snapshot: Path,
     sentinel_event: str,
@@ -207,6 +230,9 @@ def select_snapshot(args: argparse.Namespace) -> None:
                     args.sentinel_event,
                     min_cuts=args.min_cuts,
                     min_cut_groups=args.min_cut_groups,
+                )
+                _require_every_active_call_cut(
+                    snapshot, phase_log.read_text(errors="replace")
                 )
             except (AssertionError, FileNotFoundError, json.JSONDecodeError) as error:
                 last_error = f"{snapshot}: {error}"
