@@ -702,6 +702,10 @@ def setup(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     loss_config: ClippedPGLossConfig = master_config.loss_fn
+    if loss_config.score_centering:
+        raise ValueError(
+            "Score centering requires SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
+        )
     env_configs = master_config.env
     data_config = master_config.data
     grpo_config = master_config.grpo
@@ -1047,6 +1051,7 @@ def setup(
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             policy_api_key=policy_api_key,
+            turn_checkpointing_enabled=False,
         )
         train_splits = (
             {f"train[{name}]": split for name, split in dataset.items()}
