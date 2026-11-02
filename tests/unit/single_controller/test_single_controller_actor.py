@@ -2302,6 +2302,7 @@ def _train_pump_controller(*, sampler) -> object:
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
+        rollout_recovery=SimpleNamespace(generation_prefix_cuts_enabled=False),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -2336,7 +2337,6 @@ def _train_pump_controller(*, sampler) -> object:
     attach_rollout_checkpointing(ctrl)
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
-    ctrl._generation_prefix_cuts_enabled = False
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
     ctrl._ppo_epochs = 1
@@ -2814,11 +2814,12 @@ def test_train_pump_logs_generation_prefix_restores_with_prefix_cuts(
     ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
     ctrl._trainer = _StepMetricRecordingTrainer(events)
     ctrl._gen = _StepMetricRecordingGeneration(events, dies_in=None)
-    ctrl._gen.get_generation_prefix_restore_counts = lambda: {
+    ctrl._gen.get_generation_prefix_counts = lambda: {
         "restored_calls": 3,
         "restored_prefix_tokens": 120,
+        "failed_cuts_control_deadline": 2,
     }
-    ctrl._generation_prefix_cuts_enabled = True
+    ctrl._master_config.rollout_recovery.generation_prefix_cuts_enabled = True
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
@@ -2828,6 +2829,7 @@ def test_train_pump_logs_generation_prefix_restores_with_prefix_cuts(
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["generation_prefix/restored_calls"] == 3.0
     assert train_metrics["generation_prefix/restored_prefix_tokens"] == 120.0
+    assert train_metrics["generation_prefix/failed_cuts_control_deadline"] == 2.0
 
 
 @pytest.mark.parametrize(

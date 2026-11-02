@@ -2985,20 +2985,18 @@ class SingleControllerActor:
                     log.warning("Skipping generation step metrics: %s", error)
                 if self._master_config.rollout_recovery.generation_prefix_cuts_enabled:
                     try:
-                        restore_counts = await asyncio.to_thread(
-                            self._gen.get_generation_prefix_restore_counts
+                        prefix_counts = await asyncio.to_thread(
+                            self._gen.get_generation_prefix_counts
                         )
                     except RayActorError as error:
-                        log.warning(
-                            "Skipping generation-prefix restore metrics: %s", error
-                        )
+                        log.warning("Skipping generation-prefix metrics: %s", error)
                     else:
                         # Totals since the generation workers started, so a
-                        # restore shows up as a step in the curve.
+                        # restore or a failed cut shows up as a step in the curve.
                         step_metrics.update(
                             {
                                 f"generation_prefix/{name}": float(count)
-                                for name, count in restore_counts.items()
+                                for name, count in prefix_counts.items()
                             }
                         )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
