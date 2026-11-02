@@ -48,6 +48,7 @@ from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     OPD_FULL_FIELDS,
+    SAMPLER_TOPK_FIELDS,
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -70,6 +71,7 @@ _TEXT_TOKEN_ALIGNED_FIELDS = frozenset(
         "token_mask",
         "sample_mask",
         "routed_experts",
+        *SAMPLER_TOPK_FIELDS,
         INVALID_TOOL_CALL_MASK,
         MALFORMED_THINKING_MASK,
     }

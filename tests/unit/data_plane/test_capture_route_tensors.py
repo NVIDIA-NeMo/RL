@@ -107,11 +107,14 @@ def forbid_route_codec(monkeypatch):
 @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32])
 @pytest.mark.parametrize("prev_len", [0, 3], ids=["root", "continuation"])
 @pytest.mark.parametrize("has_routes", [False, True], ids=["dense", "moe"])
+@pytest.mark.parametrize("has_sampler_topk", [False, True])
 def test_served_capture_bypasses_codec_through_route_consumers(
-    dtype, prev_len, has_routes, forbid_route_codec
+    dtype, prev_len, has_routes, has_sampler_topk, forbid_route_codec
 ):
     client = _StagingClient()
-    worker = SimpleNamespace(_capture_calls={})
+    worker = SimpleNamespace(
+        _capture_calls={}, _capture_top_logprobs=2 if has_sampler_topk else 0
+    )
     worker.token_capture = RolloutTokenCapture(
         sink=TQTokenSink(client, staging_partition="staging"),
         weight_version_fn=lambda: 7,
@@ -123,7 +126,7 @@ def test_served_capture_bypasses_codec_through_route_consumers(
     worker._delta_align_routed_experts = (
         VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
     )
-    admission = {"rollout_id": "r", "model_call_id": "c", "mode": "text"}
+    admission = {"capture_key": "r", "model_call_id": "c", "mode": "text"}
     prompt = [10, 11]
     if prev_len:
         prompt = [10, 11, 12, 20, 21]
@@ -134,7 +137,9 @@ def test_served_capture_bypasses_codec_through_route_consumers(
             required_prefix_token_ids=prompt[:prev_len],
             parent_chain_hash="1" * 64,
         )
-    request = SimpleNamespace(ng_capture=admission, stream=False)
+    request = SimpleNamespace(
+        ng_capture=admission, stream=False, logprobs=True, top_logprobs=2
+    )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, prompt)
     prompt_routes = torch.arange((len(prompt) - 1) * 2, dtype=dtype).reshape(-1, 1, 2)
     prompt_routes[0, 0, 0] = -1
@@ -161,6 +166,11 @@ def test_served_capture_bypasses_codec_through_route_consumers(
             routed_experts_dtype=dtype,
             encode_for_wire=id(request) not in worker._capture_calls,
         )
+    if has_sampler_topk:
+        sampler_ids = torch.tensor([[22, 23]], dtype=torch.int32)
+        sampler_logprobs = torch.tensor([[-0.25, -1.5]], dtype=torch.float32)
+        response.choices[0].message.sampler_topk_token_ids = sampler_ids
+        response.choices[0].message.sampler_topk_logprobs = sampler_logprobs
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
         worker,
         request,
@@ -179,8 +189,16 @@ def test_served_capture_bypasses_codec_through_route_consumers(
     source = TQTokenSource(client, staging_partition="staging")
     key = coords["staging_key"]
     deferred = source.fetch_for_finalization([key])[0]
-    direct = source.fetch_for_finalization([key], include_route_fragments=True)[0]
+    direct = source.fetch_for_finalization(
+        [key], include_route_fragments=True, include_sampler_topk=has_sampler_topk
+    )[0]
     assert deferred.fragment is None
+    assert deferred.sampler_topk is None
+    if has_sampler_topk:
+        torch.testing.assert_close(direct.sampler_topk[0], sampler_ids)
+        torch.testing.assert_close(direct.sampler_topk[1], sampler_logprobs)
+    else:
+        assert direct.sampler_topk is None
     if not has_routes:
         assert deferred.routed_len == 0
         assert direct.fragment is None
@@ -268,7 +286,7 @@ def test_capture_stages_and_verifies_native_routes_without_codec(
     routes = torch.tensor([[[1, -1]], [[3, 4]], [[5, 6]]], dtype=dtype)
     coords = capture.complete_call(
         capture.begin_call(
-            CaptureAdmission(rollout_id="r", model_call_id="c", mode="text")
+            CaptureAdmission(capture_key="r", model_call_id="c", mode="text")
         ),
         prompt_token_ids=[10, 11],
         generated_token_ids=[12],
@@ -342,7 +360,7 @@ def test_capture_rejects_missing_or_unsupported_attachments(attachment):
     )
     coords = capture.complete_call(
         capture.begin_call(
-            CaptureAdmission(rollout_id="r", model_call_id="c", mode="text")
+            CaptureAdmission(capture_key="r", model_call_id="c", mode="text")
         ),
         prompt_token_ids=[10],
         generated_token_ids=[11],
@@ -366,7 +384,7 @@ def test_capture_rejects_route_attachment_without_metadata():
     )
     coords = capture.complete_call(
         capture.begin_call(
-            CaptureAdmission(rollout_id="r", model_call_id="c", mode="text")
+            CaptureAdmission(capture_key="r", model_call_id="c", mode="text")
         ),
         prompt_token_ids=[10],
         generated_token_ids=[11],

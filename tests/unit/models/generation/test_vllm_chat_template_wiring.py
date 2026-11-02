@@ -161,6 +161,7 @@ def _install_fake_vllm(monkeypatch):
         with_cancellation=lambda handler: handler,
     )
     module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
+    module("vllm.renderers.hf", HfRenderer=placeholder("HfRenderer"))
 
     class ValidationError(ValueError):
         def __init__(self, message, **kwargs):
@@ -564,7 +565,11 @@ def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
         },
     }
     captured = []
-    admission = SimpleNamespace(mode="token_in", prev_len=4) if capture_media else None
+    admission = (
+        SimpleNamespace(mode="token_in", prev_len=4, request_replay=None)
+        if capture_media
+        else None
+    )
 
     async def preprocess(self, *, messages, **kwargs):
         rendered = (
@@ -576,7 +581,10 @@ def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
         )
         return (None, [rendered])
 
-    def capture(self, engine_prompt, *, admission, splice=None):
+    def capture(
+        self, engine_prompt, *, admission, splice=None, verify_retained_media=False
+    ):
+        assert not verify_retained_media
         if not capture_media:
             return None
         media = capture_processed_media(
