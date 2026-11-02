@@ -818,12 +818,13 @@ class GenerationInterface(ABC):
             f"{type(self).__name__}"
         )
 
-    def get_generation_prefix_restore_counts(self) -> dict[str, int]:
-        """Sum over workers of calls resumed from a restored generation prefix.
+    def get_generation_prefix_counts(self) -> dict[str, int]:
+        """Sum over workers of generation-prefix restore and cut counts.
 
         Returns:
-            ``restored_calls`` and their total ``restored_prefix_tokens`` since
-            the workers started.
+            Counts since the workers started: ``restored_calls`` and their
+            ``restored_prefix_tokens``, and the cut counts named by
+            ``GenerationCutCaptureMixin.get_generation_prefix_counts``.
         """
         raise NotImplementedError(
             "generation-prefix checkpointing is not supported for "

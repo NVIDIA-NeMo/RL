@@ -61,6 +61,7 @@ from nemo_rl.models.generation.generation_cut_capture import (
     _remaining_generation_limits_after_prefix,
     _RequestCaptureState,
     _TokenCaptureSnapshotGate,
+    initial_generation_cut_counts,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -662,6 +663,7 @@ class VllmAsyncGenerationWorkerImpl(
         # their prefix tokens; the driver logs the sums each step.
         self._restored_generation_prefix_calls = 0
         self._restored_generation_prefix_tokens = 0
+        self._generation_cut_counts = initial_generation_cut_counts()
         self._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
         # A dedicated executor prevents completions waiting on the closed gate
         # from consuming all threads needed to create the checkpoint cut.
