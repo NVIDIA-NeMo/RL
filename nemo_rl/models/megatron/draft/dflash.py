@@ -418,7 +418,10 @@ def _live_context_parallel_size() -> int:
 
 
 class DFlashBody(_ShardedModule):
-    """DFlash decoder body with caller-provided embeddings and no output head."""
+    """DFlash decoder body with caller-provided embeddings and no output head.
+
+    Constructed by the DFlash training provider added in PR #3757.
+    """
 
     def __init__(
         self,
@@ -452,7 +455,6 @@ class DFlashBody(_ShardedModule):
                 "parallel_config.tensor_model_parallel_size must match the "
                 "DFlash tensor parallel group size"
             )
-        self.parallel_config = parallel_config
         partitioned_dimensions = {
             "hidden_size": self.config.hidden_size,
             "intermediate_size": self.config.intermediate_size,
