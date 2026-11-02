@@ -26,10 +26,10 @@ from nemo_rl.models.generation.trtllm import trtllm_generation
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmDisaggServerConfig,
     replica_width,
-    role_engine_config,
     resolve_disagg_layout,
     resolve_disagg_server_config,
     resolve_role_overrides,
+    role_engine_config,
 )
 from nemo_rl.models.generation.trtllm.trtllm_generation import TrtllmGeneration
 
