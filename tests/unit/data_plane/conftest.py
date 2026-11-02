@@ -29,6 +29,7 @@ smoke / smoke-backend / smoke-1d / obj-backend / mix-e2e today).
 
 from __future__ import annotations
 
+import functools
 import os
 
 import pytest
@@ -124,25 +125,30 @@ def _isolate_codec_timer():
 
 # ----------------------------------------------------------------------------- nixl backend
 # Tests marked ``nixl`` need NIXL importable and UCX restricted to RDMA (the
-# NIXL data plane refuses TCP); the RDMA-only UCX env is set up here as the
-# driver does in production. Tests marked ``gpu`` need a CUDA device. Both are
-# skipped otherwise, so CPU-only runners execute only the pure tests.
-# CI sets NEMO_RL_REQUIRE_NIXL=1 on runners with an RDMA device, which turns a
-# nixl skip into a failure there, as NEMO_RL_REQUIRE_MOONCAKE does.
+# NIXL data plane refuses TCP) and an RDMA device; tests marked ``gpu`` need a
+# CUDA device. Both are skipped otherwise, so CPU-only runners execute only the
+# pure tests. ``_nixl_ready`` sets the RDMA-only UCX env itself, through
+# ``configure_engine_env``. CI sets NEMO_RL_REQUIRE_NIXL=1 on runners with an
+# RDMA device, which turns a nixl skip into a failure there, as
+# NEMO_RL_REQUIRE_MOONCAKE does.
 
 
+@functools.cache
 def _nixl_ready() -> str | None:
     try:
         from nixl._api import nixl_agent  # noqa: F401
     except Exception as e:  # noqa: BLE001
         return f"nixl not importable: {e}"
+    from nemo_rl.data_plane.adapters.transfer_queue import rdma_devices
     from nemo_rl.data_plane.adapters.transfer_queue_env import configure_engine_env
     from nemo_rl.data_plane.nixl.errors import TransportPolicyError
-    from nemo_rl.data_plane.nixl.nixl_io import check_rdma_only
 
+    # configure_engine_env fills in UCX_TLS, so the UCX env no longer tells a
+    # host with RDMA from one without: look for the device itself.
+    if not rdma_devices():
+        return "no RDMA device"
     try:
-        configure_engine_env({"backend": "nixl"})
-        check_rdma_only()
+        configure_engine_env({"backend": "nixl"})  # ends with check_rdma_only
     except TransportPolicyError as e:
         return f"UCX not restricted to RDMA: {e}"
     return None
