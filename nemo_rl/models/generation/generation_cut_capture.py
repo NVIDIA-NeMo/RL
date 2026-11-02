@@ -56,6 +56,12 @@ def initial_generation_cut_counts() -> dict[str, int]:
     return {
         "completed_cuts_kept": 0,
         "cut_lifecycle_races": 0,
+        # Reads of vLLM's decoding progress: how many, for how many calls, and
+        # the total time spent waiting for and holding vLLM's output lock.
+        "progress_reads": 0,
+        "progress_read_calls": 0,
+        "progress_read_wait_us": 0,
+        "progress_read_hold_us": 0,
         **{f"failed_cuts_{reason}": 0 for reason in GENERATION_CUT_FAILURE_REASONS},
     }
 
@@ -511,8 +517,10 @@ class GenerationCutCaptureMixin:
         Returns:
             ``restored_calls`` and their total ``restored_prefix_tokens``;
             ``completed_cuts_kept``, finished calls a cut kept whole;
-            ``cut_lifecycle_races``, calls that finished while being cut; and
-            ``failed_cuts`` with one ``failed_cuts_<reason>`` per
+            ``cut_lifecycle_races``, calls that finished while being cut;
+            ``progress_reads``, ``progress_read_calls`` and the microseconds
+            they waited for and held vLLM's output lock; and ``failed_cuts``
+            with one ``failed_cuts_<reason>`` per
             ``GENERATION_CUT_FAILURE_REASONS`` entry.
         """
         with self._capture_registry_lock:

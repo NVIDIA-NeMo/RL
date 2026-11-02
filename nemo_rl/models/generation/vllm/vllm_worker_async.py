@@ -17,8 +17,10 @@ import contextvars
 import copy
 import functools
 import gc
+import importlib.metadata
 import logging
 import secrets
+import sys
 import threading
 import time
 import uuid
@@ -32,6 +34,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Literal, Optional, cast
 import ray
 import torch
 import uvicorn
+from packaging.version import Version
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
@@ -109,6 +112,43 @@ _GENERATION_CUT_ROUTE = "/ng-control/v1/generation-cut"
 # Reasons already logged by this worker process; calls sharing a setting log once.
 _LOGGED_UNCUTTABLE_REASONS: set[str] = set()
 
+# The vLLM release whose private OutputProcessor layout direct progress reads
+# were checked against; see _AsyncLLMHTTPClient.enable_generation_progress_reads.
+_PROGRESS_READ_VLLM_RELEASE = (0, 29)
+
+
+@dataclass(frozen=True)
+class _EngineGenerationProgress:
+    """One request's generated tokens past a cut's start, read at an output boundary.
+
+    ``logprobs`` is vLLM's own append-only container; positions up to
+    ``start + len(token_ids)`` were published when the tokens were copied.
+    """
+
+    token_ids: list[int]
+    logprobs: Any
+    finish_reason: str | None
+    stop_reason: str | int | None
+
+
+@dataclass(frozen=True)
+class _EngineProgressRead:
+    """Progress for each requested call, and how long the read held vLLM up."""
+
+    progress: list[_EngineGenerationProgress | None]
+    wait_seconds: float
+    hold_seconds: float
+
+
+@dataclass(frozen=True)
+class _FinishedEngineRequest:
+    """A finished request's state, kept until its consumer has the final output."""
+
+    request_state: Any
+    finish_reason: str | None
+    stop_reason: str | int | None
+
+
 # The capture state of a cuttable call whose sampling params were just built.
 # vLLM's chat handler submits the request in the same task, where the HTTP
 # engine client takes it to note the vLLM request ID that cuts read progress by.
@@ -136,6 +176,33 @@ def _bad_words_can_straddle_a_cut(sampling_params: Any, tokenizer: Any) -> bool:
     except Exception:  # noqa: BLE001 - vLLM rejects the request itself later
         return True
     return any(len(token_ids) > 1 for token_ids in params._bad_words_token_ids or ())
+
+
+def _record_terminal_reason(
+    state: _RequestCaptureState, finish_reason: Any, stop_reason: Any
+) -> None:
+    """Record how vLLM finished a call; the caller holds ``state.lock``."""
+    if finish_reason is None:
+        return
+    if finish_reason not in ("stop", "length"):
+        state.observation_error = (
+            f"unsupported terminal finish_reason {finish_reason!r}"
+        )
+    elif (
+        state.terminal_finish_reason is not None
+        and state.terminal_finish_reason != finish_reason
+    ):
+        state.observation_error = (
+            "conflicting terminal finish reasons: "
+            f"{state.terminal_finish_reason!r} and {finish_reason!r}"
+        )
+    elif not isinstance(stop_reason, (str, int, type(None))):
+        state.observation_error = (
+            "terminal stop_reason must be a string, integer, or None"
+        )
+    else:
+        state.terminal_finish_reason = finish_reason
+        state.terminal_stop_reason = stop_reason
 
 
 def _generation_cut_blockers(sampling_params: Any, tokenizer: Any) -> list[str]:
@@ -451,6 +518,14 @@ class _AsyncLLMHTTPClient:
         self._engine_loop = engine_loop
         self._flat_logprobs = flat_logprobs
         self._on_generate = on_generate
+        # Direct progress reads (enable_generation_progress_reads). Reentrant:
+        # vLLM's finish hook runs inside the process_outputs call that holds it.
+        self._progress_lock = threading.RLock()
+        self._progress_reads_enabled = False
+        # External request IDs this client is serving, and the finished ones
+        # whose consumers have not yet taken the final output.
+        self._serving_request_ids: set[str] = set()
+        self._finished_requests: dict[str, _FinishedEngineRequest | None] = {}
         self.model_config = engine_client.model_config
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
@@ -504,6 +579,9 @@ class _AsyncLLMHTTPClient:
 
         iterator = None
         completed = False
+        if self._progress_reads_enabled:
+            with self._progress_lock:
+                self._serving_request_ids.add(request_id)
 
         async def next_output() -> Any:
             nonlocal iterator
@@ -521,13 +599,173 @@ class _AsyncLLMHTTPClient:
                     completed = True
                     return
         finally:
-            if not completed:
-                try:
-                    await self._run_on_engine_loop(
-                        lambda: self._engine_client.abort(request_id)
+            try:
+                if not completed:
+                    try:
+                        await self._run_on_engine_loop(
+                            lambda: self._engine_client.abort(request_id)
+                        )
+                    except Exception:
+                        LOGGER.exception("Failed to abort vLLM request %s", request_id)
+            finally:
+                if self._progress_reads_enabled:
+                    # The consumer took the final output before asking for the
+                    # next one, so its capture state has recorded the tokens.
+                    with self._progress_lock:
+                        self._serving_request_ids.discard(request_id)
+                        self._finished_requests.pop(request_id, None)
+
+    def enable_generation_progress_reads(self) -> None:
+        """Let generation cuts read vLLM's request state from their own thread.
+
+        Queuing each read onto the engine loop waited behind everything else
+        on it (router-replay route reads measured 52 ms median, 588 ms p95 and
+        40 s worst that way, against 1-4 ms read directly). Instead, each
+        ``OutputProcessor.process_outputs`` call runs under ``_progress_lock``,
+        so a read under the same lock sees whole decode steps and waits for at
+        most one. ``_finish_request`` keeps a finished request's state until
+        its consumer has the final output, so a call vLLM just finished is
+        still read whole.
+
+        Raises:
+            RuntimeError: The interpreter or vLLM is not one these private
+                reads were checked on.
+        """
+        if self._progress_reads_enabled:
+            return
+        gil_enabled = getattr(sys, "_is_gil_enabled", None)
+        if not (
+            sys.implementation.name == "cpython"
+            and gil_enabled is not None
+            and gil_enabled()
+        ):
+            raise RuntimeError(
+                "generation-prefix cuts read vLLM's request state from another "
+                "thread, which needs GIL-enabled CPython"
+            )
+        installed = importlib.metadata.version("vllm")
+        if Version(installed).release[:2] != _PROGRESS_READ_VLLM_RELEASE:
+            expected = ".".join(map(str, _PROGRESS_READ_VLLM_RELEASE))
+            raise RuntimeError(
+                "generation-prefix cuts read vLLM's private OutputProcessor state, "
+                f"checked on vLLM {expected}.x; vLLM {installed} is installed. "
+                "Re-check _AsyncLLMHTTPClient.enable_generation_progress_reads."
+            )
+        processor = self._engine_client.output_processor
+        missing = [
+            name
+            for name in (
+                "process_outputs",
+                "_finish_request",
+                "external_req_ids",
+                "request_states",
+            )
+            if not hasattr(processor, name)
+        ]
+        if missing:
+            raise RuntimeError(
+                "generation-prefix cuts need vLLM's OutputProcessor."
+                f"{', '.join(missing)}, which this vLLM lacks"
+            )
+        process_outputs = processor.process_outputs
+        finish_request = processor._finish_request
+
+        def locked_process_outputs(*args: Any, **kwargs: Any) -> Any:
+            with self._progress_lock:
+                return process_outputs(*args, **kwargs)
+
+        def retaining_finish_request(req_state: Any) -> Any:
+            with self._progress_lock:
+                request_id = req_state.external_req_id
+                if request_id in self._serving_request_ids:
+                    # vLLM queued the final output just before this hook.
+                    output = getattr(req_state.queue, "output", None)
+                    choices = getattr(output, "outputs", None) or ()
+                    finished = (
+                        _FinishedEngineRequest(
+                            req_state,
+                            getattr(choices[0], "finish_reason", None),
+                            getattr(choices[0], "stop_reason", None),
+                        )
+                        if len(choices) == 1
+                        else None
                     )
-                except Exception:
-                    LOGGER.exception("Failed to abort vLLM request %s", request_id)
+                    # A second engine request under one ID cannot be read.
+                    self._finished_requests[request_id] = (
+                        None if request_id in self._finished_requests else finished
+                    )
+                return finish_request(req_state)
+
+        processor.process_outputs = locked_process_outputs
+        processor._finish_request = retaining_finish_request
+        self._progress_reads_enabled = True
+
+    def read_generation_progress(
+        self, requests: list[tuple[str, int]], *, timeout_s: float | None
+    ) -> _EngineProgressRead:
+        """Copy each request's generated token IDs past ``start``, all at one boundary.
+
+        Args:
+            requests: ``(engine request ID, start)`` per call; ``start`` is the
+                number of generated tokens the call has already recorded.
+            timeout_s: How long to wait for vLLM to finish its current output
+                chunk; ``None`` waits indefinitely.
+
+        Returns:
+            Per request, its progress, or ``None`` when vLLM has not started
+            it, it was aborted, or it is not a single engine request.
+
+        Raises:
+            TimeoutError: vLLM held the lock past ``timeout_s``.
+        """
+        if not self._progress_reads_enabled:
+            raise RuntimeError("generation progress reads are not enabled")
+        started = time.perf_counter()
+        if not self._progress_lock.acquire(
+            timeout=-1 if timeout_s is None else max(0.0, timeout_s)
+        ):
+            raise TimeoutError("vLLM held its output lock past the cut's deadline")
+        acquired = time.perf_counter()
+        try:
+            processor = self._engine_client.output_processor
+            progress = [
+                self._read_one_request(processor, request_id, start)
+                for request_id, start in requests
+            ]
+        finally:
+            self._progress_lock.release()
+        return _EngineProgressRead(
+            progress, acquired - started, time.perf_counter() - acquired
+        )
+
+    def _read_one_request(
+        self, processor: Any, request_id: str, start: int
+    ) -> _EngineGenerationProgress | None:
+        if request_id in self._finished_requests:
+            finished = self._finished_requests[request_id]
+            if finished is None:
+                return None
+            request_state = finished.request_state
+            finish_reason, stop_reason = finished.finish_reason, finished.stop_reason
+        else:
+            internal_ids = processor.external_req_ids.get(request_id)
+            if not internal_ids or len(internal_ids) != 1:
+                return None
+            request_state = processor.request_states.get(internal_ids[0])
+            if request_state is None:
+                return None
+            finish_reason = stop_reason = None
+        if request_state.detokenizer is None:
+            return None
+        logprobs_processor = request_state.logprobs_processor
+        return _EngineGenerationProgress(
+            token_ids=list(request_state.detokenizer.output_token_ids[start:]),
+            logprobs=None
+            if logprobs_processor is None
+            else logprobs_processor.logprobs,
+            finish_reason=finish_reason,
+            stop_reason=stop_reason,
+        )
 
     # These members only read engine status or immutable configuration. Running
     # them on the engine loop added a cross-thread wait to each HTTP request.
@@ -1064,6 +1302,12 @@ class VllmAsyncGenerationWorkerImpl(
         if generation_prefix_cuts_enabled:
             # Cuts must land on character boundaries; see _ends_inside_character.
             self._generation_cut_tokenizer = self.llm.renderer.get_tokenizer()
+            if self._http_engine_client is None:
+                raise RuntimeError(
+                    "generation-prefix cuts need the vLLM HTTP server "
+                    "(vllm_cfg.expose_http_server: true)"
+                )
+            self._http_engine_client.enable_generation_progress_reads()
         source = TQTokenSource(
             dp_client, staging_partition=staging_partition, capture_media=capture_media
         )
@@ -1206,26 +1450,7 @@ class VllmAsyncGenerationWorkerImpl(
             return
         with state.lock:
             state.observe(generation_token_ids, generation_logprobs, start=observed)
-            if finish_reason is not None:
-                if finish_reason not in ("stop", "length"):
-                    state.observation_error = (
-                        f"unsupported terminal finish_reason {finish_reason!r}"
-                    )
-                elif (
-                    state.terminal_finish_reason is not None
-                    and state.terminal_finish_reason != finish_reason
-                ):
-                    state.observation_error = (
-                        "conflicting terminal finish reasons: "
-                        f"{state.terminal_finish_reason!r} and {finish_reason!r}"
-                    )
-                elif not isinstance(stop_reason, (str, int, type(None))):
-                    state.observation_error = (
-                        "terminal stop_reason must be a string, integer, or None"
-                    )
-                else:
-                    state.terminal_finish_reason = finish_reason
-                    state.terminal_stop_reason = stop_reason
+            _record_terminal_reason(state, finish_reason, stop_reason)
 
     def _bind_capture_engine_request(self, engine_request_id: str) -> None:
         """Note the vLLM request ID of the captured call being submitted, if any."""
@@ -1241,11 +1466,12 @@ class VllmAsyncGenerationWorkerImpl(
     ) -> None:
         """Record the tokens each call decoded since its last record, read from vLLM.
 
-        One pass on the engine loop copies every call's new token IDs, so all
-        calls are read at the same decode step and none mid-step. Their logprobs
-        are then read here, off the engine loop, from positions that pass saw
-        published. A call vLLM no longer holds (not yet submitted, or finished)
-        keeps what it has recorded; its finished output records the rest.
+        One read under vLLM's output lock copies every call's new token IDs,
+        so all calls are read at the same output boundary; their logprobs are
+        then read outside it, from positions that read saw published. A call
+        vLLM has finished but whose consumer has not yet taken the output is
+        read whole, with its finish reason. One vLLM does not hold (not yet
+        submitted, or aborted) keeps what it has recorded.
         """
         pending = []
         for state in states:
@@ -1260,62 +1486,46 @@ class VllmAsyncGenerationWorkerImpl(
                     )
         if not pending:
             return
-        output_processor = self.llm.output_processor
-
-        async def read_engine_progress() -> list[tuple[list[int], Any] | None]:
-            # Never awaits, so the engine loop cannot process a step mid-read.
-            progress: list[tuple[list[int], Any] | None] = []
-            for _, engine_request_id, start in pending:
-                internal_ids = output_processor.external_req_ids.get(engine_request_id)
-                request_state = (
-                    output_processor.request_states.get(internal_ids[0])
-                    if internal_ids is not None and len(internal_ids) == 1
-                    else None
-                )
-                if request_state is None or request_state.detokenizer is None:
-                    progress.append(None)
-                    continue
-                progress.append(
-                    (
-                        request_state.detokenizer.output_token_ids[start:],
-                        request_state.logprobs_processor.logprobs
-                        if request_state.logprobs_processor is not None
-                        else None,
-                    )
-                )
-            return progress
-
-        future = asyncio.run_coroutine_threadsafe(
-            read_engine_progress(), self._engine_loop
-        )
         try:
-            progress = future.result(
-                timeout=None
-                if deadline is None
-                else max(0.0, deadline - time.monotonic())
+            read = self._http_engine_client.read_generation_progress(
+                [(request_id, start) for _, request_id, start in pending],
+                timeout_s=None if deadline is None else deadline - time.monotonic(),
             )
         except TimeoutError:
-            future.cancel()
             LOGGER.warning(
                 "generation cut could not read vLLM's progress before its deadline; "
                 "%d calls are cut at the tokens they have recorded",
                 len(pending),
             )
             return
-        for (state, _, start), entry in zip(pending, progress, strict=True):
-            if entry is None:
+        with self._capture_registry_lock:
+            counts = self._generation_cut_counts
+            counts["progress_reads"] += 1
+            counts["progress_read_calls"] += len(pending)
+            counts["progress_read_wait_us"] += round(read.wait_seconds * 1e6)
+            counts["progress_read_hold_us"] += round(read.hold_seconds * 1e6)
+        LOGGER.debug(
+            "generation cut read %d calls from vLLM: waited %.2f ms, held %.2f ms",
+            len(pending),
+            read.wait_seconds * 1e3,
+            read.hold_seconds * 1e3,
+        )
+        for (state, _, start), progress in zip(pending, read.progress, strict=True):
+            if progress is None:
                 continue
-            token_ids, logprobs = entry
             try:
                 generated_logprobs = extract_generation_logprobs(
-                    token_ids, logprobs, start=start
+                    progress.token_ids, progress.logprobs, start=start
                 )
             except (RuntimeError, TypeError, ValueError) as error:
                 with state.lock:
                     state.observation_error = f"{type(error).__name__}: {error}"
                 continue
             with state.lock:
-                state.observe(token_ids, generated_logprobs, start=start)
+                state.observe(progress.token_ids, generated_logprobs, start=start)
+                _record_terminal_reason(
+                    state, progress.finish_reason, progress.stop_reason
+                )
 
     def _restore_response_prefix(
         self, request: Any, request_output: Any, *, tokenizer: Any
@@ -2331,10 +2541,12 @@ class VllmAsyncGenerationWorkerImpl(
                     nonlocal final_res, cancelled
                     try:
                         async for res in result_generator:
+                            # Recorded before asking for the next output, which
+                            # releases vLLM's finished state for this request.
+                            worker_self._observe_request_capture(request, res)
                             final_res = res
                         if final_res is None:
                             return
-                        worker_self._observe_request_capture(request, final_res)
                         worker_self._restore_response_prefix(
                             request,
                             final_res,
