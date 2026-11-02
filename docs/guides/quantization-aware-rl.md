@@ -32,29 +32,33 @@ The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dy
 
 ## Dynamic FP8 KV Cache
 
-For vLLM rollouts with `precision: fp8` (including MXFP8 weights), enable:
+For vLLM rollouts with FP8 precision (including MXFP8 weights), configure:
 
 ```yaml
 policy:
   generation:
     vllm_cfg:
-      fp8_per_token_head: true
+      precision: fp8
+      kv_cache_dtype: fp8_per_token_head
+    vllm_kwargs:
+      attention_backend: TRITON_ATTN
 ```
 
-The flag defaults to false. When enabled, it selects vLLM's
-`fp8_per_token_head` cache format and `TRITON_ATTN`, replacing the configured
-attention backend. K and V scales are computed independently for each token
-and KV head when writing the cache, and stored alongside the FP8 cache.
-Static policy KV scales are not synchronized during weight refits.
-This requires a vLLM build supporting `fp8_per_token_head`.
-It accepts `kv_cache_dtype: auto`, `fp8`, or `fp8_e4m3`; DeepSeek's
-specialized MLA cache and ModelOpt `real_quant` rollout are not supported.
-Mamba state caches are unaffected. This flag configures rollout cache storage;
-it does not change policy training attention.
+K and V scales are computed independently for each token and KV head when
+writing the cache, and stored alongside the FP8 cache. Static policy KV scales
+are not synchronized during weight refits. This requires a vLLM build supporting
+`fp8_per_token_head`. Explicitly incompatible attention backends raise an error;
+when no backend is specified, vLLM selects or rejects the backend. NeMo RL does
+not override the configured backend.
+
+DeepSeek's specialized MLA cache and ModelOpt `real_quant` rollout are not
+supported. Mamba state caches are unaffected. This configures rollout cache
+storage; it does not change policy training attention.
 
 For command-line overrides, use
-`++policy.generation.vllm_cfg.fp8_per_token_head=true`.
-Disabling the flag preserves the existing cache dtype and attention backend.
+`policy.generation.vllm_cfg.kv_cache_dtype=fp8_per_token_head` and
+`++policy.generation.vllm_kwargs.attention_backend=TRITON_ATTN`.
+The default `kv_cache_dtype: auto` preserves the existing cache behavior.
 
 ## Simulated KV-Cache Quantization
 

@@ -498,10 +498,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "kv_cache_dtype": kv_cache_dtype,
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
-    if kv_cache_dtype == "fp8_per_token_head":
-        # FLASH_ATTN does not support per-token-head cache scales.
-        vllm_kwargs["attention_backend"] = "TRITON_ATTN"
-
     return vllm_kwargs
 
 
