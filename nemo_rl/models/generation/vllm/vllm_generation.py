@@ -60,7 +60,7 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
-from nemo_rl.telemetry.instrumentation import trace_fn
+from nemo_rl.telemetry.instrumentation import trace_context_kwargs, trace_fn
 from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
@@ -1788,6 +1788,7 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             "begin_token_capture_snapshot_fence_async",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            **trace_context_kwargs(),
         )
         if not all(ray.get(futures, timeout=timeout_s)):
             raise RuntimeError(
@@ -1808,6 +1809,7 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             "end_token_capture_snapshot_fence_async",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            **trace_context_kwargs(),
         )
         if not all(ray.get(futures, timeout=timeout_s)):
             raise RuntimeError(

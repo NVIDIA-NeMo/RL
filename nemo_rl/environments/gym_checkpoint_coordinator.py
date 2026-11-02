@@ -25,7 +25,7 @@ from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import ray
 
@@ -35,8 +35,23 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointPrepareSummary,
     GymCheckpointUnavailable,
 )
-from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.failures import FailureClass, classify_rollout_failure
+from nemo_rl.telemetry.instrumentation import dispatch_with_trace_context
+from nemo_rl.telemetry.rollout_checkpoint import Phase, checkpoint_phase
+
+if TYPE_CHECKING:
+    from nemo_rl.environments.nemo_gym import NemoGymShardSet
+
+_CONTROL_PHASES: dict[str, Phase] = {
+    "prepare": "gym_prepare",
+    "renew": "gym_renew",
+    "commit": "gym_commit",
+    "resume": "gym_resume",
+    "retire": "gym_retire",
+    "forget": "gym_forget",
+    "restore": "gym_restore",
+    "restore_retire": "gym_restore_retire",
+}
 
 GYM_CHECKPOINT_MANIFEST_FILENAME = "gym_checkpoint.json"
 GYM_CHECKPOINT_SCHEMA_VERSION = 1
@@ -338,36 +353,53 @@ class GymCheckpointCoordinator:
         waited on forever. Giving up is safe: a Gym deployment left parked
         reopens by itself when its checkpoint lease expires.
         """
-        tasks = {
-            instance_id: asyncio.ensure_future(reference)
-            for instance_id, reference in references.items()
-        }
-        grace_s = min(self._control_timeout_s, _MAX_REPLY_GRACE_S)
-        timeout_s = max(0.0, deadline_ts - time.time()) + grace_s
-        try:
-            await asyncio.wait(tasks.values(), timeout=timeout_s)
-        except BaseException:
-            for task in tasks.values():
-                task.cancel()
-            raise
-        results: dict[str, Any] = {}
-        failures: dict[str, BaseException] = {}
-        for instance_id, task in tasks.items():
-            if not task.done():
-                task.cancel()
-                _cancel_remote(references[instance_id])
-                failures[instance_id] = TimeoutError(
-                    f"no reply within {timeout_s:.1f}s of the {operation} call"
-                )
-            elif task.cancelled():
-                failures[instance_id] = asyncio.CancelledError()
-            elif task.exception() is not None:
-                failures[instance_id] = task.exception()
-            else:
-                results[instance_id] = task.result()
-        if failures:
-            raise GymCheckpointOperationError(operation, failures)
-        return results
+        with checkpoint_phase(
+            _CONTROL_PHASES.get(operation, "gym_control")
+        ) as progress:
+            tasks = {
+                instance_id: asyncio.ensure_future(reference)
+                for instance_id, reference in references.items()
+            }
+            if progress is not None:
+
+                def update_pending(
+                    _finished: asyncio.Future[Any] | None = None,
+                ) -> None:
+                    progress.pending(
+                        instance_id
+                        for instance_id, task in tasks.items()
+                        if not task.done()
+                    )
+
+                update_pending()
+                for task in tasks.values():
+                    task.add_done_callback(update_pending)
+            grace_s = min(self._control_timeout_s, _MAX_REPLY_GRACE_S)
+            timeout_s = max(0.0, deadline_ts - time.time()) + grace_s
+            try:
+                await asyncio.wait(tasks.values(), timeout=timeout_s)
+            except BaseException:
+                for task in tasks.values():
+                    task.cancel()
+                raise
+            results: dict[str, Any] = {}
+            failures: dict[str, BaseException] = {}
+            for instance_id, task in tasks.items():
+                if not task.done():
+                    task.cancel()
+                    _cancel_remote(references[instance_id])
+                    failures[instance_id] = TimeoutError(
+                        f"no reply within {timeout_s:.1f}s of the {operation} call"
+                    )
+                elif task.cancelled():
+                    failures[instance_id] = asyncio.CancelledError()
+                elif task.exception() is not None:
+                    failures[instance_id] = task.exception()
+                else:
+                    results[instance_id] = task.result()
+            if failures:
+                raise GymCheckpointOperationError(operation, failures)
+            return results
 
     async def prepare(
         self,
@@ -379,7 +411,8 @@ class GymCheckpointCoordinator:
         results = await self._collect(
             "prepare",
             {
-                instance_id: handle.checkpoint_prepare.remote(
+                instance_id: dispatch_with_trace_context(
+                    handle.checkpoint_prepare,
                     checkpoint_id,
                     deadline_ts=deadline_ts,
                 )
@@ -402,7 +435,8 @@ class GymCheckpointCoordinator:
         await self._collect(
             "renew",
             {
-                instance_id: handle.checkpoint_renew.remote(
+                instance_id: dispatch_with_trace_context(
+                    handle.checkpoint_renew,
                     checkpoint_id,
                     deadline_ts=deadline_ts,
                 )
@@ -454,7 +488,8 @@ class GymCheckpointCoordinator:
         raw_summaries = await self._collect(
             "commit",
             {
-                instance_id: self._handles[instance_id].checkpoint_commit.remote(
+                instance_id: dispatch_with_trace_context(
+                    self._handles[instance_id].checkpoint_commit,
                     checkpoint_id,
                     str(checkpoint_root),
                     episodes,
@@ -523,7 +558,8 @@ class GymCheckpointCoordinator:
         await self._collect(
             "retire",
             {
-                instance_id: self._handles[instance_id].checkpoint_retire.remote(
+                instance_id: dispatch_with_trace_context(
+                    self._handles[instance_id].checkpoint_retire,
                     checkpoint_id,
                     episodes,
                     deadline_ts=deadline_ts,
@@ -552,7 +588,8 @@ class GymCheckpointCoordinator:
         await self._collect(
             "forget",
             {
-                instance_id: self._handles[instance_id].checkpoint_forget.remote(
+                instance_id: dispatch_with_trace_context(
+                    self._handles[instance_id].checkpoint_forget,
                     checkpoint_id,
                     tuple(sorted({episode.rollout_id for episode in episodes})),
                     deadline_ts=deadline_ts,
@@ -589,7 +626,8 @@ class GymCheckpointCoordinator:
             await self._collect(
                 "restore",
                 {
-                    instance_id: self._handles[instance_id].checkpoint_restore.remote(
+                    instance_id: dispatch_with_trace_context(
+                        self._handles[instance_id].checkpoint_restore,
                         restore_id,
                         str(checkpoint_root),
                         episodes,
@@ -614,9 +652,8 @@ class GymCheckpointCoordinator:
                 await self._collect(
                     "restore_retire",
                     {
-                        instance_id: self._handles[
-                            instance_id
-                        ].checkpoint_retire.remote(
+                        instance_id: dispatch_with_trace_context(
+                            self._handles[instance_id].checkpoint_retire,
                             restore_id,
                             tuple(
                                 episode.next_attempt()
@@ -685,7 +722,8 @@ class GymCheckpointCoordinator:
                 await self._collect(
                     "resume",
                     {
-                        instance_id: handle.checkpoint_resume.remote(
+                        instance_id: dispatch_with_trace_context(
+                            handle.checkpoint_resume,
                             checkpoint_id,
                             deadline_ts=deadline_ts,
                         )
