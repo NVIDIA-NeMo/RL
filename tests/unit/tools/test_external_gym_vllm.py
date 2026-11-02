@@ -1260,7 +1260,6 @@ def test_serve_mode_requires_a_pool_dir_and_rejects_unknown_modes(tmp_path):
     assert "EXTERNAL_VLLM_MODE must be inline or serve, got: attach" in result.stderr
 
 
-
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
 def test_serve_mode_survives_a_failed_heartbeat_write(tmp_path):
     pool_dir = tmp_path / "pool"
