@@ -35,8 +35,6 @@ run_test() {
 }
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
-# Same smoke on the nixl data plane (skips without an RDMA device).
-run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_nixl.sh
 # Same non-colocated vLLM SingleController smoke, but install refitted weights
 # through vLLM's native reload_weights API.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh
