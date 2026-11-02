@@ -75,6 +75,19 @@ def test_valid_config_returns_parsed_pipeline_block():
     assert pipeline_cfg == AutomodelPipelineConfig(microbatches_per_step=4)
 
 
+@pytest.mark.parametrize("interval", [None, 0])
+def test_pipeline_accepts_disabled_periodic_cache_clearing(interval):
+    assert _validate(_config(clear_cache_every_n_steps=interval)) is not None
+
+
+@pytest.mark.parametrize("interval", [1, 50])
+def test_non_pipeline_accepts_periodic_cache_clearing(interval):
+    assert (
+        _validate(_config(pipeline_parallel_size=1, clear_cache_every_n_steps=interval))
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
@@ -151,6 +164,10 @@ def test_logprob_batch_size_must_match_train_micro_batch_size():
             "automodel_cfg.sequence_parallel",
         ),
         (lambda c: c["automodel_cfg"].update(cpu_offload=True), "cpu_offload"),
+        (
+            lambda c: c["automodel_cfg"].update(clear_cache_every_n_steps=1),
+            "automodel_cfg.clear_cache_every_n_steps",
+        ),
         (
             lambda c: c["automodel_cfg"]["lora_cfg"].update(enabled=True),
             "lora_cfg.enabled",

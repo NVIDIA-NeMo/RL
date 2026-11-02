@@ -60,6 +60,9 @@ Qwen3.5-MoE's MTP layer) are not placed on any stage; RL training does not use t
   LoRA, draft co-training, router replay, reward models, ModelOpt quantization,
   multimodal (VLM) models, non-colocated generation, and any `refit_transport`.
 - Models whose embedding and LM head share one weight (`tie_word_embeddings`).
+- A nonzero `automodel_cfg.clear_cache_every_n_steps`: periodic microbatch cache
+  clearing is not supported under PP. Leave it unset, or set it to `null` or `0`.
+  The usual cache clearing at the end of `train()` still runs.
 
 SFT additionally requires `sft.val_micro_batch_size == policy.train_micro_batch_size`.
 Top-k logits, full logits, and reward scoring raise `NotImplementedError` in the worker.

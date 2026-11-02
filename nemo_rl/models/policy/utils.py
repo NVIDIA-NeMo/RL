@@ -259,6 +259,9 @@ def validate_automodel_pipeline_config(
         "dynamic_batching.enabled": config["dynamic_batching"]["enabled"],
         "automodel_cfg.sequence_parallel": automodel_cfg["sequence_parallel"],
         "automodel_cfg.cpu_offload": automodel_cfg["cpu_offload"],
+        "automodel_cfg.clear_cache_every_n_steps": automodel_cfg.get(
+            "clear_cache_every_n_steps"
+        ),
         "automodel_cfg.lora_cfg.enabled": "lora_cfg" in automodel_cfg
         and automodel_cfg["lora_cfg"]["enabled"],
         "draft.enabled": draft_refit_enabled(config.get("draft")),
