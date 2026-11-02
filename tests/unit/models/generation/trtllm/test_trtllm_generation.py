@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -644,3 +645,85 @@ def test_role_blocks_are_left_as_written_without_disaggregation(disaggregation):
     cfg = _config(disaggregation=disaggregation, prefill_engine={"precision": "x"})
 
     assert resolve_role_overrides(cfg) is cfg
+
+
+def _fake_disagg_server_actor():
+    """A stand-in whose ``start`` returns a URL naming its replica and frontend."""
+
+    def options(**_kwargs):
+        def remote(replica_idx, *, frontend_idx, **_rest):
+            url = f"http://frontend-{replica_idx}-{frontend_idx}"
+            return SimpleNamespace(start=SimpleNamespace(remote=lambda: url))
+
+        return SimpleNamespace(remote=remote)
+
+    return SimpleNamespace(options=options)
+
+
+def test_the_engine_topology_maps_each_engine_to_its_replica_role_and_frontends(
+    monkeypatch,
+):
+    generation = _bare_generation(colocated=False, expose_http_server=True)
+    generation.cfg["disaggregation"] = {
+        "enabled": True,
+        "num_prefill_engines": 1,
+        "num_decode_engines": 1,
+        "num_frontend_workers": 2,
+    }
+    generation._disagg_cfg = resolve_disagg_layout(generation.cfg)
+    generation.num_replicas = 2
+    generation._engine_roles = ["prefill", "decode", "prefill", "decode"]
+    generation._engine_tps = [2, 2, 2, 2]
+    generation._disagg_actors = []
+    generation._disagg_server_urls = []
+    generation._engine_topology = []
+    generation._report_engine_addrs = lambda: [
+        # Ray validates node ids as 28-byte hex strings when pinning an actor.
+        {"host": f"host-{i}", "port": 9000 + i, "node_id": f"{i:056x}"}
+        for i in range(4)
+    ]
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_rl.models.generation.trtllm.trtllm_disagg_server",
+        SimpleNamespace(DisaggServerActor=_fake_disagg_server_actor()),
+    )
+    monkeypatch.setattr(trtllm_generation.ray, "get", lambda futures: futures)
+
+    generation._start_disagg_servers()
+    topology = generation.timeline_topology()
+    generation._disagg_actors = []  # fakes: nothing for a later shutdown to stop
+
+    assert [(t["engine_index"], t["replica_idx"], t["role"]) for t in topology] == [
+        (0, 0, "prefill"),
+        (1, 0, "decode"),
+        (2, 1, "prefill"),
+        (3, 1, "decode"),
+    ]
+    assert topology[3]["host"] == "host-3" and topology[3]["port"] == 9003
+    assert topology[3]["ray_node_id"] == f"{3:056x}"
+    assert topology[3]["tensor_parallel_size"] == 2
+    # Each engine carries the frontends of its own replica, replica-major.
+    assert topology[0]["frontend_urls"] == [
+        "http://frontend-0-0",
+        "http://frontend-0-1",
+    ]
+    assert topology[3]["frontend_urls"] == [
+        "http://frontend-1-0",
+        "http://frontend-1-1",
+    ]
+
+
+def test_the_engine_topology_is_empty_before_the_disagg_servers_start():
+    generation = _bare_generation()
+    generation._engine_topology = []
+
+    assert generation.timeline_topology() == []
+
+
+def test_the_engine_topology_is_returned_as_a_copy():
+    generation = _bare_generation()
+    generation._engine_topology = [{"engine_index": 0}]
+
+    generation.timeline_topology().append({"engine_index": 1})
+
+    assert generation.timeline_topology() == [{"engine_index": 0}]
