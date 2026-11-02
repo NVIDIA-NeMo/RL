@@ -1215,8 +1215,22 @@ def validate_csd_packing_setup(master_config: MasterConfig) -> Optional[int]:
                     f"{characters_per_sample!r})."
                 )
 
+    # The context that bounds each side's longest row. A same-tokenizer teacher
+    # packs the student's rows, so the student's context bounds it.
+    student_context = ("policy", int(policy_config["max_total_sequence_length"]))
+    side_contexts = [student_context] + [
+        (label, int(teacher_config["max_total_sequence_length"]))
+        if _teacher_is_cross_tokenizer(master_config, teacher)
+        else student_context
+        for (label, teacher_config), teacher in zip(
+            side_configs[1:], master_config.teachers, strict=True
+        )
+    ]
+
     algorithms: list[str] = []
-    for label, config in side_configs:
+    for (label, config), (context_label, context) in zip(
+        side_configs, side_contexts, strict=True
+    ):
         dynamic_batching = config.get("dynamic_batching") or {}
         if bool(dynamic_batching.get("enabled", False)):
             raise ValueError(
@@ -1236,14 +1250,27 @@ def validate_csd_packing_setup(master_config: MasterConfig) -> Optional[int]:
                 "CSD lockstep packing requires sequence_packing.fuse_loss=false; "
                 f"it is enabled for {label}."
             )
-        _positive_config_int(
+        capacity_key = "train_mb_tokens"
+        capacity = _positive_config_int(
             sequence_packing.get("train_mb_tokens"),
             field=f"{label}.sequence_packing.train_mb_tokens",
         )
         if label.startswith("teachers["):
-            _positive_config_int(
+            # The planner packs teachers into logprob_mb_tokens bins.
+            capacity_key = "logprob_mb_tokens"
+            capacity = _positive_config_int(
                 sequence_packing.get("logprob_mb_tokens"),
                 field=f"{label}.sequence_packing.logprob_mb_tokens",
+            )
+        divisor = int(config["make_sequence_length_divisible_by"])
+        (longest_row,) = _effective_lengths((context,), divisor=divisor)
+        if capacity < longest_row:
+            raise ValueError(
+                f"{label}.sequence_packing.{capacity_key}={capacity} is smaller "
+                "than the longest row it can receive: "
+                f"{context_label}.max_total_sequence_length={context} rounded up "
+                f"to {label}.make_sequence_length_divisible_by={divisor} is "
+                f"{longest_row} tokens. Set it to at least {longest_row}."
             )
         if config.get("train_micro_batch_size") != 1:
             raise ValueError(
