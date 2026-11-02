@@ -450,7 +450,13 @@ def test_the_chat_route_renders_gym_tools_in_normalized_order(monkeypatch):
     rendered = {}
 
     async def fake_build(
-        messages, tools, tokenizer, model_config, template_kwargs, eos_token_ids
+        messages,
+        tools,
+        tokenizer,
+        model_config,
+        template_kwargs,
+        eos_token_ids,
+        chat_template=None,
     ):
         rendered["tools"] = tools
         # Stop before generation; the route answers a ValueError with a 400.

@@ -118,6 +118,7 @@ async def build_spliced_prompt_ids(
     model_config: Any,
     template_kwargs: dict[str, Any],
     eos_token_ids: Collection[int] | None = None,
+    chat_template: str | None = None,
 ) -> list[int]:
     """Render the chat template and splice in the on-policy prefix.
 
@@ -151,6 +152,7 @@ async def build_spliced_prompt_ids(
             tokenizer,
             tools=tools,
             default_template_kwargs=template_kwargs,
+            chat_template=chat_template,
         )
         # Empty required_prefix_ids on turn one returns the template unchanged.
         required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
@@ -159,6 +161,7 @@ async def build_spliced_prompt_ids(
             tokenizer,
             tools,
             template_kwargs,
+            chat_template=chat_template,
         )
         return replace_prefix_tokens(
             tokenizer=tokenizer,
@@ -366,6 +369,7 @@ def create_app(
     default_chat_template_kwargs: dict[str, Any] | None = None,
     tool_parser: str | None = None,
     reasoning_parser: str | None = None,
+    chat_template: str | None = None,
 ) -> "FastAPI":
     """Build a FastAPI application backed by *llm* (``tensorrt_llm.LLM``)."""
     from fastapi import FastAPI, Request
@@ -474,6 +478,7 @@ def create_app(
                         model_config,
                         effective_template_kwargs,
                         _eos_token_ids,
+                        chat_template=chat_template,
                     )
                     if recomputed != adj_prompt:
                         diff = next(
@@ -513,6 +518,7 @@ def create_app(
                     model_config,
                     effective_template_kwargs,
                     _eos_token_ids,
+                    chat_template=chat_template,
                 )
             except ValueError as e:
                 return JSONResponse(status_code=400, content={"error": str(e)})
@@ -830,6 +836,7 @@ def _build_prompt_token_ids(
     *,
     tools: list[dict[str, Any]] | None = None,
     default_template_kwargs: dict[str, Any] | None = None,
+    chat_template: str | None = None,
 ) -> list[int]:
     """Convert chat messages to token IDs via apply_chat_template (full retokenisation each turn).
 
@@ -843,6 +850,8 @@ def _build_prompt_token_ids(
     }
     if tools:
         template_kwargs["tools"] = tools
+    if chat_template is not None:
+        template_kwargs["chat_template"] = chat_template
     return _to_int_ids(tokenizer.apply_chat_template(messages, **template_kwargs))
 
 
@@ -852,6 +861,7 @@ def _compute_splice_inputs(
     tokenizer: Any,
     tools: list[dict[str, Any]] | None,
     default_template_kwargs: dict[str, Any],
+    chat_template: str | None = None,
 ) -> tuple[list[int], list[int]]:
     """Return preserved and rendered token IDs for the on-policy prefix splice."""
     required_prefix_ids: list[int] = []
@@ -882,6 +892,8 @@ def _compute_splice_inputs(
     }
     if tools:
         _prefix_tkw["tools"] = tools
+    if chat_template is not None:
+        _prefix_tkw["chat_template"] = chat_template
     template_prefix_ids = _to_int_ids(
         tokenizer.apply_chat_template(_msgs_to_last_asst, **_prefix_tkw)
     )
@@ -906,6 +918,7 @@ def start_server(
     default_chat_template_kwargs: dict[str, Any] | None = None,
     tool_parser: str | None = None,
     reasoning_parser: str | None = None,
+    chat_template: str | None = None,
 ) -> "tuple[threading.Thread, str, Any]":
     """Start the HTTP server in a daemon thread and return (thread, base_url, server)."""
     import uvicorn
@@ -931,6 +944,7 @@ def start_server(
         default_chat_template_kwargs=default_chat_template_kwargs,
         tool_parser=tool_parser,
         reasoning_parser=reasoning_parser,
+        chat_template=chat_template,
     )
 
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")

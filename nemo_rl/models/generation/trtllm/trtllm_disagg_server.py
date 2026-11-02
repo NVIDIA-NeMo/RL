@@ -401,7 +401,9 @@ def _build_adaptor_class() -> type:
 
 
 def _build_frontend_tokenizer(
-    model_name: str, server_template_kwargs: dict[str, Any]
+    model_name: str,
+    server_template_kwargs: dict[str, Any],
+    chat_template: Optional[str] = None,
 ) -> Any:
     """Async ``payload -> b64 prompt ids`` using the adapters' exact pipeline.
 
@@ -449,6 +451,7 @@ def _build_frontend_tokenizer(
             model_config,
             effective,
             eos_token_ids,
+            chat_template=chat_template,
         )
         return base64.b64encode(np.asarray(ids, dtype=np.int32).tobytes()).decode()
 
@@ -573,6 +576,7 @@ class DisaggServerActorImpl:
         frontend_tokenize: bool = False,
         model_name: Optional[str] = None,
         default_chat_template_kwargs: Optional[dict[str, Any]] = None,
+        chat_template: Optional[str] = None,
     ) -> None:
         # node_id keys the snowflake request-id mint (process_id is hardwired
         # to 0 without a coordinator, and time.monotonic() shares an origin
@@ -592,7 +596,7 @@ class DisaggServerActorImpl:
         if frontend_tokenize:
             assert model_name, "frontend_tokenize requires the model name"
             tokenize_fn = _build_frontend_tokenizer(
-                model_name, default_chat_template_kwargs or {}
+                model_name, default_chat_template_kwargs or {}, chat_template
             )
         self._thread, self._base_url, self._server = start_server(
             config, port=self._port, tokenize_fn=tokenize_fn

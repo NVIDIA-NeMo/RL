@@ -425,7 +425,13 @@ def test_the_frontend_tokenizer_renders_the_history_tool_calls(monkeypatch):
     rendered = {}
 
     async def fake_build(
-        messages, tools, tokenizer, model_config, template_kwargs, eos_token_ids
+        messages,
+        tools,
+        tokenizer,
+        model_config,
+        template_kwargs,
+        eos_token_ids,
+        chat_template=None,
     ):
         rendered["messages"] = messages
         return [1, 2, 3]
