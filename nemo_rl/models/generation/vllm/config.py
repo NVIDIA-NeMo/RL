@@ -29,6 +29,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
 )
+from nemo_rl.models.generation.vllm.lora_utils import LoraRefitMode
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
     MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
@@ -82,6 +83,11 @@ class VllmSpecificArgs(TypedDict):
     cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
+    # With is_mx, quantize weights to MXFP8 on the trainer during refit and
+    # stream E4M3 data plus scales (~47% smaller payload) instead of BF16;
+    # the vLLM worker then skips its per-refit re-quantization. Requires the
+    # Megatron policy backend.
+    refit_prequantize: NotRequired[bool]
     # Deprecated in 0.8. Use quantization_ignore_patterns instead.
     quantization_ignored_layer_kws: NotRequired[list[str]]
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
@@ -93,6 +99,19 @@ class VllmSpecificArgs(TypedDict):
     # Collect vLLM request, cache, and cumulative token counters in a model-owner
     # background thread for performance diagnostics.
     enable_vllm_metrics_logger: NotRequired[bool]
+    # Store each request's logprobs in vLLM's FlatLogprobs (a few flat lists per
+    # request) instead of a dict plus one Logprob object per generated token. Same
+    # values; avoids long full GC pauses on the generation actor when many requests
+    # with logprobs are in flight. Applies to requests through the exposed HTTP
+    # server that ask for logprobs but not prompt logprobs, so it requires
+    # async_engine: true and expose_http_server: true. Default false.
+    flat_logprobs: NotRequired[bool]
+    # Bound how long vLLM's front-end output loops may hold the generation actor's
+    # event loop under a backlog: output_handler yields once per engine step and the
+    # output-socket reader after this many ms of continuous work (20 is a good value).
+    # Keeps refit and other control calls responsive. Requires async_engine: true.
+    # None (default) disables it.
+    output_loop_yield_budget_ms: NotRequired[float | None]
     # Sampling cadence for the optional vLLM metrics logger.
     vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
@@ -223,6 +242,9 @@ class VllmConfig(GenerationConfig):
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
     refit_transport: NotRequired[VllmRefitSelector | str | None]
     refit_cfg: NotRequired[VllmRefitConfig | None]
+    # LoRA policies use vLLM's factorized adapter runtime by default. Set to
+    # ``merged`` to opt into materializing and refitting full ``W + BA`` weights.
+    lora_refit_mode: NotRequired[LoraRefitMode]
 
     # quantization config
     quant_cfg: NotRequired[str | None]
@@ -242,9 +264,74 @@ class VllmConfig(GenerationConfig):
     worker_extension_cls_fqn: NotRequired[str | None]
 
 
+def validate_vllm_quantization_config(config: VllmConfig) -> None:
+    """Reject quantization options that would otherwise be silently ignored."""
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    refit_prequantize = vllm_cfg.get("refit_prequantize")
+    if refit_prequantize is not None and not isinstance(refit_prequantize, bool):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize must be a boolean."
+        )
+    if refit_prequantize and not (
+        vllm_cfg.get("precision") == "fp8" and vllm_cfg.get("is_mx") is True
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize requires "
+            "precision='fp8' and is_mx=true."
+        )
+    if refit_prequantize and config.get("refit_transport") == "nccl_reshard":
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize is not supported with "
+            "nccl_reshard; that transport owns its weight-format conversion."
+        )
+    if refit_prequantize and vllm_cfg.get("refit_with_reload_api"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize is not supported with "
+            "refit_with_reload_api; prequantized refit uses receiver scale names "
+            "that are not accepted by vLLM's native reload path."
+        )
+
+
+def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
+    """Reject async-actor options that would otherwise be silently ignored."""
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    if vllm_cfg.get("flat_logprobs") and not (
+        vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.flat_logprobs only applies to requests "
+            "through the async engine's HTTP server; it requires async_engine: true "
+            "and expose_http_server: true."
+        )
+    budget_ms = vllm_cfg.get("output_loop_yield_budget_ms")
+    if budget_ms is None:
+        return
+    if not vllm_cfg.get("async_engine"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.output_loop_yield_budget_ms requires "
+            "async_engine: true."
+        )
+    if budget_ms <= 0:
+        raise ValueError(
+            "policy.generation.vllm_cfg.output_loop_yield_budget_ms must be positive "
+            f"(or null to disable), got {budget_ms}."
+        )
+
+
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
     """Validate and return the optional vLLM video sampling contract."""
-    raw_video_config = config["vllm_cfg"].get("video")
+    vllm_config = cast(dict[str, Any], config["vllm_cfg"])
+    if "video_loader" in vllm_config:
+        raise ValueError(
+            "policy.generation.vllm_cfg.video_loader is not supported; "
+            "use policy.generation.vllm_cfg.video"
+        )
+
+    raw_video_config = vllm_config.get("video")
     if raw_video_config is None:
         return None
     return VllmVideoConfig.model_validate(raw_video_config)
@@ -480,6 +567,7 @@ def validate_nvfp4_pertoken_model(hf_config: Any) -> None:
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     """Validate the selected refit transport and resolve its scoped defaults."""
+    validate_vllm_quantization_config(config)
     rollout = parse_nvfp4_pertoken_rollout(config)
     if cast(dict[str, Any], config).get("checkpoint_engine") is not None:
         raise ValueError(

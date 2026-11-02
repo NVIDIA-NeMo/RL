@@ -27,23 +27,31 @@ from nemo_rl.experience import sync_rollout_actor as actor_mod
 
 
 @pytest.mark.parametrize("multimodal", [False, True])
+@pytest.mark.parametrize("history_length", [0, 100])
 def test_actor_stamps_distinct_groups_and_preserves_multimodal_tags(
-    monkeypatch, multimodal
+    monkeypatch, multimodal, history_length
 ):
     cls = actor_mod.SyncRolloutActor.__ray_metadata__.modified_class
     actor = object.__new__(cls)
     actor.policy_generation = MagicMock()
     actor.tokenizer = SimpleNamespace(pad_token_id=0)
     actor.task_to_env = {}
+    actor.per_token_multimodal_fields = ()
     actor._dp_client = MagicMock()
     actor.master_config = SimpleNamespace(
         policy={
-            "max_total_sequence_length": 32,
+            "max_total_sequence_length": 128,
             "make_sequence_length_divisible_by": 1,
             "precision": "float32",
             "generation": {},
         },
-        grpo=SimpleNamespace(max_rollout_turns=1, deduplicate_multimodal_data=False),
+        grpo=SimpleNamespace(
+            max_rollout_turns=1,
+            deduplicate_multimodal_data=False,
+            # Read by the bulk sample_mask (grpo._dynamic_sampling_valid_mask).
+            masked_reward_policy="include",
+            overlong_filtering=False,
+        ),
     )
     batch = BatchedDataDict(
         {
@@ -52,13 +60,23 @@ def test_actor_stamps_distinct_groups_and_preserves_multimodal_tags(
                     {
                         "role": "user",
                         "content": "same prompt",
-                        "token_ids": torch.tensor([1, 2]),
+                        "token_ids": torch.ones(5, dtype=torch.long),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "prompt history",
+                        "token_ids": torch.ones(history_length, dtype=torch.long),
+                    },
+                    {
+                        "role": "user",
+                        "content": "follow-up",
+                        "token_ids": torch.ones(5, dtype=torch.long),
                     },
                     {
                         "role": "assistant",
                         "content": "answer",
-                        "token_ids": torch.tensor([3]),
-                        "generation_logprobs": torch.tensor([0.1]),
+                        "token_ids": torch.ones(15, dtype=torch.long),
+                        "generation_logprobs": torch.zeros(15),
                     },
                 ]
                 for _ in range(4)
@@ -66,7 +84,7 @@ def test_actor_stamps_distinct_groups_and_preserves_multimodal_tags(
             "total_reward": torch.tensor([0.0, 2.0, 10.0, 14.0]),
             "loss_multiplier": torch.ones(4),
             "truncated": torch.zeros(4, dtype=torch.bool),
-            "length": torch.full((4,), 2),
+            "length": torch.full((4,), 10 + history_length),
         }
     )
     monkeypatch.setattr(
@@ -85,6 +103,8 @@ def test_actor_stamps_distinct_groups_and_preserves_multimodal_tags(
     )
 
     def write(bulk, **kwargs):
+        expected_mask = torch.tensor([0] * (10 + history_length) + [1] * 15)
+        torch.testing.assert_close(bulk["token_mask"], expected_mask.repeat(4, 1))
         return KVBatchMeta(
             sample_ids=kwargs["sample_ids"],
             partition_id=kwargs["partition_id"],
@@ -95,6 +115,9 @@ def test_actor_stamps_distinct_groups_and_preserves_multimodal_tags(
 
     monkeypatch.setattr(actor_mod, "kv_first_write", write)
     meta, carry, _, _ = actor.rollout_to_tq(batch, partition_id="train", group_size=2)
+    assert carry["response_token_lengths"].tolist() == [15] * 4
+    # Flattening has now filled in history logprobs; length must use the earlier log.
+    assert "generation_logprobs" in batch["message_log"][0][1]
     groups = row_group_ids(meta)
     assert groups[0] == groups[1]
     assert groups[2] == groups[3]

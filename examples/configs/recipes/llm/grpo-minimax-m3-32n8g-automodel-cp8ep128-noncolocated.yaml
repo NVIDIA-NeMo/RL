@@ -16,7 +16,7 @@ checkpointing:
   checkpoint_dir: results/grpo-minimax-m3-32n8g-automodel-cp8ep128-noncolocated
   keep_top_k: 1
   save_period: 100
-  checkpoint_must_save_by: 00:03:45:00
+  checkpoint_must_save_by: 00:01:45:00
 policy:
   model_name: MiniMaxAI/MiniMax-M3
   hf_config_overrides:
@@ -77,13 +77,15 @@ policy:
   generation:
     max_new_tokens: 6144
     vllm_kwargs:
+      compilation_config:
+        cudagraph_mode: PIECEWISE
       language_model_only: true
       block_size: 128
     vllm_cfg:
       tensor_parallel_size: 16
       expert_parallel_size: 16
       gpu_memory_utilization: 0.8
-      enforce_eager: true
+      # PIECEWISE CUDA graphs instead of enforce_eager: ~2x faster generation, metrics unchanged (H100 A/B in #4568).
       max_model_len: 8192
     colocated:
       enabled: false

@@ -1,0 +1,250 @@
+# Nemotron 3.5 Super VL (NemotronH_Omni_Reasoning_V3, 120B-A12B hybrid Mamba+Attention
+# MoE) -- NeMo Gym workplace_assistant (multi-step tool use, one user turn, up to 6
+# tool steps, simulated databases, no code sandbox) on the Automodel backend with
+# async, non-colocated vLLM generation. Text-only: the vision tower is built but
+# never receives images.
+#
+# Inherits the task, data layout and GRPO/loss settings from
+# grpo_workplace_assistant_nemotron_nano_v2_9b.yaml (64 prompts x 16 generations,
+# validation on the full validation set every 10 steps) and swaps in the Super VL
+# model, the Automodel trainer, the async importance-sampling correction and the
+# Nemotron 3.5 tool-call / thinking handling.
+#
+# Sized for 4-GPU GB200 nodes: 8 training nodes (32 GPUs: FSDP2, EP4 within a node,
+# CP2 across a node pair, DP16) + 8 generation nodes (one TP4/EP4 vLLM engine each);
+# cluster.num_nodes is the sum (16). Prompts are ~4.5K tokens and trajectories short,
+# so 16K context is enough; the 120B trainer is memory-bound at this node count, hence
+# moe_parallelizer.reshard_after_forward=true (as in the Nemotron 3 Super 120B
+# automodel recipe) and CP2. See docs/guides/models/nemotron/nemotron-3.5-super-vl.md.
+#
+# Requirements:
+#   - Automodel r0.6.0 @ b916107a5 or later (the submodule pin on main).
+#   - Stock vLLM 0.29.0 (pyproject pin): registers NemotronH_Omni_Reasoning_V3 and
+#     ships the nemotron_v3 reasoning parser and qwen3_coder tool parser the chat
+#     template needs (<think> blocks, <tool_call><function=...> calls).
+#   - NeMo Gym venvs for workplace_assistant (prebaked under NEMO_GYM_VENV_DIR, or
+#     built on first launch).
+#
+# Notes:
+#   - hf_config_overrides.num_nextn_predict_layers=0 drops the checkpoint's MTP head on
+#     the training side; keep generation speculative_config unset.
+#   - automodel_cfg.automodel_kwargs.force_hf must NOT be set (the custom NemotronOmni
+#     implementation + state-dict adapter are required for EP and per-tensor refit).
+#   - expert_parallel_size=4 keeps the EP group within one 4-GPU node. Keep EP >= 2:
+#     with EP1 the Omni fp32 parameter holders share an FSDP group with bf16 parameters
+#     and FSDP2 rejects the mixed dtypes.
+#   - Keep vLLM prefix caching OFF for this hybrid Mamba model: with it on, multi-step
+#     tool-use trajectories showed token_mult_prob_error 1.45 / gen_kl_error 0.057 vs
+#     1.02 / 0.0008 with it off.
+#   - Do not set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True on the trainer.
+
+defaults: "../grpo_workplace_assistant_nemotron_nano_v2_9b.yaml"
+
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron3.5-super-vl-workplace-assistant-automodel
+  metric_name: val:total_reward/mean
+  higher_is_better: true
+  keep_top_k: 2
+  save_period: 10
+  # 4h partition limit; leave >= 40 min so the timeout save + exit never straddles the
+  # wall clock.
+  checkpoint_must_save_by: 00:03:20:00
+  save_optimizer: true
+
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  # 1255 training prompts / 64 per step is ~20 steps per epoch; do not stop there.
+  max_num_epochs: 100
+  val_period: 10
+  val_at_start: true
+  val_batch_size: null
+  max_val_samples: null
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    max_generation_failures: 3
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  # Async GRPO trains on trajectories up to max_trajectory_age_steps old; truncated
+  # importance sampling corrects for the generation/trainer mismatch.
+  # use_on_policy_kl_approximation only takes effect with a non-zero
+  # reference_policy_kl_penalty (0 here, inherited).
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+  tokenizer:
+    name: ${policy.model_name}
+    # The GA chat template defaults to enable_thinking=true; the server-side
+    # default_chat_template_kwargs below keep history thinking across turns.
+    chat_template_kwargs: null
+  hf_config_overrides:
+    num_nextn_predict_layers: 0
+  # train_global_batch_size = 64 x 16 = 1024 (inherited), one optimizer step per GRPO
+  # step. Must be a multiple of the trainer data-parallel size (32 train GPUs / CP2 = 16).
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 16384
+  # HybridEP's dispatch/combine kernels are JIT-specialised on the per-rank token count
+  # (the 16-aligned running max of tokens each EP rank dispatches) and static_assert
+  # that it is a multiple of their 64-token chunk (NUM_OF_TOKENS_PER_CHUNK_*_API). With
+  # CP2 each rank sees half of the padded sequence, so the padding multiple must be a
+  # multiple of 64 x CP = 128: with 64, a 10304-token batch gave a 5152-token shard
+  # (5152 % 64 = 32) and the kernel failed to compile. 256 is used here.
+  make_sequence_length_divisible_by: 256
+  precision: bfloat16
+  offload_optimizer_for_logprob: true
+  # Same optimizer settings as the other Super VL recipes (text DAPO, CLEVR GRPO).
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+  scheduler:
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones: []
+  automodel_cfg:
+    enabled: true
+    tensor_parallel_size: 1
+    context_parallel_size: 2
+    expert_parallel_size: 4
+    sequence_parallel: false
+    activation_checkpointing: true
+    cpu_offload: false
+    moe_parallelizer:
+      ignore_router_for_ac: true
+      # Re-shard each block's gathered weights after its forward instead of keeping
+      # all of them resident until the backward (see header); costs an extra
+      # all-gather per block in the backward.
+      reshard_after_forward: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: torch_fp32
+        experts: gmm
+        dispatcher: hybridep
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  megatron_cfg:
+    enabled: false
+  generation:
+    port_range_low: 3000
+    port_range_high: 4999
+    max_new_tokens: 8192
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 4
+      expert_parallel_size: 4
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      cap_max_tokens_to_context: true
+      enable_prefix_caching: false
+      enforce_eager: false
+      expose_http_server: true
+      skip_tokenizer_init: false
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      reasoning_parser_plugin: null
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nemotron_v3
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      moe_backend: triton
+      mamba_ssm_cache_dtype: float32
+      # vLLM's chunked-prefill default budget is 2048 tokens per scheduler step; the
+      # multi-step tool-use rollouts re-prefill 4-20K-token prompts on every agent step.
+      max_num_batched_tokens: 16384
+      # No images are ever sent, but vLLM still builds the multimodal encoder budget
+      # for this architecture: skip the profiling pass, drop the default 4 GiB
+      # host-side processor cache, and bound the per-prompt image limit.
+      skip_mm_profiling: true
+      mm_processor_cache_gb: 0
+      limit_mm_per_prompt:
+        image: 1
+      compilation_config:
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 8
+
+data:
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: /path/to/data/workplace_assistant/train.jsonl
+  validation:
+    data_path: /path/to/data/workplace_assistant/validation.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+  # Replace (not merge) the base env block: it carries extra_body.chat_template_kwargs
+  # with enable_thinking: false and a code_gen section this recipe does not use.
+  _override_: true
+
+logger:
+  log_dir: logs/grpo-nemotron3.5-super-vl-workplace-assistant-automodel
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl-super-3.5
+    name: grpo-nemotron3.5-super-vl-workplace-assistant-automodel
+  mlflow:
+    experiment_name: grpo-nemotron3.5-super-vl-workplace-assistant-automodel
+    run_name: grpo-nemotron3.5-super-vl-workplace-assistant-automodel
+
+cluster:
+  gpus_per_node: 4
+  # 8 training + 8 generation nodes (policy.generation.colocated.resources.num_nodes).
+  num_nodes: 16

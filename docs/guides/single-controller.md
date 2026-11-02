@@ -177,7 +177,7 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
-- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
+- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, including an empty list when none are held. Schema-3 checkpoints may omit an empty reserve.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
 The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
@@ -185,6 +185,12 @@ The TQ snapshot and replay index are captured under the same checkpoint barrier.
 On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
 
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
+
+[Forest-training runs](./context-compaction.md) recover the same way and need no extra settings.
+
+Restart does not resume a Gym tool call that was in progress, and it does not guarantee that external side effects happen exactly once. In token-capture runs, if Gym reports capture writes it could not confirm, the run stops instead of retrying, so no uncertain write is cleared or repeated.
+
+Every Megatron training resume (all algorithms, not only forest training) loads the saved RNG when the parallel layout supports it, and preserves it through reference-model and wrapper setup. Changing `seed` before a resume no longer reseeds the restored Megatron RNG. Fresh runs and PEFT warm starts are unchanged.
 
 ### Periodic rollout snapshots
 
@@ -354,7 +360,7 @@ Pick one of five modes with `sampler.name`. Each mode takes its own knobs, liste
 | `custom`       | Determined by the imported class.                                                                                       | Determined by the imported class.                                                                                 | `target: "module:ClassName"` — bring your own `PromptGroupSampler`.                                          |
 
 
-PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before the critic trains on the assembled full batch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true` and `loss_fn.force_on_policy_ratio: false`; its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable.
+PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before the critic trains on the assembled full batch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true` and `loss_fn.force_on_policy_ratio: false`, unless using `loss_fn.use_cispo: true` with TIS correction as described in the [CISPO guide](cispo.md#configuration). Its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable.
 
 ### Config → behavior map
 
@@ -377,6 +383,7 @@ Field definitions:
 - `sampler.warmup_lookahead_versions` (PPO, `in_order` only) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
 - `num_advantage_workers` — CPU Ray actors that run the advantage stage. `0` (the default) keeps it in the controller process, which is correct but both holds a whole cohort's advantage inputs in the controller's heap and blocks the controller's event loop for the duration of the computation — long enough at Ultra scale to miss Ray's actor liveness ping. A positive value moves both costs onto dedicated actors, placed off the dedicated Ray head so their host-memory peak does not land beside the controller. Only `grpo` and `opd` are sharded across the pool: every other `adv_estimator` also reduces over the whole batch, which a shard is not, so those run as one call on one actor and a larger pool buys them nothing. Each stage logs `advantage stage: N row(s) over M shard(s), pool=P` with the reason whenever `M` is 1. Under `data_plane.backend: mooncake_cpu` each actor is its own TransferQueue client and mounts a full `global_segment_size + local_buffer_size`, like each token-capture finalizer, so budget it on top of `gpus_per_node × (segment + buffer)`.
 - `log_full_train_data` — writes every consumed sample to `train_data_step<N>.jsonl` in the log dir. The advantage stage is what holds the untruncated tensors, so the stage writes the dump wherever it runs: with a pool each shard writes its own `train_data_step<N>.jsonl.part-<shard>` and the controller merges them in shard order on a completed optimizer step, assigning `idx` across the merged file. That requires the pool to share a filesystem with the controller: the log dir was controller-only before this, so a node-local one worked and now would not. The controller checks the merged row count against what the shards reported and fails the step rather than publishing a dump that is short a shard. The JSON serialization is the expensive part and scales with batch size × sequence length, so a pool also moves that cost off the controller; it is reported back per call and still shows up under the `train_data_dump` timer. Debug-only — leave it `false` for production runs.
+- `defer_async_checkpoint_finalize` — with `policy.megatron_cfg.checkpoint.async_save: true`, finalizes an async policy checkpoint at a later step boundary, once every rank's background write is done, instead of from a background thread whose blocking finalize holds the policy workers until the write lands. The train pump polls at the top of each step, before the step's first policy-worker call; the next save and training exit still finalize blocking, and so does teardown after a failure. `tmp_step_N` is renamed to `step_N` only after that finalize, and resume reads only `step_N`, so a crash in that window — typically one step — resumes from the previous checkpoint. It cannot be combined with rollout snapshots (`rollout_checkpointing.snapshot_attempt_interval_s`), and setup rejects that combination: a snapshot anchors on `step_N`, which a deferred finalize publishes only after training has moved past step N. Only non-colocated generation gains: a colocated refit, and PPO's per-chunk critic handoff, block on the finalize anyway. Time spent finalizing at a step boundary is reported as `timing/train/checkpoint_finalize`. Leave it `false` (the default) when `async_save` is off; setup rejects that combination.
 
 ## Implementation Structure
 
@@ -422,7 +429,9 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 2. **Actor startup**: `SingleControllerActor` launches `_rollout_pump` and `_train_pump` concurrently as asyncio tasks; both share the same `TQReplayBuffer` and `StalenessSampler`.
 3. **Rollout pump loop**: `sampler.admit` gates dispatch against the current trainer version (returning a `target_step` for `in_order`); the pump then reserves a buffer slot, drives `RolloutManager.generate_and_push`, and commits with the observed `start_weight` / `end_weight`.
 4. **Train pump loop**: `sampler.evict` removes out-of-window groups, and `sampler.select` chooses the next chunk. For PPO, `_value_stage` computes critic values and `_advantage_stage` computes advantages. TQPolicy then updates the policy: full-batch PPO uses `ppo.ppo_epochs` updates, while streaming PPO accumulates gradients across chunks for one update. Streaming PPO refits the updated policy before `_value_train_epochs` trains the critic on the assembled full batch for `ppo.critic_ppo_epochs`. GRPO uses one TQPolicy optimizer step per RL step.
-5. **Weight sync**: after each optimizer step the pump bumps the trainer version, clears rollout permission, calls the weight synchronizer, and re-opens the rollout pump for the next version. In streaming PPO, it does the weight sync as soon as the policy training is finished, which is before the critic model training starts. This allows new batch generation with the updated policy weight overlapping with the critic training epochs.
+5. **Weight sync**: after each optimizer step the pump bumps the trainer version, clears rollout permission, asks the generation backend to pause in-flight work, calls the weight synchronizer, resumes generation, and re-opens the rollout pump for the next version. vLLM's native pause preserves active request state; backends without pause support warn and retain their existing refit behavior. In streaming PPO, it does the weight sync as soon as the policy training is finished, which is before the critic model training starts. This allows new batch generation with the updated policy weight overlapping with the critic training epochs.
+
+   For non-colocated vLLM, freezing a request does not stop its end-to-end generation timeout. Size `NRL_VLLM_ASYNC_TIMEOUT_SECONDS` and, when the generation router is enabled, `async_rl.generation_router.backend_timeout_s` to cover the longest expected generation plus time spent paused for refit, including membership recovery and a possible retry. With a finite `async_rl.generation_fleet_health.refit_timeout_s`, pause, each transfer attempt, and resume each use that timeout plus a 60 s grace; these are separate call budgets, not a single total refit budget. When `refit_timeout_s` is `null`, pause and resume retain a 360 s budget each, but the collective transfer wait is unbounded, so no finite worst-case total pause duration is guaranteed.
 
 ## Relation to Legacy Async GRPO
 
@@ -449,7 +458,7 @@ Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-
 | `enabled: true` | Implicit — SC is always async; use `sampler.max_lookahead_versions: 0` for sync semantics, `>= 1` for async |
 | `max_trajectory_age_steps: N` | `sampler.name: in_order` with `sampler.max_lookahead_versions: N` |
 | `warmup_generation_lead_steps` (PPO) | `sampler.warmup_lookahead_versions` — the lookahead to use while critic warmup is in progress |
-| `recompute_kv_cache_after_weight_updates` | `recompute_kv_cache_after_weight_updates` (same) |
+| `recompute_kv_cache_after_weight_updates` | `recompute_kv_cache_after_weight_updates` (same, defaults to `true` in both loops); when vLLM pauses natively, preserved requests recompute their KV cache after refit, repeating prefill. Set `false` to retain pre-update KV. For Megatron generation, pair `true` with `kv_cache_management_mode: recompute`, or `false` with `persist`/`offload`. |
 | `in_flight_weight_updates` | Always effectively true; `false`-equivalent behavior is not yet supported (drain-gate tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625)) |
 | *(no legacy equivalent — matches legacy full-batch train semantics)* | `min_groups_for_streaming_train: ${grpo.num_prompts_per_step}`, or `${ppo.num_prompts_per_step}` on a PPO run |
 | *(no legacy equivalent — matches legacy `max_trajectory_age + 1` batches in flight)* | `max_inflight_prompts: num_prompts_per_step × (max_lookahead_versions + 1)` |
@@ -540,12 +549,12 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes); SGLang and TRT-LLM have not been tested on SC.
+- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). Managed Dynamo (`backend: dynamo`) is supported on the native rollout path; see [Managed Dynamo generation](dynamo-generation.md#run-under-the-singlecontroller). SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
-- The drain gate in refit is not yet supported.
+- The drain gate in refit is not yet supported. Managed Dynamo pauses its engines before every refit because its weight update is unsafe while requests run, but that is not the drain gate: running requests finish on the old weights, while queued requests and later turns of a multi-turn rollout run on the new ones.
 
 ### Full training-data dumps
 
@@ -559,6 +568,16 @@ is removed; response content is not capped. Values follow the legacy
 singleton-batch JSONL shape. Chunks stream through `.jsonl.partial` files;
 the final name is published only after the optimizer step completes. A
 partial file is not proof of a completed training step.
+
+The files are written by `JsonDebugWriter`, which is what the default
+`async_rl.debug_writer.target: json` selects. To store the dump elsewhere, set
+`target` to the dotted import path of a `DebugWriter` subclass, for example
+`my_pkg.my_module.MyWriter`; any other keys under `async_rl.debug_writer` are
+passed to its constructor after `log_dir` and `shard_id`. The class implements
+`_write_chunk`, which receives each validated chunk as tensors, and
+`_publish_step`, and may override `close`, which the controller calls once at
+shutdown. It is built on the controller and on every advantage shard, so it
+must be importable in each of those processes.
 
 The per-step `timing/train/train_data_dump` metric reports wall-clock seconds
 summed across chunk preparation/writes and final-file publication. Chunk dump

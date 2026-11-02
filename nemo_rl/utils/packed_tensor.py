@@ -45,6 +45,7 @@ def packed_broadcast_producer(
     *,
     buffer_size_bytes: int | None = None,
     num_buffers: int | None = None,
+    use_legacy_packing: bool = False,
 ):
     """Broadcast a list of tensors in a packed manner.
 
@@ -55,11 +56,15 @@ def packed_broadcast_producer(
         post_iter_func: function to apply to each tensor before packing, should return a tensor
         buffer_size_bytes: packed-buffer target. Uses the NeMo-RL default when unset.
         num_buffers: number of alternating CUDA buffers. Uses the default when unset.
+        use_legacy_packing: pack an oversized tensor with the ones before it, as
+            vLLM's own consumer expects, instead of sending it in its own broadcast.
 
     Returns:
         None
 
     """
+    if buffer_size_bytes is not None and buffer_size_bytes <= 0:
+        raise ValueError("buffer_size_bytes must be > 0")
     target_packed_tensor_size = (
         get_target_packed_tensor_size()
         if buffer_size_bytes is None
@@ -69,6 +74,7 @@ def packed_broadcast_producer(
     num_buffers = get_num_buffers() if num_buffers is None else num_buffers
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
+    pending_tensor = None
 
     packing_tensor_list = [[] for _ in range(num_buffers)]
     packing_tensor_sizes = [0 for _ in range(num_buffers)]
@@ -76,11 +82,23 @@ def packed_broadcast_producer(
         torch.empty(0, dtype=torch.uint8, device="cuda") for _ in range(num_buffers)
     ]
 
+    # The iterator is driven from alternating streams, but the work it enqueues
+    # for one item (e.g. an FSDP2 all-gather whose completion ``full_tensor()``
+    # registers only on the stream that was current at the time) may be read by
+    # the *next* item on the other stream: the state-dict adapter yields several
+    # per-expert views of one gathered tensor, and a multi-GB expert parameter
+    # always straddles a buffer boundary. Carry the previous stream's export
+    # dependencies over to the new stream with an event recorded *before* the
+    # previous broadcast is issued, so packing of buffer k+1 still overlaps the
+    # broadcast of buffer k and no host synchronization is added.
+    export_done: torch.cuda.Event | None = None
     while True:
         # Move to the next buffer
         buffer_idx = (buffer_idx + 1) % num_buffers
         # Synchronize the current stream
         streams[buffer_idx].synchronize()
+        if export_done is not None:
+            streams[buffer_idx].wait_event(export_done)
         # Start tasks for the new buffer in a new stream
         with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
             try:
@@ -89,32 +107,62 @@ def packed_broadcast_producer(
                 packing_tensor_sizes[buffer_idx] = 0
                 # Pack the tensors
                 while True:
-                    # Apply backend specific post processing and then convert to linearized uint8 tensor.
-                    # contiguous() is required because the upstream iterator may
-                    # yield non-contiguous tensors that view(...) cannot handle.
-                    tensor = post_iter_func(next(iterator))
-                    if tensor.device.type != "cuda":
-                        # Everything here is concatenated into one buffer and
-                        # broadcast over a CUDA collective, so a single host
-                        # tensor anywhere in the stream fails the cat. The
-                        # producer owns its buffer's device rather than
-                        # trusting every upstream exporter to agree.
-                        tensor = tensor.to(torch.cuda.current_device())
-                    tensor = tensor.contiguous().reshape(-1).view(torch.uint8)
+                    if pending_tensor is None:
+                        # Apply backend specific post processing and then convert to linearized uint8 tensor.
+                        # contiguous() is required because the upstream iterator may
+                        # yield non-contiguous tensors that view(...) cannot handle.
+                        tensor = post_iter_func(next(iterator))
+                        if tensor.device.type != "cuda":
+                            # Everything here is concatenated into one buffer and
+                            # broadcast over a CUDA collective, so a single host
+                            # tensor anywhere in the stream fails the cat. The
+                            # producer owns its buffer's device rather than
+                            # trusting every upstream exporter to agree.
+                            tensor = tensor.to(torch.cuda.current_device())
+                        tensor = tensor.contiguous().reshape(-1).view(torch.uint8)
+                    else:
+                        tensor = pending_tensor
+                        pending_tensor = None
+                    if (
+                        not use_legacy_packing
+                        and packing_tensor_list[buffer_idx]
+                        and tensor.numel() > target_packed_tensor_size
+                    ):
+                        pending_tensor = tensor
+                        break
                     packing_tensor_list[buffer_idx].append(tensor)
                     packing_tensor_sizes[buffer_idx] += tensor.numel()
                     if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
                         break
                 # Pack the tensors and call broadcast collective
-                packed_tensors[buffer_idx] = torch.cat(
-                    packing_tensor_list[buffer_idx], dim=0
+                packed_tensors[buffer_idx] = (
+                    packing_tensor_list[buffer_idx][0]
+                    if len(packing_tensor_list[buffer_idx]) == 1
+                    else torch.cat(packing_tensor_list[buffer_idx], dim=0)
                 )
+                export_done = torch.cuda.Event()
+                export_done.record(streams[buffer_idx])
                 group.broadcast(packed_tensors[buffer_idx], src=src)
+                if (
+                    len(packing_tensor_list[buffer_idx]) == 1
+                    and packing_tensor_sizes[buffer_idx] > target_packed_tensor_size
+                ):
+                    # Oversized tensor: drain its collective and free it before
+                    # materializing the next one.
+                    for idx, stream in enumerate(streams):
+                        stream.synchronize()
+                        packing_tensor_list[idx].clear()
+                        packed_tensors[idx] = torch.empty(
+                            0, dtype=torch.uint8, device="cuda"
+                        )
+                    del tensor
             except StopIteration:
                 # do the last broadcast if there are remaining tensors
                 if len(packing_tensor_list[buffer_idx]) > 0:
-                    packed_tensors[buffer_idx] = torch.cat(
-                        packing_tensor_list[buffer_idx], dim=0
+                    packed_tensors[buffer_idx] = (
+                        packing_tensor_list[buffer_idx][0]
+                        if len(packing_tensor_list[buffer_idx]) == 1
+                        else torch.cat(packing_tensor_list[buffer_idx], dim=0)
                     )
                     group.broadcast(packed_tensors[buffer_idx], src=src)
                 break
@@ -180,6 +228,7 @@ def _packed_broadcast_consumer_batches(
         num_buffers = get_num_buffers()
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
+    pending_meta_data = None
 
     packing_tensor_meta_data = [[] for _ in range(num_buffers)]
     packing_tensor_sizes = [0 for _ in range(num_buffers)]
@@ -202,8 +251,18 @@ def _packed_broadcast_consumer_batches(
                 try:
                     # Form a packed tensor
                     while True:
-                        name, (shape, dtype) = next(iterator)
-                        tensor_size = math.prod(shape) * dtype.itemsize
+                        if pending_meta_data is None:
+                            name, (shape, dtype) = next(iterator)
+                            tensor_size = math.prod(shape) * dtype.itemsize
+                        else:
+                            name, shape, dtype, tensor_size = pending_meta_data
+                            pending_meta_data = None
+                        if (
+                            packing_tensor_meta_data[buffer_idx]
+                            and tensor_size > target_packed_tensor_size
+                        ):
+                            pending_meta_data = (name, shape, dtype, tensor_size)
+                            break
                         packing_tensor_meta_data[buffer_idx].append(
                             (name, shape, dtype, offsets[buffer_idx], tensor_size)
                         )
@@ -222,6 +281,16 @@ def _packed_broadcast_consumer_batches(
                         packed_tensors[buffer_idx],
                         packing_tensor_meta_data[buffer_idx],
                     )
+                    if (
+                        len(packing_tensor_meta_data[buffer_idx]) == 1
+                        and packing_tensor_sizes[buffer_idx] > target_packed_tensor_size
+                    ):
+                        for idx, stream in enumerate(streams):
+                            stream.synchronize()
+                            packing_tensor_meta_data[idx].clear()
+                            packed_tensors[idx] = torch.empty(
+                                0, dtype=torch.uint8, device="cuda"
+                            )
                 except StopIteration:
                     # Do the last broadcast if there are remaining tensors.
                     if len(packing_tensor_meta_data[buffer_idx]) > 0:

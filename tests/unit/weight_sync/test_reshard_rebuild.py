@@ -77,6 +77,7 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
             get_dp_leader_worker_idx=lambda shard: shard * workers_per_shard,
         ),
         dp_size=dp_size,
+        vllm_dp_size=1,
         # Declared, because VllmGeneration declares it. It used to be read with a getattr
         # default, which meant this fake could omit it and still pass -- the getattr was
         # covering for the fake rather than for a genuinely optional field.
@@ -85,7 +86,6 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
         # so a stand-in has to answer. Omitting it is how the reshard rebuild went on
         # passing its tests while silently defaulting to "nemo".
         get_collective_sender_spec=lambda: SimpleNamespace(nccl_peer="nemo"),
-        get_refit_payload_mode=lambda: "hf_export",
     )
     for name in (
         "rebuild_collective",
@@ -93,6 +93,7 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
         "prepare_nccl_reshard_refit_info",
         "set_refit_membership",
         "nccl_reshard_refit",
+        "_refit_leaders_by_shard",
         "_refit_leader_workers",
     ):
         setattr(
@@ -121,17 +122,11 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
         sync_params_before_refit=lambda: None,
         init_collective=lambda *a, **k: ["train-f"],
         init_nccl_reshard_comm_group=lambda **k: ["train-bulk"],
-        prepare_nccl_reshard_refit_info=lambda tp,
-        gp,
-        tws,
-        iws,
-        *,
-        refit_payload_mode: (
+        prepare_nccl_reshard_refit_info=lambda tp, gp, tws, iws: (
             plan_calls.append(
                 {
                     "train_world_size": tws,
                     "gen_world_size": iws,
-                    "refit_payload_mode": refit_payload_mode,
                 }
             )
             or {"gen_world_size": iws}
@@ -170,6 +165,15 @@ def _no_ray(monkeypatch):
 
 
 class TestPlanRegeneration:
+    def test_vllm_dp_rebuild_is_rejected(self):
+        sync, generation, _, _, _ = _reshard(dp_size=4)
+        generation.vllm_dp_size = 2
+
+        with pytest.raises(
+            RuntimeError, match="Partial-shard rebuild is not supported with vLLM DP"
+        ):
+            sync.init_communicator()
+
     def test_the_plan_is_rebuilt_for_the_smaller_fleet(self):
         """The whole reason reshard could not simply resize."""
         sync, _, _, plan_calls, kill = _reshard(dp_size=4, dead_shards=(2,))

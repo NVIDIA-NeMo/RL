@@ -41,6 +41,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             "draft": Eagle3DraftConfig(enabled=False),
             "megatron_cfg": {"mtp_num_layers": 2},
         },
+        data={},
         env={},
         data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
         logger=LoggerConfig(log_dir="/tmp/logs"),
@@ -50,6 +51,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     configured_generation = {"backend": "vllm", "_mtp_weights_from_refit": True}
     configure_generation = MagicMock(return_value=configured_generation)
+    materialize_video_config = MagicMock()
     actor = SimpleNamespace(run=SimpleNamespace(remote=MagicMock(return_value="run")))
     actor_args = SimpleNamespace(
         env_handles={},
@@ -94,6 +96,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     monkeypatch.setattr(
         run_grpo_single_controller,
+        "materialize_vllm_video_config",
+        materialize_video_config,
+    )
+    monkeypatch.setattr(
+        run_grpo_single_controller,
         "setup_single_controller",
         setup_single_controller,
     )
@@ -116,6 +123,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         configure_generation=configure_generation,
         configured_generation=configured_generation,
         generation_config=generation_config,
+        materialize_video_config=materialize_video_config,
         ray_get=ray_get,
         ray_wait=ray_wait,
         setup_single_controller=setup_single_controller,
@@ -167,9 +175,20 @@ def test_main_configures_generation_for_trained_mtp(
         "tokenizer",
         has_refit_draft_weights=False,
         trains_mtp=True,
+        draft_full_refit=False,
     )
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
+    )
+
+
+def test_main_materializes_video_contract_before_worker_setup(
+    main_context: SimpleNamespace,
+) -> None:
+    run_grpo_single_controller.main()
+
+    main_context.materialize_video_config.assert_called_once_with(
+        main_context.config.policy, main_context.config.data
     )
 
 
@@ -185,6 +204,7 @@ def test_main_accepts_policy_without_draft_config(
         "tokenizer",
         has_refit_draft_weights=False,
         trains_mtp=True,
+        draft_full_refit=False,
     )
 
 

@@ -57,7 +57,7 @@ policy:
       tensor_parallel_size: 32
       async_engine: true
     vllm_kwargs:
-      moe_backend: flashinfer_trtllm
+      moe_backend: triton
       speculative_config:
         method: "deepseek_mtp"
         num_speculative_tokens: 1

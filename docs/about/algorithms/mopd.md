@@ -125,10 +125,26 @@ on_policy_distillation:
 ```
 
 > [!NOTE]
-> Teachers run the Megatron backend in inference-only mode. A DTensor-configured
+> Teachers run the Megatron backend in inference-only mode. An Automodel-configured
 > policy is rejected for the teacher; PEFT / draft modules are stripped so
 > adapters are never attached to the frozen teacher; and teachers run
 > unquantized (a policy `quant_cfg` is ignored, with a warning).
+
+Teachers default to `mtp_num_layers: 0` because scoring does not use MTP
+outputs, even when the student or teacher checkpoint has MTP layers. Set
+`megatron_cfg_overrides.mtp_num_layers` explicitly in the teacher configuration
+to retain them. Other model architecture settings come from the teacher's
+checkpoint unless explicitly overridden.
+
+Per-alias `teacher_overrides` merge shallowly with `default_teacher_cfg`.
+A per-alias `megatron_cfg_overrides` dictionary replaces the default dictionary
+entirely; repeat any default entries you want to keep. Unknown top-level keys
+merge individually and are then folded into `megatron_cfg_overrides`, whose
+explicit entries take precedence.
+
+NeMo Gym does not support the dataset option `image_max_num_tiles`, with or
+without token capture. Remove it from `data.default`, `data.train`, and
+`data.validation`; setup rejects it before starting model or Gym workers.
 
 > [!NOTE]
 > `adv_estimator: opd` fails fast at setup if the config would zero

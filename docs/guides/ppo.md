@@ -14,7 +14,7 @@ uv run examples/run_ppo.py --config <PATH TO YAML CONFIG> {overrides}
 
 If not specified, `config` will default to [examples/configs/ppo_math_1B.yaml](../../examples/configs/ppo_math_1B.yaml).
 
-**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for gated models.
+**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `hf auth login` as well for gated models.
 
 In this guide, we'll walk through how we handle:
 
@@ -102,7 +102,7 @@ value:
       data_parallel_sharding_strategy: "optim_grads_params"
 ```
 
-For a DTensor PPO recipe, see [ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml](../../examples/configs/recipes/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml).
+For an Automodel PPO recipe, see [ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-dynbatch.yaml](../../examples/configs/recipes/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-dynbatch.yaml).
 
 ## Generalized Advantage Estimation (GAE)
 
@@ -276,7 +276,7 @@ ppo:
     max_trajectory_age_steps: 1
     warmup_generation_lead_steps: null
     in_flight_weight_updates: false
-    recompute_kv_cache_after_weight_updates: false
+    recompute_kv_cache_after_weight_updates: true  # Default; false avoids repeated prefill but retains old KV.
     drop_incomplete_targets_on_restore: false
 
   adv_estimator:

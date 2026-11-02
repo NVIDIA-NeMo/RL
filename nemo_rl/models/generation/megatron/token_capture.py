@@ -43,7 +43,12 @@ from nemo_rl.data_plane.tq_token_sink import (
     resolve_admission_prefix_chains,
     validate_media_tensors,
 )
+from nemo_rl.experience.route_assembly import (
+    ROUTE_MISSING_SENTINEL,
+    boundary_route_rows,
+)
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 if TYPE_CHECKING:
     from megatron.core.inference.inference_request import (
@@ -57,6 +62,63 @@ MEDIA_PREV_COUNT_KEY = "media_prev_count"
 # ``(height, width)`` rows per staged item (``StagedPrefix.media_sizes`` as
 # nested lists): the stager checks the engine's retained media against them.
 MEDIA_PREV_SIZES_KEY = "media_prev_sizes"
+
+
+def _delta_align_minf_routing_indices(
+    routing_indices: Any,
+    *,
+    total_tokens: int,
+    prev_len: int,
+    expected_route_dims: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    """Convert MInf ``[T - 1, L, K]`` routes to Gym's delta-token layout.
+
+    A continuation also keeps the row for the previous turn's last token: the
+    previous call sampled it without feeding it in, so only this call's
+    prefill routed it.
+
+    ``expected_route_dims`` is the model-owned ``(L, K)``; when given, a payload
+    whose layer or top-k axis differs is rejected here, at the first request,
+    rather than a full rollout later in the reassembler.
+    """
+    if not 0 <= prev_len <= total_tokens:
+        raise ValueError(
+            f"MInf route prev_len must be in [0, {total_tokens}], got {prev_len}"
+        )
+    routes = torch.as_tensor(routing_indices)
+    if routes.dim() != 3:
+        raise ValueError(
+            "MInf routing_indices must have shape [tokens, layers, topk], "
+            f"got {tuple(routes.shape)}"
+        )
+    expected_routes = total_tokens - 1
+    if routes.shape[0] != expected_routes:
+        raise ValueError(
+            "MInf routing_indices must contain one row for every non-final token: "
+            f"got {routes.shape[0]}, expected {expected_routes}"
+        )
+    if routes.shape[1] <= 0 or routes.shape[2] <= 0:
+        raise ValueError(
+            "MInf routing_indices layer and top-k dimensions must be positive"
+        )
+    if expected_route_dims is not None and tuple(routes.shape[1:]) != tuple(
+        expected_route_dims
+    ):
+        raise ValueError(
+            "MInf routing_indices (layers, top_k) does not match the served "
+            f"model: got {tuple(routes.shape[1:])}, expected "
+            f"{tuple(expected_route_dims)}. MInf records routes per pipeline "
+            "stage; check the generation model's parallel layout."
+        )
+    aligned = torch.full(
+        (total_tokens, routes.shape[1], routes.shape[2]),
+        ROUTE_MISSING_SENTINEL,
+        dtype=routes.dtype,
+        device=routes.device,
+    )
+    if expected_routes:
+        aligned[:-1].copy_(routes)
+    return aligned[prev_len - boundary_route_rows(prev_len) :]
 
 
 class TQMegatronPromptPreparer:
@@ -387,19 +449,30 @@ class TQMegatronTokenStager:
     canonical TQ row as vLLM, and returns lightweight commit coordinates.
     """
 
-    def __init__(self, sink: TQTokenSink) -> None:
+    def __init__(
+        self,
+        sink: TQTokenSink,
+        *,
+        require_routed_experts: bool = False,
+        expected_route_dims: tuple[int, int] | None = None,
+    ) -> None:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.megatron import (
             MegatronCaptureAdapter,
         )
         from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
 
+        # Gym's adapter validates the offloaded payload's prompt/generated ids
+        # and log probs; _stage_admitted reads them through it.
+        self._adapter = MegatronCaptureAdapter()
         self._capture = RolloutTokenCapture(
             sink=sink,
             # MInf passes the authoritative version explicitly for every call.
             weight_version_fn=lambda: 0,
-            adapter=MegatronCaptureAdapter(),
+            adapter=self._adapter,
         )
+        self._require_routed_experts = require_routed_experts
+        self._expected_route_dims = expected_route_dims
         # MInf hands over float32 pixels; the sink's column is pinned to the
         # vision encoder's weight dtype (the trainer casts pixels to it before
         # encoding anyway), so cast once here and stage half the bytes.
@@ -468,17 +541,30 @@ class TQMegatronTokenStager:
         capture_payload = (offload_params or {}).get(NG_CAPTURE_FIELD)
         if capture_payload is None:
             return None
+        call = None
         try:
+            # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+            from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+            admission = CaptureAdmission.model_validate(capture_payload)
+            call = self._capture.begin_call(
+                admission,
+                weight_version=self._weight_version(finished_metadata),
+            )
             return self._stage_admitted(
                 payload,
-                capture_payload=capture_payload,
-                finished_metadata=finished_metadata,
+                call=call,
                 minf_params=(offload_params or {}).get(MINF_CAPTURE_PARAMS_FIELD),
             )
         except Exception:  # noqa: BLE001 — capture failure must not fail generation
             logging.getLogger(__name__).exception(
                 "MInf canonical token capture failed for request %s", uid
             )
+            if call is not None and not call.completed:
+                coords = self._capture.fail_call(
+                    call, reason="megatron_payload_staging_failed"
+                )
+                return self._stage_result(coords)
             return None
 
     def _cast_media_pixels(
@@ -500,19 +586,59 @@ class TQMegatronTokenStager:
         self,
         payload: Any,
         *,
-        capture_payload: Any,
-        finished_metadata: Any,
+        call: Any,
         minf_params: Any = None,
     ) -> RequestPayloadStageResult:
         """Validate and stage traffic that carries a Gym capture admission."""
-        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
-
-        admission = CaptureAdmission.model_validate(capture_payload)
-        call = self._capture.begin_call(
-            admission,
-            weight_version=self._weight_version(finished_metadata),
+        # Gym's MegatronCaptureAdapter reads prompt/generated ids and log
+        # probs off the offloaded payload and rejects malformed material. It
+        # stages no extras: MInf routes are ``[T - 1, L, K]`` while the
+        # staging contract is delta-token aligned and needs the admission's
+        # ``prev_len``, so the route conversion lives here and the call is
+        # completed through ``complete_call`` rather than
+        # ``complete_call_from_response``. Errors raised here are poisoned by
+        # ``stage`` with ``capture_failed`` coordinates (surfacing in Gym as
+        # ``worker_capture_failed``, matching vLLM) instead of leaving Gym
+        # with no coordinates at all.
+        prompt_token_ids = self._adapter.extract_prompt_ids(payload)
+        generated_token_ids, generated_logprobs = self._adapter.extract_generation(
+            payload
         )
+        routing_indices = getattr(payload, "routing_indices", None)
+        if routing_indices is None and self._require_routed_experts:
+            raise ValueError(
+                "MInf offloaded payload carries no routing_indices while router "
+                "replay is enabled"
+            )
+        extras = None
+        if routing_indices is not None:
+            routed_experts = _delta_align_minf_routing_indices(
+                routing_indices,
+                total_tokens=len(prompt_token_ids) + len(generated_token_ids),
+                prev_len=call.admission.prev_len,
+                expected_route_dims=self._expected_route_dims,
+            )
+            extras = {"routed_experts": encode_routed_experts(routed_experts)}
+        try:
+            media = _new_media_tensors(payload, minf_params)
+        except (TypeError, ValueError, RuntimeError) as error:
+            coords = self._capture.fail_call(
+                call, reason=f"{type(error).__name__}: {error}"
+            )
+            return self._stage_result(coords)
+        coords = self._capture.complete_call(
+            call,
+            prompt_token_ids=prompt_token_ids,
+            generated_token_ids=generated_token_ids,
+            generated_logprobs=generated_logprobs,
+            extras=extras,
+            attachments=self._cast_media_pixels(media),
+        )
+        return self._stage_result(coords)
+
+    @staticmethod
+    def _stage_result(coords: Any) -> RequestPayloadStageResult:
+        """Wrap Gym commit coordinates in MInf's stage result."""
         # Deferred: Megatron-LM's inference hooks are only present on the
         # Megatron generation backend (see prepare_prompt); nemo_gym is an
         # optional extra absent in non-gym runs.
@@ -521,20 +647,6 @@ class TQMegatronTokenStager:
         )
         from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD
 
-        try:
-            media = _new_media_tensors(payload, minf_params)
-        except (TypeError, ValueError, RuntimeError) as error:
-            coords = self._capture.fail_call(
-                call, reason=f"{type(error).__name__}: {error}"
-            )
-            return RequestPayloadStageResult(
-                response_metadata={
-                    NG_COMMIT_COORDS_FIELD: coords.model_dump(mode="json")
-                }
-            )
-        coords = self._capture.complete_call_from_response(
-            call, payload, attachments=self._cast_media_pixels(media)
-        )
         return RequestPayloadStageResult(
             response_metadata={
                 NG_COMMIT_COORDS_FIELD: coords.model_dump(mode="json"),
