@@ -1230,19 +1230,24 @@ def validate_shared_prefix_training_config(
 def validate_shared_prefix_data_parallel_size(
     shared_prefix_config: SharedPrefixTrainingConfig, *, data_parallel_size: int
 ) -> None:
-    """Reject unaligned group packing across data-parallel ranks before workers start.
+    """Reject unaligned shared-prefix execution across data-parallel ranks before workers start.
 
-    Packed groups change each rank's forward count, so DP>1 needs
-    ``align_data_parallel`` to keep expert and data-parallel collectives matched.
+    Every worker splits its own prompt groups, so forward counts can differ
+    between data-parallel ranks in every shared mode. DP>1 therefore needs
+    ``pack_groups`` and ``align_data_parallel``, which split real rows until
+    the counts match, to keep expert and data-parallel collectives matched.
     """
     if (
         shared_prefix_config.enabled_for(stage="logprobs")
-        and shared_prefix_config.pack_groups
-        and not shared_prefix_config.align_data_parallel
         and data_parallel_size > 1
+        and not (
+            shared_prefix_config.pack_groups
+            and shared_prefix_config.align_data_parallel
+        )
     ):
         raise ValueError(
-            "policy.shared_prefix_training.pack_groups with data parallel size "
-            f"{data_parallel_size} requires "
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} with "
+            f"data parallel size {data_parallel_size} requires "
+            "policy.shared_prefix_training.pack_groups=true and "
             "policy.shared_prefix_training.align_data_parallel=true"
         )

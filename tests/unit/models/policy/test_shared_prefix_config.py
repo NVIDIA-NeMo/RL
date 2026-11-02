@@ -585,17 +585,26 @@ def test_enabled_mode_allows_disabled_router_replay(policy_config, megatron_rl):
     [
         ({"mode": "train", "pack_groups": True}, 2, True),
         ({"mode": "logprobs", "pack_groups": True}, 4, True),
+        # Workers split their own groups, so unpacked modes need alignment too.
+        ({"mode": "train"}, 2, True),
+        ({"mode": "logprobs"}, 2, True),
         ({"mode": "train", "pack_groups": True}, 1, False),
+        ({"mode": "train"}, 1, False),
         (
             {"mode": "train", "pack_groups": True, "align_data_parallel": True},
             2,
             False,
         ),
-        ({"mode": "train"}, 2, False),
+        (
+            {"mode": "logprobs", "pack_groups": True, "align_data_parallel": True},
+            8,
+            False,
+        ),
+        ({"mode": "dense"}, 2, False),
         ({"mode": "disabled"}, 2, False),
     ],
 )
-def test_group_packing_across_data_parallel_requires_alignment(
+def test_shared_modes_across_data_parallel_require_aligned_group_packing(
     block, data_parallel_size, rejected
 ):
     config = SharedPrefixTrainingConfig(**block)
@@ -604,7 +613,10 @@ def test_group_packing_across_data_parallel_requires_alignment(
             config, data_parallel_size=data_parallel_size
         )
         return
-    with pytest.raises(ValueError, match="requires .*align_data_parallel=true"):
+    with pytest.raises(
+        ValueError,
+        match=r"requires .*pack_groups=true and .*align_data_parallel=true",
+    ):
         validate_shared_prefix_data_parallel_size(
             config, data_parallel_size=data_parallel_size
         )
