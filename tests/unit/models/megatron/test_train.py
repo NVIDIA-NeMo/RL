@@ -1560,6 +1560,7 @@ class TestLossPostProcessor:
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(0.5), {"loss": 0.5}))
         mock_loss_fn.input_type = LossInputType.LOGIT
+        mock_loss_fn.score_centering = False
         cfg = {"sequence_packing": {"enabled": False}}
 
         processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg, cp_normalize=False)
@@ -1599,6 +1600,7 @@ class TestLossPostProcessor:
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(1.0), {}))
         mock_loss_fn.input_type = LossInputType.LOGIT
+        mock_loss_fn.score_centering = False
         cfg = {"sequence_packing": {"enabled": False}}
 
         processor = LossPostProcessor(

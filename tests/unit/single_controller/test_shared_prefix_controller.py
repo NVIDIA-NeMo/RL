@@ -331,3 +331,53 @@ def test_shared_prefix_rejects_drop_budgets_before_allocating_workers(
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     patched_factories["_build_clusters"].assert_not_called()
+
+
+def test_shared_prefix_train_rejects_score_centering_before_allocating_workers(
+    patched_factories,  # noqa: F811
+):
+    # Shared training units hand the loss extracted logprobs, not logits, so the
+    # loss cannot gather the policy logprobs at the sampler top-k ids.
+    from nemo_rl.algorithms.loss import ClippedPGLossConfig
+
+    mc = _make_master_config(
+        sampler_cfg=InOrderSamplerConfig(),
+        loss_cfg=ClippedPGLossConfig(score_centering=True),
+    )
+    mc.policy["generation"].update(
+        top_logprobs=4,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=None,
+        vllm_kwargs={"max_logprobs": 4},
+    )
+    mc.policy["shared_prefix_training"] = {"mode": "train"}
+    mc.token_capture.enabled = True
+
+    with pytest.raises(ValueError, match="does not support loss_fn.score_centering"):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    patched_factories["_build_clusters"].assert_not_called()
+
+
+def test_shared_prefix_rejects_forest_training_before_allocating_workers(
+    patched_factories,  # noqa: F811
+    monkeypatch,
+):
+    # Forest segment and execution-padding rows are not shared-prefix
+    # completions. Skip the forest objective checks, which this partial config
+    # does not populate, so the shared-prefix gate itself is exercised.
+    import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
+
+    monkeypatch.setattr(
+        sc_setup_mod, "validate_single_controller_config", lambda master_config: None
+    )
+    mc = _make_master_config(sampler_cfg=InOrderSamplerConfig())
+    mc.policy["shared_prefix_training"] = {"mode": "logprobs"}
+    mc.token_capture.enabled = True
+    mc.token_capture.forest_training = True
+
+    with pytest.raises(ValueError, match="token_capture.forest_training=true"):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    patched_factories["_build_clusters"].assert_not_called()

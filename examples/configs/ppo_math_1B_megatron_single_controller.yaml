@@ -57,6 +57,10 @@ async_rl:
   # elsewhere (extra keys are passed to its constructor).
   debug_writer:
     target: json
+  # With policy.megatron_cfg.checkpoint.async_save: finalize async checkpoints at a
+  # later step boundary so the disk write overlaps training. The overlap is shorter
+  # here than for GRPO: the critic handoff blocks on the finalize once per chunk.
+  defer_async_checkpoint_finalize: false
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are

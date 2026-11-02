@@ -369,6 +369,10 @@ def setup(
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env
     loss_config: ClippedPGLossConfig = master_config.loss_fn
+    if loss_config.score_centering:
+        raise ValueError(
+            "Score centering requires SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy PPO trainer does not capture sampler tensors."
+        )
     ppo_config = master_config.ppo
     data_config = master_config.data
     logger_config = master_config.logger
@@ -445,11 +449,6 @@ def setup(
             "Context parallelism (CP>1) is currently not supported for the Automodel PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
-        assert value_config["dynamic_batching"]["enabled"] is False, (
-            "Dynamic batching currently has some issue for the Automodel PPO value model. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2953."
-        )
-
     # Set seed for all random number generators
     set_seed(ppo_config.seed)
 
@@ -857,6 +856,7 @@ def setup(
             cluster=train_cluster,
             config=value_config,
             tokenizer=tokenizer,
+            seed=ppo_config.seed,
             name_prefix="lm_value",
             weights_path=value_weights_path,
             optimizer_path=value_optimizer_path,

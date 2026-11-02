@@ -26,6 +26,7 @@ from transformers import (
 )
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
@@ -109,6 +110,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         self,
         config: ValueConfig,
         tokenizer: AutoTokenizer,
+        seed: int,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
@@ -187,6 +189,15 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         self.dp_size = distributed_manager.dp_size
         self.tp_size = distributed_manager.tp_size
         self.cp_size = distributed_manager.cp_size
+
+        # Value workers run in separate Ray processes, so the controller's PPO
+        # seed does not cover model construction here. Seed before creating the
+        # model so a missing HF regression head is initialized reproducibly.
+        set_seed(seed)
+        print(
+            f"[Rank {self.rank}] Set Automodel value-model initialization seed "
+            f"to {seed}"
+        )
 
         # Initialize checkpoint manager
         automodel_cfg = config["automodel_cfg"]

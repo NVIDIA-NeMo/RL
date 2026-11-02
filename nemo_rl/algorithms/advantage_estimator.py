@@ -31,6 +31,8 @@ only rows with a nonzero loss weight vote. Token-capture placeholder rows and
 over-length prompts (dataset weight 0) never vote. Reinforce++ also
 receives a ``normalization_mask`` for its token-level statistics; the loss mask
 is unchanged.
+Forest deduplicates segments before estimation so each logical rollout contributes
+at most one reward, using the same participation rule as ordinary rollouts.
 
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
