@@ -52,6 +52,25 @@ from nemo_rl.distributed.model_utils import (
 
 CSD_STUDENT_LOSS_CHUNK_SIZE = 256
 
+# Process-wide caches for the sub-token tables and everything built from them.
+# Ray sends a fresh copy of the loss to every worker with every Policy.train
+# call, so anything cached on the instance would be rebuilt on every call.
+# Like the projection caches in ``x_token.loss_utils``, these last for the
+# worker process. Keys name the source artifacts, never a teacher index.
+# Table path -> (subtoks, lengths) CPU tensors.
+_CSD_SUBTOK_TABLE_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+# (common-map source kind, source path, teacher vocab size, device) ->
+# (common_student, common_teacher).
+_CSD_COMMON_INDICES_CACHE: dict[
+    tuple[str, str, int, torch.device], tuple[torch.Tensor, torch.Tensor]
+] = {}
+# Same key -> teacher id to common student id (-1 when not common).
+_CSD_TEACHER_TO_COMMON_STUDENT_CACHE: dict[
+    tuple[str, str, int, torch.device], torch.Tensor
+] = {}
+# (forward table path, reverse table path, pre-deduplicated) -> prefix index.
+_CSD_PREFIX_INDEX_CACHE: dict[tuple[str, str, bool], dict[str, Any]] = {}
+
 
 def _generalized_jsd(
     student_log_probs: torch.Tensor,
@@ -426,9 +445,7 @@ class CSDLossFn(LossFunction):
         # ------------------------------------------------------------------
         # CSD state. Each cross-tokenizer teacher's
         # KD term is the prefix-bidir partition KL; same-vocab teachers keep the
-        # direct-KL path and hold no CSD state. Per-teacher artifact caches
-        # (common-index set, prefix-support index, pseudo-target tables) are
-        # keyed by teacher index so any number of cross-tok teachers compose.
+        # direct-KL path and hold no CSD state.
         # ------------------------------------------------------------------
         self.common_indices_from_subtoks = bool(cfg.common_indices_from_subtoks)
         # Per-teacher pseudo-target table paths (forward: student->teacher
@@ -456,31 +473,12 @@ class CSDLossFn(LossFunction):
         self._loss_dump_call_idx = 0
         # Keep the validated loss settings alongside per-teacher metadata.
         self.cfg = cfg
-        # Lazy CSD caches, populated on first call, keyed by (device, teacher_idx).
-        self._csd_common_indices_per_device: dict[
-            tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]
-        ] = {}
-        self._csd_teacher_to_common_student_per_device: dict[
-            tuple[torch.device, int], torch.Tensor
-        ] = {}
-        self._csd_prefix_index_per_device: dict[
-            tuple[torch.device, int], dict[str, Any]
-        ] = {}
-        # Per-teacher pseudo-target tables, loaded lazily. idx -> (subtoks,
-        # lengths); forward = student->teacher chains, reverse = teacher->student.
-        self._csd_fwd_subtoks_per_teacher: dict[
-            int, tuple[torch.Tensor, torch.Tensor]
-        ] = {}
-        self._csd_rev_subtoks_per_teacher: dict[
-            int, tuple[torch.Tensor, torch.Tensor]
-        ] = {}
-        # The materialized projection matrix and the derived exact-map
-        # partition both live in process-local caches in
-        # ``x_token.loss_utils`` (see ``get_sparse_projection_matrix``,
-        # ``get_topk_projection``, ``build_exact_token_map``), not on
-        # this instance. That keeps the driver-side ``loss_fn`` free of
-        # any large CUDA tensors and lets multiple loss instances on
-        # the same worker share one load.
+        # The sub-token tables and the maps and index built from them live in
+        # the process-wide ``_CSD_*_CACHE`` dicts above; the projection
+        # exact-map partition lives in ``x_token.loss_utils``
+        # (``build_exact_token_map``). None of it is stored on this instance,
+        # so the driver-side ``loss_fn`` holds no large tensors and every copy
+        # Ray sends to a worker reuses that worker's first build.
 
     def _teacher_is_same_vocab(self, i: int) -> bool:
         """Same-tokenizer teachers supply neither CSD tables nor a projection."""
@@ -1324,8 +1322,8 @@ class CSDLossFn(LossFunction):
         common_student_idx_t: torch.Tensor,
         common_teacher_idx_t: torch.Tensor,
     ) -> torch.Tensor:
-        cache_key = (device, i)
-        cached = self._csd_teacher_to_common_student_per_device.get(cache_key)
+        cache_key = self._common_map_key(device, i, v_t)
+        cached = _CSD_TEACHER_TO_COMMON_STUDENT_CACHE.get(cache_key)
         if cached is not None:
             return cached
         mapping = torch.full(
@@ -1336,7 +1334,7 @@ class CSDLossFn(LossFunction):
         )
         valid = common_teacher_idx_t < int(v_t)
         mapping[common_teacher_idx_t[valid]] = common_student_idx_t[valid]
-        self._csd_teacher_to_common_student_per_device[cache_key] = mapping
+        _CSD_TEACHER_TO_COMMON_STUDENT_CACHE[cache_key] = mapping
         return mapping
 
     @staticmethod
@@ -1495,16 +1493,16 @@ class CSDLossFn(LossFunction):
     # ------------------------------------------------------------------ #
 
     def _csd_fwd_table(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Lazily load+cache teacher ``i``'s forward subtoks table.
+        """Teacher ``i``'s forward subtoks table, cached per process by path.
 
         Forward = student->teacher sub-token chains (``subtoks`` / ``lengths``
         keys). Small CPU tensors, shared by ``_common_indices_from_subtoks`` and
         the forward branch of ``_ensure_bidir_prefix_support_index``.
         """
-        cached = self._csd_fwd_subtoks_per_teacher.get(i)
+        fwd_path = self.student_to_teacher_table_paths[i] or ""
+        cached = _CSD_SUBTOK_TABLE_CACHE.get(fwd_path)
         if cached is not None:
             return cached
-        fwd_path = self.student_to_teacher_table_paths[i] or ""
         if not fwd_path or not os.path.exists(fwd_path):
             raise RuntimeError(
                 f"teacher {i}: forward pseudo-target table required "
@@ -1512,19 +1510,19 @@ class CSDLossFn(LossFunction):
             )
         fwd = torch.load(fwd_path, map_location="cpu", weights_only=True)
         table = (fwd["subtoks"].long(), fwd["lengths"].long())
-        self._csd_fwd_subtoks_per_teacher[i] = table
+        _CSD_SUBTOK_TABLE_CACHE[fwd_path] = table
         return table
 
     def _csd_rev_table(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Lazily load+cache teacher ``i``'s reverse subtoks table.
+        """Teacher ``i``'s reverse subtoks table, cached per process by path.
 
         Reverse = teacher->student sub-token chains, consumed by the reverse
         branch of ``_ensure_bidir_prefix_support_index``.
         """
-        cached = self._csd_rev_subtoks_per_teacher.get(i)
+        rev_path = self.teacher_to_student_table_paths[i] or ""
+        cached = _CSD_SUBTOK_TABLE_CACHE.get(rev_path)
         if cached is not None:
             return cached
-        rev_path = self.teacher_to_student_table_paths[i] or ""
         if not rev_path or not os.path.exists(rev_path):
             raise RuntimeError(
                 f"teacher {i}: reverse pseudo-target table required "
@@ -1532,8 +1530,18 @@ class CSDLossFn(LossFunction):
             )
         rev = torch.load(rev_path, map_location="cpu", weights_only=True)
         table = (rev["subtoks"].long(), rev["lengths"].long())
-        self._csd_rev_subtoks_per_teacher[i] = table
+        _CSD_SUBTOK_TABLE_CACHE[rev_path] = table
         return table
+
+    def _common_map_key(
+        self, device: torch.device, i: int, v_t: int
+    ) -> tuple[str, str, int, torch.device]:
+        """Cache key naming the artifact teacher ``i``'s common-token map comes from."""
+        if self.common_indices_from_subtoks:
+            kind, path = "subtoks", self.student_to_teacher_table_paths[i]
+        else:
+            kind, path = "projection", self.projection_matrix_paths[i]
+        return kind, str(path), int(v_t), device
 
     def _get_common_indices_csd(
         self,
@@ -1545,11 +1553,13 @@ class CSDLossFn(LossFunction):
         The exact 1-to-1 common set is sourced either from the forward subtoks
         table (``common_indices_from_subtoks=True``, the CSD-preset path, no
         projection matrix needed) or from the strict exact-token map of the
-        teacher's projection matrix. Cached per ``(device, i)``.
+        teacher's projection matrix. Cached per process by source artifact,
+        teacher vocabulary size and device.
         """
-        cache_key = (device, i)
-        if cache_key in self._csd_common_indices_per_device:
-            return self._csd_common_indices_per_device[cache_key]
+        cache_key = self._common_map_key(device, i, self.teacher_vocab_sizes[i])
+        cached = _CSD_COMMON_INDICES_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
         if self.common_indices_from_subtoks:
             common_s, common_t = self._common_indices_from_subtoks(device, i)
         else:
@@ -1569,7 +1579,7 @@ class CSDLossFn(LossFunction):
             )
             common_s = exact_map["common_student"]
             common_t = exact_map["common_teacher"]
-        self._csd_common_indices_per_device[cache_key] = (common_s, common_t)
+        _CSD_COMMON_INDICES_CACHE[cache_key] = (common_s, common_t)
         return common_s, common_t
 
     def _common_indices_from_subtoks(
@@ -1613,21 +1623,25 @@ class CSDLossFn(LossFunction):
 
         return common_s.to(device), common_t.to(device)
 
-    def _ensure_bidir_prefix_support_index(
-        self,
-        device: torch.device,
-        i: int,
-    ) -> dict[str, Any]:
+    def _ensure_bidir_prefix_support_index(self, i: int) -> dict[str, Any]:
         """Lazy-build teacher ``i``'s bidirectional prefix support index.
 
         The cache maps ``(length, prefix_tuple) -> tuple[(s_id, t_id), ...]``
         for both the forward (``student_to_teacher_table_paths[i]``) and reverse
         (``teacher_to_student_table_paths[i]``) pseudo-target tables. Built once
-        per ``(device, i)``; the table loaders raise if a path is missing.
+        per process per table pair; the table loaders raise if a path is missing.
         """
-        cache_key = (device, i)
-        if cache_key in self._csd_prefix_index_per_device:
-            return self._csd_prefix_index_per_device[cache_key]
+        # Pre-dedupe. The same env override
+        # gate is preserved so A/B verification stays available.
+        _prededuped = os.environ.get("NRL_CSD_PREDEDUP_PREFIX_INDEX", "1") == "1"
+        cache_key = (
+            str(self.student_to_teacher_table_paths[i]),
+            str(self.teacher_to_student_table_paths[i]),
+            _prededuped,
+        )
+        cached = _CSD_PREFIX_INDEX_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
         # Small CPU tensors (shape [V, max_chain]); slices move to device on
         # demand.
@@ -1663,10 +1677,6 @@ class CSDLossFn(LossFunction):
             final_s = int(row[length - 1].item())
             reverse[(length, prefix)].append((int(t_id), final_s))
 
-        # Pre-dedupe. The same env override
-        # gate is preserved so A/B verification stays available.
-        _prededuped = os.environ.get("NRL_CSD_PREDEDUP_PREFIX_INDEX", "1") == "1"
-
         def _dedup_by_second(pairs_list):
             seen_second = set()
             out = []
@@ -1697,7 +1707,7 @@ class CSDLossFn(LossFunction):
         # Cache the table sizes used by the chunk-classification skip rules.
         cache["max_chain_t"] = int(subtoks_t_cpu.size(1))
         cache["max_chain_s"] = int(subtoks_s_cpu.size(1))
-        self._csd_prefix_index_per_device[cache_key] = cache
+        _CSD_PREFIX_INDEX_CACHE[cache_key] = cache
         return cache
 
     @staticmethod
@@ -3356,7 +3366,7 @@ class CSDLossFn(LossFunction):
                 max_chain_t = 0
                 max_chain_s = 0
             else:
-                prefix_index = self._ensure_bidir_prefix_support_index(device, i)
+                prefix_index = self._ensure_bidir_prefix_support_index(i)
                 _prefix_index_prededuped = bool(prefix_index.get("_prededuped", False))
                 max_chain_t = int(prefix_index.get("max_chain_t", 0))
                 max_chain_s = int(prefix_index.get("max_chain_s", 0))
@@ -4186,7 +4196,7 @@ class CSDLossFn(LossFunction):
 
                 prefix_index = None
                 if not realized_only and any(r[-1] for r in mismatch_records):
-                    prefix_index = self._ensure_bidir_prefix_support_index(device, i)
+                    prefix_index = self._ensure_bidir_prefix_support_index(i)
                 owned_mismatch: list[
                     tuple[int, tuple[list[int], list[int], int, int]]
                 ] = []

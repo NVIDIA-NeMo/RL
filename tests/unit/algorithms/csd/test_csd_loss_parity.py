@@ -877,6 +877,43 @@ def test_csd_mismatch_partition_aggregation(tmp_path):
     assert torch.count_nonzero(grad) > 0
 
 
+def test_csd_tables_and_prefix_index_are_built_once_per_process(tmp_path, monkeypatch):
+    """A fresh loss instance, as Ray sends per call, reuses the process's builds."""
+    from nemo_rl.algorithms.loss.csd import CSDLossFn
+
+    fx = _build_case("with_mismatch", str(tmp_path))
+    fwd_path = fx["knobs"]["student_to_teacher_table_path"]
+    rev_path = fx["knobs"]["teacher_to_student_table_path"]
+    loaded_paths = []
+    torch_load = torch.load
+
+    def counting_load(path, *args, **kwargs):
+        loaded_paths.append(path)
+        return torch_load(path, *args, **kwargs)
+
+    prefix_indexes = []
+    build_prefix_index = CSDLossFn._ensure_bidir_prefix_support_index
+
+    def recording_prefix_index(self, *args, **kwargs):
+        prefix_index = build_prefix_index(self, *args, **kwargs)
+        prefix_indexes.append(prefix_index)
+        return prefix_index
+
+    monkeypatch.setattr(torch, "load", counting_load)
+    monkeypatch.setattr(
+        CSDLossFn, "_ensure_bidir_prefix_support_index", recording_prefix_index
+    )
+    first_loss, first_metrics, first_grad = _run_csd(fx)
+    second_loss, _, second_grad = _run_csd(fx)
+
+    assert sorted(loaded_paths) == sorted([fwd_path, rev_path])
+    assert len(prefix_indexes) == 2
+    assert prefix_indexes[1] is prefix_indexes[0]
+    assert first_metrics["num_mismatch_chunks"] == 4
+    torch.testing.assert_close(second_loss, first_loss, rtol=0, atol=0)
+    torch.testing.assert_close(second_grad, first_grad, rtol=0, atol=0)
+
+
 _REALIZED_ONLY = {"csd_realized_only_mismatch": True}
 
 
