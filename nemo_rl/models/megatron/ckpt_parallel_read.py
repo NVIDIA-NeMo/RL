@@ -11,17 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Parallel reads for torch_dist checkpoint loads (opt-in).
+"""Parallel reads for torch_dist checkpoint loads.
 
-PyTorch's ``FileSystemReader.read_data`` reads a rank's checkpoint items one at a
-time from one stream. With ``NRL_CKPT_READ_THREADS=N`` (N > 1), it is replaced by
-a version that reads the same byte ranges with N threads (16 MB requests, at most
-1 GiB ahead) while the calling thread deserializes and copies the items in order,
-with PyTorch's own code. Supports torch 2.11-2.13, whose ``read_data`` is
-identical; other versions raise.
+PyTorch's ``FileSystemReader.read_data`` reads a rank's items one at a time from one
+stream, and Megatron builds its reader with no load-side thread count, so this patches
+``read_data`` to read the same byte ranges with N threads (16 MB requests, at most
+``WINDOW_BYTES`` ahead) while the calling thread loads the items in order with
+PyTorch's own code. Peak host memory per rank: ``WINDOW_BYTES`` plus ~2x the largest item.
 """
 
 import collections
+import hashlib
+import inspect
 import io
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -33,20 +34,21 @@ from torch.distributed.checkpoint.planner import LoadItemType
 
 CHUNK_BYTES = 16 << 20
 WINDOW_BYTES = 1 << 30
-_SUPPORTED_TORCH = ((2, 11), (2, 12), (2, 13))
+# sha256 of inspect.getsource(FileSystemReader.read_data) in torch 2.11-2.13 (same code).
+READ_DATA_SHA256 = "86ad890ac621f4f563ee5f66a2059ebb3a3ba022a58d91d4e23d757405c691be"
 _original_read_data = dcp_fs.FileSystemReader.read_data
 
 
-def install() -> None:
-    """Patch ``FileSystemReader.read_data`` if ``NRL_CKPT_READ_THREADS`` > 1."""
-    threads = int(os.environ.get("NRL_CKPT_READ_THREADS", "1"))
+def install(threads: int) -> None:
+    """Patch ``FileSystemReader.read_data`` to read with ``threads`` threads (if > 1)."""
     if threads <= 1:
         return
-    version = tuple(int(v) for v in torch.__version__.split(".")[:2])
-    if version not in _SUPPORTED_TORCH:
+    source = inspect.getsource(_original_read_data)
+    if hashlib.sha256(source.encode()).hexdigest() != READ_DATA_SHA256:
         raise RuntimeError(
-            f"NRL_CKPT_READ_THREADS={threads} supports torch 2.11-2.13, found "
-            f"{torch.__version__}; unset it or check FileSystemReader.read_data."
+            f"torch {torch.__version__} changed FileSystemReader.read_data, which "
+            "parallel_read_threads replaces; set it to 1, or port the change into "
+            "nemo_rl/models/megatron/ckpt_parallel_read.py and update READ_DATA_SHA256."
         )
 
     def read_data(self: Any, plan: Any, planner: Any) -> Any:
@@ -63,6 +65,8 @@ def install() -> None:
             pool = ThreadPoolExecutor(threads, thread_name_prefix="nrl-ckpt-read")
             try:
                 _read_file(self, planner, fd, pool, reqs)
+            except EOFError as e:
+                raise EOFError(f"{path}: {e}") from e
             finally:
                 # No read may outlive the file descriptor.
                 pool.shutdown(wait=True, cancel_futures=True)

@@ -2502,7 +2502,9 @@ def setup_model_and_optimizer(
     state = GlobalState()
     _patch_bridge_signal_handler_for_worker_threads()
     state.cfg = megatron_cfg
-    ckpt_parallel_read.install()  # NRL_CKPT_READ_THREADS; no-op unless set
+    ckpt_cfg = policy_cfg["megatron_cfg"].get("checkpoint") or {}
+    if "parallel_read_threads" in ckpt_cfg:
+        ckpt_parallel_read.install(ckpt_cfg["parallel_read_threads"])
     # TODO: Freeze state.cfg
 
     # Must be called before initialize_megatron (before CUDA init) so the
