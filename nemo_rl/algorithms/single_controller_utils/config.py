@@ -49,6 +49,7 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -1220,13 +1221,82 @@ def _validate_failure_settings(
         )
 
 
+def _validate_reward_shaping(shaping_cfg: RewardShapingConfig) -> None:
+    """Reject a reward_shaping block apply_reward_shaping would choke on.
+
+    The advantage stage applies the block, so it is supported -- but
+    ``apply_reward_shaping`` only rejects a bad one at the first advantage
+    call, a whole round of rollouts and logprobs later. Each check here mirrors
+    one there and admits exactly what it admits, with two deliberate
+    exceptions that function never asserts: ``overlong_buffer_length`` must be
+    positive -- it is the penalty's divisor, so a non-positive one is a crash
+    or an inverted penalty rather than a config it can honour -- and the
+    penalty must be finite, since an infinite one clears its ``>= 0`` assert
+    and turns every overlong row's reward into ``-inf``.
+
+    The two modes are mutually exclusive: ``stop_properly_penalty_coef``
+    short-circuits, and the DAPO trio is only read when it is unset.
+    """
+    if not shaping_cfg.enabled:
+        return
+
+    coef = shaping_cfg.stop_properly_penalty_coef
+    if coef is not None:
+        if not 0 <= coef <= 1:
+            raise ValueError(
+                f"reward_shaping.stop_properly_penalty_coef={coef} must be in "
+                "[0, 1]. It scales a truncated row's reward."
+            )
+        return
+
+    buffer_length = shaping_cfg.overlong_buffer_length
+    buffer_penalty = shaping_cfg.overlong_buffer_penalty
+    max_response_length = shaping_cfg.max_response_length
+    if buffer_length is None or buffer_penalty is None or max_response_length is None:
+        missing = [
+            name
+            for name, value in (
+                ("overlong_buffer_length", buffer_length),
+                ("overlong_buffer_penalty", buffer_penalty),
+                ("max_response_length", max_response_length),
+            )
+            if value is None
+        ]
+        raise ValueError(
+            f"reward_shaping is enabled but {', '.join(missing)} "
+            f"{'is' if len(missing) == 1 else 'are'} unset. DAPO overlong "
+            "shaping needs all three, or set stop_properly_penalty_coef to use "
+            "the truncation penalty instead."
+        )
+
+    # Stricter than apply_reward_shaping, which asserts only the penalty. The
+    # buffer divides every row in min(-exceed / buffer * penalty, 0): 0 raises
+    # on the first one, and a negative buffer flips the ratio's sign, so
+    # overlong rows go unpenalized and SHORT ones are penalized instead.
+    if buffer_length <= 0:
+        raise ValueError(
+            f"reward_shaping.overlong_buffer_length={buffer_length} must be "
+            "positive. The overlong penalty divides by it."
+        )
+    # Finiteness ahead of the sign: neither non-finite case is rejected by the
+    # >= 0 assert in apply_reward_shaping -- nan compares False and fails there
+    # a rollout later, and inf passes it and makes every overlong row -inf.
+    if not math.isfinite(buffer_penalty) or buffer_penalty < 0:
+        raise ValueError(
+            f"reward_shaping.overlong_buffer_penalty={buffer_penalty} must be "
+            "finite and >= 0. It is subtracted from the reward, so a negative "
+            "one rewards overlong responses and a non-finite one makes every "
+            "overlong row's reward non-finite."
+        )
+
+
 def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
     Both directions on the critic: one the PPO path needs and does not have, and
     one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knobs SC reads on neither path, and a range check on the one it
-    does read.
+    sampling knob SC reads on neither path, a range check on reward_scaling,
+    and reward_shaping's own checks in :func:`_validate_reward_shaping`.
     """
     algo_cfg = algo_config(master_config)
 
@@ -1247,7 +1317,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         name
         for name, enabled in (
             ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
-            ("reward_shaping", algo_cfg.reward_shaping.enabled),
             # getattr: PPO's config has no length_penalty field.
             ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
         )
@@ -1292,6 +1361,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "scale divides by (source_max - source_min), so an empty or "
                 "inverted interval produces inf/nan rewards and advantages."
             )
+
+    _validate_reward_shaping(algo_cfg.reward_shaping)
 
     # Rejected here rather than at the first advantage call, which is a whole
     # round of rollouts and logprobs later: gdpo needs one reward column per

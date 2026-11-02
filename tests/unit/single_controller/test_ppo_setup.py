@@ -22,6 +22,7 @@ training cluster after the policy has stepped off it.
 
 from __future__ import annotations
 
+import math
 import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -477,11 +478,9 @@ class TestPPOValidation:
         "enable",
         [
             lambda cfg: setattr(cfg, "use_dynamic_sampling", True),
-            lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
         ],
         ids=[
             "use_dynamic_sampling",
-            "reward_shaping",
         ],
     )
     def test_rejects_shaping_the_sc_path_does_not_implement(self, enable):
@@ -491,6 +490,37 @@ class TestPPOValidation:
         with pytest.raises(
             NotImplementedError, match="not supported on the SingleController"
         ):
+            validate_single_controller_config(mc)
+
+    def test_accepts_dapo_reward_shaping_on_a_ppo_run(self):
+        """The replacement for reward_shaping's entry in the list above.
+
+        PPOConfig and GRPOConfig declare reward_shaping separately, and
+        _validate_reward_shaping reads it off whichever algo_config returns,
+        so a declaration that drifts breaks PPO runs alone. The cases above
+        cannot catch it: they raise out of the unsupported-knob list, which
+        returns before that validator is reached. The boundaries it enforces
+        are covered on GRPO in test_setup.py's TestRewardShapingValidation.
+        """
+        mc = _ppo_master_config()
+        shaping = mc.ppo.reward_shaping
+        shaping.enabled = True
+        shaping.overlong_buffer_length = 512
+        shaping.overlong_buffer_penalty = 1
+        shaping.max_response_length = 4096
+
+        validate_single_controller_config(mc)
+
+    def test_rejects_a_non_finite_penalty_on_a_ppo_run(self):
+        """The same declaration, read for a rejection rather than an accept."""
+        mc = _ppo_master_config()
+        shaping = mc.ppo.reward_shaping
+        shaping.enabled = True
+        shaping.overlong_buffer_length = 512
+        shaping.overlong_buffer_penalty = math.inf
+        shaping.max_response_length = 4096
+
+        with pytest.raises(ValueError, match="overlong_buffer_penalty"):
             validate_single_controller_config(mc)
 
     def test_rejects_length_penalty_until_sc_applies_it(self):
