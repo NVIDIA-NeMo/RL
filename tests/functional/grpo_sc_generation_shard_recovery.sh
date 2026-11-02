@@ -757,4 +757,19 @@ if [[ "$RESTART_DEAD_SHARDS" == "true" ]]; then
     grep -E "supervisor:|stale -> healthy" "$RUN_LOG" | head -6
 fi
 
+if [[ "$*" == *generation.dynamo=true* ]]; then
+    bash "${SCRIPT_DIR}/check_dynamo_overlay.sh" "$RUN_LOG"
+    # The frontend picks engines itself: the lost shard must leave its routing, and a
+    # replacement must join it, or the fleet health above only held for NeMo RL.
+    if ! grep -q "\[Dynamo\] generation shard .* out of the frontend's routing" "$RUN_LOG"; then
+        echo "[recovery] FAIL: the lost shard never left the Dynamo frontend's routing"
+        grep -E "\[Dynamo\]|fleet: shard" "$RUN_LOG" | tail -20; exit 1
+    fi
+    if [[ "$RESTART_DEAD_SHARDS" == "true" ]] && \
+        ! grep -q "\[Dynamo\] generation shard .* back in the frontend's routing" "$RUN_LOG"; then
+        echo "[recovery] FAIL: the replacement never joined the Dynamo frontend's routing"
+        grep -E "\[Dynamo\]|fleet: shard" "$RUN_LOG" | tail -20; exit 1
+    fi
+fi
+
 echo "[recovery] PASS: survived a shard loss and completed all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT, restart=$RESTART_DEAD_SHARDS)"

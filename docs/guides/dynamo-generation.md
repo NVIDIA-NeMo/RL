@@ -139,6 +139,18 @@ Where the behavior differs from the native endpoint:
   only NeMo RL's `nano_v3` parser does.
 - The frontend refuses more than 4 `stop` strings or `stop_token_ids` (HTTP 500).
 
+## Fleet health
+
+`async_rl.generation_fleet_health` works as natively, except that the frontend
+picks engines itself. On every probe, the SingleController takes the shards out
+of service out of the frontend's routing and puts the returning ones back.
+Requests already in flight on a shard that leaves finish. A restarted shard
+registers with the frontend only after a refit gives it current weights. An
+engine whose Dynamo endpoint stops fails its probe.
+
+Rollouts through the frontend report no per-shard outcome, so the probes alone
+judge the shards.
+
 ## Not supported
 
 Startup rejects these with `dynamo: true`:
@@ -146,10 +158,8 @@ Startup rejects these with `dynamo: true`:
 - `colocated.enabled: true`: a colocated engine sleeps while the policy trains,
   and the frontend would keep routing to it. The SingleController never runs
   colocated vLLM; the other entrypoints need non-colocated generation.
-- `async_rl.generation_fleet_health.enabled`: the frontend picks engines itself,
-  and a restarted shard does not register with it yet.
 - `async_rl.generation_router`: the frontend already routes the fleet behind one
-  URL.
+  URL and, with fleet health, only to the shards in service.
 - `extra_body.bad_words` on the policy model
   (`env.nemo_gym.policy_model.responses_api_models.vllm_model`): the frontend
   answers every request carrying it with HTTP 400. Startup checks only this
