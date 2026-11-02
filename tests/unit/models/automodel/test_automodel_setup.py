@@ -34,10 +34,10 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.config import DistributedContext
 from nemo_rl.models.automodel.setup import (
-    _distributed_timeout_minutes,
-    _init_process_group,
     ModelAndOptimizerState,
     RuntimeConfig,
+    _distributed_timeout_minutes,
+    _init_process_group,
     _maybe_set_force_hf,
     get_tokenizer,
     setup_distributed,
@@ -845,6 +845,61 @@ class TestSetupDistributed:
         assert parallelism.ep_size == 1
         assert parallelism.dp_replicate_size == 2
         assert mesh_call_kwargs["world_size"] == 4
+
+    @pytest.mark.parametrize(
+        ("timeout_setting", "expected_init_kwargs", "expected_mesh_timeout"),
+        [
+            pytest.param(
+                45,
+                {"backend": "nccl", "timeout": datetime.timedelta(minutes=45)},
+                45,
+                id="explicit",
+            ),
+            pytest.param(None, {"backend": "nccl"}, None, id="null"),
+            pytest.param("absent", {"backend": "nccl"}, None, id="absent"),
+        ],
+    )
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_forwards_timeout_to_process_group_and_mesh(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_mesh_context,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
+        timeout_setting,
+        expected_init_kwargs,
+        expected_mesh_timeout,
+    ):
+        """distributed_timeout_minutes must reach init_process_group *and* MeshContext.build.
+
+        DeviceMesh axes create their own NCCL groups, which do not inherit the default
+        group's timeout; Automodel applies ``timeout_minutes`` to them via a backend
+        override. Unset / null must leave both at torch's default.
+        """
+        mock_torch_dist.get_world_size.return_value = 4
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_mesh_context.build.return_value = SimpleNamespace(
+            device_mesh=mock_device_mesh, moe_mesh=None
+        )
+        if timeout_setting != "absent":
+            mock_config["automodel_cfg"]["distributed_timeout_minutes"] = (
+                timeout_setting
+            )
+
+        setup_distributed(mock_config, mock_runtime_config)
+
+        assert mock_torch_dist.init_process_group.call_args.kwargs == (
+            expected_init_kwargs
+        )
+        mesh_call_kwargs = mock_mesh_context.build.call_args.kwargs
+        assert mesh_call_kwargs.get("timeout_minutes") == expected_mesh_timeout
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
     @patch("nemo_rl.models.automodel.setup.MeshContext")
@@ -3060,8 +3115,13 @@ class TestLoadInitialLoraAdapterEndToEnd:
             )
 
 
+@pytest.mark.automodel
 class TestDistributedTimeoutMinutes:
-    """automodel_cfg.distributed_timeout_minutes reaches the default process group."""
+    """automodel_cfg.distributed_timeout_minutes is validated and reaches the default process group.
+
+    The mesh side is covered by
+    ``TestSetupDistributed.test_setup_distributed_forwards_timeout_to_process_group_and_mesh``.
+    """
 
     @staticmethod
     def _init_call(automodel_cfg, cpu_offload=False):
