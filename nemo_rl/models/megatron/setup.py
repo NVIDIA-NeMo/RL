@@ -1502,6 +1502,7 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Multi-Token Prediction settings onto the mcore model config."""
     megatron_cfg = config["megatron_cfg"]
+
     def _allowed(key: str) -> bool:
         return provider_override_allowed(megatron_cfg, key)
 
