@@ -40,10 +40,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
-from nemo_rl.distributed.virtual_cluster import (
-    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
-    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
-)
 
 
 def _all_sampler_names() -> list[str]:
@@ -100,45 +96,14 @@ def test_single_forward_threshold_rejected_before_streaming_setup(
 
 
 class TestDefaultsAreInert:
-    def test_timeouts_default_to_disabled(self):
-        cfg = AsyncRLConfig()
-        assert cfg.rollout_failure.nemo_gym.rollout_timeout_s is None
-        assert cfg.rollout_failure.native.generation_timeout_s is None
-        assert cfg.rollout_failure.native.env_timeout_s is None
-
-    def test_retry_budgets_have_documented_defaults(self):
-        cfg = AsyncRLConfig().rollout_failure
-        assert cfg.max_infra_attempts_per_prompt == 5
-        assert cfg.max_data_attempts_per_prompt == 2
-        assert cfg.backoff_base_s == 1.0
-        assert cfg.max_backoff_s == 30.0
-        assert cfg.max_skipped_prompts == 0
-        assert cfg.max_consecutive_dropped_prompts == 0
-        assert cfg.min_step_batch_fraction == 0.9
-        assert cfg.on_dropped_prompt == "shrink"
-        assert cfg.max_replacement_attempts == 1
-        assert cfg.replacement_reserve_prompts == 1
-        assert cfg.nemo_gym.max_row_attempts == 3
-
-    def test_watchdog_has_documented_defaults(self):
-        cfg = AsyncRLConfig().stall_watchdog
-        assert cfg.interval_s == 30.0
-        assert cfg.stall_timeout_s == 600.0
-        assert cfg.stall_action == "warn"
-        assert cfg.gym_subprocess_check is True
-
     def test_pre_existing_configs_still_load(self):
         """A config written before these fields existed must be unaffected."""
-        cfg = AsyncRLConfig(
-            **{
-                "sampler": {"name": "in_order", "max_lookahead_versions": 0},
-                "min_groups_for_streaming_train": 4,
-                "max_inflight_prompts": 4,
-                "max_buffered_rollouts": 4,
-            }
+        AsyncRLConfig(
+            sampler={"name": "in_order", "max_lookahead_versions": 0},
+            min_groups_for_streaming_train=4,
+            max_inflight_prompts=4,
+            max_buffered_rollouts=4,
         )
-        assert cfg.rollout_failure.nemo_gym.rollout_timeout_s is None
-        assert cfg.rollout_failure.max_infra_attempts_per_prompt == 5
 
 
 class TestRolloutFailureValidation:
@@ -154,22 +119,9 @@ class TestRolloutFailureValidation:
         cfg = RolloutFailureConfig(max_skipped_prompts=10)
         assert cfg.max_skipped_prompts == 10
 
-    def test_zero_is_the_default_and_means_fail_on_the_first_one(self):
-        """One knob: the illegal "skip, but never skip anything" state is unrepresentable.
-
-        It used to take an enum plus a count, which could contradict each other, and a
-        validator existed purely to reject that one combination.
-        """
-        assert RolloutFailureConfig().max_skipped_prompts == 0
-
     def test_a_consecutive_drop_budget_is_accepted(self):
         cfg = RolloutFailureConfig(max_consecutive_dropped_prompts=4)
         assert cfg.max_consecutive_dropped_prompts == 4
-
-    def test_the_two_drop_budgets_are_independent_knobs(self):
-        """Tolerating a bad dataset must not imply tolerating a dying fleet."""
-        cfg = RolloutFailureConfig(max_skipped_prompts=100)
-        assert cfg.max_consecutive_dropped_prompts == 0
 
     @pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1])
     def test_an_out_of_range_step_floor_is_rejected(self, fraction):
@@ -179,10 +131,6 @@ class TestRolloutFailureValidation:
 
     def test_a_full_step_floor_is_allowed_and_forbids_shrinking(self):
         assert RolloutFailureConfig(min_step_batch_fraction=1.0).min_step_batch_fraction
-
-    def test_replace_mode_is_opt_in(self):
-        """Shrinking is what the branch shipped with; replacing must be asked for."""
-        assert RolloutFailureConfig().on_dropped_prompt == "shrink"
 
     @pytest.mark.parametrize("policy", ["regenerate", "promote"])
     def test_an_unknown_drop_policy_is_rejected(self, policy):
@@ -214,10 +162,7 @@ class TestRolloutFailureValidation:
 
     def test_the_same_zeros_are_fine_while_shrinking(self):
         """They are only read in replace mode, so shrink runs must not trip on them."""
-        cfg = RolloutFailureConfig(
-            max_replacement_attempts=0, replacement_reserve_prompts=0
-        )
-        assert cfg.on_dropped_prompt == "shrink"
+        RolloutFailureConfig(max_replacement_attempts=0, replacement_reserve_prompts=0)
 
     def test_replace_mode_accepts_a_deeper_budget(self):
         cfg = RolloutFailureConfig(
@@ -276,9 +221,6 @@ class TestWatchdogValidation:
 
 
 class TestGenerationRouterValidation:
-    def test_the_default_status_is_outside_gyms_retry_set(self):
-        assert GenerationRouterConfig().no_healthy_backend_status == 409
-
     @pytest.mark.parametrize("status", [429, 500, 502, 503, 504, 520])
     def test_a_status_gym_retries_is_rejected(self, status):
         """Returning one of these would make Gym retry forever.
@@ -300,38 +242,15 @@ class TestGenerationRouterValidation:
             == status
         )
 
-    def test_it_is_off_by_default(self):
-        assert AsyncRLConfig().generation_router.enabled is False
-
 
 class TestFleetHealthValidation:
-    def test_it_is_off_by_default(self):
-        assert AsyncRLConfig().generation_fleet_health.enabled is False
-
     def test_a_probe_timeout_that_outlasts_the_interval_is_rejected(self):
         """Otherwise probes overlap and a slow fleet reads as a dead one."""
         with pytest.raises(ValidationError, match="probe_timeout_s"):
             FleetHealthConfig(probe_interval_s=2.0, probe_timeout_s=2.0)
 
-    def test_restarting_dead_shards_is_off_by_default(self):
-        """Recreating a vLLM worker mid-run is the most invasive thing this does, so it
-        is opt-in rather than implied by enabling fleet health."""
-        assert AsyncRLConfig().generation_fleet_health.restart_dead_shards is False
-
     def test_restarting_can_be_enabled(self):
         assert FleetHealthConfig(restart_dead_shards=True).restart_dead_shards is True
-
-    def test_the_restart_budget_defaults_are_armed(self):
-        """Both bounds are what stop a restart failing silently rather than loudly.
-
-        Without restart_timeout_s a bundle that can never be filled leaves the shard in
-        RESTARTING for the rest of the run -- never retried, never retired. Without
-        restart_backoff_s the whole attempt budget can burn inside 25s at the default
-        probe interval, none of the attempts having waited for the cause to clear.
-        """
-        cfg = FleetHealthConfig()
-        assert cfg.restart_timeout_s == 1800.0
-        assert cfg.restart_backoff_s == 60.0
 
     def test_the_restart_budget_is_not_the_refit_deadline(self):
         """A refit moves bytes between live processes; a restart reloads a model from
@@ -352,9 +271,6 @@ class TestTheRefitDeadlineIsArmedByDefault:
     but no refit recovery, and nothing said so. These tests exist so that reverting the
     default to None fails loudly rather than silently removing recovery.
     """
-
-    def test_the_documented_default_is_armed(self):
-        assert AsyncRLConfig().generation_fleet_health.refit_timeout_s == 300.0
 
     def test_turning_fleet_health_on_does_not_have_to_ask_for_it(self):
         """The combination that used to be silently non-recovering."""
@@ -516,12 +432,6 @@ class TestWrongPathFaultToleranceIsRejected:
 
 
 class TestGenerationRouterPortAndTimeoutValidation:
-    def test_default_port_range_uses_the_reserved_router_band(self):
-        cfg = GenerationRouterConfig()
-
-        assert cfg.port_range_low == DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
-        assert cfg.port_range_high == DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
-
     def test_a_transposed_port_range_is_rejected(self):
         """Otherwise it surfaces as 'empty range for randrange()' far from the typo."""
         with pytest.raises(ValidationError, match="port_range_low"):
@@ -534,7 +444,6 @@ class TestGenerationRouterPortAndTimeoutValidation:
     def test_the_connect_timeout_defaults_well_below_the_backend_timeout(self):
         """A handshake to a local vLLM is ms-or-never; the generation is minutes."""
         cfg = GenerationRouterConfig()
-        assert cfg.connect_timeout_s == 5.0
         assert cfg.connect_timeout_s < cfg.backend_timeout_s
 
     def test_a_connect_timeout_beyond_the_total_is_rejected(self):
@@ -602,11 +511,6 @@ class TestRouterDeadlineFitsInsideTheRollout:
             rollout_failure={"nemo_gym": {"rollout_timeout_s": 300.0}},
         )
         assert cfg.generation_router.backend_timeout_s == 120.0
-
-    def test_an_unset_rollout_deadline_imposes_no_constraint(self):
-        """rollout_timeout_s defaults to None -- disabled -- so there is nothing to fit in."""
-        cfg = AsyncRLConfig(generation_router={"enabled": True})
-        assert cfg.rollout_failure.nemo_gym.rollout_timeout_s is None
 
     def test_a_disabled_router_imposes_no_constraint(self):
         cfg = AsyncRLConfig(

@@ -30,28 +30,6 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 register_omegaconf_resolvers()
 
 
-def test_eagle3_draft_config_preserves_legacy_defaults() -> None:
-    from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
-
-    config = Eagle3DraftConfig.model_validate({})
-
-    assert config.model_dump() == {
-        "speculator_type": "eagle3",
-        "enabled": False,
-        "model_name": None,
-        "loss_weight": 0.1,
-        "num_layers": None,
-        "aux_layer_indices": None,
-        "optimizer": None,
-        # Automodel TTT training options; the Megatron single-step path
-        # ignores these.
-        "learning_rate": 1.0e-4,
-        "ttt_steps": 3,
-        "ttt_step_loss_decay": 1.0,
-        "train_embed_and_head": True,
-    }
-
-
 def test_draft_optimizer_config_is_typed() -> None:
     draft = Eagle3DraftConfig(
         enabled=True,

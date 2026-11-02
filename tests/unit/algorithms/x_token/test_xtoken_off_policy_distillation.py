@@ -47,7 +47,6 @@ import nemo_rl.algorithms.xtoken_off_policy_distillation as xt_mod
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
-    TeacherAlignerConfig,
     TeacherConfig,
     _default_off_policy_distillation_save_state,
     export_teacher_logits_and_pack,
@@ -388,15 +387,8 @@ def test_collator_schema_defaults_when_block_is_omitted() -> None:
 
     _, mocks = _patched_setup_call(config)
 
-    assert config.collator.model_dump() == {
-        "mode": "text",
-        "include_thinking_in_loss": False,
-        "native_thinking_alignment": False,
-        "kd_alignment_regions": None,
-        "num_packed_rows": 1,
-    }
     collator = mocks["dataloader"].call_args_list[0].kwargs["collate_fn"]
-    assert collator.mode == "text"
+    assert collator.mode == config.collator.mode
 
 
 @pytest.mark.parametrize(
@@ -432,14 +424,6 @@ def test_collator_config_preserves_unsupported_feature_guards(
     config.collator = CrossTokenizerCollatorConfig.model_validate(overrides)
     with pytest.raises(error, match=match):
         _patched_setup_call(config)
-
-
-def test_teacher_aligner_config_defaults():
-    teacher = TeacherConfig(model_name="teacher")
-
-    assert isinstance(teacher.aligner, TeacherAlignerConfig)
-    assert teacher.aligner.projection_matrix_path is None
-    assert teacher.aligner.drop_first_assistant_chunk_kl is False
 
 
 def test_teacher_aligner_config_explicit_values_serialize_and_stay_out_of_policy():

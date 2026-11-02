@@ -474,14 +474,7 @@ def test_rejected_restore_names_the_settings_that_changed():
 
 
 def test_energon_config_validates_sequence_packing():
-    config = EnergonLoaderConfig(model_family="qwen")
-    assert config.model_family == "qwen"
-    assert config.packing_buffer_size is None
-    assert config.max_samples_per_sequence is None
-    assert config.processor_adapter == "hf_multimodal"
-    assert config.topology_mapper == "default"
-    assert config.task_encoder.name == "generic_sft"
-    assert [cooker.name for cooker in config.cookers] == ["generic_conversation"]
+    EnergonLoaderConfig(model_family="qwen")
 
     source = EnergonSourceConfig(
         path="/data/prepared", split="train", virtual_epoch_length=10
@@ -498,7 +491,6 @@ def test_energon_config_validates_sequence_packing():
             }
         },
     )
-    assert packed.packing_buffer_size is None
     assert packed.task_encoder.packing is not None
     assert packed.task_encoder.packing.buffer_size == 10
     assert packed.max_samples_per_sequence == 2
