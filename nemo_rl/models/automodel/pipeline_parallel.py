@@ -30,6 +30,7 @@ non-pipelined path. ``PipelineWeightExporter`` separately assembles each stage's
 weights into the full-model stream consumed by refit.
 """
 
+import inspect
 import math
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -108,6 +109,21 @@ class ExecutionBatch:
     cp_sharder: Optional[ContextParallelSharder]
 
 
+def _forward_names_padding_mask(model: nn.Module) -> bool:
+    """Return whether ``model.forward`` names a ``padding_mask`` parameter.
+
+    Automodel's MoE models name it next to ``**kwargs`` and route only tokens
+    it leaves unmasked into the auxiliary loss and expert load. Models that
+    only take ``**kwargs`` (e.g. Hugging Face models) would forward an unknown
+    ``padding_mask`` to their layers, so they do not get one.
+    """
+    try:
+        parameters = inspect.signature(type(model).forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return "padding_mask" in parameters
+
+
 def _check_batch_major_inputs(model: nn.Module, model_batch: dict[str, Any]) -> None:
     """Reject model inputs whose batch dimension is not dim 0.
 
@@ -156,9 +172,13 @@ def plan_execution_batches(
     batches. The tail, and any extra execution batches needed to match the DP
     rank with the most, are filled with copies of the first sample whose
     ``sample_mask`` and ``token_mask`` are zero. Every DP rank therefore issues
-    the same number of schedule calls and FSDP collectives. All execution
-    batches keep ``data``'s sequence length, so one training update never
-    re-initializes the pipeline stages (which would drop accumulated gradients).
+    the same number of schedule calls and FSDP collectives. Models whose
+    ``forward`` takes a ``padding_mask`` (Automodel's MoE models) also receive
+    one that marks the padding rows, so their routers leave them out of the
+    auxiliary loss and the expert load, which zeroing the loss cannot cancel.
+    All execution batches keep ``data``'s sequence length, so one training
+    update never re-initializes the pipeline stages (which would drop
+    accumulated gradients).
     Under context parallelism each execution batch is sharded once for all of
     its microbatches, as Automodel's own pipeline trainer does.
 
@@ -202,6 +222,7 @@ def plan_execution_batches(
     else:
         padded = data
 
+    mark_padding_rows = _forward_names_padding_mask(model)
     execution_batches = []
     for call_idx in range(num_calls):
         start = call_idx * samples_per_call
@@ -232,6 +253,16 @@ def plan_execution_batches(
             )
             for key, value in model_batches[0].items()
         }
+        if mark_padding_rows:
+            # True marks a padding row. Real rows stay unmasked, matching the
+            # all-ones attention mask they get without pipeline parallelism.
+            input_ids = model_inputs["input_ids"]
+            row_ids = torch.arange(
+                start, start + samples_per_call, device=input_ids.device
+            )
+            model_inputs["padding_mask"] = (
+                (row_ids >= num_samples).unsqueeze(1).expand_as(input_ids).contiguous()
+            )
         if cp_size > 1:
             # ``torch.cat`` gave the inputs their own storage, so sharding them
             # in place cannot reach the canonical microbatch data.

@@ -433,6 +433,39 @@ def test_pipeline_with_expert_parallel_matches_non_pipelined(
 
 
 @pytest.mark.timeout(900)
+def test_pipeline_padding_leaves_moe_router_losses_unchanged(
+    tiny_untied_qwen3_moe_path,
+):
+    """Padding microbatches add nothing to the router auxiliary loss.
+
+    Each of the two DP ranks holds 4 samples and microbatches_per_step=3, so
+    every update runs a second schedule call with two padding microbatches.
+    The auxiliary loss injects its gradient whatever the main loss is, so the
+    padding rows must be masked from the router itself. The gate bias update
+    counts tokens through the same router mask.
+    """
+    if torch.cuda.device_count() < 4:
+        pytest.skip("needs 4 GPUs")
+    automodel_kwargs = {
+        **_MOE_AUTOMODEL_KWARGS,
+        "moe_overrides": {"aux_loss_coeff": 0.1},
+    }
+
+    def config(pp_size: int) -> PolicyConfig:
+        return _policy_config(
+            tiny_untied_qwen3_moe_path,
+            pp_size=pp_size,
+            ep_size=2,
+            microbatches_per_step=3,
+            automodel_kwargs=automodel_kwargs,
+        )
+
+    reference = _run_steps(config(1), 2, "moe_aux_ref", _clipped_pg_loss_fn())
+    actual = _run_steps(config(2), 4, "moe_aux_pp", _clipped_pg_loss_fn())
+    _assert_runs_close(reference, actual)
+
+
+@pytest.mark.timeout(900)
 def test_pipeline_logprobs_with_uneven_dp_shards(
     tiny_untied_llama_path, reference_runs
 ):

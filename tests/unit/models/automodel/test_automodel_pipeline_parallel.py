@@ -289,6 +289,62 @@ def test_plan_execution_batches_pads_to_the_busiest_dp_rank(monkeypatch):
     assert data["sample_mask"].tolist() == [1.0] * num_samples
 
 
+class _PaddingMaskForward(nn.Module):
+    """A model part that names ``padding_mask`` next to ``**kwargs``.
+
+    Automodel's MoE models have this signature.
+    """
+
+    def forward(self, input_ids, *, padding_mask=None, **kwargs):
+        return input_ids
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("names_padding_mask", [True, False])
+def test_plan_execution_batches_marks_padding_rows_for_the_model(
+    monkeypatch, names_padding_mask
+):
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda tensor, op=None, group=None: None
+    )
+    num_samples = 3
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.arange(num_samples * _SEQ_LEN).reshape(num_samples, -1),
+            "input_lengths": torch.full((num_samples,), _SEQ_LEN),
+            "token_mask": torch.ones(num_samples, _SEQ_LEN),
+            "sample_mask": torch.ones(num_samples),
+        }
+    ).to("cuda")
+
+    (execution_batch,) = plan_execution_batches(
+        data,
+        model=_PaddingMaskForward() if names_padding_mask else _Forward(),
+        micro_batch_size=2,
+        microbatches_per_step=2,
+        dp_group=None,
+        tokenizer=None,
+        cfg={"automodel_cfg": {"sequence_parallel": False}},
+        allow_flash_attn_args=True,
+        device_mesh=None,
+        cp_size=1,
+        padding_token_id=0,
+    )
+
+    if not names_padding_mask:
+        # Models that only take **kwargs (e.g. Hugging Face models) keep their
+        # inputs unchanged.
+        assert "padding_mask" not in execution_batch.model_inputs
+        return
+    # The second microbatch mixes a real row with a padding row; only the
+    # padding row is masked, over its whole sequence.
+    padding_mask = execution_batch.model_inputs["padding_mask"]
+    assert padding_mask.dtype == torch.bool
+    assert padding_mask.shape == (4, _SEQ_LEN)
+    assert padding_mask.all(dim=1).tolist() == [False, False, False, True]
+    assert not padding_mask[:num_samples].any()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_plan_execution_batches_shards_each_call_once_for_cp(monkeypatch):
     monkeypatch.setattr(

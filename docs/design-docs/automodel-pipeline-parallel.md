@@ -119,6 +119,14 @@ zero, and the number of execution batches is all-reduced (max) over the DP group
 every DP rank issues the same number of schedule calls and FSDP collectives. Every
 execution batch keeps the data's padded sequence length.
 
+Zeroing a padding row's loss does not hide it from MoE routers: the router auxiliary
+loss injects its gradient regardless of the main loss, and the gate bias update counts
+every routed token. Models whose `forward` names a `padding_mask` parameter (Automodel's
+MoE models) therefore also receive one that is true on padding rows and false on real
+rows, which matches the all-ones attention mask real rows get without PP. Their routers
+drop the padding rows from the auxiliary loss and the expert load; a microbatch of only
+padding rows contributes neither.
+
 Each row gets a sample ID (its position in the planned data). The schedule receives the
 IDs as the loss `target` and splits them along dim 0 exactly like the model inputs.
 
