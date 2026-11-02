@@ -102,7 +102,7 @@ def extract_generation_logprobs(
 
     ``logprobs`` may be vLLM's live, append-only container. Positions are read
     one at a time, and only the positions of ``token_ids``, which the caller
-    must have seen published (on the engine loop, or in a finished output).
+    must have seen published (under vLLM's output lock, or in a finished output).
 
     Args:
         token_ids: The generated token IDs at positions ``start`` onward.

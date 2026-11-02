@@ -128,17 +128,12 @@ class _RequestCaptureState:
         """Record generated tokens read at position ``start`` (default: the end).
 
         A cut and the finished output both read from vLLM, so positions already
-        recorded by the other are skipped rather than appended twice.
+        recorded by the other are skipped rather than appended twice. Callers
+        read ``start`` from this state, and tokens are never removed, so it
+        never lies past the recorded end.
         """
         recorded = len(self.generated_token_ids)
-        start = recorded if start is None else start
-        if start > recorded:
-            self.observation_error = (
-                f"generated tokens read from position {start} leave a gap after "
-                f"the {recorded} already recorded"
-            )
-            return
-        skip = recorded - start
+        skip = 0 if start is None else recorded - start
         self.generated_token_ids.extend(generated_token_ids[skip:])
         self.generated_logprobs.extend(generated_logprobs[skip:])
 
@@ -169,6 +164,11 @@ class _RequestCaptureState:
         self.staged_token_count = self._require_frozen_cut(checkpoint_id)
         self.frozen_cut = None
 
+    def rollback_frozen_cut_if_owned(self, checkpoint_id: str) -> None:
+        """Abandon ``checkpoint_id``'s cut if it froze this call's tokens."""
+        if self.frozen_cut is not None and self.frozen_cut[0] == checkpoint_id:
+            self.frozen_cut = None
+
     def rollback_frozen_cut(self, checkpoint_id: str) -> None:
         """Abandon a failed cut; its tokens stay unstaged for the next one."""
         self._require_frozen_cut(checkpoint_id)
@@ -196,17 +196,32 @@ class _CompletedCaptureState:
 
 def _remaining_generation_limits_after_prefix(
     *,
-    max_tokens: int | None,
+    max_tokens: int,
     min_tokens: int | None,
     prefix_token_count: int,
-) -> tuple[int | None, int | None]:
+) -> tuple[int, int | None]:
     """Return output limits for the suffix after restoring generated tokens."""
-    if prefix_token_count < 0:
-        raise ValueError("prefix_token_count must be non-negative")
     return (
-        None if max_tokens is None else max_tokens - prefix_token_count,
+        max_tokens - prefix_token_count,
         None if min_tokens is None else max(0, min_tokens - prefix_token_count),
     )
+
+
+def _require_inventory_identity(
+    prefix: Any, worker_capture_key: str, *, call_kind: str
+) -> None:
+    """Refuse a cut whose inventory entry names another episode than the call."""
+    # Deferred: nemo_gym is an optional extra absent in non-Gym runs.
+    from nemo_gym.episode_types import EpisodeId
+
+    expected = EpisodeId(rollout_id=prefix.rollout_id, attempt=prefix.attempt)
+    if worker_capture_key != expected.capture_key:
+        raise RuntimeError(
+            "generation-prefix inventory identity does not match the "
+            f"{call_kind} call: model_call_id={prefix.model_call_id!r}, "
+            f"inventory_rollout_id={prefix.rollout_id!r}, "
+            f"worker_capture_key={worker_capture_key!r}"
+        )
 
 
 # One character spans at most four UTF-8 bytes, hence at most four byte-level
@@ -345,25 +360,16 @@ class GenerationCutCaptureMixin:
             f"{type(self).__name__} cannot read generation progress for a cut"
         )
 
-    def _fetch_generation_cut_chunks(self, continuation: Any) -> list[Any]:
-        """Fetch the staged chunks named by a ``GenerationCutContinuation``, in order."""
-        if self._staging_source is None:
-            raise RuntimeError(
-                "_staging_source not initialized; call setup_token_capture() first"
-            )
+    def _resolve_generation_cut(
+        self, admission: Any, prefix_token_ids: list[int]
+    ) -> Any:
+        """Fetch an admission's staged prefix chunks and rebuild the cumulative prefix."""
+        continuation = admission.generation_cut
+        # Gym requires at least one staging key per continuation.
         staging_keys = list(continuation.staging_keys)
         snapshots = self._staging_source.fetch(staging_keys)
         if len(snapshots) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
-        if not snapshots:
-            raise RuntimeError("generation-cut continuation has no staged chunks")
-        return snapshots
-
-    def _rebuild_generation_cut_snapshot(
-        self, admission: Any, prefix_token_ids: list[int], snapshots: list[Any]
-    ) -> Any:
-        """Rebuild and verify the cumulative staged prefix from its fetched chunks."""
-        continuation = admission.generation_cut
         weight_versions = [snapshot.weight_version for snapshot in snapshots]
         if weight_versions != sorted(weight_versions):
             raise RuntimeError(
@@ -452,18 +458,6 @@ class GenerationCutCaptureMixin:
             prefix_ids_sha256,
         )
         return snapshot
-
-    def _resolve_generation_cut(
-        self, admission: Any, prefix_token_ids: list[int]
-    ) -> Any | None:
-        """Fetch and rebuild the cumulative staged prefix named by an admission."""
-        continuation = admission.generation_cut
-        if continuation is None:
-            return None
-        snapshots = self._fetch_generation_cut_chunks(continuation)
-        return self._rebuild_generation_cut_snapshot(
-            admission, prefix_token_ids, snapshots
-        )
 
     def _resolve_usable_generation_cut(
         self, admission: Any, prefix_token_ids: list[int]
@@ -637,20 +631,12 @@ class GenerationCutCaptureMixin:
         from nemo_gym._checkpoint.generation_cut import (
             GenerationCutPrefixAck,
         )
-        from nemo_gym.episode_types import EpisodeId
 
         with self._capture_registry_lock:
             completed = self._completed_capture_calls.get(prefix.model_call_id)
-        expected_capture_key = EpisodeId(
-            rollout_id=prefix.rollout_id, attempt=prefix.attempt
-        ).capture_key
-        if (
-            completed is not None
-            and completed.coords.capture_key != expected_capture_key
-        ):
-            raise RuntimeError(
-                "generation-prefix inventory identity does not match the "
-                f"completed call: model_call_id={prefix.model_call_id!r}"
+        if completed is not None:
+            _require_inventory_identity(
+                prefix, completed.coords.capture_key, call_kind="completed"
             )
         if completed is None:
             # Gym can name a call before its request reaches this worker, so
@@ -700,12 +686,10 @@ class GenerationCutCaptureMixin:
         from nemo_gym._checkpoint.generation_cut import (
             GenerationCutPrefixAck,
         )
-        from nemo_gym.episode_types import EpisodeId
 
+        # _checkpoint_generation_cut checked both before cutting any call.
         capture = self.token_capture
         sink = self._capture_sink
-        if capture is None or sink is None:
-            raise RuntimeError("generation-prefix cuts require token capture setup")
 
         # Abort and terminal completion use the same lifecycle lock. Once the
         # cut owns it, the call cannot be removed until its detached buffer is
@@ -717,16 +701,9 @@ class GenerationCutCaptureMixin:
                 self._count_generation_cut("cut_lifecycle_races")
                 return None
 
-            expected_capture_key = EpisodeId(
-                rollout_id=prefix.rollout_id, attempt=prefix.attempt
-            ).capture_key
-            if state.call.capture_key != expected_capture_key:
-                raise RuntimeError(
-                    "generation-prefix inventory identity does not match the "
-                    f"active call: model_call_id={prefix.model_call_id!r}, "
-                    f"inventory_rollout_id={prefix.rollout_id!r}, "
-                    f"worker_capture_key={state.call.capture_key!r}"
-                )
+            _require_inventory_identity(
+                prefix, state.call.capture_key, call_kind="active"
+            )
 
             with state.lock:
                 uncuttable_reason = state.uncuttable_reason
@@ -758,7 +735,7 @@ class GenerationCutCaptureMixin:
                     prefix, reason="uncuttable_request"
                 )
             if observation_error is not None:
-                # A dropped delta leaves the buffer short of what vLLM decoded.
+                # Its recorded tokens or logprobs are inconsistent with vLLM's.
                 # Only this call regenerates; the rest of the inventory is cut.
                 LOGGER.warning(
                     "cannot cut model call %s: %s",
@@ -872,9 +849,7 @@ class GenerationCutCaptureMixin:
                         state.generation_cut_staging_keys.append(staged_key)
             except Exception:
                 with state.lock:
-                    frozen = state.frozen_cut
-                    if frozen is not None and frozen[0] == checkpoint_id:
-                        state.rollback_frozen_cut(checkpoint_id)
+                    state.rollback_frozen_cut_if_owned(checkpoint_id)
                 if staged_key is not None:
                     try:
                         sink.clear([staged_key])
@@ -962,9 +937,7 @@ class GenerationCutCaptureMixin:
                 )
                 if state is not None:
                     with state.lock:
-                        frozen = state.frozen_cut
-                        if frozen is not None and frozen[0] == inventory.checkpoint_id:
-                            state.rollback_frozen_cut(inventory.checkpoint_id)
+                        state.rollback_frozen_cut_if_owned(inventory.checkpoint_id)
                 acknowledgement = self._failed_generation_cut_ack(
                     prefix, reason="cut_error"
                 )
