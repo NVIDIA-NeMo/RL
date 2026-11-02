@@ -1147,7 +1147,7 @@ def validate_shared_prefix_training_config(
 
     # The resolver maps None to the topology quantum M. The config must still
     # name an explicit multiple of M: MasterConfig requires the key, and
-    # driver-side slot planning reads the raw value.
+    # the driver's row-fit check reads the raw value.
     topology_alignment = resolve_shared_prefix_physical_padding_multiple(
         tp_size=tp_size, cp_size=cp_size, padding_multiple=None
     )
