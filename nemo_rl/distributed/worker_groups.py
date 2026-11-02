@@ -64,6 +64,55 @@ def _log_gpu_state_on_bundle(label: str, local_rank: int) -> None:
     )
 
 
+# Constructor arguments larger than this are put in the object store once instead of being serialized again for every
+# actor that receives them. A tokenizer is the usual case: ~8 MB, and a tokenizer backend whose __getstate__ re-serializes
+# its vocabulary made each creation call cost ~0.16 s on the driver, once per node.
+SHARE_ARG_THRESHOLD_BYTES = 1 << 20
+
+
+def _share_large_arguments(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    threshold_bytes: int = SHARE_ARG_THRESHOLD_BYTES,
+    put: Optional[Callable[[Any], Any]] = None,
+    serialized_size: Optional[Callable[[Any], int]] = None,
+) -> tuple[tuple[Any, ...], dict[str, Any], list[Any]]:
+    """Replace each large top-level argument with an ObjectRef to one shared copy.
+
+    Ray resolves top-level ObjectRef arguments before an actor's ``__init__`` runs, so the receiving code sees the
+    original values. Returns ``(args, kwargs, refs)``; keep ``refs`` alive while actors created with these arguments
+    may still be starting. An argument that cannot be serialized here is left as it is, so the caller's own
+    serialization reports the error as before.
+    """
+    if put is None:
+        put = ray.put
+    if serialized_size is None:
+        import ray.cloudpickle as cloudpickle
+
+        def serialized_size(value: Any) -> int:
+            return len(cloudpickle.dumps(value))
+
+    refs: list[Any] = []
+
+    def share(value: Any) -> Any:
+        try:
+            size = serialized_size(value)
+        except Exception:
+            return value
+        if size <= threshold_bytes:
+            return value
+        ref = put(value)
+        refs.append(ref)
+        return ref
+
+    return (
+        tuple(share(value) for value in args),
+        {key: share(value) for key, value in kwargs.items()},
+        refs,
+    )
+
+
 def _check_dp_leader_worker_indices(
     requested: list[int], tied_group_leaders: list[int]
 ) -> None:
@@ -192,8 +241,16 @@ class RayWorkerBuilder:
     class IsolatedWorkerInitializer:
         def __init__(self, ray_actor_class_fqn: str, *init_args, **init_kwargs):
             self.ray_actor_class_fqn = ray_actor_class_fqn
-            self.init_args = init_args
-            self.init_kwargs = init_kwargs
+            # Large arguments may arrive as ObjectRefs (see _share_large_arguments). Ray normally resolves top-level
+            # ones before this runs; resolving any that remain keeps that from being a requirement.
+            self.init_args = tuple(
+                ray.get(arg) if isinstance(arg, ray.ObjectRef) else arg
+                for arg in init_args
+            )
+            self.init_kwargs = {
+                key: ray.get(value) if isinstance(value, ray.ObjectRef) else value
+                for key, value in init_kwargs.items()
+            }
 
         def create_worker(
             self,
@@ -593,6 +650,13 @@ class RayWorkerGroup:
         if initializer_env_vars:
             initializer_runtime_env["env_vars"] = initializer_env_vars
         self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
+        # Serialized once for all initializers instead of once per initializer: the constructor arguments
+        # include the tokenizer, which is megabytes and slow to pickle. The refs live as long as this group.
+        initializer_args, initializer_kwargs, self._shared_init_arg_refs = (
+            _share_large_arguments(
+                remote_worker_builder.args, remote_worker_builder.kwargs
+            )
+        )
         for pg_idx in unique_pg_indices:
             # num_cpus=0 so the initializer doesn't consume a CPU slot — it
             # sits idle after creating workers and only exists for GC lifetime.
@@ -602,8 +666,8 @@ class RayWorkerGroup:
                     runtime_env=initializer_runtime_env,
                 ).remote(
                     remote_worker_builder.ray_actor_class_fqn,
-                    *remote_worker_builder.args,
-                    **remote_worker_builder.kwargs,
+                    *initializer_args,
+                    **initializer_kwargs,
                 )
             )
 
