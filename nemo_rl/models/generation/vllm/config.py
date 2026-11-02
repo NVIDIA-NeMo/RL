@@ -93,7 +93,9 @@ class VllmSpecificArgs(TypedDict):
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
     # Supports exact names, substrings, and fnmatch wildcards.
     quantization_ignore_patterns: NotRequired[list[str]]
-    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
+    kv_cache_dtype: Literal[
+        "auto", "fp8", "fp8_e4m3", "fp8_ds_mla", "fp8_per_token_head"
+    ]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
     # Collect vLLM request, cache, and cumulative token counters in a model-owner

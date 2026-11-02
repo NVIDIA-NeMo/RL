@@ -300,7 +300,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
     # Validate configuration: kv_cache_dtype
-    supported_kv_cache_dtypes = ["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
+    supported_kv_cache_dtypes = [
+        "auto",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_ds_mla",
+        "fp8_per_token_head",
+    ]
     if kv_cache_dtype not in supported_kv_cache_dtypes:
         raise ValueError(
             f"kv_cache_dtype must be one of {supported_kv_cache_dtypes}, but got {kv_cache_dtype}"

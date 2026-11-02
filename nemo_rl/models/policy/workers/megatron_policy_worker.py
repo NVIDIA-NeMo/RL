@@ -108,6 +108,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_obj_from_pp_rank,
     broadcast_tensors_from_last_stage,
 )
+from nemo_rl.models.megatron.kv_qat import KVFP8QAT, validate_kv_fp8_qat_config
 from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     router_replay_layout,
@@ -1051,6 +1052,12 @@ class MegatronPolicyWorkerImpl(
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
             get_model_config(self.model).param_sync_func = param_sync_func
+
+        # Reproduce the rollout's FP8 per-token-head KV-cache rounding.
+        self.kv_qat = None
+        if self.cfg["megatron_cfg"].get("kv_fp8_qat"):
+            validate_kv_fp8_qat_config(self.cfg)
+            self.kv_qat = KVFP8QAT(self.model)
 
         # Reference construction must not advance the restored policy RNG.
         # Keep fresh-run RNG ordering unchanged, including PEFT warm starts.
@@ -3162,7 +3169,14 @@ class MegatronPolicyWorkerImpl(
 
             # - self.model is the original reference_model, now on CUDA
             # - self.reference_model is the original model, now on CPU
-            yield
+            # The reference policy keeps its original BF16 attention.
+            if self.kv_qat is not None:
+                self.kv_qat.enabled = False
+            try:
+                yield
+            finally:
+                if self.kv_qat is not None:
+                    self.kv_qat.enabled = True
 
             # Restore sampling_params
             self.sampling_params = saved_sampling_params

@@ -273,6 +273,8 @@ policy:
     pipeline_dtype: ${policy.precision}
     sequence_parallel: false
     freeze_moe_router: true
+    # Quantize-dequantize post-RoPE K/V like vLLM's kv_cache_dtype=fp8_per_token_head (STE).
+    kv_fp8_qat: false
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
@@ -573,7 +575,7 @@ policy:
       precision: ${policy.precision}
       # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
       refit_prequantize: false
-      kv_cache_dtype: "auto"
+      kv_cache_dtype: "auto" # auto | fp8 | fp8_e4m3 | fp8_per_token_head (dynamic per-token, per-KV-head scales; TRITON_ATTN only)
       logprobs_mode: processed_logprobs
       fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.

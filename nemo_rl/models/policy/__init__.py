@@ -458,6 +458,8 @@ class MegatronConfig(TypedDict):
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool
+    # Quantize-dequantize K/V like vLLM's fp8_per_token_head KV cache (STE).
+    kv_fp8_qat: NotRequired[bool]
     # Optional multimodal provider controls. These map legacy Omni recipe
     # names onto the canonical NemotronOmniModel provider fields.
     freeze_vision_encoder: NotRequired[bool]
