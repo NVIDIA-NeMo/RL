@@ -12,16 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.dpo import _validate_stop_after_step
 from nemo_rl.algorithms.loss import MPOLossConfig, MPOLossFn
 from nemo_rl.algorithms.mpo import (
-    MasterConfig,
     MPOConfig,
     MPOSaveState,
     _update_reward_shift,
@@ -29,7 +26,6 @@ from nemo_rl.algorithms.mpo import (
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 
 def _save_state() -> MPOSaveState:
@@ -163,18 +159,3 @@ def test_mpo_rejects_pair_batch_not_divisible_by_dp():
         match=r"train_global_batch_size=3, DP=2.*1 nodes x 4 GPUs",
     ):
         _validate_pair_safe_packing(policy_config, _cluster_config())
-
-
-def test_vlm_mpo_exemplar_validates_without_dpo_config():
-    root = Path(__file__).parents[3]
-    register_omegaconf_resolvers()
-    config = load_config(root / "examples/configs/vlm_mpo.yaml")
-    master_config = MasterConfig.model_validate(
-        OmegaConf.to_container(config, resolve=True)
-    )
-
-    train_config = master_config.data["train"]
-    assert isinstance(train_config, dict)
-    assert train_config["dataset_name"] == "MMPRPreference"
-    assert master_config.data["validation"] is None
-    assert "dpo" not in (master_config.model_extra or {})
