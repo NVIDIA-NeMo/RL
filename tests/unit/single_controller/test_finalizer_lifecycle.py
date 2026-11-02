@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections import deque
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock
@@ -30,7 +31,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller import (
+    SingleControllerActor,
+    _BelowValidFraction,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.experience.reward_penalties import FinalizedReward
@@ -114,12 +118,15 @@ def _controller(actor: object) -> Any:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
-    ctrl._buffer.drop_committed_group = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(staging_partition="staging"),
+        token_capture=SimpleNamespace(
+            staging_partition="staging",
+            min_valid_fraction_per_group=None,
+            forest_training=False,
+        ),
         grpo=SimpleNamespace(num_prompts_per_step=1),
     )
     ctrl._trainer_version = 3
@@ -376,82 +383,126 @@ def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
     asyncio.run(exercise())
 
 
-def test_below_threshold_group_releases_pending_finalizer_state() -> None:
-    """A committed group dropped for min_valid_fraction_per_group leaves no state."""
-    meta = KVBatchMeta(
-        partition_id="canonical",
-        task_name="train",
-        sample_ids=["group_g0"],
-        fields=["input_ids"],
-        sequence_lengths=[3],
-        tags=[{"weight_version": 3}],
-    )
-    result = FinalizedGroup(
-        meta=meta,
-        group_min_wv=3,
-        group_max_wv=3,
-        staging_keys=["group_g0/call"],
-        metrics={"finalize/invalid_row_rate": 0.0},
-        reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
-    )
-    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
-    request = _request()
-
-    async def _below_threshold_branch() -> None:
-        # The same calls the rollout pump makes when
-        # valid_row_count / total_row_count < min_valid_fraction_per_group.
-        assert await ctrl._finalize_with_actor(request, {}) is result
-        assert "group" in ctrl._finalizer_metrics_by_group
-        assert "group" in ctrl._finalizer_rewards_by_group
-        await ctrl._discard_committed_group(request)
-
-    asyncio.run(_below_threshold_branch())
-
-    ctrl._buffer.abort.assert_called_once_with("group")
-    ctrl._buffer.drop_committed_group.assert_awaited_once_with(ANY, "group")
-    assert "group" not in ctrl._finalizer_metrics_by_group
-    assert "group" not in ctrl._finalizer_rewards_by_group
-
-
-def test_below_threshold_group_leaves_the_replay_buffer() -> None:
-    """A discarded group must not stay selectable with its rows cleared."""
-    result = FinalizedGroup(
+def _below_threshold_result() -> FinalizedGroup:
+    # One of two rollouts verified: 0.5 < the 0.75 bar set by _below_threshold.
+    return FinalizedGroup(
         meta=KVBatchMeta(
             partition_id="canonical",
             task_name="train",
-            sample_ids=["group_g0"],
+            sample_ids=["group_g0", "group_g1"],
             fields=["input_ids"],
-            sequence_lengths=[3],
-            tags=[{"weight_version": 3}],
+            sequence_lengths=[3, 3],
+            tags=[{"weight_version": 3}, {"weight_version": 3}],
         ),
         group_min_wv=3,
         group_max_wv=3,
         staging_keys=["group_g0/call"],
+        metrics={"finalize/invalid_row_rate": 0.5},
+        reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
+        valid_row_count=1,
+        total_row_count=2,
     )
-    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+
+
+def _below_threshold(ctrl: Any, *, spares: list[dict[str, Any]]) -> None:
+    ctrl._master_config.token_capture.min_valid_fraction_per_group = 0.75
+    ctrl._async_cfg = SimpleNamespace(
+        rollout_failure=SimpleNamespace(
+            on_dropped_prompt="replace", max_replacement_attempts=1
+        )
+    )
+    ctrl._replacement_reserve = deque(spares)
+    ctrl._batch_shortfall = {}
+    ctrl._rollout_recovery_enabled = True
+
+
+class _ReadyWatchingClient(_DataPlaneClient):
+    """Records whether any replay slot was ready while rows were being cleared."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buffer: TQReplayBuffer | None = None
+        self.ready_during_clear: list[bool] = []
+
+    async def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
+        assert self.buffer is not None
+        self.ready_during_clear.append(any(self.buffer.ready_list))
+        await asyncio.sleep(0)  # let any other task run mid-cleanup
+        await super().clear_samples(sample_ids=sample_ids, partition_id=partition_id)
+
+
+def test_below_threshold_group_never_becomes_selectable() -> None:
+    """A rejected group leaves the buffer without ever being marked ready."""
+    enricher_calls: list[str] = []
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_below_threshold_result()))
+    )
+    _below_threshold(ctrl, spares=[])
+    client = _ReadyWatchingClient()
+    ctrl._dp_client = client
     ctrl._buffer = TQReplayBuffer(
-        ctrl._dp_client,
+        client,
         partition_id="canonical",
         staging_partition_id="staging",
         pad_value_dict={"token_ids": 0},
         include_message_violation_fields=False,
     )
+    client.buffer = ctrl._buffer
     ctrl._buffer.set_data_plane_checkpoint_barrier(ctrl._data_plane_checkpoint_barrier)
-    ctrl._buffer.reserve(weight_version=3, group_id="group")
-    request = _request()
 
-    async def _below_threshold_branch() -> None:
-        assert await ctrl._finalize_with_actor(request) is result
-        assert ctrl._buffer.ready_list == [True]
-        await ctrl._discard_committed_group(request)
+    async def _enrich(meta: KVBatchMeta, extra_env_info: Any) -> None:
+        enricher_calls.append(meta.sample_ids[0])
 
-    asyncio.run(_below_threshold_branch())
+    ctrl._buffer.set_post_write_enricher(_enrich)
+    ctrl._buffer.reserve(weight_version=3, target_step=3, group_id="group")
 
+    outcome = asyncio.run(ctrl._finalize_with_actor(_request(), {}, target_step=3))
+
+    assert outcome == _BelowValidFraction(
+        valid_count=1, total_count=2, replacement=None, lineage_group_id=None
+    )
     assert ctrl._buffer.group_ids == ()
-    assert ctrl._dp_client.clear_calls == [
+    assert client.ready_during_clear == [False, False]
+    assert client.clear_calls == [
         {"sample_ids": ["group_g0"], "partition_id": "canonical"},
         {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
     ]
+    # Never committed: no enrichment, no pending metrics, and the step was
+    # credited short because no spare was left.
+    assert enricher_calls == []
+    assert "group" not in ctrl._finalizer_metrics_by_group
+    assert "group" not in ctrl._finalizer_rewards_by_group
+    assert ctrl._batch_shortfall == {3: 1}
+    assert ctrl._available_finalizers.qsize() == 1
+
+
+def test_below_threshold_replacement_is_reserved_in_the_cleanup_cut() -> None:
+    """The rejected group's ledger discard and its spare's reservation share a cut."""
+    spare = {"idx": 99}
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_below_threshold_result()))
+    )
+    _below_threshold(ctrl, spares=[spare])
+    ctrl._rollout_recovery_ledger.__contains__.return_value = True
+    ctrl._rollout_manager.reserve_prompt_group.return_value = "spare-group"
+
+    outcome = asyncio.run(ctrl._finalize_with_actor(_request(), {}, target_step=3))
+
+    assert outcome == _BelowValidFraction(
+        valid_count=1, total_count=2, replacement=spare, lineage_group_id="spare-group"
+    )
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    ctrl._buffer.abort.assert_called_once_with("group")
+    (discard_cut, discarded), _ = ctrl._rollout_recovery_ledger.discard_group.call_args
+    (reserve_cut, reserved), kwargs = (
+        ctrl._rollout_manager.reserve_prompt_group.call_args
+    )
+    assert discarded == "group"
+    assert reserved is spare
+    assert kwargs == {"target_step": 3}
+    assert reserve_cut is discard_cut
+    assert not ctrl._replacement_reserve
+    assert ctrl._batch_shortfall == {}
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:
