@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 
 from nemo_rl.distributed.worker_groups import _share_large_arguments
 
@@ -52,7 +51,11 @@ def test_arguments_at_or_below_the_threshold_are_passed_through_unchanged():
     put = _Counter()
     obj = {"k": "v"}
     args, kwargs, refs = _share_large_arguments(
-        (obj, "x" * 50), {"b": b"y" * 10}, threshold_bytes=50, put=put, serialized_size=_size
+        (obj, "x" * 50),
+        {"b": b"y" * 10},
+        threshold_bytes=50,
+        put=put,
+        serialized_size=_size,
     )
     assert put.calls == []
     assert refs == []
@@ -64,7 +67,11 @@ def test_arguments_at_or_below_the_threshold_are_passed_through_unchanged():
 def test_two_large_arguments_get_one_reference_each():
     put = _Counter()
     args, kwargs, refs = _share_large_arguments(
-        ("a" * 100,), {"b": "b" * 100}, threshold_bytes=50, put=put, serialized_size=_size
+        ("a" * 100,),
+        {"b": "b" * 100},
+        threshold_bytes=50,
+        put=put,
+        serialized_size=_size,
     )
     assert args == ("ref-1",)
     assert kwargs == {"b": "ref-2"}
