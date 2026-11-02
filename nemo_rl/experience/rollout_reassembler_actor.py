@@ -139,6 +139,10 @@ class RolloutReassemblerActorConfig:
     top_logprobs: int
     reward_penalty_config: RewardPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
+    # Message-level advantage penalties; patterns and tags come from env.nemo_gym.
+    message_violation_masks: bool = False
+    invalid_tool_call_patterns: Optional[list[str]] = None
+    thinking_tags: Optional[list[str]] = None
 
 
 @ray.remote(
@@ -169,6 +173,9 @@ class RolloutReassemblerActor:  # pragma: no cover
             reward_penalty_config=config.reward_penalty_config,
             effort_config=config.effort_config,
             top_logprobs=config.top_logprobs,
+            message_violation_masks=config.message_violation_masks,
+            invalid_tool_call_patterns=config.invalid_tool_call_patterns,
+            thinking_tags=config.thinking_tags,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

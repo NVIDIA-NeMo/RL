@@ -1772,25 +1772,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     # configs can omit it. Only apply rollout-path validation when it is present.
     env_config = getattr(master_config, "env", None)
 
+    # With token capture, the finalizer builds the masks from the last output
+    # item Gym records for each call (token_id_capture.record_last_output_item).
     penalties_enabled = (
         algo_cfg.invalid_tool_call_advantage is not None
         or algo_cfg.malformed_thinking_advantage is not None
     )
-    if penalties_enabled and token_capture_config.enabled:
-        # TODO(token-capture): thread the per-message violation flags through
-        # capture receipts/staging so RolloutReassembler can emit
-        # invalid_tool_call_mask/malformed_thinking_mask; then drop this guard.
-        # Checked before the gym-path validation: the conflict exists
-        # regardless of how the rollout path is configured.
-        raise NotImplementedError(
-            "invalid_tool_call_advantage/malformed_thinking_advantage require "
-            "the invalid_tool_call_mask/malformed_thinking_mask train-batch "
-            "columns, which the token-capture finalizer does not emit — the "
-            "first streamed group would crash the train pump with a KeyError "
-            "at the advantage stage. Set grpo.invalid_tool_call_advantage=null "
-            "and grpo.malformed_thinking_advantage=null to run with token "
-            "capture; mask support on the capture path is a follow-up."
-        )
     if penalties_enabled and not should_use_nemo_gym(master_config):
         raise ValueError(
             "invalid_tool_call_advantage and malformed_thinking_advantage on the "

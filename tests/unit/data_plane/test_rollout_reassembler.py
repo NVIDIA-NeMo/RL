@@ -558,6 +558,114 @@ def test_finalize_group_reports_valid_and_total_row_counts(tq_client, partitions
 
 
 # ---------------------------------------------------------------------------
+# Message-level advantage penalties: masks from Gym's recorded last output items
+# ---------------------------------------------------------------------------
+
+_VIOLATION_PARTITION = "rollout_data_fin_violation_test"
+_VIOLATION_FIELDS = ["invalid_tool_call_mask", "malformed_thinking_mask"]
+
+
+@pytest.fixture()
+def violation_partitions(tq_client):
+    tq_client.register_partition(
+        partition_id=STAGING_PARTITION,
+        fields=list(STAGING_FIELDS),
+        num_samples=64,
+        consumer_tasks=["finalize"],
+    )
+    tq_client.register_partition(
+        partition_id=_VIOLATION_PARTITION,
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+            "prompt_ids_for_adv",
+            "total_reward",
+            "mask_sample",
+            "truncated",
+            *_VIOLATION_FIELDS,
+        ],
+        num_samples=64,
+        consumer_tasks=["train"],
+    )
+    yield
+    tq_client.clear_samples(sample_ids=None, partition_id=STAGING_PARTITION)
+    tq_client.clear_samples(sample_ids=None, partition_id=_VIOLATION_PARTITION)
+
+
+def _message(text: str) -> dict:
+    return {"type": "message", "content": [{"text": text}]}
+
+
+def test_finalize_group_masks_flagged_calls_from_last_output_items(
+    tq_client, violation_partitions
+):
+    """Each chain call's recorded last item drives the echo path's detector."""
+    group_id = "grpviol"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, expected = _stage_fixture(
+        tq_client, "worked_example", rollout_id=rollout_ids[0]
+    )
+    # c1 leaks a thinking tag into its answer; c2 writes a tool call as text.
+    receipt["manifest"][0]["last_output_item"] = _message("answer </think>")
+    receipt["manifest"][1]["last_output_item"] = _message("<tool_call>x</tool_call>")
+    finalizer = _finalizer(
+        tq_client, partition_id=_VIOLATION_PARTITION, message_violation_masks=True
+    )
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],
+        [1.0, 0.0],
+        mask_sample=[False] * 2,
+        fallback_weight_version=3,
+        prompt_idx=0,
+    )
+    assert finalized.valid_row_count == 1
+    assert finalized.metrics["finalize/malformed_thinking_rate"] == 0.5
+    assert finalized.metrics["finalize/invalid_tool_call_rate"] == 0.5
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=_VIOLATION_PARTITION,
+        select_fields=_VIOLATION_FIELDS,
+    )
+    length = len(expected.token_ids)
+    # Row [10, 11 | 12, 13 | 20 | 21, 22]: c1 generates 12, 13 and c2 generates 21, 22.
+    malformed = torch.as_tensor(rows["malformed_thinking_mask"][0]).flatten()
+    invalid = torch.as_tensor(rows["invalid_tool_call_mask"][0]).flatten()
+    assert malformed[:length].tolist() == [
+        False,
+        False,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert invalid[:length].tolist() == [False, False, False, False, False, True, True]
+    assert not torch.as_tensor(rows["malformed_thinking_mask"][1]).any()
+    assert not torch.as_tensor(rows["invalid_tool_call_mask"][1]).any()
+
+
+def test_finalize_rollout_rejects_a_chain_call_without_last_output_item(
+    tq_client, violation_partitions
+):
+    receipt, _ = _stage_fixture(tq_client, "worked_example")
+    receipt["manifest"][0]["last_output_item"] = _message("answer")
+    finalizer = _finalizer(
+        tq_client, partition_id=_VIOLATION_PARTITION, message_violation_masks=True
+    )
+    row = finalizer.finalize_rollout("g7_r0", receipt, reward=1.0)
+    assert row.rejection_reason == "missing_last_output_item:c2"
+    # Without the penalties the same receipt is valid and carries no masks.
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id="g7_r1")
+    row = _finalizer(tq_client).finalize_rollout("g7_r1", receipt, reward=1.0)
+    assert row.valid and row.output_masks == {} and row.violation_counts == {}
+
+
+# ---------------------------------------------------------------------------
 # Router replay (R3): routed_experts rebuilt from staged extras and published
 # ---------------------------------------------------------------------------
 

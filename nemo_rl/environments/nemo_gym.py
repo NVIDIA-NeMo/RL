@@ -1055,6 +1055,12 @@ Depending on your data shape, you may want to change these values."""
                 else "fingerprint",
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
+            if token_capture.get("record_last_output_item"):
+                # Message-level advantage penalties: the finalizer runs the
+                # detector on each call's last output item from the ledger.
+                initial_global_config_dict["token_id_capture"][
+                    "record_last_output_item"
+                ] = True
             # Gym resolves the credential inside each serving process. Keep
             # only the variable name in serialized config and inherit the
             # secret through the server process environment.
