@@ -1020,12 +1020,6 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     )
     make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
     make_module(
-        "vllm.sampling_params",
-        RequestOutputKind=type(
-            "RequestOutputKind", (), {"DELTA": "delta", "CUMULATIVE": "cumulative"}
-        ),
-    )
-    make_module(
         "vllm.reasoning.abs_reasoning_parsers",
         ReasoningParserManager=ReasoningParserManager,
     )

@@ -296,10 +296,12 @@ def _classify_restored_prefix_terminal(
     terminal_finish_reason: Literal["stop", "length"] | None = None,
     terminal_stop_reason: str | int | None = None,
 ) -> _RestoredPrefixTerminal | None:
-    """Classify an exact terminal prefix or reject an incompatible restore."""
+    """Classify an exact terminal prefix or reject an incompatible restore.
+
+    Gym's continuation model already guarantees a non-negative prefix count and
+    a stop reason only alongside a finish reason.
+    """
     prompt_token_count = len(prompt_token_ids)
-    if prefix_token_count < 0:
-        raise ValueError("prefix_token_count must be non-negative")
     if prefix_token_count > prompt_token_count:
         raise ValueError(
             "Durable generation prefix contains more generated tokens than the "
@@ -320,8 +322,6 @@ def _classify_restored_prefix_terminal(
             f"({prompt_token_count}) exceeds restored model capacity "
             f"({model_max_tokens})."
         )
-    if terminal_stop_reason is not None and terminal_finish_reason is None:
-        raise ValueError("terminal_stop_reason requires terminal_finish_reason")
     if terminal_finish_reason is not None:
         return _RestoredPrefixTerminal(
             prompt_token_ids=tuple(prompt_token_ids),
@@ -633,12 +633,7 @@ class _AsyncLLMHTTPClient:
         """
         if self._progress_reads_enabled:
             return
-        gil_enabled = getattr(sys, "_is_gil_enabled", None)
-        if not (
-            sys.implementation.name == "cpython"
-            and gil_enabled is not None
-            and gil_enabled()
-        ):
+        if not (sys.implementation.name == "cpython" and sys._is_gil_enabled()):
             raise RuntimeError(
                 "generation-prefix cuts read vLLM's request state from another "
                 "thread, which needs GIL-enabled CPython"
@@ -651,22 +646,8 @@ class _AsyncLLMHTTPClient:
                 f"checked on vLLM {expected}.x; vLLM {installed} is installed. "
                 "Re-check _AsyncLLMHTTPClient.enable_generation_progress_reads."
             )
+        # vLLM is pinned to that release, which has every field read here.
         processor = self._engine_client.output_processor
-        missing = [
-            name
-            for name in (
-                "process_outputs",
-                "_finish_request",
-                "external_req_ids",
-                "request_states",
-            )
-            if not hasattr(processor, name)
-        ]
-        if missing:
-            raise RuntimeError(
-                "generation-prefix cuts need vLLM's OutputProcessor."
-                f"{', '.join(missing)}, which this vLLM lacks"
-            )
         process_outputs = processor.process_outputs
         finish_request = processor._finish_request
 
@@ -718,8 +699,6 @@ class _AsyncLLMHTTPClient:
         Raises:
             TimeoutError: vLLM held the lock past ``timeout_s``.
         """
-        if not self._progress_reads_enabled:
-            raise RuntimeError("generation progress reads are not enabled")
         started = time.perf_counter()
         if not self._progress_lock.acquire(
             timeout=-1 if timeout_s is None else max(0.0, timeout_s)
@@ -1256,14 +1235,6 @@ class VllmAsyncGenerationWorkerImpl(
             raise ValueError(
                 "generation-prefix cuts require a non-empty control bearer token"
             )
-        if generation_prefix_cuts_enabled and capture_media:
-            raise ValueError(
-                "generation-prefix recovery does not yet support multimodal capture"
-            )
-        if generation_prefix_cuts_enabled and self._capture_top_logprobs:
-            raise ValueError(
-                "generation-prefix recovery does not yet support sampler top-k capture"
-            )
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,
@@ -1425,6 +1396,8 @@ class VllmAsyncGenerationWorkerImpl(
 
     def _observe_request_capture(self, request: Any, request_output: Any) -> None:
         """Record the tokens a finished vLLM output adds past the last cut."""
+        if not self._generation_prefix_cuts_enabled:
+            return  # Only generation cuts read the recorded tokens.
         state = self._get_request_capture(request)
         if state is None:
             return
@@ -2238,10 +2211,7 @@ class VllmAsyncGenerationWorkerImpl(
                                 serving_admission.generation_cut.prefix_token_count
                             ),
                         )
-                        if (
-                            remaining_output_tokens is not None
-                            and remaining_output_tokens > 0
-                        ):
+                        if remaining_output_tokens > 0:
                             actual_request_max_tokens = remaining_output_tokens
                         if remaining_min_tokens is not None:
                             request.min_tokens = remaining_min_tokens
