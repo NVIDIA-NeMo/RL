@@ -565,9 +565,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int, required=True)
     parser.add_argument("--prompts-per-step", type=int, required=True)
     parser.add_argument("--generations-per-prompt", type=int, required=True)
-    # Calibrated on four Qwen3-1.7B runs of this workload (~28k generated
-    # tokens): 99.2-99.3% bit-identical, max |diff| 0.25-0.30.
-    parser.add_argument("--logprob-min-bit-identical", type=float, default=0.99)
+    # Calibrated on Qwen3-1.7B runs of this workload: 99.2-99.3% bit-identical
+    # at ~28k generated tokens, and 98.9-99.1% at ~9.3k on Gym main's Workplace
+    # agent, so the floor leaves room below the smaller workload's spread.
+    parser.add_argument("--logprob-min-bit-identical", type=float, default=0.98)
     parser.add_argument("--logprob-max-abs-diff", type=float, default=0.5)
     parser.add_argument("--rtol", type=float, default=1e-4)
     parser.add_argument("--atol", type=float, default=1e-5)
