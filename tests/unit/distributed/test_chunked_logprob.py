@@ -14,7 +14,6 @@
 
 import pytest
 import torch
-import torch.distributed.nn.functional
 
 from nemo_rl.distributed.model_utils import ChunkedDistributedLogprob
 
@@ -30,11 +29,6 @@ def test_chunked_logprob_gradients(
 ) -> None:
     """Check weighted gradients, partial chunks, and saved-input reuse at TP=1."""
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        torch.distributed.nn.functional,
-        "all_reduce",
-        lambda tensor, *args, **kwargs: tensor,
-    )
     torch.manual_seed(42)
     source = (torch.randn(2, 11, 74) * logit_scale).to(dtype)
     logits = source[..., ::2].requires_grad_(True)
