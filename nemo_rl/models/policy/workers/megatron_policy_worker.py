@@ -69,10 +69,7 @@ from nemo_rl.data.multimodal_utils import (
     chunks_accept_media_token_validity_mask,
     media_placeholder_token_id_from_chunks,
 )
-from nemo_rl.data.packing.shared_prefix_metadata import (
-    SHARED_PREFIX_EXECUTION_SLOT,
-    SHARED_PREFIX_GROUP_ID,
-)
+from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_GROUP_ID
 from nemo_rl.data_plane.grouping import row_group_ids
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -870,23 +867,7 @@ class MegatronPolicyWorkerImpl(
             # The row tag the driver shards complete groups on. Avoid an extra
             # non-tensor queue column and its broadcast semantics.
             data[SHARED_PREFIX_GROUP_ID] = row_group_ids(meta)
-            data = _normalize_shared_prefix_group_ids(data)
-            raw_slots = (meta.extra_info or {}).get(SHARED_PREFIX_EXECUTION_SLOT)
-            if raw_slots is None:
-                raise ValueError(
-                    "shared-prefix TQ dispatch is missing driver-prescribed "
-                    "execution slots"
-                )
-            if len(raw_slots) != data.size:
-                raise ValueError(
-                    "shared-prefix TQ execution slots must align with fetched rows: "
-                    f"{len(raw_slots)} != {data.size}"
-                )
-            data[SHARED_PREFIX_EXECUTION_SLOT] = torch.tensor(
-                raw_slots,
-                dtype=torch.long,
-            )
-            return data
+            return _normalize_shared_prefix_group_ids(data)
         return super()._attach_or_repack_pack_metadata(data, meta, stage=stage)
 
     def validate_forest_execution_padding(self) -> None:
@@ -1641,10 +1622,10 @@ class MegatronPolicyWorkerImpl(
                     raise RuntimeError(
                         "shared-prefix physical forward counts differ across the "
                         f"full model world during {stage}: min={minimum_count}, "
-                        f"max={target_count}. The first implementation requires "
-                        "group-coherent sharding to produce an equal number of "
-                        "star plus fallback execution units on every rank; masked "
-                        "dummy forwards are unsafe for Hybrid MoE auxiliary losses."
+                        f"max={target_count}. Set policy.shared_prefix_training."
+                        "pack_groups=true and align_data_parallel=true to align "
+                        "them by splitting real rows; masked dummy forwards are "
+                        "unsafe for Hybrid MoE auxiliary losses."
                     )
                 return units
             if target_count > minimum_rows:

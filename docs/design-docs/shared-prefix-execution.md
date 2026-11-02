@@ -51,7 +51,6 @@ policy:
   shared_prefix_training:
     mode: train
     pack_groups: true
-    repack_groups: true
     align_data_parallel: true
     training_dense_bins: true
     match_logprob_training_layout: true
@@ -92,15 +91,16 @@ These rules are checked when the configuration is loaded:
 
 - Unknown keys under `policy.shared_prefix_training` are rejected.
 - `disabled` and `dense` reject every execution flag that differs from its default. `uniform_router_gating` and `bypass_evaluation_mtp` are the exceptions in `dense`.
-- `repack_groups`, `pack_dense_fallbacks` and `evaluation_packing` each require `pack_groups`.
+- `pack_dense_fallbacks` and `evaluation_packing` each require `pack_groups`.
 - `merge_dense_fallbacks` requires `pack_dense_fallbacks`.
-- `align_data_parallel` requires `pack_groups` and `repack_groups`, and rejects `merge_dense_fallbacks`. With it, `evaluation_packing` also requires `bypass_evaluation_mtp`.
+- `align_data_parallel` requires `pack_groups`, and rejects `merge_dense_fallbacks`. With it, `evaluation_packing` also requires `bypass_evaluation_mtp`.
 - `preserve_training_prefixes_during_alignment` requires `align_data_parallel`.
-- `training_dense_bins` requires `mode: train`, `pack_groups`, `repack_groups` and `align_data_parallel`.
+- `training_dense_bins` requires `mode: train`, `pack_groups` and `align_data_parallel`.
 - `match_logprob_training_layout` and `training_shard_work_weights` require `mode: train`. `evaluation_packing` has no effect with `match_logprob_training_layout` and is rejected.
 - Work weights must be nonnegative with a positive sum.
+- `repack_groups` is deprecated. It is still accepted in every mode, but it warns and has no effect.
 
-`repack_groups` re-plans each complete group on the worker and ignores the execution slots that the driver assigned. `pack_groups` at data-parallel size greater than one requires `align_data_parallel`; `Policy` checks this before it allocates workers.
+The driver assigns complete prompt groups to data-parallel ranks and checks that every row fits one forward after padding. Each worker then splits its own groups into execution slots under the stage's token budget and the 16-completion branch limit; `repack_groups` used to select this local planning. `pack_groups` at data-parallel size greater than one requires `align_data_parallel`; `Policy` checks this before it allocates workers.
 
 ### Other requirements
 
@@ -155,7 +155,7 @@ The supported scope is the guarded hybrid model path with PP=1, TP with sequence
 
 NeMo RL tests in this repository:
 
-- `tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py` compares shared logprobs, loss and gradients with dense rows through the worker's entry points. It uses a table-lookup model whose logits depend only on causal history, so a correct consumer must match dense exactly. Cases cover stars, forests, split execution slots, dense bins and dense fallbacks, with and without temperature. The TP1/CP1 cases need one GPU. The TP1/CP2, TP2/CP1 and TP2/CP2 variants need up to four: `CUDA_VISIBLE_DEVICES=0,1,2,3 pytest --mcore-only tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py -k distributed`.
+- `tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py` compares shared logprobs, loss and gradients with dense rows through the worker's entry points. It uses a table-lookup model whose logits depend only on causal history, so a correct consumer must match dense exactly. Cases cover stars, forests, a group split past the branch limit, dense bins and dense fallbacks, with and without temperature. The TP1/CP1 cases need one GPU. The TP1/CP2, TP2/CP1 and TP2/CP2 variants need up to four: `CUDA_VISIBLE_DEVICES=0,1,2,3 pytest --mcore-only tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py -k distributed`.
 - `tests/unit/models/megatron/test_megatron_imports_without_shared_prefix.py` checks that the default Megatron path imports without `megatron.rl`.
 - `tests/unit/data_plane/test_shared_prefix_preshard.py`, `tests/unit/single_controller/test_shared_prefix_controller.py`, `tests/unit/models/policy/test_shared_prefix_config.py`, `test_shared_prefix_stage_weights.py`, `test_megatron_worker_shared_prefix.py` and `tests/unit/models/megatron/test_shared_prefix_setup_capability.py` cover sharding, the train pump, configuration rules, dispatch plumbing, worker gating and setup checks.
 

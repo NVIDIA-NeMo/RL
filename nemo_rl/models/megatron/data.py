@@ -50,7 +50,6 @@ from nemo_rl.data.megatron_sft_packed import (
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.data.packing.algorithms import get_packer
 from nemo_rl.data.packing.shared_prefix_metadata import (
-    SHARED_PREFIX_EXECUTION_SLOT,
     SHARED_PREFIX_GROUP_ID,
     SHARED_PREFIX_PROMPT_LENGTHS,
 )
@@ -1086,38 +1085,6 @@ def _resolve_shared_prefix_execution_topology(
     return tp_size, cp_size, padding_multiple
 
 
-def _get_prescribed_shared_prefix_slots(
-    data_dict: BatchedDataDict[Any],
-) -> tuple[tuple[int, ...], ...]:
-    """Return deterministic ``(group, slot)`` row sets and validate equal K."""
-    # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
-    from megatron.rl.shared_prefix_metadata import get_prescribed_shared_prefix_slots
-
-    if SHARED_PREFIX_EXECUTION_SLOT not in data_dict:
-        raise ValueError(
-            "shared-prefix train mode requires a driver-prescribed execution-slot field"
-        )
-    raw_slots = data_dict[SHARED_PREFIX_EXECUTION_SLOT]
-    if isinstance(raw_slots, torch.Tensor):
-        if raw_slots.ndim != 1:
-            raise ValueError("shared-prefix execution slots must have shape [batch]")
-        slots = [int(value) for value in raw_slots.detach().cpu().tolist()]
-    elif isinstance(raw_slots, np.ndarray):
-        if raw_slots.ndim != 1:
-            raise ValueError("shared-prefix execution slots must have shape [batch]")
-        slots = [int(value) for value in raw_slots.tolist()]
-    elif isinstance(raw_slots, (list, tuple)):
-        slots = [int(value) for value in raw_slots]
-    else:
-        raise TypeError(
-            "shared-prefix execution slots must be a tensor, ndarray, list, "
-            f"or tuple, got {type(raw_slots).__name__}"
-        )
-    return get_prescribed_shared_prefix_slots(
-        group_ids=data_dict[SHARED_PREFIX_GROUP_ID], slot_ids=slots
-    )
-
-
 def _make_shared_prefix_dense_packer(
     packing_cfg: Mapping[str, Any], bin_capacity: int
 ) -> Callable[[Sequence[int]], list[list[int]]]:
@@ -1151,12 +1118,13 @@ def plan_shared_prefix_execution_units(
     Workers call this before :func:`get_microbatch_iterator` and pass the result
     back through ``shared_prefix_execution_units``, so the CPU planning (one host
     copy of ``input_ids`` plus the exact per-row prompt tuples) runs a single
-    time per call. Each driver-prescribed slot resolves to exactly one star,
-    forest or conventional unit. Row indices address ``data`` in its given
-    order, which :func:`get_microbatch_iterator` preserves. ``forward_only``
-    requires model evaluation mode, where shared-prefix MTP is skipped. It
-    relaxes only the expanded MTP budget for merging stars; physical capacity
-    and dense fallback validation remain unchanged.
+    time per call. Each worker splits its own prompt groups into execution
+    slots; without ``pack_groups`` every slot runs as exactly one star or
+    conventional unit. Row indices address ``data`` in its given order, which
+    :func:`get_microbatch_iterator` preserves. ``forward_only`` requires model
+    evaluation mode, where shared-prefix MTP is skipped. It relaxes only the
+    expanded MTP budget for merging stars; physical capacity and dense fallback
+    validation remain unchanged.
     """
     # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
     from megatron.rl.shared_prefix_execution import (
@@ -1166,16 +1134,13 @@ def plan_shared_prefix_execution_units(
     data = _normalize_shared_prefix_group_ids(data)
     rows = _build_shared_prefix_rows(data)
     *_, padding_multiple = _resolve_shared_prefix_execution_topology(cfg)
-    row_slots = _get_prescribed_shared_prefix_slots(data)
     group_config = get_shared_prefix_training_config(cfg)
     packing_cfg = cfg["sequence_packing"]
     return plan_execution_units(
         rows,
-        row_slots=row_slots,
         bin_capacity=bin_capacity,
         padding_multiple=padding_multiple,
         pack_groups=group_config.pack_groups,
-        repack_groups=group_config.repack_groups,
         pack_dense_fallbacks=group_config.pack_dense_fallbacks,
         merge_dense_fallbacks=group_config.merge_dense_fallbacks,
         forward_only=forward_only,

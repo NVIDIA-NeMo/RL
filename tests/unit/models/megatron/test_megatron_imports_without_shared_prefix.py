@@ -80,7 +80,6 @@ batch = BatchedDataDict(
         "input_lengths": torch.tensor([4, 3]),
         "shared_prefix_prompt_lengths": torch.tensor([2, 2]),
         "shared_prefix_group_id": ["g", "g"],
-        "_shared_prefix_execution_slot": [0, 0],
     }
 )
 cfg = {

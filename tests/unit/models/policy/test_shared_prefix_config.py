@@ -14,6 +14,7 @@
 """Shared-prefix configuration errors must precede worker initialization."""
 
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from pydantic import ValidationError
 
 from nemo_rl.models.policy import (
     SharedPrefixTrainingConfig,
+    get_shared_prefix_training_config,
     validate_shared_prefix_data_parallel_size,
     validate_shared_prefix_training_config,
 )
@@ -191,7 +193,6 @@ _FLAG_COMBINATION_ERRORS = [
         {"mode": "dense", "evaluation_packing": True},
         "mode=dense ignores evaluation_packing",
     ),
-    ({"mode": "train", "repack_groups": True}, "repack_groups requires pack_groups"),
     (
         {"mode": "train", "pack_dense_fallbacks": True},
         "pack_dense_fallbacks requires pack_groups",
@@ -222,14 +223,13 @@ _FLAG_COMBINATION_ERRORS = [
         "Preserving training prefixes requires align_data_parallel",
     ),
     (
-        {"mode": "train", "pack_groups": True, "align_data_parallel": True},
-        "align_data_parallel requires pack_groups and repack_groups",
+        {"mode": "train", "align_data_parallel": True},
+        "align_data_parallel requires pack_groups",
     ),
     (
         {
             "mode": "train",
             "pack_groups": True,
-            "repack_groups": True,
             "pack_dense_fallbacks": True,
             "merge_dense_fallbacks": True,
             "align_data_parallel": True,
@@ -240,7 +240,6 @@ _FLAG_COMBINATION_ERRORS = [
         {
             "mode": "logprobs",
             "pack_groups": True,
-            "repack_groups": True,
             "evaluation_packing": True,
             "align_data_parallel": True,
         },
@@ -271,7 +270,6 @@ def test_flag_combination_rejected_at_config_load(block, message):
         {
             "mode": "train",
             "pack_groups": True,
-            "repack_groups": True,
             "pack_dense_fallbacks": True,
             "align_data_parallel": True,
             "preserve_training_prefixes_during_alignment": True,
@@ -286,6 +284,41 @@ def test_effective_flag_combinations_accepted(block):
     assert SharedPrefixTrainingConfig(**block).mode == block["mode"]
 
 
+@pytest.mark.parametrize(
+    "block",
+    [
+        # repack_groups used to require pack_groups; it is now ignored.
+        {"mode": "train", "repack_groups": True},
+        {"mode": "train", "pack_groups": True, "repack_groups": False},
+        # Inactive modes reject non-default flags, but not this one.
+        {"mode": "disabled", "repack_groups": True},
+        {
+            "mode": "train",
+            "pack_groups": True,
+            "align_data_parallel": True,
+            "training_dense_bins": True,
+            "repack_groups": True,
+        },
+    ],
+)
+def test_deprecated_repack_groups_is_accepted_with_a_warning_and_ignored(block):
+    without = {key: value for key, value in block.items() if key != "repack_groups"}
+    with pytest.warns(FutureWarning, match="repack_groups is deprecated and ignored"):
+        config = SharedPrefixTrainingConfig(**block)
+    assert config.model_dump(exclude={"repack_groups"}) == (
+        SharedPrefixTrainingConfig(**without).model_dump(exclude={"repack_groups"})
+    )
+    # Workers resolve the block from the raw policy config, so they accept it too.
+    with pytest.warns(FutureWarning, match="repack_groups"):
+        get_shared_prefix_training_config({"shared_prefix_training": block})
+
+
+def test_configs_without_repack_groups_do_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        SharedPrefixTrainingConfig(mode="train", pack_groups=True)
+
+
 def test_training_dense_bins_is_strict_and_disabled_by_default():
     assert SharedPrefixTrainingConfig().training_dense_bins is False
     with pytest.raises(ValidationError):
@@ -297,7 +330,6 @@ def test_training_dense_bins_is_strict_and_disabled_by_default():
     [
         ("mode", "logprobs"),
         ("pack_groups", False),
-        ("repack_groups", False),
         ("align_data_parallel", False),
     ],
 )
@@ -308,7 +340,6 @@ def test_training_dense_bins_requires_training_and_aligned_group_execution(
         "mode": "train",
         "training_dense_bins": True,
         "pack_groups": True,
-        "repack_groups": True,
         "align_data_parallel": True,
     }
     block[field] = value
@@ -556,12 +587,7 @@ def test_enabled_mode_allows_disabled_router_replay(policy_config, megatron_rl):
         ({"mode": "logprobs", "pack_groups": True}, 4, True),
         ({"mode": "train", "pack_groups": True}, 1, False),
         (
-            {
-                "mode": "train",
-                "pack_groups": True,
-                "repack_groups": True,
-                "align_data_parallel": True,
-            },
+            {"mode": "train", "pack_groups": True, "align_data_parallel": True},
             2,
             False,
         ),
@@ -604,5 +630,8 @@ def test_exemplar_documents_every_key_at_its_default():
             break
         block.append(line.removeprefix("  # "))
     documented = yaml.safe_load("\n".join(block))["shared_prefix_training"]
-    assert set(documented) == set(SharedPrefixTrainingConfig.model_fields)
+    # The deprecated repack_groups is accepted but no longer documented.
+    assert set(documented) == set(SharedPrefixTrainingConfig.model_fields) - {
+        "repack_groups"
+    }
     assert SharedPrefixTrainingConfig(**documented) == SharedPrefixTrainingConfig()

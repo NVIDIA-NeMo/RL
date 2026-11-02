@@ -14,9 +14,9 @@
 
 """Shared-prefix row metadata carried through NeMo RL batches.
 
-Planning is owned by :mod:`megatron.rl.shared_prefix_metadata`; callers
-import it lazily so driver-side modules that only route batches stay
-importable without the optional Megatron installation.
+Sharding and planning are owned by :mod:`megatron.rl`; callers import it
+lazily so driver-side modules that only route batches stay importable
+without the optional Megatron installation.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 __all__ = [
-    "SHARED_PREFIX_EXECUTION_SLOT",
     "SHARED_PREFIX_GROUP_ID",
     "SHARED_PREFIX_PROMPT_LENGTHS",
     "with_prompt_length_tags",
@@ -33,7 +32,6 @@ __all__ = [
 
 SHARED_PREFIX_GROUP_ID = "shared_prefix_group_id"
 SHARED_PREFIX_PROMPT_LENGTHS = "shared_prefix_prompt_lengths"
-SHARED_PREFIX_EXECUTION_SLOT = "_shared_prefix_execution_slot"
 
 
 def with_prompt_length_tags(

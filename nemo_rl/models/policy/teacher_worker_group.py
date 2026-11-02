@@ -200,10 +200,10 @@ class TeacherWorkerGroup:
         # TQ fetch does not carry routed_experts, so replay must stay off.
         if "router_replay" in cfg:
             cfg["router_replay"]["enabled"] = False
-        # Shared-prefix execution needs complete prompt groups and slots that the
-        # driver prescribes for the student's dispatches. Teacher dispatches are
-        # dense and never group-sharded, so the student's mode would fail the
-        # first teacher fetch.
+        # Shared-prefix execution needs complete prompt groups and per-row prompt
+        # lengths, which only the student's dispatches shard and fetch. Teacher
+        # dispatches are dense and never group-sharded, so the student's mode
+        # would fail the first teacher logprob request.
         if "shared_prefix_training" in cfg:
             cfg["shared_prefix_training"] = {"mode": "disabled"}
         # A student `pretrained_checkpoint` rides along on the copied config and

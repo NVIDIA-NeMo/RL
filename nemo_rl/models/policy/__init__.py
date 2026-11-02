@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from typing import Any, Literal, NotRequired, Self, TypedDict, Union, cast
 
 from pydantic import BaseModel, StrictBool, StrictInt, model_validator
@@ -266,7 +267,10 @@ class SharedPrefixTrainingConfig(BaseModel, extra="forbid"):
     pack_groups: StrictBool = False
     """Experimental forest execution under each stage's token budget."""
     repack_groups: StrictBool = False
-    """Rebuild local slots per group; experimental pending numerical validation."""
+    """Deprecated and ignored: every worker now splits its own prompt groups.
+
+    Still accepted so that existing configs load; setting it warns.
+    """
     pack_dense_fallbacks: StrictBool = False
     """Repack local dense fallback rows with the configured conventional packer."""
     merge_dense_fallbacks: StrictBool = False
@@ -332,6 +336,19 @@ class SharedPrefixTrainingConfig(BaseModel, extra="forbid"):
         return self.mode == "train" or (self.mode == "logprobs" and stage == "logprobs")
 
     @model_validator(mode="after")
+    def _warn_deprecated_flags(self) -> Self:
+        """Accept the deprecated ``repack_groups`` key, but say that it is ignored."""
+        if "repack_groups" in self.model_fields_set:
+            warnings.warn(
+                "policy.shared_prefix_training.repack_groups is deprecated and "
+                "ignored: every worker now splits its own prompt groups. Remove "
+                "the key from the config.",
+                FutureWarning,
+                stacklevel=2,
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_flag_combinations(self) -> Self:
         """Reject flag combinations that crash at the first planning call or do nothing.
 
@@ -341,14 +358,11 @@ class SharedPrefixTrainingConfig(BaseModel, extra="forbid"):
         if self.match_logprob_training_layout and self.mode != "train":
             raise ValueError("match_logprob_training_layout requires shared train mode")
         if self.training_dense_bins and not (
-            self.mode == "train"
-            and self.pack_groups
-            and self.repack_groups
-            and self.align_data_parallel
+            self.mode == "train" and self.pack_groups and self.align_data_parallel
         ):
             raise ValueError(
-                "training_dense_bins requires train mode, pack_groups, repack_groups, "
-                "and align_data_parallel"
+                "training_dense_bins requires train mode, pack_groups and "
+                "align_data_parallel"
             )
         if self.training_shard_work_weights is not None:
             weights = self.training_shard_work_weights
@@ -388,12 +402,18 @@ class SharedPrefixTrainingConfig(BaseModel, extra="forbid"):
             )
         if not self.enabled_for(stage="logprobs"):
             # Inactive modes never read the execution flags: reject all of them
-            # instead of silently ignoring a subset.
+            # instead of silently ignoring a subset. The deprecated
+            # repack_groups is ignored in every mode and only warns.
             ignored = sorted(
                 name
                 for name, field in type(self).model_fields.items()
                 if name
-                not in ("mode", "uniform_router_gating", "bypass_evaluation_mtp")
+                not in (
+                    "mode",
+                    "uniform_router_gating",
+                    "bypass_evaluation_mtp",
+                    "repack_groups",
+                )
                 and getattr(self, name) != field.default
             )
             if ignored:
@@ -404,7 +424,7 @@ class SharedPrefixTrainingConfig(BaseModel, extra="forbid"):
                 )
             return self
 
-        for flag in ("repack_groups", "pack_dense_fallbacks", "evaluation_packing"):
+        for flag in ("pack_dense_fallbacks", "evaluation_packing"):
             if getattr(self, flag) and not self.pack_groups:
                 raise ValueError(f"{flag} requires pack_groups")
         if self.merge_dense_fallbacks and not (
@@ -426,10 +446,8 @@ class SharedPrefixTrainingConfig(BaseModel, extra="forbid"):
                 "Preserving training prefixes requires align_data_parallel"
             )
         if self.align_data_parallel:
-            if not (self.pack_groups and self.repack_groups):
-                raise ValueError(
-                    "align_data_parallel requires pack_groups and repack_groups"
-                )
+            if not self.pack_groups:
+                raise ValueError("align_data_parallel requires pack_groups")
             if self.merge_dense_fallbacks:
                 raise ValueError(
                     "Distributed packing does not support merge_dense_fallbacks"

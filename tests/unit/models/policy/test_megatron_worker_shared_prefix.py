@@ -40,7 +40,6 @@ pytest.importorskip("megatron.bridge.training.checkpointing")
 import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module  # noqa: E402
 from nemo_rl.algorithms.loss.interfaces import LossInputType, LossType  # noqa: E402
 from nemo_rl.data.packing.shared_prefix_metadata import (  # noqa: E402
-    SHARED_PREFIX_EXECUTION_SLOT,
     SHARED_PREFIX_GROUP_ID,
 )
 from nemo_rl.data_plane import KVBatchMeta  # noqa: E402
@@ -178,9 +177,7 @@ def test_aligned_planning_agrees_with_one_collective(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     alignment = pytest.importorskip("megatron.rl.shared_prefix_alignment")
-    worker = _bare_worker(
-        mode="train", pack_groups=True, repack_groups=True, align_data_parallel=True
-    )
+    worker = _bare_worker(mode="train", pack_groups=True, align_data_parallel=True)
     all_reduce = _AllReduce(count=2, rows=2)
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
     monkeypatch.setattr(
@@ -362,7 +359,6 @@ def _tq_meta(rows: int, *, tags: Any) -> KVBatchMeta:
         partition_id="train",
         task_name="prev_lp",
         sample_ids=[f"sample{index}" for index in range(rows)],
-        extra_info={SHARED_PREFIX_EXECUTION_SLOT: [0] * rows},
         tags=tags,
     )
 
@@ -375,7 +371,8 @@ def test_attaches_group_ids_from_row_tags_for_the_enabled_stage() -> None:
     data = worker._attach_or_repack_pack_metadata(_batch(), meta, stage="logprobs")
 
     assert data[SHARED_PREFIX_GROUP_ID] == ["a", "b"]
-    assert data[SHARED_PREFIX_EXECUTION_SLOT].tolist() == [0, 0]
+    # The worker plans its own forwards: group IDs are the only attached field.
+    assert set(data) == {"input_ids", "input_lengths", SHARED_PREFIX_GROUP_ID}
 
 
 def test_shared_prefix_dispatch_requires_group_id_tags() -> None:
@@ -408,8 +405,8 @@ def test_stage_without_sharing_uses_the_base_packing_path(stage: Any) -> None:
 def test_teacher_with_an_inherited_logprobs_mode_uses_the_base_packing_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Teacher dispatches are not group-sharded, so the driver prescribes no
-    # execution slots. With the student's mode the fetch below would raise.
+    # Teacher dispatches are not group-sharded and do not fetch prompt lengths,
+    # so a teacher built from a shared-mode student must take the base path.
     from tests.unit.models.policy.test_teacher_worker_group import (
         _shared_prefix_student_config,
         _teacher_worker_cfg,

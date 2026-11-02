@@ -73,7 +73,6 @@ class TestSharedPrefixDenseBins(unittest.TestCase):
                 "input_lengths": torch.empty(0, dtype=torch.long),
                 "shared_prefix_prompt_lengths": torch.empty(0, dtype=torch.long),
                 "shared_prefix_group_id": [],
-                "_shared_prefix_execution_slot": [],
             }
         )
         with self.assertRaisesRegex(

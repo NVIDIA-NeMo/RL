@@ -28,10 +28,7 @@ from typing import Any, Optional
 
 import torch
 
-from nemo_rl.data.packing.shared_prefix_metadata import (
-    SHARED_PREFIX_EXECUTION_SLOT,
-    SHARED_PREFIX_PROMPT_LENGTHS,
-)
+from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_PROMPT_LENGTHS
 from nemo_rl.data_plane.grouping import row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -77,7 +74,9 @@ def shard_meta_for_dp(
         shared_prefix_groups: Assign complete prompt groups (rows sharing a
             ``GROUP_ID_TAG`` tag) coherently to DP ranks. This supersedes
             ordinary row-level sequence packing; each worker performs the
-            structured star planning locally.
+            structured star planning locally. Every row must fit
+            ``max_tokens_per_microbatch`` after padding to
+            ``sequence_length_pad_multiple``.
 
     Returns:
         ``(per_rank_metas, unsorted_indices)``. ``unsorted_indices`` contains
@@ -121,20 +120,23 @@ def shard_meta_for_dp(
         # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds,
         # and dense sharding must stay importable without it.
         from megatron.rl.shared_prefix_cost import estimate_shared_prefix_row_work
-        from megatron.rl.shared_prefix_metadata import (
-            plan_fixed_execution_slots,
-            plan_group_coherent_shards,
-        )
+        from megatron.rl.shared_prefix_metadata import plan_group_coherent_shards
 
-        slot_plan = plan_fixed_execution_slots(
-            group_ids=group_ids,
-            sequence_lengths=sequence_lengths,
-            bin_capacity=int(sequence_packing_args["max_tokens_per_microbatch"]),
-            batch_size=batch_size,
-            sequence_length_pad_multiple=int(
-                sequence_packing_args["sequence_length_pad_multiple"]
-            ),
-        )
+        # Each worker splits its own prompt groups into forwards. Reject a row
+        # that cannot fit one forward here, before any worker fetches the batch.
+        bin_capacity = int(sequence_packing_args["max_tokens_per_microbatch"])
+        pad_multiple = int(sequence_packing_args["sequence_length_pad_multiple"])
+        for row_index, sequence_length in enumerate(sequence_lengths):
+            padded_length = (
+                (int(sequence_length) + pad_multiple - 1) // pad_multiple * pad_multiple
+            )
+            if not 0 < padded_length <= bin_capacity:
+                raise ValueError(
+                    "shared-prefix row must be nonempty and fit the execution bin "
+                    f"capacity after padding: row={row_index}, "
+                    f"length={sequence_length}, padded_length={padded_length}, "
+                    f"capacity={bin_capacity}"
+                )
         assignment_lengths = sequence_lengths
         if shared_prefix_work_weights is not None:
             if meta.tags is None or any(
@@ -149,8 +151,6 @@ def shard_meta_for_dp(
                 prompt_lengths=[tag[SHARED_PREFIX_PROMPT_LENGTHS] for tag in meta.tags],
                 physical_weight=shared_prefix_work_weights[0],
                 expanded_weight=shared_prefix_work_weights[1],
-                # Each execution slot stores its own prompt copy.
-                row_slot_ids=slot_plan.row_slot_ids,
             )
         plan = plan_group_coherent_shards(
             group_ids=group_ids,
@@ -158,15 +158,8 @@ def shard_meta_for_dp(
             num_shards=dp_world,
             batch_size=batch_size,
         )
-        sharded_metas: list[KVBatchMeta] = []
-        for indices in plan.shard_indices:
-            shard = meta.subset(indices)
-            shard.extra_info[SHARED_PREFIX_EXECUTION_SLOT] = [
-                slot_plan.row_slot_ids[index] for index in indices
-            ]
-            sharded_metas.append(shard)
         return (
-            sharded_metas,
+            [meta.subset(indices) for indices in plan.shard_indices],
             (
                 list(plan.rank_order_permutation)
                 if plan.rank_order_permutation is not None

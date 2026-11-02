@@ -103,7 +103,6 @@ from nemo_rl.algorithms.logits_sampling_utils import (  # noqa: E402
 )
 from nemo_rl.algorithms.loss.interfaces import LossInputType, LossType  # noqa: E402
 from nemo_rl.data.packing.shared_prefix_metadata import (  # noqa: E402
-    SHARED_PREFIX_EXECUTION_SLOT,
     SHARED_PREFIX_GROUP_ID,
     SHARED_PREFIX_PROMPT_LENGTHS,
 )
@@ -151,8 +150,6 @@ class _Case:
     seed: int
     shared_prefix: dict[str, Any]
     bin_capacity: int
-    # Alternate siblings between two execution slots (prompt fragments).
-    split_slots: bool = False
     # Groups that get one invalid placeholder row (prompt length 0, masked).
     placeholders: tuple[str, ...] = ()
     # TransferQueue delivers group IDs as a numpy object array.
@@ -164,7 +161,7 @@ class _Case:
     expect: Optional[str] = None
 
 
-_PACK = {"mode": "train", "pack_groups": True, "repack_groups": True}
+_PACK = {"mode": "train", "pack_groups": True}
 _DENSE_BINS = {**_PACK, "align_data_parallel": True, "training_dense_bins": True}
 _SPEC_A = (("g0", 5, 3), ("g1", 7, 4), ("g2", 9, 2), ("g3", 3, 5))
 # A singleton group (G=1), more siblings than one star holds, and a one-token prompt.
@@ -175,20 +172,11 @@ _CASES = {
     ),
     "forest": _Case(_SPEC_A, 12, _PACK, 512, numpy_group_ids=True, expect="forest"),
     "forest_small_bins": _Case(_SPEC_A, 13, _PACK, 160, expect="forest"),
-    # repack_groups re-plans each complete group and ignores prescribed slots,
-    # so split slots run without it: five fragment stars and three singleton
-    # fallbacks, or, with pack_groups, one five-root forest and the fallbacks.
-    "split_slots": _Case(
-        _SPEC_A, 21, {"mode": "train"}, 512, split_slots=True, expect="fragments"
-    ),
-    "split_slots_packed": _Case(
-        _SPEC_A,
-        24,
-        {"mode": "train", "pack_groups": True},
-        512,
-        split_slots=True,
-        expect="forest_fragments",
-    ),
+    # The worker splits the 17-row group past the branch limit into stars of 9
+    # and 8. Without pack_groups each star is its own forward; with it, the two
+    # stars become roots of one forest next to the singleton's dense fallback.
+    "split_group": _Case(_SPEC_B, 21, {"mode": "train"}, 1024, expect="fragments"),
+    "split_group_packed": _Case(_SPEC_B, 24, _PACK, 1024, expect="forest_fragments"),
     "dense_bins": _Case(_SPEC_A, 14, _DENSE_BINS, 160),
     "fallbacks": _Case(
         _SPEC_B, 22, _PACK, 1024, placeholders=("g4",), expect="fallback"
@@ -359,10 +347,6 @@ def _build_batch(case: _Case) -> BatchedDataDict[Any]:
         if valid:
             token_mask[index, prompt_length : len(tokens)] = 1.0
     group_ids = [group for group, *_ in rows]
-    slots = [
-        group_ids[:index].count(group) % 2 if case.split_slots else 0
-        for index, group in enumerate(group_ids)
-    ]
     sample_mask = torch.tensor([1.0 if valid else 0.0 for *_, valid in rows])
     data: dict[str, Any] = {
         "input_ids": input_ids,
@@ -371,7 +355,6 @@ def _build_batch(case: _Case) -> BatchedDataDict[Any]:
         SHARED_PREFIX_GROUP_ID: (
             np.asarray(group_ids, dtype=object) if case.numpy_group_ids else group_ids
         ),
-        SHARED_PREFIX_EXECUTION_SLOT: slots,
         "token_mask": token_mask,
         "sample_mask": sample_mask,
         "advantages": torch.randn(
@@ -822,18 +805,13 @@ def test_shared_prefix_consumer_matches_dense_oracle_with_temperature(
 def test_inactive_shared_prefix_modes_keep_the_conventional_iterator(
     single_rank_model_parallel, mode, stage
 ):
-    case = _CASES["split_slots"]
+    case = _CASES["forest_small_bins"]
     shared_batch = _build_batch(case)
     conventional = BatchedDataDict(
         {
             key: value
             for key, value in shared_batch.items()
-            if key
-            not in (
-                SHARED_PREFIX_PROMPT_LENGTHS,
-                SHARED_PREFIX_GROUP_ID,
-                SHARED_PREFIX_EXECUTION_SLOT,
-            )
+            if key not in (SHARED_PREFIX_PROMPT_LENGTHS, SHARED_PREFIX_GROUP_ID)
         }
     )
     baseline_cfg = _policy_cfg(case, None, 1, 1)

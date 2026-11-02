@@ -14,7 +14,7 @@
 """Shared-prefix transport through the data plane.
 
 Covers the driver-side pieces between rollout and the Megatron worker:
-complete-group DP sharding with prescribed execution slots, the reassembler's
+complete-group DP sharding and its row-length check, the reassembler's
 prompt-length column and group tags, and the rollout partition schema. The
 train pump's DP-aligned prompt-group selection is covered in
 ``tests/unit/single_controller/test_shared_prefix_controller.py``.
@@ -22,6 +22,7 @@ train pump's DP-aligned prompt-group selection is covered in
 
 from __future__ import annotations
 
+import functools
 import random
 from collections import defaultdict
 from typing import Any
@@ -29,10 +30,7 @@ from typing import Any
 import pytest
 import torch
 
-from nemo_rl.data.packing.shared_prefix_metadata import (
-    SHARED_PREFIX_EXECUTION_SLOT,
-    SHARED_PREFIX_PROMPT_LENGTHS,
-)
+from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_PROMPT_LENGTHS
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
@@ -100,7 +98,6 @@ def test_shared_prefix_preshard_assigns_complete_groups_and_round_trips(
     dp_world, work_weights
 ):
     pytest.importorskip("megatron.rl.shared_prefix_metadata")
-    from megatron.rl.shared_prefix_metadata import plan_fixed_execution_slots
 
     meta = _grouped_meta()
     shards, permutation = _shard(
@@ -108,23 +105,15 @@ def test_shared_prefix_preshard_assigns_complete_groups_and_round_trips(
     )
 
     assert len(shards) == dp_world
-    expected_slots = plan_fixed_execution_slots(
-        group_ids=[tag[GROUP_ID_TAG] for tag in meta.tags],
-        sequence_lengths=meta.sequence_lengths,
-        bin_capacity=_PACKING_ARGS["max_tokens_per_microbatch"],
-        batch_size=None,
-        sequence_length_pad_multiple=1,
-    ).row_slot_ids
     original_row = {sample_id: row for row, sample_id in enumerate(meta.sample_ids)}
     ranks_by_group: dict[str, set[int]] = defaultdict(set)
     for rank, shard in enumerate(shards):
         assert shard.tags is not None
-        slots = shard.extra_info[SHARED_PREFIX_EXECUTION_SLOT]
-        assert len(slots) == len(shard.sample_ids)
-        for sample_id, tag, slot in zip(shard.sample_ids, shard.tags, slots):
-            # Tags, lengths and prescribed slots travel with their rows.
+        # Workers split their own groups, so the driver adds no execution metadata.
+        assert shard.extra_info == meta.extra_info
+        for sample_id, tag in zip(shard.sample_ids, shard.tags):
+            # Tags and lengths travel with their rows.
             assert tag["owner"] == sample_id
-            assert slot == expected_slots[original_row[sample_id]]
             ranks_by_group[tag[GROUP_ID_TAG]].add(rank)
         assert shard.sequence_lengths == [
             meta.sequence_lengths[original_row[sample_id]]
@@ -163,9 +152,8 @@ def test_shared_prefix_preshard_rejects_groups_that_cannot_split_evenly():
 
 
 @pytest.mark.mcore
-def test_shared_prefix_work_weights_cost_each_execution_slot(monkeypatch):
+def test_shared_prefix_work_weights_cost_each_group_from_its_row_tags(monkeypatch):
     cost = pytest.importorskip("megatron.rl.shared_prefix_cost")
-    from megatron.rl.shared_prefix_metadata import plan_fixed_execution_slots
 
     estimate = cost.estimate_shared_prefix_row_work
     calls = []
@@ -178,16 +166,44 @@ def test_shared_prefix_work_weights_cost_each_execution_slot(monkeypatch):
     meta = _grouped_meta()
     _shard(meta, 2, shared_prefix_work_weights=(4, 1))
 
-    # A group split into K slots stores its prompt K times.
-    expected_slots = plan_fixed_execution_slots(
-        group_ids=[tag[GROUP_ID_TAG] for tag in meta.tags],
-        sequence_lengths=meta.sequence_lengths,
-        bin_capacity=_PACKING_ARGS["max_tokens_per_microbatch"],
-        batch_size=None,
-        sequence_length_pad_multiple=1,
-    ).row_slot_ids
-    assert max(expected_slots) > 0
-    assert len(calls) == 1 and calls[0]["row_slot_ids"] == expected_slots
+    # Each group counts one prompt copy; the driver no longer splits groups.
+    assert calls == [
+        {
+            "group_ids": [tag[GROUP_ID_TAG] for tag in meta.tags],
+            "sequence_lengths": meta.sequence_lengths,
+            "prompt_lengths": [tag[SHARED_PREFIX_PROMPT_LENGTHS] for tag in meta.tags],
+            "physical_weight": 4,
+            "expanded_weight": 1,
+        }
+    ]
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    "length, pad_multiple, fits",
+    [(256, 1, True), (257, 1, False), (250, 8, True), (250, 24, False), (0, 1, False)],
+    ids=["at_capacity", "over_capacity", "padded_fits", "padding_overflows", "empty"],
+)
+def test_shared_prefix_preshard_rejects_rows_that_cannot_fit_one_forward(
+    length, pad_multiple, fits
+):
+    pytest.importorskip("megatron.rl.shared_prefix_metadata")
+    meta = _grouped_meta()
+    meta.sequence_lengths[5] = length
+    packing_args = {**_PACKING_ARGS, "sequence_length_pad_multiple": pad_multiple}
+    shard = functools.partial(
+        shard_meta_for_dp,
+        meta,
+        dp_world=2,
+        sequence_packing_args=packing_args,
+        shared_prefix_groups=True,
+    )
+    if fits:
+        shard()
+        return
+    # Workers would reject the row while planning; the driver fails first.
+    with pytest.raises(ValueError, match="row=5, .*capacity=256"):
+        shard()
 
 
 @pytest.mark.mcore

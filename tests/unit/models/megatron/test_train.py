@@ -2468,7 +2468,6 @@ def test_shared_prefix_logprobs_match_dense_rows(pack_groups):
             "input_lengths": torch.tensor(lengths),
             "shared_prefix_prompt_lengths": torch.tensor(prompt_lengths),
             "shared_prefix_group_id": np.asarray(groups, dtype=object),
-            "_shared_prefix_execution_slot": torch.zeros(len(tokens), dtype=torch.long),
         }
     )
     cfg = {
@@ -2479,11 +2478,7 @@ def test_shared_prefix_logprobs_match_dense_rows(pack_groups):
             "context_parallel_size": 1,
             "sequence_parallel": False,
         },
-        "shared_prefix_training": {
-            "mode": "train",
-            "pack_groups": pack_groups,
-            "repack_groups": pack_groups,
-        },
+        "shared_prefix_training": {"mode": "train", "pack_groups": pack_groups},
     }
     units = plan_shared_prefix_execution_units(data, cfg=cfg, bin_capacity=64)
     assert all(unit.shared_layout is not None for unit in units)

@@ -2990,7 +2990,7 @@ def test_get_pack_sequence_parameters_for_megatron(get_pack_sequence_parameters_
 
 
 def _shared_prefix_batch(tokens, prompt_lengths, group_ids):
-    """Build a shared-prefix batch whose every group runs in one prescribed slot."""
+    """Build a shared-prefix batch with the row metadata that workers plan from."""
     import numpy as np
 
     lengths = [len(row) for row in tokens]
@@ -3005,7 +3005,6 @@ def _shared_prefix_batch(tokens, prompt_lengths, group_ids):
             "sample_mask": torch.ones(len(tokens)),
             "shared_prefix_prompt_lengths": torch.tensor(prompt_lengths),
             "shared_prefix_group_id": np.asarray(group_ids, dtype=object),
-            "_shared_prefix_execution_slot": torch.zeros(len(tokens), dtype=torch.long),
         }
     )
 
@@ -3180,9 +3179,7 @@ class TestSharedPrefixMicrobatchIterator:
         ]
         groups = ["a", "a", "b", "b", "c", "c"]
         data = _shared_prefix_batch(tokens, [3] * 6, groups)
-        cfg = _shared_prefix_cfg(
-            pack_groups=True, repack_groups=True, pack_dense_fallbacks=True
-        )
+        cfg = _shared_prefix_cfg(pack_groups=True, pack_dense_fallbacks=True)
         cfg["sequence_packing"]["max_sequences_per_bin"] = 2
         units = self._plan(data, cfg)
         dense_sizes = [len(u.row_indices) for u in units if u.shared_layout is None]

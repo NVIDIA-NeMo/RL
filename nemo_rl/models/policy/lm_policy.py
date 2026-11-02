@@ -110,8 +110,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     shared_prefix_training_config: SharedPrefixTrainingConfig = (
         SharedPrefixTrainingConfig()
     )
-    # Shared-prefix forwards need per-row group IDs, prompt lengths and
-    # execution slots, which only the data-plane dispatch of TQPolicy carries.
+    # Shared-prefix forwards need per-row group IDs and prompt lengths, which
+    # only the data-plane dispatch of TQPolicy carries.
     _supports_shared_prefix_execution: ClassVar[bool] = False
 
     def __init__(
