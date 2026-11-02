@@ -234,6 +234,7 @@ token_capture:
   selection_policy: returned_history
   staging_partition: rollout_staging
 
+
 # Retry and restore policy for unfinished token-capture groups. "sibling" reuses
 # already sealed generations; "prompt_group" regenerates every sibling when any
 # sibling fails in-process or was unfinished at a checkpoint.

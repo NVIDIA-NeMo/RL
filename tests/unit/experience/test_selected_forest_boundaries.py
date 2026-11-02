@@ -8,6 +8,7 @@ Strict xfails document deferred provider shapes, not required forest behavior.
 import asyncio
 from collections import Counter
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -46,7 +47,9 @@ class ForestCapture:
     plane: PublicationDataPlane
     finalizer: RolloutReassembler
 
-    def capture(self, parents: list[int | None]) -> tuple[list, list[dict]]:
+    def capture(
+        self, parents: list[int | None], *, owner: str = "attempt"
+    ) -> tuple[list, list[dict]]:
         contexts, replies = [], []
         for index, parent in enumerate(parents):
             prompt = (
@@ -57,8 +60,8 @@ class ForestCapture:
                 + [{"role": "user", "content": f"observation {index}"}]
             )
             contexts.append(prompt)
-            replies.append(gym.assert_clean(self.harness.post("attempt", prompt)))
-        records = list(self.harness.manifest("attempt").records)
+            replies.append(gym.assert_clean(self.harness.post(owner, prompt)))
+        records = list(self.harness.manifest(owner).records)
         # Parent edges must come from production inference, never injected hints.
         assert [r.parent_call_id for r in records] == [
             records[parent].model_call_id if parent is not None else None
@@ -183,6 +186,102 @@ def test_selection_policy_reuses_forest_publication(forest, policy, reverse_mani
     )
     assert result.meta is not None
     assert_loss_once(forest, selected, records)
+
+
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_forest_restart_retains_selection_terminal_and_once_only_loss(
+    forest: ForestCapture, tmp_path: Path, policy: str, interleaved: bool
+) -> None:
+    from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+    from tests.unit.experience.test_rollout_recovery import _mutate, _prompt, _reserve
+
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="group",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=0,
+        start_weight_version=7,
+    )
+    owner = group.gate_rollout_id(0)
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "group"))
+    # Shared ancestor, omitted retry, and an independent post-compaction context.
+    parents = [None, 0, 0, None, 3]
+    accepted_indices, scored_index = (0, 2, 3, 4), 2
+    expected_rows = 3 if policy == "all_captured" else 2
+    if interleaved:
+        # Main A -> retry C / accepted E; worker B -> D / H;
+        # the main agent compacts into independent F -> scored G.
+        parents = [None, None, 0, 1, 0, None, 5, 1]
+        accepted_indices, scored_index = (0, 1, 3, 4, 5, 6, 7), 6
+        expected_rows = 5 if policy == "all_captured" else 4
+    records, replies = forest.capture(parents, owner=owner)
+    env = _env(forest.harness)
+    env._selection_policy = policy
+    output = ordinary(
+        [replies[i] for i in accepted_indices], terminal=replies[scored_index]["id"]
+    )
+    output["reward"] = 1.0
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": owner}, output)
+    )
+    processed["receipt"]["manifest"].reverse()
+    checks = RewardChecks(False, False, False)
+    context = RewardLogContext("agent", '{"answer":"done"}')
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "group",
+            generation_index=0,
+            gate_rollout_id=owner,
+            receipt=processed["receipt"],
+            reward=1.0,
+            mask_sample=False,
+            logical_selection=processed["logical_selection"],
+            reward_checks=checks,
+            reward_log_context=context,
+        )
+    )
+    path = tmp_path / "forest-recovery.pt"
+    torch.save(ledger.state_dict(), path)
+    restored = RolloutRecoveryLedger.from_state_dict(
+        torch.load(path, weights_only=True)
+    )
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+    attempt = restored.get_group("group").siblings[0].current_attempt
+    assert attempt == ledger.get_group("group").siblings[0].current_attempt
+    assert (
+        attempt.receipt["terminal_model_call_id"] == records[scored_index].model_call_id
+    )
+    owners, sample_ids, receipts, rewards, masks, reward_checks, log_contexts = (
+        restored.finalization_inputs("group")
+    )
+    assert reward_checks == [checks] and log_contexts == [context]
+    result = forest.finalizer.finalize_group(
+        "group",
+        owners,
+        receipts,
+        rewards,
+        mask_sample=masks,
+        fallback_weight_version=7,
+        prompt_idx=7,
+        canonical_sample_ids=sample_ids,
+        logical_selections=[attempt.logical_selection],
+        execution_row_multiple=4,
+        reward_checks=reward_checks,
+        reward_log_contexts=log_contexts,
+    )
+    assert result.meta is not None
+    assert result.meta.size == ((expected_rows + 3) // 4) * 4
+    assert result.total_row_count == result.valid_row_count == expected_rows
+    selected = (
+        records if policy == "all_captured" else [records[i] for i in accepted_indices]
+    )
+    assert_loss_once(forest, selected, records)
+    assert not any(partition == "staged" for partition, _ in forest.plane.rows)
 
 
 @pytest.mark.parametrize("policy", ["returned_history", "all_captured"])

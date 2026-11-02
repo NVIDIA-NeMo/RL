@@ -41,9 +41,10 @@ from nemo_rl.experience.reward_penalties import (
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
+    from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
-SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, 3, ROLLOUT_RECOVERY_SCHEMA_VERSION}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 5
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, 3, 4, ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -87,6 +88,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "reward_checks",
         "reward_log_context",
         "staging_keys",
+        "logical_selection",
     }
 )
 
@@ -194,6 +196,7 @@ class RolloutAttemptRecord:
     reward_checks: RewardChecks | None = None
     reward_log_context: RewardLogContext | None = None
     staging_keys: list[str] = field(default_factory=list)
+    logical_selection: RolloutSelection | None = None
 
     @property
     def attempt_id(self) -> str:
@@ -306,7 +309,12 @@ class SiblingSealResult:
     mask_sample: bool
     reward_checks: RewardChecks | None = None
     reward_log_context: RewardLogContext | None = None
+    logical_selection: RolloutSelection | None = None
     resolved_agent_name: Optional[str] = field(default=None, kw_only=True)
+
+
+class UnresolvedCaptureAcknowledgement(ValueError):
+    """Capture custody is ambiguous; stop rather than redispatch or discard it."""
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -322,8 +330,9 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
         return []
     pending = set(receipt.get("pending_call_ids", []))
     if pending and not receipt.get("capture_poisoned"):
-        raise ValueError(
-            "Capture acknowledgement is unresolved; preserve staging until reconciliation"
+        raise UnresolvedCaptureAcknowledgement(
+            "Capture acknowledgement is unresolved; preserve staging until reconciliation: "
+            f"capture_key={receipt.get('capture_key')!r}, pending_calls={len(pending)}"
         )
     manifest = receipt.get("manifest")
     if not isinstance(manifest, list):
@@ -353,6 +362,92 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
 
             staging_keys.append(staging_key(owner, call_id))
     return list(dict.fromkeys(staging_keys))
+
+
+def _attempt_staging_keys(
+    gate_id: str,
+    receipt: dict[str, Any] | None,
+    selection: RolloutSelection | None,
+) -> list[str]:
+    """Prove cleanup custody now; leave selection/chain proofs to the finalizer."""
+    if receipt is not None and receipt.get("capture_key") != gate_id:
+        raise ValueError(
+            "sealed receipt identity mismatch: "
+            f"expected {gate_id!r}, receipt has {receipt.get('capture_key')!r}"
+        )
+    keys = _receipt_staging_keys(receipt)
+    if selection is not None:
+        # Round-trip validation also rejects tensor or malformed selection metadata.
+        _selection_from_state(dataclasses.asdict(selection))
+        if receipt is None:
+            raise ValueError(
+                f"Forest recovery requires an ordinary capture receipt: {gate_id=}"
+            )
+        if not selection.response_ids and not receipt.get("capture_poisoned"):
+            raise ValueError(
+                f"Empty Forest selection requires poisoned capture: {gate_id=}"
+            )
+        for entry in receipt["manifest"]:
+            call_id = entry.get("model_call_id")
+            if (
+                not isinstance(call_id, str)
+                or not call_id
+                or "/" in call_id
+                or entry["staging_key"] != f"{gate_id}/{call_id}"
+            ):
+                raise ValueError(
+                    "Forest recovery has foreign staging ownership: "
+                    f"{gate_id=}, staging_key={entry['staging_key']!r}"
+                )
+        manifest_keys = [entry["staging_key"] for entry in receipt["manifest"]]
+        if len(manifest_keys) != len(set(manifest_keys)):
+            raise ValueError(
+                f"Forest recovery has duplicate staging ownership: {gate_id=}"
+            )
+    return keys
+
+
+def _selection_from_state(raw: Any) -> RolloutSelection | None:
+    """Restore the existing selection type from weights-only-safe metadata."""
+    if raw is None:
+        return None
+    # Ordinary recovery need not import the optional capture/reassembly stack.
+    from nemo_rl.experience.rollout_reassembler import (
+        ActionOutputFlags,
+        RolloutSelection,
+    )
+
+    expected_fields = {field.name for field in dataclasses.fields(RolloutSelection)}
+    if not isinstance(raw, dict) or set(raw) != expected_fields:
+        raise ValueError(
+            "Forest recovery selection must contain every descriptor field: "
+            f"expected={sorted(expected_fields)}, "
+            f"found={sorted(map(str, raw)) if isinstance(raw, dict) else type(raw).__name__}"
+        )
+    responses, flags = raw["response_ids"], raw["action_flags"]
+    if (
+        not isinstance(responses, tuple)
+        or not all(isinstance(response, str) and response for response in responses)
+        or len(set(responses)) != len(responses)
+        or not isinstance(flags, tuple)
+        or len(flags) != len(responses)
+        or not isinstance(raw["truncated"], bool)
+        or any(
+            not isinstance(flag, dict)
+            or set(flag)
+            != {field.name for field in dataclasses.fields(ActionOutputFlags)}
+            or not all(isinstance(value, bool) for value in flag.values())
+            for flag in flags
+        )
+    ):
+        raise ValueError(
+            "Forest recovery selection has invalid response IDs or action flags"
+        )
+    selection_state: dict[str, Any] = {
+        **raw,
+        "action_flags": tuple(ActionOutputFlags(**flag) for flag in flags),
+    }
+    return RolloutSelection(**selection_state)
 
 
 class RolloutRecoveryLedger:
@@ -493,6 +588,7 @@ class RolloutRecoveryLedger:
             attempt = sibling.current_attempt
             attempt.status = RolloutAttemptStatus.ABANDONED
             attempt.receipt = None
+            attempt.logical_selection = None
             attempt.reward = None
             attempt.mask_sample = None
             attempt.reward_checks = None
@@ -517,15 +613,26 @@ class RolloutRecoveryLedger:
                 f"groups={unsafe!r}"
             )
 
-    def expected_staging_keys(self) -> set[str]:
-        """Return staged token rows still owned by sealed sibling attempts."""
+    def expected_staging_keys(self, *, required_only: bool = False) -> set[str]:
+        """Return sealed custody, or just manifest rows proven to have been stored.
+
+        Attempted calls without commits may never have written a row. Keep them
+        cleanup-owned when present without requiring them in a cold snapshot.
+        """
         return {
             staging_key
             for record in self._groups.values()
             for sibling in record.siblings
             for attempt in sibling.attempts[-1:]
             if attempt.status is RolloutAttemptStatus.SEALED
-            for staging_key in attempt.staging_keys
+            for staging_key in (
+                [
+                    entry["staging_key"]
+                    for entry in (attempt.receipt or {}).get("manifest", [])
+                ]
+                if required_only
+                else attempt.staging_keys
+            )
         }
 
     def prepare_incomplete_retry(
@@ -630,6 +737,7 @@ class RolloutRecoveryLedger:
         resolved_agent_name: Optional[str] = None,
         reward_checks: RewardChecks | None = None,
         reward_log_context: RewardLogContext | None = None,
+        logical_selection: RolloutSelection | None = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -639,7 +747,9 @@ class RolloutRecoveryLedger:
         sibling = self._require_sibling(record, generation_index)
         attempt = sibling.current_attempt
         expected_gate_rollout_id = record.gate_rollout_id(generation_index)
-        staging_keys = _receipt_staging_keys(receipt)
+        staging_keys = _attempt_staging_keys(
+            gate_rollout_id, receipt, logical_selection
+        )
         if not isinstance(mask_sample, bool):
             raise TypeError("mask_sample must be a bool")
         self._validate_agent_name(record, resolved_agent_name)
@@ -656,6 +766,7 @@ class RolloutRecoveryLedger:
         if attempt.status == RolloutAttemptStatus.SEALED:
             if (
                 attempt.receipt == receipt
+                and attempt.logical_selection == logical_selection
                 and attempt.reward == float(reward)
                 and attempt.mask_sample is mask_sample
                 and attempt.reward_checks == reward_checks
@@ -676,6 +787,7 @@ class RolloutRecoveryLedger:
 
         record.resolved_agent_name = resolved_agent_name
         attempt.receipt = copy.deepcopy(receipt)
+        attempt.logical_selection = copy.deepcopy(logical_selection)
         attempt.reward = float(reward)
         attempt.mask_sample = mask_sample
         attempt.reward_checks = reward_checks
@@ -747,13 +859,22 @@ class RolloutRecoveryLedger:
                 )
             if not isinstance(result.mask_sample, bool):
                 raise TypeError("mask_sample must be a bool")
-            validated.append((attempt, result, _receipt_staging_keys(result.receipt)))
+            validated.append(
+                (
+                    attempt,
+                    result,
+                    _attempt_staging_keys(
+                        result.gate_rollout_id, result.receipt, result.logical_selection
+                    ),
+                )
+            )
 
         # Validate the complete cohort before changing any sibling. A checkpoint
         # therefore observes either no committed siblings or the complete group.
         record.resolved_agent_name = resolved_agent_name
         for attempt, result, staging_keys in validated:
             attempt.receipt = copy.deepcopy(result.receipt)
+            attempt.logical_selection = copy.deepcopy(result.logical_selection)
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
             attempt.reward_checks = result.reward_checks
@@ -954,6 +1075,11 @@ class RolloutRecoveryLedger:
                                     "attempt_uuid": attempt.attempt_uuid.bytes,
                                     "status": attempt.status.value,
                                     "receipt": copy.deepcopy(attempt.receipt),
+                                    "logical_selection": (
+                                        dataclasses.asdict(attempt.logical_selection)
+                                        if attempt.logical_selection is not None
+                                        else None
+                                    ),
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
                                     "reward_checks": dataclasses.asdict(
@@ -1132,7 +1258,11 @@ class RolloutRecoveryLedger:
                     raise ValueError("rollout-recovery attempt must be a mapping")
                 _reject_unknown_fields(
                     attempt_state,
-                    expected=_ATTEMPT_STATE_FIELDS,
+                    expected=(
+                        _ATTEMPT_STATE_FIELDS
+                        if schema_version >= 5
+                        else (_ATTEMPT_STATE_FIELDS - {"logical_selection"})
+                    ),
                     context="rollout-recovery attempt",
                 )
                 raw_attempt_uuid = attempt_state.get("attempt_uuid")
@@ -1163,6 +1293,13 @@ class RolloutRecoveryLedger:
                         "Token-capture rollout checkpoints from before schema v4 cannot be resumed "
                         f"(schema={schema_version}). Restart the rollouts."
                     )
+                if schema_version >= 5 and "logical_selection" not in attempt_state:
+                    raise ValueError(
+                        f"recovery attempt is missing logical_selection: {gate_id=}"
+                    )
+                selection = _selection_from_state(
+                    attempt_state.get("logical_selection")
+                )
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
                 raw_checks = attempt_state.get("reward_checks")
@@ -1196,14 +1333,18 @@ class RolloutRecoveryLedger:
                     elif isinstance(receipt, dict):
                         if receipt.get("capture_key") != gate_id:
                             raise ValueError("sealed receipt identity mismatch")
-                        if _receipt_staging_keys(receipt) != staging_keys:
-                            raise ValueError("sealed receipt staging manifest mismatch")
                     else:
                         raise ValueError(
                             "sealed attempt receipt must be a mapping or None"
                         )
+                    if (
+                        _attempt_staging_keys(gate_id, receipt, selection)
+                        != staging_keys
+                    ):
+                        raise ValueError("sealed receipt staging manifest mismatch")
                 elif (
                     receipt is not None
+                    or selection is not None
                     or reward is not None
                     or mask_sample is not None
                     or checks is not None
@@ -1216,6 +1357,7 @@ class RolloutRecoveryLedger:
                         attempt_uuid=attempt_uuid,
                         status=attempt_status,
                         receipt=copy.deepcopy(receipt),
+                        logical_selection=selection,
                         reward=float(reward) if reward is not None else None,
                         mask_sample=mask_sample,
                         reward_checks=checks,

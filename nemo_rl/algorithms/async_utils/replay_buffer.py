@@ -144,8 +144,50 @@ class DataPlaneCheckpointMetadata(TypedDict):
     rollout_recovery_schema_version: NotRequired[int]
     rollout_recovery_payload_sha256: NotRequired[str]
     rollout_recovery_group_count: NotRequired[int]
+    forest_training: NotRequired[bool]
+    forest_execution_row_multiple: NotRequired[int | None]
     # opd_full only: checkpoint path per teacher_index.
     opd_full_teacher_checkpoints: NotRequired[list[str]]
+
+
+def validate_forest_checkpoint_metadata(
+    metadata: DataPlaneCheckpointMetadata,
+    *,
+    forest_training: bool,
+    execution_row_multiple: int | None,
+) -> None:
+    """Reject changes to the interpretation or padding of restored rollout rows."""
+    schema = metadata.get("rollout_recovery_schema_version")
+    if forest_training and type(schema) is int and schema < 5:
+        raise ValueError(
+            "forest_training needs rollout recovery schema >= 5; "
+            f"checkpoint has schema {schema}. Start a fresh run."
+        )
+    if "forest_training" not in metadata:
+        # Before schema 5, only ordinary recovery was supported.
+        if forest_training or (type(schema) is int and schema >= 5):
+            raise ValueError(
+                "Checkpoint is missing forest_training compatibility metadata; "
+                f"schema={schema!r}, current forest_training={forest_training}. "
+                "Start a fresh run."
+            )
+        return
+    saved_mode = metadata["forest_training"]
+    if type(saved_mode) is not bool or saved_mode != forest_training:
+        raise ValueError(
+            "Checkpoint forest_training mismatch: "
+            f"saved={saved_mode!r}, current={forest_training}"
+        )
+    saved_multiple = metadata.get("forest_execution_row_multiple")
+    if (
+        "forest_execution_row_multiple" not in metadata
+        or (forest_training and (type(saved_multiple) is not int or saved_multiple < 1))
+        or saved_multiple != execution_row_multiple
+    ):
+        raise ValueError(
+            "Checkpoint forest execution padding mismatch: "
+            f"saved={saved_multiple!r}, current={execution_row_multiple!r}"
+        )
 
 
 def _canonical_manifest_value(value: Any, *, path: str) -> Any:
@@ -1811,8 +1853,8 @@ class TQReplayBuffer:
             expected_partition_id: Partition this buffer writes to; must
                 match the envelope.
             expected_group_size: num_generations_per_prompt; every group must
-                hold exactly this many rows (a changed group size silently
-                breaks the group-relative baseline).
+                hold exactly this many logical responses. Forest responses may span
+                multiple rows, with additional ownerless execution padding.
             expected_manifest_digest: Digest returned by the matching native
                 TQ checkpoint load. It must match the replay metadata file.
 
@@ -1825,6 +1867,12 @@ class TQReplayBuffer:
                 sample_ids), disagrees with the native TQ snapshot, or exceeds
                 ``max_groups``.
         """
+        # Defer to avoid the SC setup -> replay buffer import cycle.
+        from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+            has_logical_owners,
+            validate_logical_owner_metadata,
+        )
+
         if self.meta_list or self._group_ids or self._training_claims:
             raise RuntimeError(
                 "Replay-buffer checkpoint loading requires an empty local buffer"
@@ -1888,8 +1936,9 @@ class TQReplayBuffer:
             num_lengths = (
                 len(meta.sequence_lengths) if meta.sequence_lengths is not None else -1
             )
-            if not (
-                len(meta.sample_ids) == num_tags == num_lengths == expected_group_size
+            logical = has_logical_owners(meta)
+            if not (len(meta.sample_ids) == num_tags == num_lengths) or (
+                not logical and len(meta.sample_ids) != expected_group_size
             ):
                 raise ValueError(
                     "Replay buffer checkpoint group misaligned: "
@@ -1897,6 +1946,15 @@ class TQReplayBuffer:
                     f"sequence_lengths={num_lengths}, "
                     f"expected_group_size={expected_group_size}"
                 )
+            if logical:
+                owners = validate_logical_owner_metadata(
+                    meta, expected_group_size=expected_group_size
+                )
+                if set(owners) != {group["group_id"]}:
+                    raise ValueError(
+                        "Forest replay group_id disagrees with owner metadata: "
+                        f"group_id={group['group_id']!r}, owners={sorted(set(owners))}"
+                    )
             for sid in meta.sample_ids:
                 if sid in seen_sample_ids:
                     raise ValueError(
