@@ -355,6 +355,9 @@ env:
     nemo_gym_log_dir: "logs/nemo_gym"
     num_gpu_nodes: 1
     skip_venv_if_present: true
+    # Seconds Gym waits for all its servers to become ready, counting venv installs and the GenRM loading.
+    # Gym's default of 600 is too tight for the GenRM; a hung GenRM startup fails the run after this.
+    server_spinup_timeout_seconds: 1800
     port_range_low: 15001
     port_range_high: 20000
     global_aiohttp_client_request_debug: true

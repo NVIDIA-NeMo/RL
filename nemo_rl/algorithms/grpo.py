@@ -84,6 +84,7 @@ from nemo_rl.distributed.virtual_cluster import (
     TOPO_RANK_UNKNOWN,
     ClusterConfig,
     RayVirtualCluster,
+    ResourceInsufficientError,
     get_ray_cluster_topology,
     prepare_segment_topology,
 )
@@ -1104,6 +1105,35 @@ def setup(
                         f"skipping inference topology constraints",
                         flush=True,
                     )
+                elif inference_nodes % segment_size == 0:
+                    # Single-node instances don't need NVLink themselves, but leaving them unconstrained
+                    # lets Ray take one node from several domains, which splits the leftover nodes across
+                    # domains (e.g. a multi-node NeMo-Gym GenRM then spans two racks). Taking whole
+                    # segments keeps the leftover domains whole.
+                    remaining_topology = {
+                        nid: topology[nid] for nid in remaining_node_ids
+                    }
+                    try:
+                        (
+                            inference_node_resource_constraints,
+                            inference_remaining_ids,
+                            _,
+                        ) = prepare_segment_topology(
+                            segment_size,
+                            inference_nodes,
+                            topology=remaining_topology,
+                            role="inference",
+                        )
+                    except ResourceInsufficientError as e:
+                        print(
+                            f"  ⚠ Could not place inference nodes in whole NVLink segments, "
+                            f"skipping inference topology constraints: {e}",
+                            flush=True,
+                        )
+                    else:
+                        teacher_segment_topology = {
+                            nid: topology[nid] for nid in inference_remaining_ids
+                        }
 
         # initialize train cluster
         train_cluster = RayVirtualCluster(
