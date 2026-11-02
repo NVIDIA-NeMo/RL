@@ -1344,14 +1344,40 @@ def test_call_whose_tokens_left_a_gap_is_not_cut():
     assert healthy.generation_cut_staging_keys == sink.generation_prefix_keys
 
 
-def _sampling_params(**overrides) -> SimpleNamespace:
+class _WordTokenizer:
+    """One token per whitespace-separated word, the shape vLLM's expansion reads."""
+
+    max_token_id = 1000
+
+    def encode(self, text: str, add_special_tokens: bool) -> list[int]:
+        return [len(word) for word in text.split()]
+
+
+class _SamplingParams(SimpleNamespace):
+    """The SamplingParams surface the cut checks read."""
+
+    _bad_words_token_ids = None
+
+    def clone(self) -> "_SamplingParams":
+        return _SamplingParams(**vars(self))
+
+    def update_from_tokenizer(self, tokenizer) -> None:
+        self._bad_words_token_ids = [
+            tokenizer.encode(word, add_special_tokens=False) for word in self.bad_words
+        ]
+
+
+def _sampling_params(**overrides) -> _SamplingParams:
     defaults = dict(stop=[], bad_words=[], presence_penalty=0.0, frequency_penalty=0.0)
-    return SimpleNamespace(**{**defaults, **overrides})
+    return _SamplingParams(**{**defaults, **overrides})
 
 
 def _record_cut_constraints(state, sampling_params) -> None:
     VllmAsyncGenerationWorkerImpl._record_request_cut_constraints(
-        SimpleNamespace(_get_request_capture=lambda request: state),
+        SimpleNamespace(
+            _get_request_capture=lambda request: state,
+            _generation_cut_tokenizer=_WordTokenizer(),
+        ),
         object(),
         sampling_params,
     )
@@ -1411,10 +1437,54 @@ def test_sampling_settings_a_resumed_tail_cannot_honor_keep_the_call_uncut(
 )
 def test_only_a_seeded_sampled_call_is_kept_out_of_cuts(seed, temperature, blocked):
     blockers = _generation_cut_blockers(
-        _sampling_params(seed=seed, temperature=temperature)
+        _sampling_params(seed=seed, temperature=temperature), _WordTokenizer()
     )
 
     assert ("seed" in blockers) is blocked
+
+
+@pytest.mark.parametrize(
+    ("bad_words", "blocked"),
+    [
+        # Banned at every step whatever precedes it, before or after a cut.
+        (["forbidden", "banned"], False),
+        # Its first token can sit in the restored prefix, where vLLM no longer looks.
+        (["forbidden", "two words"], True),
+    ],
+)
+def test_only_multi_token_bad_words_keep_a_call_uncut(bad_words, blocked):
+    sampling_params = _sampling_params(bad_words=bad_words)
+
+    blockers = _generation_cut_blockers(sampling_params, _WordTokenizer())
+
+    assert ("multi-token bad_words" in blockers) is blocked
+    # The check runs on a copy; vLLM tokenizes the request's own params later.
+    assert sampling_params._bad_words_token_ids is None
+
+
+@pytest.mark.vllm
+def test_bad_word_check_uses_vllms_own_expansion():
+    # Both dependency markers select the combined vLLM + Gym lane.
+    pytest.importorskip("vllm")
+    from vllm import SamplingParams
+
+    class SpaceSplitsTokenizer(_WordTokenizer):
+        # " split" encodes as two tokens, "split" as one.
+        def encode(self, text: str, add_special_tokens: bool) -> list[int]:
+            ids = super().encode(text, add_special_tokens)
+            return [999, *ids] if text == " split" else ids
+
+    tokenizer = SpaceSplitsTokenizer()
+
+    assert not _generation_cut_blockers(
+        SamplingParams(bad_words=["forbidden"]), tokenizer
+    )
+    assert "multi-token bad_words" in _generation_cut_blockers(
+        SamplingParams(bad_words=["two words"]), tokenizer
+    )
+    # vLLM drops a space-prefixed form whose length differs, so only "split"
+    # (one token) is enforced and the call stays cuttable.
+    assert not _generation_cut_blockers(SamplingParams(bad_words=["split"]), tokenizer)
 
 
 def test_uncuttable_sampling_settings_warn_once_per_reason(monkeypatch, caplog):

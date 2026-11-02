@@ -120,13 +120,31 @@ _PENDING_ENGINE_REQUEST_CAPTURE: contextvars.ContextVar[Any] = contextvars.Conte
 _GREEDY_TEMPERATURE = 1e-5
 
 
-def _generation_cut_blockers(sampling_params: Any) -> list[str]:
+def _bad_words_can_straddle_a_cut(sampling_params: Any, tokenizer: Any) -> bool:
+    """Whether any bad word vLLM enforces spans more than one token.
+
+    vLLM bans a one-token bad word at every step, whatever came before it, so a
+    restored tail bans it exactly as the original call did. A longer one is
+    banned only after its leading tokens appear in the call's own output, which
+    after a restore no longer holds the prefix. The expansion of each word into
+    token sequences (with and without a leading space) is vLLM's own.
+    """
+    params = sampling_params.clone()
+    try:
+        params.update_from_tokenizer(tokenizer)
+    except Exception:  # noqa: BLE001 - vLLM rejects the request itself later
+        return True
+    return any(len(token_ids) > 1 for token_ids in params._bad_words_token_ids or ())
+
+
+def _generation_cut_blockers(sampling_params: Any, tokenizer: Any) -> list[str]:
     """Sampling settings a resumed tail cannot honor across a generation cut.
 
     After a restore the prefix is part of the prompt, but vLLM matches stop
-    strings and bad words, and counts presence/frequency penalties, over the
-    output tokens only. A resumed tail would therefore miss a stop string or
-    bad word that straddles the cut and stop penalizing the prefix's tokens.
+    strings and multi-token bad words, and counts presence/frequency penalties,
+    over the output tokens only. A resumed tail would therefore miss a stop
+    string or bad word that straddles the cut and stop penalizing the prefix's
+    tokens.
 
     A request-level ``seed`` gives the call its own random generator, seeded
     when vLLM admits it. The restored call would start that generator over and
@@ -137,8 +155,10 @@ def _generation_cut_blockers(sampling_params: Any) -> list[str]:
     blockers = []
     if getattr(sampling_params, "stop", None):
         blockers.append("stop strings")
-    if getattr(sampling_params, "bad_words", None):
-        blockers.append("bad_words")
+    if getattr(sampling_params, "bad_words", None) and _bad_words_can_straddle_a_cut(
+        sampling_params, tokenizer
+    ):
+        blockers.append("multi-token bad_words")
     if getattr(sampling_params, "presence_penalty", 0.0):
         blockers.append("presence_penalty")
     if getattr(sampling_params, "frequency_penalty", 0.0):
@@ -1407,7 +1427,9 @@ class VllmAsyncGenerationWorkerImpl(
         Such a call regenerates from its previous boundary after a restore, which
         costs time but not correctness; see ``_generation_cut_blockers``.
         """
-        blockers = _generation_cut_blockers(sampling_params)
+        blockers = _generation_cut_blockers(
+            sampling_params, self._generation_cut_tokenizer
+        )
         if not blockers:
             return
         state = self._get_request_capture(request)
