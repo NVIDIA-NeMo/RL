@@ -208,7 +208,9 @@ def test_checkpoint_refit_preserves_nonsharded_fp8_path(monkeypatch):
         model=SimpleNamespace(
             load_weights=lambda **_kwargs: pytest.fail("used full loader")
         ),
-        vllm_config=SimpleNamespace(model_config=SimpleNamespace(architectures=[])),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=[]), quant_config=object()
+        ),
     )
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
 

@@ -383,7 +383,11 @@ def test_no_shipped_config_is_outdated(config_file):
 
 
 # Keep only the regressions tracked in #4427 on DeepEP until they pass validation.
+# The native SpeechLM recipe has been validated only with DeepEP.
 DEEPEP_FALLBACK_RECIPES = {
+    Path(
+        "recipes/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml"
+    ),
     Path("recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-ep8.yaml"),
     Path("recipes/llm/sft-nanov3-30BA3B-2n4g-automodel-ep4.yaml"),
     Path("recipes/llm/sft-gpt-oss-20b-1n8g-automodel-ep8.yaml"),
@@ -406,7 +410,12 @@ def test_automodel_moe_recipes_use_expected_dispatcher(
     ):
         pytest.skip("Not an AutoModel expert-parallel recipe")
 
-    backend = automodel_cfg.automodel_kwargs.backend
+    # Native models configure Automodel through their own model config.
+    backend = OmegaConf.select(
+        config, "policy.native_model.model_config_overrides.automodel_backend"
+    )
+    if backend is None:
+        backend = automodel_cfg.automodel_kwargs.backend
     assert "enable_deepep" not in backend
     if Path(config_file).relative_to(configs_dir) in DEEPEP_FALLBACK_RECIPES:
         assert backend.get("dispatcher") == "deepep"

@@ -17,6 +17,8 @@ replace-imports-with-any = [
   "torchaudio.*",
   "torchcodec.*",
   "nemo.*",
+  "nemo_skills.*",
+  "rapidfuzz.*",
   "megatron.*",
   "ray.*",
   "numpy.*",
@@ -27,6 +29,14 @@ replace-imports-with-any = [
 project-includes = [
   "nemo_rl/environments/call_selection.py",
   "nemo_rl/algorithms/single_controller_utils/logical_advantage.py",
+  "nemo_rl/models/policy/workers/speechlm_policy_worker.py",
+  "nemo_rl/data/asr.py",
+  "nemo_rl/environments/asr_environment.py",
+  "nemo_rl/environments/asr_reward.py",
+  "nemo_rl/models/automodel/refit.py",
+  "nemo_rl/models/automodel/speechlm.py",
+  "nemo_rl/models/automodel/speechlm_logprobs.py",
+  "nemo_rl/models/generation/vllm/output_limits.py",
   "nemo_rl/data/captured_media.py",
   "nemo_rl/experience/reward_penalties.py",
   # TODO: enable these once we have 100 correctness

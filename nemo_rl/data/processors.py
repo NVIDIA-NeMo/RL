@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
+from nemo_rl.data.asr import asr_data_processor
 from nemo_rl.data.chat_utils import normalize_message_loss_mask
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -1136,6 +1137,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "multichoice_qa_processor": multichoice_qa_processor,
         "sft_processor": sft_processor,
         "vlm_hf_data_processor": vlm_hf_data_processor,
+        "asr": asr_data_processor,
         "nemo_gym_data_processor": nemo_gym_data_processor,
     },
 )
