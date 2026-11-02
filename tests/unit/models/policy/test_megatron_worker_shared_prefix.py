@@ -348,6 +348,7 @@ def test_logprobs_skip_mtp_through_compute_mtp_loss(bypass: bool) -> None:
     worker.sampling_params = None
     worker.defer_fp32_logits = False
     worker._router_replay_enabled = False
+    worker._opd_full_enabled = False
 
     with (
         patch.object(
