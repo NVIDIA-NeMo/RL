@@ -55,8 +55,9 @@ uv run --extra automodel python -m torch.distributed.run --standalone --nproc-pe
   --source-sha "$(git rev-parse HEAD)" --wandb-project nemorl-gemma4
 ```
 
-See the [low-level design and validation record](../design-docs/automodel-single-controller-full-batch.md)
-for the lifecycle, reused numerical primitives, and limitations of each test.
+See the [AutoModel full-batch design](../design-docs/automodel-single-controller-full-batch.md)
+for the lifecycle, numerical primitives, forward-padding contract, and training
+comparison curves.
 
 ### Mandatory settings
 
