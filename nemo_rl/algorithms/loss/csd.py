@@ -41,6 +41,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_contiguous_tensor,
     chunked_vocab_parallel_logsumexp,
+    cp_shift_next,
     distributed_selected_logprobs,
     get_next_token_logprobs_from_logits,
     group_all_reduce_sum,
@@ -926,7 +927,7 @@ class CSDLossFn(LossFunction):
                     "be used with sparse teacher IPC."
                 )
             weights = self._compute_dynamic_weights(
-                data, teacher_full_logits_by_idx, aligns_by_idx
+                data, teacher_full_logits_by_idx, aligns_by_idx, cp_group=cp_group
             )
         else:
             weights = [
@@ -1111,18 +1112,16 @@ class CSDLossFn(LossFunction):
         with torch.no_grad():
             ces: list[float] = []
             for i in range(self.num_teachers):
-                t_logits, t_ids, t_mask = self._teacher_score_inputs(
-                    i, data, teacher_full_logits_by_idx, aligns_by_idx
+                t_logits, next_ids, next_mask, _ = self._teacher_score_inputs(
+                    i, teacher_full_logits_by_idx, aligns_by_idx, cp_group=cp_group
                 )
-                ce_pos = torch.nn.functional.cross_entropy(
-                    t_logits[:, :-1].reshape(-1, t_logits.shape[-1]).float(),
-                    t_ids[:, 1:].reshape(-1),
-                    reduction="none",
+                ce = self._teacher_next_token_ce(
+                    t_logits,
+                    next_ids=next_ids,
+                    next_mask=next_mask,
+                    sample_mask=data["sample_mask"],
                 )
-                mask = (
-                    t_mask[:, 1:].float() * data["sample_mask"].unsqueeze(-1).float()
-                ).reshape(-1)
-                ces.append(self._dp_global_masked_mean(ce_pos, mask).item())
+                ces.append(ce.item())
             best = int(min(range(self.num_teachers), key=lambda j: ces[j]))
 
         kd, m = self._compute_teacher_kd(
@@ -1147,32 +1146,65 @@ class CSDLossFn(LossFunction):
     def _teacher_score_inputs(
         self,
         i: int,
-        data: BatchedDataDict[CSDLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return ``(logits, input_ids, token_mask)`` for teacher ``i``'s CE / weight-metric scores.
+        *,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(logits, next_ids, next_mask, token_mask)`` for teacher ``i``'s scores.
 
-        The token mask is over the tokenization the score is computed on: the
-        shared student tokens (CP-relaid) for a same-vocab teacher, teacher ``i``'s
-        own otherwise. Every teacher ships full logits, so the full distribution
-        is always available.
+        All four cover this CP rank's contiguous window of the tokenization the
+        score is computed on: the shared student tokens for a same-vocab teacher,
+        teacher ``i``'s own otherwise. ``next_ids`` / ``next_mask`` hold each
+        position's next token: the window's last position takes the first token
+        of the next CP rank's window, and the sequence's last position has none
+        (``next_mask`` is 0). Every teacher ships full logits, so the full
+        distribution is always available.
         """
+        align = aligns_by_idx[i]
         if self._teacher_is_same_vocab(i):
-            align = aligns_by_idx[i]
             assert align.student_input_ids is not None
             ids = to_local_if_dtensor(align.student_input_ids)
             token_mask = self._student_kd_mask(align)
         else:
-            ids = to_local_if_dtensor(data[f"teacher_{i}_input_ids"])
-            token_mask = to_local_if_dtensor(data[f"teacher_{i}_token_mask"])
-        return teacher_full_logits_by_idx[i], ids, token_mask
+            assert align.teacher_input_ids is not None
+            if align.teacher_token_mask is None:
+                raise ValueError(
+                    f"localized alignment for teacher {i} is missing the teacher "
+                    "token mask"
+                )
+            ids = to_local_if_dtensor(align.teacher_input_ids)
+            token_mask = to_local_if_dtensor(align.teacher_token_mask)
+        token_mask = token_mask.float()
+        next_ids = cp_shift_next(ids, cp_group, fill=0)
+        next_mask = cp_shift_next(token_mask, cp_group, fill=0.0)
+        return teacher_full_logits_by_idx[i], next_ids, next_mask, token_mask
+
+    def _teacher_next_token_ce(
+        self,
+        t_logits: torch.Tensor,
+        *,
+        next_ids: torch.Tensor,
+        next_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Teacher's next-token CE on its own tokens, averaged over every rank's window."""
+        ce_pos = torch.nn.functional.cross_entropy(
+            t_logits.reshape(-1, t_logits.shape[-1]).float(),
+            next_ids.reshape(-1),
+            reduction="none",
+        )
+        samp = to_local_if_dtensor(sample_mask).unsqueeze(-1).float()
+        mask = (next_mask * samp).reshape(-1)
+        return self._dp_global_masked_mean(ce_pos, mask)
 
     def _compute_dynamic_weights(
         self,
         data: BatchedDataDict[CSDLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
+        *,
+        cp_group: Optional[torch.distributed.ProcessGroup],
     ) -> list[torch.Tensor]:
         """Sequence-level dynamic teacher weights via ``sum_weights_metric``.
 
@@ -1188,11 +1220,15 @@ class CSDLossFn(LossFunction):
             )
         scores: list[torch.Tensor] = []
         for i in range(self.num_teachers):
-            t_logits, t_ids, t_mask = self._teacher_score_inputs(
-                i, data, teacher_full_logits_by_idx, aligns_by_idx
+            t_logits, next_ids, next_mask, token_mask = self._teacher_score_inputs(
+                i, teacher_full_logits_by_idx, aligns_by_idx, cp_group=cp_group
             )
             score = self._teacher_weight_score(
-                t_logits, t_ids, t_mask, data["sample_mask"]
+                t_logits,
+                next_ids=next_ids,
+                next_mask=next_mask,
+                token_mask=token_mask,
+                sample_mask=data["sample_mask"],
             )
             if self.normalize_teacher_by_vocab:
                 v_log = torch.log(
@@ -1206,8 +1242,10 @@ class CSDLossFn(LossFunction):
     def _teacher_weight_score(
         self,
         t_logits: torch.Tensor,
-        t_ids: torch.Tensor,
-        t_mask: torch.Tensor,
+        *,
+        next_ids: torch.Tensor,
+        next_mask: torch.Tensor,
+        token_mask: torch.Tensor,
         sample_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Scalar weight-metric score for one teacher (higher = more trusted).
@@ -1215,16 +1253,15 @@ class CSDLossFn(LossFunction):
         Padded positions and masked-out samples are excluded, so long-padded
         batches don't let near-uniform padding logits dominate the score.
         """
-        samp = to_local_if_dtensor(sample_mask).unsqueeze(-1).float()
         if self.sum_weights_metric == "ce":
-            ce_pos = torch.nn.functional.cross_entropy(
-                t_logits[:, :-1].reshape(-1, t_logits.shape[-1]).float(),
-                t_ids[:, 1:].reshape(-1),
-                reduction="none",
+            return -self._teacher_next_token_ce(
+                t_logits,
+                next_ids=next_ids,
+                next_mask=next_mask,
+                sample_mask=sample_mask,
             )
-            mask = (t_mask[:, 1:].float() * samp).reshape(-1)
-            return -self._dp_global_masked_mean(ce_pos, mask)
-        mask = t_mask.float() * samp
+        samp = to_local_if_dtensor(sample_mask).unsqueeze(-1).float()
+        mask = token_mask * samp
         if self.sum_weights_metric == "entropy":
             probs = torch.softmax(t_logits.float(), dim=-1)
             entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)

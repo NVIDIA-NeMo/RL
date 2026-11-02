@@ -177,6 +177,7 @@ def test_csd_automodel_cp_layout_localizes_csd_windows_after_global_shift():
         "sample_mask": torch.ones(1),
         "teacher_0_full_logits_ipc": teacher_ipc,
         "teacher_0_input_ids": torch.arange(20, 24).unsqueeze(0),
+        "teacher_0_token_mask": torch.tensor([[1, 1, 0, 1]]),
         "alignment_0_student_chunk_id": torch.tensor([[10, 11, 12, 13, 14, 15]]),
         "alignment_0_teacher_chunk_id": torch.tensor([[20, 21, 22, 23]]),
         "alignment_0_pair_valid": torch.ones(1, 2, dtype=torch.bool),
@@ -226,6 +227,14 @@ def test_csd_automodel_cp_layout_localizes_csd_windows_after_global_shift():
         local_logits, seq_dim=1, trim=True
     )
     rebuild_teacher.assert_called_once_with(teacher_ipc, cp_group=cp_group, device=0)
+    # CP rank 1 of 2 holds the second teacher window (2 of 4 positions); its ids
+    # and token mask match the teacher-logit window that the scoring code reads.
+    torch.testing.assert_close(
+        aligns[0].teacher_input_ids, data["teacher_0_input_ids"][:, 2:4]
+    )
+    torch.testing.assert_close(
+        aligns[0].teacher_token_mask, data["teacher_0_token_mask"][:, 2:4]
+    )
 
 
 def test_csd_automodel_cp_layout_rejects_non_divisible_student_sequence():

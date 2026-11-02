@@ -67,6 +67,7 @@ from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollatorConfig,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import cp_shift_next
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.config import (
     load_config_with_inheritance,
@@ -2503,6 +2504,25 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _weight_score(
+    fn: CSDLossFn,
+    logits: torch.Tensor,
+    *,
+    ids: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Score full-sequence inputs as ``_teacher_score_inputs`` hands them over at CP=1."""
+    token_mask = token_mask.float()
+    return fn._teacher_weight_score(
+        logits,
+        next_ids=cp_shift_next(ids, None, fill=0),
+        next_mask=cp_shift_next(token_mask, None, fill=0.0),
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+    )
+
+
 @pytest.mark.parametrize("metric", ["ce", "entropy", "max_prob"])
 def test_teacher_weight_score_ignores_padded_positions(metric):
     # The per-teacher weight/selection score must exclude padded positions:
@@ -2520,15 +2540,21 @@ def test_teacher_weight_score_ignores_padded_positions(metric):
     token_mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 0, 0]], dtype=torch.float32)
     sample_mask = torch.ones(batch)
 
-    score = fn._teacher_weight_score(logits, ids, token_mask, sample_mask)
+    score = _weight_score(
+        fn, logits, ids=ids, token_mask=token_mask, sample_mask=sample_mask
+    )
 
     # Corrupt the padded tail; a properly masked score must not move.
     logits_corrupt = logits.clone()
     logits_corrupt[:, 3:, :] = 1e4
     ids_corrupt = ids.clone()
     ids_corrupt[:, 3:] = 0
-    score_corrupt = fn._teacher_weight_score(
-        logits_corrupt, ids_corrupt, token_mask, sample_mask
+    score_corrupt = _weight_score(
+        fn,
+        logits_corrupt,
+        ids=ids_corrupt,
+        token_mask=token_mask,
+        sample_mask=sample_mask,
     )
 
     assert torch.allclose(score, score_corrupt, atol=1e-5)
@@ -2545,12 +2571,14 @@ def test_teacher_weight_score_masks_dropped_samples():
     token_mask = torch.ones(2, 4)
     sample_mask = torch.tensor([1.0, 0.0])  # second sample dropped
 
-    score = fn._teacher_weight_score(logits, ids, token_mask, sample_mask)
+    score = _weight_score(
+        fn, logits, ids=ids, token_mask=token_mask, sample_mask=sample_mask
+    )
 
     logits_corrupt = logits.clone()
     logits_corrupt[1] = 1e4  # corrupt the dropped sample
-    score_corrupt = fn._teacher_weight_score(
-        logits_corrupt, ids, token_mask, sample_mask
+    score_corrupt = _weight_score(
+        fn, logits_corrupt, ids=ids, token_mask=token_mask, sample_mask=sample_mask
     )
 
     assert torch.allclose(score, score_corrupt, atol=1e-5)
@@ -2857,7 +2885,7 @@ def _dynamic_weights_fn(alpha, scores):
     fn.num_teachers = len(scores)
     fn.alpha = alpha
     fn.normalize_teacher_by_vocab = False
-    fn._teacher_score_inputs = lambda i, *a, **k: (None, None, None)
+    fn._teacher_score_inputs = lambda i, *a, **k: (None, None, None, None)
     it = iter([torch.tensor(float(s)) for s in scores])
     fn._teacher_weight_score = lambda *a, **k: next(it)
     return fn
@@ -2870,7 +2898,7 @@ def test_compute_dynamic_weights_softmax_over_teachers():
     data = {"input_ids": torch.zeros(1, 1), "sample_mask": torch.ones(1)}
 
     weights = _dynamic_weights_fn(1.0, [1.0, 0.0])._compute_dynamic_weights(
-        data, {}, {}
+        data, {}, {}, cp_group=None
     )
     expected = torch.softmax(torch.tensor([1.0, 0.0]), dim=0)
     assert len(weights) == 2
@@ -2881,7 +2909,9 @@ def test_compute_dynamic_weights_softmax_over_teachers():
 
     # alpha multiplies the scores before softmax: a larger alpha sharpens onto
     # the top-scoring teacher.
-    sharp = _dynamic_weights_fn(8.0, [1.0, 0.0])._compute_dynamic_weights(data, {}, {})
+    sharp = _dynamic_weights_fn(8.0, [1.0, 0.0])._compute_dynamic_weights(
+        data, {}, {}, cp_group=None
+    )
     assert sharp[0].item() == pytest.approx(
         torch.softmax(torch.tensor([8.0, 0.0]), dim=0)[0].item()
     )

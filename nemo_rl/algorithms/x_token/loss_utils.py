@@ -614,10 +614,12 @@ class LocalizedAlignment:
     # mode aliases this to ``student_token_mask``.
     student_kd_token_mask: Optional[torch.Tensor] = None
     # Filled post-construction for the CSD (CSD) path:
-    # this CP rank's contiguous teacher input ids, per-chunk contiguous position
-    # spans ``[B, max_pairs, 2]`` derived from the unshifted chunk ids, and the
-    # per-sample chunk count ``[B]``. Left ``None`` for a same-tokenizer teacher.
+    # this CP rank's contiguous teacher input ids and token mask, per-chunk
+    # contiguous position spans ``[B, max_pairs, 2]`` derived from the unshifted
+    # chunk ids, and the per-sample chunk count ``[B]``. Left ``None`` for a
+    # same-tokenizer teacher.
     teacher_input_ids: Optional[torch.Tensor] = None
+    teacher_token_mask: Optional[torch.Tensor] = None
     student_spans: Optional[torch.Tensor] = None
     teacher_spans: Optional[torch.Tensor] = None
     num_chunks: Optional[torch.Tensor] = None
@@ -2894,12 +2896,17 @@ def prepare_csd_cross_tokenizer_loss_input(
         align.num_chunks = to_local_if_dtensor(align.pair_valid).shape[1] * torch.ones(
             align.pair_valid.shape[0], dtype=torch.long, device=align.pair_valid.device
         )
-        # Teacher input ids for this CP rank's contiguous teacher window (matches
-        # the teacher-logit / teacher_chunk_id slice).
+        # Teacher input ids and token mask for this CP rank's contiguous teacher
+        # window (matches the teacher-logit / teacher_chunk_id slice).
         teacher_ids_full = to_local_if_dtensor(data[f"teacher_{i}_input_ids"])
         align.teacher_input_ids = teacher_ids_full[
             :, teacher_seq_start : teacher_seq_start + teacher_seq_len
         ]
+        teacher_mask_full = data.get(f"teacher_{i}_token_mask")
+        if teacher_mask_full is not None:
+            align.teacher_token_mask = to_local_if_dtensor(teacher_mask_full)[
+                :, teacher_seq_start : teacher_seq_start + teacher_seq_len
+            ]
         # Preserve the established next-token-shifted localized fields for
         # metrics and compatibility while CSD consumes the unshifted spans.
         if cp_sharder is not None:
