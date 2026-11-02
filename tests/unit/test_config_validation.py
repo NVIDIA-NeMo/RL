@@ -47,6 +47,9 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig as XTokenOffPolicyDistillationMasterConfig,
 )
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
+from nemo_rl.models.megatron.zero_train_gen_mismatch import (
+    validate_batch_invariant_mode,
+)
 from nemo_rl.utils.config import (
     load_config_with_inheritance,
     register_omegaconf_resolvers,
@@ -435,7 +438,7 @@ def _check_automodel_moe_dispatcher(config_file: str, config: DictConfig) -> Non
 
 
 @pytest.mark.parametrize("config_file", config_files)
-def test_nccl_reshard_recipes_pass_refit_support_check(config_file: str) -> None:
+def test_check_nccl_reshard_refit_support_on_all_configs(config_file: str) -> None:
     config_dict = OmegaConf.to_container(
         load_config_with_inheritance(config_file), resolve=True
     )
@@ -443,6 +446,19 @@ def test_nccl_reshard_recipes_pass_refit_support_check(config_file: str) -> None
     if generation.get("refit_transport") != "nccl_reshard":
         pytest.skip("Not an nccl_reshard recipe")
     check_nccl_reshard_refit_support(SimpleNamespace(policy=config_dict["policy"]))
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_validate_batch_invariant_mode_on_all_configs(config_file: str) -> None:
+    config_dict = OmegaConf.to_container(
+        load_config_with_inheritance(config_file), resolve=True
+    )
+    policy = config_dict.get("policy") or {}
+    if not (policy.get("megatron_cfg") or {}).get("batch_invariant_mode"):
+        pytest.skip("batch_invariant_mode is not enabled")
+    validate_batch_invariant_mode(policy).raise_if_invalid(
+        "batch_invariant_mode=True failed validation:"
+    )
 
 
 def test_base_exemplars_pin_flash_attention_to_fa2():
