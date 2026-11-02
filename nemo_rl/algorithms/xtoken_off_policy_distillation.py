@@ -798,6 +798,20 @@ class CSDMasterConfig(MasterConfig):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _reject_zero_averaged_teacher_weights(self) -> "CSDMasterConfig":
+        # averaged_logits forms a convex combination of teacher logits
+        # (weight_i / sum(weights)); a zero weight-sum (all zeros, or a signed
+        # set cancelling to 0) makes that division undefined.
+        weights = [teacher.weight for teacher in self.teachers]
+        if self.loss_fn.kd_loss_mode == "averaged_logits" and sum(weights) == 0:
+            raise ValueError(
+                "teachers[*].weight must not sum to zero in "
+                "kd_loss_mode='averaged_logits' (they form a convex combination "
+                f"of teacher logits); got {weights}."
+            )
+        return self
+
 
 def _teacher_is_cross_tokenizer(config: MasterConfig, teacher: TeacherConfig) -> bool:
     """Select alignment using the artifacts belonging to the chosen algorithm."""

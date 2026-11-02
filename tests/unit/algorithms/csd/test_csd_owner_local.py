@@ -990,8 +990,10 @@ def test_owner_local_config_violations_cover_the_restrictions():
         "teacher_topk_ipc_keep_realized": (False, "keep_realized=false"),
     }
     for field, (value, message) in cases.items():
+        # model_construct skips config validation, which rejects the BCE cases
+        # on its own; this checks the owner-local rules.
         violations = owner_local_config_violations(
-            CSDLossConfig(**{**base, field: value})
+            CSDLossConfig.model_construct(**{**base, field: value})
         )
         assert len(violations) == 1 and message in violations[0], field
     # BCE on the binary realized-only partitions, keep_realized implied by

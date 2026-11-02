@@ -228,6 +228,38 @@ class CSDLossConfig(BaseModel, extra="allow"):
                     )
         return value
 
+    @model_validator(mode="after")
+    def _reject_unsupported_combinations(self) -> "CSDLossConfig":
+        # Dynamic teacher weighting (sum_weights_metric) and
+        # normalize_teacher_by_vocab are only applied in kd_loss_mode="sum";
+        # reject the combo instead of silently ignoring them under other modes.
+        if self.sum_weights_metric is not None and self.kd_loss_mode != "sum":
+            raise ValueError(
+                f"sum_weights_metric={self.sum_weights_metric!r} is only applied "
+                f"in kd_loss_mode='sum'; it is ignored by '{self.kd_loss_mode}'. "
+                "Unset one of them."
+            )
+        if self.normalize_teacher_by_vocab and self.kd_loss_mode != "sum":
+            raise ValueError(
+                "normalize_teacher_by_vocab is only applied in kd_loss_mode='sum'; "
+                f"it is ignored by '{self.kd_loss_mode}'. Unset one of them."
+            )
+        # BCE compares a realized chain with its rest bucket, so it needs a
+        # binary (realized-vs-rest) support.
+        if self.csd_loss_fn == "bce" and not self.csd_pure_alm:
+            raise ValueError(
+                "csd_loss_fn='bce' needs csd_pure_alm=true: common chunks "
+                "otherwise carry a multi-token support."
+            )
+        if (self.csd_last_pos_loss_fn or self.csd_loss_fn) == "bce" and not (
+            self.csd_pure_alm or self.csd_realized_only_mismatch
+        ):
+            raise ValueError(
+                "csd_last_pos_loss_fn='bce' needs csd_pure_alm=true or "
+                "csd_realized_only_mismatch=true."
+            )
+        return self
+
 
 def owner_local_config_violations(cfg: CSDLossConfig) -> list[str]:
     """CSD loss settings that owner-local evaluation does not support.
@@ -362,35 +394,6 @@ class CSDLossFn(LossFunction):
         cfg = (
             cfg if isinstance(cfg, CSDLossConfig) else CSDLossConfig.model_validate(cfg)
         )
-        # Dynamic teacher weighting (sum_weights_metric) and normalize_teacher_by_vocab
-        # are only applied in kd_loss_mode="sum"; reject the combo instead of
-        # silently ignoring them under the other modes.
-        if cfg.sum_weights_metric is not None and cfg.kd_loss_mode != "sum":
-            raise ValueError(
-                f"sum_weights_metric={cfg.sum_weights_metric!r} is only applied "
-                f"in kd_loss_mode='sum'; it is ignored by '{cfg.kd_loss_mode}'. "
-                "Unset one of them."
-            )
-        if cfg.normalize_teacher_by_vocab and cfg.kd_loss_mode != "sum":
-            raise ValueError(
-                "normalize_teacher_by_vocab is only applied in kd_loss_mode='sum'; "
-                f"it is ignored by '{cfg.kd_loss_mode}'. Unset one of them."
-            )
-        # averaged_logits forms a convex combination of teacher logits
-        # (weight_i / sum(weights)); a zero weight-sum (all zeros, or a signed
-        # set cancelling to 0) makes that division undefined. Reject it here
-        # rather than fail with a deep ZeroDivisionError mid-step.
-        _weights = cfg.teacher_weights
-        if (
-            cfg.kd_loss_mode == "averaged_logits"
-            and _weights is not None
-            and sum(_weights) == 0
-        ):
-            raise ValueError(
-                "teacher_weights must not sum to zero in "
-                "kd_loss_mode='averaged_logits' (they form a convex combination "
-                f"of teacher logits); got teacher_weights={list(_weights)}."
-            )
         if cfg.student_vocab_size is None:
             raise ValueError("CSD requires the runtime student_vocab_size")
         if cfg.owner_local:

@@ -29,6 +29,7 @@ from __future__ import annotations
 import math
 import os
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -36,6 +37,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from omegaconf import OmegaConf
 from pydantic import ValidationError
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -66,6 +68,10 @@ from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.config import (
+    load_config_with_inheritance,
+    register_omegaconf_resolvers,
+)
 from nemo_rl.utils.logger import LoggerConfig
 
 
@@ -2506,17 +2512,22 @@ def test_sum_weights_metric_rejected_outside_sum_mode(mode):
 
 @pytest.mark.parametrize("weights", [[0.0, 0.0], [1.0, -1.0]])
 def test_averaged_logits_rejects_zero_weight_sum(weights):
-    # averaged_logits divides by sum(teacher_weights) to form a convex average,
-    # so a zero weight-sum (all zeros, or a signed set cancelling to 0) is
-    # rejected at construction with a clear message instead of failing with a
-    # deep ZeroDivisionError mid-step.
+    # averaged_logits divides by the sum of the teacher weights to form a
+    # convex average, so a zero weight-sum (all zeros, or a signed set
+    # cancelling to 0) is rejected when the config loads, before any cluster
+    # starts.
+    register_omegaconf_resolvers()
+    config = OmegaConf.to_container(
+        load_config_with_inheritance(
+            str(Path(__file__).resolve().parents[4] / "examples/configs/csd.yaml")
+        ),
+        resolve=True,
+    )
+    teacher = config["teachers"][0]
+    config["teachers"] = [{**deepcopy(teacher), "weight": w} for w in weights]
+    config["loss_fn"]["kd_loss_mode"] = "averaged_logits"
     with pytest.raises(ValueError, match="must not sum to zero"):
-        CSDLossFn(
-            {
-                "kd_loss_mode": "averaged_logits",
-                "teacher_weights": weights,
-            }
-        )
+        CSDMasterConfig(**config)
 
 
 # ---------------------------------------------------------------------------

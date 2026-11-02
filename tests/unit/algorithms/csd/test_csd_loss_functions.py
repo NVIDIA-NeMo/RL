@@ -20,7 +20,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from nemo_rl.algorithms.loss import prepare_loss_input
-from nemo_rl.algorithms.loss.csd import CSDLossFn
+from nemo_rl.algorithms.loss.csd import CSDLossConfig, CSDLossFn
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
     same_tokenizer_topk_kl,
@@ -94,6 +94,52 @@ def test_normalize_teacher_by_vocab_rejected_outside_sum_mode(tmp_path):
     cfg["normalize_teacher_by_vocab"] = True
     with pytest.raises(ValueError, match="normalize_teacher_by_vocab"):
         CSDLossFn(cfg)
+
+
+@pytest.mark.parametrize(
+    "settings,message",
+    [
+        (
+            {"kd_loss_mode": "averaged_logits", "sum_weights_metric": "ce"},
+            "sum_weights_metric='ce' is only applied in kd_loss_mode='sum'",
+        ),
+        (
+            {"kd_loss_mode": "select_teacher", "normalize_teacher_by_vocab": True},
+            "normalize_teacher_by_vocab is only applied in kd_loss_mode='sum'",
+        ),
+        ({"csd_loss_fn": "bce"}, "csd_loss_fn='bce' needs csd_pure_alm=true"),
+        (
+            {"csd_loss_fn": "bce", "csd_realized_only_mismatch": True},
+            "csd_loss_fn='bce' needs csd_pure_alm=true",
+        ),
+        (
+            {"csd_last_pos_loss_fn": "bce"},
+            "csd_last_pos_loss_fn='bce' needs csd_pure_alm=true or "
+            "csd_realized_only_mismatch=true",
+        ),
+    ],
+)
+def test_unsupported_loss_settings_are_rejected_when_the_config_loads(
+    settings, message
+):
+    """Combinations the loss cannot run fail at config load, before any cluster."""
+    with pytest.raises(ValueError, match=message):
+        CSDLossConfig(**settings)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"csd_loss_fn": "bce", "csd_pure_alm": True},
+        {"csd_last_pos_loss_fn": "bce", "csd_pure_alm": True},
+        {"csd_last_pos_loss_fn": "bce", "csd_realized_only_mismatch": True},
+        {"kd_loss_mode": "sum", "sum_weights_metric": "entropy"},
+        {"kd_loss_mode": "sum", "normalize_teacher_by_vocab": True},
+    ],
+)
+def test_supported_loss_settings_pass_config_validation(settings):
+    """BCE on a binary support and sum-mode teacher weighting are accepted."""
+    CSDLossConfig(**settings)
 
 
 def test_csd_ce_uniform_logits_equals_log_vocab(tmp_path):
