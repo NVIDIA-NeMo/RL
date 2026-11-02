@@ -51,6 +51,8 @@ from nemo_rl.distributed.model_utils import (
 )
 
 CSD_STUDENT_LOSS_CHUNK_SIZE = 256
+# Token lookups into sparse teacher rows per pass; bounds memory only.
+CSD_SPARSE_LOOKUP_ROW_CHUNK_SIZE = 2048
 
 # Process-wide caches for the sub-token tables and everything built from them.
 # Ray sends a fresh copy of the loss to every worker with every Policy.train
@@ -68,8 +70,8 @@ _CSD_COMMON_INDICES_CACHE: dict[
 _CSD_TEACHER_TO_COMMON_STUDENT_CACHE: dict[
     tuple[str, str, int, torch.device], torch.Tensor
 ] = {}
-# (forward table path, reverse table path, pre-deduplicated) -> prefix index.
-_CSD_PREFIX_INDEX_CACHE: dict[tuple[str, str, bool], dict[str, Any]] = {}
+# (forward table path, reverse table path) -> prefix index.
+_CSD_PREFIX_INDEX_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _generalized_jsd(
@@ -199,9 +201,10 @@ class CSDLossConfig(BaseModel, extra="allow"):
     # it), for dense and sparse transport alike; sparse transport keeps at
     # most k-1 other alternatives.
     teacher_topk_ipc_keep_realized: bool = True
-    # Owner-local evaluation (eligible Megatron students): selected student or
-    # teacher rows per tile, and alignment chunks evaluated per batch. Both
-    # bound memory only; they do not change the loss.
+    # Memory tiles; neither changes the loss. Selected student or teacher rows
+    # per tile under owner-local evaluation (eligible Megatron students), and
+    # alignment chunks evaluated per batch: every chunk under owner-local
+    # evaluation, the common (1-to-1) chunks under replicated evaluation.
     csd_selected_row_chunk_size: Annotated[int, Field(gt=0)] = 128
     csd_support_chunk_batch_size: Annotated[int, Field(gt=0)] = 16
 
@@ -468,11 +471,6 @@ class CSDLossFn(LossFunction):
             or len(self.teacher_to_student_table_paths) != self.num_teachers
         ):
             raise ValueError("CSD table paths must contain one entry per teacher")
-        # Optional per-microbatch loss dump for parity comparison
-        # (NRL_CSD_LOSS_DUMP_DIR). Raw floats from the loss-compute site.
-        self._loss_dump_dir = os.environ.get("NRL_CSD_LOSS_DUMP_DIR")
-        self._loss_dump_records: list[dict[str, Any]] = []
-        self._loss_dump_call_idx = 0
         # Keep the validated loss settings alongside per-teacher metadata.
         self.cfg = cfg
         # The sub-token tables and the maps and index built from them live in
@@ -1299,18 +1297,13 @@ class CSDLossFn(LossFunction):
             per_token_ce = -get_next_token_logprobs_from_logits(
                 input_ids=data["input_ids"],
                 next_token_logits=logits,
-                seq_index=data.get("seq_index"),
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=tp_group,
                 context_parallel_group=cp_group,
                 chunk_size=CSD_STUDENT_LOSS_CHUNK_SIZE,
             )
         else:
-            per_token_ce = student_next_token_ce(
-                logits,
-                input_ids=data["input_ids"],
-                seq_index=data.get("seq_index"),
-            )
+            per_token_ce = student_next_token_ce(logits, input_ids=data["input_ids"])
         label_mask = ce_label_mask(
             token_mask=data["token_mask"],
             sample_mask=data["sample_mask"],
@@ -1420,8 +1413,7 @@ class CSDLossFn(LossFunction):
         )
 
         k_top = topk_indices.shape[-1]
-        row_chunk = int(os.environ.get("NRL_CSD_SPARSE_LOOKUP_ROWS", "2048"))
-        row_chunk = max(row_chunk, 1)
+        row_chunk = CSD_SPARSE_LOOKUP_ROW_CHUNK_SIZE
         for start in range(0, token_flat.numel(), row_chunk):
             end = min(start + row_chunk, token_flat.numel())
             rows_idx = topk_indices[b_flat[start:end], pos_flat[start:end]]
@@ -1452,51 +1444,6 @@ class CSDLossFn(LossFunction):
             logp = logp.squeeze(-1)
             found = found.squeeze(-1)
         return logp, found
-
-    def _maybe_dump_loss(self, metrics: dict[str, Any]) -> None:
-        """Append per-call raw loss values to a per-rank dump file.
-
-        Activated by ``NRL_CSD_LOSS_DUMP_DIR``. One file per rank,
-        rewritten on each call with the full record list. Records are raw
-        ``loss.item()`` values from the loss-compute site — not scaled,
-        aggregated, or DP-summed — for loss parity comparisons.
-        """
-        loss_dump_dir = self._loss_dump_dir
-        if not loss_dump_dir:
-            return
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        # The P-KL path emits kl_loss/ce_loss/kl_loss_scale/num_valid_pairs;
-        # the gold-loss path emits kl_common/l1_uncommon/num_valid_chunks;
-        # the CSD path emits ce_loss_per_token/kl_loss_per_token plus the
-        # per-chunk diagnostics. Record everything that's present so the
-        # same dump file format serves all — downstream comparison scripts
-        # read by key.
-        record: dict[str, Any] = {
-            "call_idx": self._loss_dump_call_idx,
-            "loss": metrics["loss"],
-        }
-        for k in (
-            "kl_loss",
-            "ce_loss",
-            "kl_loss_per_chunk",
-            "ce_loss_per_token",
-            "kl_loss_scale",
-            "num_valid_pairs",
-            "kl_common",
-            "kl_common_per_chunk",
-            "kl_partition_last_per_chunk",
-            "l1_uncommon",
-            "num_valid_chunks",
-        ):
-            if k in metrics:
-                record[k] = metrics[k]
-        self._loss_dump_records.append(record)
-        self._loss_dump_call_idx += 1
-        os.makedirs(loss_dump_dir, exist_ok=True)
-        torch.save(
-            self._loss_dump_records,
-            os.path.join(loss_dump_dir, f"rank{rank}.pt"),
-        )
 
     # ------------------------------------------------------------------ #
     # Loss-mode implementations
@@ -1638,16 +1585,13 @@ class CSDLossFn(LossFunction):
 
         The cache maps ``(length, prefix_tuple) -> tuple[(s_id, t_id), ...]``
         for both the forward (``student_to_teacher_table_paths[i]``) and reverse
-        (``teacher_to_student_table_paths[i]``) pseudo-target tables. Built once
+        (``teacher_to_student_table_paths[i]``) pseudo-target tables, with each
+        key's pairs already unique (deduplicated by their second id). Built once
         per process per table pair; the table loaders raise if a path is missing.
         """
-        # Pre-dedupe. The same env override
-        # gate is preserved so A/B verification stays available.
-        _prededuped = os.environ.get("NRL_CSD_PREDEDUP_PREFIX_INDEX", "1") == "1"
         cache_key = (
             str(self.student_to_teacher_table_paths[i]),
             str(self.teacher_to_student_table_paths[i]),
-            _prededuped,
         )
         cached = _CSD_PREFIX_INDEX_CACHE.get(cache_key)
         if cached is not None:
@@ -1698,22 +1642,10 @@ class CSDLossFn(LossFunction):
                 out.append(p)
             return tuple(out)
 
-        if _prededuped:
-            cache: dict[str, Any] = {
-                "forward": {
-                    key: _dedup_by_second(value) for key, value in forward.items()
-                },
-                "reverse": {
-                    key: _dedup_by_second(value) for key, value in reverse.items()
-                },
-                "_prededuped": True,
-            }
-        else:
-            cache = {
-                "forward": {key: tuple(value) for key, value in forward.items()},
-                "reverse": {key: tuple(value) for key, value in reverse.items()},
-                "_prededuped": False,
-            }
+        cache: dict[str, Any] = {
+            "forward": {key: _dedup_by_second(value) for key, value in forward.items()},
+            "reverse": {key: _dedup_by_second(value) for key, value in reverse.items()},
+        }
         # Cache the table sizes used by the chunk-classification skip rules.
         cache["max_chain_t"] = int(subtoks_t_cpu.size(1))
         cache["max_chain_s"] = int(subtoks_s_cpu.size(1))
@@ -2160,10 +2092,6 @@ class CSDLossFn(LossFunction):
         # sum, while target - input stays finite (no 0*nan).
         NEG_INF = -1.0e30
 
-        # The NumPy fast path is enabled by default. The Python-list branch
-        # can be selected for parity verification through the environment.
-        _use_np = os.environ.get("NRL_CSD_BATCHED_HELPER_NUMPY", "1") == "1"
-
         b_idx_list = [r[0] for r in chunk_records]
         s_last_list = [r[1] for r in chunk_records]
         t_last_list = [r[2] for r in chunk_records]
@@ -2180,177 +2108,87 @@ class CSDLossFn(LossFunction):
         t_label_id = None
         t_pmask = None
 
-        if _use_np:
-            s_ids_np = np.zeros((K, Smax), dtype=np.int64)
-            t_ids_np = np.zeros((K, Smax), dtype=np.int64)
-            smask_np = np.zeros((K, Smax), dtype=np_accum_dtype)
-            if Pmax_s > 0:
-                s_pred_pos_np = np.zeros((K, Pmax_s), dtype=np.int64)
-                s_label_id_np = np.zeros((K, Pmax_s), dtype=np.int64)
-                s_pmask_np = np.zeros((K, Pmax_s), dtype=np_accum_dtype)
-            if Pmax_t > 0:
-                t_pred_pos_np = np.zeros((K, Pmax_t), dtype=np.int64)
-                t_label_id_np = np.zeros((K, Pmax_t), dtype=np.int64)
-                t_pmask_np = np.zeros((K, Pmax_t), dtype=np_accum_dtype)
-            for i, r in enumerate(chunk_records):
-                s_pp, s_lid = r[3], r[4]
-                t_pp, t_lid = r[5], r[6]
-                s_list, t_list = r[7], r[8]
-                ns_p = len(s_pp)
-                if ns_p > 0:
-                    s_pred_pos_np[i, :ns_p] = s_pp
-                    s_label_id_np[i, :ns_p] = s_lid
-                    s_pmask_np[i, :ns_p] = 1.0
-                nt_p = len(t_pp)
-                if nt_p > 0:
-                    t_pred_pos_np[i, :nt_p] = t_pp
-                    t_label_id_np[i, :nt_p] = t_lid
-                    t_pmask_np[i, :nt_p] = 1.0
-                n_sup = len(s_list)
-                if n_sup > 0:
-                    s_ids_np[i, :n_sup] = s_list
-                    t_ids_np[i, :n_sup] = t_list
-                    smask_np[i, :n_sup] = 1.0
+        s_ids_np = np.zeros((K, Smax), dtype=np.int64)
+        t_ids_np = np.zeros((K, Smax), dtype=np.int64)
+        smask_np = np.zeros((K, Smax), dtype=np_accum_dtype)
+        if Pmax_s > 0:
+            s_pred_pos_np = np.zeros((K, Pmax_s), dtype=np.int64)
+            s_label_id_np = np.zeros((K, Pmax_s), dtype=np.int64)
+            s_pmask_np = np.zeros((K, Pmax_s), dtype=np_accum_dtype)
+        if Pmax_t > 0:
+            t_pred_pos_np = np.zeros((K, Pmax_t), dtype=np.int64)
+            t_label_id_np = np.zeros((K, Pmax_t), dtype=np.int64)
+            t_pmask_np = np.zeros((K, Pmax_t), dtype=np_accum_dtype)
+        for i, r in enumerate(chunk_records):
+            s_pp, s_lid = r[3], r[4]
+            t_pp, t_lid = r[5], r[6]
+            s_list, t_list = r[7], r[8]
+            ns_p = len(s_pp)
+            if ns_p > 0:
+                s_pred_pos_np[i, :ns_p] = s_pp
+                s_label_id_np[i, :ns_p] = s_lid
+                s_pmask_np[i, :ns_p] = 1.0
+            nt_p = len(t_pp)
+            if nt_p > 0:
+                t_pred_pos_np[i, :nt_p] = t_pp
+                t_label_id_np[i, :nt_p] = t_lid
+                t_pmask_np[i, :nt_p] = 1.0
+            n_sup = len(s_list)
+            if n_sup > 0:
+                s_ids_np[i, :n_sup] = s_list
+                t_ids_np[i, :n_sup] = t_list
+                smask_np[i, :n_sup] = 1.0
 
-            b_idx = torch.from_numpy(np.asarray(b_idx_list, dtype=np.int64)).to(
-                device, non_blocking=True
+        b_idx = torch.from_numpy(np.asarray(b_idx_list, dtype=np.int64)).to(
+            device, non_blocking=True
+        )
+        s_last = torch.from_numpy(np.asarray(s_last_list, dtype=np.int64)).to(
+            device, non_blocking=True
+        )
+        t_last = torch.from_numpy(np.asarray(t_last_list, dtype=np.int64)).to(
+            device, non_blocking=True
+        )
+        s_realized_last = torch.from_numpy(
+            np.asarray(s_realized_list, dtype=np.int64)
+        ).to(device, non_blocking=True)
+        t_realized_last = torch.from_numpy(
+            np.asarray(t_realized_list, dtype=np.int64)
+        ).to(device, non_blocking=True)
+        s_ids = torch.from_numpy(s_ids_np).to(device, non_blocking=True)
+        t_ids = torch.from_numpy(t_ids_np).to(device, non_blocking=True)
+        support_mask = torch.from_numpy(smask_np).to(
+            device,
+            dtype=accum_dtype,
+            non_blocking=True,
+        )
+        if Pmax_s > 0:
+            s_pred_pos = torch.from_numpy(s_pred_pos_np).to(
+                device,
+                non_blocking=True,
             )
-            s_last = torch.from_numpy(np.asarray(s_last_list, dtype=np.int64)).to(
-                device, non_blocking=True
+            s_label_id = torch.from_numpy(s_label_id_np).to(
+                device,
+                non_blocking=True,
             )
-            t_last = torch.from_numpy(np.asarray(t_last_list, dtype=np.int64)).to(
-                device, non_blocking=True
-            )
-            s_realized_last = torch.from_numpy(
-                np.asarray(s_realized_list, dtype=np.int64)
-            ).to(device, non_blocking=True)
-            t_realized_last = torch.from_numpy(
-                np.asarray(t_realized_list, dtype=np.int64)
-            ).to(device, non_blocking=True)
-            s_ids = torch.from_numpy(s_ids_np).to(device, non_blocking=True)
-            t_ids = torch.from_numpy(t_ids_np).to(device, non_blocking=True)
-            support_mask = torch.from_numpy(smask_np).to(
+            s_pmask = torch.from_numpy(s_pmask_np).to(
                 device,
                 dtype=accum_dtype,
                 non_blocking=True,
             )
-            if Pmax_s > 0:
-                s_pred_pos = torch.from_numpy(s_pred_pos_np).to(
-                    device,
-                    non_blocking=True,
-                )
-                s_label_id = torch.from_numpy(s_label_id_np).to(
-                    device,
-                    non_blocking=True,
-                )
-                s_pmask = torch.from_numpy(s_pmask_np).to(
-                    device,
-                    dtype=accum_dtype,
-                    non_blocking=True,
-                )
-            if Pmax_t > 0:
-                t_pred_pos = torch.from_numpy(t_pred_pos_np).to(
-                    device,
-                    non_blocking=True,
-                )
-                t_label_id = torch.from_numpy(t_label_id_np).to(
-                    device,
-                    non_blocking=True,
-                )
-                t_pmask = torch.from_numpy(t_pmask_np).to(
-                    device,
-                    dtype=accum_dtype,
-                    non_blocking=True,
-                )
-        else:
-            s_pred_pos_buf = [[0] * Pmax_s for _ in range(K)]
-            s_label_id_buf = [[0] * Pmax_s for _ in range(K)]
-            s_pmask_buf = [[0.0] * Pmax_s for _ in range(K)]
-            t_pred_pos_buf = [[0] * Pmax_t for _ in range(K)]
-            t_label_id_buf = [[0] * Pmax_t for _ in range(K)]
-            t_pmask_buf = [[0.0] * Pmax_t for _ in range(K)]
-            s_ids_buf = [[0] * Smax for _ in range(K)]
-            t_ids_buf = [[0] * Smax for _ in range(K)]
-            smask_buf = [[0.0] * Smax for _ in range(K)]
-
-            for i, r in enumerate(chunk_records):
-                s_pp, s_lid = r[3], r[4]
-                t_pp, t_lid = r[5], r[6]
-                s_list, t_list = r[7], r[8]
-                for j, (p, lid) in enumerate(zip(s_pp, s_lid)):
-                    s_pred_pos_buf[i][j] = p
-                    s_label_id_buf[i][j] = lid
-                    s_pmask_buf[i][j] = 1.0
-                for j, (p, lid) in enumerate(zip(t_pp, t_lid)):
-                    t_pred_pos_buf[i][j] = p
-                    t_label_id_buf[i][j] = lid
-                    t_pmask_buf[i][j] = 1.0
-                n_sup = len(s_list)
-                for j in range(n_sup):
-                    s_ids_buf[i][j] = s_list[j]
-                    t_ids_buf[i][j] = t_list[j]
-                    smask_buf[i][j] = 1.0
-
-            b_idx = torch.tensor(b_idx_list, device=device, dtype=torch.long)
-            s_last = torch.tensor(
-                s_last_list,
-                device=device,
-                dtype=torch.long,
+        if Pmax_t > 0:
+            t_pred_pos = torch.from_numpy(t_pred_pos_np).to(
+                device,
+                non_blocking=True,
             )
-            t_last = torch.tensor(
-                t_last_list,
-                device=device,
-                dtype=torch.long,
+            t_label_id = torch.from_numpy(t_label_id_np).to(
+                device,
+                non_blocking=True,
             )
-            s_realized_last = torch.tensor(
-                s_realized_list,
-                device=device,
-                dtype=torch.long,
-            )
-            t_realized_last = torch.tensor(
-                t_realized_list,
-                device=device,
-                dtype=torch.long,
-            )
-            s_ids = torch.tensor(s_ids_buf, device=device, dtype=torch.long)
-            t_ids = torch.tensor(t_ids_buf, device=device, dtype=torch.long)
-            support_mask = torch.tensor(
-                smask_buf,
-                device=device,
+            t_pmask = torch.from_numpy(t_pmask_np).to(
+                device,
                 dtype=accum_dtype,
+                non_blocking=True,
             )
-            if Pmax_s > 0:
-                s_pred_pos = torch.tensor(
-                    s_pred_pos_buf,
-                    device=device,
-                    dtype=torch.long,
-                )
-                s_label_id = torch.tensor(
-                    s_label_id_buf,
-                    device=device,
-                    dtype=torch.long,
-                )
-                s_pmask = torch.tensor(
-                    s_pmask_buf,
-                    device=device,
-                    dtype=accum_dtype,
-                )
-            if Pmax_t > 0:
-                t_pred_pos = torch.tensor(
-                    t_pred_pos_buf,
-                    device=device,
-                    dtype=torch.long,
-                )
-                t_label_id = torch.tensor(
-                    t_label_id_buf,
-                    device=device,
-                    dtype=torch.long,
-                )
-                t_pmask = torch.tensor(
-                    t_pmask_buf,
-                    device=device,
-                    dtype=accum_dtype,
-                )
 
         # ---- Student prefix chain (batched gather) ----
         if Pmax_s > 0:
@@ -2618,13 +2456,6 @@ class CSDLossFn(LossFunction):
         # B is the per-sample loop bound; S is the global student-side
         # predictor-position bound used in the classify-loop range check.
         B, student_local_seq_len, _ = student_logits.shape
-        student_tp_size = (
-            torch.distributed.get_world_size(tp_group)
-            if tp_group is not None
-            and torch.distributed.is_initialized()
-            and torch.distributed.get_world_size(tp_group) > 1
-            else 1
-        )
         student_cp_size = (
             torch.distributed.get_world_size(cp_group)
             if cp_group is not None
@@ -3075,15 +2906,9 @@ class CSDLossFn(LossFunction):
                 dtype=torch.long,
             )
 
-            _env_common_mb = os.environ.get("NRL_CSD_COMMON_LOOP_MB")
-            common_mb = int(_env_common_mb) if _env_common_mb else len(common_chunks)
-            if student_tp_size > 1 or student_cp_size > 1:
-                # Student owner lookups issue TP/CP collectives. Fix the row
-                # bound in code so environment drift cannot change collective
-                # counts or order across ranks, regardless of teacher transport.
-                common_mb = min(len(common_chunks), 64)
-            elif teacher_sparse_payload is not None and not _env_common_mb:
-                common_mb = min(common_mb, 64)
+            # A config value, so every TP/CP rank walks the same tiles and
+            # issues the same student-lookup collectives.
+            common_mb = int(cfg.csd_support_chunk_batch_size)
             teacher_to_common_student = None
             if teacher_sparse_payload is not None and not pure_alm:
                 teacher_to_common_student = self._get_csd_teacher_to_common_student(
@@ -3372,12 +3197,10 @@ class CSDLossFn(LossFunction):
         prefix_index = None
         if mismatch_chunks:
             if pure_alm or realized_only_mismatch:
-                _prefix_index_prededuped = False
                 max_chain_t = 0
                 max_chain_s = 0
             else:
                 prefix_index = self._ensure_bidir_prefix_support_index(i)
-                _prefix_index_prededuped = bool(prefix_index.get("_prededuped", False))
                 max_chain_t = int(prefix_index.get("max_chain_t", 0))
                 max_chain_s = int(prefix_index.get("max_chain_s", 0))
 
@@ -3443,7 +3266,7 @@ class CSDLossFn(LossFunction):
                     s_list, t_list = self._unique_bidir_pairs_cpu(
                         pairs,
                         swap=False,
-                        assume_unique=_prefix_index_prededuped,
+                        assume_unique=True,
                     )
                     if teacher_topk_keep_realized and (
                         s_realized_id,
@@ -3495,7 +3318,7 @@ class CSDLossFn(LossFunction):
                     s_list, t_list = self._unique_bidir_pairs_cpu(
                         pairs,
                         swap=True,
-                        assume_unique=_prefix_index_prededuped,
+                        assume_unique=True,
                     )
                     if teacher_topk_keep_realized and (
                         s_realized_id,
@@ -3996,7 +3819,7 @@ class CSDLossFn(LossFunction):
         s_list, t_list = self._unique_bidir_pairs_cpu(
             pairs,
             swap=swap,
-            assume_unique=bool(prefix_index.get("_prededuped", False)),
+            assume_unique=True,
         )
         if keep_realized and (realized_s, realized_t) not in set(zip(s_list, t_list)):
             s_list.append(realized_s)
