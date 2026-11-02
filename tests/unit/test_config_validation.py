@@ -17,6 +17,7 @@ import glob
 import os
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Type
 
 import pytest
@@ -51,6 +52,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
+from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
 # All tests in this module should run first
 pytestmark = pytest.mark.run_first
@@ -432,6 +434,17 @@ def _check_automodel_moe_dispatcher(config_file: str, config: DictConfig) -> Non
         assert dynamic_batching.sequence_length_round % alignment == 0, (
             f"{config_file}: dynamic_batching.sequence_length_round must be a multiple of {alignment}"
         )
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_nccl_reshard_recipes_pass_refit_support_check(config_file: str) -> None:
+    config_dict = OmegaConf.to_container(
+        load_config_with_inheritance(config_file), resolve=True
+    )
+    generation = (config_dict.get("policy") or {}).get("generation") or {}
+    if generation.get("refit_transport") != "nccl_reshard":
+        pytest.skip("Not an nccl_reshard recipe")
+    check_nccl_reshard_refit_support(SimpleNamespace(policy=config_dict["policy"]))
 
 
 def test_base_exemplars_pin_flash_attention_to_fa2():
