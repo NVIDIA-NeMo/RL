@@ -66,6 +66,7 @@ from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     _GENERATION_CUT_ROUTE,
+    _PENDING_ENGINE_REQUEST_CAPTURE,
     VllmAsyncGenerationWorkerImpl,
     _classify_restored_prefix_terminal,
     _count_restored_prefix_as_completion,
@@ -534,84 +535,152 @@ def test_restored_call_replays_its_prefix_with_the_original_settings(monkeypatch
     ]
 
 
-def test_cumulative_outputs_are_observed_once_per_token():
-    """vLLM's cumulative outputs share its live lists; each token is taken once."""
-    worker = _worker_with_capture(_MemorySink())
+def _captured_text_call(
+    worker, model_call_id: str = "c1", prompt_token_ids: tuple[int, ...] = (10, 11)
+) -> _FakeRequest:
+    """Begin capturing a parentless text call of rollout ``r0``."""
     request = _FakeRequest(
-        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"},
+        ng_capture={"rollout_id": "r0", "model_call_id": model_call_id, "mode": "text"},
         stream=False,
     )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
-    token_ids = [12]
-    logprobs = [{12: SimpleNamespace(logprob=-0.1)}]
-    first = SimpleNamespace(
-        outputs=[SimpleNamespace(token_ids=token_ids, logprobs=logprobs)]
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker, request, list(prompt_token_ids)
     )
+    return request
 
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(worker, request, first)
-    # vLLM appends to the same lists; a late read of the old output sees them.
-    token_ids += [13, 14]
-    logprobs += [
-        {13: SimpleNamespace(logprob=-0.2)},
-        {14: SimpleNamespace(logprob=-0.3)},
-    ]
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(worker, request, first)
+
+def test_finished_output_records_only_tokens_past_the_last_cut():
+    worker = _worker_with_capture(_MemorySink())
+    request = _captured_text_call(worker)
+    state = worker._capture_calls[id(request)]
+    with state.lock:
+        state.observe([12], [-0.1], start=0)  # read earlier by a cut
     final = SimpleNamespace(
         outputs=[
             SimpleNamespace(
-                token_ids=token_ids, logprobs=logprobs, finish_reason="stop"
+                token_ids=[12, 13, 14],
+                logprobs=[
+                    {12: SimpleNamespace(logprob=-9.0)},
+                    {13: SimpleNamespace(logprob=-0.2)},
+                    {14: SimpleNamespace(logprob=-0.3)},
+                ],
+                finish_reason="stop",
             )
         ]
     )
+
     VllmAsyncGenerationWorkerImpl._observe_request_capture(worker, request, final)
 
-    state = worker._capture_calls[id(request)]
     assert state.observation_error is None
     assert state.generated_token_ids == [12, 13, 14]
     assert state.generated_logprobs == [-0.1, -0.2, -0.3]
     assert state.terminal_finish_reason == "stop"
 
 
-def test_token_read_before_its_logprob_is_observed_with_the_next_output():
-    """vLLM's engine loop appends while the HTTP thread reads; a lagging logprob waits."""
+def test_tokens_read_by_both_a_cut_and_the_finished_output_are_recorded_once():
+    state = _RequestCaptureState(call=None, prompt_token_ids=[1])
+    state.observe([12, 13], [-0.1, -0.2], start=0)
+    state.observe([12, 13, 14], [-0.1, -0.2, -0.3], start=0)
+    state.observe([14], [-0.3], start=2)
+
+    assert state.generated_token_ids == [12, 13, 14]
+    assert state.generated_logprobs == [-0.1, -0.2, -0.3]
+    assert state.observation_error is None
+
+    state.observe([16], [-0.5], start=4)
+    assert "gap" in state.observation_error
+    assert state.generated_token_ids == [12, 13, 14]
+
+
+def _engine_request(token_ids: list[int], logprobs: list[float]) -> SimpleNamespace:
+    return SimpleNamespace(
+        detokenizer=SimpleNamespace(output_token_ids=list(token_ids)),
+        logprobs_processor=SimpleNamespace(
+            logprobs=[
+                {token_id: SimpleNamespace(logprob=logprob)}
+                for token_id, logprob in zip(token_ids, logprobs, strict=True)
+            ]
+        ),
+    )
+
+
+@pytest.fixture
+def engine_loop():
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    yield loop
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+    loop.close()
+
+
+def test_cut_reads_each_call_progress_from_vllm_request_state(engine_loop):
     worker = _worker_with_capture(_MemorySink())
-    request = _FakeRequest(
-        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"},
-        stream=False,
+    worker._engine_loop = engine_loop
+    decoding, resumed, finished, unsubmitted = (
+        worker._capture_calls[id(_captured_text_call(worker, call_id))]
+        for call_id in ("c1", "c2", "c3", "c4")
     )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
-    # Caught between the engine appending token 13 and appending its logprob.
-    token_ids = [12, 13]
-    logprobs = [{12: SimpleNamespace(logprob=-0.1)}]
-    output = SimpleNamespace(token_ids=token_ids, logprobs=logprobs)
-
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(
-        worker, request, SimpleNamespace(outputs=[output])
-    )
-
-    state = worker._capture_calls[id(request)]
-    assert state.observation_error is None
-    assert state.generated_token_ids == [12]
-
-    logprobs.append({13: SimpleNamespace(logprob=-0.2)})
-    output.finish_reason = "stop"
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(
-        worker, request, SimpleNamespace(outputs=[output])
+    decoding.engine_request_id = "chatcmpl-1"
+    resumed.engine_request_id = "chatcmpl-2"
+    finished.engine_request_id = "chatcmpl-3"
+    resumed.observe([30], [-0.3])  # recorded by an earlier cut
+    worker.llm = SimpleNamespace(
+        output_processor=SimpleNamespace(
+            external_req_ids={"chatcmpl-1": ["i1"], "chatcmpl-2": ["i2"]},
+            request_states={
+                "i1": _engine_request([20, 21], [-0.1, -0.2]),
+                # The earlier cut's position is not read again.
+                "i2": _engine_request([30, 31], [-9.0, -0.4]),
+            },
+        )
     )
 
-    assert state.observation_error is None
-    assert state.generated_token_ids == [12, 13]
-    assert state.generated_logprobs == [-0.1, -0.2]
-    assert state.terminal_finish_reason == "stop"
+    VllmAsyncGenerationWorkerImpl._record_generation_progress(
+        worker, [decoding, resumed, finished, unsubmitted], deadline=None
+    )
+
+    assert (decoding.generated_token_ids, decoding.generated_logprobs) == (
+        [20, 21],
+        [-0.1, -0.2],
+    )
+    assert (resumed.generated_token_ids, resumed.generated_logprobs) == (
+        [30, 31],
+        [-0.3, -0.4],
+    )
+    # Gone from vLLM, or never submitted: they keep what they recorded.
+    assert finished.generated_token_ids == unsubmitted.generated_token_ids == []
+    assert all(
+        state.observation_error is None
+        for state in (decoding, resumed, finished, unsubmitted)
+    )
+
+
+def test_cut_past_its_deadline_skips_reading_vllm_progress(engine_loop, caplog):
+    worker = _worker_with_capture(_MemorySink())
+    worker._engine_loop = engine_loop
+    state = worker._capture_calls[id(_captured_text_call(worker))]
+    state.engine_request_id = "chatcmpl-1"
+    worker.llm = SimpleNamespace(output_processor=MagicMock())
+    engine_busy = threading.Event()
+    engine_loop.call_soon_threadsafe(engine_busy.wait)
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            VllmAsyncGenerationWorkerImpl._record_generation_progress(
+                worker, [state], deadline=time.monotonic()
+            )
+    finally:
+        engine_busy.set()
+
+    assert state.generated_token_ids == []
+    assert "could not read vLLM's progress before its deadline" in caplog.text
 
 
 def test_terminal_token_without_a_logprob_makes_its_call_uncuttable():
     worker = _worker_with_capture(_MemorySink())
-    request = _FakeRequest(
-        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"},
-        stream=False,
-    )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    request = _captured_text_call(worker)
     # Nothing appends after the terminal step, so this logprob never arrives.
     final = SimpleNamespace(
         outputs=[
@@ -824,6 +893,25 @@ class _FakeRequest(SimpleNamespace):
     pass
 
 
+def _single_call_inventory(
+    model_call_id: str = "c1", *, checkpoint_id: str = "checkpoint-1"
+) -> GenerationCutInventory:
+    """Gym's inventory naming one active call of rollout ``r0``."""
+    return GenerationCutInventory.build(
+        checkpoint_id=checkpoint_id,
+        server_name="policy_model",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id="ticket-1",
+                rollout_id="r0",
+                attempt=0,
+                model_call_id=model_call_id,
+                admitted_at=1.0,
+            )
+        ],
+    )
+
+
 def _worker_with_capture(sink: _MemorySink):
     """A real worker, minus the engine, with in-memory token capture."""
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
@@ -918,17 +1006,7 @@ def test_request_capture_round_trip_stages_and_rides_coords(
 ) -> None:
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
-    request = _FakeRequest(
-        ng_capture={
-            "capture_key": "r0",
-            "model_call_id": "c1",
-            "parent_call_id": None,
-            "prev_len": 0,
-            "mode": "text",
-        },
-        stream=False,
-    )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+    request = _captured_text_call(worker, "c1", (10, 11, 12))
     content = _served_content([13, 14], [-0.1, -0.2])
     message = content["choices"][0]["message"]
     if with_message_tokens:
@@ -976,35 +1054,13 @@ def test_generation_cut_stages_prefix_then_terminal_row_replaces_it():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     worker._generation_prefix_cuts_enabled = True
-    request = _FakeRequest(
-        ng_capture={
-            "rollout_id": "r0",
-            "model_call_id": "c1",
-            "parent_call_id": None,
-            "prev_len": 0,
-            "mode": "text",
-        },
-        stream=False,
-    )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    request = _captured_text_call(worker)
     state = worker._capture_calls[id(request)]
     with state.lock:
         state.effective_output_limit = 8
         state.observe([20, 21], [-0.1, -0.2])
 
-    inventory = GenerationCutInventory.build(
-        checkpoint_id="checkpoint-1",
-        server_name="policy_model",
-        active_prefixes=[
-            GenerationCutPrefix(
-                ticket_id="ticket-1",
-                rollout_id="r0",
-                attempt=0,
-                model_call_id="c1",
-                admitted_at=1.0,
-            )
-        ],
-    )
+    inventory = _single_call_inventory()
     receipt = worker._checkpoint_generation_cut(inventory)
     replayed = worker._checkpoint_generation_cut(inventory)
 
@@ -1025,6 +1081,42 @@ def test_generation_cut_stages_prefix_then_terminal_row_replaces_it():
     assert sink.cleared_generation_prefix_keys == sink.generation_prefix_keys
     assert worker._capture_calls == {}
     assert worker._capture_calls_by_model_call_id == {}
+
+
+def test_generation_cut_stages_the_tokens_it_reads_from_vllm(engine_loop):
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    worker._generation_prefix_cuts_enabled = True
+    worker._engine_loop = engine_loop
+    request = _captured_text_call(worker)
+    state = worker._capture_calls[id(request)]
+    with state.lock:
+        state.effective_output_limit = 8
+    VllmAsyncGenerationWorkerImpl._bind_capture_engine_request(worker, "unbound")
+    token = _PENDING_ENGINE_REQUEST_CAPTURE.set(state)
+    try:
+        VllmAsyncGenerationWorkerImpl._bind_capture_engine_request(worker, "chatcmpl-1")
+    finally:
+        _PENDING_ENGINE_REQUEST_CAPTURE.reset(token)
+    engine_request = _engine_request([20, 21], [-0.1, -0.2])
+    worker.llm = SimpleNamespace(
+        output_processor=SimpleNamespace(
+            external_req_ids={"chatcmpl-1": ["i1"]},
+            request_states={"i1": engine_request},
+        )
+    )
+    inventory = _single_call_inventory()
+
+    receipt = worker._checkpoint_generation_cut(inventory)
+
+    assert state.engine_request_id == "chatcmpl-1"
+    assert receipt.prefixes[0].disposition == "durable_prefix"
+    assert receipt.prefixes[0].prefix_token_count == 2
+    assert sink.generation_prefix_records[0][1].token_ids_delta == [10, 11, 20, 21]
+    assert sink.generation_prefix_records[0][1].generation_log_probs_delta[2:] == [
+        -0.1,
+        -0.2,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1071,28 +1163,12 @@ def test_generation_cut_past_its_deadline_fails_uncut_calls_without_staging(capl
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     worker._generation_prefix_cuts_enabled = True
-    request = _FakeRequest(
-        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"},
-        stream=False,
-    )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10])
+    request = _captured_text_call(worker, "c1", (10,))
     state = worker._capture_calls[id(request)]
     with state.lock:
         state.effective_output_limit = 8
         state.observe([11, 12], [-0.1, -0.2])
-    inventory = GenerationCutInventory.build(
-        checkpoint_id="checkpoint-1",
-        server_name="policy_model",
-        active_prefixes=[
-            GenerationCutPrefix(
-                ticket_id="ticket-1",
-                rollout_id="r0",
-                attempt=0,
-                model_call_id="c1",
-                admitted_at=1.0,
-            )
-        ],
-    )
+    inventory = _single_call_inventory()
 
     # Gym has already stopped waiting: the queued cut must not stage rows.
     with caplog.at_level(logging.WARNING):
@@ -1245,7 +1321,7 @@ def test_completed_call_that_cannot_be_cut_logs_why(completed, reason, caplog):
     assert f"cannot cut completed model call c2: {reason}" in caplog.text
 
 
-def test_dropped_output_delta_keeps_its_call_uncuttable():
+def test_call_whose_tokens_left_a_gap_is_not_cut():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     worker._generation_prefix_cuts_enabled = True
@@ -1253,9 +1329,9 @@ def test_dropped_output_delta_keeps_its_call_uncuttable():
         worker, ("poisoned", [11, 12]), ("healthy", [13, 14])
     )
     with poisoned.lock:
-        poisoned.observe([15], [])
-        # A later valid delta must not hide the tokens the bad one dropped.
-        poisoned.observe([16], [-0.1])
+        poisoned.observe([16], [-0.1], start=3)
+        # A later contiguous read must not hide the position that was skipped.
+        poisoned.observe([17], [-0.1])
         assert poisoned.observation_error is not None
 
     receipt = worker._checkpoint_generation_cut(inventory)
@@ -1372,34 +1448,14 @@ class _FailOncePrefixSink(_MemorySink):
 def test_generation_cut_rolls_back_tokens_after_staging_failure():
     sink = _FailOncePrefixSink()
     worker = _worker_with_capture(sink)
-    request = _FakeRequest(
-        ng_capture={
-            "rollout_id": "r0",
-            "model_call_id": "c1",
-            "mode": "text",
-        },
-        stream=False,
-    )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10])
+    request = _captured_text_call(worker, "c1", (10,))
     state = worker._capture_calls[id(request)]
     with state.lock:
         state.effective_output_limit = 8
         state.observe([11, 12], [-0.1, -0.2])
 
     def inventory(checkpoint_id: str) -> GenerationCutInventory:
-        return GenerationCutInventory.build(
-            checkpoint_id=checkpoint_id,
-            server_name="policy_model",
-            active_prefixes=[
-                GenerationCutPrefix(
-                    ticket_id="ticket-1",
-                    rollout_id="r0",
-                    attempt=0,
-                    model_call_id="c1",
-                    admitted_at=1.0,
-                )
-            ],
-        )
+        return _single_call_inventory(checkpoint_id=checkpoint_id)
 
     # The failed call is acknowledged, not raised, and its buffer rolls back.
     failed = worker._checkpoint_generation_cut(inventory("checkpoint-1"))
@@ -1591,19 +1647,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
             ]
         ),
     )
-    inventory = GenerationCutInventory.build(
-        checkpoint_id="checkpoint-1",
-        server_name="policy_model",
-        active_prefixes=[
-            GenerationCutPrefix(
-                ticket_id="ticket-1",
-                rollout_id="r0",
-                attempt=0,
-                model_call_id="c1",
-                admitted_at=1.0,
-            )
-        ],
-    )
+    inventory = _single_call_inventory()
     receipt = original_worker._checkpoint_generation_cut(inventory)
     (cut_key,) = receipt.prefixes[0].staging_keys
     cut_record = sink.generation_prefix_records[-1][1]
@@ -2049,34 +2093,12 @@ def test_request_capture_topk_partial_write_returns_capture_failed():
 
 def _cut_active_call(worker, sink, model_call_id: str = "c1"):
     """Begin one captured call and stage its prefix at a generation cut."""
-    request = _FakeRequest(
-        ng_capture={
-            "rollout_id": "r0",
-            "model_call_id": model_call_id,
-            "parent_call_id": None,
-            "prev_len": 0,
-            "mode": "text",
-        },
-        stream=False,
-    )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    request = _captured_text_call(worker, model_call_id)
     state = worker._capture_calls[id(request)]
     with state.lock:
         state.effective_output_limit = 8
         state.observe([20, 21], [-0.1, -0.2])
-    inventory = GenerationCutInventory.build(
-        checkpoint_id="checkpoint-1",
-        server_name="policy_model",
-        active_prefixes=[
-            GenerationCutPrefix(
-                ticket_id="ticket-1",
-                rollout_id="r0",
-                attempt=0,
-                model_call_id=model_call_id,
-                admitted_at=1.0,
-            )
-        ],
-    )
+    inventory = _single_call_inventory(model_call_id)
     worker._checkpoint_generation_cut(inventory)
     assert state.generation_cut_staging_keys == sink.generation_prefix_keys
     return request
@@ -2147,17 +2169,7 @@ def test_call_whose_terminal_staging_fails_clears_its_cut_rows():
 def test_request_capture_abort_fails_the_call_and_drains_state():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
-    request = _FakeRequest(
-        ng_capture={
-            "capture_key": "r0",
-            "model_call_id": "c1",
-            "parent_call_id": None,
-            "prev_len": 0,
-            "mode": "text",
-        },
-        stream=False,
-    )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [1, 2])
+    request = _captured_text_call(worker, "c1", (1, 2))
     VllmAsyncGenerationWorkerImpl._abort_request_capture(
         worker, request, reason="engine_error"
     )

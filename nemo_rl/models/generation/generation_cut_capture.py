@@ -36,9 +36,11 @@ _COMPLETED_CAPTURE_RETENTION_S = 60.0 * 60.0
 class _RequestCaptureState:
     """Append-only generated tokens for one in-flight captured request.
 
-    ``observe`` appends each step's new tokens exactly once. A checkpoint
-    freezes the current length under ``lock`` and performs its blocking TQ
-    write after releasing it, so decoding keeps appending meanwhile.
+    Tokens are recorded lazily: a checkpoint cut reads the tokens vLLM decoded
+    since the last record, and the finished output records the rest. ``observe``
+    keeps each position once whichever source reaches it first. A cut freezes
+    the recorded length under ``lock`` and performs its blocking TQ write after
+    releasing it.
 
     Each successful cut stages only the tokens past ``staged_token_count``.
     The ordered TQ keys remain in Gym lineage; the full list is kept locally to
@@ -54,6 +56,8 @@ class _RequestCaptureState:
     media: Any | None = None
     resumed_generation_token_ids: list[int] = field(default_factory=list)
     effective_output_limit: int | None = None
+    # vLLM's ID for the request decoding this call, which a cut reads progress by.
+    engine_request_id: str | None = None
     terminal_finish_reason: Literal["stop", "length"] | None = None
     terminal_stop_reason: str | int | None = None
     observation_error: str | None = None
@@ -62,8 +66,8 @@ class _RequestCaptureState:
     uncuttable_reason: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     # Serializes lifecycle-changing TQ operations for this call. Token
-    # observation deliberately uses ``lock`` instead so decoding can continue
-    # while a detached generation chunk is staged.
+    # recording deliberately uses ``lock`` instead so a finished output can be
+    # recorded while a detached generation chunk is staged.
     lifecycle_lock: threading.Lock = field(default_factory=threading.Lock)
     terminal_started: bool = False
     generated_token_ids: list[int] = field(default_factory=list)
@@ -84,15 +88,25 @@ class _RequestCaptureState:
         self,
         generated_token_ids: list[int],
         generated_logprobs: list[float],
+        *,
+        start: int | None = None,
     ) -> None:
-        """Append the tokens one vLLM step added."""
-        if len(generated_token_ids) != len(generated_logprobs):
+        """Record generated tokens read at position ``start`` (default: the end).
+
+        A cut and the finished output both read from vLLM, so positions already
+        recorded by the other are skipped rather than appended twice.
+        """
+        recorded = len(self.generated_token_ids)
+        start = recorded if start is None else start
+        if start > recorded:
             self.observation_error = (
-                "generated token IDs and log probabilities must have equal lengths"
+                f"generated tokens read from position {start} leave a gap after "
+                f"the {recorded} already recorded"
             )
             return
-        self.generated_token_ids.extend(generated_token_ids)
-        self.generated_logprobs.extend(generated_logprobs)
+        skip = recorded - start
+        self.generated_token_ids.extend(generated_token_ids[skip:])
+        self.generated_logprobs.extend(generated_logprobs[skip:])
 
     def freeze_for_checkpoint(
         self, checkpoint_id: str
@@ -285,6 +299,17 @@ class GenerationCutCaptureMixin:
                 completed_at_monotonic=now,
             )
 
+    def _record_generation_progress(
+        self, states: list[_RequestCaptureState], *, deadline: float | None
+    ) -> None:
+        """Record the tokens each call decoded since its last record.
+
+        Backend-specific: the vLLM worker reads them from its engine.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot read generation progress for a cut"
+        )
+
     def _fetch_generation_cut_chunks(self, continuation: Any) -> list[Any]:
         """Fetch the staged chunks named by a ``GenerationCutContinuation``, in order."""
         if self._staging_source is None:
@@ -338,62 +363,35 @@ class GenerationCutCaptureMixin:
 
         # Deferred: nemo_gym is an optional extra absent in non-Gym runs.
         from nemo_gym.token_id_capture.staging.digest import (
-            EXTRAS_DIGEST_VERSION,
-            STAGING_DIGEST_VERSION,
             compute_chain_hash,
             compute_extras_digest,
-            compute_staging_digest,
             hash_token_ids,
         )
-        from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
+        from nemo_gym.token_id_capture.staging.records import StagedCallRecord
 
         delta_len = len(token_ids_delta)
-        cum_len = admission.prev_len + delta_len
         # A cut chain may span retries performed after later weight updates.
         # Its token-level behavior logprobs remain attached to their original
         # chunks. The cumulative snapshot uses the oldest contributing version
         # so downstream replay-buffer staleness checks remain conservative.
-        weight_version = weight_versions[0]
-        extras_digest = compute_extras_digest(None)
-        chain_hash = compute_chain_hash(admission.parent_chain_hash, token_ids_delta)
-        cumulative_hash = hash_token_ids(prefix_token_ids + token_ids_delta)
-        digest = compute_staging_digest(
-            schema_version=admission.schema_version,
-            digest_version=STAGING_DIGEST_VERSION,
-            extras_digest_version=EXTRAS_DIGEST_VERSION,
-            capture_key=continuation.source_capture_key,
-            model_call_id=continuation.source_model_call_id,
-            parent_call_id=admission.parent_call_id,
-            mode=admission.mode,
-            prev_len=admission.prev_len,
-            delta_len=delta_len,
-            cum_len=cum_len,
-            weight_version=weight_version,
-            token_ids_delta=token_ids_delta,
-            token_mask_delta=token_mask_delta,
-            generation_log_probs_delta=generation_logprobs_delta,
-            extras_digest=extras_digest,
-            chain_hash=chain_hash,
-            cumulative_hash=cumulative_hash,
-        )
         # Gym's begin_call checks this snapshot's digest and generated-token
         # count against the admission before the call is served.
-        snapshot = StagedCallBaseSnapshot(
+        snapshot = StagedCallRecord.from_components(
             capture_key=continuation.source_capture_key,
             model_call_id=continuation.source_model_call_id,
             parent_call_id=admission.parent_call_id,
             mode=admission.mode,
             prev_len=admission.prev_len,
             delta_len=delta_len,
-            cum_len=cum_len,
-            weight_version=weight_version,
-            digest=digest,
+            cum_len=admission.prev_len + delta_len,
+            weight_version=weight_versions[0],
             token_ids_delta=token_ids_delta,
             token_mask_delta=token_mask_delta,
             generation_log_probs_delta=generation_logprobs_delta,
-            extras_digest=extras_digest,
-            chain_hash=chain_hash,
-            cumulative_hash=cumulative_hash,
+            extras=None,
+            extras_digest=compute_extras_digest(None),
+            chain_hash=compute_chain_hash(admission.parent_chain_hash, token_ids_delta),
+            cumulative_hash=hash_token_ids(prefix_token_ids + token_ids_delta),
         )
         # Lets a consumer confirm the exact generated tokens it later receives
         # (e.g. a trained row) without access to the staging store.
@@ -688,10 +686,7 @@ class GenerationCutCaptureMixin:
                     prefix.model_call_id,
                     uncuttable_reason,
                 )
-                return GenerationCutPrefixAck(
-                    **prefix.model_dump(mode="json"),
-                    disposition="durable_failure",
-                )
+                return GenerationCutPrefixAck.failure(prefix)
             if observation_error is not None:
                 # A dropped delta leaves the buffer short of what vLLM decoded.
                 # Only this call regenerates; the rest of the inventory is cut.
@@ -700,10 +695,7 @@ class GenerationCutCaptureMixin:
                     prefix.model_call_id,
                     observation_error,
                 )
-                return GenerationCutPrefixAck(
-                    **prefix.model_dump(mode="json"),
-                    disposition="durable_failure",
-                )
+                return GenerationCutPrefixAck.failure(prefix)
             if effective_output_limit is None:
                 # Checked before freezing, so the call's buffer is untouched.
                 LOGGER.warning(
@@ -711,10 +703,7 @@ class GenerationCutCaptureMixin:
                     "effective output limit",
                     prefix.model_call_id,
                 )
-                return GenerationCutPrefixAck(
-                    **prefix.model_dump(mode="json"),
-                    disposition="durable_failure",
-                )
+                return GenerationCutPrefixAck.failure(prefix)
             inherited_prefix_token_count = (
                 state.call.admission.generation_cut.prefix_token_count
                 if state.call.admission.generation_cut is not None
@@ -745,10 +734,7 @@ class GenerationCutCaptureMixin:
             if unusable_prefix:
                 with state.lock:
                     state.rollback_frozen_cut(checkpoint_id)
-                return GenerationCutPrefixAck(
-                    **prefix.model_dump(mode="json"),
-                    disposition="durable_failure",
-                )
+                return GenerationCutPrefixAck.failure(prefix)
             staged_key = None
             try:
                 cumulative_record = capture.build_prefix_record(
@@ -845,6 +831,18 @@ class GenerationCutCaptureMixin:
             cached_receipt = self._generation_cut_receipts.get(receipt_key)
         if cached_receipt is not None:
             return cached_receipt
+        with self._capture_registry_lock:
+            active_states = [
+                state
+                for prefix in inventory.active_prefixes
+                if (
+                    state := self._capture_calls_by_model_call_id.get(
+                        prefix.model_call_id
+                    )
+                )
+                is not None
+            ]
+        self._record_generation_progress(active_states, deadline=deadline)
         acknowledgements = []
         for index, prefix in enumerate(inventory.active_prefixes):
             if deadline is not None and time.monotonic() >= deadline:

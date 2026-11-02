@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextvars
 import copy
 import functools
 import gc
@@ -81,7 +82,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
-    extract_published_generation,
+    extract_generation_logprobs,
     format_prompt_for_vllm_generation,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
@@ -106,6 +107,13 @@ _GENERATION_CUT_ROUTE = "/ng-control/v1/generation-cut"
 
 # Reasons already logged by this worker process; calls sharing a setting log once.
 _LOGGED_UNCUTTABLE_REASONS: set[str] = set()
+
+# The capture state of a cuttable call whose sampling params were just built.
+# vLLM's chat handler submits the request in the same task, where the HTTP
+# engine client takes it to note the vLLM request ID that cuts read progress by.
+_PENDING_ENGINE_REQUEST_CAPTURE: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "_PENDING_ENGINE_REQUEST_CAPTURE", default=None
+)
 
 
 # vLLM's _SAMPLING_EPS: below this temperature a request decodes greedily.
@@ -416,10 +424,12 @@ class _AsyncLLMHTTPClient:
         engine_loop: asyncio.AbstractEventLoop,
         *,
         flat_logprobs: bool,
+        on_generate: Callable[[str], None] | None = None,
     ):
         self._engine_client = engine_client
         self._engine_loop = engine_loop
         self._flat_logprobs = flat_logprobs
+        self._on_generate = on_generate
         self.model_config = engine_client.model_config
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
@@ -451,6 +461,8 @@ class _AsyncLLMHTTPClient:
             and sampling_params.prompt_logprobs is None
         ):
             sampling_params.flat_logprobs = True
+        if self._on_generate is not None:
+            self._on_generate(request_id)
         return self._generate(prompt, sampling_params, request_id, kwargs)
 
     async def _generate(
@@ -917,6 +929,7 @@ class VllmAsyncGenerationWorkerImpl(
                 self.llm,
                 self._engine_loop,
                 flat_logprobs=bool(self.cfg["vllm_cfg"].get("flat_logprobs")),
+                on_generate=self._bind_capture_engine_request,
             )
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
@@ -1145,7 +1158,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
     def _observe_request_capture(self, request: Any, request_output: Any) -> None:
-        """Observe the tokens one cumulative vLLM output adds."""
+        """Record the tokens a finished vLLM output adds past the last cut."""
         state = self._get_request_capture(request)
         if state is None:
             return
@@ -1156,30 +1169,21 @@ class VllmAsyncGenerationWorkerImpl(
             observed = state.observed_generation_token_count
         try:
             output = outputs[0]
-            # Cumulative output: slice off what earlier steps already observed.
-            # The lists are vLLM's live ones, appended to on the engine loop
-            # while this HTTP thread reads them, so copy only the new tail.
-            token_ids = getattr(output, "token_ids", None) or ()
-            generation_token_ids, generation_logprobs = extract_published_generation(
-                token_ids, getattr(output, "logprobs", None), start=observed
+            # Finished, so vLLM appends to these lists no more.
+            generation_token_ids = list(getattr(output, "token_ids", None) or ())[
+                observed:
+            ]
+            generation_logprobs = extract_generation_logprobs(
+                generation_token_ids, getattr(output, "logprobs", None), start=observed
             )
             finish_reason = getattr(output, "finish_reason", None)
             stop_reason = getattr(output, "stop_reason", None)
-            unpaired_token_count = len(token_ids) - observed - len(generation_token_ids)
-            if finish_reason is not None and unpaired_token_count:
-                # Nothing appends after the terminal step, so a token still
-                # without its logprob was never given one.
-                raise RuntimeError(
-                    "vLLM finished a generation with tokens that have no log "
-                    f"probabilities: token_count={len(token_ids)}, "
-                    f"logprob_count={observed + len(generation_token_ids)}"
-                )
         except (RuntimeError, TypeError, ValueError) as error:
             with state.lock:
                 state.observation_error = f"{type(error).__name__}: {error}"
             return
         with state.lock:
-            state.observe(generation_token_ids, generation_logprobs)
+            state.observe(generation_token_ids, generation_logprobs, start=observed)
             if finish_reason is not None:
                 if finish_reason not in ("stop", "length"):
                     state.observation_error = (
@@ -1200,6 +1204,96 @@ class VllmAsyncGenerationWorkerImpl(
                 else:
                     state.terminal_finish_reason = finish_reason
                     state.terminal_stop_reason = stop_reason
+
+    def _bind_capture_engine_request(self, engine_request_id: str) -> None:
+        """Note the vLLM request ID of the captured call being submitted, if any."""
+        state = _PENDING_ENGINE_REQUEST_CAPTURE.get()
+        if state is None:
+            return
+        _PENDING_ENGINE_REQUEST_CAPTURE.set(None)
+        with state.lock:
+            state.engine_request_id = engine_request_id
+
+    def _record_generation_progress(
+        self, states: list[_RequestCaptureState], *, deadline: float | None
+    ) -> None:
+        """Record the tokens each call decoded since its last record, read from vLLM.
+
+        One pass on the engine loop copies every call's new token IDs, so all
+        calls are read at the same decode step and none mid-step. Their logprobs
+        are then read here, off the engine loop, from positions that pass saw
+        published. A call vLLM no longer holds (not yet submitted, or finished)
+        keeps what it has recorded; its finished output records the rest.
+        """
+        pending = []
+        for state in states:
+            with state.lock:
+                if state.engine_request_id is not None:
+                    pending.append(
+                        (
+                            state,
+                            state.engine_request_id,
+                            state.observed_generation_token_count,
+                        )
+                    )
+        if not pending:
+            return
+        output_processor = self.llm.output_processor
+
+        async def read_engine_progress() -> list[tuple[list[int], Any] | None]:
+            # Never awaits, so the engine loop cannot process a step mid-read.
+            progress: list[tuple[list[int], Any] | None] = []
+            for _, engine_request_id, start in pending:
+                internal_ids = output_processor.external_req_ids.get(engine_request_id)
+                request_state = (
+                    output_processor.request_states.get(internal_ids[0])
+                    if internal_ids is not None and len(internal_ids) == 1
+                    else None
+                )
+                if request_state is None or request_state.detokenizer is None:
+                    progress.append(None)
+                    continue
+                progress.append(
+                    (
+                        request_state.detokenizer.output_token_ids[start:],
+                        request_state.logprobs_processor.logprobs
+                        if request_state.logprobs_processor is not None
+                        else None,
+                    )
+                )
+            return progress
+
+        future = asyncio.run_coroutine_threadsafe(
+            read_engine_progress(), self._engine_loop
+        )
+        try:
+            progress = future.result(
+                timeout=None
+                if deadline is None
+                else max(0.0, deadline - time.monotonic())
+            )
+        except TimeoutError:
+            future.cancel()
+            LOGGER.warning(
+                "generation cut could not read vLLM's progress before its deadline; "
+                "%d calls are cut at the tokens they have recorded",
+                len(pending),
+            )
+            return
+        for (state, _, start), entry in zip(pending, progress, strict=True):
+            if entry is None:
+                continue
+            token_ids, logprobs = entry
+            try:
+                generated_logprobs = extract_generation_logprobs(
+                    token_ids, logprobs, start=start
+                )
+            except (RuntimeError, TypeError, ValueError) as error:
+                with state.lock:
+                    state.observation_error = f"{type(error).__name__}: {error}"
+                continue
+            with state.lock:
+                state.observe(token_ids, generated_logprobs, start=start)
 
     def _restore_response_prefix(
         self, request: Any, request_output: Any, *, tokenizer: Any
@@ -1676,7 +1770,6 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.serve.utils.api_utils import with_cancellation
         from vllm.renderers.online_renderer import OnlineRenderer
         from vllm.renderers.hf import HfRenderer
-        from vllm.sampling_params import RequestOutputKind
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
@@ -2134,12 +2227,11 @@ class VllmAsyncGenerationWorkerImpl(
                     worker_self._generation_prefix_cuts_enabled
                     and self.ng_capture is not None
                 ):
-                    # A cut needs per-step progress, not vLLM's FINAL_ONLY.
-                    # CUMULATIVE outputs reference vLLM's live token and
-                    # logprob lists, so each step costs only its new tokens.
-                    # Streaming keeps vLLM's DELTA, which its stream expects.
-                    if not self.stream:
-                        sampling_params.output_kind = RequestOutputKind.CUMULATIVE
+                    # A cut reads the call's progress from vLLM's request
+                    # state, so the output kind stays vLLM's own.
+                    _PENDING_ENGINE_REQUEST_CAPTURE.set(
+                        worker_self._get_request_capture(self)
+                    )
                     worker_self._record_request_effective_output_limit(
                         self, int(sampling_params.max_tokens)
                     )
@@ -2157,8 +2249,6 @@ class VllmAsyncGenerationWorkerImpl(
             authorization: str | None = Header(default=None),
         ):
             """Persist one checkpoint's frozen active-call prefixes to TQ."""
-            import secrets
-
             from nemo_gym._checkpoint.generation_cut import GenerationCutInventory
 
             expected = worker_self._generation_cut_control_token
@@ -2216,13 +2306,11 @@ class VllmAsyncGenerationWorkerImpl(
                 async def capture_result_generator():
                     nonlocal final_res, cancelled
                     try:
-                        # vLLM's full generator keeps only the last output, so
-                        # observe each and restore the prefix once, on the last.
                         async for res in result_generator:
-                            worker_self._observe_request_capture(request, res)
                             final_res = res
                         if final_res is None:
                             return
+                        worker_self._observe_request_capture(request, final_res)
                         worker_self._restore_response_prefix(
                             request,
                             final_res,
