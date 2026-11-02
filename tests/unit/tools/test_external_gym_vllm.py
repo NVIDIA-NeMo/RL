@@ -1270,11 +1270,11 @@ def test_serve_mode_publishes_the_manifest_before_the_pools_are_healthy(tmp_path
     process = _start(_WRAPPER, env, tmp_path / "serve.out")
     try:
         # The URLs are fixed once the load balancers are placed, well before READY.
+        # pools.env is written right after manifest.tsv, so waiting for it covers both.
         _wait_for(
-            (pool_dir / "manifest.tsv").exists, 60, "manifest was not published early"
+            (pool_dir / "pools.env").exists, 60, "manifest was not published early"
         )
         assert "http://127.0.0.1:9213/v1" in (pool_dir / "manifest.tsv").read_text()
-        assert (pool_dir / "pools.env").exists()
         assert not (pool_dir / "READY").exists()
         (stub_log / "healthy_9213").unlink()
         (stub_log / "healthy_9214").unlink()
