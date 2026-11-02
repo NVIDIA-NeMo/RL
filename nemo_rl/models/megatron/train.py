@@ -1036,6 +1036,13 @@ def _prepare_precomputed_next_token_logprobs(
         raise NotImplementedError(
             "precomputed next-token logprobs require LossInputType.LOGPROB"
         )
+    # Score centering gathers the policy logprobs at the sampler top-k ids from
+    # vocabulary logits, which already-extracted logprobs no longer carry.
+    if getattr(loss_fn, "score_centering", False):
+        raise NotImplementedError(
+            "precomputed next-token logprobs do not support "
+            "loss_fn.score_centering=true"
+        )
     expected_shape = (data["input_ids"].shape[0], data["input_ids"].shape[1] - 1)
     if logits.ndim != 2 or tuple(logits.shape) != expected_shape:
         raise ValueError(

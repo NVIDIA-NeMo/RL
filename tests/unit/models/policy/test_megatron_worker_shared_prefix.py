@@ -273,11 +273,32 @@ def test_begin_train_step_clears_mtp_tracker_only_in_execution_modes(
     worker._shared_prefix_cfg = SharedPrefixTrainingConfig(mode=mode)
     worker.mtp_enabled = True
     worker._test_loss_fn.input_type = LossInputType.LOGPROB
+    worker._test_loss_fn.score_centering = False
 
     with patch.object(MTPLossLoggingHelper, "clean_metrics_in_tracker") as clean:
         worker.begin_train_step(loss_fn=worker._test_loss_fn)
 
     assert clean.call_count == expected_clears
+
+
+@pytest.mark.parametrize(
+    ("mode", "rejected"), [("train", True), ("logprobs", False), ("dense", False)]
+)
+def test_shared_prefix_training_rejects_score_centering(
+    mode: str, rejected: bool
+) -> None:
+    # Single-controller setup rejects this first; the worker repeats the check
+    # for callers that bypass it. mode=logprobs trains densely.
+    worker = _bare_worker(mode=mode)
+    loss_fn = MagicMock(input_type=LossInputType.LOGPROB, score_centering=True)
+
+    if not rejected:
+        worker._validate_shared_prefix_loss(loss_fn)
+        return
+    with pytest.raises(NotImplementedError, match="score_centering"):
+        worker._validate_shared_prefix_loss(loss_fn)
+    loss_fn.score_centering = False
+    worker._validate_shared_prefix_loss(loss_fn)
 
 
 def test_dense_control_checks_evaluation_mtp_bypass_at_setup() -> None:

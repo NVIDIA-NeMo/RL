@@ -1508,6 +1508,15 @@ class MegatronPolicyWorkerImpl(
                 "shared-prefix train mode currently supports only losses with "
                 f"input_type=LOGPROB, got {loss_fn.input_type!r}"
             )
+        # Single-controller setup rejects this before any worker exists. Shared
+        # units hand the loss extracted next-token logprobs, not vocabulary
+        # logits, so it cannot gather policy logprobs at the sampler top-k ids.
+        if getattr(loss_fn, "score_centering", False):
+            raise NotImplementedError(
+                "shared-prefix train mode does not support "
+                "loss_fn.score_centering=true: shared-prefix training units do "
+                "not expose vocabulary logits to the loss"
+            )
 
     def _shared_prefix_bin_capacity(
         self,

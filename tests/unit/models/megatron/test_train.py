@@ -2413,6 +2413,28 @@ class TestSharedPrefixTrainGuards:
         )(precomputed)
         assert torch.equal(outputs["logprobs"][:, 1:], precomputed)
 
+    @pytest.mark.parametrize("score_centering", [False, True])
+    def test_precomputed_logprobs_reject_score_centering(self, score_centering):
+        """Shared units cannot gather policy logprobs at the sampler top-k ids."""
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.train import (
+            _prepare_precomputed_next_token_logprobs,
+        )
+
+        loss_fn = SimpleNamespace(
+            input_type=LossInputType.LOGPROB, score_centering=score_centering
+        )
+        data = BatchedDataDict({"input_ids": torch.tensor([[1, 2, 3, 4]])})
+        logprobs = torch.randn(1, 3)
+        if not score_centering:
+            loss_input, _ = _prepare_precomputed_next_token_logprobs(
+                logprobs, data, loss_fn
+            )
+            assert loss_input["next_token_logprobs"] is logprobs
+            return
+        with pytest.raises(NotImplementedError, match="score_centering"):
+            _prepare_precomputed_next_token_logprobs(logprobs, data, loss_fn)
+
     def test_shared_prefix_rejects_teacher_full_payload(self):
         from nemo_rl.models.megatron.data import ProcessedMicrobatch
         from nemo_rl.models.megatron.train import (
