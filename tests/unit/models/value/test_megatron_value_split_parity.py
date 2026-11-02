@@ -73,7 +73,7 @@ def test_value_split_parity(
         config = _create_value_test_config(tiny_qwen2_model_path, tp=tp, pp=pp, cp=cp)
         _apply_config_updates(config, updates)
         tokenizer = get_tokenizer(config["tokenizer"])
-        model = Value(cluster=cluster, config=config, tokenizer=tokenizer)
+        model = Value(cluster=cluster, config=config, tokenizer=tokenizer, seed=42)
         torch.manual_seed(42)
         data = BatchedDataDict(
             {
@@ -139,6 +139,7 @@ def test_value_split_parity(
             cluster=cluster,
             config=config,
             tokenizer=tokenizer,
+            seed=42,
             weights_path=Path(weights),
             name_prefix="value_split",
         )
