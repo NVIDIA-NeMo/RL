@@ -30,6 +30,7 @@ from yaml import safe_load
 
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
     ROLLOUT_MATCHED_MEDIA_KEY,
@@ -47,6 +48,7 @@ from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
     _count_structured_response_tokens,
+    _input_text,
     _wait_for_external_services,
     build_reward_component_columns,
     extract_external_service_readiness,
@@ -2310,6 +2312,452 @@ def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():
     assert "apply_chat_template failed" in msg
     assert "RuntimeError" in msg
     assert "['reasoning']" in msg
+
+
+class _UnusableRolloutTokenizer:
+    eos_token_id = 2
+    pad_token_id = 0
+
+    def apply_chat_template(self, input_messages, tokenize=True):
+        return list(range(1234))
+
+    def encode(self, text, add_special_tokens=False):
+        assert not add_special_tokens
+        return [100 + i for i, _ in enumerate(text.split())]
+
+    def batch_decode(self, token_id_lists):
+        return [" ".join(str(t) for t in ids) for ids in token_id_lists]
+
+
+class _MaskUnusableRolloutsSelf:
+    cfg = {"mask_unusable_rollouts": True}
+
+
+def test_nemo_gym_postprocess_no_generation_data_masked_when_enabled():
+    nemo_gym_result = {
+        "reward": 1.0,
+        "response": {"output": [{"type": "reasoning"}, {"type": "function_call"}]},
+        "responses_create_params": {
+            "input": [{"role": "user", "content": "three word prompt"}]
+        },
+    }
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MaskUnusableRolloutsSelf(),
+            {},
+            nemo_gym_result,
+            _UnusableRolloutTokenizer(),
+        )
+    )
+
+    user, assistant = result["message_log"]
+    assert user["role"] == "user"
+    # The start of the input text, padded with EOS to a fixed length.
+    assert user["token_ids"].tolist() == [100, 101, 102] + [2] * 125
+    assert assistant["role"] == "assistant"
+    assert assistant["token_ids"].tolist() == [2]
+    assert assistant["generation_logprobs"].tolist() == [0.0]
+    # The input log is the placeholder's single user turn (the same object, so
+    # a tensor-bearing dict comparison is not needed).
+    assert len(result["input_message_log"]) == 1
+    assert result["input_message_log"][0] is user
+    full_result = result["full_result"]
+    assert full_result["mask_sample"] is True
+    assert full_result["_ng_unusable_rollout"] == "no_generation_data"
+
+
+def _trainable_item(prompt_token_ids, generation_token_ids):
+    return {
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "prompt_token_ids": prompt_token_ids,
+        "generation_token_ids": generation_token_ids,
+        "generation_log_probs": [-0.5] * len(generation_token_ids),
+    }
+
+
+def _non_contiguous_result():
+    return {
+        "reward": 1.0,
+        "response": {
+            "output": [
+                _trainable_item([1, 2], [3, 4]),
+                # The history was rewritten: [1, 2, 3, 4] is not a prefix.
+                _trainable_item([1, 9, 3, 4, 5], [6]),
+            ]
+        },
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+
+def test_nemo_gym_postprocess_non_contiguous_chain_raises_by_default():
+    class _MockSelf:
+        cfg = {}
+
+    with pytest.raises(AssertionError, match="Non-contiguous messages found"):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, _non_contiguous_result(), _UnusableRolloutTokenizer()
+        )
+
+
+def test_nemo_gym_postprocess_non_contiguous_chain_masked_when_enabled():
+    nemo_gym_result = _non_contiguous_result()
+    # An opaque router-replay payload on the dropped turn; it is never decoded.
+    nemo_gym_result["response"]["output"][1]["routed_experts"] = "opaque-blob"
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MaskUnusableRolloutsSelf(),
+            {},
+            nemo_gym_result,
+            _UnusableRolloutTokenizer(),
+        )
+    )
+
+    # The contiguous prefix (the first turn) is kept.
+    assert [m["role"] for m in result["message_log"]] == ["user", "assistant"]
+    assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
+    assert result["message_log"][1]["token_ids"].tolist() == [3, 4]
+    full_result = result["full_result"]
+    assert full_result["mask_sample"] is True
+    assert full_result["_ng_unusable_rollout"] == "non_contiguous_token_chain"
+    # full_result keeps one shape for logging: the kept turn is decoded like
+    # any other row and the dropped tail is stripped of its token payloads.
+    kept, dropped = full_result["response"]["output"]
+    assert kept["prompt_str"] == "1 2"
+    assert kept["generation_str"] == "3 4"
+    for item in (kept, dropped):
+        for key in (
+            "prompt_token_ids",
+            "generation_token_ids",
+            "generation_log_probs",
+            "routed_experts",
+        ):
+            assert key not in item
+    assert "generation_str" not in dropped
+
+
+def _gym_flagged_no_generation_result():
+    """A Gym-flagged result with no token-annotated items.
+
+    NeMo-Gym's token capture emits this shape for an unusable capture build:
+    ``mask_sample`` is already True at the top level and the response holds no
+    trainable output item.
+    """
+    return {
+        "mask_sample": True,
+        "reward": 0.0,
+        "response": {"output": [{"type": "message"}]},
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+
+def test_nemo_gym_postprocess_gym_flagged_no_generation_result_masked_when_enabled():
+    """A result Gym already flagged converts to the placeholder and stays flagged."""
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MaskUnusableRolloutsSelf(),
+            {},
+            _gym_flagged_no_generation_result(),
+            _UnusableRolloutTokenizer(),
+        )
+    )
+
+    assert [m["role"] for m in result["message_log"]] == ["user", "assistant"]
+    assert result["message_log"][0]["token_ids"].tolist() == [100] + [2] * 127
+    assert result["message_log"][1]["token_ids"].tolist() == [2]
+    full_result = result["full_result"]
+    assert full_result["mask_sample"] is True
+    assert full_result["_ng_unusable_rollout"] == "no_generation_data"
+
+
+@pytest.mark.parametrize("cfg", [{}, {"mask_unusable_rollouts": False}])
+def test_nemo_gym_postprocess_gym_flagged_no_generation_result_raises_by_default(
+    cfg,
+):
+    """Strict by default: Gym's own flag does not make a no-generation result convert.
+
+    Recovering such a result is the explicit opt-in, not an implicit behavior
+    of the flag.
+    """
+    mock_self = SimpleNamespace(cfg=cfg)
+
+    with pytest.raises(ValueError, match="no generation data"):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            mock_self,
+            {},
+            _gym_flagged_no_generation_result(),
+            _UnusableRolloutTokenizer(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("eos_token_id", "pad_token_id", "expected_filler"),
+    [(2, 0, 2), (None, 5, 5), (None, None, 0)],
+)
+def test_nemo_gym_postprocess_no_generation_empty_input_gets_fixed_length_prompt(
+    eos_token_id, pad_token_id, expected_filler
+):
+    """An empty input still yields a non-empty, fixed-length placeholder prompt."""
+
+    class _Tokenizer(_UnusableRolloutTokenizer):
+        pass
+
+    _Tokenizer.eos_token_id = eos_token_id
+    _Tokenizer.pad_token_id = pad_token_id
+    nemo_gym_result = {
+        "mask_sample": True,
+        "reward": 0.0,
+        "response": {"output": []},
+        "responses_create_params": {"input": []},
+    }
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MaskUnusableRolloutsSelf(), {}, nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    user, assistant = result["message_log"]
+    assert user["token_ids"].tolist() == [expected_filler] * 128
+    assert assistant["token_ids"].tolist() == [expected_filler]
+    assert result["full_result"]["_ng_unusable_rollout"] == "no_generation_data"
+
+
+def test_nemo_gym_postprocess_no_generation_long_input_is_truncated_to_fixed_length():
+    """A prompt longer than the placeholder length keeps only its first 128 tokens."""
+    words = " ".join(f"w{i}" for i in range(300))
+    nemo_gym_result = {
+        "reward": 0.0,
+        "response": {"output": []},
+        "responses_create_params": {"input": [{"role": "user", "content": words}]},
+    }
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MaskUnusableRolloutsSelf(),
+            {},
+            nemo_gym_result,
+            _UnusableRolloutTokenizer(),
+        )
+    )
+
+    user, assistant = result["message_log"]
+    assert user["token_ids"].tolist() == [100 + i for i in range(128)]
+    assert assistant["token_ids"].tolist() == [2]
+    assert result["full_result"]["_ng_unusable_rollout"] == "no_generation_data"
+
+
+@pytest.mark.parametrize(
+    ("input_messages", "expected_text"),
+    [
+        ("plain string prompt", "plain string prompt"),
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "part one"},
+                        {"type": "input_image", "image_url": "data:x"},
+                        {"type": "input_text", "text": "part two"},
+                    ],
+                }
+            ],
+            "part one\npart two",
+        ),
+        (
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "usr"}],
+            "sys\nusr",
+        ),
+        (["not a dict", {"role": "user"}, {"role": "user", "content": 5}], ""),
+        ({"role": "user", "content": "a dict, not a list"}, ""),
+        (None, ""),
+    ],
+)
+def test_input_text_handles_every_responses_input_shape(input_messages, expected_text):
+    """The placeholder prompt text covers every Responses ``input`` shape Gym sends."""
+    assert _input_text(input_messages) == expected_text
+
+
+def test_nemo_gym_postprocess_no_generation_encode_failure_falls_back_to_filler():
+    """A tokenizer that cannot encode the text still yields a 128-token filler prompt."""
+
+    class _Raising(_UnusableRolloutTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            raise RuntimeError("boom")
+
+    nemo_gym_result = {
+        "reward": 0.0,
+        "response": {"output": []},
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MaskUnusableRolloutsSelf(), {}, nemo_gym_result, _Raising()
+        )
+    )
+
+    user, assistant = result["message_log"]
+    assert user["token_ids"].tolist() == [2] * 128
+    assert assistant["token_ids"].tolist() == [2]
+
+
+_NEMOTRON_MEDIA_TOKEN_ID = 99
+
+
+def _check_nemotron_omni_media_alignment(
+    input_ids: torch.Tensor,
+    media_embeddings: torch.Tensor,
+    media_token_id: int,
+    validity_mask: torch.Tensor | None,
+) -> None:
+    """Mirror the alignment check of the pinned native Nemotron Omni forward.
+
+    Megatron-Bridge ec835530efeff71b55ec015f36bcc0c33b8b52b7,
+    ``src/megatron/bridge/models/nemotron_omni/modeling_nemotron_omni.py``,
+    ``NemotronOmniModel._merge_projected_media``: every valid media placeholder
+    token is replaced by exactly one projected feature row, so the two counts
+    must match. This reproduces the input invariant only, not a model forward.
+    """
+    media_mask = input_ids == media_token_id
+    if validity_mask is not None:
+        if validity_mask.shape != input_ids.shape:
+            raise ValueError("media token-validity mask must match input_ids")
+        media_mask = media_mask & validity_mask.bool()
+    expected_features = int(media_mask.sum().item())
+    actual_features = media_embeddings.shape[0]
+    if expected_features != actual_features:
+        raise ValueError(
+            "Expanded-sequence media alignment failed: "
+            f"found {expected_features} valid placeholders for "
+            f"{actual_features} projected features."
+        )
+
+
+def _nemotron_source_prompt(pixel_values: PackedTensor) -> list[dict]:
+    """The dataset-side prompt of a legacy Gym Nemotron Omni VLM row.
+
+    One text media placeholder (``_NEMOTRON_MEDIA_TOKEN_ID``) beside the text
+    token 10, with the processor-owned image tensors and validity mask.
+    """
+    return [
+        {
+            "role": "user",
+            "content": "",
+            "token_ids": torch.tensor([10, _NEMOTRON_MEDIA_TOKEN_ID]),
+            "pixel_values": pixel_values,
+            "media_token_validity_mask": torch.tensor([False, True]),
+        }
+    ]
+
+
+def _assert_nemotron_model_inputs_align(message_log: list[dict]) -> None:
+    """Flatten a Gym message log the way training does and check the invariant."""
+    flat, _ = batched_message_log_to_flat_message(
+        [message_log], pad_value_dict={"token_ids": 0}
+    )
+    input_ids = flat["token_ids"]
+    pixel_values = flat.get("pixel_values")
+    media_embeddings = (
+        pixel_values.as_tensor()
+        if isinstance(pixel_values, PackedTensor)
+        else torch.zeros(0, 4)
+    )
+    _check_nemotron_omni_media_alignment(
+        input_ids,
+        media_embeddings,
+        _NEMOTRON_MEDIA_TOKEN_ID,
+        flat.get("media_token_validity_mask"),
+    )
+
+
+def test_nemo_gym_no_generation_placeholder_never_acquires_original_media():
+    """Regression for the Nemotron Omni placeholder/media mismatch.
+
+    With ``mask_unusable_rollouts`` on, a no-generation result becomes a
+    text/EOS placeholder with zero media placeholder tokens. Restoring the
+    prompt's original image tensors onto it would hand the native Nemotron
+    Omni forward one projected feature for zero placeholders, which raises
+    before loss masking. Both restoration entry points must skip it.
+    """
+    pixel_values = PackedTensor(torch.zeros(1, 4), dim_to_pack=0)
+    source = _nemotron_source_prompt(pixel_values)
+    nemo_gym_result = {
+        "reward": 0.0,
+        "response": {"output": []},
+        "responses_create_params": {
+            "input": [{"role": "user", "content": "describe this image"}]
+        },
+    }
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            SimpleNamespace(cfg={"mask_unusable_rollouts": True}, _processor=None),
+            {},
+            nemo_gym_result,
+            _UnusableRolloutTokenizer(),
+        )
+    )
+    assert result["full_result"]["_ng_unusable_rollout"] == "no_generation_data"
+
+    # Control: the generic attach helper would pair the image tensors with a
+    # prompt that has no media placeholder, and the pinned invariant rejects it.
+    control = deepcopy(result)
+    attach_static_multimodal_payload(control["message_log"], source)
+    assert control["message_log"][0]["pixel_values"] is pixel_values
+    with pytest.raises(ValueError, match="found 0 valid placeholders for 1"):
+        _assert_nemotron_model_inputs_align(control["message_log"])
+
+    # The batched rollout path restores unconditionally through this helper.
+    _reattach_static_multimodal_payloads_to_result(result, source)
+    # The deduplicated path restores through the omitted-media flag.
+    result["_initial_multimodal_data_omitted"] = True
+    _reattach_original_multimodal_payloads([result], [source])
+
+    for log_key in ("input_message_log", "message_log"):
+        user = result[log_key][0]
+        assert user["role"] == "user"
+        assert "pixel_values" not in user
+        assert "media_token_validity_mask" not in user
+    assert result["message_log"][0]["token_ids"].eq(_NEMOTRON_MEDIA_TOKEN_ID).sum() == 0
+    _assert_nemotron_model_inputs_align(result["message_log"])
+
+
+def test_nemo_gym_non_contiguous_prefix_keeps_original_media():
+    """The retained contiguous prefix is real Gym tokens and keeps its media."""
+    pixel_values = PackedTensor(torch.zeros(1, 4), dim_to_pack=0)
+    source = _nemotron_source_prompt(pixel_values)
+    nemo_gym_result = {
+        "reward": 1.0,
+        "response": {
+            "output": [
+                _trainable_item([10, _NEMOTRON_MEDIA_TOKEN_ID], [3, 4]),
+                # The history was rewritten: the first turn is not a prefix.
+                _trainable_item([10, 9, 3, 4, 5], [6]),
+            ]
+        },
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MaskUnusableRolloutsSelf(),
+            {},
+            nemo_gym_result,
+            _UnusableRolloutTokenizer(),
+        )
+    )
+    assert result["full_result"]["_ng_unusable_rollout"] == "non_contiguous_token_chain"
+
+    _reattach_static_multimodal_payloads_to_result(result, source)
+
+    user = result["message_log"][0]
+    assert user["token_ids"].tolist() == [10, _NEMOTRON_MEDIA_TOKEN_ID]
+    assert user["pixel_values"] is pixel_values
+    assert user["media_token_validity_mask"].tolist() == [False, True]
+    assert result["input_message_log"][0]["pixel_values"] is pixel_values
+    _assert_nemotron_model_inputs_align(result["message_log"])
 
 
 @pytest.mark.nemo_gym

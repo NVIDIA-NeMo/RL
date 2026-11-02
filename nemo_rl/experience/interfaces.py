@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -22,6 +23,38 @@ NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
 NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
+# Set on a NeMo-Gym result (to the reason) when env.nemo_gym.mask_unusable_rollouts
+# replaced an untrainable rollout with a masked placeholder sample. Rollout
+# batching zeroes the loss weight of such samples whatever the mask_sample gate.
+NEMO_GYM_UNUSABLE_ROLLOUT_KEY = "_ng_unusable_rollout"
+# Reasons recorded under NEMO_GYM_UNUSABLE_ROLLOUT_KEY. Only the first one
+# replaces the Gym-authored tokens: its message log is a synthetic text/EOS
+# placeholder, so the prompt's static media must never be attached to it. The
+# second keeps the contiguous prefix of the real token chain, media included.
+NEMO_GYM_UNUSABLE_NO_GENERATION_DATA = "no_generation_data"
+NEMO_GYM_UNUSABLE_NON_CONTIGUOUS_TOKEN_CHAIN = "non_contiguous_token_chain"
+
+
+def is_synthetic_unusable_rollout(extra: Mapping[str, Any] | None) -> bool:
+    """Return whether a Gym result's message log is the no-generation placeholder.
+
+    Args:
+        extra: The Gym result (``full_result``) or a completion's ``env_extras``
+            derived from it.
+
+    Returns:
+        True only for the synthetic text/EOS placeholder that
+        ``env.nemo_gym.mask_unusable_rollouts`` emits for a result with no
+        generation data. A non-contiguous rollout reduced to its contiguous
+        prefix still carries real tokens and returns False.
+    """
+    if not extra:
+        return False
+    return (
+        extra.get(NEMO_GYM_UNUSABLE_ROLLOUT_KEY) == NEMO_GYM_UNUSABLE_NO_GENERATION_DATA
+    )
+
+
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.
 PENDING_PROMPTS_KEY = "pending_prompt_batch"
