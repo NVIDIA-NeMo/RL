@@ -103,6 +103,10 @@ def test_eagle3_draft_config_validates_ttt_fields() -> None:
     assert Eagle3DraftConfig(ttt_steps=1).ttt_steps == 1
     with pytest.raises(ValidationError, match="ttt_steps"):
         Eagle3DraftConfig(ttt_steps=0)
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        Eagle3DraftConfig(ttt_step_loss_decay=-0.5)
+    with pytest.raises(ValidationError, match="finite"):
+        Eagle3DraftConfig(ttt_step_loss_decay=float("nan"))
 
 
 def test_eagle3_draft_config_rejects_unknown_speculator_type() -> None:
