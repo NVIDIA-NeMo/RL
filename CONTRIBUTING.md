@@ -173,7 +173,7 @@ Quality documentation is essential for both the usability of NeMo RL and its abi
 
 ## Code Quality
 
-- Follow the coding guidelines in [`skills/`](skills/) — each skill covers a specific topic (style, config conventions, error handling, testing, copyright, docs)
+- Follow the coding guidelines in [`skills/`](skills/). Every code change follows the rules in [`skills/contributing/references/`](skills/contributing/references/), one file per theme (comments and docs, config, copyright, dead code, error handling, style, reuse); testing and docs have their own skills.
 - Write tests for new features
 - Update documentation to reflect your changes
 - Ensure all tests pass before submitting a PR
