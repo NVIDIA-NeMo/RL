@@ -57,6 +57,9 @@ from nemo_rl.data.multimodal_utils import (  # noqa: E402
 from nemo_rl.data_plane.schema import (  # noqa: E402
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
+    SAMPLER_TOPK_FIELDS,
+    SAMPLER_TOPK_LOGPROBS_FIELD,
+    SAMPLER_TOPK_TOKEN_IDS_FIELD,
 )
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     MEDIA_STAGING_FIELDS,
@@ -228,7 +231,7 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     receipt, expected = _stage_fixture(
         tq_client, "worked_example", rollout_id=f"{group_id}_g0"
     )
-    receipt["rollout_id"] = f"{group_id}_g0"
+    receipt["capture_key"] = f"{group_id}_g0"
     # Mark this receipt's terminal as heuristically selected so the group
     # metric sees a mixed declared/heuristic population.
     receipt["terminal_selection"] = "heuristic"
@@ -262,6 +265,14 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     assert finalized.metrics["finalize/terminal_selection_heuristic_count"] == 1.0
     assert finalized.metrics["finalize/terminal_selection_heuristic_fraction"] == 0.5
     assert finalized.metrics["finalize/terminal_selection_declared_count"] == 0.0
+    assert {
+        key
+        for key in finalized.metrics
+        if key.startswith("finalize/terminal_selection_") and key.endswith("_count")
+    } == {
+        f"finalize/terminal_selection_{method}_count"
+        for method in ("declared", "response_id", "content", "heuristic")
+    }
     assert finalized.metrics["finalize/terminal_witness_disagreement_count"] == 0.0
     assert finalized.canonical_output_tokens == sum(expected.token_mask)
 
@@ -297,12 +308,12 @@ def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
     receipt, expected = _stage_fixture(
         tq_client, "worked_example", rollout_id=f"{group_id}_g0"
     )
-    receipt["rollout_id"] = f"{group_id}_g0"
+    receipt["capture_key"] = f"{group_id}_g0"
     assert receipt["terminal_selection"] == "declared"
     # A manifest that never parsed ran no attribution stage, so the receipt
     # carries terminal_selection=None (Gym #2823, pinned 9fc05c0f) rather than a method.
     unset = {
-        "rollout_id": f"{group_id}_g1",
+        "capture_key": f"{group_id}_g1",
         "reward": 0.0,
         "terminal_model_call_id": None,
         "manifest": [],
@@ -344,6 +355,155 @@ def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
     assert sum(bucket_counts) == 1.0
 
 
+STAGING_PARTITION_TOPK = "rollout_staging_topk_fin_test"
+CANONICAL_PARTITION_TOPK = "rollout_data_topk_fin_test"
+TOPK = 3
+
+
+@pytest.fixture()
+def topk_partitions(tq_client):
+    tq_client.register_partition(
+        partition_id=STAGING_PARTITION_TOPK,
+        fields=list(STAGING_FIELDS) + list(SAMPLER_TOPK_FIELDS),
+        num_samples=64,
+        consumer_tasks=["finalize"],
+    )
+    tq_client.register_partition(
+        partition_id=CANONICAL_PARTITION_TOPK,
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+            "prompt_ids_for_adv",
+            "total_reward",
+            "mask_sample",
+            "truncated",
+            *SAMPLER_TOPK_FIELDS,
+        ],
+        num_samples=64,
+        consumer_tasks=["train"],
+    )
+    yield
+    tq_client.clear_samples(sample_ids=None, partition_id=STAGING_PARTITION_TOPK)
+    tq_client.clear_samples(sample_ids=None, partition_id=CANONICAL_PARTITION_TOPK)
+
+
+def _topk_finalizer(tq_client) -> RolloutReassembler:
+    return RolloutReassembler(
+        tq_client,
+        partition_id=CANONICAL_PARTITION_TOPK,
+        staging_partition=STAGING_PARTITION_TOPK,
+        pad_token_id=PAD,
+        max_seq_len=4096,
+        top_logprobs=TOPK,
+    )
+
+
+def _stage_fixture_with_topk(
+    tq_client, name: str, *, rollout_id: str, short_call: str | None = None
+):
+    """Stage a fixture plus a distinct top-k per call.
+
+    Returns (receipt_dict, expected LinearizedRow, expected row ids, expected
+    row log-probs); the expectation follows the row's link spans: zeros for
+    each span's carried tokens, then that call's fragment. ``short_call``
+    stages one row too few for that call.
+    """
+    records, receipt, row = build_fixture_artifacts(name, rollout_id=rollout_id)
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION_TOPK)
+    fragments = {}
+    for call_idx, record in enumerate(records):
+        generated = int(sum(record.token_mask_delta))
+        ids = torch.arange(generated * TOPK, dtype=torch.int32).reshape(generated, TOPK)
+        ids = ids + 100 * (call_idx + 1)
+        logprobs = -(torch.arange(generated * TOPK, dtype=torch.float32) + call_idx + 1)
+        logprobs = logprobs.reshape(generated, TOPK) / 10
+        if record.model_call_id == short_call:
+            ids, logprobs = ids[:-1], logprobs[:-1]
+        assert sink.stage(
+            record,
+            attachments={
+                "sampler_topk_token_ids": ids,
+                "sampler_topk_logprobs": logprobs,
+            },
+        ).ok
+        fragments[record.model_call_id] = (ids, logprobs)
+    expected_ids, expected_logprobs = [], []
+    for call_id, carry_len, _generation_len in row.link_spans:
+        ids, logprobs = fragments[call_id]
+        expected_ids += [torch.zeros((carry_len, TOPK), dtype=torch.int32), ids]
+        expected_logprobs += [torch.zeros((carry_len, TOPK)), logprobs]
+    return (
+        receipt.model_dump(),
+        row,
+        torch.cat(expected_ids),
+        torch.cat(expected_logprobs),
+    )
+
+
+def test_finalize_group_publishes_the_sampler_topk(tq_client, topk_partitions):
+    group_id = "topk_grp"
+    receipt, expected, expected_ids, expected_logprobs = _stage_fixture_with_topk(
+        tq_client, "worked_example", rollout_id=f"{group_id}_g0"
+    )
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+
+    finalized = _topk_finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],  # second rollout lost its receipt -> placeholder
+        [1.0, 0.0],
+        mask_sample=[True, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+    )
+
+    assert not finalized.dropped
+    assert set(SAMPLER_TOPK_FIELDS) <= set(finalized.meta.fields)
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=CANONICAL_PARTITION_TOPK,
+        select_fields=["token_mask", *SAMPLER_TOPK_FIELDS],
+    )
+    length = len(expected.token_ids)
+    ids = torch.as_tensor(rows[SAMPLER_TOPK_TOKEN_IDS_FIELD][0])
+    logprobs = torch.as_tensor(rows[SAMPLER_TOPK_LOGPROBS_FIELD][0])
+    assert ids.dtype == torch.int32
+    assert logprobs.dtype == torch.float32
+    assert torch.equal(ids[:length], expected_ids)
+    assert torch.equal(logprobs[:length], expected_logprobs)
+    # Token-aligned: zeros exactly on the carried (mask 0) positions.
+    generated = torch.as_tensor(rows["token_mask"][0]).flatten()[:length].bool()
+    assert not ids[:length][~generated].any()
+    assert ids[:length][generated].all()
+    placeholder = torch.as_tensor(rows[SAMPLER_TOPK_TOKEN_IDS_FIELD][1])
+    assert tuple(placeholder.shape) == (1, TOPK)
+    assert not placeholder.any()
+
+
+def test_finalize_rollout_rejects_a_topk_fragment_of_the_wrong_length(
+    tq_client, topk_partitions
+):
+    receipt, _, _, _ = _stage_fixture_with_topk(
+        tq_client, "worked_example", rollout_id="topk_short", short_call="c2"
+    )
+    row = _topk_finalizer(tq_client).finalize_rollout("topk_short", receipt, reward=1.0)
+    assert row.rejection_reason == "topk_length_mismatch:c2"
+
+
+def test_finalize_rollout_rejects_a_row_without_topk(tq_client, topk_partitions):
+    records, receipt, _ = build_fixture_artifacts("single_call", rollout_id="topk_none")
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION_TOPK)
+    for record in records:
+        assert sink.stage(record).ok
+    row = _topk_finalizer(tq_client).finalize_rollout(
+        "topk_none", receipt.model_dump(), reward=0.0
+    )
+    assert (row.rejection_reason or "").startswith("missing_staging_row")
+
+
 def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(
     tq_client, partitions
 ):
@@ -355,7 +515,7 @@ def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(
         "worked_example",
         rollout_id=physical_id,
     )
-    receipt["rollout_id"] = physical_id
+    receipt["capture_key"] = physical_id
 
     finalized = _finalizer(tq_client).finalize_group(
         group_id,
@@ -479,7 +639,7 @@ def _record_with_routes(record: StagedCallRecord, routes: list) -> StagedCallRec
         schema_version=record.schema_version,
         digest_version=record.digest_version,
         extras_digest_version=record.extras_digest_version,
-        rollout_id=record.rollout_id,
+        capture_key=record.capture_key,
         model_call_id=record.model_call_id,
         parent_call_id=record.parent_call_id,
         mode=record.mode,
@@ -643,7 +803,7 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
     coords_c1 = _stage_minf_call(
         stager,
         nemo_gym.CaptureAdmission(
-            rollout_id=rollout_id, model_call_id="c1", mode="text"
+            capture_key=rollout_id, model_call_id="c1", mode="text"
         ),
         prompt=[10, 11],
         generated=[12, 13],
@@ -656,7 +816,7 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
     coords_c2 = _stage_minf_call(
         stager,
         nemo_gym.CaptureAdmission(
-            rollout_id=rollout_id,
+            capture_key=rollout_id,
             model_call_id="c2",
             parent_call_id="c1",
             prev_len=4,
@@ -669,7 +829,7 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
         routes=routes_c2,
     )
     receipt = nemo_gym.RolloutReceipt(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         terminal_model_call_id="c2",
         manifest=[
             _manifest_from_coords(coords_c1, mode="text"),
@@ -912,9 +1072,13 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
 
     class _InjectedSource:
         def fetch_for_finalization(
-            self, staging_keys, *, include_route_fragments=False
+            self,
+            staging_keys,
+            *,
+            include_route_fragments=False,
+            include_sampler_topk=False,
         ):
-            del staging_keys, include_route_fragments
+            del staging_keys, include_route_fragments, include_sampler_topk
             return fetched
 
     finalizer._source = _InjectedSource()
@@ -1020,9 +1184,13 @@ def test_direct_extras_corruption_rejects_before_publication(
 
     class _InjectedSource:
         def fetch_for_finalization(
-            self, staging_keys, *, include_route_fragments=False
+            self,
+            staging_keys,
+            *,
+            include_route_fragments=False,
+            include_sampler_topk=False,
         ):
-            del staging_keys, include_route_fragments
+            del staging_keys, include_route_fragments, include_sampler_topk
             return fetched
 
     finalizer._source = _InjectedSource()
@@ -1072,7 +1240,7 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
     from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
     receipt = RolloutReceipt(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         terminal_model_call_id="c2",
         manifest=[_manifest(root), _manifest(child)],
         terminal_selection="declared",
@@ -1302,7 +1470,7 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
         return coords
 
     root = nemo_gym.CaptureAdmission(
-        rollout_id=rollout_id, model_call_id="c1", mode="text"
+        capture_key=rollout_id, model_call_id="c1", mode="text"
     )
     c1 = stage(
         "c1",
@@ -1312,7 +1480,7 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
         {"ng_capture": root.model_dump(mode="json")},
     )
     child = nemo_gym.CaptureAdmission(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=c1["cum_len"],
@@ -1346,7 +1514,7 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
         for c in (c1, c2)
     ]
     receipt = RolloutReceipt(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         terminal_model_call_id="c2",
         manifest=manifest,
         terminal_selection="declared",
@@ -1806,7 +1974,7 @@ def test_effort_uses_terminal_call_with_carries_and_abandoned_branch(
         )
     )
     receipt = RolloutReceipt(
-        rollout_id="effort",
+        capture_key="effort",
         reward=raw_reward,
         terminal_model_call_id=f"c{len(generations) - 1}",
         manifest=[_manifest(record) for record in records],

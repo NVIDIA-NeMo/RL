@@ -226,7 +226,7 @@ export HF_HOME="/shared/nfs/huggingface"
 - **Prefer HF_HOME**: If you already have `HF_HOME` mounted across nodes, this reduces the number of environment variables to manage.
 - **Sufficient space**: Ensure adequate disk space for the converted model checkpoints.
 
-### Force Reconvert ###
+### Force Reconvert
 
 By default, NeMo RL skips the HF → Megatron conversion if a converted checkpoint already exists at the target path. If you need to force a fresh conversion (e.g., after updating megatron-bridge or changing `hf_config_overrides`), set the following option in your config:
 

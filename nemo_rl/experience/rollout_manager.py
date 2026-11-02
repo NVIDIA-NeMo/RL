@@ -61,6 +61,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
     Completion,
     PromptGroupRecord,
 )
@@ -73,6 +74,7 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
     SiblingSealResult,
+    UnresolvedCaptureAcknowledgement,
 )
 from nemo_rl.experience.rollouts import (
     _SHARED_GENRM_METRICS,
@@ -935,6 +937,8 @@ class AsyncNemoGymRolloutImpl:
     batched through a single NeMo-Gym run_rollouts call.
     """
 
+    _forest_training: bool = False
+
     def __init__(
         self,
         tokenizer: TokenizerType,
@@ -956,6 +960,7 @@ class AsyncNemoGymRolloutImpl:
         # Length-based reward shaping for low-effort prompts; None disables it.
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        forest_training: bool = False,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -967,6 +972,7 @@ class AsyncNemoGymRolloutImpl:
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
+        self._forest_training = forest_training
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._deadline_registry = deadline_registry
         self._max_gym_row_attempts = (
@@ -976,8 +982,25 @@ class AsyncNemoGymRolloutImpl:
         ).max_gym_row_attempts
         self._stats = stats
         self._effort_config = effort_config
+        # Small integers keep Gym task IDs safe for NumPy/W&B numeric metrics.
+        self._next_nemo_gym_task_index = 0
 
         self._validate_init_params()
+
+    def get_next_nemo_gym_task_index(self) -> int:
+        """Return the next attempt ID for checkpointing."""
+        return self._next_nemo_gym_task_index
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        """Restore the next attempt ID before dispatching rollouts."""
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("next NeMo-Gym task index must be a non-negative integer")
+        self._next_nemo_gym_task_index = value
+
+    def _take_nemo_gym_task_index(self) -> int:
+        task_index = self._next_nemo_gym_task_index
+        self._next_nemo_gym_task_index += 1
+        return task_index
 
     async def run_rollout(
         self,
@@ -1006,6 +1029,7 @@ class AsyncNemoGymRolloutImpl:
 
         rollout_inputs = self._build_inputs(
             input_sample,
+            task_index=self._take_nemo_gym_task_index(),
             rollout_ids=rollout_ids,
             generation_indices=generation_indices,
         )
@@ -1086,12 +1110,20 @@ class AsyncNemoGymRolloutImpl:
         self,
         input_sample: DatumSpec,
         *,
+        task_index: int,
         rollout_ids: Optional[list[str]] = None,
         generation_indices: Optional[list[int]] = None,
     ) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
+        # One fresh ID per run_rollout attempt, shared by all sibling rows.
+        # Gym keys rollouts by task + rollout index (observability capture when
+        # no _ng_rollout_id is set, Harbor job folders), so a repeated dataset
+        # ID would reuse an earlier attempt's key. Unlike the async collector,
+        # this is NOT the prompt's dataloader position. Do not mutate the source
+        # sample. Row-level redispatch reuses these rows and keeps the same ID.
+        template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
 
         # We do not translate max_seq_len into row-level max_tokens here because that would
         # change semantics from "total sequence length" to "max new tokens".
@@ -1178,10 +1210,12 @@ class AsyncNemoGymRolloutImpl:
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
 
-        # Read here, not in the actor: the scope is a ContextVar in this
-        # process, and NemoGym is a separate Ray actor.
+        options: dict[str, Any] = {"num_returns": "streaming"}
+        if self._forest_training:
+            options["max_task_retries"] = 0
+        # Capture retries belong to the recovery ledger, not Ray task retries.
         async for result_ref in dispatch_with_trace_context(
-            nemo_gym_env.run_rollouts.options(num_returns="streaming"),
+            nemo_gym_env.run_rollouts.options(**options),
             pending,
             timer_prefix,
             per_prompt=in_per_prompt_scope(),
@@ -1302,7 +1336,8 @@ class AsyncNemoGymRolloutImpl:
             last_error: Optional[Exception] = None
             max_row_attempts = (
                 1
-                if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+                if self._forest_training
+                or recovery_granularity is RecoveryGranularity.PROMPT_GROUP
                 else self._max_gym_row_attempts
             )
             async with _Deadline(
@@ -1477,13 +1512,19 @@ class AsyncNemoGymRolloutImpl:
                 env_extras = dict(completion_extras(result["full_result"]))
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
+                if self._forest_training:
+                    if "logical_selection" not in result:
+                        raise ValueError(
+                            "Forest dispatch requires an ordered response selection for every owner"
+                        )
+                    env_extras["ng_logical_selection"] = result["logical_selection"]
                 env_extras["ng_reward_checks"] = result.get("reward_checks")
                 env_extras["ng_reward_log_context"] = result.get("reward_log_context")
                 completions.append(
                     Completion(
                         message_log=result["message_log"],
                         env_extras=env_extras,
-                        truncated=False,
+                        truncated=bool(result.get("truncated")),
                         # Same defensive read the receipt producer uses
                         # (nemo_gym._postprocess_receipt_mode): a gym result with
                         # no reward finalizes as 0.0 rather than a KeyError.
@@ -1536,13 +1577,29 @@ class AsyncNemoGymRolloutImpl:
             completions[0].env_extras or {}
         )
         if receipt_mode:
-            # Token-free receipts: token accounting comes from the manifest
-            # (cum_len of the deepest chain; delta sums as the generation
-            # proxy) instead of a message_log walk.
-            manifests = [
-                (((c.env_extras or {}).get("ng_receipt") or {}).get("manifest") or [])
-                for c in completions
-            ]
+            # A receipt knows context lengths, not generation lengths. Exact
+            # output metrics are emitted after staged tensors are verified by
+            # the reassembler; delta_len includes input and is not a proxy.
+            if self._forest_training:
+                manifests = [
+                    [
+                        record
+                        for record in ((c.env_extras or {})["ng_receipt"] or {}).get(
+                            "manifest", []
+                        )
+                        if record.get("response_id")
+                        in (c.env_extras or {})["ng_logical_selection"].response_ids
+                    ]
+                    for c in completions
+                ]
+            else:
+                manifests = [
+                    (
+                        ((c.env_extras or {}).get("ng_receipt") or {}).get("manifest")
+                        or []
+                    )
+                    for c in completions
+                ]
             # .get with 0: _assemble_receipt ships raw ledger rows unvalidated
             # when CallRecord validation fails (it only stamps
             # capture_poisoned), so a malformed row must degrade a metric, not
@@ -1550,13 +1607,6 @@ class AsyncNemoGymRolloutImpl:
             turn_count = [len(m) for m in manifests]
             total_tokens = [
                 max((entry.get("cum_len", 0) for entry in m), default=0)
-                for m in manifests
-            ]
-            assistant_tokens = [
-                sum(entry.get("delta_len", 0) for entry in m) for m in manifests
-            ]
-            max_gen_tokens_per_turn = [
-                max((entry.get("delta_len", 0) for entry in m), default=0)
                 for m in manifests
             ]
         else:
@@ -1606,11 +1656,6 @@ class AsyncNemoGymRolloutImpl:
             "turns_per_sample/p99": pct(turn_count, 99),
             # token metrics
             **calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
-            **calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
-            **calculate_single_metric(
-                max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
-            ),
-            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
             # truncated metrics
             "natural_termination_rate": sum(not t for t in truncated) / n,
             "truncation_rate": truncation_rate,
@@ -1619,19 +1664,35 @@ class AsyncNemoGymRolloutImpl:
 
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
-        if full_results is not None:
-            agent_extras = [dict(full_result) for full_result in full_results]
-        else:
-            agent_extras = [
-                {
-                    k: v
-                    for k, v in (c.env_extras or {}).items()
-                    if k
-                    not in ("ng_receipt", "ng_reward_checks", "ng_reward_log_context")
-                    and not (receipt_mode and k == "reward")
-                }
-                for c in completions
-            ]
+        agent_results = (
+            full_results
+            if full_results is not None
+            else [c.env_extras or {} for c in completions]
+        )
+        agent_extras = [
+            {
+                k: v
+                for k, v in result.items()
+                if k
+                not in (
+                    "ng_receipt",
+                    "ng_logical_selection",
+                    "ng_reward_checks",
+                    "ng_reward_log_context",
+                )
+                and not (
+                    receipt_mode
+                    and k
+                    in (
+                        "reward",
+                        "gen_tokens_per_sample",
+                        "max_gen_tokens_per_turn",
+                        "mean_gen_tokens_per_sample",
+                    )
+                )
+            }
+            for result in agent_results
+        ]
         for key in agent_extras[0].keys():
             if key in _SHARED_GENRM_METRICS:
                 continue
@@ -1653,11 +1714,23 @@ class AsyncNemoGymRolloutImpl:
                 total_tokens, n, f"{agent_name}/total_tokens_per_sample"
             )
         )
-        rollout_metrics.update(
-            calculate_single_metric(
-                assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
+        if not receipt_mode:
+            rollout_metrics.update(
+                calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample")
             )
-        )
+            rollout_metrics.update(
+                calculate_single_metric(
+                    max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
+                )
+            )
+            rollout_metrics["max_gen_tokens_per_turn/p95"] = pct(
+                max_gen_tokens_per_turn, 95
+            )
+            rollout_metrics.update(
+                calculate_single_metric(
+                    assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
+                )
+            )
         if self._log_full_result_tables and not receipt_mode:
             rollout_metrics[f"{agent_name}/full_result"] = Table(
                 data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
@@ -1665,9 +1738,10 @@ class AsyncNemoGymRolloutImpl:
             )
 
         # Necessary for downstream nemo rl logging/printing.
-        rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
-            "gen_tokens_per_sample/mean"
-        ]
+        if not receipt_mode:
+            rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
+                "gen_tokens_per_sample/mean"
+            ]
         return rollout_metrics
 
 
@@ -1692,6 +1766,8 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        forest_training: bool = False,
+        execution_row_multiple: int = 1,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1708,6 +1784,10 @@ class RolloutManager:
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
         self._request_deadlines = RequestDeadlineRegistry()
+        self._forest_training = forest_training
+        self._execution_row_multiple = execution_row_multiple
+        if forest_training and not use_nemo_gym:
+            raise ValueError("forest training requires the NeMo-Gym rollout path")
 
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -1740,6 +1820,7 @@ class RolloutManager:
             retry_policy=self._retry_policy,
             stats=self._stats,
             effort_config=effort_config,
+            forest_training=forest_training,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
@@ -1760,6 +1841,11 @@ class RolloutManager:
         # deliberately: the question it answers -- "is the fleet still answering
         # anyone?" -- is about the fleet, not about one prompt's history.
         self._consecutive_infra_drops: int = 0
+
+    @property
+    def execution_row_multiple(self) -> int:
+        """Return the resolved row divisibility used to publish forest groups."""
+        return self._execution_row_multiple
 
     @property
     def stats(self) -> RolloutStats:
@@ -1899,6 +1985,17 @@ class RolloutManager:
             version: Trainer weight version to stamp on future rollout tags.
         """
         self._weight_version = int(version)
+
+    def get_next_nemo_gym_task_index(self) -> int:
+        """Return the Gym attempt counter, or zero for native rollouts."""
+        if isinstance(self._impl, AsyncNemoGymRolloutImpl):
+            return self._impl.get_next_nemo_gym_task_index()
+        return 0
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        """Restore the attempt counter for Gym rollouts only."""
+        if isinstance(self._impl, AsyncNemoGymRolloutImpl):
+            self._impl.set_next_nemo_gym_task_index(value)
 
     async def run_rollout(
         self,
@@ -2214,6 +2311,12 @@ class RolloutManager:
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
         )
+        if (
+            self._forest_training
+            and "loss_multiplier" in input_sample
+            and input_sample["loss_multiplier"] != 1.0
+        ):
+            raise ValueError("Forest currently requires unit dataset loss_multiplier")
         owns_recovery_group = lineage_group_id is None
         recovery_group_id = lineage_group_id
         if recovery_group_id is None:
@@ -2247,6 +2350,8 @@ class RolloutManager:
                     inflight_registry=inflight_registry,
                 )
             except Exception as error:
+                if isinstance(error, UnresolvedCaptureAcknowledgement):
+                    raise
                 reason = type(error).__name__
                 if classify_rollout_failure(error) is FailureClass.INFRA:
                     infra_attempts += 1
@@ -2356,6 +2461,13 @@ class RolloutManager:
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
+            selection = None
+            if self._forest_training:
+                selection = env_extras.get("ng_logical_selection")
+                if not selection:
+                    raise ValueError(
+                        "Forest completion must contain selected responses"
+                    )
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
                 raise ValueError(
@@ -2377,10 +2489,10 @@ class RolloutManager:
                     f"result={gate_rollout_id!r}, "
                     f"expected={expected_gate_rollout_id!r}"
                 )
-            if receipt is not None and receipt.get("rollout_id") != gate_rollout_id:
+            if receipt is not None and receipt.get("capture_key") != gate_rollout_id:
                 raise ValueError(
                     "receipt rollout identity mismatch: "
-                    f"receipt={receipt.get('rollout_id')!r}, "
+                    f"receipt={receipt.get('capture_key')!r}, "
                     f"expected={gate_rollout_id!r}"
                 )
             mask_sample = bool(
@@ -2399,6 +2511,7 @@ class RolloutManager:
                     resolved_agent_name=resolved_agent_name,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
+                    logical_selection=selection,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2431,6 +2544,7 @@ class RolloutManager:
                     resolved_agent_name=resolved_agent_name,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
+                    logical_selection=selection,
                 )
 
         try:
@@ -2477,12 +2591,27 @@ class RolloutManager:
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
+                logical_selections=(
+                    tuple(
+                        sibling.current_attempt.logical_selection
+                        for sibling in self._recovery_ledger.get_group(
+                            group_id
+                        ).siblings
+                    )
+                    if self._forest_training
+                    else None
+                ),
+                execution_row_multiple=self._execution_row_multiple,
                 resolved_agent_name=self._recovery_ledger.get_group(
                     group_id
                 ).resolved_agent_name,
             )
             assert_metadata_only(request)
             return request
+        except UnresolvedCaptureAcknowledgement:
+            # Neither retry nor abandon an attempt whose capture writes may still
+            # be in flight. Surface the failure with its ledger ownership intact.
+            raise
         except BaseException:
             # Abandoned dispatch: no receipt will name these rollouts' staged
             # rows, so they leak until the staging partition is torn down at

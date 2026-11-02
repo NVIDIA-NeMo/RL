@@ -401,6 +401,7 @@ def _stub_gym_spinup(run_helper):
     server_utils = types.ModuleType("nemo_gym.server_utils")
     server_utils.HEAD_SERVER_KEY_NAME = "head_server"
     server_utils.BaseServerConfig = MagicMock
+    server_utils.ServerClient = MagicMock
     with (
         patch.dict(
             sys.modules,
@@ -417,6 +418,46 @@ def _stub_gym_spinup(run_helper):
     ):
         mock_ray.get_runtime_context.return_value.gcs_address = "10.0.0.1:6379"
         yield
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize("forest_training", [False, True])
+def test_spinup_passes_parent_resolution_to_gym(forest_training, tmp_path, monkeypatch):
+    from nemo_gym.token_id_capture.config import TokenIdCaptureConfig
+
+    monkeypatch.setenv("NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN", "test-control")
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__(
+        {
+            "model_name": "test-model",
+            "base_urls": [],
+            "initial_global_config_dict": {},
+            "token_capture": {
+                "enabled": True,
+                "forest_training": forest_training,
+                "selection_policy": "returned_history",
+                "generation_backend": "vllm",
+                "capture_dir": str(tmp_path),
+                "control_auth_token": "test-control",
+            },
+        }
+    )
+    run_helper = MagicMock()
+    run_helper.start.side_effect = RuntimeError("stop before server startup")
+    with (
+        _stub_gym_spinup(run_helper),
+        pytest.raises(RuntimeError, match="stop before server startup"),
+    ):
+        actor._spinup()
+    config = run_helper.start.call_args.kwargs[
+        "global_config_dict_parser_config"
+    ].initial_global_config_dict
+    capture = TokenIdCaptureConfig.model_validate(dict(config)).token_id_capture
+    assert capture.parent_resolution == (
+        "source_history" if forest_training else "fingerprint"
+    )
+    assert "framework_owned_context" not in config["token_id_capture"]
 
 
 def test_spinup_stops_local_gym_servers_when_external_services_time_out():

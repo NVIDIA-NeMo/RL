@@ -22,7 +22,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -52,6 +52,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutRecoveryState,
@@ -1124,6 +1125,91 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         assert ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
+
+
+@pytest.mark.parametrize("row_counts", [(3, 4), (7, 8), (3, 8)])
+@pytest.mark.parametrize("threshold", [None, 0.75, 0.8])
+@pytest.mark.parametrize("forest_training", [False, True])
+def test_min_valid_fraction_counts_rollouts_independently_of_segments(
+    row_counts: tuple[int, int],
+    threshold: float | None,
+    forest_training: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    valid_rows, total_rows = row_counts
+    # Three of four owners verified, regardless of how many rows they produced.
+    # Ordinary capture has one row per owner and needs no forest metrics.
+    finalized = FinalizedGroup(
+        meta=None,
+        group_min_wv=0,
+        group_max_wv=0,
+        staging_keys=[],
+        valid_row_count=valid_rows,
+        total_row_count=total_rows,
+        metrics=(
+            {
+                "finalize/logical_owner_count": 4.0,
+                "finalize/valid_logical_owner_count": 3.0,
+            }
+            if forest_training
+            else {}
+        ),
+    )
+    fraction = 0.75 if forest_training else valid_rows / total_rows
+    dropped = threshold is not None and fraction < threshold
+
+    async def run() -> None:
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(
+                min_valid_fraction_per_group=threshold, forest_training=forest_training
+            ),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        request = SimpleNamespace(group_id="group")
+        ctrl._rollout_manager = SimpleNamespace(
+            generate_for_finalization=AsyncMock(return_value=request),
+            record_finalizer_dropped_prompt=MagicMock(),
+            stats=SimpleNamespace(committed=0),
+        )
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = AsyncMock(return_value=finalized)
+        ctrl._discard_committed_group = AsyncMock()
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await ctrl._rollout_pump()
+
+        assert ctrl._rollout_manager.stats.committed == int(not dropped)
+        assert ctrl._buffer_capacity._value == int(dropped)
+        assert ctrl._inflight_rollouts == 0
+        assert ctrl._rollout_exhausted.is_set()
+        if dropped:
+            ctrl._discard_committed_group.assert_awaited_once_with(request)
+            ctrl._rollout_manager.record_finalizer_dropped_prompt.assert_called_once()
+        else:
+            ctrl._discard_committed_group.assert_not_awaited()
+            ctrl._rollout_manager.record_finalizer_dropped_prompt.assert_not_called()
+
+    asyncio.run(run())
+    if dropped and forest_training:
+        assert "(3/4 < 0.8)" in capsys.readouterr().out
 
 
 def test_actor_path_releases_generation_permit_before_finalization() -> None:
