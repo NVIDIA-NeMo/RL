@@ -68,6 +68,7 @@ from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noq
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     _GENERATION_CUT_ROUTE,
     _PENDING_ENGINE_REQUEST_CAPTURE,
+    _AsyncLLMHTTPClient,
     VllmAsyncGenerationWorkerImpl,
     _classify_restored_prefix_terminal,
     _count_restored_prefix_as_completion,
@@ -595,8 +596,21 @@ def test_tokens_read_by_both_a_cut_and_the_finished_output_are_recorded_once():
     assert state.generated_token_ids == [12, 13, 14]
 
 
-def _engine_request(token_ids: list[int], logprobs: list[float]) -> SimpleNamespace:
+def _engine_request(
+    token_ids: list[int],
+    logprobs: list[float],
+    *,
+    request_id: str = "chatcmpl-1",
+    finish_reason: str | None = None,
+) -> SimpleNamespace:
+    """The RequestState fields a progress read touches."""
+    final = SimpleNamespace(
+        outputs=[SimpleNamespace(finish_reason=finish_reason, stop_reason=None)]
+    )
     return SimpleNamespace(
+        request_id=f"{request_id}-internal",
+        external_req_id=request_id,
+        queue=SimpleNamespace(output=final),
         detokenizer=SimpleNamespace(output_token_ids=list(token_ids)),
         logprobs_processor=SimpleNamespace(
             logprobs=[
@@ -607,20 +621,112 @@ def _engine_request(token_ids: list[int], logprobs: list[float]) -> SimpleNamesp
     )
 
 
-@pytest.fixture
-def engine_loop():
-    loop = asyncio.new_event_loop()
-    thread = threading.Thread(target=loop.run_forever, daemon=True)
-    thread.start()
-    yield loop
-    loop.call_soon_threadsafe(loop.stop)
-    thread.join(timeout=5)
-    loop.close()
+class _OutputProcessor:
+    """vLLM 0.29's OutputProcessor surface: live requests and the two hooks."""
+
+    def __init__(self, *requests: SimpleNamespace) -> None:
+        self.request_states = {r.request_id: r for r in requests}
+        self.external_req_ids = {r.external_req_id: [r.request_id] for r in requests}
+        self.processed_under_lock: list[bool] = []
+
+    def process_outputs(self, client) -> None:
+        self.processed_under_lock.append(client._progress_lock._is_owned())
+
+    def _finish_request(self, req_state) -> None:
+        self.request_states.pop(req_state.request_id)
+        del self.external_req_ids[req_state.external_req_id]
 
 
-def test_cut_reads_each_call_progress_from_vllm_request_state(engine_loop):
+def _progress_client(monkeypatch, processor: _OutputProcessor) -> _AsyncLLMHTTPClient:
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.importlib.metadata.version",
+        lambda name: "0.29.0",
+    )
+    engine = SimpleNamespace(
+        output_processor=processor,
+        model_config=None,
+        renderer=None,
+        input_processor=None,
+        vllm_config=None,
+    )
+    client = _AsyncLLMHTTPClient(engine, MagicMock(), flat_logprobs=False)
+    client.enable_generation_progress_reads()
+    return client
+
+
+def test_vllm_processes_outputs_under_the_progress_lock(monkeypatch):
+    processor = _OutputProcessor()
+    client = _progress_client(monkeypatch, processor)
+
+    processor.process_outputs(client)
+
+    assert processor.processed_under_lock == [True]
+
+
+def test_finished_request_stays_readable_until_its_consumer_is_done(monkeypatch):
+    request = _engine_request([20, 21], [-0.1, -0.2], finish_reason="stop")
+    unserved = _engine_request([30], [-0.3], request_id="offline-1")
+    processor = _OutputProcessor(request, unserved)
+    client = _progress_client(monkeypatch, processor)
+    client._serving_request_ids.add("chatcmpl-1")
+
+    processor._finish_request(request)
+    processor._finish_request(unserved)
+    read = client.read_generation_progress(
+        [("chatcmpl-1", 1), ("offline-1", 0)], timeout_s=None
+    )
+
+    [finished, gone] = read.progress
+    assert (finished.token_ids, finished.finish_reason) == ([21], "stop")
+    # Only requests this client serves are kept after they finish.
+    assert gone is None
+    assert "offline-1" not in client._finished_requests
+
+
+def test_finished_request_is_released_once_its_consumer_has_the_output(monkeypatch):
+    request = _engine_request([20], [-0.1], finish_reason="length")
+    processor = _OutputProcessor(request)
+    client = _progress_client(monkeypatch, processor)
+
+    async def consume() -> list:
+        client._engine_loop = asyncio.get_running_loop()
+        seen = []
+
+        async def engine_generate(*args, **kwargs):
+            processor._finish_request(request)
+            yield "final output"
+
+        client._engine_client.generate = engine_generate
+        async for output in client._generate("prompt", None, "chatcmpl-1", {}):
+            # The consumer records the output while vLLM's state is still kept.
+            seen.append(client._finished_requests["chatcmpl-1"].finish_reason)
+        return seen
+
+    assert asyncio.run(consume()) == ["length"]
+    assert client._finished_requests == {}
+    assert client._serving_request_ids == set()
+
+
+def test_progress_reads_refuse_an_unchecked_vllm(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.importlib.metadata.version",
+        lambda name: "0.30.1",
+    )
+    engine = SimpleNamespace(
+        output_processor=_OutputProcessor(),
+        model_config=None,
+        renderer=None,
+        input_processor=None,
+        vllm_config=None,
+    )
+    client = _AsyncLLMHTTPClient(engine, MagicMock(), flat_logprobs=False)
+
+    with pytest.raises(RuntimeError, match="checked on vLLM 0.29.x"):
+        client.enable_generation_progress_reads()
+
+
+def test_cut_reads_each_call_progress_from_vllm_request_state(monkeypatch):
     worker = _worker_with_capture(_MemorySink())
-    worker._engine_loop = engine_loop
     decoding, resumed, finished, unsubmitted = (
         worker._capture_calls[id(_captured_text_call(worker, call_id))]
         for call_id in ("c1", "c2", "c3", "c4")
@@ -629,16 +735,18 @@ def test_cut_reads_each_call_progress_from_vllm_request_state(engine_loop):
     resumed.engine_request_id = "chatcmpl-2"
     finished.engine_request_id = "chatcmpl-3"
     resumed.observe([30], [-0.3])  # recorded by an earlier cut
-    worker.llm = SimpleNamespace(
-        output_processor=SimpleNamespace(
-            external_req_ids={"chatcmpl-1": ["i1"], "chatcmpl-2": ["i2"]},
-            request_states={
-                "i1": _engine_request([20, 21], [-0.1, -0.2]),
-                # The earlier cut's position is not read again.
-                "i2": _engine_request([30, 31], [-9.0, -0.4]),
-            },
-        )
+    done = _engine_request(
+        [40, 41], [-0.5, -0.6], request_id="chatcmpl-3", finish_reason="stop"
     )
+    processor = _OutputProcessor(
+        _engine_request([20, 21], [-0.1, -0.2]),
+        # The earlier cut's position is not read again.
+        _engine_request([30, 31], [-9.0, -0.4], request_id="chatcmpl-2"),
+        done,
+    )
+    worker._http_engine_client = _progress_client(monkeypatch, processor)
+    worker._http_engine_client._serving_request_ids.add("chatcmpl-3")
+    processor._finish_request(done)
 
     VllmAsyncGenerationWorkerImpl._record_generation_progress(
         worker, [decoding, resumed, finished, unsubmitted], deadline=None
@@ -652,30 +760,45 @@ def test_cut_reads_each_call_progress_from_vllm_request_state(engine_loop):
         [30, 31],
         [-0.3, -0.4],
     )
-    # Gone from vLLM, or never submitted: they keep what they recorded.
-    assert finished.generated_token_ids == unsubmitted.generated_token_ids == []
+    # Finished but not yet taken by its consumer: read whole, with its reason.
+    assert finished.generated_token_ids == [40, 41]
+    assert finished.terminal_finish_reason == "stop"
+    # Never submitted: it keeps what it recorded.
+    assert unsubmitted.generated_token_ids == []
     assert all(
         state.observation_error is None
         for state in (decoding, resumed, finished, unsubmitted)
     )
+    counts = _cut_counts(worker)
+    assert (counts["progress_reads"], counts["progress_read_calls"]) == (1, 3)
 
 
-def test_cut_past_its_deadline_skips_reading_vllm_progress(engine_loop, caplog):
+def test_cut_past_its_deadline_skips_reading_vllm_progress(monkeypatch, caplog):
     worker = _worker_with_capture(_MemorySink())
-    worker._engine_loop = engine_loop
     state = worker._capture_calls[id(_captured_text_call(worker))]
     state.engine_request_id = "chatcmpl-1"
-    worker.llm = SimpleNamespace(output_processor=MagicMock())
-    engine_busy = threading.Event()
-    engine_loop.call_soon_threadsafe(engine_busy.wait)
+    client = _progress_client(
+        monkeypatch, _OutputProcessor(_engine_request([20], [-0.1]))
+    )
+    worker._http_engine_client = client
+    vllm_busy, release = threading.Event(), threading.Event()
 
+    def process_a_long_chunk():
+        with client._progress_lock:
+            vllm_busy.set()
+            release.wait(timeout=5)
+
+    vllm = threading.Thread(target=process_a_long_chunk)
+    vllm.start()
+    vllm_busy.wait(timeout=5)
     try:
         with caplog.at_level(logging.WARNING):
             VllmAsyncGenerationWorkerImpl._record_generation_progress(
                 worker, [state], deadline=time.monotonic()
             )
     finally:
-        engine_busy.set()
+        release.set()
+        vllm.join(timeout=5)
 
     assert state.generated_token_ids == []
     assert "could not read vLLM's progress before its deadline" in caplog.text
@@ -1096,11 +1219,10 @@ def test_generation_cut_stages_prefix_then_terminal_row_replaces_it():
     assert worker._capture_calls_by_model_call_id == {}
 
 
-def test_generation_cut_stages_the_tokens_it_reads_from_vllm(engine_loop):
+def test_generation_cut_stages_the_tokens_it_reads_from_vllm(monkeypatch):
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     worker._generation_prefix_cuts_enabled = True
-    worker._engine_loop = engine_loop
     request = _captured_text_call(worker)
     state = worker._capture_calls[id(request)]
     with state.lock:
@@ -1111,12 +1233,8 @@ def test_generation_cut_stages_the_tokens_it_reads_from_vllm(engine_loop):
         VllmAsyncGenerationWorkerImpl._bind_capture_engine_request(worker, "chatcmpl-1")
     finally:
         _PENDING_ENGINE_REQUEST_CAPTURE.reset(token)
-    engine_request = _engine_request([20, 21], [-0.1, -0.2])
-    worker.llm = SimpleNamespace(
-        output_processor=SimpleNamespace(
-            external_req_ids={"chatcmpl-1": ["i1"]},
-            request_states={"i1": engine_request},
-        )
+    worker._http_engine_client = _progress_client(
+        monkeypatch, _OutputProcessor(_engine_request([20, 21], [-0.1, -0.2]))
     )
     inventory = _single_call_inventory()
 
