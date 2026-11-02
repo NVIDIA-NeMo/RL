@@ -312,6 +312,19 @@ gate a heterogeneous job uses, built from the pool's manifest. Then it runs
 Restarting the pool job always changes its URLs; resubmit attached training jobs
 afterwards (a queued one resolves the new URLs when it starts).
 
+### Starting before the pool is READY
+
+A pool job publishes `manifest.tsv` (and `pools.env`) as soon as its load balancers are placed, which fixes every URL,
+and writes `READY` only once every load balancer counts all its replicas healthy. By default `attach_and_run.sh` waits
+for `READY` before it runs `ray.sub`, so Ray, the trainer and Gym initialization start only after the judges have
+loaded. With `EXTERNAL_VLLM_ATTACH_EARLY=1` it waits for the manifest instead (the same pool job generation and a fresh
+heartbeat are still required) and starts `ray.sub` immediately. The readiness gate that replaces
+`__EXTERNAL_SERVICE_READINESS__` still holds rollout setup until every pool reports its full backend count, so this
+overlaps initialization with model loading, as an inline heterogeneous job does, without letting rollouts start early.
+
+To start the training allocation together with a pool that is still queued, submit the pool job held (`--hold`), submit
+the training job without an `after:` dependency on it, and release the pool job when the training allocation starts.
+
 ### Settings
 
 | Variable | Default | Purpose |
@@ -329,3 +342,4 @@ afterwards (a queued one resolves the new URLs when it starts).
 | `EXTERNAL_VLLM_POOL_GONE_CHECKS` | `3` | Consecutive "finished or unknown" Slurm answers before the pool job counts as gone. |
 | `EXTERNAL_VLLM_ATTACH_REQUIRE_LIFETIME` | `0` | `1` refuses to start a training job that would outlive the pool job. |
 | `EXTERNAL_VLLM_ATTACH_AFTER_MIN` | `15` | Minutes after the pool job starts before a training job submitted against a loading pool may start. |
+| `EXTERNAL_VLLM_ATTACH_EARLY` | `0` | `1` starts `ray.sub` as soon as the pool job has published its URLs instead of once every replica is healthy. See [Starting before the pool is READY](#starting-before-the-pool-is-ready). |

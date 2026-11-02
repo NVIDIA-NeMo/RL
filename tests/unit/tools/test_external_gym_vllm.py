@@ -1260,6 +1260,32 @@ def test_serve_mode_requires_a_pool_dir_and_rejects_unknown_modes(tmp_path):
     assert "EXTERNAL_VLLM_MODE must be inline or serve, got: attach" in result.stderr
 
 
+
+def test_serve_mode_publishes_the_manifest_before_the_pools_are_healthy(tmp_path):
+    pool_dir = tmp_path / "pool"
+    env = _serve_env(tmp_path)
+    stub_log = Path(env["STUB_LOG"])
+    # No load balancer counts a healthy backend yet, so the pool cannot be READY.
+    (stub_log / "healthy_9213").write_text("0\n")
+    (stub_log / "healthy_9214").write_text("0\n")
+    process = _start(_WRAPPER, env, tmp_path / "serve.out")
+    try:
+        # The URLs are fixed once the load balancers are placed, well before READY.
+        _wait_for(
+            (pool_dir / "manifest.tsv").exists, 60, "manifest was not published early"
+        )
+        assert "http://127.0.0.1:9213/v1" in (pool_dir / "manifest.tsv").read_text()
+        assert (pool_dir / "pools.env").exists()
+        assert not (pool_dir / "READY").exists()
+        (stub_log / "healthy_9213").unlink()
+        (stub_log / "healthy_9214").unlink()
+        _wait_for((pool_dir / "READY").exists, 60, "pools never published READY")
+        # READY does not change what was published.
+        assert "http://127.0.0.1:9213/v1" in (pool_dir / "manifest.tsv").read_text()
+    finally:
+        _stop(process)
+
+
 def test_serve_mode_publishes_relaunches_and_withdraws_ready_while_degraded(tmp_path):
     pool_dir = tmp_path / "pool"
     env = _serve_env(tmp_path, STUB_END_TIME="2026-10-14T06:00:00")
@@ -1533,6 +1559,54 @@ def test_attach_and_run_resolves_urls_and_the_readiness_gate_from_the_manifest(
         "timeout_seconds:900,poll_interval_seconds:5,request_timeout_seconds:10}'"
     )
     assert not (pool_dir / "attached" / "900").exists()
+
+
+
+def test_attach_and_run_early_starts_ray_sub_once_the_manifest_is_published(tmp_path):
+    pool_dir = _published_pool(tmp_path)
+    (pool_dir / "READY").unlink()  # replicas are still loading
+    env = _attach_env(tmp_path, EXTERNAL_VLLM_ATTACH_EARLY="1")
+    result = subprocess.run(
+        ["bash", str(_ATTACH)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    assert "manifest published, replicas still loading" in result.stdout
+    # The driver command still carries the readiness gate that waits for the backends.
+    assert "external_service_readiness=" in (tmp_path / "command_seen").read_text()
+    assert "a=http://10.0.0.1:9213/v1" in (tmp_path / "command_seen").read_text()
+
+
+@pytest.mark.parametrize("early", ["0", "1"])
+def test_attach_and_run_waits_for_ready_unless_early_is_set(tmp_path, early):
+    pool_dir = _published_pool(tmp_path)
+    (pool_dir / "READY").unlink()
+    env = _attach_env(
+        tmp_path, EXTERNAL_VLLM_ATTACH_EARLY=early, EXTERNAL_VLLM_ATTACH_TIMEOUT="1"
+    )
+    result = subprocess.run(
+        ["bash", str(_ATTACH)], env=env, capture_output=True, text=True, timeout=60
+    )
+    if early == "1":
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "command_seen").exists()
+    else:
+        assert result.returncode != 0
+        assert "pool job 555 not READY after 1s" in result.stderr
+        assert not (tmp_path / "command_seen").exists()
+
+
+def test_attach_and_run_early_does_not_trust_a_manifest_from_another_job(tmp_path):
+    pool_dir = _published_pool(tmp_path)
+    (pool_dir / "READY").unlink()
+    (pool_dir / "generation").write_text("444-0\n")
+    env = _attach_env(
+        tmp_path, EXTERNAL_VLLM_ATTACH_EARLY="1", EXTERNAL_VLLM_ATTACH_TIMEOUT="1"
+    )
+    result = subprocess.run(
+        ["bash", str(_ATTACH)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode != 0
+    assert not (tmp_path / "command_seen").exists()
 
 
 def test_attach_and_run_requires_the_readiness_placeholder(tmp_path):

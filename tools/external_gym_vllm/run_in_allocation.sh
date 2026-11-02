@@ -820,6 +820,31 @@ for pool in "${pool_names[@]}"; do
   fi
 done
 
+# publish_manifest: write manifest.tsv, pools.env and <pool>_url. Serve mode only. The URLs are fixed as soon as every
+# load balancer is placed, which is long before any replica is healthy, so this runs right after placement and an
+# attaching job can start ray.sub then. READY, written only once every replica is healthy, stays the "usable" signal.
+publish_manifest() {
+  {
+    echo "# External vLLM pools from Slurm job ${SLURM_JOB_ID}, generation ${pool_generation}"
+    printf '# pool\tbase_url\thealth_url\texpected_backends\tserved_model_name\tstartup_timeout\n'
+    for pool in "${pool_names[@]}"; do
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${pool}" "${pool_urls[${pool}]}" "${health_urls[${pool}]}" \
+        "${replicas[${pool}]}" "${served_model_names[${pool}]}" "${startup_timeouts[${pool}]}"
+    done
+  } > "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv.tmp"
+  mv "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv.tmp" "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv"
+  : > "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp"
+  for pool in "${pool_names[@]}"; do
+    echo "${pool_urls[${pool}]}" > "${EXTERNAL_VLLM_POOL_DIR}/${pool,,}_url"
+    echo "${pool}=${pool_urls[${pool}]}" >> "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp"
+  done
+  mv "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp" "${EXTERNAL_VLLM_POOL_DIR}/pools.env"
+}
+if [[ "${EXTERNAL_VLLM_MODE}" == serve ]]; then
+  publish_manifest
+  echo "[INFO] $(date -Iseconds) manifest published (URLs fixed); replicas still loading"
+fi
+
 if [[ "${EXTERNAL_VLLM_MODE}" == inline ]]; then
   external_service_readiness_override+='],timeout_seconds:'
   external_service_readiness_override+="${max_startup_timeout}"
@@ -917,21 +942,8 @@ if [[ "${EXTERNAL_VLLM_MODE}" == serve ]]; then
 
   # Publish, READY last. manifest.tsv is what attach_and_run.sh reads; the
   # <pool>_url files and pools.env are for launchers that read single URLs.
-  {
-    echo "# External vLLM pools from Slurm job ${SLURM_JOB_ID}, generation ${pool_generation}"
-    printf '# pool\tbase_url\thealth_url\texpected_backends\tserved_model_name\tstartup_timeout\n'
-    for pool in "${pool_names[@]}"; do
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${pool}" "${pool_urls[${pool}]}" "${health_urls[${pool}]}" \
-        "${replicas[${pool}]}" "${served_model_names[${pool}]}" "${startup_timeouts[${pool}]}"
-    done
-  } > "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv.tmp"
-  mv "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv.tmp" "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv"
-  : > "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp"
-  for pool in "${pool_names[@]}"; do
-    echo "${pool_urls[${pool}]}" > "${EXTERNAL_VLLM_POOL_DIR}/${pool,,}_url"
-    echo "${pool}=${pool_urls[${pool}]}" >> "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp"
-  done
-  mv "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp" "${EXTERNAL_VLLM_POOL_DIR}/pools.env"
+  # Already published right after the load balancers were placed; rewrite so the files reflect the final state.
+  publish_manifest
 
   ready_published=0
   publish_ready() {
