@@ -706,6 +706,59 @@ def attach_sampler_topk_logprobs_to_chat_response_choices(
     return response
 
 
+def extract_flat_score_centering_samples(
+    flat_logprobs: Any,
+    generated_token_ids: list[int],
+    *,
+    num_candidates: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Vectorized ``extract_score_centering_samples`` for vLLM ``FlatLogprobs``.
+
+    With ``flat_logprobs=True`` vLLM stores ``num_candidates + 1`` entries per
+    generated position: the sampled token first, then the top-k head by rank (a
+    sampled token inside the head appears twice). Reading the flat lists avoids
+    building a Python dict per position.
+
+    Returns:
+        CPU ``(sampler_ids, sampler_logprobs, sampled_logprobs)``: int32 and
+        float32 ``[generated_len, num_candidates]`` head tensors, plus the
+        float32 ``[generated_len]`` log-probs of the sampled tokens.
+    """
+    num_generated = len(generated_token_ids)
+    width = num_candidates + 1
+    starts = getattr(flat_logprobs, "start_indices", None)
+    ends = getattr(flat_logprobs, "end_indices", None)
+    if starts is None or ends is None or len(starts) != num_generated:
+        raise RuntimeError(
+            "Score centering requires vLLM flat logprobs for every generated token "
+            f"(got {type(flat_logprobs).__name__})"
+        )
+    first = starts[0] if num_generated else 0
+    last = first + num_generated * width
+    if num_generated and (
+        ends[-1] != last
+        or any(end - start != width for start, end in zip(starts, ends))
+    ):
+        raise RuntimeError(
+            f"Expected {width} logprobs per generated token (sampled token + top-k)"
+        )
+    token_ids = torch.tensor(
+        flat_logprobs.token_ids[first:last], dtype=torch.int64
+    ).view(num_generated, width)
+    logprobs = torch.tensor(
+        flat_logprobs.logprobs[first:last], dtype=torch.float32
+    ).view(num_generated, width)
+    if not torch.equal(
+        token_ids[:, 0], torch.tensor(generated_token_ids, dtype=torch.int64)
+    ):
+        raise RuntimeError("vLLM flat logprobs do not start with the sampled tokens")
+    return (
+        token_ids[:, 1:].to(torch.int32),
+        logprobs[:, 1:].contiguous(),
+        logprobs[:, 0].contiguous(),
+    )
+
+
 def model_dump_chat_response_with_dynamic_message_fields(
     response: Any,
 ) -> dict[str, Any]:

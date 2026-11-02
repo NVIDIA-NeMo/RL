@@ -71,6 +71,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
+    extract_flat_score_centering_samples,
     format_prompt_for_vllm_generation,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
@@ -2016,6 +2017,8 @@ class VllmAsyncGenerationWorkerImpl(
         batch_specific_stop_strings_list = data.get(
             "stop_strings", [[] for _ in range(batch_size)]
         )
+        # Score centering (legacy GRPO): capture the sampler's top-k head per token.
+        top_logprobs = self.cfg.get("top_logprobs", 0)
 
         # Create tasks for each sample in the batch
         async def process_single_sample(sample_idx):
@@ -2089,6 +2092,16 @@ class VllmAsyncGenerationWorkerImpl(
                         "truncated": truncated_tensor,
                     }
                 )
+                if top_logprobs:
+                    # Every row carries the sampler keys so batches concatenate.
+                    for key, dtype in (
+                        ("sampler_topk_token_ids", torch.int32),
+                        ("sampler_topk_logprobs", torch.float32),
+                    ):
+                        result_batch[key] = torch.zeros(
+                            (1, current_input_actual_length, top_logprobs),
+                            dtype=dtype,
+                        )
 
                 return (sample_idx, result_batch)
 
@@ -2096,6 +2109,7 @@ class VllmAsyncGenerationWorkerImpl(
                 greedy=greedy,
                 stop_strings=final_stop_strings_for_sample,
                 max_new_tokens=allowed_new_tokens,
+                top_logprobs=top_logprobs,
             )
 
             request_id = str(uuid.uuid4())
@@ -2159,7 +2173,29 @@ class VllmAsyncGenerationWorkerImpl(
                 dtype=torch.float32,
                 device=original_input_ids_single_row.device,
             )
-            if hasattr(generation_details, "logprobs") and generation_details.logprobs:
+            sampler_topk: dict[str, torch.Tensor] = {}
+            if top_logprobs:
+                sampler_ids, sampler_logprobs, sampled_logprobs = (
+                    extract_flat_score_centering_samples(
+                        generation_details.logprobs,
+                        generated_token_ids,
+                        num_candidates=top_logprobs,
+                    )
+                )
+                logprobs_single_item[0, current_input_actual_length:] = sampled_logprobs
+                # Token-aligned like ``logprobs``: prompt positions stay zero.
+                for key, values in (
+                    ("sampler_topk_token_ids", sampler_ids),
+                    ("sampler_topk_logprobs", sampler_logprobs),
+                ):
+                    padded = values.new_zeros(
+                        (1, final_output_tensor_len, top_logprobs)
+                    )
+                    padded[0, current_input_actual_length:] = values
+                    sampler_topk[key] = padded
+            elif (
+                hasattr(generation_details, "logprobs") and generation_details.logprobs
+            ):
                 for idx, logprob_dict_per_token in enumerate(
                     generation_details.logprobs
                 ):
@@ -2206,6 +2242,7 @@ class VllmAsyncGenerationWorkerImpl(
                 "generation_lengths": generation_lengths_tensor,
                 "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
                 "truncated": truncated_tensor,
+                **sampler_topk,
             }
             routed_experts, r3_stats = pad_and_align_routed_expert_indices(
                 final_request_output,
