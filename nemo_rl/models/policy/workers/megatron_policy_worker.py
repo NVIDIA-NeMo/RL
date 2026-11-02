@@ -5096,7 +5096,7 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.empty_cache()
             _free_after = torch.cuda.mem_get_info()[0]
             _gib = 1024**3
-            log.info(
+            log.debug(
                 f"[CKPT_MEM] rank={torch.distributed.get_rank()} "
                 f"device-free before={_free_before / _gib:.1f} GiB "
                 f"after={_free_after / _gib:.1f} GiB "

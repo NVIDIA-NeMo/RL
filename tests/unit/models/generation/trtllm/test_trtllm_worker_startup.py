@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 import ray
+import requests
 import torch
 from omegaconf import OmegaConf
 
@@ -128,6 +129,47 @@ def test_trtllm_tp2_worker_starts_under_slurm_launcher_env(monkeypatch):
         assert outputs["output_ids"].shape[0] == len(prompts)
         assert torch.all(outputs["generation_lengths"] > 0)
         assert torch.all(outputs["generation_lengths"] <= _MAX_NEW_TOKENS)
+    finally:
+        if generation is not None:
+            generation.shutdown()
+        cluster.shutdown()
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < _TP, reason=f"needs {_TP} GPUs for a TP={_TP} engine"
+)
+@pytest.mark.timeout(600)
+def test_trtllm_http_server_serves_with_fastokens(monkeypatch):
+    pytest.importorskip("fastokens")
+    # Set on the driver; the worker group forwards it to the TRT-LLM actors.
+    monkeypatch.setenv("NRL_USE_FASTOKENS", "1")
+
+    tokenizer = get_tokenizer({"name": _MODEL})
+    config = _generation_config(tokenizer)
+    config["trtllm_cfg"]["expose_http_server"] = True
+    cluster = RayVirtualCluster(
+        bundle_ct_per_node_list=[_TP],
+        use_gpus=True,
+        max_colocated_worker_groups=1,
+        num_gpus_per_node=_TP,
+        name="trtllm-fastokens-test-cluster",
+    )
+    generation = None
+    try:
+        # start_http_server raises if the fastokens patch did not land.
+        generation = TrtllmGeneration(cluster, config)
+        resp = requests.post(
+            f"{generation.dp_openai_server_base_urls[0]}/chat/completions",
+            json={
+                "model": _MODEL,
+                "messages": [{"role": "user", "content": "1 + 1 ="}],
+                "max_tokens": _MAX_NEW_TOKENS,
+                "temperature": 0.0,
+            },
+            timeout=120,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["choices"][0]["message"]["content"]
     finally:
         if generation is not None:
             generation.shutdown()
