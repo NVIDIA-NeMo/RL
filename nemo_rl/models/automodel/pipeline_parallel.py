@@ -12,21 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pipeline-parallel execution for the Automodel policy worker.
+"""Pipeline-parallel batching, execution, and weight export for Automodel.
 
 Automodel's ``AutoPipeline`` splits the model into stages and builds the
 PyTorch schedule, which runs the forward and backward passes and the
-inter-stage communication. This module feeds NeMo RL's execution batches
-(``pipeline_batch.py``) through that schedule. The RL loss runs on the last
-stage inside the schedule's loss callback, ``PipelineOutputAdapter``, which
-delegates to the same post-processors as the non-pipelined path.
+inter-stage communication. This module plans NeMo RL's execution batches
+and feeds them through that schedule.
+
+One schedule call (an execution batch) runs ``microbatches_per_step`` (M)
+microbatches of ``micro_batch_size`` samples. The planning unit is whatever data
+one call hands over -- a global batch or a logprob request -- so nothing here
+assumes it equals ``gbs / dp`` or that DP ranks hold the same amount.
+
+The RL loss runs on the last stage inside the schedule's loss callback,
+``PipelineOutputAdapter``, which delegates to the same post-processors as the
+non-pipelined path. ``PipelineWeightExporter`` separately assembles each stage's
+weights into the full-model stream consumed by refit.
 """
 
-from contextlib import AbstractContextManager
+import math
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Iterator, Literal, Optional
 
 import torch
+from nemo_automodel.components.distributed.context_parallel import (
+    ContextParallelSharder,
+)
 from nemo_automodel.components.distributed.pipelining.autopipeline import (
     AutoPipeline,
 )
@@ -39,15 +51,214 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
+from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
+from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
-from nemo_rl.models.automodel.pipeline_batch import ExecutionBatch
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.data import (
+    ProcessedMicrobatch,
+    make_processed_microbatch_iterator,
+)
 from nemo_rl.models.automodel.train import (
     LogprobsPostProcessor,
     LossPostProcessor,
+    _build_model_batch,
     post_process_logits,
     scale_metrics_for_global_batches,
+    shard_model_batch_for_cp,
 )
+
+# Masks that make a padding sample contribute nothing to losses or metrics.
+_DUMMY_SAMPLE_MASK_KEYS = ("sample_mask", "token_mask")
+
+
+@dataclass
+class ExecutionBatch:
+    """The inputs of one pipeline schedule call.
+
+    ``sample_ids`` is passed to the schedule as the loss target. The schedule
+    splits it along dim 0 exactly like the model inputs, so the last stage can
+    tell which microbatch each loss call belongs to no matter how often or in
+    which order the schedule calls the loss.
+    """
+
+    # The call's microbatches in schedule order. The first
+    # ``num_real_microbatches`` hold at least one real sample; the rest are
+    # fully masked padding.
+    microbatches: list[ProcessedMicrobatch]
+    num_real_microbatches: int
+    # Position of every row in the planned data, real rows first. Shape [E] on
+    # CPU, where E = micro_batch_size * microbatches_per_step.
+    sample_ids: torch.Tensor
+    # Model-facing inputs for the whole call. Tensors are [E, ...], the
+    # row-wise concatenation of each microbatch's model batch; the schedule
+    # splits them back into the same microbatches. Under context parallelism
+    # ``cp_sharder`` has prepared them, and entering ``model_context_factory()``
+    # may shard them along the sequence in place.
+    model_inputs: dict[str, Any]
+    # The context the schedule call runs in: Automodel's context-parallel
+    # attention context, or ``nullcontext`` without context parallelism.
+    model_context_factory: Callable[[], AbstractContextManager[Any]]
+    # Maps a microbatch's token tensors between the canonical sequence layout
+    # and this rank's context-parallel shard; None without context
+    # parallelism. One sharder serves every microbatch of the call because the
+    # layout depends only on the sequence position.
+    cp_sharder: Optional[ContextParallelSharder]
+
+
+def _check_batch_major_inputs(model: nn.Module, model_batch: dict[str, Any]) -> None:
+    """Reject model inputs whose batch dimension is not dim 0.
+
+    Execution batches concatenate microbatch inputs along dim 0 and the schedule
+    splits them back along dim 0. A model whose
+    ``get_pipeline_kwargs_chunk_dims`` hook places the batch on another axis for
+    these inputs (for example multimodal M-RoPE position IDs of shape
+    ``[3, B, S]``) would be split wrongly, so it fails here. Text-only inputs of
+    such models (the hook returns no exceptions) are batch-major and run.
+
+    Args:
+        model: A local model part.
+        model_batch: One microbatch's model-facing inputs, or a whole call's
+            once a context-parallel hook has prepared them.
+    """
+    chunk_dims_hook = getattr(model, "get_pipeline_kwargs_chunk_dims", None)
+    if chunk_dims_hook is None:
+        return
+    non_batch_major = chunk_dims_hook(model_batch)
+    if non_batch_major:
+        raise NotImplementedError(
+            f"{type(model).__name__} splits pipeline inputs "
+            f"{sorted(non_batch_major)} along a non-batch dimension, which NeMo "
+            "RL's pipeline execution batches do not support yet. Set "
+            "policy.automodel_cfg.pipeline_parallel_size=1 for these inputs."
+        )
+
+
+def plan_execution_batches(
+    data: BatchedDataDict[Any],
+    *,
+    model: nn.Module,
+    micro_batch_size: int,
+    microbatches_per_step: int,
+    dp_group: torch.distributed.ProcessGroup,
+    tokenizer: AutoTokenizer,
+    cfg: dict[str, Any],
+    allow_flash_attn_args: bool,
+    device_mesh: DeviceMesh,
+    cp_size: int,
+    padding_token_id: int,
+) -> list[ExecutionBatch]:
+    """Split ``data`` into pipeline execution batches.
+
+    The local data becomes ``ceil(size / (micro_batch_size * M))`` execution
+    batches. The tail, and any extra execution batches needed to match the DP
+    rank with the most, are filled with copies of the first sample whose
+    ``sample_mask`` and ``token_mask`` are zero. Every DP rank therefore issues
+    the same number of schedule calls and FSDP collectives. All execution
+    batches keep ``data``'s sequence length, so one training update never
+    re-initializes the pipeline stages (which would drop accumulated gradients).
+    Under context parallelism each execution batch is sharded once for all of
+    its microbatches, as Automodel's own pipeline trainer does.
+
+    Args:
+        data: The rows to plan, already on the training device.
+        model: A local model part, used to build its model-facing batch.
+        micro_batch_size: Samples per pipeline microbatch.
+        microbatches_per_step: Microbatches per schedule call (M).
+        dp_group: Group whose ranks must issue the same number of calls.
+        tokenizer: Tokenizer used to process microbatches.
+        cfg: Policy config used to process microbatches.
+        allow_flash_attn_args: Whether the model accepts flash-attention kwargs.
+        device_mesh: Device mesh with the ``cp`` axis.
+        cp_size: Context-parallel size.
+        padding_token_id: Token used to pad ``input_ids`` to the
+            context-parallel granularity.
+
+    Returns:
+        The execution batches in order. Real rows keep their order, so row
+        ``i`` of ``data`` has sample ID ``i``.
+    """
+    num_samples = data.size
+    if num_samples == 0:
+        raise ValueError(
+            "Pipeline-parallel batch planning needs at least one sample per "
+            "data-parallel rank to build padding samples from."
+        )
+    samples_per_call = micro_batch_size * microbatches_per_step
+    num_calls = torch.tensor([math.ceil(num_samples / samples_per_call)], device="cuda")
+    torch.distributed.all_reduce(
+        num_calls, op=torch.distributed.ReduceOp.MAX, group=dp_group
+    )
+    num_calls = int(num_calls.item())
+
+    num_padding = num_calls * samples_per_call - num_samples
+    if num_padding > 0:
+        padded = data.select_indices(list(range(num_samples)) + [0] * num_padding)
+        for key in _DUMMY_SAMPLE_MASK_KEYS:
+            if key in padded:
+                padded[key][num_samples:] = 0
+    else:
+        padded = data
+
+    execution_batches = []
+    for call_idx in range(num_calls):
+        start = call_idx * samples_per_call
+        call_data = padded.slice(start, start + samples_per_call)
+        microbatches = list(
+            make_processed_microbatch_iterator(
+                call_data.make_microbatch_iterator(micro_batch_size),
+                tokenizer,
+                cfg,
+            )
+        )
+        model_batches = [
+            _build_model_batch(
+                model,
+                mb.processed_inputs,
+                is_reward_model=False,
+                allow_flash_attn_args=allow_flash_attn_args,
+                clone_model_tensors=False,
+            )
+            for mb in microbatches
+        ]
+        _check_batch_major_inputs(model, model_batches[0])
+        model_inputs = {
+            key: (
+                torch.cat([batch[key] for batch in model_batches])
+                if isinstance(value, torch.Tensor)
+                else value
+            )
+            for key, value in model_batches[0].items()
+        }
+        if cp_size > 1:
+            # ``torch.cat`` gave the inputs their own storage, so sharding them
+            # in place cannot reach the canonical microbatch data.
+            cp_sharder, model_context_factory, model_inputs = shard_model_batch_for_cp(
+                model,
+                model_inputs,
+                device_mesh=device_mesh,
+                padding_token_id=padding_token_id,
+                num_chunks=microbatches_per_step,
+            )
+            # The model's CP hook may have rewritten inputs.
+            _check_batch_major_inputs(model, model_inputs)
+        else:
+            cp_sharder, model_context_factory = None, nullcontext
+        num_real_samples = min(max(num_samples - start, 0), samples_per_call)
+        execution_batches.append(
+            ExecutionBatch(
+                microbatches=microbatches,
+                num_real_microbatches=math.ceil(num_real_samples / micro_batch_size),
+                sample_ids=torch.arange(start, start + samples_per_call),
+                model_inputs=model_inputs,
+                model_context_factory=model_context_factory,
+                cp_sharder=cp_sharder,
+            )
+        )
+    return execution_batches
+
 
 # "train" returns the loss for the schedule's backward pass, "eval" records the
 # loss and metrics without a backward pass, "logprobs" records token logprobs.
@@ -435,3 +646,111 @@ def release_pipeline_runtime_state(pipeline: AutoPipeline) -> None:
     # The stages now describe pp_seq_len; keep AutoPipeline's record in sync so
     # the next update_seq_len() re-describes them for the next batch's length.
     pipeline.update_seq_len(pipeline.pp_seq_len)
+
+
+# Yields this rank's pipeline stage as its (Hugging Face name, full tensor) stream.
+LocalParamsFn = Callable[[], Iterator[tuple[str, torch.Tensor]]]
+
+
+@dataclass(frozen=True)
+class _ManifestEntry:
+    """One tensor of the full-model stream."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    # Rank within the pipeline group whose stage produces the tensor.
+    owner_pp_rank: int
+
+
+class PipelineWeightExporter:
+    """Produce the whole model's ``(name, tensor)`` stream on every PP rank.
+
+    Refit consumers expect every training rank to stream the complete model, as
+    without pipeline parallelism, but a pipeline rank holds only its stage.
+    Each tensor is produced by the ranks of the stage that owns it (the same
+    per-module stream the non-pipelined refit uses: full tensors, Hugging Face
+    names, refit dtypes) and broadcast within the pipeline group. Under 1F1B
+    PP rank ``i`` owns stage ``i``, so the stream visits the stages in PP rank
+    order, an order every rank agrees on. The stream does not assume its
+    consumer, so colocated CUDA IPC and NCCL broadcast refits both iterate it.
+    """
+
+    def __init__(self, pipeline: AutoPipeline, *, local_params: LocalParamsFn):
+        """Initialize the exporter.
+
+        Args:
+            pipeline: The AutoPipeline that drives this rank's stage.
+            local_params: Yields the refit stream of this rank's stage.
+        """
+        self._local_params = local_params
+        self._pp_group = pipeline.pp_mesh.get_group()
+        self._manifest: Optional[list[_ManifestEntry]] = None
+
+    def _build_manifest(self) -> list[_ManifestEntry]:
+        """List every stage's tensors, in PP rank order."""
+        local_entries = [
+            (name, tuple(tensor.shape), tensor.dtype)
+            for name, tensor in self._local_params()
+        ]
+        # all_gather_object fills every slot with one PP rank's entries.
+        gathered: list[Any] = [None] * torch.distributed.get_world_size(self._pp_group)
+        torch.distributed.all_gather_object(
+            gathered, local_entries, group=self._pp_group
+        )
+
+        manifest = []
+        producing_rank: dict[str, int] = {}
+        for owner_pp_rank, entries in enumerate(gathered):
+            for name, shape, dtype in entries:
+                if name in producing_rank:
+                    raise RuntimeError(
+                        f"Weight {name!r} is produced by the pipeline stages of "
+                        f"PP ranks {producing_rank[name]} and {owner_pp_rank}."
+                    )
+                producing_rank[name] = owner_pp_rank
+                manifest.append(_ManifestEntry(name, shape, dtype, owner_pp_rank))
+        return manifest
+
+    def manifest(self) -> list[_ManifestEntry]:
+        """The full model's tensors in stream order; built once, collectively."""
+        if self._manifest is None:
+            self._manifest = self._build_manifest()
+        return self._manifest
+
+    def refit_info(self) -> dict[str, tuple[torch.Size, torch.dtype]]:
+        """Shape and dtype of every streamed tensor, as ``prepare_refit_info``."""
+        return {
+            entry.name: (torch.Size(entry.shape), entry.dtype)
+            for entry in self.manifest()
+        }
+
+    def iter_params(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield the full model's ``(name, tensor)`` pairs on every PP rank.
+
+        Collective over the pipeline group (and, through the per-module stream,
+        over each stage's data-parallel group): every rank must consume the
+        whole stream.
+        """
+        manifest = self.manifest()
+        pp_rank = torch.distributed.get_rank(self._pp_group)
+        local_stream = self._local_params()
+        for entry in manifest:
+            if entry.owner_pp_rank == pp_rank:
+                name, tensor = next(local_stream)
+                if name != entry.name or tuple(tensor.shape) != entry.shape:
+                    raise RuntimeError(
+                        f"Pipeline weight stream produced {name!r} "
+                        f"{tuple(tensor.shape)} where the manifest expects "
+                        f"{entry.name!r} {entry.shape}."
+                    )
+            else:
+                tensor = torch.empty(entry.shape, dtype=entry.dtype, device="cuda")
+            torch.distributed.broadcast(
+                tensor,
+                src=torch.distributed.get_global_rank(
+                    self._pp_group, entry.owner_pp_rank
+                ),
+                group=self._pp_group,
+            )
+            yield entry.name, tensor

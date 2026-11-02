@@ -46,19 +46,17 @@ from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
-from nemo_rl.models.automodel.pipeline_batch import (
-    ExecutionBatch,
-    plan_execution_batches,
-)
 from nemo_rl.models.automodel.pipeline_parallel import (
+    ExecutionBatch,
+    PipelineWeightExporter,
     broadcast_object_from_last_stage,
     broadcast_tensor_from_last_stage,
     pipeline_forward_backward,
     pipeline_forward_logprobs,
     pipeline_optimizer_part_ids,
+    plan_execution_batches,
     release_pipeline_runtime_state,
 )
-from nemo_rl.models.automodel.pipeline_refit import PipelineWeightExporter
 from nemo_rl.models.automodel.router_replay import (
     microbatch_replay_context,
     router_replay_gates,

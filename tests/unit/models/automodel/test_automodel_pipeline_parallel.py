@@ -26,13 +26,11 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 try:
     from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
-    from nemo_rl.models.automodel.pipeline_batch import (
-        ExecutionBatch,
-        plan_execution_batches,
-    )
     from nemo_rl.models.automodel.pipeline_parallel import (
+        ExecutionBatch,
         PipelineCallContext,
         PipelineOutputAdapter,
+        plan_execution_batches,
     )
     from nemo_rl.models.automodel.train import (
         LogprobsPostProcessor,
@@ -306,7 +304,7 @@ def test_plan_execution_batches_shards_each_call_once_for_cp(monkeypatch):
         return sharder, nullcontext, model_batch
 
     monkeypatch.setattr(
-        "nemo_rl.models.automodel.pipeline_batch.shard_model_batch_for_cp",
+        "nemo_rl.models.automodel.pipeline_parallel.shard_model_batch_for_cp",
         fake_shard,
     )
     num_samples = 8

@@ -112,7 +112,7 @@ normalized exactly as without PP.
 
 ### 4.1 Batch Planning
 
-`plan_execution_batches` (`nemo_rl/models/automodel/pipeline_batch.py`) turns the data
+`plan_execution_batches` (`nemo_rl/models/automodel/pipeline_parallel.py`) turns the data
 of one global batch (or one logprob request) into execution batches of `mbs * M` samples. The
 tail is padded with copies of the first sample whose `sample_mask` and `token_mask` are
 zero, and the number of execution batches is all-reduced (max) over the DP group, so
@@ -181,7 +181,7 @@ within an update.
   model; Automodel's checkpointer gets the PP rank and group, and optimizer state is
   namespaced by the stage index (`optimizer_part_ids`), as in Automodel's own pipeline
   trainer.
-- **Refit.** `PipelineWeightExporter` (`nemo_rl/models/automodel/pipeline_refit.py`)
+- **Refit.** `PipelineWeightExporter` (`nemo_rl/models/automodel/pipeline_parallel.py`)
   makes every PP rank produce the full model's `(name, tensor)` stream: each stage lists
   its tensors (the same per-module stream as the non-PP refit: full tensors, Hugging
   Face names, refit dtypes), the lists are gathered in PP rank order (stage order under
