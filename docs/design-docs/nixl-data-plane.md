@@ -116,7 +116,8 @@ Effect on NCCL collective speed (no SHARP plugin) was not measured.
   with a different count, the live rows are put again through a client.
   It works with the SSD tier on: spilled blobs are saved from their files,
   and a restore that RAM cannot hold spills the rest to disk. `mooncake_cpu`
-  cannot checkpoint with its offload on, so pick `nixl` when a run needs both.
+  and `simple` checkpoint with their `ssd_offload` on too; only TQ's own
+  Mooncake offload client (`offload.enabled`) refuses to checkpoint.
 
 ## Measured (GB300, 2 nodes, 4 RDMA rails; ms, lower is better)
 

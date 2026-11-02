@@ -105,8 +105,11 @@ def _expected(p: int):  # pragma: no cover
 
 def _on_ssd(backend: str, ssd_root: str) -> int:  # pragma: no cover
     """How much is on SSD now (files, or blobs for nixl)."""
-    if backend != "nixl":
-        return sum(f.is_file() for f in Path(ssd_root).rglob("*"))
+    if backend != "nixl":  # not mooncake's always-present .lock
+        return sum(
+            f.is_file() and not f.name.startswith(".lock")
+            for f in Path(ssd_root).rglob("*")
+        )
     import ray
 
     from nemo_rl.data_plane.adapters.tq_nixl import DEFAULT_NAMESPACE

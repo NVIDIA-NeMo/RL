@@ -1,7 +1,9 @@
 #!/bin/bash
 # grpo_dp_single_controller.sh on the nixl data plane, with the units' SSD tier
 # on and a slab this run exceeds, saving a data-plane checkpoint at the last
-# step. Fails unless a unit spilled and no unit memory was retired.
+# step. Fails unless a unit spilled and no unit memory was retired. The data
+# plane may be empty at that save; restoring SSD-backed values is covered by
+# tests/unit/data_plane/test_ssd_checkpoint_e2e.py.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 
