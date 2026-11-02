@@ -669,11 +669,8 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "vLLM's reload_weights API)."
         )
 
-    # Draft co-training speculators are refit through the coverage-aware
-    # finalize(); nccl_reshard_refit finalizes the target only and loads its misc
-    # params without a coverage object, so the drafter would never run
-    # process_weights_after_loading. MTP is unaffected: it finalizes through
-    # _mtp_drafter_refit_enabled, not the draft manifest.
+    # nccl_reshard lacks coverage and finalization for draft.* weights.
+    # MTP weights use a separate finalization path.
     speculative_config = vllm_kwargs.get("speculative_config")
     if _speculative_config_carries_draft_weights(speculative_config):
         assert isinstance(speculative_config, dict)
