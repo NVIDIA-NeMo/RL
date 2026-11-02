@@ -3956,6 +3956,109 @@ def test_split_train_api_rejects_direct_packed_sft_rows():
         )
 
 
+@pytest.mark.parametrize("eval_mode", [False, True])
+def test_train_all_padding_dp_shard_reports_zero_loss(
+    monkeypatch: pytest.MonkeyPatch, eval_mode: bool
+) -> None:
+    """A DP shard of only sample_mask=0 rows reports a zero loss and no metric rows.
+
+    maybe_pad_last_batch can leave a DP rank with nothing but padding rows, so
+    train() skips every loss record of that rank's global batch.
+    """
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    loss_fn = NLLLossFn()
+    shard = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(1, 4, dtype=torch.long),
+            "input_lengths": torch.tensor([4]),
+            "token_mask": torch.ones(1, 4),
+            "sample_mask": torch.zeros(1),
+        }
+    )
+    records = []
+
+    def forward_backward(**kwargs: Any) -> list[dict[str, Any]]:
+        _, metrics = loss_fn(
+            torch.zeros(1, 3),
+            shard,
+            kwargs["global_valid_seqs"],
+            kwargs["global_valid_toks"],
+        )
+        records.append(metrics)
+        return [metrics]
+
+    worker = MagicMock()
+    worker.dp_size = 1
+    worker.mtp_enabled = False
+    worker.media_placeholder_token_id = None
+    worker._router_replay_enabled = False
+    worker.model.modules.return_value = []
+    worker.model.config = None
+    # Packing skips the FLOPs estimate, which needs a real Megatron config.
+    worker.cfg = {
+        "megatron_cfg": {"empty_unused_memory_level": 0},
+        "sequence_packing": {"enabled": True},
+    }
+    worker.optimizer.step.return_value = (True, 0.0, 0.0)
+    worker.optimizer.grad_norms_by_group = {}
+    state = MagicMock()
+    state.is_pipeline_last_stage.return_value = True
+    monkeypatch.setattr(worker_module, "parallel_state", state)
+    monkeypatch.setattr(
+        worker_module,
+        "process_global_batch",
+        lambda *_a, **_kw: {
+            "batch": shard,
+            "global_valid_seqs": torch.tensor(0.0),
+            "global_valid_toks": torch.tensor(0.0),
+            "global_valid_chunks_by_idx": {},
+        },
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "get_microbatch_iterator",
+        lambda *_a, **_kw: (iter([]), 1, 1, 4, 4),
+    )
+    monkeypatch.setattr(worker_module, "LossPostProcessor", MagicMock())
+    rerun = MagicMock()
+    rerun.should_run_forward_backward.side_effect = [True, False]
+    monkeypatch.setattr(worker_module, "get_rerun_state_machine", lambda: rerun)
+    monkeypatch.setattr(worker_module, "megatron_forward_backward", forward_backward)
+    monkeypatch.setattr(
+        worker_module, "broadcast_loss_metrics_from_last_stage", lambda m: m
+    )
+    monkeypatch.setattr(worker_module, "get_pg_collection", MagicMock())
+    monkeypatch.setattr(
+        worker_module, "logical_and_across_model_parallel_group", lambda v, **_: v
+    )
+    monkeypatch.setattr(
+        worker_module, "reduce_max_stat_across_model_parallel_group", lambda v, **_: v
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", MagicMock())
+    monkeypatch.setattr(torch.distributed, "barrier", MagicMock())
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", MagicMock())
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "cpu")
+    # train() creates the dataset-size scalar on CUDA; keep this test on CPU.
+    tensor = torch.tensor
+
+    def cpu_tensor(*args: Any, **kwargs: Any) -> torch.Tensor:
+        kwargs.pop("device", None)
+        return tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", cpu_tensor)
+
+    result = worker_module.MegatronPolicyWorkerImpl.train(
+        worker, shard, loss_fn, eval_mode=eval_mode, gbs=1, mbs=1
+    )
+
+    assert [record["num_valid_samples"] for record in records] == [0]
+    # One zero loss for the one global batch keeps the DP loss reduction aligned.
+    torch.testing.assert_close(result["global_loss"], torch.zeros(1))
+    assert result["all_mb_metrics"] == {}
+
+
 @pytest.mark.parametrize(
     ("kwargs", "expected_param_sync"),
     [({}, False), ({"param_sync": True}, True)],

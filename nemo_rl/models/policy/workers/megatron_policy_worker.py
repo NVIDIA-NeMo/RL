@@ -1764,7 +1764,9 @@ class MegatronPolicyWorkerImpl(
                     mb_losses = [x["loss"] for x in gb_loss_metrics]
 
                 all_mb_metrics.extend(gb_loss_metrics)
-                if all(isinstance(loss, torch.Tensor) for loss in mb_losses):
+                if mb_losses and all(
+                    isinstance(loss, torch.Tensor) for loss in mb_losses
+                ):
                     losses.append(torch.stack(mb_losses).sum())
                 else:
                     losses.append(
