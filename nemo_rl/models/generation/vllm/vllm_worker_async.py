@@ -879,6 +879,9 @@ class VllmAsyncGenerationWorkerImpl(
                     f"length {expected_full_len}"
                 )
             start = prev_len - boundary_route_rows(prev_len)
+            # Keep this as a view: capture uses a local client, and SimpleStorage
+            # serializes only the slice's bytes. Message routes sent through
+            # Ray/pickle use slice_routed_experts() to copy only their token span.
             routed = routed[start:]
             message["routed_experts"] = routed_experts_tensor_metadata(routed)
         except (IndexError, TypeError, ValueError) as error:

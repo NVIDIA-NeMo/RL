@@ -43,6 +43,22 @@ _WIRE_TORCH_DTYPES = {
 _TORCH_DTYPE_NAMES = {v: k for k, v in _WIRE_TORCH_DTYPES.items()}
 
 
+def _route_array(routed_experts: torch.Tensor) -> tuple[str, Any]:
+    """Validate a route tensor; return its wire dtype name and CPU array."""
+    if routed_experts.dim() != 3:
+        raise ValueError(
+            "routed_experts must have shape [tokens, num_moe_layers, topk], "
+            f"got {tuple(routed_experts.shape)}."
+        )
+    dtype_name = _TORCH_DTYPE_NAMES.get(routed_experts.dtype)
+    if dtype_name is None:
+        raise ValueError(
+            f"Unsupported routed_experts dtype {routed_experts.dtype}; "
+            f"expected one of {sorted(_WIRE_TORCH_DTYPES)}."
+        )
+    return dtype_name, routed_experts.detach().cpu().contiguous().numpy()
+
+
 def routed_experts_tensor_metadata(routed_experts: torch.Tensor) -> dict[str, Any]:
     """Bind a captured route tensor to its dtype, shape, and content checksum.
 
@@ -50,14 +66,7 @@ def routed_experts_tensor_metadata(routed_experts: torch.Tensor) -> dict[str, An
     extras digest; consumers recreate it from the stored tensor for verification.
     Hash contiguous little-endian bytes without allocating a base64 payload.
     """
-    if routed_experts.dim() != 3:
-        raise ValueError(
-            "routed_experts must have shape [tokens, num_moe_layers, topk]"
-        )
-    dtype_name = _TORCH_DTYPE_NAMES.get(routed_experts.dtype)
-    if dtype_name is None:
-        raise ValueError(f"Unsupported routed_experts dtype {routed_experts.dtype}")
-    arr = routed_experts.detach().cpu().contiguous().numpy()
+    dtype_name, arr = _route_array(routed_experts)
     arr = arr.astype(arr.dtype.newbyteorder("<"), copy=False)
     return {
         "dtype": dtype_name,
@@ -72,18 +81,7 @@ def encode_routed_experts(routed_experts: torch.Tensor) -> str:
     The tensor's own dtype (int8/int16/int32, as resolved by
     ``resolve_routed_experts_dtype``) is preserved on the wire.
     """
-    if routed_experts.dim() != 3:
-        raise ValueError(
-            "routed_experts must have shape [tokens, num_moe_layers, topk], "
-            f"got {tuple(routed_experts.shape)}."
-        )
-    dtype_name = _TORCH_DTYPE_NAMES.get(routed_experts.dtype)
-    if dtype_name is None:
-        raise ValueError(
-            f"Unsupported routed_experts dtype {routed_experts.dtype}; "
-            f"expected one of {sorted(_WIRE_TORCH_DTYPES)}."
-        )
-    arr = routed_experts.detach().cpu().contiguous().numpy()
+    dtype_name, arr = _route_array(routed_experts)
     tokens, num_layers, topk = arr.shape
     # memoryview feeds the buffer to b64encode zero-copy; tobytes() would
     # materialize a full-size intermediate copy of the payload.

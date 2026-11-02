@@ -356,3 +356,23 @@ def test_capture_rejects_missing_or_unsupported_attachments(attachment):
     )
     assert coords.disposition == "capture_failed"
     assert client.puts == 0
+
+
+def test_capture_rejects_route_attachment_without_metadata():
+    client = _StagingClient()
+    capture = RolloutTokenCapture(
+        sink=TQTokenSink(client, staging_partition="staging"),
+        weight_version_fn=lambda: 7,
+    )
+    coords = capture.complete_call(
+        capture.begin_call(
+            CaptureAdmission(rollout_id="r", model_call_id="c", mode="text")
+        ),
+        prompt_token_ids=[10],
+        generated_token_ids=[11],
+        generated_logprobs=[-0.5],
+        extras={"other_extra": 42},
+        attachments={"routed_experts": torch.ones(2, 1, 1, dtype=torch.int16)},
+    )
+    assert coords.disposition == "capture_failed"
+    assert client.puts == 0
