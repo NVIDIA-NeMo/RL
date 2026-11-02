@@ -106,14 +106,19 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
-# Every shipped config tree. Configs outside examples/configs only receive the
-# outdated-config check: env manifests and launcher templates cannot satisfy the
-# training schema and may contain unset environment interpolations.
+# Every shipped config tree. Configs outside examples/configs receive only the
+# outdated-config and local-path checks; their manifests and templates may
+# lack the training schema or contain unset environment interpolations.
 repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
 full_config_files = config_files + [
     path
     for extra in ("examples/nemo_gym", "research")
     for path in glob.glob(str(repo_root / extra / "**/*.yaml"), recursive=True)
+]
+suite_scripts = [
+    path
+    for pattern in ("tests/test_suites/**/*.sh", "research/*/tests/test_suites/**/*.sh")
+    for path in glob.glob(str(repo_root / pattern), recursive=True)
 ]
 
 
@@ -445,3 +450,12 @@ def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
     if config_file in config_files:
         with subtests.test(check="automodel_moe_dispatcher"):
             _check_automodel_moe_dispatcher(config_file, deepcopy(config))
+
+
+@pytest.mark.parametrize("path", full_config_files + suite_scripts)
+def test_shipped_configs_and_suite_scripts_have_no_local_paths(path):
+    text = Path(path).read_text().lower()
+    for local_prefix in ("/lustre/", "/home/"):
+        assert local_prefix not in text, (
+            f"{path} contains a local path ({local_prefix})"
+        )
