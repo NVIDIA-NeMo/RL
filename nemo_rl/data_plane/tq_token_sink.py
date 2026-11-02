@@ -29,7 +29,10 @@ the wire, matching ``compute_staging_digest``'s float32-bit-pattern scheme, so
 digest recomputation over fetched values is byte-exact. Route payloads never
 ride inside snapshots: the source returns them as separate ``RouteFragment``
 values keyed by staging key, digest-verified by the plan executor at point of
-use.
+use. With ``policy.generation.top_logprobs`` the worker adds two more jagged
+columns to the same staging put through the opaque attachment mapping: the
+sampler's top-k ids and log-probs of the call's generated tokens. They are not
+digest-covered; the finalizer checks their shape against the generated length.
 """
 
 from __future__ import annotations
@@ -67,6 +70,9 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
+    SAMPLER_TOPK_FIELDS,
+    SAMPLER_TOPK_LOGPROBS_FIELD,
+    SAMPLER_TOPK_TOKEN_IDS_FIELD,
 )
 from nemo_rl.experience.route_assembly import RouteFragment, boundary_route_rows
 
@@ -112,7 +118,7 @@ STAGING_FIELDS = [
     "schema_version",
     "digest_version",
     "extras_digest_version",
-    "rollout_id_utf8",
+    "capture_key_utf8",
     "model_call_id_utf8",
     "parent_call_id_utf8",
     "parent_call_id_present",
@@ -335,7 +341,9 @@ class FetchedStagedCall:
 
     ``fragment`` is populated only when the fetch requested route payloads
     (direct mode); deferred finalization leaves route bytes in TQ and carries
-    only ``routed_len`` transport metadata.
+    only ``routed_len`` transport metadata. ``sampler_topk`` is the call's staged
+    sampler top-k ``(ids, logprobs)``, each ``[generated_len, k]``, only when
+    the fetch requested it.
     """
 
     staging_key: str
@@ -350,6 +358,7 @@ class FetchedStagedCall:
     # ``media_present`` is True; ``media_has_frames`` selects the video shape.
     media_present: bool = False
     media_has_frames: bool = False
+    sampler_topk: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -449,7 +458,7 @@ class TQTokenSink:
         *,
         attachments: Mapping[str, Any] | None = None,
     ) -> StageResult:
-        """Write the token row and its media attachments in one ``put``.
+        """Write tokens, media and sampler attachments in one ``put``.
 
         Success is returned only after the combined write was acknowledged,
         so ``staged`` coordinates vouch for tokens and pixels together. TQ has
@@ -463,11 +472,40 @@ class TQTokenSink:
         key = record.staging_key
         write_started = False
         try:
-            if attachments is not None and not self._capture_media:
+            remaining = dict(attachments) if attachments is not None else None
+            sampler_columns: dict[str, torch.Tensor] = {}
+            if remaining is not None and any(
+                key in remaining for key in SAMPLER_TOPK_FIELDS
+            ):
+                if not all(key in remaining for key in SAMPLER_TOPK_FIELDS):
+                    raise ValueError(
+                        "sampler top-k attachments require both IDs and logprobs"
+                    )
+                ids = remaining.pop(SAMPLER_TOPK_TOKEN_IDS_FIELD)
+                logprobs = remaining.pop(SAMPLER_TOPK_LOGPROBS_FIELD)
+                if (
+                    not isinstance(ids, torch.Tensor)
+                    or not isinstance(logprobs, torch.Tensor)
+                    or ids.ndim != 2
+                    or ids.shape != logprobs.shape
+                    or ids.dtype != torch.int32
+                    or logprobs.dtype != torch.float32
+                    or ids.device.type != "cpu"
+                    or logprobs.device.type != "cpu"
+                ):
+                    raise ValueError(
+                        "sampler top-k attachments require matching CPU [T, K] int32 IDs and float32 logprobs"
+                    )
+                sampler_columns = {
+                    SAMPLER_TOPK_TOKEN_IDS_FIELD: ids.unsqueeze(0),
+                    SAMPLER_TOPK_LOGPROBS_FIELD: logprobs.unsqueeze(0),
+                }
+                remaining = remaining or None
+            if remaining is not None and not self._capture_media:
                 raise ValueError(
                     "media attachments require a media-enabled staging partition"
                 )
-            media = validate_media_tensors(attachments)
+            media = validate_media_tensors(remaining)
             media_columns: dict[str, torch.Tensor] | None = None
             if self._capture_media:
                 if self._media_pixel_dtype is None:
@@ -499,7 +537,7 @@ class TQTokenSink:
                 "extras_digest_version": torch.tensor(
                     [record.extras_digest_version], dtype=torch.int64
                 ),
-                "rollout_id_utf8": _bytes_tensor(record.rollout_id.encode("utf-8")),
+                "capture_key_utf8": _bytes_tensor(record.capture_key.encode("utf-8")),
                 "model_call_id_utf8": _bytes_tensor(
                     record.model_call_id.encode("utf-8")
                 ),
@@ -594,9 +632,10 @@ class TQTokenSink:
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
             if media_columns is not None:
                 field_dict.update(media_columns)
+            field_dict.update(sampler_columns)
             tags = [
                 {
-                    "rollout_id": record.rollout_id,
+                    "capture_key": record.capture_key,
                     "model_call_id": record.model_call_id,
                     "parent_call_id": record.parent_call_id,
                     "prev_len": record.prev_len,
@@ -946,6 +985,7 @@ class TQTokenSource:
         staging_keys: list[str],
         *,
         include_route_fragments: bool = False,
+        include_sampler_topk: bool = False,
     ) -> list[FetchedStagedCall]:
         """Fetch digest-covered base columns, plus route payloads when requested.
 
@@ -953,7 +993,9 @@ class TQTokenSource:
         bytes stay in TQ for the policy worker. Direct mode passes
         ``include_route_fragments=True`` to pull the payloads in the same
         batched read and receives them as ``RouteFragment`` values beside the
-        base snapshots, never inside them.
+        base snapshots, never inside them. ``include_sampler_topk`` adds the sampler
+        top-k columns (``policy.generation.top_logprobs``); a row without them
+        fails the fetch like a missing row.
         """
         if not staging_keys:
             return []
@@ -964,6 +1006,8 @@ class TQTokenSource:
         select_fields = list(STAGING_FIELDS)
         if self._capture_media:
             select_fields += MEDIA_METADATA_FIELDS
+        if include_sampler_topk:
+            select_fields += list(SAMPLER_TOPK_FIELDS)
         try:
             if include_route_fragments:
                 # Route payloads are optional per run (feature-gated at the
@@ -1022,6 +1066,14 @@ class TQTokenSource:
                     extras=_row_extras(row, verify_media=self._capture_media),
                     media_present=media_present,
                     media_has_frames=media_has_frames,
+                    sampler_topk=(
+                        (
+                            row[SAMPLER_TOPK_TOKEN_IDS_FIELD][0],
+                            row[SAMPLER_TOPK_LOGPROBS_FIELD][0],
+                        )
+                        if include_sampler_topk
+                        else None
+                    ),
                 )
             )
         return fetched
@@ -1092,7 +1144,7 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
         schema_version=int(_row_leaf(row, "schema_version")[0].item()),
         digest_version=int(_row_leaf(row, "digest_version")[0].item()),
         extras_digest_version=int(_row_leaf(row, "extras_digest_version")[0].item()),
-        rollout_id=_row_text(row, "rollout_id_utf8"),
+        capture_key=_row_text(row, "capture_key_utf8"),
         model_call_id=_row_text(row, "model_call_id_utf8"),
         parent_call_id=parent_call_id,
         mode=mode,

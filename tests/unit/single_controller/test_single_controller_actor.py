@@ -66,6 +66,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
     MasterConfig,
+    TokenCaptureConfig,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -79,6 +80,7 @@ from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GROUP_ID_TAG,
     ROLLOUT_METRICS,
+    SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS, STAGING_FIELDS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -95,6 +97,21 @@ from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
 )
+
+
+def test_train_fields_add_the_sampler_topk_for_score_centering():
+    without = single_controller._train_fields_for_step(
+        policy_logprobs_required=True,
+        reference_logprobs_required=False,
+        score_centering=False,
+    )
+    with_topk = single_controller._train_fields_for_step(
+        policy_logprobs_required=True,
+        reference_logprobs_required=False,
+        score_centering=True,
+    )
+    assert "reference_policy_logprobs" not in without
+    assert with_topk == without + SAMPLER_TOPK_FIELDS
 
 
 class FakeWeightSynchronizer:
@@ -127,8 +144,12 @@ class _InitRolloutManager:
 
     def __init__(self, tq_buffer: _InitBuffer) -> None:
         self._tq_buffer = tq_buffer
+        self.next_nemo_gym_task_index = 0
         self.recovery_ledger = RolloutRecoveryLedger()
         self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        self.next_nemo_gym_task_index = value
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -159,6 +180,7 @@ def _grpo_master_config(tmp_path) -> MasterConfig:
             "generation": {
                 "top_k": None,
                 "top_p": 1.0,
+                "top_logprobs": 0,
                 "colocated": {"enabled": False},
             },
         },
@@ -2266,6 +2288,7 @@ def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._master_config = SimpleNamespace(
+        token_capture=TokenCaptureConfig(),
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=2,
             max_num_steps=1,
@@ -2296,6 +2319,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._train_fields = single_controller._train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
+        score_centering=False,
     )
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
@@ -2563,6 +2587,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
     ctrl._train_fields = single_controller._train_fields_for_step(
         policy_logprobs_required=policy_logprobs_required,
         reference_logprobs_required=reference_logprobs_required,
+        score_centering=False,
     )
     trainer = _LogprobRecordingTrainer()
     ctrl._trainer = trainer

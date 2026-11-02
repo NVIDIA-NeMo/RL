@@ -515,7 +515,7 @@ async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
         async def abort(self, _request_id: str) -> None:
             calls.append(("abort", asyncio.get_running_loop(), threading.get_ident()))
 
-    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop, flat_logprobs=False)
     assert (
         await client._run_on_engine_loop(
             lambda: asyncio.sleep(0, result="same-loop-result")
@@ -595,7 +595,7 @@ async def test_async_vllm_http_client_aborts_cancelled_generation(
             if abort_error is not None:
                 raise abort_error
 
-    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop, flat_logprobs=False)
 
     def cancel_from_http_thread():
         async def cancel():
@@ -999,6 +999,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.renderers.online_renderer",
         OnlineRenderer=OnlineRenderer,
     )
+    make_module("vllm.renderers.hf", HfRenderer=type("HfRenderer", (), {}))
 
     def with_cancellation(handler):
         handler.cancels_on_disconnect = True
@@ -1132,6 +1133,7 @@ def _setup_fake_vllm_chat_handler(
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
     worker._http_engine_client = worker.llm
     worker._capture_calls = {}
+    worker._capture_top_logprobs = 0
     worker.token_capture = None
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
@@ -1270,6 +1272,43 @@ async def test_plain_value_error_context_overflow_returns_http_400(monkeypatch):
     token_capture.fail_call.assert_called_once_with("call", reason="context_length")
 
 
+@pytest.mark.nemo_gym
+@pytest.mark.asyncio
+@pytest.mark.parametrize("validation_error", [False, True])
+async def test_context_refusal_acknowledges_unstaged_capture(
+    monkeypatch, validation_error
+):
+    from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
+    from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
+
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    message = "Input length (129) exceeds model's maximum context length (128)."
+    error_type = (
+        sys.modules["vllm.exceptions"].VLLMValidationError
+        if validation_error
+        else ValueError
+    )
+
+    async def refuse(_request, _raw_request):
+        raise error_type(message)
+
+    serving_chat.create_chat_completion = refuse
+    request = _fake_chat_request()
+    request.ng_capture = {
+        "capture_key": "r1",
+        "model_call_id": "refused",
+        "mode": "text",
+    }
+    sink = MagicMock()
+    worker.token_capture = RolloutTokenCapture(sink=sink, weight_version_fn=lambda: 7)
+    worker._begin_request_capture(request, [10, 11])
+    response = await chat_handler(request, MagicMock())
+    assert response.status_code == 400
+    assert response.headers[CAPTURE_REFUSAL_HEADER] == "refused"
+    assert worker._capture_calls == {}
+    sink.stage.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_unrelated_value_error_is_reraised(monkeypatch):
     """Only context overflow is a client error; other ValueErrors stay loud."""
@@ -1284,6 +1323,27 @@ async def test_unrelated_value_error_is_reraised(monkeypatch):
     with pytest.raises(ValueError, match="unexpected internal failure"):
         await chat_handler(request, MagicMock())
     token_capture.fail_call.assert_called_once_with("call", reason="engine_error")
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.asyncio
+async def test_unknown_length_error_does_not_acknowledge_unstaged_capture(monkeypatch):
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    async def fail(_request, _raw_request):
+        raise ValueError("engine failure mentioning maximum context length")
+
+    serving_chat.create_chat_completion = fail
+    request = _fake_chat_request()
+    request.ng_capture = {
+        "capture_key": "r1",
+        "model_call_id": "uncertain",
+        "mode": "text",
+    }
+    _track_request_capture(worker, request)
+    response = await chat_handler(request, MagicMock())
+    assert response.status_code == 400  # Existing error translation is unchanged.
+    assert "x-ng-capture-refused" not in response.headers
 
 
 @pytest.mark.asyncio
@@ -2340,6 +2400,25 @@ def test_vllm_missing_required_config_key(cluster):
         "Error should mention the missing 'model_name' key"
     )
     print(f"Successfully caught missing config key with error: {error_message}")
+
+
+@pytest.mark.parametrize(
+    ("world_size", "tensor_parallel_size", "expert_parallel_size"),
+    [(6, 2, 8), (4, 1, 8)],
+)
+def test_vllm_generation_rejects_partial_vllm_dp_group(
+    world_size, tensor_parallel_size, expert_parallel_size
+):
+    cluster = MagicMock()
+    cluster.world_size.return_value = world_size
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
+    config["vllm_cfg"]["expert_parallel_size"] = expert_parallel_size
+
+    with pytest.raises(AssertionError, match="multiple of vLLM data parallel size"):
+        VllmGeneration(cluster, config)
+
+    cluster._init_placement_groups.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -3985,6 +4064,100 @@ def test_vllm_non_divisible_batch_handling(policy):
     )
 
 
+def test_sync_vllm_dp_empty_shards_enter_engine_loop():
+    class EngineEntered(Exception):
+        pass
+
+    batch_size = 17
+    dp_size = 16
+    max_new_tokens = 5
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.ones((batch_size, 1), dtype=torch.long),
+            "input_lengths": torch.ones(batch_size, dtype=torch.long),
+        }
+    )
+    shards = batch.shard_by_batch_size(dp_size, allow_uneven_shards=True)
+    empty_ranks = 0
+    for data in shards:
+        row_count = len(data["input_ids"])
+        empty_ranks += row_count == 0
+        worker = object.__new__(VllmGenerationWorkerImpl)
+        worker.cfg = {
+            "vllm_cfg": {"async_engine": False},
+            "_pad_token_id": 0,
+            "top_k": None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": max_new_tokens,
+            "stop_token_ids": None,
+        }
+        worker.tensor_parallel_size = 1
+        worker.expert_parallel_size = dp_size
+        worker._native_lora_request = None
+        worker.llm = MagicMock()
+        worker.llm.generate.side_effect = EngineEntered
+        worker.SamplingParams = MagicMock()
+        with pytest.raises(EngineEntered):
+            worker.generate(data)
+
+        if row_count == 0:
+            args, kwargs = worker.llm.generate.call_args
+            assert args[0] == [{"prompt_token_ids": [0]}]
+            assert kwargs == {"use_tqdm": False}
+            worker.SamplingParams.assert_called_once_with(
+                temperature=0.0, max_tokens=max_new_tokens, ignore_eos=True
+            )
+        else:
+            worker.llm.generate.assert_called_once()
+    assert empty_ranks == 7
+
+
+def test_sync_vllm_dp_empty_text_shards_enter_engine_loop():
+    class EngineEntered(Exception):
+        pass
+
+    batch_size = 17
+    dp_size = 16
+    max_new_tokens = 5
+    batch = BatchedDataDict({"prompts": ["prompt"] * batch_size})
+    shards = batch.shard_by_batch_size(dp_size, allow_uneven_shards=True)
+    empty_ranks = 0
+    for data in shards:
+        row_count = len(data["prompts"])
+        empty_ranks += row_count == 0
+        worker = object.__new__(VllmGenerationWorkerImpl)
+        worker.cfg = {
+            "vllm_cfg": {"async_engine": False},
+            "_pad_token_id": 0,
+            "top_k": None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": max_new_tokens,
+            "stop_token_ids": None,
+        }
+        worker.tensor_parallel_size = 1
+        worker.expert_parallel_size = dp_size
+        worker._native_lora_request = None
+        worker.llm = MagicMock()
+        worker.llm.generate.side_effect = EngineEntered
+        worker.SamplingParams = MagicMock()
+        worker._tokenize_prompt_with_bos = lambda prompt: prompt
+        with pytest.raises(EngineEntered):
+            worker.generate_text(data)
+
+        if row_count == 0:
+            args, kwargs = worker.llm.generate.call_args
+            assert args[0] == [{"prompt_token_ids": [0]}]
+            assert kwargs == {"use_tqdm": False}
+            worker.SamplingParams.assert_called_once_with(
+                temperature=0.0, max_tokens=max_new_tokens, ignore_eos=True
+            )
+        else:
+            worker.llm.generate.assert_called_once()
+    assert empty_ranks == 7
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_engine", [True, False])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
@@ -4694,7 +4867,9 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
             if n > 2:
                 raise Overflow("queue full")
 
-    client = _AsyncLLMHTTPClient(FakeEngine(), asyncio.new_event_loop())
+    client = _AsyncLLMHTTPClient(
+        FakeEngine(), asyncio.new_event_loop(), flat_logprobs=False
+    )
 
     client.check_admission(1)
     client.check_admission(2, request_id="req-2")
