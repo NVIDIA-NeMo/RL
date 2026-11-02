@@ -93,7 +93,7 @@ class Eagle3DraftConfig(_DraftConfigBase):
     # Per-unroll-step loss decay factor: step k (0-indexed) is weighted by
     # ttt_step_loss_decay**k (1.0 keeps all steps equally weighted, matching
     # the speculators default).
-    ttt_step_loss_decay: float = 1.0
+    ttt_step_loss_decay: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 1.0
     # Train the draft's embed_tokens/lm_head (streamed on every refit)
     # instead of keeping the checkpoint copies frozen.
     train_embed_and_head: bool = True
