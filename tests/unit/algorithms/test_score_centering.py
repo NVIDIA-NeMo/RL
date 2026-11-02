@@ -343,6 +343,7 @@ def test_score_centering_matches_full_distribution_gradient(mode, head_probs):
         importance_sampling_mode=mode,
         is_bounds=(0.5, 2.0) if mode in ("tis", "icepop") else None,
         token_mask=torch.ones(1, 1),
+        sampler_replay=False,
     )
     ratios = logp.detach().exp() / q
     if mode == "off":
@@ -367,7 +368,7 @@ def test_score_centering_matches_full_distribution_gradient(mode, head_probs):
 
 @pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop"])
 def test_score_centering_is_exact_over_the_sampler_support(mode):
-    """Replay: p and q share S_q and the head covers it, so there is no tail (rho = 1)."""
+    """Replay: p and q share S_q and the head covers it, so there is no tail (rho = 0)."""
     logits = torch.tensor([0.6, -0.2, 0.1, -0.7, -1.5], requires_grad=True)
     # Head ids 0..4; the sampler filtered ids 3 and 4 (-inf), so S_q = {0, 1, 2}.
     kept = torch.tensor([True, True, True, False, False])
@@ -392,6 +393,7 @@ def test_score_centering_is_exact_over_the_sampler_support(mode):
         importance_sampling_mode=mode,
         is_bounds=(lo, hi) if mode in ("tis", "icepop") else None,
         token_mask=torch.ones(1, 1),
+        sampler_replay=True,
     )
 
     assert torch.isfinite(correction).all() and correction.abs().max() < 10
@@ -407,24 +409,56 @@ def test_score_centering_is_exact_over_the_sampler_support(mode):
 
 
 @pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop"])
-def test_score_centering_has_no_tail_when_the_trainer_head_holds_all_its_mass(mode):
-    """No trainer tail means nothing to model a sampler tail on: rho is zero.
+def test_score_centering_replay_has_no_tail(mode):
+    """Under replay the head holds all of p, so rho is zero.
 
-    Dividing the sampler's leftover mass by an empty trainer tail would scale the
-    term's value by about 1e5 (the gradient is unaffected, but the value enters
+    A complete head may still miss up to 1e-4 of the sampler's mass to rounding.
+    Dividing that by the empty trainer tail, clamped to 1e-6, would scale the
+    term's value by about 50 (the gradient is unaffected, but the value enters
     the reported loss).
     """
     logits = torch.tensor([0.6, -0.2, 0.1], requires_grad=True)
     logp = logits.log_softmax(-1)
-    q = torch.tensor([0.5, 0.3, 0.1])  # 0.1 of the sampler's mass is elsewhere
+    q = torch.tensor([0.5, 0.3, 0.19995])
     correction, _ = compute_score_centering_term(
         logp.reshape(1, 1, -1),
         sampler_topk_logprobs=q.log().reshape(1, 1, -1),
         importance_sampling_mode=mode,
         is_bounds=(0.5, 2.0) if mode in ("tis", "icepop") else None,
         token_mask=torch.ones(1, 1),
+        sampler_replay=True,
     )
     assert torch.isfinite(correction).all() and correction.abs().max() < 10
+
+
+def test_score_centering_keeps_a_small_positive_trainer_tail_without_replay():
+    """Unfiltered capture models the sampler's tail on the trainer's, however small.
+
+    The top-2 head leaves a trainer tail of 9e-7 but a sampler tail of 0.2. The
+    estimate rho = 0.2 / 1e-6 (the clamp) cancels the expected tail-logit
+    gradient down to about 0.02; rho = 0 would leave all 0.2 of it.
+    """
+    p = torch.tensor([0.6, 0.3999991, 9e-7], dtype=torch.float64)
+    q = torch.tensor([0.5, 0.3, 0.2], dtype=torch.float64)
+    logits = p.log().requires_grad_()
+    logp = logits.log_softmax(-1)
+    correction, _ = compute_score_centering_term(
+        logp[:2].reshape(1, 1, 2),
+        sampler_topk_logprobs=q[:2].log().reshape(1, 1, 2),
+        importance_sampling_mode="off",
+        is_bounds=None,
+        token_mask=torch.ones(1, 1),
+        sampler_replay=False,
+    )
+    # E_q[grad log p_y] = q - p, minus the gradient of the centering term.
+    centered = (q - p) - torch.autograd.grad(correction.sum(), logits)[0]
+    rho = 0.2 / 1e-6
+    torch.testing.assert_close(
+        centered[2],
+        torch.tensor(0.2 - rho * 9e-7, dtype=torch.float64),
+        atol=1e-6,
+        rtol=0,
+    )
 
 
 def _replayed_score_centering_loss(mode, sampled_ids, token_level_loss, sample_weight):

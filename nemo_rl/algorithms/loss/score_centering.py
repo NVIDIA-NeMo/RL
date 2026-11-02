@@ -24,6 +24,7 @@ def compute_score_centering_term(
     importance_sampling_mode: str,
     is_bounds: tuple[float, float] | None,
     token_mask: torch.Tensor,
+    sampler_replay: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-token ``sum_v sg(c_v) * log p_v`` whose gradient is the sampler-expected score.
 
@@ -60,6 +61,10 @@ def compute_score_centering_term(
         is_bounds: ``(lo, hi)`` for TIS/ICEPOP, otherwise ``None``.
         token_mask: Active token/sample positions, before IS filtering. A zero
             sampled-token ICEPOP weight must not mask the correction.
+        sampler_replay: Whether the trainer log-probs are renormalized over the
+            sampler's support, so the head holds all of p and ``rho`` is zero.
+            Otherwise ``rho`` models the sampler's tail on the trainer's tail,
+            however small that tail is.
 
     Returns:
         The per-token term ``[B, S]`` and the sampler mass the head covers ``[B, S]``.
@@ -71,14 +76,10 @@ def compute_score_centering_term(
     p = torch.where(slots, p_log.detach().exp(), 0.0)
     q = torch.where(slots, q_log.exp(), 0.0)
     head_mass = q.sum(-1)
-    # With no trainer tail (the head holds all of p, as under replay) there is
-    # nothing to model the sampler's tail on.
-    trainer_tail = 1.0 - p.sum(-1)
-    rho = torch.where(
-        trainer_tail > 1e-6,
-        (1.0 - head_mass).clamp(min=0.0) / trainer_tail.clamp(min=1e-6),
-        0.0,
-    )
+    if sampler_replay:
+        rho = torch.zeros_like(head_mass)
+    else:
+        rho = (1.0 - head_mass).clamp(min=0.0) / (1.0 - p.sum(-1)).clamp(min=1e-6)
     if importance_sampling_mode == "off":
         mass, alpha = q, rho
     elif importance_sampling_mode == "is":
