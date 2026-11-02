@@ -529,3 +529,37 @@ def test_cut_coverage_counts_distinct_prompt_groups() -> None:
         _SNAPSHOT_HELPER._require_cut_coverage(candidates, min_cuts=1, min_cut_groups=3)
     with pytest.raises(AssertionError, match="need 4 in 1"):
         _SNAPSHOT_HELPER._require_cut_coverage(candidates, min_cuts=4, min_cut_groups=1)
+
+
+def _save_line(snapshot: str, failed: str = "0.00", skipped: str = "0.00") -> str:
+    return (
+        "(SingleControllerActor pid=1) rollout checkpoint save completed: "
+        f"/ckpt/bootstrap/rollout_snapshots/{snapshot} (step=0, trainer_version=0, "
+        f"generation_cut_calls=8.00, generation_cut_failed_calls={failed}, "
+        f"generation_cut_skipped_calls={skipped})"
+    )
+
+
+def test_selected_snapshot_must_have_cut_every_active_call() -> None:
+    snapshot = Path("/ckpt/bootstrap/rollout_snapshots/snapshot_000002")
+    log = "\n".join(
+        [_save_line("snapshot_000001", failed="1.00"), _save_line("snapshot_000002")]
+    )
+
+    _SNAPSHOT_HELPER._require_every_active_call_cut(snapshot, log)
+    for uncut in ({"failed": "1.00"}, {"skipped": "2.00"}):
+        with pytest.raises(AssertionError, match="left active calls uncut"):
+            _SNAPSHOT_HELPER._require_every_active_call_cut(
+                snapshot, _save_line("snapshot_000002", **uncut)
+            )
+    # Published before its save line: not a candidate yet.
+    with pytest.raises(FileNotFoundError):
+        _SNAPSHOT_HELPER._require_every_active_call_cut(
+            snapshot, _save_line("snapshot_000001")
+        )
+    # A save line without the cut figures cannot vouch for every call.
+    with pytest.raises(AssertionError, match="left active calls uncut"):
+        _SNAPSHOT_HELPER._require_every_active_call_cut(
+            snapshot,
+            "rollout checkpoint save completed: /ckpt/snapshot_000002 (step=0)",
+        )
