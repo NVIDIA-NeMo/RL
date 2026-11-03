@@ -26,7 +26,10 @@ import pytest
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
+    PostWriteEnrichmentError,
+    TQReplayBuffer,
 )
+from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
@@ -74,7 +77,7 @@ class _DataPlaneClient:
         )
 
 
-def _request() -> ReassemblyRequest:
+def _request(resolved_agent_name: str | None = None) -> ReassemblyRequest:
     return ReassemblyRequest(
         group_id="group",
         prompt_idx=17,
@@ -91,6 +94,7 @@ def _request() -> ReassemblyRequest:
         rewards=(1.0,),
         mask_sample=(False,),
         fallback_weight_version=3,
+        resolved_agent_name=resolved_agent_name,
     )
 
 
@@ -157,8 +161,142 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         3,
         3,
         staging_keys=["group_g0/call"],
+        extra_env_info=None,
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel", "missing_route"])
+def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
+    outcome: str,
+) -> None:
+    """Exercise the real controller -> buffer -> teacher coordinator boundary."""
+
+    async def exercise() -> None:
+        meta = KVBatchMeta(
+            partition_id="canonical",
+            task_name="train",
+            sample_ids=["group_g0"],
+            fields=["input_ids", "input_lengths"],
+            sequence_lengths=[3],
+            tags=[{"weight_version": 3}],
+        )
+        result = FinalizedGroup(
+            meta=meta,
+            group_min_wv=2,
+            group_max_wv=3,
+            staging_keys=["group_g0/call"],
+        )
+        actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+        ctrl = _controller(actor)
+        ctrl._buffer = TQReplayBuffer(
+            ctrl._dp_client,
+            partition_id="canonical",
+            staging_partition_id="staging",
+            pad_value_dict={"token_ids": 0},
+            include_message_violation_fields=False,
+        )
+        ctrl._buffer.set_data_plane_checkpoint_barrier(
+            ctrl._data_plane_checkpoint_barrier
+        )
+        ctrl._buffer.reserve(weight_version=3, group_id="group")
+        teacher_started = asyncio.Event()
+        release_teacher = threading.Event()
+        teacher_writes: list[str] = []
+        loop = asyncio.get_running_loop()
+
+        def score(received_meta: KVBatchMeta) -> None:
+            assert received_meta is meta
+            loop.call_soon_threadsafe(teacher_started.set)
+            if not release_teacher.wait(timeout=5):
+                raise TimeoutError("test did not release teacher inference")
+            # Includes a partial write in the failure case. Cleanup must happen
+            # only after this background writer has stopped, even on cancellation.
+            assert ctrl._dp_client.clear_calls == []
+            teacher_writes.extend(received_meta.sample_ids)
+            if outcome == "failure":
+                raise RuntimeError("teacher unavailable")
+
+        teacher = SimpleNamespace(
+            sharding_annotations=SimpleNamespace(get_axis_size=lambda _: 1),
+            get_logprobs_from_meta=score,
+        )
+        coordinator = TQTeacherLogprobCoordinator(
+            dp_client=ctrl._dp_client,
+            teacher_worker_groups={"vision": teacher},
+            alias_to_group_alias={"image_agent": "vision"},
+            on_policy_distillation_cfg={
+                "teacher_model_by_agent_name": {"image_agent": "/ckpt/student"},
+                "strict_agent_name_match": True,
+            },
+        )
+        ctrl._buffer.set_post_write_enricher(coordinator.enrich)
+        task = asyncio.create_task(
+            ctrl._finalize_with_actor(
+                _request(None if outcome == "missing_route" else "image_agent"),
+            )
+        )
+        try:
+            if outcome != "missing_route":
+                await asyncio.wait_for(teacher_started.wait(), timeout=2)
+                assert ctrl._buffer.ready_list == [False]
+                assert ctrl._buffer.meta_list == [None]
+                ctrl._rollout_recovery_ledger.discard_group.assert_not_called()
+                if outcome == "cancel":
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    assert not task.done()
+                    assert ctrl._dp_client.clear_calls == []
+                release_teacher.set()
+
+            if outcome == "success":
+                assert await asyncio.wait_for(task, timeout=2) is result
+                assert ctrl._buffer.ready_list == [True]
+                assert ctrl._buffer.start_weight_list == [2]
+                assert ctrl._buffer.end_weight_list == [3]
+                assert ctrl._buffer._staging_keys_list == [["group_g0/call"]]
+                committed_meta = ctrl._buffer.meta_list[0]
+                assert committed_meta is not None
+                assert committed_meta.fields == [
+                    *meta.fields,
+                    "teacher_reference_logprobs",
+                ]
+                assert teacher_writes == ["group_g0"]
+                assert ctrl._dp_client.clear_calls == []
+                ctrl._rollout_recovery_ledger.discard_group.assert_called_once()
+                assert (
+                    coordinator.drain_metrics()[
+                        "on_policy_distillation/teacher_samples"
+                    ]
+                    == 1
+                )
+            else:
+                expected_error = (
+                    asyncio.CancelledError
+                    if outcome == "cancel"
+                    else PostWriteEnrichmentError
+                )
+                with pytest.raises(expected_error):
+                    await asyncio.wait_for(task, timeout=2)
+                assert ctrl._buffer.group_ids == ()
+                assert ctrl._dp_client.clear_calls == [
+                    {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+                    {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+                ]
+                assert teacher_writes == (
+                    [] if outcome == "missing_route" else ["group_g0"]
+                )
+                ctrl._rollout_manager.record_canonical_publication.assert_not_called()
+            assert ctrl._available_finalizers.get_nowait() is actor
+            assert ctrl._active_finalizers == 0
+            assert ctrl._finalizer_unknown_outcomes == 0
+        finally:
+            release_teacher.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
 
 
 def test_below_threshold_group_releases_pending_finalizer_state() -> None:

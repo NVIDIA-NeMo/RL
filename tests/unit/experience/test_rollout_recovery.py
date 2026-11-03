@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, TypeVar
 
 import pytest
@@ -29,6 +30,8 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.experience import rollout_reassembler
+from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, RolloutSelection
 from nemo_rl.experience.rollout_recovery import (
     _ATTEMPT_STATE_FIELDS,
     _GROUP_STATE_FIELDS,
@@ -37,6 +40,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     PromptGroupPhase,
     PromptGroupRecoveryRecord,
+    PromptGroupStatus,
     PromptRef,
     RecoveryGranularity,
     RolloutAttemptRecord,
@@ -44,11 +48,272 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutSiblingRecord,
     SiblingSealResult,
+    _selection_from_state,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
 
 _T = TypeVar("_T")
+
+
+def test_selection_restore_preserves_new_defaulted_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection_type = dataclasses.make_dataclass(
+        "ExtendedSelection",
+        [("extra_state", int, dataclasses.field(default=0))],
+        bases=(RolloutSelection,),
+        frozen=True,
+    )
+    monkeypatch.setattr(rollout_reassembler, "RolloutSelection", selection_type)
+    selection = selection_type(
+        ("response0",), (ActionOutputFlags(False, False),), extra_state=7
+    )
+    assert _selection_from_state(dataclasses.asdict(selection)) == selection
+
+
+def _forest_sealed_ledger() -> RolloutRecoveryLedger:
+    from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
+
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    owner = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=owner,
+            receipt={
+                "capture_key": owner,
+                "manifest": [
+                    {"model_call_id": f"call{i}", "staging_key": f"{owner}/call{i}"}
+                    for i in range(3)
+                ],
+                "attempted_call_ids": ["call0", "call1", "call2", "failed"],
+            },
+            reward=0.5,
+            mask_sample=True,
+            reward_checks=RewardChecks(False, True, False),
+            reward_log_context=RewardLogContext("agent", '{"answer":"empty"}'),
+            logical_selection=RolloutSelection(
+                ("response0", "response2"),
+                (ActionOutputFlags(True, False), ActionOutputFlags(False, True)),
+                truncated=True,
+            ),
+        )
+    )
+    return ledger
+
+
+@pytest.mark.nemo_gym
+def test_forest_recovery_disk_round_trip_retains_completed_evidence(
+    tmp_path: Path,
+) -> None:
+    ledger = _forest_sealed_ledger()
+    state = ledger.state_dict()
+    path = tmp_path / "recovery.pt"
+    torch.save(state, path)
+    restored = RolloutRecoveryLedger.from_state_dict(
+        torch.load(path, weights_only=True)
+    )
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict() == state
+    owner = ledger.get_group("g7").gate_rollout_id(0)
+    # Unselected and failed calls remain cleanup-owned, but aren't selected for loss.
+    assert restored.expected_staging_keys() == {
+        f"{owner}/{call}" for call in ("call0", "call1", "call2", "failed")
+    }
+    before = ledger.get_group("g7").siblings[0].current_attempt
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+    retried = _mutate(lambda cut: restored.prepare_incomplete_retry(cut, "g7"))
+    assert retried.siblings[0].current_attempt == before
+    assert (
+        retried.siblings[1].current_attempt.attempt_id
+        != ledger.get_group("g7").siblings[1].current_attempt.attempt_id
+    )
+    assert retried.siblings[1].current_attempt.logical_selection is None
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.nemo_gym
+def test_masked_forest_sibling_round_trip_preserves_pending_custody(
+    tmp_path: Path, pending: bool
+) -> None:
+    ledger = _forest_sealed_ledger()
+    owner = ledger.get_group("g7").gate_rollout_id(1)
+    receipt = {
+        "capture_key": owner,
+        "manifest": [{"model_call_id": "done", "staging_key": f"{owner}/done"}],
+        "attempted_call_ids": ["done", "failed"],
+        "pending_call_ids": ["failed"] if pending else [],
+        "capture_poisoned": True,
+        "failure_reason": "capture_incomplete",
+    }
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=1,
+            gate_rollout_id=owner,
+            receipt=receipt,
+            reward=0.0,
+            mask_sample=True,
+            logical_selection=RolloutSelection((), ()),
+        )
+    )
+    state = ledger.state_dict()
+    path = tmp_path / "masked-recovery.pt"
+    torch.save(state, path)
+    restored = RolloutRecoveryLedger.from_state_dict(
+        torch.load(path, weights_only=True)
+    )
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict() == state
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+    group = restored.get_group("g7")
+    assert group.status is PromptGroupStatus.READY_TO_FINALIZE
+    assert group.siblings == ledger.get_group("g7").siblings
+    assert group.siblings[1].current_attempt.receipt == receipt
+    assert group.siblings[1].current_attempt.logical_selection == RolloutSelection(
+        (), ()
+    )
+    assert f"{owner}/done" in restored.expected_staging_keys(required_only=True)
+    assert (f"{owner}/failed" in restored.expected_staging_keys()) is not pending
+    assert f"{owner}/failed" not in restored.expected_staging_keys(required_only=True)
+
+
+@pytest.mark.nemo_gym
+def test_empty_forest_selection_requires_poisoned_receipt_on_seal_and_restore() -> None:
+    ledger = _forest_sealed_ledger()
+    group = ledger.get_group("g7")
+    owner = group.gate_rollout_id(1)
+    state = ledger.state_dict()
+    with pytest.raises(
+        ValueError, match="Empty Forest selection requires poisoned capture"
+    ):
+        _mutate(
+            lambda cut: ledger.mark_sibling_sealed(
+                cut,
+                "g7",
+                generation_index=1,
+                gate_rollout_id=owner,
+                receipt={"capture_key": owner, "manifest": []},
+                reward=1.0,
+                mask_sample=False,
+                logical_selection=RolloutSelection((), ()),
+            )
+        )
+    assert ledger.state_dict() == state
+    saved = state["groups"][0]["siblings"][0]["attempts"][0]
+    saved["logical_selection"] = dataclasses.asdict(RolloutSelection((), ()))
+    with pytest.raises(
+        ValueError, match="Empty Forest selection requires poisoned capture"
+    ):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_field",
+        "foreign_receipt",
+        "foreign_staging",
+        "wrong_call",
+        "missing_call",
+        "staging",
+        "duplicate",
+        "unsealed",
+        "unknown_field",
+        "missing_descriptor_field",
+        "tensor",
+        "flags",
+        "duplicate_selection",
+        "pending",
+    ],
+)
+@pytest.mark.nemo_gym
+def test_forest_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
+    state = _forest_sealed_ledger().state_dict()
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    selection, receipt = attempt["logical_selection"], attempt["receipt"]
+    if damage == "missing_field":
+        del attempt["logical_selection"]
+    elif damage == "foreign_receipt":
+        receipt["capture_key"] = "foreign"
+    elif damage in {"foreign_staging", "wrong_call", "missing_call"}:
+        entry = receipt["manifest"][0]
+        if damage == "foreign_staging":
+            entry["staging_key"] = "foreign/call0"
+        elif damage == "wrong_call":
+            entry["model_call_id"] = "other"
+        else:
+            del entry["model_call_id"]
+        attempt["staging_keys"][0] = entry["staging_key"]
+    elif damage == "staging":
+        attempt["staging_keys"] = []
+    elif damage == "duplicate":
+        receipt["manifest"].append(dict(receipt["manifest"][0]))
+    elif damage == "unsealed":
+        attempt["status"] = "abandoned"
+    elif damage == "missing_descriptor_field":
+        del selection["action_flags"]
+    elif damage == "tensor":
+        selection["truncated"] = torch.tensor(True)
+    elif damage == "flags":
+        selection["action_flags"][0]["invalid_tool_call"] = 1
+    elif damage == "duplicate_selection":
+        selection["response_ids"] = ("response0", "response0")
+    elif damage == "pending":
+        receipt["pending_call_ids"] = ["inflight"]
+    else:
+        selection["unknown"] = 1
+    with pytest.raises((ValueError, TypeError)):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+@pytest.mark.parametrize("schema", [2, 3, 4])
+def test_legacy_ordinary_recovery_still_loads(schema: int) -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+    )
+    state = ledger.state_dict()
+    state["schema_version"] = schema
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    del attempt["logical_selection"]
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    assert (
+        restored.get_group("g7").siblings[0].current_attempt.logical_selection is None
+    )
+
+
+@pytest.mark.nemo_gym
+def test_obsolete_cc_snapshot_has_explicit_error() -> None:
+    state = _forest_sealed_ledger().state_dict()
+    state["schema_version"] = 3
+    for sibling in state["groups"][0]["siblings"]:
+        for attempt in sibling["attempts"]:
+            attempt["logical_segments"] = (
+                [{}] if attempt.pop("logical_selection") else None
+            )
+    with pytest.raises(ValueError, match="unknown fields"):
+        RolloutRecoveryLedger.from_state_dict(state)
 
 
 def _mutate(callback: Callable[[DataPlaneMutationCut], _T]) -> _T:
@@ -210,7 +475,7 @@ def _sealed_attempt_state() -> dict[str, Any]:
             generation_index=0,
             gate_rollout_id=gate_id,
             receipt={
-                "rollout_id": gate_id,
+                "capture_key": gate_id,
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
@@ -218,6 +483,74 @@ def _sealed_attempt_state() -> dict[str, Any]:
         )
     )
     return ledger.state_dict()
+
+
+@pytest.mark.parametrize("schema", [2, 3])
+def test_restore_rejects_capture_receipts_before_v4(schema: int) -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = schema
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    del attempt["logical_selection"]
+    receipt = attempt["receipt"]
+    receipt["rollout_id"] = receipt.pop("capture_key")
+
+    with pytest.raises(
+        ValueError,
+        match="Token-capture rollout checkpoints from before schema v4 cannot be resumed",
+    ):
+        RolloutRecoveryLedger.from_state_dict(state)
+    assert "rollout_id" in receipt
+    assert "capture_key" not in receipt
+
+
+@pytest.mark.parametrize("schema", [2, 3, 4, 5])
+@pytest.mark.parametrize("sealed", [False, True])
+def test_receipt_free_recovery_still_loads(schema: int, sealed: bool) -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = schema
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    attempt["receipt"] = None
+    attempt["staging_keys"] = []
+    if schema < 5:
+        del attempt["logical_selection"]
+    if not sealed:
+        state["groups"][0]["status"] = "generating"
+        attempt.update(status="dispatched", reward=None, mask_sample=None)
+    if schema == 2:
+        for key in ("reward_checks", "reward_log_context"):
+            attempt.pop(key)
+
+    sidecar = {
+        **state,
+        "batch_shortfall": {7: 1},
+        "sampler_stamps_target_steps": True,
+    }
+    if schema >= 3:
+        sidecar.update(
+            reward_settings=None,
+            finalizer_metrics_by_group={},
+            finalizer_rewards_by_group={},
+        )
+    parsed = parse_rollout_recovery_state(sidecar)
+    restored = RolloutRecoveryLedger.from_state_dict(parsed.ledger_state)
+    current = restored.get_group("g7").siblings[0].current_attempt
+    assert current.receipt is None
+    assert current.reward == (1.0 if sealed else None)
+    assert parsed.batch_shortfall == {7: 1}
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict()["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
+
+
+def test_v4_capture_receipt_restores_without_forest_selection() -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = 4
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    del attempt["logical_selection"]
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    current = restored.get_group("g7").siblings[0].current_attempt
+    assert current.receipt == attempt["receipt"]
+    assert current.logical_selection is None
+    assert restored.expected_staging_keys() == set(attempt["staging_keys"])
 
 
 @pytest.mark.parametrize(
@@ -265,7 +598,7 @@ def test_restore_rejects_malformed_attempt_fields(
     elif case == "receipt_manifest_type":
         attempt["receipt"]["manifest"] = None
     elif case == "receipt_identity":
-        attempt["receipt"]["rollout_id"] = "wrong"
+        attempt["receipt"]["capture_key"] = "wrong"
     elif case == "receipt_manifest":
         attempt["receipt"]["manifest"] = [{"staging_key": "wrong"}]
     elif case == "unsealed_payload":
@@ -738,7 +1071,7 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
             generation_index=0,
             gate_rollout_id=sealed_id,
             receipt={
-                "rollout_id": sealed_id,
+                "capture_key": sealed_id,
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
@@ -792,7 +1125,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     receipts = [
         None,
         {
-            "rollout_id": gate_ids[1],
+            "capture_key": gate_ids[1],
             "manifest": [{"staging_key": f"{gate_ids[1]}/call"}],
         },
     ]
@@ -915,7 +1248,7 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
         results[generation_index] = SiblingSealResult(
             gate_rollout_id=gate_id,
             receipt={
-                "rollout_id": gate_id,
+                "capture_key": gate_id,
                 "manifest": [{"staging_key": f"g7/sibling-{generation_index}/call-0"}],
             },
             reward=1.0,
@@ -959,7 +1292,7 @@ def test_prompt_group_seal_is_atomic() -> None:
         0: SiblingSealResult(
             gate_rollout_id=gate_id,
             receipt={
-                "rollout_id": gate_id,
+                "capture_key": gate_id,
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
@@ -1003,7 +1336,7 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
             generation_index=0,
             gate_rollout_id=gate_id,
             receipt={
-                "rollout_id": gate_id,
+                "capture_key": gate_id,
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
@@ -1054,14 +1387,122 @@ def test_restore_rejects_malformed_recovery_policy_fields(
         _load(RolloutRecoveryLedger(), state)
 
 
-def test_restore_rejects_unsupported_schema_version() -> None:
+@pytest.mark.parametrize("version", [1, ROLLOUT_RECOVERY_SCHEMA_VERSION + 1])
+def test_restore_rejects_unsupported_schema_version(version: int) -> None:
     state = {
-        "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION + 1,
+        "schema_version": version,
         "groups": [],
     }
 
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema"):
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
+    state = {
+        "schema_version": version,
+        "groups": [],
+        "batch_shortfall": {},
+        "sampler_stamps_target_steps": False,
+    }
+    if version == ROLLOUT_RECOVERY_SCHEMA_VERSION:
+        state.update(
+            reward_settings=None,
+            finalizer_metrics_by_group={},
+            finalizer_rewards_by_group={},
+        )
+    parsed = parse_rollout_recovery_state(state)
+    assert parsed.reward_settings is None
+    assert parsed.finalizer_metrics_by_group == {}
+    assert parsed.finalizer_rewards_by_group == {}
+    assert len(RolloutRecoveryLedger.from_state_dict(parsed.ledger_state)) == 0
+    assert parsed.batch_shortfall == {}
+    assert parsed.sampler_stamps_target_steps is False
+
+
+@pytest.mark.parametrize("version", [2, 3, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = version
+    for group in state["groups"]:
+        group.pop("resolved_agent_name", None)
+        if version < 5:
+            for sibling in group["siblings"]:
+                for attempt in sibling["attempts"]:
+                    attempt.pop("logical_selection")
+    if version < 4:
+        attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+        attempt["receipt"] = None
+        attempt["staging_keys"] = []
+    ledger = RolloutRecoveryLedger.from_state_dict(state)
+    group_id = state["groups"][0]["group_id"]
+    before = ledger.finalization_inputs(group_id)
+    _mutate(lambda cut: ledger.prepare_for_restart(cut))
+    assert ledger.get_group(group_id).resolved_agent_name is None
+    assert ledger.finalization_inputs(group_id) == before
+    _bind(ledger, group_id, _prompt())
+    upgraded = ledger.state_dict()
+    assert upgraded["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
+    assert upgraded["groups"][0]["resolved_agent_name"] is None
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_seal_rejects_conflicting_agent_names_atomically(granularity) -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=granularity,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    results = {
+        index: SiblingSealResult(
+            gate_rollout_id=group.gate_rollout_id(index),
+            receipt=None,
+            reward=0.0,
+            mask_sample=True,
+            resolved_agent_name=f"agent-{index}",
+        )
+        for index in range(2)
+    }
+    if granularity is RecoveryGranularity.SIBLING:
+        _mutate(
+            lambda cut: ledger.mark_sibling_sealed(
+                cut, "g7", generation_index=0, **dataclasses.asdict(results[0])
+            )
+        )
+        # Preserve the route even when only the first sibling survived restart.
+        ledger = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+        _bind(ledger, "g7", _prompt())
+        assert ledger.get_group("g7").resolved_agent_name == "agent-0"
+    before = ledger.state_dict()
+    with pytest.raises(ValueError, match="siblings resolved to different agents"):
+        _mutate(
+            lambda cut: (
+                ledger.mark_group_sealed(cut, "g7", results)
+                if granularity is RecoveryGranularity.PROMPT_GROUP
+                else ledger.mark_sibling_sealed(
+                    cut, "g7", generation_index=1, **dataclasses.asdict(results[1])
+                )
+            )
+        )
+    assert ledger.state_dict() == before
+
+
+@pytest.mark.parametrize("agent_name", ["", 42, {"name": "agent"}])
+def test_restore_rejects_invalid_resolved_agent_name(agent_name) -> None:
+    state = _sealed_attempt_state()
+    state["groups"][0]["resolved_agent_name"] = agent_name
+    with pytest.raises(ValueError, match="resolved_agent_name"):
+        RolloutRecoveryLedger.from_state_dict(state)
 
 
 def test_restore_rejects_non_list_groups() -> None:
@@ -1137,7 +1578,7 @@ def test_reward_checks_seals_and_survives_checkpoint(granularity):
     context = RewardLogContext("agent", '{"answer":"ok"}')
     result = SiblingSealResult(
         rollout_id,
-        {"rollout_id": rollout_id, "manifest": []},
+        {"capture_key": rollout_id, "manifest": []},
         -2.0,
         False,
         evidence,
@@ -1238,7 +1679,7 @@ def test_restore_rejects_malformed_reward_checks(raw_checks):
     rollout_id = group.gate_rollout_ids[0]
     result = SiblingSealResult(
         rollout_id,
-        {"rollout_id": rollout_id, "manifest": []},
+        {"capture_key": rollout_id, "manifest": []},
         1.0,
         False,
         RewardChecks(False, False, False),

@@ -131,6 +131,7 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
             workers.append(_FakeWorker(len(workers), dead=shard in set(dead_shards)))
     generation = SimpleNamespace(
         cfg={"vllm_cfg": {"async_engine": True}},
+        vllm_dp_size=1,
         worker_group=SimpleNamespace(
             workers=workers,
             dp_size=dp_size,
@@ -253,6 +254,17 @@ class TestRebuildDispatch:
 
         prefixes = {w.idx: w.calls[0]["rank_prefix"] for w in workers if w.calls}
         assert prefixes == {0: 0, 2: 1, 3: 2}, "survivors must be contiguous, not holed"
+
+    def test_vllm_dp_rebuild_rejects_partial_shards(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, _ = _rebuildable(dead_shards=(1,))
+        sync._generation.vllm_dp_size = 2
+
+        with pytest.raises(
+            RuntimeError, match="Partial-shard rebuild is not supported"
+        ):
+            sync.reconcile_communicator([1])
+        assert all(not worker.calls for worker in workers)
 
     def test_world_size_shrinks_by_the_lost_shard(self, monkeypatch):
         monkeypatch.setattr("ray.get", lambda futures: futures)

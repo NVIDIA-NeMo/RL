@@ -100,6 +100,10 @@ policy: &POLICY_BASE
           ckpt_assume_constant_structure: false
         force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
+        # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+        # together every manual_gc_interval optimizer steps (a positive integer).
+        manual_gc: false
+        manual_gc_interval: 10
         activation_checkpointing: false
         cuda_graph_impl: "none"
         cuda_graph_modules: []
@@ -214,6 +218,7 @@ policy: &POLICY_BASE
         val_top_k: ${.top_k}
         stop_token_ids: null
         stop_strings: null
+        lora_refit_mode: native
         vllm_cfg:
             async_engine: false
             precision: ${...precision}
@@ -232,6 +237,8 @@ policy: &POLICY_BASE
             num_last_layers_in_bf16: 0
             num_first_layers_in_bf16: 0
             distributed_executor_backend: null
+            flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
+            output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
         vllm_kwargs: {}
 
         colocated:
@@ -275,6 +282,7 @@ env:
 logger:
     log_dir: "logs/distillation"
     num_val_samples_to_print: 5
+    extra_backends: []
     wandb_enabled: true
     tensorboard_enabled: true
     mlflow_enabled: false

@@ -48,7 +48,7 @@ new container image is built.
 | `CI:Lfast` | Fast test subset | Reuses main container (PRs to a release branch such as `r0.8.0` reuse that branch's container, published only by pushes to that branch after merges) |
 | `CI:L0` | Unit tests + docs + lint | Builds new image |
 | `CI:L1` | L0 + functional tests | Builds new image |
-| `CI:L2` | L1 + convergence tests | Builds new image |
+| `CI:L2` | Same as L1 today (plan to add convergence tests) | Builds new image |
 | `Skip CICD` | Nothing (skips all tests) | — |
 
 **Default on merge group / push to main**: L1.
@@ -58,10 +58,10 @@ new container image is built.
 | Changed paths / nature of change | Label |
 |----------------------------------|-------|
 | Docs only (`docs/`, `*.md`, docstrings) | `CI:docs` |
-| Trivial fix, no logic change | `CI:Lfast` |
-| New code, bug fix, refactor | `CI:L0` |
-| Changes that could affect model behaviour | `CI:L1` |
-| Changes that could affect convergence | `CI:L2` |
+| Default, including new features and bug fixes | `CI:Lfast` |
+| (Rarely needed) | `CI:L0` |
+| Large refactor, broad changes to core code, or dependency changes | `CI:L1` |
+| (Not needed: it runs the same jobs as `CI:L1` today) | `CI:L2` |
 
 ---
 

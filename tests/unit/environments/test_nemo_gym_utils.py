@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import types
+import warnings
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -38,6 +39,7 @@ from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    set_nemo_gym_log_dir,
     setup_nemo_gym_config,
     spinup_nemo_gym_actor,
 )
@@ -53,7 +55,7 @@ def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
         "stop_strings": ["stop"],
         "stop_token_ids": [1],
     }
-    config = SimpleNamespace(policy={"generation": generation})
+    config = SimpleNamespace(policy={"generation": generation}, data={})
 
     setup_nemo_gym_config(config, tokenizer=None)
 
@@ -74,10 +76,46 @@ def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
 
 
 def test_setup_nemo_gym_config_rejects_unsupported_backend() -> None:
-    config = SimpleNamespace(policy={"generation": {"backend": "unsupported"}})
+    config = SimpleNamespace(policy={"generation": {"backend": "unsupported"}}, data={})
 
     with pytest.raises(ValueError, match="got 'unsupported'"):
         setup_nemo_gym_config(config, tokenizer=None)
+
+
+@pytest.mark.parametrize("capture_enabled", [False, True])
+@pytest.mark.parametrize("tile_cap", [0, 4])
+@pytest.mark.parametrize(
+    "section,as_list",
+    [
+        ("default", False),
+        ("train", False),
+        ("train", True),
+        ("validation", False),
+        ("validation", True),
+    ],
+)
+def test_setup_nemo_gym_config_rejects_image_tile_cap_before_worker_setup(
+    section: str, as_list: bool, tile_cap: int, capture_enabled: bool
+) -> None:
+    dataset = {"image_max_num_tiles": tile_cap}
+    config = SimpleNamespace(
+        data={section: [{}, dataset] if as_list else dataset},
+        token_capture={"enabled": capture_enabled},
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
+    )
+    with pytest.raises(ValueError, match="image_max_num_tiles is not supported"):
+        setup_nemo_gym_config(config, tokenizer=None)
+    assert config.policy["generation"] == {"backend": "vllm", "vllm_cfg": {}}
+
+
+@pytest.mark.parametrize("tile_option", [{}, {"image_max_num_tiles": None}])
+def test_setup_nemo_gym_config_allows_unset_image_tile_cap(tile_option: dict) -> None:
+    config = SimpleNamespace(
+        data={"default": tile_option, "train": [tile_option], "validation": None},
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
+    )
+    setup_nemo_gym_config(config, tokenizer=None)
+    assert config.policy["generation"]["vllm_cfg"]["expose_http_server"] is True
 
 
 @pytest.mark.parametrize(
@@ -167,6 +205,52 @@ def test_get_nemo_gym_uv_cache_dir_uses_uv_inside_container(monkeypatch):
         lambda *args, **kwargs: b"  /root/.cache/uv\n",
     )
     assert get_nemo_gym_uv_cache_dir() == "/root/.cache/uv"
+
+
+def test_set_nemo_gym_log_dir_resolves_the_run_log_dir_on_the_driver(
+    tmp_path, monkeypatch
+):
+    """A relative log dir is made absolute here, not by the Gym actor's cwd."""
+    monkeypatch.chdir(tmp_path)
+    env_config = {"should_use_nemo_gym": True}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        set_nemo_gym_log_dir(env_config, os.path.join("logs", "exp_001"))
+
+    assert env_config["nemo_gym"] == {
+        "nemo_gym_log_dir": str(tmp_path / "logs" / "exp_001" / "nemo_gym")
+    }
+
+
+def test_set_nemo_gym_log_dir_replaces_a_configured_dir_with_a_warning(tmp_path):
+    env_config = {
+        "nemo_gym": {"nemo_gym_log_dir": "logs/nemo_gym", "config_paths": ["a.yaml"]}
+    }
+
+    with pytest.warns(UserWarning) as record:
+        set_nemo_gym_log_dir(env_config, str(tmp_path / "exp_001"))
+
+    assert env_config["nemo_gym"] == {
+        "nemo_gym_log_dir": str(tmp_path / "exp_001" / "nemo_gym"),
+        "config_paths": ["a.yaml"],
+    }
+    assert [str(warning.message) for warning in record] == [
+        "Config value env.nemo_gym.nemo_gym_log_dir='logs/nemo_gym' is overridden; "
+        f"using {str(tmp_path / 'exp_001' / 'nemo_gym')!r} "
+        "(NeMo Gym server logs always go under this run's log directory)."
+    ]
+
+
+def test_set_nemo_gym_log_dir_is_silent_when_already_pointing_there(tmp_path):
+    gym_log_dir = str(tmp_path / "exp_001" / "nemo_gym")
+    env_config = {"nemo_gym": {"nemo_gym_log_dir": gym_log_dir}}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        set_nemo_gym_log_dir(env_config, str(tmp_path / "exp_001"))
+
+    assert env_config["nemo_gym"] == {"nemo_gym_log_dir": gym_log_dir}
 
 
 # The factory only forwards the tokenizer to the actors, so a sentinel is
@@ -317,6 +401,7 @@ def _stub_gym_spinup(run_helper):
     server_utils = types.ModuleType("nemo_gym.server_utils")
     server_utils.HEAD_SERVER_KEY_NAME = "head_server"
     server_utils.BaseServerConfig = MagicMock
+    server_utils.ServerClient = MagicMock
     with (
         patch.dict(
             sys.modules,
@@ -333,6 +418,46 @@ def _stub_gym_spinup(run_helper):
     ):
         mock_ray.get_runtime_context.return_value.gcs_address = "10.0.0.1:6379"
         yield
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize("forest_training", [False, True])
+def test_spinup_passes_parent_resolution_to_gym(forest_training, tmp_path, monkeypatch):
+    from nemo_gym.token_id_capture.config import TokenIdCaptureConfig
+
+    monkeypatch.setenv("NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN", "test-control")
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__(
+        {
+            "model_name": "test-model",
+            "base_urls": [],
+            "initial_global_config_dict": {},
+            "token_capture": {
+                "enabled": True,
+                "forest_training": forest_training,
+                "selection_policy": "returned_history",
+                "generation_backend": "vllm",
+                "capture_dir": str(tmp_path),
+                "control_auth_token": "test-control",
+            },
+        }
+    )
+    run_helper = MagicMock()
+    run_helper.start.side_effect = RuntimeError("stop before server startup")
+    with (
+        _stub_gym_spinup(run_helper),
+        pytest.raises(RuntimeError, match="stop before server startup"),
+    ):
+        actor._spinup()
+    config = run_helper.start.call_args.kwargs[
+        "global_config_dict_parser_config"
+    ].initial_global_config_dict
+    capture = TokenIdCaptureConfig.model_validate(dict(config)).token_id_capture
+    assert capture.parent_resolution == (
+        "source_history" if forest_training else "fingerprint"
+    )
+    assert "framework_owned_context" not in config["token_id_capture"]
 
 
 def test_spinup_stops_local_gym_servers_when_external_services_time_out():
