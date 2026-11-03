@@ -16,7 +16,6 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX, SetupTimingMetrics
 from nemo_rl.algorithms.sft_v2 import (
     ENERGON_IN_FLIGHT_ATTR,
-    ENERGON_WORKER_PROCESSES_ATTR,
     ENERGON_WORKERS_PER_RANK_ATTR,
     SFT_V2_TEED_METRICS,
     SFTSingleControllerActor,
@@ -188,9 +187,8 @@ def test_sft_v2_checkpointing_span_covers_the_whole_save(monkeypatch, tmp_path) 
 def test_sft_v2_setup_loaders_span_records_the_energon_worker_pool() -> None:
     """The subprocesses emit nothing, so the span is the only place they appear.
 
-    Eight workers behind each of two loader ranks is sixteen processes, and the
-    count a reader needs is that one -- not the per-rank setting, which is what
-    the config holds.
+    Per rank, because the job-wide total is this times the loader rank count,
+    which every ``rl.sft_v2.build_loader`` child of this span already carries.
     """
     exporter = InMemorySpanExporter()
     handle = setup_telemetry(
@@ -205,7 +203,6 @@ def test_sft_v2_setup_loaders_span_records_the_energon_worker_pool() -> None:
 
     (span,) = exporter.get_finished_spans()
     assert span.name == "rl.sft_v2.setup_loaders"
-    assert span.attributes[ENERGON_WORKER_PROCESSES_ATTR] == 16
     assert span.attributes[ENERGON_WORKERS_PER_RANK_ATTR] == 8
     # num_workers x the default prefetch_factor of 2.
     assert span.attributes[ENERGON_IN_FLIGHT_ATTR] == 16
@@ -216,16 +213,14 @@ def test_sft_v2_setup_loaders_span_records_the_energon_worker_pool() -> None:
 def test_sft_v2_in_process_loading_reports_no_worker_pool() -> None:
     """``num_workers=0`` loads in the policy process, so the honest count is 0.
 
-    Falling back to the model default here would invent sixteen processes that
+    Falling back to the model default here would invent eight processes that
     do not exist, which is worse than the gap this span closes.
     """
     controller = _loader_setup_controller(None, energon={"num_workers": 0})
 
-    attributes = _energon_fanout_attributes(
-        controller._master_config.data, loader_ranks=2
-    )
+    attributes = _energon_fanout_attributes(controller._master_config.data)
 
-    assert attributes[ENERGON_WORKER_PROCESSES_ATTR] == 0
+    assert attributes[ENERGON_WORKERS_PER_RANK_ATTR] == 0
     assert attributes[ENERGON_IN_FLIGHT_ATTR] == 0
 
 
@@ -239,7 +234,7 @@ def test_sft_v2_worker_pool_attributes_survive_a_config_the_model_would_reject()
     telemetry traceback with the real error never reached.
     """
     attributes = _energon_fanout_attributes(
-        {"energon": {"num_workers": "eight", "prefetch_factor": None}}, loader_ranks=2
+        {"energon": {"num_workers": "eight", "prefetch_factor": None}}
     )
 
     # The model defaults, rather than a raise or a missing attribute.

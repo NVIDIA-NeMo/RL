@@ -83,7 +83,6 @@ VALID_TOKENS_PER_SECOND_KEY = "valid_tokens_per_second"
 
 # Span attributes describing the Energon worker pool; see
 # :func:`_energon_fanout_attributes`.
-ENERGON_WORKER_PROCESSES_ATTR = "rl.energon.worker_processes"
 ENERGON_WORKERS_PER_RANK_ATTR = "rl.energon.workers_per_rank"
 ENERGON_IN_FLIGHT_ATTR = "rl.energon.batches_in_flight_per_rank"
 
@@ -179,14 +178,17 @@ def _restore_save_state(
     return SFTV2SaveState(**defaults)
 
 
-def _energon_fanout_attributes(
-    data_config: Mapping[str, Any], *, loader_ranks: int
-) -> dict[str, int]:
-    """How many Energon worker subprocesses this run has, and their queue depth.
+def _energon_fanout_attributes(data_config: Mapping[str, Any]) -> dict[str, int]:
+    """How many Energon worker subprocesses a rank forks, and their queue depth.
 
     These are the only record that the subprocesses exist. They are forked by
     the loader rather than by NeMo-RL, nothing installs a tracer in them, and
     the only span that sees them at all is the loader build they happen under.
+
+    Per rank, not per job: the span these land on has one
+    ``rl.sft_v2.build_loader`` child per loader rank, each carrying its
+    ``logical_world_size``, so a job-wide total would be the product of two
+    values already on the trace.
 
     Read off the config against the model's defaults rather than by validating
     it: this feeds a span, and a read strict enough to reject a config the
@@ -210,11 +212,10 @@ def _energon_fanout_attributes(
 
     workers = setting("num_workers")
     return {
-        ENERGON_WORKER_PROCESSES_ATTR: workers * loader_ranks,
         ENERGON_WORKERS_PER_RANK_ATTR: workers,
         # num_workers=0 loads in the policy process itself, so there is neither
-        # a subprocess nor a queue in front of it. Both products are 0, which
-        # is the honest reading rather than a missing value.
+        # a subprocess nor a queue in front of it. Zero is the honest reading
+        # rather than a missing value.
         ENERGON_IN_FLIGHT_ATTR: workers * setting("prefetch_factor"),
     }
 
@@ -348,9 +349,7 @@ class SFTSingleControllerActor:
             RLSpanGroup.U_SETUP,
             "rl.sft_v2.setup_loaders",
             tracer=self._tracer,
-            **_energon_fanout_attributes(
-                config.data, loader_ranks=self._placement_plan.logical_world_size
-            ),
+            **_energon_fanout_attributes(config.data),
         ):
             if self._loader_states is None:
                 futures = self._trainer.worker_group.run_all_workers_single_data(
