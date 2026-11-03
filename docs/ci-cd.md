@@ -57,7 +57,7 @@ The main pipeline (`cicd-main.yml`) runs through these stages:
 
 1. **Pre-flight**: determines test level from PR labels, changed files, and event type
 2. **Container build**: Docker image built on GPU runners (skipped for `Lfast` or when a pre-built `image_tag` is provided via `workflow_dispatch`)
-3. **Tests**: unit and functional tests run in containers on GPU runners using the custom `test-template` action. Doc tests also run in the GPU container, in parallel with the unit tests; no test job waits for them, but Coverage and the QA gate do. The CPU config checks (`test_recipes_and_test_suites.py`, `test_config_validation.py`) run on a GitHub-hosted CPU runner as soon as pre-flight passes, alongside the container build when there is one. No test job waits for them; the QA gate requires them, and on a PR run a failure cancels the rest of the run.
+3. **Tests**: unit and functional tests run in containers on GPU runners using the custom `test-template` action. Doc tests also run in the GPU container, in parallel with the unit tests; no test job waits for them, but Coverage and the QA gate do. The CPU config checks (`test_recipes_and_test_suites.py`, `test_config_validation.py`) run on a GitHub-hosted CPU runner after pre-flight and, on PR runs, lint and the test approval queue pass, alongside the container build when there is one. No test job waits for them; the QA gate requires them, and on a PR run a failure cancels the rest of the run.
 4. **Coverage**: aggregated from doc-tests, unit-tests, and e2e; uploaded to Codecov
 5. **QA Gate**: aggregates all job results into a single pass/fail status
 
