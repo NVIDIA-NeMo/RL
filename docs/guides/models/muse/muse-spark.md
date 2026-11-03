@@ -166,17 +166,25 @@ generation KL error rises from about `1e-3` to about `0.25`.
 
 The following curves were produced with the reference PP4/EP64 configuration on
 the 32-node H100 allocation described above. They show training reward,
-validation response length, mean generated tokens per sample, generation KL
-error, gradient norm, and approximate entropy over the first 16 steps. Training
-reward rises from about 0.36 to about 0.8, while the mean response length drops
-from about 1,800 to about 800 tokens. Generation KL error stays below `2e-3`.
+validation accuracy, mean generated tokens per sample, generation KL error,
+gradient norm, and approximate entropy over the first 30 steps.
 
-![Muse-Spark-Open-816B-A42B GRPO training reward, validation average length, mean generated tokens per sample, generation KL error, gradient norm, and approximate entropy](../../../assets/muse-spark/grpo-muse-spark-open-816b-automodel.png)
+- Training reward rises from about 0.36 to about 0.8 by step 14 and stays
+  between about 0.7 and 0.85 afterwards.
+- AIME 2024 validation accuracy, evaluated every 10 steps, is about 0.57 at
+  step 10, 0.72 at step 20, and 0.65 at step 30.
+- Mean response length drops from about 1,800 to about 500 tokens, and
+  approximate entropy falls from about 0.5 to about 0.32.
+- Generation KL error stays below about `2.2e-3`.
+- Gradient norm stays mostly below 2.5, with one spike to about 8.7 at step 25
+  that recovers at the next step.
+
+![Muse-Spark-Open-816B-A42B GRPO training reward, validation accuracy, mean generated tokens per sample, generation KL error, gradient norm, and approximate entropy over 30 steps](../../../assets/muse-spark/grpo-muse-spark-open-816b-automodel.png)
 
 ## Known Limitations
 
-- **Short validation run**: The curves cover 16 training steps. Long-run
-  convergence and validation accuracy have not been established.
+- **Short validation run**: The curves cover 30 training steps with three
+  validation points. Long-run convergence has not been established.
 - **Hardware and deployment coverage**: Only colocated training and generation
   on H100 GPUs have been tested. Non-colocated deployments and Blackwell GPUs
   have not been validated.
