@@ -903,6 +903,14 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     periodic-checkpoint failures are tolerated before the controller aborts the
     run. A successful or skipped attempt resets the counter; checkpoint
     invariant failures still fail immediately.
+
+    ``trace=True`` appends one JSON line per rollout event to
+    ``rollout_trace.jsonl`` in the log directory: each attempt's dispatch,
+    seal, abandonment and resume, each group's reservation and seal, each
+    training step, weight sync and published or restored checkpoint. It is for
+    checking what a stop and restore cost, rollout by rollout, and needs
+    ``rollout_recovery`` dispatch for the per-rollout events. It does not
+    enable checkpointing.
     """
 
     snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
@@ -911,6 +919,7 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
+    trace: bool = False
 
     @model_validator(mode="after")
     def validate_extra_fingerprint_excluded_paths(self) -> "RolloutCheckpointConfig":

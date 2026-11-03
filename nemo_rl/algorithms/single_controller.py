@@ -54,6 +54,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -108,6 +109,10 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
     RolloutParts,
     RolloutRuntimeState,
     TrainingProgress,
+)
+from nemo_rl.algorithms.rollout_checkpointing.trace import (
+    ROLLOUT_TRACE_FILENAME,
+    RolloutTrace,
 )
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
@@ -327,6 +332,9 @@ class SingleControllerActor:
     # policy save whose async write has not been finalized and published yet.
     _defer_checkpoint_finalize: bool = False
     _pending_checkpoint: Optional[tuple[PathLike, int]] = None
+    # rollout_checkpointing.trace's event log. Disabled by default; a disabled
+    # trace holds no state, so one instance serves every controller.
+    _rollout_trace: RolloutTrace = RolloutTrace(None)
 
     # True from the moment a failed refit pulls every shard out of service until the
     # retry puts them back; the exhaustion check stands down for that window. See
@@ -716,6 +724,15 @@ class SingleControllerActor:
             self._async_cfg.max_buffered_rollouts
         )
 
+        self._rollout_trace = RolloutTrace(
+            Path(self._logger.base_log_dir) / ROLLOUT_TRACE_FILENAME
+            if master_config.rollout_checkpointing.trace
+            else None
+        )
+        if self._rollout_trace.enabled:
+            self._rollout_manager.recovery_ledger.set_event_sink(
+                self._rollout_trace.emit
+            )
         # Built after every part they are given.
         self._rollout_snapshots, self._rollout_restorer = (
             self._build_rollout_checkpointing(
@@ -907,6 +924,7 @@ class SingleControllerActor:
                 except Exception as error:
                     print(f"finalizer actor termination failed: {error}", flush=True)
             await stop_storage_units(self._storage_units)
+            self._rollout_trace.close()
             if self._train_data_dump is not None:
                 try:
                     await asyncio.to_thread(self._train_data_dump.close)
@@ -968,6 +986,7 @@ class SingleControllerActor:
             runtime_state=self._rollout_runtime,
             read_progress=self._training_progress,
             log_metrics=self._log_telemetry_metrics,
+            trace=self._rollout_trace,
         )
         # Rollout snapshots, the TQ part of trainer checkpoints, the lock between
         # them and the optimizer-commit window.
@@ -3008,6 +3027,12 @@ class SingleControllerActor:
                 if not early_refit_done:
                     self._trainer_version += 1
                 self._train_steps += 1
+                self._rollout_trace.emit(
+                    "step_trained",
+                    step=self._train_steps,
+                    trainer_version=self._trainer_version,
+                    group_ids=sorted(step_finalizer_group_ids),
+                )
                 self._rollout_snapshots.end_optimizer_commit()
                 dropped_prompt_groups = self._rollout_runtime.batch_shortfall.get(
                     version_during_step, 0
@@ -4212,7 +4237,7 @@ class SingleControllerActor:
             self._checkpointer,
             last_checkpoint_step=self._train_steps,
         )
-        self._rollout_snapshots.trainer_checkpoint_published()
+        self._rollout_snapshots.trainer_checkpoint_published(self._train_steps)
 
     async def _finish_pending_save(self, *, blocking: bool) -> None:
         """Finalize and publish a save deferred by defer_async_checkpoint_finalize.
@@ -4242,7 +4267,7 @@ class SingleControllerActor:
                 self._checkpointer,
                 last_checkpoint_step=step,
             )
-        self._rollout_snapshots.trainer_checkpoint_published()
+        self._rollout_snapshots.trainer_checkpoint_published(step)
 
     # Grace on top of the workers' own refit deadline, so their attributable error wins
     # the race against this bound. They need to hit the deadline, abort, unwind, raise,
@@ -4505,6 +4530,10 @@ class SingleControllerActor:
             # (per-call tagging; group staleness = min over the group's calls).
             await asyncio.to_thread(
                 self._gen.set_rollout_weight_version, self._trainer_version
+            )
+        if self._rollout_trace.enabled:
+            self._rollout_trace.emit(
+                "weights_synced", weight_version=self._trainer_version
             )
         self._rollout_permitted.set()
         self._rollout_manager.resume_request_deadlines()

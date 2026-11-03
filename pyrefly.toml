@@ -80,6 +80,7 @@ project-includes = [
   "nemo_rl/algorithms/rollout_checkpointing/restore.py",
   "nemo_rl/algorithms/rollout_checkpointing/snapshots.py",
   "nemo_rl/algorithms/rollout_checkpointing/state.py",
+  "nemo_rl/algorithms/rollout_checkpointing/trace.py",
   "nemo_rl/algorithms/single_controller.py",
   "nemo_rl/algorithms/single_controller_utils/__init__.py",
   "nemo_rl/algorithms/single_controller_utils/config.py",

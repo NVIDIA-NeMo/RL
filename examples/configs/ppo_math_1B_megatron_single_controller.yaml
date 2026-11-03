@@ -198,6 +198,10 @@ rollout_checkpointing:
   # Every config path not excluded here or by NeMo-RL's built-in denylist must
   # match before a bootstrap rollout snapshot can be restored.
   extra_fingerprint_excluded_paths: []
+  # Append one JSON line per rollout event (attempt dispatch, seal, abandonment,
+  # resume; step, weight sync, checkpoint) to rollout_trace.jsonl in the log dir,
+  # to check what a stop and restore cost rollout by rollout.
+  trace: false
 
 policy:
   tokenizer:

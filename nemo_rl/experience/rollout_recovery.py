@@ -25,10 +25,10 @@ from __future__ import annotations
 import copy
 import dataclasses
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, Optional, Self, TypeAlias
 
 from nemo_rl.environments.checkpointing.interfaces import EnvironmentEpisode
 from nemo_rl.experience.reward_penalties import (
@@ -481,6 +481,11 @@ def _parse_environment_rollout_id(rollout_id: str) -> Optional[tuple[str, int]]:
     return group_id, int(generation_index)
 
 
+# Receives each ledger transition as ``sink(event, **fields)``; see
+# ``RolloutRecoveryLedger.set_event_sink``.
+RolloutEventSink: TypeAlias = Callable[..., None]
+
+
 def _new_attempt() -> RolloutAttemptRecord:
     return RolloutAttemptRecord(
         attempt_uuid=uuid.uuid4(),
@@ -633,6 +638,38 @@ class RolloutRecoveryLedger:
         # continued attempt sealed. The environment's marks live in its
         # processes, so these stay in memory too.
         self._environment_forgets: dict[str, set[EnvironmentEpisode]] = {}
+        self._event_sink: Optional[RolloutEventSink] = None
+
+    def set_event_sink(self, sink: Optional[RolloutEventSink]) -> None:
+        """Report every attempt and group transition to ``sink``, or stop with ``None``.
+
+        Restoring the ledger from a checkpoint reports nothing; the restart that
+        follows reports which interrupted attempts resume and which start over.
+        """
+        self._event_sink = sink
+
+    def _emit(
+        self,
+        event: str,
+        record: PromptGroupRecoveryRecord,
+        generation_index: Optional[int] = None,
+        **fields: Any,
+    ) -> None:
+        if self._event_sink is None:
+            return
+        if generation_index is not None:
+            sibling = record.siblings[generation_index]
+            attempt = sibling.current_attempt
+            fields = {
+                "generation_index": generation_index,
+                "attempt": len(sibling.attempts) - 1,
+                "environment_attempt": attempt.environment_attempt,
+                "environment_instance_id": attempt.environment_instance_id,
+                **fields,
+            }
+        self._event_sink(
+            event, group_id=record.group_id, prompt_id=record.prompt_id, **fields
+        )
 
     def groups(self) -> list[PromptGroupRecoveryRecord]:
         return [self._copy_group(group) for group in self._groups.values()]
@@ -703,6 +740,15 @@ class RolloutRecoveryLedger:
             ),
         )
         self._groups[group_id] = record
+        self._emit(
+            "group_reserved",
+            record,
+            admission_id=admission_id,
+            target_step=target_step,
+            admitted=admitted,
+            restore_level=restore_level.value,
+            expected_generations=expected_generations,
+        )
         return self._copy_group(record)
 
     def mark_group_admitted(
@@ -723,6 +769,7 @@ class RolloutRecoveryLedger:
         record.target_step = target_step
         record.start_weight_version = start_weight_version
         record.phase = PromptGroupPhase.ADMITTED
+        self._emit("group_admitted", record, target_step=target_step)
 
     def bind_runtime_prompt(
         self,
@@ -760,7 +807,7 @@ class RolloutRecoveryLedger:
         for record in self._groups.values():
             if record.status is PromptGroupStatus.GENERATING:
                 if record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
-                    self._abandon_entire_group(record)
+                    self._abandon_entire_group(record, reason="restart")
                 else:
                     for sibling in record.siblings:
                         attempt = sibling.current_attempt
@@ -785,6 +832,9 @@ class RolloutRecoveryLedger:
                             attempt.environment_attempt += 1
                             attempt.status = RolloutAttemptStatus.RESERVED
                             consumed_restores.add(restore_key)
+                            self._emit(
+                                "attempt_resumed", record, sibling.generation_index
+                            )
                             continue
                         # A reserved restored attempt continues environment state; one
                         # this restart did not restore again starts over.
@@ -794,6 +844,12 @@ class RolloutRecoveryLedger:
                         ):
                             continue
                         attempt.status = RolloutAttemptStatus.ABANDONED
+                        self._emit(
+                            "attempt_abandoned",
+                            record,
+                            sibling.generation_index,
+                            reason="restart",
+                        )
         unused_restores = restored - consumed_restores
         if unused_restores:
             raise ValueError(
@@ -801,7 +857,9 @@ class RolloutRecoveryLedger:
                 f"rollouts: {sorted(unused_restores)!r}"
             )
 
-    def _abandon_entire_group(self, record: PromptGroupRecoveryRecord) -> None:
+    def _abandon_entire_group(
+        self, record: PromptGroupRecoveryRecord, *, reason: str
+    ) -> None:
         """Discard every current sibling when an incomplete group is atomic.
 
         Sealed staging rows become unreferenced here. The controller's restore
@@ -810,6 +868,13 @@ class RolloutRecoveryLedger:
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             attempt.status = RolloutAttemptStatus.ABANDONED
+            self._emit(
+                "attempt_abandoned",
+                record,
+                sibling.generation_index,
+                reason=reason,
+                whole_group=True,
+            )
             attempt.receipt = None
             attempt.logical_selection = None
             attempt.reward = None
@@ -1131,6 +1196,8 @@ class RolloutRecoveryLedger:
             elif environment_instance_id is not None:
                 attempt.environment_instance_id = environment_instance_id
             attempt.status = RolloutAttemptStatus.DISPATCHED
+        for index in indices:
+            self._emit("attempt_dispatched", record, index)
 
     def release_refused_dispatch(
         self,
@@ -1163,6 +1230,7 @@ class RolloutRecoveryLedger:
                 f"{attempt.status.value!r}"
             )
         attempt.status = RolloutAttemptStatus.RESERVED
+        self._emit("attempt_refused", record, generation_index)
 
     def replace_dropped_dispatch(
         self,
@@ -1201,6 +1269,7 @@ class RolloutRecoveryLedger:
                     attempt.environment_instance_id, set()
                 ).add(record.environment_episode(generation_index))
             attempt.status = RolloutAttemptStatus.ABANDONED
+            self._emit("attempt_abandoned", record, generation_index, reason="dropped")
             sibling.attempts.append(_new_attempt())
 
     def mark_sibling_sealed(
@@ -1279,11 +1348,13 @@ class RolloutRecoveryLedger:
         attempt.staging_keys = staging_keys
         attempt.status = RolloutAttemptStatus.SEALED
         self._record_environment_forget_if_restored(record, generation_index)
+        self._emit("attempt_sealed", record, generation_index)
         if all(
             item.current_attempt.status == RolloutAttemptStatus.SEALED
             for item in record.siblings
         ):
             record.status = PromptGroupStatus.READY_TO_FINALIZE
+            self._emit("group_sealed", record)
 
     def mark_group_sealed(
         self,
@@ -1380,7 +1451,9 @@ class RolloutRecoveryLedger:
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
             self._record_environment_forget_if_restored(record, generation_index)
+            self._emit("attempt_sealed", record, generation_index)
         record.status = PromptGroupStatus.READY_TO_FINALIZE
+        self._emit("group_sealed", record)
 
     @staticmethod
     def _validate_agent_name(
@@ -1412,8 +1485,17 @@ class RolloutRecoveryLedger:
                 "prompt-group siblings resolved to different attribution keys"
             )
 
-    def abandon_unsealed(self, cut: DataPlaneMutationCut, group_id: str) -> None:
-        """Abandon failed work at the group's persisted recovery granularity."""
+    def abandon_unsealed(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        reason: Literal["failed", "cancelled"] = "failed",
+    ) -> None:
+        """Abandon failed or cancelled work at the group's persisted recovery granularity.
+
+        ``reason`` only labels the abandoned attempts for the event sink.
+        """
         cut.require_live()
         record = self._require_group(group_id)
         if record.status not in {
@@ -1428,13 +1510,16 @@ class RolloutRecoveryLedger:
             record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
             and record.status is PromptGroupStatus.GENERATING
         ):
-            self._abandon_entire_group(record)
+            self._abandon_entire_group(record, reason=reason)
             return
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             if attempt.status == RolloutAttemptStatus.SEALED:
                 continue
             attempt.status = RolloutAttemptStatus.ABANDONED
+            self._emit(
+                "attempt_abandoned", record, sibling.generation_index, reason=reason
+            )
         record.status = (
             PromptGroupStatus.READY_TO_FINALIZE
             if all(
@@ -1524,8 +1609,10 @@ class RolloutRecoveryLedger:
     def discard_group(self, cut: DataPlaneMutationCut, group_id: str) -> None:
         """Drop a group only after its external TQ/Gate ownership is cleaned."""
         cut.require_live()
-        self._record_environment_retirements(self._require_group(group_id))
+        record = self._require_group(group_id)
+        self._record_environment_retirements(record)
         del self._groups[group_id]
+        self._emit("group_discarded", record)
 
     def discard_canonical_groups(
         self,
@@ -1537,8 +1624,9 @@ class RolloutRecoveryLedger:
         discarded = 0
         for group_id in list(self._groups):
             if group_id in group_ids:
-                del self._groups[group_id]
+                record = self._groups.pop(group_id)
                 discarded += 1
+                self._emit("group_discarded", record)
         return discarded
 
     def get_group(self, group_id: str) -> PromptGroupRecoveryRecord:

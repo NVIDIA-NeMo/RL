@@ -3113,7 +3113,7 @@ class RolloutManager:
             # Neither retry nor abandon an attempt whose capture writes may still
             # be in flight. Surface the failure with its ledger ownership intact.
             raise
-        except BaseException:
+        except BaseException as error:
             # Abandoned dispatch: no receipt will name these rollouts' staged
             # rows, so they leak until the staging partition is torn down at
             # run end (there is no prefix-clear primitive in the data plane
@@ -3125,7 +3125,16 @@ class RolloutManager:
                 # cancelling this task. Preserve the original cancellation rather
                 # than replacing it with "unknown group" during cleanup.
                 if group_id in self._recovery_ledger:
-                    self._recovery_ledger.abandon_unsealed(cut, group_id)
+                    self._recovery_ledger.abandon_unsealed(
+                        cut,
+                        group_id,
+                        # Cancelled, e.g. by the run ending, rather than failed.
+                        reason=(
+                            "cancelled"
+                            if isinstance(error, asyncio.CancelledError)
+                            else "failed"
+                        ),
+                    )
             # The capture ledger has no per-rollout fail endpoint. Rows from
             # abandoned attempts are unreferenced and are swept with the
             # staging partition at run teardown.
