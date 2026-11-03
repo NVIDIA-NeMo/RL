@@ -33,11 +33,12 @@ class CuaGenerationWorkerImpl(VllmAsyncGenerationWorkerImpl):
         *,
         admission: Any | None,
         splice: PrefixSplice | None = None,
+        **kwargs: Any,
     ) -> CapturedMedia | None:
         if admission is None and splice is not None:
             align_image_placeholders(engine_prompt, splice.token_ids)
         return super()._capture_request_media(
-            engine_prompt, admission=admission, splice=splice
+            engine_prompt, admission=admission, splice=splice, **kwargs
         )
 
 

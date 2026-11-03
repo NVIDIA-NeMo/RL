@@ -1,4 +1,4 @@
-# The requested validation starts directly at 7B.
+# L1 smoke: one training GPU and one rollout GPU.
 defaults: grpo_logra_7b.yaml
 grpo:
   num_prompts_per_step: 2
@@ -8,10 +8,22 @@ grpo:
   val_at_start: false
   val_at_end: false
 policy:
+  model_name: Qwen/Qwen2.5-1.5B
   train_global_batch_size: 8
   train_micro_batch_size: 1
+  max_total_sequence_length: 512
+  generation:
+    max_new_tokens: 512
+    colocated:
+      resources:
+        gpus_per_node: 1
 data:
   train:
     dataset_name: gsm8k
+logger:
+  log_dir: logs/logra-smoke
 checkpointing:
   enabled: false
+cluster:
+  num_nodes: 1
+  gpus_per_node: 2

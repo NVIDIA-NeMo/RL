@@ -181,10 +181,13 @@ are rerun on resume, not restored bit for bit.
 
 ```bash
 uv run --locked --group test pytest tests/unit
+# Automatic L1 smoke: 1.5B model, one training GPU and one rollout GPU.
 bash tests/functional/grpo_logra.sh
-bash tests/functional/sliding_puzzle_logra.sh
-# External desktop/model prerequisites are required.
-LOGRA_RUN_CUA_TEST=1 bash tests/functional/cua_logra.sh
+
+# Manual smokes, outside CI discovery: four GPUs for puzzle, 16 for CUA.
+bash scripts/smoke/sliding_puzzle_logra.sh
+# CUA additionally requires the external desktop/model prerequisites.
+LOGRA_RUN_CUA_TEST=1 bash scripts/smoke/cua_logra.sh
 ```
 
 Distributed numerical tests: `tests/functional/{fsdp,expert,cua}_equivalence.py`
