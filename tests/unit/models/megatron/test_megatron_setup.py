@@ -995,7 +995,7 @@ class TestApplyMoeConfig:
         assert not hasattr(model_cfg, "moe_grouped_gemm")
         assert not hasattr(model_cfg, "inference_flashinfer_mxfp8_token_capacity")
         assert not hasattr(model_cfg, "inference_moe_nvfp4_recipe")
-        assert not hasattr(model_cfg, "moe_match_generation_forward")
+        assert not hasattr(model_cfg, "moe_training_matches_inference")
 
     def test_flashinfer_mxfp8_token_capacity_forwarded(self):
         """Without this key MCore runs FlashInfer MXFP8 MoE over the full dispatcher buffer."""
@@ -1042,33 +1042,33 @@ class TestApplyMoeConfig:
             _apply_moe_config(model_cfg, config)
             assert model_cfg.moe_router_dtype == moe_router_dtype
 
-    def test_match_generation_forward_forwarded(self):
+    def test_training_matches_inference_forwarded(self):
         from nemo_rl.models.megatron.setup import _apply_moe_config
 
         model_cfg = MagicMock()
         megatron_cfg = self._base_moe_megatron_cfg()
         megatron_cfg["inference_moe_nvfp4_recipe"] = "per_token"
-        megatron_cfg["moe_match_generation_forward"] = True
+        megatron_cfg["moe_training_matches_inference"] = True
         config = {"megatron_cfg": megatron_cfg}
 
         _apply_moe_config(model_cfg, config)
 
         assert model_cfg.inference_moe_nvfp4_recipe == "per_token"
-        assert model_cfg.moe_match_generation_forward is True
+        assert model_cfg.moe_training_matches_inference is True
 
-    def test_match_generation_forward_false_resets_a_copied_provider(self):
+    def test_training_matches_inference_false_resets_a_copied_provider(self):
         """Generation can start from the training provider and must clear the flag."""
         from nemo_rl.models.megatron.setup import _apply_moe_config
 
         model_cfg = MagicMock()
-        model_cfg.moe_match_generation_forward = True
+        model_cfg.moe_training_matches_inference = True
         megatron_cfg = self._base_moe_megatron_cfg()
-        megatron_cfg["moe_match_generation_forward"] = False
+        megatron_cfg["moe_training_matches_inference"] = False
         config = {"megatron_cfg": megatron_cfg}
 
         _apply_moe_config(model_cfg, config)
 
-        assert model_cfg.moe_match_generation_forward is False
+        assert model_cfg.moe_training_matches_inference is False
 
     def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
         from nemo_rl.models.megatron import setup

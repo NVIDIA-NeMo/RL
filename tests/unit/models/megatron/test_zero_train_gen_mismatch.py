@@ -503,17 +503,18 @@ def test_validate_rejects_flashinfer_grouped_gemm_with_mxfp8():
     assert any("flashinfer" in v for v in _validate(config).violations)
 
 
-def _match_generation_forward_config(precision: str) -> dict[str, Any]:
+def _training_matches_inference_config(precision: str) -> dict[str, Any]:
     """FlashInfer experts on both sides, with the training forward running that kernel."""
     config = _policy_config()
     config["megatron_cfg"].update(
         transformer_impl="inference_optimized",
         inference_grouped_gemm_backend="flashinfer",
         inference_moe_token_dispatcher_type="nvls",
+        moe_token_dispatcher_type="alltoall",
         activation_checkpointing=True,
         recompute_granularity="selective",
         recompute_modules=["moe"],
-        moe_match_generation_forward=True,
+        moe_training_matches_inference=True,
     )
     if precision == "mxfp8":
         config["megatron_cfg"]["fp8_cfg"] = dict(_MXFP8)
@@ -523,15 +524,15 @@ def _match_generation_forward_config(precision: str) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("precision", ["mxfp8", "nvfp4"])
-def test_validate_accepts_flashinfer_with_match_generation_forward(precision):
-    assert _validate(_match_generation_forward_config(precision)).violations == []
+def test_validate_accepts_flashinfer_with_training_matches_inference(precision):
+    assert _validate(_training_matches_inference_config(precision)).violations == []
 
 
-def test_validate_rejects_flashinfer_nvfp4_without_match_generation_forward():
-    config = _match_generation_forward_config("nvfp4")
-    config["megatron_cfg"]["moe_match_generation_forward"] = False
+def test_validate_rejects_flashinfer_nvfp4_without_training_matches_inference():
+    config = _training_matches_inference_config("nvfp4")
+    config["megatron_cfg"]["moe_training_matches_inference"] = False
     assert any(
-        "requires policy.megatron_cfg.moe_match_generation_forward=true" in v
+        "requires policy.megatron_cfg.moe_training_matches_inference=true" in v
         for v in _validate(config).violations
     )
 
@@ -568,8 +569,8 @@ def _set_generation(config: dict[str, Any], key: str, value: Any) -> None:
             "cuda_graph_impl other than 'local'",
         ),
         (
-            lambda c: _set_generation(c, "inference_moe_token_dispatcher_type", "nccl"),
-            "inference_moe_token_dispatcher_type",
+            lambda c: c["megatron_cfg"].update(moe_token_dispatcher_type="flex"),
+            "moe_token_dispatcher_type='alltoall'",
         ),
         (
             lambda c: _set_generation(c, "inference_moe_nvfp4_recipe", None),
@@ -585,20 +586,20 @@ def _set_generation(config: dict[str, Any], key: str, value: Any) -> None:
         ),
     ],
 )
-def test_validate_rejects_unsupported_match_generation_forward(mutate, expected):
-    config = _match_generation_forward_config("nvfp4")
+def test_validate_rejects_unsupported_training_matches_inference(mutate, expected):
+    config = _training_matches_inference_config("nvfp4")
     mutate(config)
     assert any(expected in v for v in _validate(config).violations)
 
 
-def test_generation_config_never_runs_the_match_generation_forward():
+def test_generation_config_never_runs_the_training_matches_inference():
     from nemo_rl.models.generation.megatron.config import (
         merged_inference_megatron_cfg,
     )
 
-    config = _match_generation_forward_config("mxfp8")
+    config = _training_matches_inference_config("mxfp8")
     assert (
-        merged_inference_megatron_cfg(config)["moe_match_generation_forward"] is False
+        merged_inference_megatron_cfg(config)["moe_training_matches_inference"] is False
     )
 
 
@@ -608,7 +609,7 @@ def test_dedicated_generation_policy_passes_validation(precision):
         merged_inference_megatron_cfg,
     )
 
-    config = _match_generation_forward_config(precision)
+    config = _training_matches_inference_config(precision)
     generation_policy = {
         **config,
         "megatron_cfg": merged_inference_megatron_cfg(config),
@@ -616,7 +617,7 @@ def test_dedicated_generation_policy_passes_validation(precision):
 
     assert _validate(generation_policy, generation_only=True).violations == []
     assert any(
-        "requires policy.megatron_cfg.moe_match_generation_forward=true" in v
+        "requires policy.megatron_cfg.moe_training_matches_inference=true" in v
         for v in _validate(generation_policy).violations
     )
 

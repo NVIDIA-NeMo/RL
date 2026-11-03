@@ -1,6 +1,6 @@
 # MXFP8 on the routed experts (GroupedLinear linear_fc1 / linear_fc2) of Nemotron Nano v3
 # only; every other linear stays BF16, including linear_qkv and linear_proj. For
-# transformer_impl='inference_optimized' on the training side (moe_match_generation_forward):
+# transformer_impl='inference_optimized' on the training side (moe_training_matches_inference):
 # its log-prob forward runs under eval(), where the inference linears skip TE, so a TE MXFP8
 # qkv/proj weight would run a BF16 GEMM while generation runs MXFP8.
 #

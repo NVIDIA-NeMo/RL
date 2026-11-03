@@ -16,7 +16,7 @@
 
 The recipe sets every required value; this module only checks them. Supported
 precisions are BF16 and MXFP8 (the same on train and generation), and FlashInfer
-MXFP8 or per-token NVFP4 experts with moe_match_generation_forward.
+MXFP8 or per-token NVFP4 experts with moe_training_matches_inference.
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ def validate_zero_train_gen_mismatch(
 
     ``generation_only`` is for a dedicated generation policy, whose
     ``megatron_cfg`` is the merged inference config: the training-only
-    ``moe_match_generation_forward`` is cleared there, so the checks on the
+    ``moe_training_matches_inference`` is cleared there, so the checks on the
     training side's value are left to the driver, which sees the full config.
     """
     out = ZeroTrainGenValidation()
@@ -508,17 +508,17 @@ def _validate_backend(
         and impl == "inference_optimized"
         and backend == "flashinfer"
         and quantized_experts
-        and not config["megatron_cfg"].get("moe_match_generation_forward")
+        and not config["megatron_cfg"].get("moe_training_matches_inference")
     ):
         out.violations.append(
             "zero_train_gen_mismatch with inference_grouped_gemm_backend='flashinfer' "
             "and MXFP8 or NVFP4 experts requires "
-            "policy.megatron_cfg.moe_match_generation_forward=true: the FlashInfer "
+            "policy.megatron_cfg.moe_training_matches_inference=true: the FlashInfer "
             "kernel is batch-invariant but not bitwise identical to TE training. "
             "Otherwise use 'torch' or 'vllm' with MXFP8."
         )
-    if config["megatron_cfg"].get("moe_match_generation_forward"):
-        _validate_match_generation_forward(config, inference_cfg, out)
+    if config["megatron_cfg"].get("moe_training_matches_inference"):
+        _validate_training_matches_inference(config, inference_cfg, out)
 
 
 def _grouped_gemm_backend(cfg: dict[str, Any]) -> Any:
@@ -526,12 +526,12 @@ def _grouped_gemm_backend(cfg: dict[str, Any]) -> Any:
     return getattr(backend, "value", backend)
 
 
-def _validate_match_generation_forward(
+def _validate_training_matches_inference(
     config: PolicyConfig, inference_cfg: dict[str, Any], out: ZeroTrainGenValidation
 ) -> None:
     """The training MoE forward runs generation's FlashInfer kernel; TE recompute backs it."""
     megatron_cfg = config["megatron_cfg"]
-    prefix = "moe_match_generation_forward=true requires"
+    prefix = "moe_training_matches_inference=true requires"
     if megatron_cfg.get("transformer_impl") != "inference_optimized":
         out.violations.append(
             f"{prefix} policy.megatron_cfg.transformer_impl='inference_optimized' "
@@ -570,11 +570,17 @@ def _validate_match_generation_forward(
             f"{prefix} a training cuda_graph_impl other than 'local', which disables "
             "MoE-layer recompute."
         )
+    if megatron_cfg.get("moe_token_dispatcher_type") != "alltoall":
+        out.violations.append(
+            f"{prefix} policy.megatron_cfg.moe_token_dispatcher_type='alltoall': the "
+            "value pass dispatches through training's dispatcher, and only the "
+            "all-to-all combine adds the EP ranks in generation's order "
+            f"(got {megatron_cfg.get('moe_token_dispatcher_type')!r})."
+        )
     mismatched = [
         key
         for key in (
             "inference_moe_nvfp4_recipe",
-            "inference_moe_token_dispatcher_type",
             "expert_model_parallel_size",
         )
         if megatron_cfg.get(key) != inference_cfg.get(key)

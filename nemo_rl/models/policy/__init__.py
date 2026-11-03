@@ -502,7 +502,7 @@ class MegatronConfig(TypedDict):
     # inference_grouped_gemm_backend='flashinfer', batch_invariant_mode, and
     # activation_checkpointing with recompute_granularity='selective' and 'moe' in
     # recompute_modules. Generation never sets it.
-    moe_match_generation_forward: NotRequired[bool]
+    moe_training_matches_inference: NotRequired[bool]
     # InferenceTopKRouter requires moe_router_num_groups=None
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]
