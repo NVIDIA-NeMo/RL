@@ -19,6 +19,8 @@ policy:
       enabled: false
   generation:
     mcore_generation_config:
+      # The BF16 parent turns it off; batch-invariant generation stays bitwise-exact with it.
+      enable_chunked_prefill: true
       inference_grouped_gemm_backend: flashinfer
       fp8_cfg:
         enabled: false
