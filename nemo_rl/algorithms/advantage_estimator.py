@@ -45,7 +45,7 @@ import math
 from typing import Annotated, Literal, Optional
 
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -93,6 +93,17 @@ class GAEConfig(BaseModel, extra="allow"):
     # rows that train. "all_rows": also rows excluded from the loss by
     # sample_mask, which still never train; execution padding is excluded.
     normalize_over: Literal["kept_rows", "all_rows"] = "kept_rows"
+    # With all_rows, also whiten over Forest execution padding, so padding
+    # copies weigh into the mean and variance. Padding still carries no loss.
+    whiten_execution_padding: bool = False
+
+    @model_validator(mode="after")
+    def validate_whiten_execution_padding(self) -> "GAEConfig":
+        if self.whiten_execution_padding and self.normalize_over != "all_rows":
+            raise ValueError(
+                "whiten_execution_padding requires normalize_over=all_rows"
+            )
+        return self
 
 
 class GRPOAdvantageEstimator:

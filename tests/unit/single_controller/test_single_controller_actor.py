@@ -235,6 +235,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         restored_from_rollout_snapshot=False,
         ppo_group_multiple=1,
         ppo_min_remaining_groups=0,
+        forest_step_row_multiple=1,
     )
     args.update(overrides)
     return SimpleNamespace(**args)

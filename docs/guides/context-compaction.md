@@ -227,11 +227,24 @@ With PPO, the critic scores every physical row and GAE runs per row with that
 row's own values; every row of a logical rollout carries the rollout's reward.
 The logical rollout still decides validity as above. `ppo.adv_estimator.normalize_over`
 selects the whitening population: `kept_rows` (default) or `all_rows`, which also
-includes rows masked from the loss. Execution padding never counts. The critic
-trains on all of a step's rows as one optimizer step, and execution padding is
-sized for both the policy's and the critic's data-parallel and microbatch shapes.
+includes rows masked from the loss. Execution padding counts only with
+`whiten_execution_padding: true` (which requires `all_rows`); it never trains.
+The critic trains on all of a step's rows as one optimizer step, and execution
+padding is sized for both the policy's and the critic's data-parallel and
+microbatch shapes.
 
-Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
+Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding.
+
+`token_capture.forest_padding_scope: step` (Forest only; default `group`) pads
+each training batch once to the row multiple, instead of padding every
+published group. With few rollouts per group, per-group padding can multiply
+the rows each step trains on. `forest_pad_source` picks the copied rows: `row0`
+(default) repeats the batch's first row; `cyclic` takes rows 0, 1, 2, and so on.
+A rollout snapshot taken during a step keeps that step's padding copies; resume
+deletes them before checking the replay inventory.
+
+With `ppo.adv_estimator.whiten_execution_padding: true`, these copies also join
+the advantage whitening; they still carry no loss.
 
 Captured-rollout length metrics are emitted after tensor verification, with one
 observation per logical rollout. `gen_tokens_per_sample` sums uniquely owned

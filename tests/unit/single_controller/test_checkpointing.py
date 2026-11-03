@@ -463,6 +463,70 @@ class _FakeDPClient:
             json.dump({"user_metadata": metadata or {}}, f)
 
 
+@pytest.mark.parametrize("step_padding", ["reject", "allow", "clear"])
+def test_replay_inventory_step_padding(step_padding):
+    """forest_padding_scope=step copies are tolerated or cleared, nothing else."""
+    ctrl = object.__new__(_ACTOR_CLS)
+    ctrl._partition_id = _PARTITION_ID
+    ctrl._dp_client = _FakeDPClient(
+        sample_ids=["g0-0", "g0-1", "g0-0_pad0", "g0-0_pad1", "other_pad0"]
+    )
+    replay_metadata = {
+        "groups": [
+            {
+                "meta": KVBatchMeta(
+                    partition_id=_PARTITION_ID,
+                    task_name="train",
+                    sample_ids=["g0-0", "g0-1"],
+                    sequence_lengths=[16, 16],
+                )
+            }
+        ]
+    }
+
+    # other_pad0 copies no replayed row, so it stays unexpected in every mode.
+    with pytest.raises(RuntimeError, match="unexpected=") as error:
+        asyncio.run(
+            ctrl._validate_replay_inventory(replay_metadata, step_padding=step_padding)
+        )
+    unexpected = (
+        ["g0-0_pad0", "g0-0_pad1", "other_pad0"]
+        if step_padding == "reject"
+        else ["other_pad0"]
+    )
+    assert f"unexpected={unexpected!r}" in str(error.value)
+    assert ctrl._dp_client.clear_calls == (
+        [(["g0-0_pad0", "g0-0_pad1"], _PARTITION_ID)] if step_padding == "clear" else []
+    )
+
+
+@pytest.mark.parametrize("step_padding", ["allow", "clear"])
+def test_replay_inventory_accepts_only_step_padding_extras(step_padding):
+    ctrl = object.__new__(_ACTOR_CLS)
+    ctrl._partition_id = _PARTITION_ID
+    ctrl._dp_client = _FakeDPClient(sample_ids=["g0-0", "g0-1", "g0-1_pad0"])
+    replay_metadata = {
+        "groups": [
+            {
+                "meta": KVBatchMeta(
+                    partition_id=_PARTITION_ID,
+                    task_name="train",
+                    sample_ids=["g0-0", "g0-1"],
+                    sequence_lengths=[16, 16],
+                )
+            }
+        ]
+    }
+
+    asyncio.run(
+        ctrl._validate_replay_inventory(replay_metadata, step_padding=step_padding)
+    )
+
+    assert ctrl._dp_client.sample_ids == (
+        ["g0-0", "g0-1"] if step_padding == "clear" else ["g0-0", "g0-1", "g0-1_pad0"]
+    )
+
+
 class _StagingInventoryDPClient:
     """Partition-scoped fake for rollout-recovery inventory validation."""
 

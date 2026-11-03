@@ -136,14 +136,25 @@ def test_forest_selection_config(policy):
         TokenCaptureConfig(forest_training=True, selection_policy="guess")
 
 
-def test_router_padding_exclusion_requires_forest_training():
+@pytest.mark.parametrize(
+    "option",
+    [
+        {"exclude_padding_from_router_stats": True},
+        {"forest_padding_scope": "step"},
+    ],
+)
+def test_forest_options_require_forest_training(option):
+    assert TokenCaptureConfig(forest_training=True, **option)
+    with pytest.raises(ValueError, match=f"{next(iter(option))}.*forest_training"):
+        TokenCaptureConfig(**option)
+
+
+def test_forest_pad_source_requires_step_padding():
     assert TokenCaptureConfig(
-        forest_training=True, exclude_padding_from_router_stats=True
+        forest_training=True, forest_padding_scope="step", forest_pad_source="cyclic"
     )
-    with pytest.raises(
-        ValueError, match="exclude_padding_from_router_stats.*forest_training"
-    ):
-        TokenCaptureConfig(exclude_padding_from_router_stats=True)
+    with pytest.raises(ValueError, match="forest_padding_scope=step"):
+        TokenCaptureConfig(forest_training=True, forest_pad_source="cyclic")
 
 
 def _controller(
@@ -902,6 +913,87 @@ def test_forest_ppo_normalize_over_all_rows_excludes_execution_padding() -> None
     torch.testing.assert_close(results["all_rows"], expected)
     assert not torch.allclose(results["all_rows"], results["kept_rows"])
     assert results["all_rows"][2:].count_nonzero() == 0
+
+
+def test_gae_whitening_padding_requires_all_rows() -> None:
+    assert GAEConfig(normalize_over="all_rows", whiten_execution_padding=True)
+    with pytest.raises(ValueError, match="normalize_over=all_rows"):
+        GAEConfig(whiten_execution_padding=True)
+
+
+def _step_padded(source: str, multiple: int = 4):
+    """Five real rows in two groups, padded once for the whole batch."""
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)]), ("b", [(2.0, 1), (3.0, 1)])])
+    data = _with_values(data, seed=2)
+    data[ROUTER_EXCLUDED_ROWS] = torch.zeros(meta.size, dtype=torch.bool)
+    meta = KVBatchMeta(
+        "train", "train", meta.sample_ids, fields=list(data.keys()), tags=meta.tags
+    )
+    store = _RowStore(
+        {
+            sid: {name: data[name][row].clone() for name in data.keys()}
+            for row, sid in enumerate(meta.sample_ids)
+        }
+    )
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = store
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._forest_step_row_multiple = multiple
+    ctrl._master_config = SimpleNamespace(
+        token_capture=TokenCaptureConfig(
+            forest_training=True, forest_padding_scope="step", forest_pad_source=source
+        )
+    )
+    padded, pad_meta = asyncio.run(ctrl._pad_forest_step_rows(meta))
+    return meta, padded, pad_meta, store
+
+
+@pytest.mark.parametrize("source,copied", [("row0", [0, 0, 0]), ("cyclic", [0, 1, 2])])
+def test_forest_step_padding_copies_rows_once_per_batch(source, copied) -> None:
+    meta, padded, pad_meta, store = _step_padded(source)
+    assert padded.size == 8 and pad_meta.size == 3
+    assert padded.sample_ids == meta.sample_ids + pad_meta.sample_ids
+    for pad_id, row in zip(pad_meta.sample_ids, copied, strict=True):
+        pad, real = store.rows[pad_id], store.rows[meta.sample_ids[row]]
+        torch.testing.assert_close(pad["token_mask"], real["token_mask"])
+        torch.testing.assert_close(pad["values"], real["values"])
+        assert pad["sample_mask"] == 0 and pad[ROUTER_EXCLUDED_ROWS]
+    for tag, row in zip(pad_meta.tags, copied, strict=True):
+        assert tag["is_execution_padding"] and tag["uses_borrowed_input"]
+        assert tag["dispatch_group_id"] == meta.tags[row]["dispatch_group_id"]
+        assert tag["logical_rollout_id"] is None and tag["segment_count"] == 0
+    # A batch already at the multiple is left alone.
+    _, unpadded, none, _ = _step_padded(source, multiple=5)
+    assert none is None and unpadded.size == 5
+
+
+@pytest.mark.parametrize("whiten_padding", [False, True])
+def test_forest_step_padding_whitening_counts_padding_copies(whiten_padding) -> None:
+    _, padded, _, store = _step_padded("row0")
+    data = store.get_samples(sample_ids=padded.sample_ids, select_fields=padded.fields)
+    inputs = data.clone()
+    ctrl = _ppo_controller(
+        padded,
+        data,
+        normalize_over="all_rows",
+        whiten_execution_padding=whiten_padding,
+    )
+    _, valid = asyncio.run(ctrl._advantage_stage(padded))
+    assert valid
+    real = torch.tensor([1.0] * 5 + [0.0] * 3)
+    # With whiten_execution_padding the row-0 copies join whitening; padding
+    # never trains.
+    expected, _ = ctrl._advantage_estimator.compute_advantage(
+        prompt_ids=None,
+        rewards=inputs["total_reward"].float(),
+        mask=inputs["token_mask"]
+        * (torch.ones(8) if whiten_padding else real).unsqueeze(-1),
+        values=inputs["values"],
+    )
+    expected = expected * inputs["token_mask"] * real.unsqueeze(-1)
+    torch.testing.assert_close(data["advantages"], expected)
+    assert data["advantages"][5:].count_nonzero() == 0
 
 
 def test_forest_objective_accepts_ppo_gae_only() -> None:

@@ -3549,6 +3549,48 @@ def test_forest_router_is_validated_before_rollout_manager(
         trainer.worker_group.run_all_workers_single_data.assert_not_called()
 
 
+@pytest.mark.parametrize("scope", ["group", "step"])
+def test_forest_padding_scope_picks_who_pads(patched_factories, scope: str) -> None:
+    mc = _make_master_config(megatron_enabled=True)
+    mc.policy.update(
+        sequence_packing={"enabled": True},
+        dynamic_batching={"enabled": False},
+        train_micro_batch_size=1,
+        logprob_batch_size=1,
+    )
+    mc.policy["generation"].update(
+        model_name="test-model",
+        stop_strings=None,
+        stop_token_ids=None,
+        top_k=None,
+        vllm_cfg={"async_engine": True},
+    )
+    mc.token_capture = TokenCaptureConfig(
+        enabled=True, forest_training=True, forest_padding_scope=scope
+    )
+    mc.async_rl.rollout_failure.min_step_batch_fraction = 1
+    trainer = patched_factories["fake_policy"]
+    trainer.cfg = mc.policy
+    # Packed consumers pad to their data-parallel size.
+    trainer.sharding_annotations.get_axis_size.return_value = 4
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()),
+        patch.object(sc_setup_mod.ray, "get"),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[],
+        ),
+        patch.object(sc_setup_mod, "RolloutManager") as rollout_manager,
+    ):
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    group_multiple = rollout_manager.call_args.kwargs["execution_row_multiple"]
+    assert (group_multiple, actor_args.forest_step_row_multiple) == (
+        (4, 1) if scope == "group" else (1, 4)
+    )
+
+
 class TestAdaptiveLossRestore:
     def test_resume_restores_adaptive_ppo_clip_state(self, tmp_path, patched_factories):
         checkpoint_path = tmp_path / "step_3"

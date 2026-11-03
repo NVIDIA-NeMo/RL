@@ -53,8 +53,10 @@ ppo:
     # Length-adaptive λ_policy = 1 - 1/(α·l).  0 = disabled.
     length_adaptive_alpha: 0.0  # VAPO: 0.05
     # Rows GAE runs and whitens over: kept_rows (rows that train) or all_rows
-    # (also rows masked from the loss; never execution padding).
+    # (also rows masked from the loss).
     normalize_over: kept_rows
+    # With all_rows, also whiten over Forest execution padding (no loss).
+    whiten_execution_padding: false
 
   reward_scaling:
     enabled: true

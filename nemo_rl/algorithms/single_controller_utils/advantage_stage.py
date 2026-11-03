@@ -589,10 +589,12 @@ class AdvantageComputer:
                 and estimator_cfg.normalize_over == "all_rows"
             ):
                 # Every real row's response tokens, including rows the loss
-                # masks; execution padding never counts.
+                # masks; execution padding counts only with
+                # whiten_execution_padding.
                 real_rows = (
                     (owner_batch.row_owner >= 0).to(token_mask.dtype)
                     if owner_batch is not None
+                    and not estimator_cfg.whiten_execution_padding
                     else torch.ones_like(final_sample_mask)
                 )
                 gae_mask = token_mask * real_rows.unsqueeze(-1)

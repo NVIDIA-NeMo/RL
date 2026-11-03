@@ -216,6 +216,9 @@ class SingleControllerActorArgs:
     value_loss_fn: Optional[LossFunction] = None
     ppo_group_multiple: int = 1
     ppo_min_remaining_groups: int = 0
+    # Row multiple the controller pads each Forest training batch to under
+    # token_capture.forest_padding_scope=step; 1 when groups pad themselves.
+    forest_step_row_multiple: int = 1
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -2372,6 +2375,11 @@ def setup_single_controller(
                         ),
                     )
                 )
+    forest_row_multiple = (
+        _forest_execution_row_multiple(master_config, algo_cfg, trainer, value)
+        if token_capture_cfg.forest_training
+        else 1
+    )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -2397,8 +2405,8 @@ def setup_single_controller(
         retry_policy=_build_retry_policy(master_config),
         forest_training=token_capture_cfg.forest_training,
         execution_row_multiple=(
-            _forest_execution_row_multiple(master_config, algo_cfg, trainer, value)
-            if token_capture_cfg.forest_training
+            forest_row_multiple
+            if token_capture_cfg.forest_padding_scope == "group"
             else 1
         ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
@@ -2444,5 +2452,10 @@ def setup_single_controller(
         value_loss_fn=value_loss_fn,
         ppo_group_multiple=ppo_group_multiple,
         ppo_min_remaining_groups=ppo_min_remaining_groups,
+        forest_step_row_multiple=(
+            forest_row_multiple
+            if token_capture_cfg.forest_padding_scope == "step"
+            else 1
+        ),
     )
     return actor_args, setup_timing_metrics

@@ -703,6 +703,13 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # then also masks sequence-packing padding. Off (default): those tokens
     # count, matching ordinary training.
     exclude_padding_from_router_stats: bool = False
+    # Forest only. Where execution padding brings rows to the policy and critic
+    # row multiple. group: each published group (default). step: once per
+    # training batch, which pads far fewer rows when groups hold few rollouts.
+    forest_padding_scope: Literal["group", "step"] = "group"
+    # Step padding only. Which real rows the padding copies: row0 repeats the
+    # batch's first row; cyclic takes rows 0, 1, 2, ...
+    forest_pad_source: Literal["row0", "cyclic"] = "row0"
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
@@ -711,10 +718,16 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
             raise ValueError(
                 f"selection_policy={self.selection_policy} requires forest_training=true"
             )
-        if self.exclude_padding_from_router_stats and not self.forest_training:
+        forest_only = {
+            "exclude_padding_from_router_stats": self.exclude_padding_from_router_stats,
+            "forest_padding_scope": self.forest_padding_scope != "group",
+        }
+        if not self.forest_training and any(forest_only.values()):
+            names = ", ".join(name for name, set_ in forest_only.items() if set_)
+            raise ValueError(f"token_capture.{names} requires forest_training=true")
+        if self.forest_pad_source != "row0" and self.forest_padding_scope != "step":
             raise ValueError(
-                "token_capture.exclude_padding_from_router_stats requires "
-                "forest_training=true"
+                "token_capture.forest_pad_source requires forest_padding_scope=step"
             )
         return self
 
