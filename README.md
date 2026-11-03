@@ -11,6 +11,8 @@
 
 ## 📣 News
 
+* [11/02/2026] Muse Spark text GRPO training is supported on the [Muse Spark support branch](https://github.com/NVIDIA-NeMo/RL/tree/larkz/muse-spark-support) with the AutoModel backend and BF16 vLLM generation! See the [model guide](https://github.com/NVIDIA-NeMo/RL/blob/larkz/muse-spark-support/docs/guides/models/muse/muse-spark.md) for setup, the validated recipe, and known limitations.
+* [11/02/2026] Flint early-access GRPO training is supported on the [flint-support branch](https://github.com/NVIDIA-NeMo/RL/tree/flint-support) with the AutoModel backend and SGLang generation! See the [model guide](https://github.com/NVIDIA-NeMo/RL/blob/flint-support/docs/guides/models/flint/flint.md) for access requirements, setup, and training results.
 * [10/22/2026] MiniMax-M3.1-Flash BF16 GRPO training is supported on the [minimax-m3-1-flash branch](https://github.com/NVIDIA-NeMo/RL/tree/minimax-m3-1-flash) with the AutoModel backend and vLLM generation! See the [model guide](https://github.com/NVIDIA-NeMo/RL/blob/minimax-m3-1-flash/docs/guides/models/minimax/minimax-m3-1-flash.md) for setup, the validated recipe, and known limitations.
 * [10/22/2026] Nemotron 3.5 Super VL (120B-A12B) is now supported in NeMo RL with text DAPO, image GRPO, and NeMo Gym agentic training on the Automodel backend with vLLM generation! See the [model guide](docs/guides/models/nemotron/nemotron-3.5-super-vl.md) for recipes and training results.
 * [10/16/2026] Beam 1.0 Day 0 support by NeMo RL with SFT and RL recipes! See the [beam-support branch](https://github.com/NVIDIA-NeMo/RL/tree/beam-support) and [doc](https://github.com/NVIDIA-NeMo/RL/blob/beam-support/docs/guides/models/reflection/beam.md).
