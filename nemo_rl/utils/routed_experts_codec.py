@@ -67,14 +67,17 @@ def encode_routed_experts(routed_experts: torch.Tensor) -> str:
     return f"{_MAGIC}:{dtype_name}:{tokens}x{num_layers}x{topk}:{data}"
 
 
-def decode_routed_experts(payload: Union[str, Any], dtype: torch.dtype) -> torch.Tensor:
-    """Decode routed experts into a tensor of the requested dtype.
+def decode_routed_experts(
+    payload: Union[str, Any], dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """Decode routed experts into a tensor of ``dtype``.
 
     Accepts the base64 envelope produced by ``encode_routed_experts`` or the
-    legacy nested-list format.
+    legacy nested-list format. With ``dtype=None`` the envelope keeps the
+    dtype it was encoded with, and a nested list decodes as int16.
     """
     if not isinstance(payload, str):
-        return torch.as_tensor(payload, dtype=dtype)
+        return torch.as_tensor(payload, dtype=dtype or torch.int16)
     parts = payload.split(":", 3)
     if len(parts) != 4 or parts[0] != _MAGIC:
         raise ValueError(
@@ -95,6 +98,8 @@ def decode_routed_experts(payload: Union[str, Any], dtype: torch.dtype) -> torch
     # the bytearray construction is the single unavoidable copy).
     raw = bytearray(base64.b64decode(data, validate=True))
     expected = shape[0] * shape[1] * shape[2]
+    if dtype is None:
+        dtype = wire_dtype
     if len(raw) != expected * wire_dtype.itemsize:
         raise ValueError(
             f"routed_experts envelope has {len(raw) // wire_dtype.itemsize} "
