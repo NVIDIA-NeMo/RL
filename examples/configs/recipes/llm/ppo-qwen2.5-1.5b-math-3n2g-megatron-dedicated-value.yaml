@@ -1,0 +1,15 @@
+defaults: ../../ppo_math_1B_megatron_single_controller.yaml
+
+cluster:
+  num_nodes: 3
+
+policy:
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 2
+
+value:
+  resources:
+    dedicated: true
+    num_nodes: 1
