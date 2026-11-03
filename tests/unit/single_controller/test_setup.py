@@ -2529,7 +2529,11 @@ class TestSetup:
         patched_factories["_build_trainer"].side_effect = _build_trainer
         patched_factories["setup_response_data"].side_effect = _setup_response_data
 
-        with self._gym_patches():
+        # No wait: the trainer starts before the dataset, as it does for a slow load.
+        with (
+            self._gym_patches(),
+            patch.object(sc_setup_mod, "_TRAINER_BUILD_DATASET_WAIT_S", 0.0),
+        ):
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert actor_args.dataloader is patched_factories["dataloader"]
@@ -2582,26 +2586,37 @@ class TestSetup:
         fake_policy.shutdown.assert_not_called()
         assert mc.policy["megatron_cfg"]["train_iters"] == 2
 
-    def test_gym_vllm_rebuilds_trainer_when_clamp_binds(
+    def test_gym_vllm_rebuilds_trainer_when_a_slow_load_shows_the_clamp_binds(
         self, patched_factories, capsys
     ):
-        """More steps than the data holds: the speculative trainer is replaced."""
+        """The dataset outlasts the trainer's wait and the data holds fewer steps than
+        asked for: the speculative trainer is replaced."""
         mc = self._gym_vllm_config(
             megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
         )
-        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
         train_iters_at_build: list[int] = []
         stale_policy = MagicMock(name="stale_policy")
         final_policy = patched_factories["fake_policy"]
         policies = iter([stale_policy, final_policy])
+        trainer_started = threading.Event()
 
         def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
             train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            trainer_started.set()
             return next(policies), 0.0
 
-        patched_factories["_build_trainer"].side_effect = _build_trainer
+        def _setup_response_data(*args: Any, **kwargs: Any) -> tuple[list[int], None]:
+            # Slow: not done until the speculative trainer has started.
+            assert trainer_started.wait(timeout=30)
+            return list(range(8)), None
 
-        with self._gym_patches():
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+        patched_factories["setup_response_data"].side_effect = _setup_response_data
+
+        with (
+            self._gym_patches(),
+            patch.object(sc_setup_mod, "_TRAINER_BUILD_DATASET_WAIT_S", 0.0),
+        ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
@@ -2611,6 +2626,34 @@ class TestSetup:
         assert mc.grpo.max_num_steps == 8
         assert mc.policy["megatron_cfg"]["train_iters"] == 8
         assert "Rebuilding the trainer" in capsys.readouterr().out
+
+    def test_gym_vllm_builds_trainer_once_when_the_dataset_arrives_in_time(
+        self, patched_factories, capsys
+    ):
+        """More steps than the data holds, but the dataset is ready within the
+        trainer's wait: the trainer is built once, for the clamped count."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        train_iters_at_build: list[int] = []
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return fake_policy, 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with self._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4 -> 2 * 4 = 8 < 1000.
+        assert train_iters_at_build == [8]
+        fake_policy.shutdown.assert_not_called()
+        assert mc.grpo.max_num_steps == 8
+        assert mc.policy["megatron_cfg"]["train_iters"] == 8
+        assert "Rebuilding the trainer" not in capsys.readouterr().out
 
     def test_gym_vllm_dataset_load_failure_shuts_down_gym(self, patched_factories):
         mc = self._gym_vllm_config()
