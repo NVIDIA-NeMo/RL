@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 from PIL import Image
 
 from nemo_rl.data.multimodal_utils import (
@@ -20,6 +21,7 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.environments.nemo_gym_multimodal import (
     _extract_input_images_from_message,
+    _has_image_before_first_trainable_output,
     _index_per_turn_images,
     _without_initial_media_sources,
 )
@@ -69,6 +71,72 @@ def test_extract_input_images_ignores_text_function_call_output():
 
     item["output"] = "Tool failed to create result.png"
     assert _extract_input_images_from_message(item) == []
+
+    item["output"] = "https://example.com/a-result-that-is-text"
+    assert _extract_input_images_from_message(item) == []
+
+    item["output"] = "file:///tmp/a-result-that-is-text"
+    assert _extract_input_images_from_message(item) == []
+
+
+@pytest.mark.parametrize("error_type", [FileNotFoundError, OSError, ValueError])
+def test_extract_input_images_rejects_unresolvable_declared_sources(
+    monkeypatch, error_type
+):
+    def fail_to_resolve(_source):
+        raise error_type("missing image")
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym_multimodal.resolve_to_image",
+        fail_to_resolve,
+    )
+    item = {
+        "role": "user",
+        "content": [{"type": "input_image", "image_url": "file:///missing/image.png"}],
+    }
+
+    with pytest.raises(error_type, match="missing image"):
+        _index_per_turn_images([_assistant([1])], input_messages=[item])
+
+
+def test_pretrainable_tool_output_accepts_only_inline_images():
+    trainable_output = _assistant([1, 2])
+
+    assert _has_image_before_first_trainable_output(
+        [
+            {"type": "function_call_output", "output": _image((2, 2))},
+            trainable_output,
+        ]
+    )
+    for output in (
+        "https://example.com/tool-output",
+        "file:///tmp/tool-output",
+        '{"x": 0.5, "y": 0.5}',
+    ):
+        assert not _has_image_before_first_trainable_output(
+            [
+                {"type": "function_call_output", "output": output},
+                trainable_output,
+            ]
+        )
+
+
+@pytest.mark.parametrize("source", ["https://example.com/result", "file:///tmp/result"])
+def test_text_tool_output_preserves_initial_images(monkeypatch, source):
+    from nemo_rl.environments import nemo_gym_multimodal
+
+    resolve_to_image = nemo_gym_multimodal.resolve_to_image
+
+    def reject_text_source(image_source):
+        assert image_source != source, "a text tool output must not be resolved"
+        return resolve_to_image(image_source)
+
+    monkeypatch.setattr(nemo_gym_multimodal, "resolve_to_image", reject_text_source)
+    output = [{"type": "function_call_output", "output": source}, _assistant([1])]
+    assert _extract_input_images_from_message(output[0]) == []
+    assert not _has_image_before_first_trainable_output(output)
+    per_turn = _index_per_turn_images(output, input_messages=[_user(_image((2, 2)))])
+    assert [[image.size for image in turn] for turn in per_turn] == [[(2, 2)]]
 
 
 def test_index_per_turn_images_bins_images():

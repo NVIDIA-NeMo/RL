@@ -26,6 +26,7 @@ from transformers import (
 )
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
@@ -109,6 +110,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         self,
         config: ValueConfig,
         tokenizer: AutoTokenizer,
+        seed: int,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
@@ -152,7 +154,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
             config["reward_model_cfg"]["enabled"]
             and config["reward_model_cfg"]["reward_model_type"] == "regression"
         ), (
-            "DTensor value models require reward_model_cfg.enabled=true and reward_model_cfg.reward_model_type='regression'."
+            "Automodel value models require reward_model_cfg.enabled=true and reward_model_cfg.reward_model_type='regression'."
         )
 
         print("Initializing AutomodelValueWorker")
@@ -188,6 +190,15 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         self.tp_size = distributed_manager.tp_size
         self.cp_size = distributed_manager.cp_size
 
+        # Value workers run in separate Ray processes, so the controller's PPO
+        # seed does not cover model construction here. Seed before creating the
+        # model so a missing HF regression head is initialized reproducibly.
+        set_seed(seed)
+        print(
+            f"[Rank {self.rank}] Set Automodel value-model initialization seed "
+            f"to {seed}"
+        )
+
         # Initialize checkpoint manager
         automodel_cfg = config["automodel_cfg"]
         checkpoint_config = build_checkpoint_config(
@@ -216,19 +227,20 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
             optimizer_path=optimizer_path,
         )
 
-        # Set instance attributes from model and optimizer state.
-        (
-            self.model,
-            self.optimizer,
-            self.scheduler,
-            self.is_hf_model,
-            self.is_moe_model,
-            self._is_reward_model,
-            self.model_class,
-            self.model_config,
-            self.peft_config,
-            self.autocast_enabled,
-        ) = model_and_optimizer_state
+        # Set instance attributes from model and optimizer state. Access by
+        # field name (not positional unpacking) so optional fields appended to
+        # ModelAndOptimizerState (e.g. the DSpark draft state) don't break
+        # value workers.
+        self.model = model_and_optimizer_state.model
+        self.optimizer = model_and_optimizer_state.optimizer
+        self.scheduler = model_and_optimizer_state.scheduler
+        self.is_hf_model = model_and_optimizer_state.is_hf_model
+        self.is_moe_model = model_and_optimizer_state.is_moe_model
+        self._is_reward_model = model_and_optimizer_state.is_reward_model
+        self.model_class = model_and_optimizer_state.model_class
+        self.model_config = model_and_optimizer_state.model_config
+        self.peft_config = model_and_optimizer_state.peft_config
+        self.autocast_enabled = model_and_optimizer_state.autocast_enabled
 
         # Set instance attributes from runtime config. Value workers do not use
         # sampling parameters, but RuntimeConfig still carries the field.

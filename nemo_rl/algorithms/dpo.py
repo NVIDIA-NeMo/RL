@@ -29,7 +29,7 @@ from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
@@ -832,9 +832,8 @@ def dpo_train(
                             ),
                             is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            train_dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        save_dataloader_state(
+                            train_dataloader.state_dict(), checkpoint_path
                         )
                         checkpointer.begin_finalization(
                             checkpoint_path,

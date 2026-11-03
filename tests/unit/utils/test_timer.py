@@ -609,6 +609,21 @@ class TestThreadSafeTimer:
 
 
 class TestTimeoutChecker:
+    @patch("time.time", return_value=110.0)
+    def test_uses_nrl_job_start_epoch(self, _mock_time):
+        with patch.dict("os.environ", {"NRL_JOB_START_EPOCH": "100.5"}, clear=True):
+            checker = TimeoutChecker(timeout="00:00:00:05")
+            assert checker.start_time == 100.5
+            assert checker.check_save() is True
+
+    @patch("time.time", return_value=110.0)
+    def test_warns_when_nrl_job_start_epoch_missing(self, _mock_time):
+        with patch.dict("os.environ", {}, clear=True):
+            with pytest.warns(UserWarning, match="NRL_JOB_START_EPOCH is not set"):
+                checker = TimeoutChecker(timeout="00:00:00:05")
+            assert checker.start_time == 110.0
+            assert checker.check_save() is False
+
     def test_infinite_timeout(self):
         checker = TimeoutChecker(timeout=None)
         time.sleep(0.1)

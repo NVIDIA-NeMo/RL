@@ -14,11 +14,11 @@ variant.
 
 | Model | Task | Training backend | Training parallelism | Generation backend | Status |
 | --- | --- | --- | --- | --- | --- |
-| `google/gemma-4-E2B-it` | Text-only DAPO | AutoModel (FSDP2) | CP1 or CP2 | vLLM | Functionally Ready |
-| `google/gemma-4-E4B-it` | VLM GRPO | AutoModel (FSDP2) | CP1 | vLLM TP4 | Functionally Ready |
-| `google/gemma-4-12B-it` | Text-only DAPO | AutoModel (FSDP2) | CP1 | vLLM TP2 | Functionally Ready |
-| `google/gemma-4-26B-A4B-it` | Text-only DAPO | AutoModel (FSDP2) | EP32 with CP1; EP16 with CP2 | vLLM TP4 | Functionally Ready |
-| `google/gemma-4-31B-it` | Text-only DAPO | AutoModel (FSDP2) | CP1 or CP2 | vLLM TP4 | Functionally Ready |
+| `google/gemma-4-E2B-it` | Text-only DAPO | Automodel | CP1 or CP2 | vLLM | Functionally Ready |
+| `google/gemma-4-E4B-it` | VLM GRPO | Automodel | CP1 | vLLM TP4 | Functionally Ready |
+| `google/gemma-4-12B-it` | Text-only DAPO | Automodel | CP1 | vLLM TP2 | Functionally Ready |
+| `google/gemma-4-26B-A4B-it` | Text-only DAPO | Automodel | EP32 with CP1; EP16 with CP2 | vLLM TP4 | Functionally Ready |
+| `google/gemma-4-31B-it` | Text-only DAPO | Automodel | CP1 or CP2 | vLLM TP4 | Functionally Ready |
 
 ## Reference Recipes
 

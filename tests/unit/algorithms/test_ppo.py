@@ -1788,6 +1788,29 @@ def test_ppo_rejects_in_loss_filter_before_cluster_creation(
     cluster_cls.assert_not_called()
 
 
+def test_ppo_rejects_adaptive_ppo_clip_before_cluster_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.loss_fn = config.loss_fn.model_copy(
+        update={
+            "use_importance_sampling_correction": True,
+            "force_on_policy_ratio": True,
+            "truncated_importance_sampling_type": "adaptive-ppo-clip",
+            "truncated_importance_sampling_ratio": 1.0,
+            "truncated_importance_sampling_ratio_min": 0.5,
+        }
+    )
+
+    with pytest.raises(ValueError, match="adaptive-ppo-clip.*legacy PPO trainer"):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
 def test_noncolocated_sglang_is_rejected_before_cluster_creation(monkeypatch):
     """SGLang has no cross-cluster refit path, so setup must reject it early."""
     from unittest.mock import MagicMock
@@ -2483,6 +2506,36 @@ def _validate_async_ppo_entry_config(
     generation = MagicMock()
     generation.requires_kv_scale_sync = requires_kv_scale_sync
     _validate_async_ppo_config(master_config, generation)
+
+
+def test_legacy_ppo_entrypoint_rejects_split_value_training(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from examples import run_ppo
+
+    init_ray = MagicMock()
+    monkeypatch.setattr(run_ppo, "register_omegaconf_resolvers", MagicMock())
+    monkeypatch.setattr(
+        run_ppo,
+        "parse_args",
+        lambda: (SimpleNamespace(config="test.yaml"), []),
+    )
+    monkeypatch.setattr(run_ppo, "load_config", lambda _: {})
+    monkeypatch.setattr(run_ppo.OmegaConf, "to_container", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run_ppo, "check_outdated_config", MagicMock())
+    monkeypatch.setattr(
+        run_ppo,
+        "MasterConfig",
+        lambda **_: SimpleNamespace(
+            ppo=SimpleNamespace(async_ppo={}, value_training_mode="split")
+        ),
+    )
+    monkeypatch.setattr(run_ppo, "init_ray", init_ray)
+
+    with pytest.raises(ValueError, match="value_training_mode=split.*SingleController"):
+        run_ppo.main()
+
+    init_ray.assert_not_called()
 
 
 @pytest.mark.parametrize(

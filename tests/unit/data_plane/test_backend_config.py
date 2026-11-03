@@ -158,6 +158,130 @@ def test_mooncake_checkpoint_mode_is_internal(
     assert mooncake["gdr_staging_buffer_mb"] == 384
 
 
+_MC_SSD = {"enabled": True, "path": "/local/ssd"}
+
+
+def _mooncake_overlay(
+    monkeypatch, mooncake_cpu, checkpointing=False, watch=lambda url, path: None
+) -> dict:
+    from nemo_rl.data_plane.adapters import mooncake_ssd_offload
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    # A stub by default: no real thread polling a master that does not exist.
+    monkeypatch.setattr(mooncake_ssd_offload, "watch_master_disk_evictions", watch)
+    captured = {}
+    monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "10.0.0.7")
+    monkeypatch.setattr(adapter, "_mooncake_transport_config", lambda: {})
+    monkeypatch.setattr(adapter.os, "chmod", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        adapter.tq, "init", lambda *, conf: captured.setdefault("conf", conf)
+    )
+    cfg = _cfg("mooncake_cpu", mooncake_cpu=mooncake_cpu)
+    # Storage units are only started under a plan; the overlay ignores the IDs.
+    plan = ["a" * 56] if mooncake_cpu.get("storage_unit_segment_size") else None
+    adapter._init_tq(cfg, checkpointing=checkpointing, storage_unit_node_ids=plan)
+    conf = OmegaConf.to_container(captured["conf"], resolve=True)
+    return conf["backend"]["MooncakeStore"]
+
+
+@pytest.mark.parametrize("unit_segment_size", [1 << 30, 0])
+def test_mooncake_ssd_offload_makes_objects_evictable(
+    monkeypatch, unit_segment_size
+) -> None:
+    from transfer_queue.storage.bootstrap import mooncake_bootstrap
+
+    storage = _mooncake_overlay(
+        monkeypatch,
+        {
+            "storage_unit_segment_size": unit_segment_size,
+            "ssd_offload": {**_MC_SSD, "offload_threshold": 0.2},
+        },
+    )
+    assert storage["hard_pin"] is False
+    # TQ's own offload client would own none of the data; it stays off.
+    assert storage["offload"]["enabled"] is False
+    extra = mooncake_bootstrap.subprocess.extra_args
+    assert "--offload_on_evict=true" in extra
+    assert "--offload_force_evict=false" in extra
+    assert "--eviction_high_watermark_ratio=0.2" in extra
+    assert "--default_kv_lease_ttl=1000" in extra
+
+
+@pytest.mark.parametrize("ssd_offload", [False, True])
+def test_mooncake_ssd_offload_watches_the_master_for_disk_evictions(
+    monkeypatch, ssd_offload
+) -> None:
+    watched = []
+    _mooncake_overlay(
+        monkeypatch,
+        {"ssd_offload": _MC_SSD} if ssd_offload else {},
+        watch=lambda url, path: watched.append((url, path)),
+    )
+
+    if not ssd_offload:
+        assert watched == []
+        return
+    ((url, path),) = watched
+    assert url.startswith("http://") and url.endswith("/metrics")
+    assert path == "/local/ssd"
+
+
+def test_mooncake_without_ssd_offload_keeps_tq_master_flags(monkeypatch) -> None:
+    from transfer_queue.storage.bootstrap import mooncake_bootstrap
+
+    storage = _mooncake_overlay(monkeypatch, {})
+    assert storage["hard_pin"] is None
+    assert mooncake_bootstrap.subprocess.extra_args == ()
+
+
+def test_mooncake_ssd_offload_is_checkpointable() -> None:
+    # Saves read evictable replicas through native GET (tq_mooncake_checkpoint).
+    cfg = _cfg(
+        "mooncake_cpu",
+        mooncake_cpu={"storage_unit_segment_size": 1 << 30, "ssd_offload": _MC_SSD},
+    )
+    assert data_plane_supports_checkpointing(cfg) is True
+
+
+@pytest.mark.parametrize("ssd_offload", [False, True])
+def test_mooncake_checkpointing_pins_replicas_unless_offloading(
+    monkeypatch, ssd_offload
+) -> None:
+    storage = _mooncake_overlay(
+        monkeypatch,
+        {"ssd_offload": _MC_SSD} if ssd_offload else {},
+        checkpointing=True,
+    )
+    # Offload must evict; without it, saves borrow hard-pinned memory directly.
+    assert storage["hard_pin"] is (not ssd_offload)
+    assert storage["offload"]["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("mooncake_cpu", "match"),
+    [
+        ({"storage_unit_segment_size": 1, "ssd_offload": {"enabled": True}}, "path"),
+        (
+            {
+                "storage_unit_segment_size": 1,
+                "ssd_offload": {"enabled": True, "path": "rel/ssd"},
+            },
+            "path",
+        ),
+        (
+            {
+                "storage_unit_segment_size": 1,
+                "ssd_offload": {**_MC_SSD, "offload_threshold": 0},
+            },
+            "offload_threshold",
+        ),
+    ],
+)
+def test_mooncake_ssd_offload_config_is_checked_at_load(mooncake_cpu, match) -> None:
+    with pytest.raises(pydantic.ValidationError, match=match):
+        backend_config(_cfg("mooncake_cpu", mooncake_cpu=mooncake_cpu))
+
+
 def test_simple_backend_nested_block_is_used() -> None:
     cfg = _cfg("simple", simple={"storage_capacity": 7, "num_storage_units": 3})
     resolved = backend_config(cfg)

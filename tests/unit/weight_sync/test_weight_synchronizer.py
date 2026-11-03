@@ -803,6 +803,7 @@ class TestCollectiveWeightSynchronizer:
             refit_timeout_s=None,
             buffer_size_bytes=None,
             num_buffers=None,
+            use_legacy_packing=False,
         )
         gen.update_weights_from_collective.assert_called_once()
 
@@ -899,6 +900,7 @@ class TestCollectiveWeightSynchronizer:
             nccl_peer="vllm",
             buffer_size_bytes=1024**3,
             num_buffers=2,
+            use_legacy_packing=True,
         )
         gen.get_inference_world_size.return_value = 8
         sync = CollectiveWeightSynchronizer(
@@ -922,6 +924,7 @@ class TestCollectiveWeightSynchronizer:
             refit_timeout_s=None,
             buffer_size_bytes=1024**3,
             num_buffers=2,
+            use_legacy_packing=True,
         )
 
 
@@ -1455,8 +1458,9 @@ class TestFactory:
 
     @pytest.mark.parametrize(("configured", "expected_calls"), [(False, 0), (True, 1)])
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    @pytest.mark.parametrize("backend", [VLLM_BACKEND, "trtllm"])
     def test_non_colocated_vllm_propagates_refit_memory_release(
-        self, mock_ray, configured, expected_calls
+        self, mock_ray, configured, expected_calls, backend
     ):
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
@@ -1465,7 +1469,7 @@ class TestFactory:
         sync = create_weight_synchronizer(
             policy=policy,
             generation=_mock_generation(),
-            generation_backend=VLLM_BACKEND,
+            generation_backend=backend,
             colocated=False,
             train_cluster=_mock_cluster(),
             inference_cluster=_mock_cluster(),
@@ -1475,7 +1479,7 @@ class TestFactory:
 
         assert policy.offload_before_refit.call_count == expected_calls
 
-    def test_refit_memory_release_rejects_dtensor_policy(self):
+    def test_refit_memory_release_rejects_automodel_policy(self):
         policy = _mock_policy()
         policy.cfg["offload_policy_before_refit"] = True
 
@@ -1505,6 +1509,8 @@ class TestFactory:
                 None,
                 "requires non-colocated vLLM or Megatron",
             ),
+            # TensorRT-LLM has no shard-to-shard refit transport.
+            ("trtllm", False, "nccl_reshard", "TensorRT-LLM generation"),
         ],
     )
     def test_refit_memory_release_rejects_unsupported_transport(

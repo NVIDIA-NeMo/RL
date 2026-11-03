@@ -614,7 +614,7 @@ def _patch_real_quant_load(monkeypatch, backend, forwarded=None):
         monkeypatch.setattr(
             backend.VllmInternalWorkerExtension,
             "_load_weights",
-            lambda self, weights: forwarded.extend(weights) or "loaded",
+            lambda self, weights, coverage=None: forwarded.extend(weights) or "loaded",
         )
 
 
@@ -756,7 +756,10 @@ def test_quant_ignore_name_candidates_include_model_prefix_and_base_names():
     ]
 
 
-def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, tmp_path):
+@pytest.mark.parametrize("llm_kwargs", [{}, {"moe_backend": "triton"}])
+def test_configure_quant_engine_kwargs_for_fake_quant(
+    monkeypatch, tmp_path, llm_kwargs
+):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
     )
@@ -767,7 +770,7 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, tmp_path):
     (tmp_path / quant_cfg).touch()
     monkeypatch.chdir(tmp_path)
 
-    llm_kwargs = {}
+    llm_kwargs = dict(llm_kwargs)
     worker_mod._configure_quant_engine_kwargs(
         {"quant_cfg": quant_cfg},
         llm_kwargs,
@@ -780,7 +783,31 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, tmp_path):
         "nemo_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
     )
     assert os.environ["VLLM_QUANT_CFG"] == os.path.abspath(quant_cfg)
+    assert llm_kwargs["moe_backend"] == "triton"
     assert "quantization" not in llm_kwargs
+
+
+@pytest.mark.parametrize(
+    "moe_backend", ["auto", "flashinfer_trtllm", "flashinfer_cutlass", None]
+)
+def test_configure_fake_quant_rejects_non_triton_backend(monkeypatch, moe_backend):
+    worker_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
+    )
+    monkeypatch.delenv("VLLM_QUANT_CFG", raising=False)
+    monkeypatch.delenv("VLLM_MODELOPT_REAL_QUANT", raising=False)
+    llm_kwargs = {"moe_backend": moe_backend}
+
+    with pytest.raises(
+        ValueError, match="fake quantization requires moe_backend='triton'"
+    ):
+        worker_mod._configure_quant_engine_kwargs(
+            {"quant_cfg": "NVFP4_DEFAULT_CFG"}, llm_kwargs
+        )
+
+    assert llm_kwargs["moe_backend"] == moe_backend
+    assert "VLLM_QUANT_CFG" not in os.environ
+    assert "VLLM_MODELOPT_REAL_QUANT" not in os.environ
 
 
 def test_quant_worker_forwards_snapshot_pythonpath_to_inner_vllm_workers():
@@ -837,7 +864,7 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
         modelopt_utils, "resolve_nvfp4_real_quant_mode", lambda _: "w4a16"
     )
 
-    llm_kwargs = {}
+    llm_kwargs = {"moe_backend": "flashinfer_trtllm"}
     worker_mod._configure_quant_engine_kwargs(
         {
             "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
@@ -851,6 +878,7 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     assert os.environ["VLLM_MODELOPT_REAL_QUANT"] == "1"
     assert "VLLM_QUANT_CFG" not in os.environ
     assert "worker_cls" not in llm_kwargs
+    assert llm_kwargs["moe_backend"] == "flashinfer_trtllm"
     assert llm_kwargs["quantization"] == NEMO_MODELOPT_W4A16
     assert llm_kwargs["hf_overrides"]["quantization_config"] == (
         build_vllm_modelopt_nvfp4_config(mode="w4a16", ignore=["lm_head"])
@@ -907,16 +935,21 @@ def test_configure_quant_engine_kwargs_preserves_hf_overrides(monkeypatch):
     )
 
 
-def test_configure_quant_engine_kwargs_for_fake_quant_without_quant_cfg(monkeypatch):
+@pytest.mark.parametrize("llm_kwargs", [{}, {"moe_backend": "flashinfer_trtllm"}])
+def test_configure_quant_engine_kwargs_for_fake_quant_without_quant_cfg(
+    monkeypatch, llm_kwargs
+):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
     )
     monkeypatch.delenv("VLLM_QUANT_CFG", raising=False)
     monkeypatch.delenv("VLLM_MODELOPT_REAL_QUANT", raising=False)
 
-    llm_kwargs = {}
+    llm_kwargs = dict(llm_kwargs)
+    expected_backend = llm_kwargs.get("moe_backend", "triton")
     worker_mod._configure_quant_engine_kwargs({"quant_cfg": None}, llm_kwargs)
 
+    assert llm_kwargs["moe_backend"] == expected_backend
     assert "VLLM_QUANT_CFG" not in os.environ
     assert llm_kwargs["worker_cls"] == (
         "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
@@ -1127,6 +1160,21 @@ def test_modelopt_moe_manifest_requires_complete_w4a4_family(monkeypatch):
     with pytest.raises(RuntimeError, match="missing.*w2_input_scale"):
         backend._w13_num_shards_from_state_dict_info(
             state_dict_info, require_input_scales=True
+        )
+
+
+def test_real_quant_prepare_refit_info_rejects_draft_manifest(monkeypatch):
+    """A draft manifest must fail at preparation, before any weight is loaded."""
+    backend = _import_vllm_quant_backend(monkeypatch)
+    extension = _make_real_quant_extension(backend, torch.nn.Module(), [])
+    _patch_real_quant_load(monkeypatch, backend)
+
+    with pytest.raises(RuntimeError, match="does not support draft finalization"):
+        extension.prepare_refit_info(
+            {
+                "model.layers.0.mlp.up_proj.weight": ((4, 4), torch.uint8),
+                "draft.layers.0.self_attn.qkv_proj.weight": ((4, 4), torch.bfloat16),
+            }
         )
 
 
@@ -1406,7 +1454,7 @@ def test_real_quant_pre_ack_fence_is_device_wide_and_load_does_not_fence(
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
         "_load_weights",
-        lambda _self, _weights: events.append("load") or "loaded",
+        lambda _self, _weights, coverage=None: events.append("load") or "loaded",
     )
     monkeypatch.setattr(
         backend,
@@ -2018,7 +2066,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     extension.zmq_socket = FakeSocket()
     extension.state_dict_info = state_dict_info
     extension.maybe_init_zmq = lambda: None
-    extension._load_weights = lambda _weights: None
+    extension._load_weights = lambda _weights, coverage=None: None
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
         "_is_real_quant_model",
@@ -2100,7 +2148,8 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     }
     extension.maybe_init_zmq = lambda: None
 
-    def load_weights(weights):
+    def load_weights(weights, *, coverage=None):
+        assert coverage is None
         for name, weight in weights:
             view_refs.append(weakref.ref(weight))
             loaded.append((name, weight.clone()))

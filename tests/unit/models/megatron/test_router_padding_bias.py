@@ -22,6 +22,74 @@ import torch
 pytestmark = pytest.mark.mcore
 
 
+@pytest.mark.parametrize(
+    "overrides,rejected",
+    [
+        ({}, False),
+        ({"moe_router_bias_update_rate": 0.001}, False),
+        ({"moe_expert_capacity_factor": 1.0}, True),
+        ({"moe_expert_rank_capacity_factor": 1.0}, True),
+        ({"moe_pad_experts_for_cuda_graph_inference": True}, True),
+        ({"moe_token_dropping": True}, True),
+        (
+            {
+                "moe_router_load_balancing_type": "seq_aux_loss",
+                "moe_aux_loss_coeff": 0.01,
+            },
+            True,
+        ),
+        ({"moe_router_load_balancing_type": "seq_aux_loss"}, False),
+        ({"routing_type": "sinkhorn"}, True),
+        ({"routing_type": "quantile_balancing"}, True),
+    ],
+)
+def test_forest_allows_bias_updates_but_keeps_other_router_guards(
+    monkeypatch, overrides, rejected
+):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as module
+
+    class Router:
+        pass
+
+    class TopKRouter(Router):
+        pass
+
+    config = SimpleNamespace(
+        moe_expert_capacity_factor=None,
+        moe_expert_rank_capacity_factor=None,
+        moe_pad_experts_for_cuda_graph_inference=False,
+        moe_token_dropping=False,
+        moe_router_load_balancing_type="none",
+        moe_aux_loss_coeff=0.0,
+        moe_router_bias_update_rate=0.0,
+    )
+    router = TopKRouter()
+    router.config = config
+    router.routing_type = overrides.get("routing_type", "none")
+    router.enable_expert_bias = True
+    router.frozen_expert_bias = False
+    for key, value in overrides.items():
+        if key != "routing_type":
+            setattr(config, key, value)
+    monkeypatch.setattr(module, "Router", Router)
+    monkeypatch.setattr(module, "TopKRouter", TopKRouter)
+    monkeypatch.setattr(
+        module,
+        "_unwrapped_chunks",
+        lambda _: [SimpleNamespace(modules=lambda: [router])],
+    )
+    worker = SimpleNamespace(model=object())
+    validate = module.MegatronPolicyWorkerImpl.validate_forest_execution_padding
+    if rejected:
+        with pytest.raises(ValueError, match="dropless per-token MoE routing"):
+            validate(worker)
+    else:
+        validate(worker)
+    assert config.moe_router_bias_update_rate == overrides.get(
+        "moe_router_bias_update_rate", 0.0
+    )
+
+
 def _processed(monkeypatch, multiple, enabled=True, lengths=True):
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
     from nemo_rl.models.megatron import data as module

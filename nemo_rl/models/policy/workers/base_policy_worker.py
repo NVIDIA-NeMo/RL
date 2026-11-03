@@ -34,7 +34,7 @@ class AbstractPolicyWorker:
 
     def sync_params_before_refit(self) -> None:
         """Materialize optimizer updates before refit when the backend requires it."""
-        # DTensor policy parameters already contain the latest optimizer update.
+        # Automodel policy parameters already contain the latest optimizer update.
         # Megatron overrides this whenever the distributed optimizer overlaps the
         # parameter all-gather (MXFP8 shared-buffer and plain BF16 alike).
         pass
@@ -361,6 +361,16 @@ class AbstractPolicyWorker:
     def finalize_async_save(self) -> None:
         """Block until any in-flight async checkpoint write completes. No-op by default."""
         pass
+
+    def poll_async_save(self) -> bool:
+        """Finalize a completed async checkpoint write without waiting; True when none is pending.
+
+        Not implemented by default: answering True for a backend that writes in the
+        background would let the caller publish a checkpoint whose write hasn't landed.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support polling async checkpoint saves."
+        )
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation
