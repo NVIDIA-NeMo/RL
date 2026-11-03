@@ -15,6 +15,8 @@
 """Dense SGLang destination layout and serving-lifecycle correctness."""
 
 import json
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -207,7 +209,7 @@ def test_failed_transfer_keeps_serving_paused_and_latches_failure() -> None:
     assert sync.is_stale
 
 
-def test_cpu_control_descriptors_can_be_consumed_by_both_tp_ranks() -> None:
+def test_control_payload_can_be_consumed_by_independent_tp_processes() -> None:
     worker_class = SGLangGenerationWorker.__ray_metadata__.modified_class
     worker = worker_class.__new__(worker_class)
     worker.sglang_cfg = {"sglang_cfg": {"tp_size": 2}}
@@ -221,6 +223,23 @@ def test_cpu_control_descriptors_can_be_consumed_by_both_tp_ranks() -> None:
         [(operation, control)] = MultiprocessingSerializer.deserialize(encoded)
         assert operation == "refit"
         assert json.loads(bytes(control.tolist())) == payload
+        receiver = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import base64, json, multiprocessing, pickle, sys; "
+                "multiprocessing.current_process().authkey = b'independent-sglang'; "
+                "[(operation, control)] = pickle.loads(base64.b64decode(sys.stdin.read())); "
+                "assert operation == 'refit'; "
+                "assert json.loads(bytes(control.tolist())) == {'refit_timeout_s': 30}",
+            ],
+            input=encoded,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        assert receiver.returncode == 0, receiver.stderr
 
 
 def test_shared_mover_uses_sglang_mesh_without_a_ray_worker_group() -> None:

@@ -14,7 +14,9 @@
 
 """BF16 SGLang receiver for the shared NCCL shard-to-shard refit transport."""
 
+import base64
 import json
+import pickle
 from collections.abc import Callable
 from typing import Any, cast
 from weakref import WeakKeyDictionary, ref
@@ -33,6 +35,14 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 SGLANG_RESHARD_LOADER = (
     "nemo_rl.models.generation.sglang.utils.nccl_reshard.load_nccl_reshard"
 )
+
+
+def serialize_nccl_reshard_command(operation: str, payload: dict[str, Any]) -> str:
+    """Inline control bytes so independent serving processes need no IPC handles."""
+    control = torch.tensor(
+        list(json.dumps(payload).encode()), dtype=torch.uint8, device="cpu"
+    )
+    return base64.b64encode(pickle.dumps([(operation, control)])).decode("ascii")
 
 
 def build_sglang_refit_param_map(

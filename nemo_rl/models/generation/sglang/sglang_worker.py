@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import logging
 import multiprocessing
 import os
@@ -400,26 +399,18 @@ class SGLangGenerationWorker:
 
     def nccl_reshard_command(self, operation: str, payload: dict) -> bool:
         """Send control metadata to the registered GPU-side reshard loader."""
-        # Torch is optional in the lightweight serving actor's import path.
-        import torch
-
+        # The receiver and Torch are optional in the serving actor's import path.
         from nemo_rl.models.generation.sglang.utils.nccl_reshard import (
             SGLANG_RESHARD_LOADER,
-        )
-        from nemo_rl.models.generation.sglang.utils.train_utils import (
-            MultiprocessingSerializer,
+            serialize_nccl_reshard_command,
         )
 
-        control = torch.tensor(list(json.dumps(payload).encode()), dtype=torch.uint8)
-        # CPU shared-memory descriptors are consumed once by each deserializer.
-        serialized = [
-            MultiprocessingSerializer.serialize([(operation, control)], output_str=True)
-            for _ in range(self.sglang_cfg["sglang_cfg"]["tp_size"])
-        ]
+        serialized = serialize_nccl_reshard_command(operation, payload)
         response = self._make_request(
             "update_weights_from_tensor",
             {
-                "serialized_named_tensors": serialized,
+                "serialized_named_tensors": [serialized]
+                * self.sglang_cfg["sglang_cfg"]["tp_size"],
                 "load_format": SGLANG_RESHARD_LOADER,
                 "flush_cache": False,
                 "selector": "target",
