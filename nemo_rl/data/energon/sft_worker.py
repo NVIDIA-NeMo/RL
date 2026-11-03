@@ -86,11 +86,10 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         logical_rank = parallel_state.get_data_parallel_rank()
         logical_world_size = parallel_state.get_data_parallel_world_size()
-        # The only span covering the Energon worker subprocesses. They are
-        # forked by the loader's first iteration and emit nothing themselves --
+        # The only span covering the Energon worker subprocesses, which the
+        # loader's first iteration forks and which emit nothing themselves --
         # no tracer is installed in them, and installing one would mean an
-        # exporter per subprocess -- so this span, plus the read wait measured
-        # per step below, is the whole picture of them from this side.
+        # exporter per subprocess. With read_batch below it is all there is.
         with umbrella_span(
             RLSpanGroup.U_SETUP,
             "rl.sft_v2.build_loader",

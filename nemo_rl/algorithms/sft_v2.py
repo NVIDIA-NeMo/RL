@@ -181,26 +181,20 @@ def _restore_save_state(
 def _energon_fanout_attributes(data_config: Mapping[str, Any]) -> dict[str, int]:
     """How many Energon worker subprocesses a rank forks, and their queue depth.
 
-    These are the only record that the subprocesses exist. They are forked by
-    the loader rather than by NeMo-RL, nothing installs a tracer in them, and
-    the only span that sees them at all is the loader build they happen under.
+    The only record that the subprocesses exist: the loader forks them, not
+    NeMo-RL, and nothing installs a tracer in them. Per rank, because the span
+    these land on has one ``rl.sft_v2.build_loader`` child per rank carrying
+    ``logical_world_size``.
 
-    Per rank, not per job: the span these land on has one
-    ``rl.sft_v2.build_loader`` child per loader rank, each carrying its
-    ``logical_world_size``, so a job-wide total would be the product of two
-    values already on the trace.
-
-    Read off the config against the model's defaults rather than by validating
-    it: this feeds a span, and a read strict enough to reject a config the
-    worker would have accepted would fail a run from the telemetry path, which
-    nothing else in that path does.
+    Read against the model's defaults rather than validated: this feeds a span,
+    and rejecting a config the worker would have accepted would fail a run from
+    the telemetry path, which nothing else in that path does.
     """
     energon = data_config.get("energon")
 
     def setting(name: str) -> int:
-        # ``data["energon"]`` arrives either as the raw mapping from the YAML
-        # or as an already-validated ``EnergonLoaderConfig``, since
-        # ``build_energon_sft_loader`` takes both.
+        # ``data["energon"]`` is the raw YAML mapping or an already-validated
+        # ``EnergonLoaderConfig``; ``build_energon_sft_loader`` takes both.
         value = (
             energon.get(name)
             if isinstance(energon, Mapping)
@@ -213,9 +207,8 @@ def _energon_fanout_attributes(data_config: Mapping[str, Any]) -> dict[str, int]
     workers = setting("num_workers")
     return {
         ENERGON_WORKERS_PER_RANK_ATTR: workers,
-        # num_workers=0 loads in the policy process itself, so there is neither
-        # a subprocess nor a queue in front of it. Zero is the honest reading
-        # rather than a missing value.
+        # num_workers=0 loads in the policy process itself, so there is no
+        # subprocess and no queue. Zero is the honest reading, not a gap.
         ENERGON_IN_FLIGHT_ATTR: workers * setting("prefetch_factor"),
     }
 

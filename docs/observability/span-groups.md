@@ -673,34 +673,29 @@ to a thread pool would read as batch-shaped.
 
 ## The Energon worker pool
 
-SFT v2 loads through Energon, which runs its own `DataLoader` worker
-subprocesses — `data.energon.num_workers` of them behind each loader owner, so a
-run with four DP replicas and the default eight workers has thirty-two. They are
-forked by the loader on its first iteration, not by NeMo-RL, and no tracer is
-installed in them: giving them one would mean an OTLP exporter per subprocess,
-and a span per batch per process for the length of the run.
-
-They are covered from the consuming side instead, which is also the side the
-answer matters on — the workers run ahead of training, so what a reader needs is
-not how long a batch took to build but whether one was ready when the step asked
-for it:
+SFT v2 loads through Energon, which forks `data.energon.num_workers`
+`DataLoader` subprocesses behind each loader owner on the loader's first
+iteration. Nothing installs a tracer in them — that would mean an OTLP exporter
+per subprocess and a span per batch per process — so they are covered from the
+consuming side, which is where the answer matters: the workers run ahead of
+training, so what a reader needs is whether a batch was ready when the step
+asked for it, not how long it took to build.
 
 | Signal | What it says |
 |---|---|
-| `rl.sft_v2.setup_loaders` (controller) over `rl.sft_v2.build_loader` (each owner) | the window the subprocesses are forked in and the first batches are built, which on a cold dataset is most of it. Both unbucketed, like every `setup` span. The controller span carries `rl.energon.workers_per_rank` and `rl.energon.batches_in_flight_per_rank`, which is the only place the pool's size reaches telemetry at all — the loader config is in no resource attribute and on no other span. Both are per rank; multiply by the `logical_world_size` on any `build_loader` child for the job-wide total |
-| `rl.sft_v2.read_batch` (each owner, per step) | the blocking dequeue alone. Near zero while the workers keep up; it is the span that grows when they stop |
+| `rl.sft_v2.setup_loaders` (controller) over `rl.sft_v2.build_loader` (each owner) | the window the subprocesses are forked in and the first batches built. Unbucketed, like every `setup` span. The controller span carries `rl.energon.workers_per_rank` and `rl.energon.batches_in_flight_per_rank` — the only record of the pool's size anywhere in telemetry. Per rank; multiply by the `logical_world_size` on any `build_loader` child for the job total |
+| `rl.sft_v2.read_batch` (each owner, per step) | the blocking dequeue alone. Near zero while the workers keep up; the span that grows when they stop |
 
-Read the wait off the spans, not off a metric. There is one `read_batch` span
-per owner per step, so a cold start shows up at full resolution — on a 30-step
-run it is the difference between 2.8 s on step 1 and 0.6 ms thereafter. The
-teed gauges are sampled on the exporter's interval with last-value semantics,
-which at a 10 s interval and 1.5 s steps is roughly one step in seven and
-whichever one happened to precede the tick. `rl.sft_v2.loader.latency.max` is
-subject to that and to a second limit: it covers prepare, register and publish
-as well as the dequeue, all of which run on the policy worker itself.
+Read the wait off the spans, not a metric. There is one `read_batch` span per
+owner per step, so a cold start shows at full resolution — 2.8 s on step 1
+against 0.6 ms after, on one 30-step run. The teed gauges are sampled on the
+exporter's interval with last-value semantics, which at a 10 s interval and
+1.5 s steps is roughly one step in seven. `rl.sft_v2.loader.latency.max` is
+subject to that and covers prepare, register and publish as well as the
+dequeue.
 
-The queue *depth* at dequeue time is not exported either, so a pool that is
-keeping up and one that is barely keeping up both read as a near-zero wait.
+Queue depth at dequeue time is not exported, so a pool that is keeping up and
+one that is barely keeping up both read as a near-zero wait.
 
 ## Coverage gaps
 
