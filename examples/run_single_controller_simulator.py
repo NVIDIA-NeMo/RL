@@ -61,6 +61,7 @@ from nemo_rl.models.generation import (
     configure_generation_config,
     maybe_configure_engine_reaping_env,
 )
+from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.telemetry.instrumentation import setup_span, startup_span
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
@@ -182,6 +183,9 @@ def main() -> None:
     # After the CLI overrides, so the allocation's flags win over the recipe.
     apply_simulator_overrides(config, settings)
     config = MasterConfig(**config)
+    # As run_grpo_single_controller.py: one video contract for tokenizer, data
+    # and the vLLM request config. No-op for recipes without video inputs.
+    materialize_vllm_video_config(config.policy, config.data)
     print(f"Simulator settings: {settings}")
 
     if is_ppo_run(config):
