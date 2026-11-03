@@ -37,11 +37,9 @@ from nemo_rl.models.generation.vllm.patches import (
 from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
 if TYPE_CHECKING:
-    from nemo_rl.models.policy import (
-        AutomodelConfig,
-        AutomodelPipelineConfig,
-        PolicyConfig,
-    )
+    from transformers import PretrainedConfig
+
+    from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 
 # Environment for bitwise-reproducible policy workers. These are read when the
 # worker creates its cuBLAS handles and selects Transformer Engine kernels, so
@@ -183,13 +181,9 @@ def validate_automodel_pipeline_config(
     config: "PolicyConfig",
     *,
     is_vlm: bool,
-    model_config: object | None,
-) -> "AutomodelPipelineConfig | None":
-    """Reject unsupported PP settings on the driver before creating workers.
-
-    Returns the parsed pipeline config, or None for PP=1. model_config=None
-    defers the tied-embedding check to Automodel.
-    """
+    model_config: "PretrainedConfig",
+) -> None:
+    """Reject unsupported PP settings on the driver before creating workers."""
     from nemo_rl.models.policy import AutomodelPipelineConfig
     from nemo_rl.models.policy.draft_config import draft_refit_enabled
 
@@ -200,29 +194,24 @@ def validate_automodel_pipeline_config(
             f"policy.automodel_cfg.pipeline_parallel_size must be >= 1, got {pp_size}."
         )
     if pp_size == 1:
-        return None
+        return
 
     if "pipeline" not in automodel_cfg:
         raise ValueError(
-            f"policy.automodel_cfg.pipeline_parallel_size={pp_size} requires a "
-            "policy.automodel_cfg.pipeline block that sets at least "
-            "microbatches_per_step."
+            "PP > 1 requires policy.automodel_cfg.pipeline.microbatches_per_step."
         )
     pipeline_cfg = AutomodelPipelineConfig.model_validate(automodel_cfg["pipeline"])
     if pipeline_cfg.microbatches_per_step < pp_size:
         raise ValueError(
-            "The 1F1B pipeline schedule needs at least one microbatch per "
-            "pipeline stage: policy.automodel_cfg.pipeline.microbatches_per_step="
-            f"{pipeline_cfg.microbatches_per_step} < pipeline_parallel_size={pp_size}."
+            "policy.automodel_cfg.pipeline.microbatches_per_step="
+            f"{pipeline_cfg.microbatches_per_step} must be >= "
+            f"pipeline_parallel_size={pp_size}."
         )
 
     if "defer_fsdp_grad_sync" not in automodel_cfg:
         raise ValueError(
-            "policy.automodel_cfg.pipeline_parallel_size > 1 requires "
-            "policy.automodel_cfg.defer_fsdp_grad_sync to be set explicitly. "
-            "false reduce-scatters gradients after every microbatch (recommended); "
-            "true keeps unsharded parameters and fp32 gradients of a stage "
-            "resident for the whole schedule call."
+            "PP > 1 requires policy.automodel_cfg.defer_fsdp_grad_sync to be set "
+            "explicitly (false is recommended)."
         )
 
     if (
@@ -230,11 +219,9 @@ def validate_automodel_pipeline_config(
         and config["logprob_batch_size"] != config["train_micro_batch_size"]
     ):
         raise ValueError(
-            "policy.automodel_cfg.pipeline_parallel_size > 1 requires "
-            "policy.logprob_batch_size to equal policy.train_micro_batch_size "
-            "because pipeline stage buffers are sized for one microbatch size; got "
-            f"logprob_batch_size={config['logprob_batch_size']} and "
-            f"train_micro_batch_size={config['train_micro_batch_size']}."
+            "PP > 1 requires policy.logprob_batch_size "
+            f"({config['logprob_batch_size']}) to equal "
+            f"policy.train_micro_batch_size ({config['train_micro_batch_size']})."
         )
 
     generation_cfg = config.get("generation")
@@ -256,31 +243,21 @@ def validate_automodel_pipeline_config(
         and config["reward_model_cfg"]["enabled"],
         "quant_cfg": config.get("quant_cfg") is not None,
         "multimodal (VLM) models": is_vlm,
-        "non-colocated generation (generation.colocated.enabled=false)": (
-            generation_cfg is not None and not generation_cfg["colocated"]["enabled"]
-        ),
+        "generation.colocated.enabled=false": generation_cfg is not None
+        and not generation_cfg["colocated"]["enabled"],
         "generation.refit_transport": generation_cfg is not None
         and generation_cfg.get("refit_transport") is not None,
     }
     enabled_unsupported = [name for name, enabled in unsupported.items() if enabled]
     if enabled_unsupported:
+        raise ValueError(f"PP > 1 does not support: {', '.join(enabled_unsupported)}.")
+
+    text_config = getattr(model_config, "text_config", None) or model_config
+    if getattr(text_config, "tie_word_embeddings", False):
         raise ValueError(
-            "policy.automodel_cfg.pipeline_parallel_size > 1 does not support: "
-            f"{', '.join(enabled_unsupported)}. Disable these options or set "
-            "pipeline_parallel_size=1."
+            f"PP > 1 does not support tied embeddings ({config['model_name']} "
+            "sets tie_word_embeddings=true)."
         )
-
-    if model_config is not None:
-        text_config = getattr(model_config, "text_config", None) or model_config
-        if getattr(text_config, "tie_word_embeddings", False):
-            raise ValueError(
-                f"{config['model_name']} ties its input embedding and LM head "
-                "weights (tie_word_embeddings=true), which pipeline parallelism "
-                "cannot split across stages. Set "
-                "policy.automodel_cfg.pipeline_parallel_size=1 for this model."
-            )
-
-    return pipeline_cfg
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:

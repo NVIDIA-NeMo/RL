@@ -20,7 +20,6 @@ from typing import Any
 import pydantic
 import pytest
 
-from nemo_rl.models.policy import AutomodelPipelineConfig
 from nemo_rl.models.policy.utils import (
     automodel_pipeline_parallel_size,
     validate_automodel_pipeline_config,
@@ -52,9 +51,7 @@ def _config(**automodel_overrides: Any) -> dict[str, Any]:
 
 
 def _validate(config: dict[str, Any], *, is_vlm: bool = False, model_config=None):
-    return validate_automodel_pipeline_config(
-        config, is_vlm=is_vlm, model_config=model_config
-    )
+    validate_automodel_pipeline_config(config, is_vlm=is_vlm, model_config=model_config)
 
 
 def test_pipeline_parallel_size_defaults_to_one_when_absent():
@@ -65,27 +62,21 @@ def test_pipeline_parallel_size_defaults_to_one_when_absent():
 def test_pp_size_one_needs_no_pipeline_block():
     config = _config(pipeline_parallel_size=1)
     del config["automodel_cfg"]["pipeline"]
-    assert _validate(config) is None
+    _validate(config)
 
 
-def test_valid_config_returns_parsed_pipeline_block():
-    pipeline_cfg = _validate(
-        _config(), model_config=SimpleNamespace(tie_word_embeddings=False)
-    )
-    assert pipeline_cfg == AutomodelPipelineConfig(microbatches_per_step=4)
+def test_accepts_valid_config():
+    _validate(_config(), model_config=SimpleNamespace(tie_word_embeddings=False))
 
 
 @pytest.mark.parametrize("interval", [None, 0])
 def test_pipeline_accepts_disabled_periodic_cache_clearing(interval):
-    assert _validate(_config(clear_cache_every_n_steps=interval)) is not None
+    _validate(_config(clear_cache_every_n_steps=interval))
 
 
 @pytest.mark.parametrize("interval", [1, 50])
 def test_non_pipeline_accepts_periodic_cache_clearing(interval):
-    assert (
-        _validate(_config(pipeline_parallel_size=1, clear_cache_every_n_steps=interval))
-        is None
-    )
+    _validate(_config(pipeline_parallel_size=1, clear_cache_every_n_steps=interval))
 
 
 @pytest.mark.parametrize(
@@ -95,7 +86,7 @@ def test_non_pipeline_accepts_periodic_cache_clearing(interval):
         ({"pipeline": None}, "valid dictionary"),
         (
             {"pipeline": {"microbatches_per_step": 1}},
-            "at least one microbatch per pipeline stage",
+            "must be >= pipeline_parallel_size",
         ),
     ],
 )
@@ -107,7 +98,7 @@ def test_rejects_invalid_pipeline_settings(overrides, message):
 def test_pipeline_block_is_required():
     config = _config()
     del config["automodel_cfg"]["pipeline"]
-    with pytest.raises(ValueError, match="requires a policy.automodel_cfg.pipeline"):
+    with pytest.raises(ValueError, match="pipeline.microbatches_per_step"):
         _validate(config)
 
 
@@ -131,7 +122,7 @@ def test_pipeline_block_rejects_schedule_choices(schedule_key):
     "overrides", [{"expert_parallel_size": 8}, {"context_parallel_size": 2}]
 )
 def test_accepts_expert_and_context_parallelism(overrides):
-    assert _validate(_config(**overrides)) is not None
+    _validate(_config(**overrides))
 
 
 def test_defer_fsdp_grad_sync_must_be_explicit():
@@ -180,7 +171,7 @@ def test_logprob_batch_size_must_match_train_micro_batch_size():
         (lambda c: c.update(quant_cfg="int4"), "quant_cfg"),
         (
             lambda c: c["generation"]["colocated"].update(enabled=False),
-            "non-colocated generation",
+            "generation.colocated.enabled=false",
         ),
         (
             lambda c: c["generation"].update(refit_transport="nixl"),
