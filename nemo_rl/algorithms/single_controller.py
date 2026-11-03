@@ -127,6 +127,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
     is_ppo_run,
+    rollout_snapshots_enabled,
     validate_forest_objective,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -837,8 +838,7 @@ class SingleControllerActor:
             await self._log_rollout_throughput_metrics(emit=False)
         rollout_checkpoint_task = (
             asyncio.create_task(self._rollout_snapshots.run())
-            if self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
-            is not None
+            if rollout_snapshots_enabled(self._master_config)
             else None
         )
         if rollout_checkpoint_task is not None:
@@ -3270,6 +3270,11 @@ class SingleControllerActor:
             )
 
             if should_save_by_timeout:
+                if self._master_config.checkpointing["enabled"]:
+                    # The trainer checkpoint holds no environment state, and no
+                    # later step will wake the pump to snapshot it.
+                    await self._finish_pending_save(blocking=True)
+                    await self._rollout_snapshots.save_at_deadline()
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
         await self._finish_pending_save(blocking=True)
