@@ -32,6 +32,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.score_centering import (
     VLLM_LOGPROB_FLOOR,
+    extract_flat_score_centering_samples,
     extract_score_centering_samples,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
@@ -795,13 +796,19 @@ def attach_sampler_topk_logprobs_to_chat_response_choices(
     outputs_by_index = {
         output.index: output for output in getattr(final_request_output, "outputs", [])
     }
+    from vllm.logprobs import FlatLogprobs
+
     for choice in getattr(response, "choices", []):
+        output = outputs_by_index[choice.index]
+        extract = (
+            extract_flat_score_centering_samples
+            if isinstance(output.logprobs, FlatLogprobs)
+            else extract_score_centering_samples
+        )
         (
             choice.message.sampler_topk_token_ids,
             choice.message.sampler_topk_logprobs,
-        ) = extract_score_centering_samples(
-            outputs_by_index[choice.index], num_candidates=top_k
-        )
+        ) = extract(output, num_candidates=top_k)
 
     return response
 

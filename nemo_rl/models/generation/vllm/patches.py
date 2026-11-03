@@ -1300,6 +1300,48 @@ def install_output_loop_yield(llm: Any, *, reader_budget_s: float) -> None:
     socket.recv_multipart = recv_multipart
 
 
+def install_flat_logprobs_ids_only() -> None:
+    """Keep flat sample logprobs as token ids, without decoded candidate text.
+
+    For every generated position vLLM's ``LogprobsProcessor`` decodes the sampled
+    token and all top-k candidates, then re-decodes byte-fallback pieces with the
+    sequence context, on the generation actor's event loop. Score-centering
+    capture reads only ids and log-probs, so requests stored as flat logprobs
+    skip that work. The response text has its own detokenizer and is unchanged;
+    OpenAI logprobs, when built, decode tokens on demand when ``decoded_token``
+    is ``None``.
+
+    Raises:
+        RuntimeError: If the installed vLLM does not have the internals this patches.
+    """
+    try:
+        from vllm.v1.engine.logprobs import LogprobsProcessor
+
+        original_from_new_request = LogprobsProcessor.from_new_request.__func__
+    except (ImportError, AttributeError) as e:
+        raise RuntimeError(
+            "flat logprobs are enabled (vllm_cfg.flat_logprobs) but the installed "
+            "vLLM does not have the LogprobsProcessor.from_new_request internals "
+            "install_flat_logprobs_ids_only patches; update it in "
+            "nemo_rl/models/generation/vllm/patches.py for this vLLM version"
+        ) from e
+    if getattr(LogprobsProcessor, "_nrl_flat_logprobs_ids_only", False):
+        return
+
+    def from_new_request(cls, tokenizer, request):
+        params = request.sampling_params
+        if (
+            params is not None
+            and params.flat_logprobs
+            and params.prompt_logprobs is None
+        ):
+            tokenizer = None
+        return original_from_new_request(cls, tokenizer, request)
+
+    LogprobsProcessor.from_new_request = classmethod(from_new_request)
+    LogprobsProcessor._nrl_flat_logprobs_ids_only = True
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
