@@ -243,9 +243,8 @@ def test_sft_v2_controller_constructor_parents_setup_loaders_to_the_driver() -> 
         # Captured on the driver, inside its job span, as run_sft_v2 does.
         carrier = current_trace_carrier()
 
-    # Constructed outside that block on purpose. The actor is a separate
-    # process, where the driver's context is not ambient, so a test that runs
-    # __init__ under the open span passes whether or not the carrier is read.
+    # Outside the span: the actor is another process, so running __init__ under
+    # it would pass whether or not the carrier is read.
     with (
         patch(
             "nemo_rl.algorithms.sft_v2.init_telemetry_worker",

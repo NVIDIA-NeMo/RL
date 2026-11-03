@@ -92,8 +92,8 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         logical_rank = parallel_state.get_data_parallel_rank()
         logical_world_size = parallel_state.get_data_parallel_world_size()
-        # Bound rather than unpacked inline: a dict literal of bools narrows to
-        # dict[str, bool], which pyrefly reads as a candidate for ``tracer``.
+        # Annotated dict[str, Any]: pyrefly checks a splatted dict's value type
+        # against each named parameter, and anything narrower cannot bind ``tracer``.
         attributes: dict[str, Any] = {
             ENERGON_RANK_ATTR: logical_rank,
             ENERGON_WORLD_SIZE_ATTR: logical_world_size,
