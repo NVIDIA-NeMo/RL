@@ -25,12 +25,13 @@ import socket
 from pathlib import Path
 
 import pytest
+import ray
 import torch
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.trtllm.trtllm_generation import TrtllmGeneration
 from nemo_rl.utils.config import load_config
@@ -43,6 +44,21 @@ _EXEMPLAR = (
 # Already in CI's HF cache: the vLLM generation tests load it.
 _MODEL = "Qwen/Qwen2.5-0.5B"
 _TP = 2
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ray_cluster():
+    # The directory's conftest no-ops the session Ray fixture for the
+    # direct-server tests, but this one drives Ray actors. Init before the test
+    # body sets the Slurm env so init_ray's worker setup hook still strips it.
+    started_here = not ray.is_initialized()
+    if started_here:
+        init_ray()
+    yield
+    if started_here:
+        ray.shutdown()
+
+
 _MAX_NEW_TOKENS = 8
 
 

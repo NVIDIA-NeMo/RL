@@ -45,6 +45,15 @@ from nemo_rl.models.generation.vllm.lora_utils import (
     collect_native_lora,
     native_lora_refit_settings,
 )
+from nemo_rl.models.generation.vllm.speculator_runtime import (
+    DRAFTER_OWNER_ATTRS,
+    DraftRuntimeAdapter,
+    ModelUpdateCoverage,
+    ModelUpdateManifest,
+    SpeculatorRuntimeError,
+    find_draft_model,
+    is_speculator_type,
+)
 from nemo_rl.models.generation.vllm.utils import _format_refit_key_error
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
@@ -664,16 +673,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     # False for a checkpoint-loaded static MTP drafter; True only when the
     # trainer exports MTP weights in every policy refit stream.
     _mtp_drafter_weights_from_refit: bool = True
-    # vLLM's legacy GPUModelRunner keeps the speculative proposer as ``drafter``;
-    # the v2 model runner (vllm/v1/worker/gpu/model_runner.py, the default since
-    # vLLM 0.29) keeps it as ``speculator``. Both expose the draft nn.Module as
-    # ``.model``. Checked in this order so a legacy runner is never shadowed.
-    _DRAFTER_OWNER_ATTRS: tuple[str, ...] = ("drafter", "speculator")
     # Each worker reports a missing drafter for a co-trained MTP head at most once.
     _warned_missing_mtp_drafter: bool = False
     # Each worker logs the Gemma 4 Unified multimodal filtering at most once.
     _logged_gemma4_unified_drop: bool = False
     _sparse_delta_applier: Any = None
+    _draft_runtime_adapter: DraftRuntimeAdapter | None = None
+    _model_update_manifest: ModelUpdateManifest | None = None
+    _refit_unusable_reason: str | None = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
     hf_to_local_param_map: HFToLocalParamMap
     _nrl_layerwise_reload_active: bool = False
@@ -1006,7 +1013,40 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 MoE backend while a co-trained MTP drafter is enabled (unsupported
                 by the native layerwise refit lifecycle).
         """
+        # Reject before storing any refit state. The draft check needs this
+        # refit's manifest, so it runs again once the manifest exists.
         self._validate_native_layerwise_refit()
+        pp_group = get_pp_group()
+        pp_rank = int(getattr(pp_group, "rank_in_group", 0))
+        pp_size = int(getattr(pp_group, "world_size", 1))
+        spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
+        speculator_type = getattr(spec_config, "method", None)
+        self._draft_runtime_adapter = None
+        if is_speculator_type(speculator_type):
+            self._draft_runtime_adapter = DraftRuntimeAdapter.resolve(
+                self.model_runner,
+                speculator_type=speculator_type,
+                vllm_version=vllm.__version__,
+                pp_rank=pp_rank,
+                pp_size=pp_size,
+            )
+        elif any(name.startswith("draft.") for name in state_dict_info):
+            raise SpeculatorRuntimeError(
+                f"draft weights require a supported speculator_type, got "
+                f"{speculator_type!r} with vLLM={vllm.__version__}"
+            )
+
+        draft_owner_ranks = (
+            self._draft_runtime_adapter.owner_ranks
+            if self._draft_runtime_adapter is not None
+            else ()
+        )
+        self._model_update_manifest = ModelUpdateManifest.from_state_dict_info(
+            state_dict_info,
+            target_owner_ranks=tuple(range(pp_size)),
+            draft_owner_ranks=draft_owner_ranks,
+        )
+        self._reject_native_refit_of_trtllm_moe_draft()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
         _validate_draft_refit_info(
             self.model_runner,
@@ -1125,61 +1165,67 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         DSpark), which vLLM keeps as a module separate from the main model,
         under ``model_runner.drafter`` (legacy runner) or
         ``model_runner.speculator`` (v2 runner, used by DSpark); see
-        ``_DRAFTER_OWNER_ATTRS``. Typed ``Any`` because these are dynamic vLLM
+        ``find_draft_model``. Typed ``Any`` because these are dynamic vLLM
         model classes whose ``load_weights`` / ``mtp_start_layer_idx`` members
         are not visible through ``nn.Module``.
         """
-        for owner_attr in self._DRAFTER_OWNER_ATTRS:
-            draft_owner = getattr(self.model_runner, owner_attr, None)
-            draft_model = (
-                getattr(draft_owner, "model", None) if draft_owner is not None else None
-            )
-            if draft_model is not None:
-                return draft_model
-        return None
+        found = find_draft_model(self.model_runner)
+        return None if found is None else found[1]
 
     def configure_mtp_drafter_weight_source(self, weights_from_refit: bool) -> None:
         """Record whether the trainer owns and refreshes the MTP weights."""
         self._mtp_drafter_weights_from_refit = weights_from_refit
 
     def _load_draft_weights(
-        self, draft_weights: list[tuple[str, torch.Tensor]]
-    ) -> None:
+        self,
+        draft_weights: list[tuple[str, torch.Tensor]],
+        *,
+        runtime_adapter: DraftRuntimeAdapter | None = None,
+    ) -> bool:
         if not draft_weights:
-            return
+            return False
 
-        method = self._speculative_method()
-        # A megatron partial stream (no embed_tokens) skips the alias guard
-        # below. The warn-and-skip branch further down for a missing drafter
-        # is now effectively unreachable for a cotrained, owning rank:
-        # prepare_refit_info's _validate_draft_refit_info hard-fails earlier
-        # in that case. It still guards non-cotrained methods and a drafter
-        # that disappears between prepare and load.
+        # A megatron partial stream (no embed_tokens) skips the alias guard.
         strict_cotraining = _is_full_draft_stream([name for name, _ in draft_weights])
-        draft_model = self._get_drafter_model()
-        if draft_model is None:
-            if strict_cotraining:
-                if _draft_owns_speculator(self.model_runner, method):
-                    # Draft co-training streams every draft weight on each
-                    # refit; an owning rank without a speculator would silently
-                    # generate with stale draft weights.
-                    raise RuntimeError(
-                        f"[draft] Received {method} draft weights but no "
-                        "drafter model was found at model_runner.drafter.model "
-                        "or model_runner.speculator.model. The pinned vLLM's "
-                        f"{method} speculator layout may have changed."
-                    )
-                # Non-owning pipeline stages legitimately have no speculator;
-                # draft payloads are not theirs to load.
-                return
-            logger.warning(
-                "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
-            )
-            return
+        if runtime_adapter is not None:
+            if not runtime_adapter.is_owner:
+                return False
+            draft_model = runtime_adapter.model
+            if draft_model is None:
+                raise SpeculatorRuntimeError(
+                    "received draft weights but the owning vLLM speculative model "
+                    "is unavailable"
+                )
+        else:
+            method = self._speculative_method()
+            # Without an adapter (MTP disk load, direct calls), the warn-and-skip
+            # branch below guards non-cotrained methods and a drafter that
+            # disappears between prepare and load.
+            draft_model = self._get_drafter_model()
+            if draft_model is None:
+                if strict_cotraining:
+                    if _draft_owns_speculator(self.model_runner, method):
+                        # Draft co-training streams every draft weight on each
+                        # refit; an owning rank without a speculator would
+                        # silently generate with stale draft weights.
+                        raise RuntimeError(
+                            f"[draft] Received {method} draft weights but no "
+                            "drafter model was found at model_runner.drafter.model "
+                            "or model_runner.speculator.model. The pinned vLLM's "
+                            f"{method} speculator layout may have changed."
+                        )
+                    # Non-owning pipeline stages legitimately have no
+                    # speculator; draft payloads are not theirs to load.
+                    return False
+                logger.warning(
+                    "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
+                )
+                return False
         if strict_cotraining:
             _assert_drafter_owns_modules(self.model_runner, draft_model, draft_weights)
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
+        return True
 
     def _mtp_drafter_refit_enabled(self) -> bool:
         """Whether MTP drafter weights should be refreshed from the refit stream.
@@ -1209,7 +1255,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     "but vLLM exposes no drafter model (looked for model_runner.%s); "
                     "the drafter keeps its load-time weights, so speculative "
                     "acceptance will collapse.",
-                    " / model_runner.".join(self._DRAFTER_OWNER_ATTRS),
+                    " / model_runner.".join(attr for attr, _ in DRAFTER_OWNER_ATTRS),
                 )
             return False
         return True
@@ -1339,12 +1385,23 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         )
         return True
 
-    def _load_weights(self, weights):
+    def _load_weights(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+        *,
+        coverage: ModelUpdateCoverage | None = None,
+    ) -> None:
         """Apply model-specific transforms and load policy and draft weights.
 
         Checkpoint-format weights are normalized for the target vLLM model, then
         routed to the policy model and any supported speculative drafter.
         """
+        policy_input_names = tuple(
+            name for name, _ in weights if not name.startswith("draft.")
+        )
+        draft_input_names = tuple(
+            name for name, _ in weights if name.startswith("draft.")
+        )
         model_config = self.model_runner.vllm_config.model_config
         if "Gemma3ForConditionalGeneration" in model_config.architectures:
             for idx, (key, weight) in enumerate(weights):
@@ -1368,8 +1425,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         self._load_hf_weights(self._without_tied_embedding_aliases(policy_weights))
+        if coverage is not None:
+            coverage.record_loaded(policy_input_names)
         # Eagle3 draft weights are exported with the `draft.` prefix.
-        self._load_draft_weights(draft_weights)
+        if self._draft_runtime_adapter is None:
+            draft_loaded = self._load_draft_weights(draft_weights)
+        else:
+            draft_loaded = self._load_draft_weights(
+                draft_weights, runtime_adapter=self._draft_runtime_adapter
+            )
+        if coverage is not None and draft_input_names:
+            if draft_loaded:
+                coverage.record_loaded(draft_input_names)
+            else:
+                coverage.record_owner_skip(draft_input_names, component="draft")
         # MTP drafters co-trained with the policy receive their weights from the
         # policy stream (no `draft.` prefix), so feed it the policy weights too.
         self._maybe_refit_mtp_drafter(policy_weights)
@@ -1612,6 +1681,27 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "a co-trained MTP drafter"
             )
 
+        self._reject_native_refit_of_trtllm_moe_draft()
+
+    def _reject_native_refit_of_trtllm_moe_draft(self) -> None:
+        # Dense drafters sit outside the layerwise reload targets and take the
+        # regular post-load pass in finalize. A TRTLLM MoE drafter would need
+        # its own layerwise reload.
+        manifest = self._model_update_manifest
+        adapter = self._draft_runtime_adapter
+        if (
+            self._uses_unquantized_flashinfer_trtllm()
+            and manifest is not None
+            and manifest.draft is not None
+            and adapter is not None
+            and adapter.model is not None
+            and _model_uses_unquantized_flashinfer_trtllm(adapter.model)
+        ):
+            raise RuntimeError(
+                "Unquantized FlashInfer TRTLLM refit does not yet support "
+                "a co-trained draft model with TRTLLM MoE layers"
+            )
+
     def _reject_unsupported_native_refit(
         self, transport: UnsupportedNativeRefitTransport
     ) -> None:
@@ -1628,6 +1718,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 f"{label} refit does not support DeepSeek V4 FP8 because it "
                 "bypasses the model's prepare/finalize refit hooks. Use IPC "
                 "or collective refit with refit_with_reload_api=False."
+            )
+        manifest = self._model_update_manifest
+        if manifest is not None and manifest.draft is not None:
+            raise RuntimeError(
+                f"{label} refit does not support co-trained draft weights: the "
+                "drafter would skip process_weights_after_loading and the "
+                "refit completeness check. Use IPC or collective refit."
             )
 
     @contextmanager
@@ -1652,6 +1749,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             from vllm.model_executor.model_loader.reload import (
                 finalize_layerwise_reload,
                 initialize_layerwise_reload,
+            )
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
             )
 
             model = self.model_runner.model
@@ -1679,6 +1779,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             model, reloaded_module_ids
                         )
                     _refresh_hpc_modules_after_layerwise_reload(model)
+                    self._maybe_process_draft_after_loading(
+                        process_weights_after_loading
+                    )
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
 
@@ -1706,25 +1809,75 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             process_weights_after_loading,
         )
 
+        if self._refit_unusable_reason is not None:
+            # A full refit replaces every weight, so retry instead of failing:
+            # the refit recovery path reuses these actors after an abort.
+            logger.warning(
+                "Retrying refit on a worker that holds partial weights: %s",
+                self._refit_unusable_reason,
+            )
+
         def finalize() -> None:
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
                     self.model_runner.model, self.model_config, self.device
                 )
+                self._maybe_process_draft_after_loading(process_weights_after_loading)
             self._maybe_process_mtp_drafter_after_loading()
 
         from nemo_rl.models.generation.vllm.quantization import fp8
 
-        if fp8.is_fp8_model(self.model_runner.vllm_config):
-            fp8.prepare_fp8_linear_refit(self.model_runner.model)
-        yield finalize
-        # KV-cache scales are covered by the full process_weights_after_loading
-        # pass in finalize(); no second pass is needed.
+        try:
+            if fp8.is_fp8_model(self.model_runner.vllm_config):
+                fp8.prepare_fp8_linear_refit(self.model_runner.model)
+            yield finalize
+            # KV-cache scales are covered by the full process_weights_after_loading
+            # pass in finalize(); no second pass is needed.
+        except BaseException as error:
+            self._mark_refit_unusable(error)
+            raise
+        self._refit_unusable_reason = None
+
+    def _new_model_update_coverage(self) -> ModelUpdateCoverage | None:
+        manifest = self._model_update_manifest
+        if manifest is None:
+            return None
+        pp_rank = int(getattr(get_pp_group(), "rank_in_group", 0))
+        return ModelUpdateCoverage(manifest, rank=pp_rank)
+
+    def _maybe_process_draft_after_loading(
+        self, process_weights_after_loading: Callable[[Any, Any, Any], None]
+    ) -> None:
+        manifest = self._model_update_manifest
+        adapter = self._draft_runtime_adapter
+        if manifest is None or manifest.draft is None or adapter is None:
+            return
+        if not adapter.is_owner:
+            return
+        draft_model_config = (
+            self.model_runner.vllm_config.speculative_config.draft_model_config
+        )
+        process_weights_after_loading(adapter.model, draft_model_config, self.device)
+
+    def _mark_refit_unusable(self, error: BaseException) -> None:
+        reason = f"{type(error).__name__}: {error}"
+        self._refit_unusable_reason = reason
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
         return self._uses_unquantized_flashinfer_trtllm() or (
             self._nrl_layerwise_reload_failure is not None
+        )
+
+    def _weight_update_error_must_raise(self, error: BaseException) -> bool:
+        """Whether a transport error must propagate instead of returning False.
+
+        ``SpeculatorRuntimeError`` carries the speculator type, vLLM version,
+        and missing keys; a bare ``False`` would hide that from the driver.
+        """
+        return (
+            isinstance(error, SpeculatorRuntimeError)
+            or self._weight_update_errors_are_fatal()
         )
 
     def _synchronize_before_ipc_data_ack(self) -> None:
@@ -1889,7 +2042,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            if self._weight_update_errors_are_fatal():
+            if self._weight_update_error_must_raise(e):
                 raise
             logger.exception(
                 "Error in native IPC reload for VllmInternalWorkerExtension: %s",
@@ -1917,6 +2070,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         try:
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
+            # Native LoRA refit ships adapter tensors only, so full-model
+            # coverage does not apply.
+            coverage = None if native_lora_refit else self._new_model_update_coverage()
             noop_finalize: WeightUpdateFinalizer = lambda: None
             lifecycle = (
                 nullcontext[WeightUpdateFinalizer](noop_finalize)
@@ -1933,6 +2089,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         # fails, otherwise the sender remains blocked until timeout.
                         try:
                             manifest.require_complete()
+                            if coverage is not None:
+                                coverage.require_complete()
                             if native_lora_refit:
                                 self._install_native_lora(native_lora_tensors)
                             else:
@@ -1976,7 +2134,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         if native_lora_refit:
                             collect_native_lora(native_lora_tensors, weights)
                         else:
-                            self._load_weights(weights)
+                            self._load_weights(weights, coverage=coverage)
                     except Exception as error:
                         batch_error = error
                         # The manifest only keeps the exception message; log
@@ -2015,7 +2173,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            if native_lora_refit or self._weight_update_errors_are_fatal():
+            if native_lora_refit or self._weight_update_error_must_raise(e):
                 raise
             logger.exception(
                 "Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: %s",
@@ -2047,14 +2205,22 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             hold_refit_for_fault_injection,
         )
 
+        aborted = (
+            f"refit receive exceeded {refit_timeout_s}s and was aborted; "
+            "this engine now holds partial weights and must not serve until refit"
+        )
         with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
             hold_refit_for_fault_injection()
-            result = self._update_weights_from_collective(refit_with_reload_api)
+            try:
+                result = self._update_weights_from_collective(refit_with_reload_api)
+            except SpeculatorRuntimeError as error:
+                # An aborted broadcast leaves survivors with missing keys; the
+                # abort, not the coverage gap, is the recoverable root cause.
+                if guard.fired:
+                    raise RefitAborted(aborted) from error
+                raise
         if guard.fired:
-            raise RefitAborted(
-                f"refit receive exceeded {refit_timeout_s}s and was aborted; "
-                "this engine now holds partial weights and must not serve until refit"
-            )
+            raise RefitAborted(aborted)
         return result
 
     def _update_weights_from_collective(self, refit_with_reload_api: bool) -> bool:
@@ -2115,22 +2281,30 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         if close_weight_iterator is not None:
                             close_weight_iterator()
             else:
+                coverage = self._new_model_update_coverage()
                 native_layerwise_refit = self._uses_native_layerwise_refit("collective")
                 with self._weight_update_lifecycle("collective") as finalize:
+                    load_weights = self._load_weights
+                    if coverage is not None:
+                        load_weights = lambda weights: self._load_weights(
+                            weights, coverage=coverage
+                        )
                     packed_broadcast_consumer(
                         iterator=iter(self.state_dict_info.items()),
                         group=self.model_update_group,
                         src=0,
-                        post_unpack_func=self._load_weights,
+                        post_unpack_func=load_weights,
                         # Double buffering (num_buffers > 1) causes a race condition
                         # when using native_layerwise_refit: deferred weight_loader
                         # replays may read a buffer while the other stream refills it.
                         num_buffers=1 if native_layerwise_refit else None,
                     )
+                    if coverage is not None:
+                        coverage.require_complete()
                     finalize()
 
         except Exception as e:
-            if native_lora_refit or self._weight_update_errors_are_fatal():
+            if native_lora_refit or self._weight_update_error_must_raise(e):
                 raise
             logger.exception(
                 "Error in VllmInternalWorkerExtension.update_weights_from_collective: %s",
@@ -2524,16 +2698,30 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             *(self.pp_comm_groups or {}).values(),
             self.model_update_group,
         ]
+        aborted = (
+            f"refit nccl_reshard receive exceeded {refit_timeout_s}s and was "
+            "aborted; this engine now holds partial weights and must not serve "
+            "until refit"
+        )
         with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
             hold_refit_for_fault_injection()
-            with self._weight_update_lifecycle("nccl_reshard") as finalize:
-                result = self._nccl_reshard_refit_impl(finalize)
+            try:
+                with self._weight_update_lifecycle("nccl_reshard") as finalize:
+                    result = self._nccl_reshard_refit_impl(finalize)
+            except Exception as error:
+                if guard.fired:
+                    raise RefitAborted(aborted) from error
+                if self._weight_update_error_must_raise(error):
+                    raise
+                logger.exception(
+                    "Error in VllmInternalWorkerExtension.nccl_reshard_refit: %s",
+                    error,
+                )
+                result = False
+        # Checked after the guard exits, so an abort that lands while a nonfatal
+        # error is logged still reports as RefitAborted.
         if guard.fired:
-            raise RefitAborted(
-                f"refit nccl_reshard receive exceeded {refit_timeout_s}s and was "
-                "aborted; this engine now holds partial weights and must not serve "
-                "until refit"
-            )
+            raise RefitAborted(aborted)
         return result
 
     def _nccl_reshard_refit_impl(self, finalize: WeightUpdateFinalizer) -> bool:
