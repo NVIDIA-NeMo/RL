@@ -135,9 +135,11 @@ automodel = [
   "torch==2.11.0",
   "torchvision==0.26.0",
   "nemo-automodel[moe]",
-  # Automodel's FLA kernels require this TileLang version on Hopper.
-  # Keep this scoped to the automodel fork; vLLM requires TileLang 0.1.12.
-  "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # Automodel's FLA kernels require this TileLang version on Hopper, and
+  # tile-kernels 1.0.0 (V4.1 Sinkhorn) cannot import with TileLang 0.1.12
+  # (deepseek-ai/TileKernels#24). Keep this scoped to the automodel fork;
+  # vLLM requires TileLang 0.1.12.
+  "tilelang==0.1.11; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -159,15 +161,17 @@ vllm = [
   "transformers==5.15.1",
   "tilelang==0.1.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
+  # No external deep_gemm: vLLM imports a site-packages deep_gemm before its
+  # vendored copy (DeepGEMM 8b1392b, built against the wheel's torch), and the
+  # V4.1 SM100 indexer needs the vendored copy's 128-token KV blocks.
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  # Nightly wheels for tag v0.29.1rc0, commit 7ee8a6dd013819838da8012ca549d724bee7c6c6.
-  # Upstream wheel metadata reports 0.1.1.dev75+g7ee8a6dd0; pin by commit URL.
-  "vllm @ https://wheels.vllm.ai/7ee8a6dd013819838da8012ca549d724bee7c6c6/vllm-0.1.1.dev75%2Bg7ee8a6dd0-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "vllm @ https://wheels.vllm.ai/7ee8a6dd013819838da8012ca549d724bee7c6c6/vllm-0.1.1.dev75%2Bg7ee8a6dd0-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # Nightly wheels for main commit 000c7df9ffd3e470980fd4cd6b8ec1b0585500ff, the
+  # vLLM used by the end-to-end DeepSeek V4.1 Flash validation. Pin by commit URL.
+  "vllm @ https://wheels.vllm.ai/000c7df9ffd3e470980fd4cd6b8ec1b0585500ff/vllm-0.29.1rc1.dev133%2Bg000c7df9f-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "vllm @ https://wheels.vllm.ai/000c7df9ffd3e470980fd4cd6b8ec1b0585500ff/vllm-0.29.1rc1.dev133%2Bg000c7df9f-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.18.post1",
   "flashinfer-cubin==0.6.18.post1",
@@ -391,7 +395,6 @@ no-build-isolation-package = [
   "mamba-ssm",
   "causal-conv1d",
   "fast-hadamard-transform",
-  "deep_gemm",
   "deep_ep",
   "flash_mla",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
@@ -504,10 +507,10 @@ constraint-dependencies = [
   "opencv-python-headless>=5.0.0",            # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
 ]
 
-# Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
-# and libs-cu13 wheels overlap and race on shared paths. libs-cu13 is a
-# functional superset at 4.5.2, so drop libs-base to make installs deterministic.
-exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
+# NOTE: do not exclude `nvidia-cutlass-dsl-libs-base` again. The 4.5.x workaround for
+# https://github.com/NVIDIA/cutlass/issues/3259 is obsolete: since 4.6 libs-base ships
+# the Python `cutlass` DSL (`cutlass.cute`, ...) and libs-cu13 only the CUDA-13
+# extension. vLLM's V4.1 indexer imports `cutlass.cute` on Blackwell.
 
 conflicts = [
   [{ extra = "fsdp" }, { extra = "sglang" }],
@@ -542,7 +545,6 @@ conflicts = [
 flash-attn = [{ requirement = "torch", match-runtime = true }]
 # Git-sourced packages CAN use match-runtime = true if we provide dependency-metadata
 deep_ep = [{ requirement = "torch", match-runtime = true }]
-deep_gemm = [{ requirement = "torch", match-runtime = true }]
 transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
@@ -587,12 +589,6 @@ requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
 version = "1.2.1+17cfb81"
-requires-dist = ["torch", "packaging", "ninja"]
-
-[[tool.uv.dependency-metadata]]
-name = "deep_gemm"
-# This version has to match the version in the commit/rev/tag used
-version = "2.5.0"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]

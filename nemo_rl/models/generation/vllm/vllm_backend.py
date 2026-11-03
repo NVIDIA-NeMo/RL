@@ -289,6 +289,14 @@ def _filter_gemma4_unified_multimodal_weights(
     )
 
 
+def _has_deepseek_v41_visual_router_bias(model: torch.nn.Module) -> bool:
+    """Return whether vLLM allocated DeepSeek v4.1's visual router bias.
+
+    vLLM creates ``ffn.gate.bias_vl`` only when ``vision_n_layers > 0``.
+    """
+    return any(name.endswith(".gate.bias_vl") for name, _ in model.named_parameters())
+
+
 def _read_mtp_layer_weights_from_checkpoint(
     model_path: str, mtp_layer_indices: set[int]
 ) -> list[tuple[str, torch.Tensor]]:
@@ -955,8 +963,15 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             # Refit both the values and row/32 scales from the trained table.
             from nemo_rl.models.generation.vllm.engram_refit import load_engram_rows
 
+            # The policy keeps the checkpoint's visual router bias, which only
+            # routes image tokens. Text-only vLLM has no such parameter.
+            drop_visual_router_bias = not _has_deepseek_v41_visual_router_bias(
+                self.model_runner.model
+            )
             converted_weights = []
             for key, weight in weights:
+                if drop_visual_router_bias and key.endswith(".ffn.gate.bias_vl"):
+                    continue
                 if load_engram_rows(self.model_runner.model, key, weight):
                     continue
                 if key.endswith(".engram.embed.weight"):

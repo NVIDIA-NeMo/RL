@@ -2073,6 +2073,47 @@ def test_gemma4_refit_drops_multimodal_weights_only_for_unified_text_generation(
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("vllm_has_visual_bias", [False, True])
+def test_deepseek_v41_refit_drops_visual_router_bias_only_without_vllm_param(
+    monkeypatch, vllm_has_visual_bias
+):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    params = [("layers.0.ffn.gate.bias", None)]
+    if vllm_has_visual_bias:
+        params.append(("layers.0.ffn.gate.bias_vl", None))
+    loaded = []
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            load_weights=lambda *, weights: loaded.extend(weights),
+            named_parameters=lambda: iter(params),
+        ),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"]),
+            quant_config=None,
+        ),
+    )
+    ext._load_draft_weights = MagicMock()
+    ext._maybe_refit_mtp_drafter = MagicMock()
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+    weights = [
+        ("layers.0.ffn.gate.bias", torch.zeros(4)),
+        ("layers.0.ffn.gate.bias_vl", torch.zeros(4)),
+    ]
+
+    ext._load_weights(weights)
+
+    assert [key for key, _ in loaded] == [
+        "layers.0.ffn.gate.bias",
+        *(["layers.0.ffn.gate.bias_vl"] if vllm_has_visual_bias else []),
+    ]
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     ("architecture", "language_model_only", "expected_keys"),
     [
