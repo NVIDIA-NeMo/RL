@@ -25,7 +25,7 @@ import threading
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import AsyncGenerator, Awaitable, Iterator, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Collection, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -3492,9 +3492,26 @@ def spinup_nemo_gym_actor(
     ).sole_handle()
 
 
+def scan_dataset_agent_names(datasets: Mapping[str, Any]) -> dict[str, set[str]]:
+    """Collect the route names each split's rows reference.
+
+    This needs only the datasets, not the running Gym actors, so a caller can run
+    it while the actors are still starting and hand the result to
+    ``validate_dataset_agent_coverage``.
+
+    Args:
+        datasets: Split name to dataset. ``None`` values yield an empty set.
+
+    Returns:
+        Split name to the agent or task-source names its rows reference.
+    """
+    return {split: _iter_dataset_agent_names(ds) for split, ds in datasets.items()}
+
+
 def validate_dataset_agent_coverage(
     shard_set: NemoGymShardSet,
     datasets: Mapping[str, Any],
+    agent_names: Mapping[str, Collection[str]] | None = None,
 ) -> None:
     """Fail at setup if any row names a route no shard hosts.
 
@@ -3513,6 +3530,8 @@ def validate_dataset_agent_coverage(
             built at setup; an unsharded set is asked for its entries here.
         datasets: Split name to dataset, for the error message. ``None`` values
             and datasets without gym rows are skipped.
+        agent_names: Optional result of ``scan_dataset_agent_names`` for these
+            datasets. A split missing from it is scanned here.
 
     Raises:
         ShardSetupError: A split references routes no shard hosts.
@@ -3525,7 +3544,11 @@ def validate_dataset_agent_coverage(
         entries = ray.get(shard_set.all_handles[0].list_entries.remote())
         hosted = frozenset(build_route_shard_map({DEFAULT_SHARD_NAME: entries}))
     for split, dataset in datasets.items():
-        unhosted = sorted(_iter_dataset_agent_names(dataset) - hosted)
+        if agent_names is not None and split in agent_names:
+            referenced = set(agent_names[split])
+        else:
+            referenced = _iter_dataset_agent_names(dataset)
+        unhosted = sorted(referenced - hosted)
         if unhosted:
             raise ShardSetupError(
                 f"The {split} dataset references routes that no shard hosts: "

@@ -1763,6 +1763,59 @@ def test_an_agent_no_shard_hosts_is_caught_before_the_first_step():
     assert "['alpha']" in str(excinfo.value)
 
 
+class _ExplodingDataset:
+    """A dataset that fails the test if anything reads its rows."""
+
+    def __iter__(self):
+        raise AssertionError("the dataset was scanned again")
+
+
+def test_scan_collects_names_per_split_without_gym_actors():
+    scanned = nemo_gym_mod.scan_dataset_agent_names(
+        {"train": _gym_dataset("alpha", "beta", "alpha"), "validation": None}
+    )
+
+    assert scanned == {"train": {"alpha", "beta"}, "validation": set()}
+
+
+def test_validation_reuses_a_scan_taken_before_the_actors_were_up():
+    shard_set = _sharded_set({"alpha": "left", "beta": "right"})
+
+    # Passing means no second read of the dataset, which is the point of scanning
+    # while the actors build.
+    nemo_gym_mod.validate_dataset_agent_coverage(
+        shard_set,
+        {"train": _ExplodingDataset()},
+        agent_names={"train": {"alpha", "beta"}},
+    )
+
+
+def test_a_prescanned_unhosted_agent_is_still_caught():
+    shard_set = _sharded_set({"alpha": "left"})
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError) as excinfo:
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set,
+            {"train": _ExplodingDataset(), "validation": _ExplodingDataset()},
+            agent_names={"train": {"alpha"}, "validation": {"ghost"}},
+        )
+
+    assert "validation" in str(excinfo.value)
+    assert "['ghost']" in str(excinfo.value)
+    assert "['alpha']" in str(excinfo.value)
+
+
+def test_a_split_missing_from_the_prescan_is_scanned_at_validation():
+    shard_set = _sharded_set({"alpha": "left"})
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="ghost"):
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set,
+            {"train": _gym_dataset("alpha"), "validation": _gym_dataset("ghost")},
+            agent_names={"train": {"alpha"}},
+        )
+
+
 def test_a_fully_hosted_dataset_passes():
     shard_set = _sharded_set({"alpha": "left", "beta": "right"})
 
