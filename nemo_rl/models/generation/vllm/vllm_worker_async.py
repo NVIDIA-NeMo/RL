@@ -77,7 +77,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_token_information_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
     format_prompt_for_vllm_generation,
-    off_policy_sampling_error,
+    check_sampling_param,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
     remap_multimodal_placeholders,
@@ -1635,17 +1635,13 @@ class VllmAsyncGenerationWorkerImpl(
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
-            # The request sampling params need to exactly match those as are set in NeMo RL.
-            # If they do not match, the inference will be off policy and destroy training
-            # stability. grpo.validate() is the only caller that constructs a non-train
-            # GenerationSamplingParams, and the validation profile it stamps is accepted.
-            sampling_error = off_policy_sampling_error(
+            # Accept train and validation profiles; reject off-policy requests.
+            check_sampling_param(
                 temperature=request.temperature,
                 top_p=request.top_p,
                 top_k=request.top_k,
                 generation_config=generation_config,
             )
-            assert sampling_error is None, sampling_error
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
             request.top_k = -1
 
@@ -2007,9 +2003,6 @@ class VllmAsyncGenerationWorkerImpl(
     ) -> tuple[RolloutResult, Optional[Any]]:
         """Serve one rollout from this engine: its budget, sampling, generation and result.
 
-        Every path that serves a rollout from this engine calls this, so a rollout
-        step added here runs on all of them.
-
         Args:
             prompt: The vLLM prompt to generate from.
             prompt_token_ids: The learner's prompt tokens, which vLLM must have run.
@@ -2021,6 +2014,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         Returns:
             The result, and vLLM's final RequestOutput (None when no new token fits).
+            The final output supplies finish and usage metadata to Dynamo in PR #4905.
         """
         max_new_tokens = self._rollout_max_new_tokens(len(prompt_token_ids))
         if max_new_tokens == 0:
