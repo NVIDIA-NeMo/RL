@@ -72,6 +72,13 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointPrepareSummary,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_harnesses import (
+    HarnessRoute,
+    attribute_harness_result,
+    parse_harness_pool,
+    resolve_harness_pool,
+    route_harness_rows,
+)
 from nemo_rl.environments.nemo_gym_multimodal import (
     _has_image_before_first_trainable_output,
     _index_per_turn_images,
@@ -718,6 +725,8 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # Ordered typed Environment instances; consumed by RL, not Gym global config.
+    harness_pool: NotRequired[list[str] | None]
     # Internal checkpoint topology. These are derived by the actor builder,
     # never read from user YAML.
     checkpoint_instance: GymCheckpointInstance
@@ -1142,6 +1151,7 @@ class NemoGym(EnvironmentInterface):
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
+        self._harness_routes: tuple[HarnessRoute, ...] = ()
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -1352,8 +1362,29 @@ Depending on your data shape, you may want to change these values."""
         )
 
         try:
+            harness_pool = self.cfg.get("harness_pool")
+            if harness_pool is not None:
+                # Resolve after Gym expands config_paths, before accepting any rollout.
+                from nemo_gym.global_config import get_global_config_dict
+                from omegaconf import OmegaConf
+
+                resolved = OmegaConf.to_container(
+                    get_global_config_dict(), resolve=True
+                )
+                if not isinstance(resolved, dict):
+                    raise ValueError("Gym global configuration must be a mapping")
+                resolved_config: dict[str, Any] = {}
+                for key, value in resolved.items():
+                    if not isinstance(key, str):
+                        raise ValueError(
+                            "Gym global configuration keys must be strings"
+                        )
+                    resolved_config[key] = value
+                self._harness_routes = resolve_harness_pool(
+                    harness_pool, resolved_config
+                )
             _wait_for_external_services(self.cfg.get("external_service_readiness"))
-        except TimeoutError:
+        except (TimeoutError, ValueError, TypeError):
             # RunHelper.start() has already spawned local Gym services. Do not
             # leave them behind when an external dependency misses its deadline.
             # Clear the handle first, as shutdown() does: the caller's teardown
@@ -1755,12 +1786,22 @@ Depending on your data shape, you may want to change these values."""
 
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
 
+        if self.cfg.get("harness_pool") is not None:
+            if not self._token_capture_enabled:
+                raise ValueError("harness_pool requires SingleController token capture")
+            route_harness_rows(nemo_gym_examples, self._harness_routes)
+
         # Normalize local media before shipping requests to vLLM. Helper is a no-op
         # for text-only rows and already-qualified URLs.
         # Megatron's HTTP backend consumes the same normalized Responses payload.
         normalize_media_in_examples(nemo_gym_examples)
 
-        if any(is_nemo_gym_task(row) for row in nemo_gym_examples):
+        # Pool routing has already selected each episode's destination and
+        # requires a controller-owned capture ID. Taskset routing must not
+        # overwrite those per-completion choices with one server for the group.
+        if self.cfg.get("harness_pool") is None and any(
+            is_nemo_gym_task(row) for row in nemo_gym_examples
+        ):
             _prepare_materialized_nemo_gym_rows(
                 nemo_gym_examples,
                 self.list_environment_server_routes(),
@@ -1776,12 +1817,7 @@ Depending on your data shape, you may want to change these values."""
             **({"retry_requests": False} if self._forest_training else {}),
             route_failures_to_sidecar=True,
         )
-        # Gym resolves task_source to agent_ref synchronously in run_examples().
-        # Build the counter afterward so completion rows use the resolved identity.
-        _require_resolved_agent_refs(nemo_gym_examples)
-        counts_left: Counter[str | None] = Counter(
-            get_nemo_gym_attribution_key(row) for row in nemo_gym_examples
-        )
+        counts_left: Counter[str | None] = Counter()
 
         num_results = 0
 
@@ -1843,6 +1879,8 @@ Depending on your data shape, you may want to change these values."""
                         nemo_gym_result,
                         token_capture_enabled=capture_mode,
                     )
+                    if self.cfg.get("harness_pool") is not None:
+                        result = attribute_harness_result(nemo_gym_row, result)
                 except (GymTransportError, RolloutDataFailure) as error:
                     return nemo_gym_row, error
                 return nemo_gym_row, result
@@ -1882,6 +1920,11 @@ Depending on your data shape, you may want to change these values."""
 
         capture_tasks: list[asyncio.Task[tuple[dict, dict]]] = []
         try:
+            # Gym resolves task_source synchronously when dispatching the batch.
+            _require_resolved_agent_refs(nemo_gym_examples)
+            counts_left.update(
+                get_nemo_gym_attribution_key(row) for row in nemo_gym_examples
+            )
             result_iterator: Iterator[Awaitable[tuple[dict, dict]]] = (
                 await_gym_result(task) for task in nemo_gym_result_iterator
             )
@@ -1930,6 +1973,7 @@ Depending on your data shape, you may want to change these values."""
                     nemo_gym_row["_rowidx"],
                     None
                     if is_nemo_gym_task(nemo_gym_row)
+                    and self.cfg.get("harness_pool") is None
                     else nemo_gym_row["agent_ref"],
                     nemo_rl_result,
                     timing_metrics,
@@ -1939,6 +1983,7 @@ Depending on your data shape, you may want to change these values."""
                 task.cancel()
             if capture_tasks:
                 await asyncio.gather(*capture_tasks, return_exceptions=True)
+            if capture_tasks or self.cfg.get("harness_pool") is not None:
                 # Older Gym returns a plain iterator; newer versions expose
                 # client-task cleanup. Neither acknowledges server-side writes.
                 close = getattr(nemo_gym_result_iterator, "aclose", None)
@@ -2945,6 +2990,8 @@ def build_nemo_gym_config(
     nemo_gym_dict = dict(env_configs["nemo_gym"])
 
     shard_plan = parse_shard_plan(nemo_gym_dict)
+    if shard_plan is not None and nemo_gym_dict.get("harness_pool") is not None:
+        raise ValueError("harness_pool requires one unsharded Gym actor")
     if shard_plan is not None:
         raise ShardConfigError(
             f"env.nemo_gym.shards defines {len(shard_plan.shards)} shards "
@@ -2986,6 +3033,14 @@ def _build_gym_actor_config(
     same treatment of NeMo-RL-side keys regardless of how it was composed.
     """
     nemo_gym_dict = dict(nemo_gym_dict)
+
+    harness_pool = parse_harness_pool(nemo_gym_dict.pop("harness_pool", None))
+    if harness_pool is not None and not (
+        token_capture and token_capture.get("enabled")
+    ):
+        raise ValueError(
+            "harness_pool requires SingleController with token_capture.enabled=true"
+        )
 
     # NeMo-RL-only keys are consumed here and must never reach Gym: the merged
     # config is serialized into every Gym child process, and unrecognized
@@ -3082,6 +3137,7 @@ def _build_gym_actor_config(
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=instance_token_capture,
+        harness_pool=harness_pool,
         checkpoint_instance=checkpoint_instance,
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         **port_range,
@@ -3400,6 +3456,8 @@ def build_nemo_gym_actors(
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
     plan = parse_shard_plan(nemo_gym_dict)
+    if plan is not None and nemo_gym_dict.get("harness_pool") is not None:
+        raise ValueError("harness_pool requires one unsharded Gym actor")
 
     if plan is None:
         return _build_single_gym_actor(

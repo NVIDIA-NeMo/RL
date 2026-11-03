@@ -116,7 +116,14 @@ def capture_segment(harness, scope, *, child=False):
     return {"scope": scope, "manifest": manifest, "ids": ids, "output": output}
 
 
-def finalize(finalizer, owners, *, execution_row_multiple=1, mask_sample=None):
+def finalize(
+    finalizer,
+    owners,
+    *,
+    execution_row_multiple=1,
+    mask_sample=None,
+    resolved_agent_names: list[str] | None = None,
+):
     receipts, selections = [], []
     for chunks in owners:
         manifest = chunks[-1]["manifest"]
@@ -150,6 +157,7 @@ def finalize(finalizer, owners, *, execution_row_multiple=1, mask_sample=None):
         canonical_sample_ids=[f"group_g{i}" for i in range(len(owners))],
         logical_selections=selections,
         execution_row_multiple=execution_row_multiple,
+        resolved_agent_names=resolved_agent_names,
     )
 
 
@@ -183,10 +191,16 @@ def test_selected_roots_publish_in_order_and_cleanup_exact_attempt(
         ),
         [[first], [sibling]],
         execution_row_multiple=padding,
+        resolved_agent_names=["opencode_agent", "pi_agent"],
     )
     assert result.valid_row_count == 2
     assert result.meta.sample_ids[:2] == ["group_g0_s0", "group_g1_s0"]
     assert len(result.meta.sample_ids) == (4 if padding == 4 else 2)
+    assert [tag.get("agent_name") for tag in result.meta.tags] == [
+        "opencode_agent",
+        "pi_agent",
+        *([None, None] if padding == 4 else []),
+    ]
     assert plane.rows["canonical", "group_g0_s0"]["input_ids"].tolist() == [
         [10, 11, 1001, 20, 21, 1002]
     ]

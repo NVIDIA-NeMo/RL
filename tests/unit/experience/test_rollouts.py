@@ -2868,6 +2868,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._harness_pool = None
     manager._dispatch_admission_gate = DataPlaneCheckpointBarrier()
     manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
@@ -2925,6 +2926,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
 
 def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._harness_pool = None
     manager.set_next_nemo_gym_task_index(0)
     manager._dispatch_admission_gate = None
     manager._num_generations_per_prompt = 2
@@ -3012,6 +3014,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._harness_pool = None
     manager._dispatch_admission_gate = None
     manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
@@ -3098,6 +3101,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
     first, second = object(), object()
     selected = []
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._harness_pool = None
     manager._dispatch_admission_gate = None
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
@@ -3202,6 +3206,7 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
             return _FailedStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._harness_pool = None
     manager._dispatch_admission_gate = None
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
@@ -3501,6 +3506,7 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
     first, second = object(), object()
     selected = []
     impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._harness_pool = None
     impl._dispatch_admission_gate = None
     impl._timeouts = RolloutTimeouts()
     impl._max_gym_row_attempts = 1
