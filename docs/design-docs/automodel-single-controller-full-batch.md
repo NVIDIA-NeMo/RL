@@ -197,51 +197,64 @@ selection remain controller concerns. Packing/dynamic batching need a distinct
 row-count/participation contract. Broader parallelism and model features receive
 capability-specific tests rather than dense-versus-MoE implementations.
 
-## Matched 100-update training curves
+## Matched training curves
 
-The following figures show dense and MoE training behavior using the Gemma4
-E2B IT and Qwen3.5-35B-A3B Base EP=16 recipes above. Each figure covers 100
-updates and links to the corresponding V1 and SC runs.
+The following figures compare V1 and full-batch SC on Gemma4 E2B IT and
+Qwen3.5-35B-A3B Base. The paired configurations use the same model, optimizer,
+seed 42, and sampling settings. SC uses full-batch dispatch, in-order sampling,
+and lookahead zero. V1 uses legacy Ray data transport; SC uses TQ.
 
-Each pair uses seed 42, global batch size 32, microbatch size 1, and matched
-model, optimizer, and sampling settings. SC uses full-batch dispatch, in-order
-sampling, and lookahead zero. V1 uses legacy Ray data transport; SC uses TQ.
-Rollouts are sampled independently, so the curves describe training behavior
-rather than exact numerical parity or a statistically established quality
-difference. Identical-input worker replay provides the separate numerical
-equivalence evidence.
+| Model | Plotted updates | Prompts × responses per prompt | Global batch | Microbatch |
+| --- | ---: | ---: | ---: | ---: |
+| Gemma4 E2B IT | 1–150 | 32 × 16 | 512 | 1 |
+| Qwen3.5-35B-A3B Base, EP=16 | 1–300 | 8 × 4 | 32 | 1 |
+
+Both comparisons use a 4,096-token total sequence limit and at most 2,048
+generated tokens. Dynamic sampling and reward shaping are disabled. Rollouts
+are sampled independently, so these curves describe training behavior for one
+seed; they do not establish exact numerical parity or statistical quality
+equivalence. Identical-input worker replay provides the separate numerical
+equivalence evidence. These runs do not include held-out evaluation.
 
 All five panels use the original NeMo RL metric names: `train/reward`,
 `train/mean_gen_tokens_per_sample`, `train/loss`, `train/gen_kl_error`, and
-`train/approx_entropy`. Every metric has 100 finite values per run. Plotted
-values come from the complete exported W&B histories and were checked against
-the native TensorBoard records. Faint lines show every raw update; solid lines
-show trailing 10-update means, starting at update 10. No updates are removed.
+`train/approx_entropy`. The figures use native training scalar records. Each
+panel includes every update in its stated window, with no nonfinite values or
+removed outliers. Faint lines show raw values; solid lines show trailing
+10-update means, starting at update 10. The logged metrics retain the configured
+sample masking behavior.
 
-### Gemma4 E2B IT
+### Gemma4 E2B IT: batch 512, 150 updates
 
-Each run uses four training and four rollout H100 GPUs, with EP=1.
-[V1 run](https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/cf9668ea) and
-[SC run](https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/afadd4ca).
+Each run uses four training and four rollout H100 GPUs, with EP=1. The figure
+uses the shared first 150 updates of the larger-batch comparison. Mean reward
+increases from 0.3653 in updates 1–50 for both paths to 0.4494 for V1 and 0.4452
+for SC in updates 101–150.
 
-![Gemma4 E2B IT: V1 versus full-batch SC over 100 updates, showing reward, mean generated tokens per sample, loss, generation KL error, and approximate entropy.](../assets/automodel-sc/gemma4-e2b-v1-vs-sc-100steps.png)
+To reproduce the SC batch configuration with the Gemma4 recipe above, use:
 
-### Qwen3.5-35B-A3B Base, EP=16
+```bash
+uv run examples/run_grpo_single_controller.py \
+  --config examples/configs/recipes/llm/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch.yaml \
+  grpo.num_prompts_per_step=32 \
+  grpo.num_generations_per_prompt=16 \
+  grpo.max_num_steps=150
+```
+
+Global batch size and full-batch admission capacities follow the prompt counts
+through the exemplar's interpolations. The checked-in recipe retains its smaller
+starter batch; the curves use the overrides above.
+
+![Gemma4 E2B IT at batch 512: V1 versus full-batch SC over 150 updates, showing reward, mean generated tokens per sample, loss, generation KL error, and approximate entropy.](../assets/automodel-sc/gemma4-e2b-b512-v1-vs-sc-150steps.png)
+
+### Qwen3.5-35B-A3B Base: EP=16, 300 updates
 
 Each run uses sixteen training H100 GPUs with HybridEP and eight rollout H100
-GPUs with TP=8. These histories include checkpoint/resume and contain updates
-1–100 once. SC policy-version lag stayed zero.
-[V1 run](https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/2a121400) and
-[SC run](https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/c926b37d).
+GPUs with TP=8. The histories include checkpoint/resume and contain updates
+1–300 once. Mean reward increases from 0.2919 / 0.2766 (V1 / SC) in updates
+1–100 to 0.6172 / 0.5981 in updates 201–300. The final 20-update means are
+0.6281 / 0.6219. SC policy-version lag stays zero in both model comparisons.
 
-![Qwen3.5-35B-A3B Base at EP=16: V1 versus full-batch SC over 100 updates, showing reward, mean generated tokens per sample, loss, generation KL error, and approximate entropy.](../assets/automodel-sc/qwen3.5-35ba3b-ep16-v1-vs-sc-100steps.png)
+Use the Qwen3.5 recipe above with `grpo.max_num_steps=300` for this run length.
 
-For reference, the means over all 100 updates are:
-
-| Native metric | Gemma4 V1 | Gemma4 SC | Qwen3.5 EP16 V1 | Qwen3.5 EP16 SC |
-| --- | ---: | ---: | ---: | ---: |
-| `train/reward` | 0.339375 | 0.352188 | 0.291875 | 0.276563 |
-| `train/mean_gen_tokens_per_sample` | 1734.29 | 1710.88 | 1755.90 | 1801.75 |
-| `train/loss` | 0.019315 | 0.017606 | 0.023737 | 0.021416 |
-| `train/gen_kl_error` | 0.00038688 | 0.00038830 | 0.00091623 | 0.00090550 |
-| `train/approx_entropy` | 0.177857 | 0.186579 | 0.478026 | 0.479710 |
+![Qwen3.5-35B-A3B Base at EP=16: V1 versus full-batch SC over 300 updates, showing reward, mean generated tokens per sample, loss, generation KL error, and approximate entropy.](../assets/automodel-sc/qwen3.5-35ba3b-ep16-v1-vs-sc-300steps.png)
