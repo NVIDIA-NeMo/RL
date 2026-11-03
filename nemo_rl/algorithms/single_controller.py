@@ -3047,10 +3047,15 @@ class SingleControllerActor:
         time is still recoverable as held + skipped.
 
         Returns:
-            ``(held_s, idle_skipped_s)``; both zero outside a simulator run.
+            ``(held_s, idle_skipped_s)``; both zero unless the cpu trainer
+            stands in for the train step.
         """
         settings = self._simulator
-        if settings is None or settings.train_time_s <= 0:
+        if (
+            settings is None
+            or not settings.uses_cpu_trainer
+            or settings.train_time_s <= 0
+        ):
             return 0.0, 0.0
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -4016,7 +4021,7 @@ class SingleControllerActor:
                         "promoted_prompt_groups": promoted_prompt_groups,
                     }
                 )
-                if self._simulator is not None:
+                if self._simulator is not None and self._simulator.uses_cpu_trainer:
                     # Where policy.train() would have run, and how much of that
                     # hold was skipped because no rollout was left to overlap with.
                     step_metrics.update(

@@ -154,6 +154,10 @@ def apply_simulator_overrides(
         rollout-only run serves generation, so the generation resources and
         ``cluster.num_nodes`` are the same number.
       - ``data.validation``: there is no validation pass without a trainer.
+      - ``policy.generation.vllm_cfg.load_format`` defaults to ``auto``: the
+        engine serves the checkpoint, since no refit follows to replace the
+        ``dummy`` weights a training run starts from. An explicit ``dummy`` is
+        rejected by :func:`validate_simulator_config`.
       - ``env.nemo_gym.is_trajectory_collection``: a NeMo-RL control-flow knob
         that run_grpo_nemo_gym.py pops before setup so it never reaches Gym's
         global config.
@@ -178,6 +182,11 @@ def apply_simulator_overrides(
             colocated["resources"]["num_nodes"] = settings.num_nodes
         raw_config["cluster"]["num_nodes"] = settings.num_nodes
     raw_config["data"]["validation"] = None
+    generation = raw_config["policy"]["generation"]
+    if generation["backend"] in ("vllm", "dynamo") and "vllm_cfg" in generation:
+        # Where configure_generation_config would default a training run to
+        # "dummy" (the first refit fills the weights in), there is no refit here.
+        generation["vllm_cfg"].setdefault("load_format", "auto")
     nemo_gym = raw_config["env"].get("nemo_gym")
     if isinstance(nemo_gym, dict):
         nemo_gym.pop("is_trajectory_collection", None)
@@ -244,6 +253,13 @@ def validate_simulator_config(
             "lifecycle this run drives."
         )
     reject_online_quantization(master_config.policy["generation"])
+    if generation_config["vllm_cfg"].get("load_format") == "dummy":
+        raise ValueError(
+            "rollout_only cannot run with vllm_cfg.load_format='dummy': no refit "
+            "follows to replace the dummy weights, so the engine would serve "
+            "random weights for the whole run. Drop the override; the driver "
+            "defaults load_format to 'auto'."
+        )
     kv_cache_dtype = generation_config["vllm_cfg"].get("kv_cache_dtype")
     if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
         raise NotImplementedError(
@@ -265,6 +281,11 @@ def validate_simulator_config(
         raise NotImplementedError(
             "token_capture.defer_routed_experts_to_policy assembles routes on "
             "the Megatron policy workers, which rollout_only does not build."
+        )
+    if master_config.token_capture.forest_training:
+        raise NotImplementedError(
+            "token_capture.forest_training validates forest padding on the "
+            "trainer's workers at setup, which rollout_only does not build."
         )
     if master_config.loss_fn.truncated_importance_sampling_type == "adaptive-ppo-clip":
         raise NotImplementedError(

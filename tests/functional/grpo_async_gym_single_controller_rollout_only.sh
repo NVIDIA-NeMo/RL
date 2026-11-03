@@ -49,10 +49,9 @@ cd -
 
 # Same trimming as the training smoke: with every tool attached the first prompt is >4000
 # tokens, which vLLM answers with nothing at this max_total_sequence_length.
+# No validation split: the driver drops data.validation (there is no trainer to validate).
 TRAIN_PATH=$DATA_DIR/workplace_assistant_train.jsonl
-VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
 jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl > $TRAIN_PATH
-jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > $VALIDATION_PATH
 
 # Every node is an inference node: the recipe's 1-GPU generation split is all this run uses.
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
@@ -92,7 +91,6 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     logger.monitor_gpus=true \
     checkpointing.enabled=false \
     data.train.data_path=$TRAIN_PATH \
-    data.validation.data_path=$VALIDATION_PATH \
     ++data_plane.enabled=true \
     ++data_plane.impl=transfer_queue \
     ++data_plane.backend=simple \

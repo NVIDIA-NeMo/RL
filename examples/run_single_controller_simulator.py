@@ -238,10 +238,17 @@ def main() -> None:
                 # Before configure_generation_config, whose own nvfp4 check would
                 # reject such a recipe first with a message that does not say why.
                 reject_online_quantization(config.policy["generation"])
-                # Unlike a training run there is no trainer to refit dummy weights:
-                # is_eval=True makes the engine load the real checkpoint directly.
+                # Configured as run_grpo_single_controller.py configures it (same
+                # skip_tokenizer_init rule, so the engine does the same per-token
+                # work as one beside a trainer), not as an eval engine. load_format
+                # is already "auto" from apply_simulator_overrides, and no refit
+                # delivers draft or MTP weights, so none are expected from one.
                 config.policy["generation"] = configure_generation_config(
-                    config.policy["generation"], tokenizer, is_eval=True
+                    config.policy["generation"],
+                    tokenizer,
+                    has_refit_draft_weights=False,
+                    trains_mtp=False,
+                    draft_full_refit=False,
                 )
 
             if bool(config.env.get("should_use_nemo_gym")):

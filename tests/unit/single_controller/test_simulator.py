@@ -153,6 +153,21 @@ def test_apply_overrides_colocated_recipe_only_touches_cluster_nodes() -> None:
     assert raw["policy"]["generation"]["colocated"]["resources"]["num_nodes"] == 2
 
 
+def test_apply_overrides_defaults_load_format_to_auto() -> None:
+    raw = _raw_config()
+    raw["policy"]["generation"]["vllm_cfg"] = {}
+    apply_simulator_overrides(raw, SimulatorSettings())
+    # No refit follows to fill dummy weights in, so the engine loads the checkpoint.
+    assert raw["policy"]["generation"]["vllm_cfg"]["load_format"] == "auto"
+
+
+def test_apply_overrides_keeps_explicit_load_format() -> None:
+    raw = _raw_config()
+    raw["policy"]["generation"]["vllm_cfg"] = {"load_format": "safetensors"}
+    apply_simulator_overrides(raw, SimulatorSettings())
+    assert raw["policy"]["generation"]["vllm_cfg"]["load_format"] == "safetensors"
+
+
 # ── validation ──────────────────────────────────────────────────────────────
 
 
@@ -165,6 +180,7 @@ def _master_config(
     ppo: bool = False,
     tis_type: str | None = None,
     defer_routes: bool = False,
+    forest_training: bool = False,
 ) -> MasterConfig:
     generation: dict[str, Any] = {
         "backend": backend,
@@ -179,7 +195,10 @@ def _master_config(
         grpo=None if ppo else GRPOConfig(async_grpo=None),
         ppo=SimpleNamespace() if ppo else None,
         loss_fn=SimpleNamespace(truncated_importance_sampling_type=tis_type),
-        token_capture=TokenCaptureConfig(defer_routed_experts_to_policy=defer_routes),
+        token_capture=TokenCaptureConfig(
+            defer_routed_experts_to_policy=defer_routes,
+            forest_training=forest_training,
+        ),
         on_policy_distillation=None,
     )
 
@@ -197,6 +216,13 @@ def test_validate_rejects_ppo() -> None:
 def test_validate_rejects_non_vllm_backends(backend: str) -> None:
     with pytest.raises(NotImplementedError, match="vllm"):
         validate_simulator_config(_master_config(backend=backend), SimulatorSettings())
+
+
+def test_validate_rejects_dummy_load_format() -> None:
+    with pytest.raises(ValueError, match="load_format='dummy'"):
+        validate_simulator_config(
+            _master_config(vllm_cfg={"load_format": "dummy"}), SimulatorSettings()
+        )
 
 
 def test_validate_rejects_checkpointing() -> None:
@@ -217,6 +243,13 @@ def test_validate_rejects_deferred_routed_experts() -> None:
     with pytest.raises(NotImplementedError, match="defer_routed_experts_to_policy"):
         validate_simulator_config(
             _master_config(defer_routes=True), SimulatorSettings()
+        )
+
+
+def test_validate_rejects_forest_training() -> None:
+    with pytest.raises(NotImplementedError, match="forest_training"):
+        validate_simulator_config(
+            _master_config(forest_training=True), SimulatorSettings()
         )
 
 
