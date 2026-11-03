@@ -54,32 +54,23 @@ UV_PROJECT_ENVIRONMENT="${dynamo_venv_dir}" uv sync \
 dynamo_python=${dynamo_venv_dir}/bin/python
 vllm_version=$("${dynamo_python}" -c \
   'from importlib.metadata import version; print(version("vllm"))')
-if [[ "${vllm_version}" != "0.23.0" ]]; then
-  echo "Expected vllm==0.23.0 from ai-dynamo[vllm]==1.3.0.post1; got ${vllm_version}" >&2
+if [[ "${vllm_version}" != "0.28.0" ]]; then
+  echo "Expected vllm==0.28.0 from ai-dynamo[vllm]==1.5.1; got ${vllm_version}" >&2
   exit 1
 fi
 
-vllm_root=$("${dynamo_python}" -c \
-  'from pathlib import Path; import vllm; print(Path(vllm.__file__).resolve().parent.parent)')
-patch_file=${project_dir}/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch
+# Layerwise weight reload must count only the elements each composed loader
+# actually writes (vLLM PR #44814). Without it, trailing NemotronH/Mamba2
+# parameters such as mixer.D stay unloaded after a refit and corrupt logits.
+# vLLM 0.28.0 ships the fix; fail the build if a future pin drops it.
+"${dynamo_python}" - <<'PY'
+import inspect
 
-# Dynamo 1.3.0 pins vLLM 0.23.0, which predates vLLM PR #44814.
-# Without that fix, composed weight loaders can make layerwise reload finalize
-# a layer early, leaving trailing NemotronH/Mamba2 parameters such as mixer.D
-# unloaded and corrupting logits after a weight refit.
-# Remove this backport only after Dynamo pins a vLLM release containing #44814.
-if git -C "${vllm_root}" apply --check "${patch_file}"; then
-  git -C "${vllm_root}" apply "${patch_file}"
-elif [[ -f "${dynamo_venv_dir}/VLLM_BACKPORTS" ]] \
-  && git -C "${vllm_root}" apply --reverse --check "${patch_file}"; then
-  echo "vLLM PR #44814 backport is already applied"
-else
-  echo "vLLM PR #44814 backport does not apply cleanly to vLLM ${vllm_version}" >&2
-  exit 1
-fi
-printf '%s\n' \
-  'vllm PR #44814 merge commit c9e5bf813530fb9ce06024e075da0f520b0718c8' \
-  > "${dynamo_venv_dir}/VLLM_BACKPORTS"
+import vllm.model_executor.model_loader.reload.meta as meta
+
+if "min(numel," not in inspect.getsource(meta):
+    raise SystemExit("vLLM is missing the PR #44814 layerwise-reload fix")
+PY
 
 download_dir=$(mktemp -d "${TMPDIR:-/tmp}/nemorl-dynamo-install.XXXXXX")
 trap 'rm -rf "${download_dir}"' EXIT
@@ -101,10 +92,6 @@ install -m 0755 \
   "${dynamo_venv_dir}/bin/nats-server"
 
 "${dynamo_python}" -c \
-  'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.3.0.post1"; assert m.version("vllm") == "0.23.0"; assert m.version("nvidia-nccl-cu13") == "2.30.7"'
-test -s "${dynamo_venv_dir}/VLLM_BACKPORTS"
-grep -Fqx \
-  'vllm PR #44814 merge commit c9e5bf813530fb9ce06024e075da0f520b0718c8' \
-  "${dynamo_venv_dir}/VLLM_BACKPORTS"
+  'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.5.1"; assert m.version("vllm") == "0.28.0"; assert m.version("nvidia-nccl-cu13") == "2.30.7"'
 "${dynamo_venv_dir}/bin/etcd" --version
 "${dynamo_venv_dir}/bin/nats-server" --version

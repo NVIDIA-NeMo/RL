@@ -19,7 +19,7 @@ To get started quickly, use the example configuration [examples/configs/recipes/
 uv run examples/run_grpo.py --config examples/configs/recipes/llm/dapo-qwen2.5-7b.v2.yaml {overrides}
 ```
 
-**Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for LLaMA models.
+**Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `hf auth login` as well for LLaMA models.
 
 ## Dynamic Sampling
 

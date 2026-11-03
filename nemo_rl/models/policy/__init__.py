@@ -17,7 +17,12 @@ from typing import Any, Literal, NotRequired, TypedDict, Union
 from pydantic import BaseModel
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.models.policy.draft_config import (
+    DFlashDraftConfig,
+    DraftConfig,
+    DSparkDraftConfig,
+    Eagle3DraftConfig,
+)
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
@@ -38,21 +43,21 @@ def _patch_transformers_tokenizer_class_set():
 
     Placed here (nemo_rl/models/policy/__init__.py) so it fires exactly once
     per process the first time any policy code is imported -- covers the driver
-    (via nemo_rl.algorithms.grpo) and every policy worker (Megatron / DTensor /
-    DTensor v2 all import from nemo_rl.models.policy) without polluting nemo_rl
+    (via nemo_rl.algorithms.grpo) and every policy worker (Megatron and Automodel
+    both import from nemo_rl.models.policy) without polluting nemo_rl
     consumers that don't touch tokenizers.
     """
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # Transformers 5.12.1 still ships both registry entries, so the patch remains
+    # Transformers 5.16.1 still ships both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.20.0"), (
         f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
+        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.20. "
         "Check if the upstream fix now applies and remove this patch if so."
     )
 
@@ -185,7 +190,7 @@ class MoEParallelizerOptions(TypedDict):
 
 
 class AutomodelCheckpointConfig(TypedDict, total=False):
-    """Automodel checkpoint settings used by DTensor v2."""
+    """Automodel checkpoint settings."""
 
     model_save_format: Literal["torch_save", "safetensors"] | None
     save_consolidated: Literal["false", "final", "every"]
@@ -352,6 +357,20 @@ class Fp4Config(BaseModel, extra="forbid"):
     fp4_param: bool = False
 
 
+def provider_override_allowed(megatron_cfg: Any, key: str) -> bool:
+    """Whether a megatron_cfg key may be applied onto the model provider.
+
+    Student configs carry no allowlist and every key applies (status quo).
+    Teacher configs allow only explicit teacher overrides plus ``mtp_num_layers``,
+    which defaults to zero because scoring does not use MTP outputs. Other
+    architecture settings come from the teacher checkpoint; inherited student
+    keys must not reach its provider (for example, VLM tower keys on a text
+    teacher).
+    """
+    allowlist = megatron_cfg.get("_provider_override_allowlist")
+    return allowlist is None or key in allowlist
+
+
 # Type exists to be lax if not specified
 class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
@@ -382,6 +401,19 @@ class MegatronConfig(TypedDict):
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
+    # Megatron-style manual garbage collection. An automatic full Python GC lands on
+    # whichever rank crosses its threshold, and every other rank then waits for it
+    # in the next collective. When True, the Megatron policy workers (and, under
+    # value.megatron_cfg, the PPO Megatron value workers) disable automatic GC
+    # (from the end of worker setup) and collect on every rank after every
+    # manual_gc_interval-th optimizer step, on both the monolithic train() and
+    # split-step (finish_train_step) paths. Not supported on distillation teachers,
+    # which never train: the student's value is reset for them. Recommended: false;
+    # see docs/design-docs/training-backends.md for when to enable it.
+    manual_gc: NotRequired[bool]
+    # Optimizer steps between manual collections; must be a positive integer when
+    # manual_gc is True (validated at worker setup).
+    manual_gc_interval: NotRequired[int]
     # When True, offload_after_refit skips rerunning the full offload_before_refit
     # pass (grad-buffer moves, cache clears, and a second gc.collect/empty_cache)
     # and only re-offloads the optimizer with a single allocator cleanup.
@@ -463,7 +495,7 @@ class MegatronConfig(TypedDict):
     # Options are 'nvls' (requires Hopper+ NVLink) and 'nccl' (fallback for non-NVLS systems).
     inference_moe_token_dispatcher_type: NotRequired[str]
     # Backend for grouped-GEMM during inference-optimized MoE forward.
-    # Options: 'flashinfer', 'torch', 'vllm' (mcore default).
+    # Options: 'flashinfer', 'torch', 'vllm'.
     inference_grouped_gemm_backend: NotRequired[str]
     # Fixed decode row capacity for the FlashInfer routed-MXFP8 MoE path. Without it
     # every decode step processes the full NVLS dispatcher buffer
@@ -607,6 +639,12 @@ class MegatronConfig(TypedDict):
     zero_train_gen_mismatch: NotRequired[bool]
 
 
+# Block drafters propose a whole anchored block per step and exist only on
+# the Automodel co-training path; eagle3 additionally runs on Megatron.
+BLOCK_DRAFT_ALGOS = ("dspark", "dflash")
+DRAFT_ALGOS = ("eagle3", *BLOCK_DRAFT_ALGOS)
+
+
 class TokenizerConfig(TypedDict):
     name: str
     # None selects NeMo-RL's passthrough prompt/response template.
@@ -707,7 +745,7 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
-    draft: NotRequired[Eagle3DraftConfig]
+    draft: NotRequired[DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     # Resolved once by the driver and carried to the student workers and (via
     # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.

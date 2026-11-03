@@ -369,6 +369,18 @@ def test_ft_save_period_triggers_periodic_saves(mock_components):
     assert saved_steps == [2, 4, 5]
 
 
+def test_setup_rejects_deferred_checkpoint_finalize(mock_components):
+    master_config = mock_components["master_config"]
+    master_config.sft.defer_async_checkpoint_finalize = True
+
+    with patch(
+        "nemo_rl.algorithms.sft.Logger",
+        side_effect=AssertionError("setup continued into logger initialization"),
+    ):
+        with pytest.raises(ValueError, match="only supported by SFT v2"):
+            setup(master_config, mock_components["tokenizer"], MagicMock(), None)
+
+
 def test_setup_rejects_only_unmask_final_for_direct_packed_sft_before_side_effects(
     mock_components,
 ):

@@ -43,6 +43,10 @@ RAY_CLUSTER_SOURCE_ATTR = "rl.ray.cluster_source"
 RAY_CLUSTER_EXTERNAL = "attached_external"
 RAY_CLUSTER_REUSED_LOCAL = "reused_local"
 RAY_CLUSTER_STARTED_LOCAL = "started_local"
+# See nemo_rl.distributed.ray_worker_setup.
+_WORKER_PROCESS_SETUP_HOOK = (
+    "nemo_rl.distributed.ray_worker_setup.ray_worker_process_setup"
+)
 
 
 class ClusterConfig(BaseModel, extra="allow"):
@@ -466,6 +470,11 @@ def _init_ray(log_dir: Optional[str] = None) -> str:
 
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
+        # A module path, not the function: Ray rewrites a callable hook's
+        # runtime_env entry to its bare name, so a nested ray.init (vLLM's
+        # EngineCore at TP>1) sees a hook that no longer matches and refuses
+        # to connect.
+        "worker_process_setup_hook": _WORKER_PROCESS_SETUP_HOOK,
     }
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")

@@ -111,6 +111,10 @@ policy:
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: false
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     cuda_graph_impl: none
     cuda_graph_modules: []
@@ -224,6 +228,7 @@ logger:
   swanlab_enabled: false
   monitor_gpus: true
   num_val_samples_to_print: 0
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb:
     project: vlm-mpo
     name: vlm-mpo

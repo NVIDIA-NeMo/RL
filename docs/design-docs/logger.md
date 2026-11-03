@@ -152,6 +152,16 @@ Then access the UI at `http://127.0.0.1:5000/` to view:
 - Hyperparameters
 - Model artifacts and checkpoints
 
+### Custom Backends
+
+Other backends can be added without changing NeMo RL. List {py:class}`LoggerInterface <nemo_rl.utils.logger.LoggerInterface>` subclasses by fully qualified class name; each is imported and constructed without arguments, then receives the same calls as the built-in backends:
+
+```yaml
+logger:
+  extra_backends:
+    - my_package.logging.MyLogger
+```
+
 ## Validation Pretty Logging
 
 The logger supports pretty-formatted logging of validation samples to help visualize model outputs during training. This feature is controlled by the `num_val_samples_to_print` configuration parameter.

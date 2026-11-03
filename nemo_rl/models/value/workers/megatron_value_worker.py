@@ -66,6 +66,7 @@ from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.megatron.manual_gc import ManualGCMixin
 from nemo_rl.models.megatron.setup import (
     _distributed_timeout_minutes,
     finalize_megatron_setup,
@@ -92,6 +93,7 @@ from nemo_rl.telemetry.setup import (
     traced_worker_init,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.path_utils import maybe_enable_msc
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 from nemo_rl.utils.tensor_ops import pad_and_concat
 
@@ -227,7 +229,7 @@ def _value_loss_prepare_fn(
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
+class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker):
     """Megatron-Core based value function worker for PPO.
 
     This worker wraps a Megatron-Core GPT model backbone with a value head
@@ -353,6 +355,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             init_optimizer: Whether to initialize the optimizer.
             worker_sharding_annotations: Sharding topology for distributed training.
         """
+        # Resume loads from weights_path/optimizer_path during setup, before any
+        # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
+        maybe_enable_msc(weights_path, optimizer_path)
         # Must be the first CUDA-touching call in this process.
         # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
         gpu_ids = ray.get_gpu_ids()
@@ -377,6 +382,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
         self.cfg = config
         self.rank = get_rank_safe()
+        # Fail on a bad manual_gc config before the expensive setup below; GC itself
+        # is disabled at the end of __init__ (_maybe_enable_manual_gc).
+        self._manual_gc_interval_from_cfg()
 
         # Step 1: Setup distributed
         setup_distributed(config)
@@ -484,6 +492,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         )
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
+        self._maybe_enable_manual_gc()
 
     def enable_forward_pre_hook(self):
         if isinstance(self.model, DistributedDataParallel):
@@ -606,6 +615,8 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
+                    # Once per optimizer step, as in the policy worker.
+                    self._maybe_run_manual_gc()
 
                     pg_collection = get_pg_collection(self.model)
                     update_successful = logical_and_across_model_parallel_group(
@@ -942,6 +953,8 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             raise RuntimeError(
                 "Distributed process group is not initialized. Cannot save checkpoint."
             )
+
+        maybe_enable_msc(weights_path)
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
 

@@ -103,3 +103,39 @@ uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
 | `--hf-model-name` | HuggingFace model identifier used to resolve the model architecture and tokenizer (e.g. `Qwen/Qwen2.5-7B`). |
 | `--hf-ckpt-path` | Output directory for the exported HuggingFace checkpoint or adapter. Must not already exist. |
 | `--adapter-only` | Export only the LoRA adapter in HuggingFace PEFT format without merging into the base model. |
+
+## Object-storage checkpoints (MSC / S3)
+
+`checkpointing.checkpoint_dir` (and `policy.pretrained_checkpoint.path`) may be an
+`msc://<profile>/<prefix>` URL instead of a filesystem path. Checkpoints are then
+written to and resumed from object storage through
+[Multi-Storage Client](https://github.com/NVIDIA/multi-storage-client) (MSC), for
+example S3. Ordinary paths are unaffected.
+
+```yaml
+checkpointing:
+  checkpoint_dir: msc://my-s3/runs/grpo-llama-1b   # profile `my-s3` is defined in MSC_CONFIG
+  save_data_plane: false                           # required for msc:// (no data-plane snapshots yet)
+```
+
+- **Profile:** point `MSC_CONFIG` at an MSC JSON/YAML config on every Ray process,
+  e.g. `{"profiles": {"my-s3": {"storage_provider": {"type": "s3", "options":
+  {"base_path": "<bucket>/<prefix>", "region_name": "us-east-2"}}}}}`. Credentials come
+  from the usual AWS environment/role chain; keep them out of the config file.
+- **Publish marker:** a step is written directly under `step_N/` and only becomes
+  visible to resume and retention after an `_SUCCESS` object is written once every
+  shard (including async writes) has finished. An unfinished step is never resumed.
+- **No overwrite:** saving into an existing `step_N` raises `FileExistsError`; use a
+  fresh `checkpoint_dir` prefix for a new run.
+- **Resuming:** use the same `max_num_steps` (or compatible LR-scheduler settings) as
+  the run that wrote the checkpoint; Megatron validates the scheduler state on load.
+- **Support:** Megatron policy backend; dataloader state for all algorithms
+  (`save_dataloader_state`); async GRPO, including its replay buffer and rollout
+  state (`replay_buffer.pt`, `rollouts.pt`), as long as `save_data_plane=false`;
+  SingleController (async) with `checkpointing.metric_name=null` and
+  `save_data_plane=false`. SingleController cannot snapshot its data plane to
+  `msc://`, so a resume restores weights and the dataloader cursor and regenerates
+  the buffered rollouts (a warning says so at setup).
+- **Trust:** resume deserializes `torch` pickles (`train_dataloader*.pt`) from the
+  bucket; only point `msc://` at storage you control.
+

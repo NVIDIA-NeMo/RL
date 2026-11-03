@@ -27,6 +27,7 @@ from PIL import Image
 from transformers import AutoTokenizer
 
 import nemo_rl.experience.rollouts as rollouts_mod
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -46,6 +47,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.interfaces import (
@@ -228,6 +230,48 @@ def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():
     )
 
     assert set(message) == {"role", "content", "token_ids"}
+
+
+def test_reattach_preserves_rollout_matched_media_marker():
+    """Media the Gym actor attached rollout-matched must not be overwritten.
+
+    Provenance is the explicit marker, not key presence: an unmarked
+    placeholder value is still replaced (see the neighboring test), while a
+    marked turn keeps its actor-attached tensors and the marker is consumed.
+    """
+    from nemo_rl.data.multimodal_utils import ROLLOUT_MATCHED_MEDIA_KEY
+
+    static_image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    rollout_matched = PackedTensor(torch.tensor([[9.0]]), dim_to_pack=0)
+    original_logs = [
+        [
+            {"role": "user", "content": "first", "pixel_values": static_image},
+        ]
+    ]
+    results = [
+        {
+            "_initial_multimodal_data_omitted": True,
+            "input_message_log": [
+                {"role": "user", "content": "first"},
+            ],
+            "message_log": [
+                {
+                    "role": "user",
+                    "content": "first",
+                    "pixel_values": rollout_matched,
+                    ROLLOUT_MATCHED_MEDIA_KEY: True,
+                },
+            ],
+        }
+    ]
+
+    _reattach_original_multimodal_payloads(results, original_logs)
+
+    marked_user = results[0]["message_log"][0]
+    assert marked_user["pixel_values"] is rollout_matched
+    assert ROLLOUT_MATCHED_MEDIA_KEY not in marked_user
+    # The unmarked representation is still restored from the static source.
+    assert results[0]["input_message_log"][0]["pixel_values"] is static_image
 
 
 def test_processor_media_mask_rejects_unknown_token_fallback():
@@ -2703,6 +2747,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._dispatch_admission_gate = DataPlaneCheckpointBarrier()
     manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
@@ -2759,6 +2804,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
 
 def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager.set_next_nemo_gym_task_index(0)
+    manager._dispatch_admission_gate = None
     manager._num_generations_per_prompt = 2
     manager._generation_config = {
         "temperature": 1.0,
@@ -2778,8 +2825,11 @@ def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
         *,
         on_completion=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
+        gym_instance_id=None,
+        dispatch_recorder=None,
     ):
-        del timer, timer_prefix, on_completion, recovery_granularity
+        del timer, timer_prefix, on_completion, recovery_granularity, gym_instance_id
+        del dispatch_recorder
         for row in inputs:
             row["agent_ref"] = resolved_agent_ref
         receipt_completion = SimpleNamespace(env_extras={"ng_receipt": {}})
@@ -2841,6 +2891,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._dispatch_admission_gate = None
     manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
@@ -2887,6 +2938,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
     first, second = object(), object()
     selected = []
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._dispatch_admission_gate = None
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
     manager._deadline_registry = None
@@ -2910,8 +2962,18 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
         timer_prefix,
         *,
         on_completion,
+        dispatch_recorder=None,
+        admission_closed_rows=None,
+        recovery_granularity=None,
     ):
-        del total_rows, timer_prefix, on_completion
+        del (
+            total_rows,
+            timer_prefix,
+            on_completion,
+            dispatch_recorder,
+            admission_closed_rows,
+            recovery_granularity,
+        )
         selected.append(environment)
         for row in pending:
             rowidx = row["_rowidx"]
@@ -2980,6 +3042,7 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
             return _FailedStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._dispatch_admission_gate = None
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
     manager._deadline_registry = None
@@ -3216,6 +3279,42 @@ def test_run_async_nemo_gym_rollout(
     """
 
 
+def test_reattach_preserves_marker_across_aliased_message_log_views():
+    """Production shape: ``input_message_log`` is a slice of ``message_log``.
+
+    Both views reference the same message dictionary; consuming the
+    rollout-matched marker while processing one view must not leave the other
+    view free to overwrite the repaired media with the static payload.
+    """
+    from nemo_rl.data.multimodal_utils import ROLLOUT_MATCHED_MEDIA_KEY
+
+    static_image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    rollout_matched = PackedTensor(torch.tensor([[9.0]]), dim_to_pack=0)
+    original_logs = [
+        [{"role": "user", "content": "first", "pixel_values": static_image}]
+    ]
+    shared_message = {
+        "role": "user",
+        "content": "first",
+        "pixel_values": rollout_matched,
+        ROLLOUT_MATCHED_MEDIA_KEY: True,
+    }
+    message_log = [shared_message]
+    results = [
+        {
+            "_initial_multimodal_data_omitted": True,
+            "input_message_log": message_log[:1],
+            "message_log": message_log,
+        }
+    ]
+
+    _reattach_original_multimodal_payloads(results, original_logs)
+
+    assert results[0]["input_message_log"][0] is shared_message
+    assert shared_message["pixel_values"] is rollout_matched
+    assert ROLLOUT_MATCHED_MEDIA_KEY not in shared_message
+
+
 def test_mask_sample_flags_read_either_form_of_the_flag():
     """Either the verify response's first-class ``mask_sample`` field or the
     ``instance_config.mask_sample`` extras mapping flags a sample. Gym defaults
@@ -3236,3 +3335,52 @@ def test_mask_sample_flags_read_either_form_of_the_flag():
         ]
     )
     assert flags.tolist() == [True, True, True, False, False, False]
+
+
+@pytest.mark.nemo_gym
+def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
+    """A restored turn continues only on the replica that holds its Gym state."""
+    first, second = object(), object()
+    selected = []
+    impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._dispatch_admission_gate = None
+    impl._timeouts = RolloutTimeouts()
+    impl._max_gym_row_attempts = 1
+    impl._deadline_registry = None
+    impl._num_generations_per_prompt = 1
+    impl._task_to_env = {
+        "nemo_gym": NemoGymShardSet(
+            handles={"tools": [first, second]}, route_to_shard={"agent": "tools"}
+        )
+    }
+    impl._tokenizer = None
+    impl._effort_config = None
+
+    async def fake_stream_rows(environment, pending, results, shaping, *_a, **_k):
+        selected.append(environment)
+        for row in pending:
+            results[row["_rowidx"]] = {
+                "input_message_log": [{"token_ids": [1]}],
+                "full_result": {"reward": 0.0},
+            }
+            shaping[row["_rowidx"]] = SimpleNamespace(
+                length_rewards_low=[], rewards_low=[], low_lengths=[], high_lengths=[]
+            )
+
+    impl._stream_rows = fake_stream_rows
+    impl._results_to_completions = lambda _results: ([object()], {})
+    impl._compute_rollout_metrics = lambda *_args, **_kwargs: {}
+    impl._compute_reward_penalty_metrics = lambda *_args: {}
+    owner = GymCheckpointInstance("tools", 1).instance_id
+
+    for _ in range(3):
+        asyncio.run(
+            impl._run_rollouts(
+                inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+                timer=rollouts_mod.Timer(),
+                timer_prefix="timing/test",
+                gym_instance_id=owner,
+            )
+        )
+
+    assert selected == [second, second, second]

@@ -35,6 +35,7 @@ from ray.util.placement_group import PlacementGroup
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.fleet_health import (
@@ -50,7 +51,12 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
+    validate_vllm_async_actor_settings,
     validate_vllm_quantization_config,
+)
+from nemo_rl.models.generation.vllm.draft_utils import (
+    DRAFT_DISABLE_MODULE_SHARING_ENV,
+    draft_module_sharing_disable_required,
 )
 from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
 from nemo_rl.models.generation.vllm.utils import (
@@ -59,6 +65,10 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
+)
+from nemo_rl.models.generation.vllm.worker_utils import (
+    resolve_vllm_dp_size,
+    resolve_vllm_rank_prefixes,
 )
 from nemo_rl.telemetry.instrumentation import trace_fn
 from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
@@ -79,6 +89,24 @@ if TYPE_CHECKING:
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_refit_rank_prefixes(
+    membership: RefitMembership,
+    total_workers: int,
+    dp_size: int,
+    vllm_dp_size: int,
+) -> dict[int, int]:
+    """Use instance prefixes for native DP, preserving compacted shard prefixes otherwise."""
+    if vllm_dp_size == 1:
+        return membership.shard_prefixes
+    if (
+        sorted(membership.shard_prefixes) != list(range(dp_size))
+        or membership.world_size - membership.train_world_size != total_workers
+    ):
+        raise RuntimeError("Partial-shard rebuild is not supported with vLLM DP")
+    prefixes = resolve_vllm_rank_prefixes(total_workers, dp_size, vllm_dp_size)
+    return {shard_idx: prefixes[shard_idx] for shard_idx in membership.shard_prefixes}
 
 
 def http_server_api_key_and_worker_config(
@@ -221,6 +249,7 @@ class VllmGeneration(GenerationInterface):
             defer_model_load: If True, defer model loading for overlapped init
         """
         validate_vllm_quantization_config(config)
+        validate_vllm_async_actor_settings(config)
 
         # Store config
         self.cfg = config
@@ -236,7 +265,6 @@ class VllmGeneration(GenerationInterface):
             f"Got world size {cluster.world_size()} and model parallel size (TP * PP) {self.model_parallel_size}."
         )
         self.dp_size = cluster.world_size() // self.model_parallel_size
-        self.vllm_dp_size = self.ep_size // self.tp_size
 
         if self.pp_size > 1:
             assert self.cfg["vllm_cfg"]["async_engine"], (
@@ -249,13 +277,10 @@ class VllmGeneration(GenerationInterface):
                 "When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP. "
                 "Please update your configuration to set expert_parallel_size to a multiple of tensor_parallel_size."
             )
-            if self.ep_size != self.tp_size:
-                # vLLM's EP = DP * TP, so here we need to use DP inside vLLM.
-                assert not self.cfg["vllm_cfg"]["async_engine"], (
-                    "vLLM async_engine has some issues when using DP inside vLLM. "
-                    "Please update your configuration to set `policy.generation.vllm_cfg.async_engine=false`. "
-                    "See https://github.com/NVIDIA-NeMo/RL/issues/1101 for more details."
-                )
+        self.vllm_dp_size = resolve_vllm_dp_size(self.tp_size, self.ep_size)
+        assert self.dp_size % self.vllm_dp_size == 0, (
+            f"Data parallel size ({self.dp_size}) must be a multiple of vLLM data parallel size ({self.vllm_dp_size})."
+        )
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         top_k: int | None = self.cfg["top_k"]
@@ -367,10 +392,15 @@ class VllmGeneration(GenerationInterface):
                 "[INFO] NCCL_NVLS_ENABLE is set to 0 for non-colocated inference with cross-node model parallelism."
                 "See https://github.com/NVIDIA-NeMo/RL/issues/1352 for more details."
             )
-        # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
-        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
-        if self.ep_size > self.tp_size:
-            env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
+
+        # Set via runtime_env (not a later os.environ mutation in __init__)
+        # because this actor's own vLLM engine spawns further Ray actors for
+        # each TP rank when tensor_parallel_size > 1 (e.g. RayWorkerProc); a
+        # parent actor's runtime os.environ changes are invisible to those
+        # child actors, but runtime_env.env_vars set here (via
+        # RayWorkerGroup(env_vars=...) below) is inherited by them.
+        if draft_module_sharing_disable_required(self.cfg):
+            env_vars[DRAFT_DISABLE_MODULE_SHARING_ENV] = "1"
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
@@ -691,6 +721,7 @@ class VllmGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        top_logprobs: int = 0,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -698,6 +729,7 @@ class VllmGeneration(GenerationInterface):
         builds its in-worker data-plane client + TQTokenSink and makes the
         single Gym ``install_capture`` call. Returns the media column spec the
         leaders pinned (``None`` for text-only capture).
+        ``top_logprobs`` > 0 also stages sampler top-k log-probs.
         """
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "
@@ -708,6 +740,7 @@ class VllmGeneration(GenerationInterface):
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
             capture_media=capture_media,
+            top_logprobs=top_logprobs,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         return agreed_media_columns(ray.get(futures))
@@ -820,14 +853,10 @@ class VllmGeneration(GenerationInterface):
             else "init_collective"
         )
 
-        # Prepare rank
         total_workers = len(self.worker_group.workers)
-        if self.dp_size == 0:
-            raise RuntimeError(
-                "Data parallel size is zero, cannot initialize collective."
-            )
-        workers_per_group = total_workers // self.dp_size
-        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+        rank_prefix_list = resolve_vllm_rank_prefixes(
+            total_workers, self.dp_size, self.vllm_dp_size
+        )
 
         # Send world_size and rank for init collective to all workers
         futures = self.worker_group.run_all_workers_multiple_data(
@@ -941,8 +970,8 @@ class VllmGeneration(GenerationInterface):
         """
         self._refit_membership = membership
 
-    def _refit_leader_workers(self) -> list[Any]:
-        """DP leaders that should receive refit calls, in rank order.
+    def _refit_leaders_by_shard(self) -> list[tuple[int, int, Any]]:
+        """Snapshot (shard index, leader index, worker) in refit rank order.
 
         Falls back to every leader when no membership has been recorded, which is the
         state for the entire life of a run that never loses a shard.
@@ -953,17 +982,24 @@ class VllmGeneration(GenerationInterface):
         membership = self._refit_membership
         if membership is None:
             per_shard = len(workers) // self.dp_size
-            return [workers[idx * per_shard] for idx in range(self.dp_size)]
+            shard_indices = range(self.dp_size)
+        else:
+            per_shard = membership.workers_per_shard
+            shard_indices = membership.shard_prefixes
         leaders = []
-        for shard_idx in membership.shard_prefixes:
-            leader_idx = shard_idx * membership.workers_per_shard
+        for shard_idx in shard_indices:
+            leader_idx = shard_idx * per_shard
             if leader_idx >= len(workers):
                 raise RuntimeError(
                     f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
                     f"{len(workers)} workers"
                 )
-            leaders.append(workers[leader_idx])
+            leaders.append((shard_idx, leader_idx, workers[leader_idx]))
         return leaders
+
+    def _refit_leader_workers(self) -> list[Any]:
+        """DP leaders that should receive refit calls, in rank order."""
+        return [worker for _, _, worker in self._refit_leaders_by_shard()]
 
     def rebuild_collective(
         self, membership: "RefitMembership", ip: str, port: int
@@ -982,6 +1018,13 @@ class VllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
+        rank_prefixes = resolve_refit_rank_prefixes(
+            membership,
+            len(self.worker_group.workers),
+            self.dp_size,
+            self.vllm_dp_size,
+        )
+
         method_name = (
             "init_collective_async"
             if self.cfg["vllm_cfg"]["async_engine"]
@@ -989,7 +1032,7 @@ class VllmGeneration(GenerationInterface):
         )
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
-        for shard_idx, rank_prefix in membership.shard_prefixes.items():
+        for shard_idx, rank_prefix in rank_prefixes.items():
             leader_idx = shard_idx * membership.workers_per_shard
             if leader_idx >= len(workers):
                 raise RuntimeError(
@@ -1542,9 +1585,9 @@ class VllmGeneration(GenerationInterface):
             else "init_nccl_reshard_comm_group"
         )
 
-        total_workers = len(self.worker_group.workers)
-        workers_per_group = total_workers // self.dp_size
-        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+        rank_prefix_list = resolve_vllm_rank_prefixes(
+            len(self.worker_group.workers), self.dp_size, self.vllm_dp_size
+        )
 
         futures = self.worker_group.run_all_workers_multiple_data(
             method_name,
@@ -1597,6 +1640,13 @@ class VllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
+        rank_prefixes = resolve_refit_rank_prefixes(
+            membership,
+            len(self.worker_group.workers),
+            self.dp_size,
+            self.vllm_dp_size,
+        )
+
         method_name = (
             "init_nccl_reshard_comm_group_async"
             if self.cfg["vllm_cfg"]["async_engine"]
@@ -1604,7 +1654,7 @@ class VllmGeneration(GenerationInterface):
         )
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
-        for shard_idx, rank_prefix in membership.shard_prefixes.items():
+        for shard_idx, rank_prefix in rank_prefixes.items():
             leader = workers[shard_idx * membership.workers_per_shard]
             futures.append(
                 getattr(leader, method_name).remote(
@@ -1754,37 +1804,66 @@ class VllmGeneration(GenerationInterface):
             print(f"Error invalidating vLLM caches: {e}")
             return False
 
-    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float] = None
+    ) -> bool:
         """Pause every async vLLM engine while preserving in-flight requests."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError("pause_generation_for_refit requires async_engine=True")
-        if not self.worker_group or not self.worker_group.workers:
-            raise RuntimeError("Worker group is not initialized")
-
-        futures = self.worker_group.run_all_workers_single_data(
-            "pause_generation_async",
-            clear_cache=clear_cache,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        if not all(ray.get(futures)):
-            raise RuntimeError("Failed to pause every async vLLM engine")
-        return True
-
-    def resume_generation_after_refit(self) -> bool:
-        """Resume every async vLLM engine paused for refit."""
-        if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError(
-                "resume_generation_after_refit requires async_engine=True"
+            return super().pause_generation_for_refit(
+                clear_cache=clear_cache, timeout_s=timeout_s
             )
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
-        futures = self.worker_group.run_all_workers_single_data(
-            "resume_generation_async",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        if not all(ray.get(futures)):
-            raise RuntimeError("Failed to resume every async vLLM engine")
+        # Address surviving DP leaders directly. SingleController may have rebuilt the
+        # refit communicator after losing a shard; walking the whole worker group here
+        # would call the dead Ray actor and undo that recovery before the refit starts.
+        futures = [
+            worker.pause_generation_async.remote(clear_cache=clear_cache)
+            for worker in self._refit_leader_workers()
+        ]
+        try:
+            results = ray.get(futures, timeout=timeout_s)
+        except ray.exceptions.GetTimeoutError as exc:
+            raise RefitAborted(
+                f"vLLM generation pause did not return within {timeout_s}s"
+            ) from exc
+        if not all(results):
+            raise RuntimeError("Failed to pause every async vLLM engine")
+        return True
+
+    def resume_generation_after_refit(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Resume surviving engines; fleet health excludes confirmed actor deaths."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return super().resume_generation_after_refit(timeout_s=timeout_s)
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        leaders = self._refit_leaders_by_shard()
+        futures = [worker.resume_generation_async.remote() for _, _, worker in leaders]
+        # Settle all calls within one budget before inspecting failures. A dead leader
+        # must not prevent us from waiting for the surviving engines to resume.
+        _, pending = ray.wait(futures, num_returns=len(futures), timeout=timeout_s)
+        if pending:
+            raise RefitAborted(
+                f"vLLM generation resume did not return within {timeout_s}s"
+            )
+        for (shard_idx, leader_idx, worker), future in zip(leaders, futures):
+            try:
+                resumed = ray.get(future)
+            except ray.exceptions.ActorDiedError as exc:
+                if self.fleet_monitor is None:
+                    raise
+                # A late error from an old actor must not condemn its replacement.
+                if self.worker_group.workers[leader_idx] is worker:
+                    self.fleet_monitor.record_actor_death(shard_idx, error=str(exc))
+                continue
+            if not resumed:
+                raise RuntimeError("Failed to resume every async vLLM engine")
+        if self.fleet_monitor is not None:
+            self.fleet_monitor.raise_if_exhausted()
         return True
 
     @property

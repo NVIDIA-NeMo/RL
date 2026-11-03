@@ -45,6 +45,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.multimodal_utils import (
+    ROLLOUT_MATCHED_MEDIA_KEY,
     VLLM_MULTI_MODAL_DATA_KEY,
     VLLM_PROMPT_KEYS,
     PackedTensor,
@@ -65,6 +66,10 @@ from nemo_rl.environments.nemo_gym import (
     get_nemo_gym_route_name,
     get_pad_dynamic_image_shapes,
 )
+from nemo_rl.environments.nemotron_utils import (
+    verify_static_video_media_alignment,
+)
+from nemo_rl.experience.failures import GymRowFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -97,6 +102,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
+from nemo_rl.utils.routed_experts_codec import slice_routed_experts
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -272,20 +278,37 @@ def _reattach_original_multimodal_payloads(
 def _reattach_static_multimodal_payloads_to_result(
     result: dict[str, Any],
     source_message_log: list[dict[str, Any]],
+    tokenizer: Any = None,
 ) -> None:
     """Restore static media to each Gym-authored message-log representation."""
+    # input_message_log is commonly a slice of message_log, so the two views
+    # can alias the same message dictionaries. Process each target once.
+    processed_target_ids: set[int] = set()
     for log_key in ("input_message_log", "message_log"):
         target_log = result.get(log_key)
         if not target_log:
             continue
-        attach_static_multimodal_payload(target_log, source_message_log)
+        attach_static_multimodal_payload(
+            target_log,
+            source_message_log,
+            processed_target_ids=processed_target_ids,
+            tokenizer=tokenizer,
+        )
 
 
 def attach_static_multimodal_payload(
     target_message_log: list[dict[str, Any]],
     source_message_log: list[dict[str, Any]],
+    processed_target_ids: set[int] | None = None,
+    tokenizer: Any = None,
 ) -> None:
-    """Copy policy-ready media from static source turns to Gym-authored turns."""
+    """Copy policy-ready media from static source turns to Gym-authored turns.
+
+    A shared ``processed_target_ids`` prevents aliased views from consuming a
+    rollout-matched marker and then overwriting the repaired media. When a
+    tokenizer is supplied, static video placeholder geometry is verified
+    before tensors are copied.
+    """
     source_users = [
         message for message in source_message_log if message.get("role") == "user"
     ]
@@ -298,6 +321,14 @@ def attach_static_multimodal_payload(
             "turns than the source prompt."
         )
     for source, target in zip(source_users, target_users):
+        if processed_target_ids is not None:
+            if id(target) in processed_target_ids:
+                continue
+            processed_target_ids.add(id(target))
+        if target.pop(ROLLOUT_MATCHED_MEDIA_KEY, False):
+            continue
+        if tokenizer is not None:
+            verify_static_video_media_alignment(source, target, tokenizer)
         # Check if the source is empty or not.
         source_token_ids = source.get("token_ids")
         source_is_tokenized = (
@@ -397,7 +428,9 @@ def _attach_routed_experts_to_message_log_prefix(
         if not isinstance(token_ids, torch.Tensor):
             continue
         msg_len = int(token_ids.shape[0])
-        msg["routed_experts"] = routed_experts[cursor : cursor + msg_len]
+        msg["routed_experts"] = slice_routed_experts(
+            routed_experts, cursor, cursor + msg_len
+        )
         cursor += msg_len
     return cursor
 
@@ -683,9 +716,9 @@ def generate_responses(
                     "message_log token length does not match generation input_length "
                     f"({prefix_length} != {int(input_length.item())})."
                 )
-            assistant_message["routed_experts"] = routed_experts[
-                input_length:total_length
-            ]
+            assistant_message["routed_experts"] = slice_routed_experts(
+                routed_experts, int(input_length.item()), int(total_length.item())
+            )
 
         batch["message_log"][i].append(assistant_message)
 
@@ -824,9 +857,9 @@ async def generate_responses_async(
                     "message_log token length does not match generation input_length "
                     f"({prefix_length} != {int(input_length.item())})."
                 )
-            assistant_message["routed_experts"] = routed_experts[
-                input_length:total_length
-            ]
+            assistant_message["routed_experts"] = slice_routed_experts(
+                routed_experts, int(input_length.item()), int(total_length.item())
+            )
 
         batch["message_log"][i].append(assistant_message)
 
@@ -2528,7 +2561,15 @@ async def _merge_nemo_gym_instance_streams(
                 instance_label = iterators[iterator]
                 try:
                     future = task.result()
-                    row_index, resolved_agent_ref, result, timing_metrics = await future
+                    item = await future
+                    if isinstance(item, GymRowFailure):
+                        # This path retries the whole batch, not one row, so a
+                        # failed row still ends its instance's stream.
+                        stream = streams_by_iterator[iterator]
+                        if isinstance(stream, ray.ObjectRefGenerator):
+                            ray.cancel(stream)
+                        raise item.error
+                    row_index, resolved_agent_ref, result, timing_metrics = item
                 except StopAsyncIteration:
                     active_iterators.remove(iterator)
                     continue
@@ -2837,7 +2878,7 @@ async def run_async_nemo_gym_rollout(
                 )
                 if original_message_logs is not None:
                     _reattach_static_multimodal_payloads_to_result(
-                        result, original_message_logs[rowidx]
+                        result, original_message_logs[rowidx], tokenizer
                     )
                     result.pop("_initial_multimodal_data_omitted", None)
                 if completed_group is not None:

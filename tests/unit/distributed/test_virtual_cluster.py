@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
+from ray._common.utils import load_class
 
 from nemo_rl.distributed import virtual_cluster
 from nemo_rl.distributed.virtual_cluster import (
@@ -991,3 +992,45 @@ def test_actor_registry_honors_system_flag(use_system_executable):
             "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker"
         ].startswith("uv run")
         assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")
+
+
+def test_init_ray_worker_setup_drops_srun_env_in_trtllm_workers_only():
+    """TRT-LLM's MPI_Init breaks under srun's launcher env; other workers keep it."""
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True):
+            init_ray()
+        hook_path = mock_ray_init.call_args_list[0][1]["runtime_env"][
+            "worker_process_setup_hook"
+        ]
+    # A module path, as Ray loads it in each worker: a callable would break a
+    # nested ray.init (vLLM's EngineCore at TP>1).
+    assert isinstance(hook_path, str)
+    hook = load_class(hook_path)
+
+    launcher = {
+        "SLURM_JOBID": "14",
+        "SLURM_JOB_ID": "14",
+        "SLURM_STEP_ID": "0",
+        "PMIX_NAMESPACE": "x",
+        "PMI_FD": "3",
+        "MPI_LOCALRANKID": "0",
+        "OMPI_MCA_plm": "s",
+        "OMPI_ALLOW_RUN_AS_ROOT": "1",
+    }
+    kept = {"PRTE_ALLOW_RUN_AS_ROOT": "1", "HOME": "/root"}
+    env = {**launcher, **kept}
+    spec = "importlib.util.find_spec"
+
+    with patch.dict(os.environ, env, clear=True), patch(spec, return_value=object()):
+        hook()
+        assert dict(os.environ) == kept
+
+    with patch.dict(os.environ, env, clear=True), patch(spec, return_value=None):
+        hook()
+        assert dict(os.environ) == env
