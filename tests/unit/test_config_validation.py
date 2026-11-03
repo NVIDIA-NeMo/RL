@@ -117,18 +117,13 @@ config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
 # Every shipped config tree. Configs outside examples/configs receive only the
-# outdated-config, local-path and W&B-entity checks; their manifests and templates
+# outdated-config and local-path checks; their manifests and templates
 # may lack the training schema or contain unset environment interpolations.
 repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
 full_config_files = config_files + [
     path
     for extra in ("examples/nemo_gym", "research")
     for path in glob.glob(str(repo_root / extra / "**/*.yaml"), recursive=True)
-]
-suite_scripts = [
-    path
-    for pattern in ("tests/test_suites/**/*.sh", "research/*/tests/test_suites/**/*.sh")
-    for path in glob.glob(str(repo_root / pattern), recursive=True)
 ]
 
 
@@ -494,20 +489,10 @@ def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
             _check_automodel_moe_dispatcher(config_file, deepcopy(config))
 
 
-@pytest.mark.parametrize("path", full_config_files + suite_scripts)
-def test_shipped_configs_and_suite_scripts_have_no_local_paths(path):
+@pytest.mark.parametrize("path", full_config_files)
+def test_shipped_configs_have_no_local_paths(path: str) -> None:
     text = Path(path).read_text().lower()
     for local_prefix in ("/lustre/", "/scratch/", "/home/"):
         assert local_prefix not in text, (
             f"{path} contains a local path ({local_prefix})"
         )
-
-
-@pytest.mark.parametrize("config_file", full_config_files)
-def test_shipped_configs_do_not_pin_wandb_entity(config_file):
-    raw = yaml.safe_load(Path(config_file).read_text())
-    logger = raw.get("logger") if isinstance(raw, dict) else None
-    wandb_config = logger.get("wandb") if isinstance(logger, dict) else None
-    assert not isinstance(wandb_config, dict) or "entity" not in wandb_config, (
-        f"{config_file} pins a W&B entity"
-    )

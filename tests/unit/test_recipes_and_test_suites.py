@@ -355,3 +355,13 @@ def test_all_recipes_start_with_algo_hyphen(all_recipe_yaml_rel_paths):
         assert algo in expected_algos, (
             f"Recipe {recipe_yaml} has unexpected algo {algo}"
         )
+
+
+def test_suite_scripts_have_no_local_paths(all_test_suites):
+    for script in all_test_suites:
+        text = (Path(project_root) / script).read_text().lower()
+        for local_prefix in ("/lustre/", "/scratch/", "/home/"):
+            assert local_prefix not in text, (
+                f"{script} contains a local path ({local_prefix})"
+            )
+
