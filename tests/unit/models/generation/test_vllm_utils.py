@@ -35,12 +35,12 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    check_sampling_param,
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
     encode_counter_key,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
-    check_sampling_param,
     pad_and_align_routed_expert_indices,
     remap_multimodal_placeholders,
 )
