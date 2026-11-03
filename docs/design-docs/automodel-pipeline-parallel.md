@@ -150,7 +150,7 @@ A non-`None` `num_label_tokens` would rescale gradients the loss already normali
 - Only 1F1B. Interleaved and V-shaped schedules place several stages on one rank and
   would need per-rank lists of stages, optimizers, and schedulers.
 - Inputs that a model's `get_pipeline_kwargs_chunk_dims` hook splits along a non-batch
-  dimension are rejected when a batch is planned, for example Qwen3.5-MoE's M-RoPE
-  `position_ids`, which its CP hook also produces for text-only inputs.
+  dimension, such as multimodal M-RoPE `position_ids`, are rejected when a batch is
+  planned.
 - SingleController streaming updates need an upstream fix that preserves gradients
   across stage re-initialization.
