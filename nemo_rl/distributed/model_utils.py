@@ -305,7 +305,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
         # Opt-in: write the grad into the logits' storage; only safe when this op is
-        # their sole consumer, as each chunk is upcast before it is overwritten.
+        # their sole consumer, as each chunk is read before its slice is overwritten.
         reuse_logits_storage = (
             ctx.reuse_logits_storage and not vocab_parallel_logits.is_leaf
         )
