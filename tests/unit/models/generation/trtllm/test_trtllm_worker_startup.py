@@ -22,6 +22,7 @@ it only comes up if init_ray's worker_process_setup_hook strips them first.
 """
 
 import socket
+import time
 from pathlib import Path
 
 import pytest
@@ -147,6 +148,8 @@ def test_trtllm_http_server_serves_with_fastokens(monkeypatch):
     tokenizer = get_tokenizer({"name": _MODEL})
     config = _generation_config(tokenizer)
     config["trtllm_cfg"]["expose_http_server"] = True
+    # TRT-LLM cannot infer a tool parser for this model.
+    config["trtllm_cfg"]["tool_parser"] = "qwen3"
     cluster = RayVirtualCluster(
         bundle_ct_per_node_list=[_TP],
         use_gpus=True,
@@ -158,16 +161,25 @@ def test_trtllm_http_server_serves_with_fastokens(monkeypatch):
     try:
         # start_http_server raises if the fastokens patch did not land.
         generation = TrtllmGeneration(cluster, config)
-        resp = requests.post(
-            f"{generation.dp_openai_server_base_urls[0]}/chat/completions",
-            json={
-                "model": _MODEL,
-                "messages": [{"role": "user", "content": "1 + 1 ="}],
-                "max_tokens": _MAX_NEW_TOKENS,
-                "temperature": 0.0,
-            },
-            timeout=120,
-        )
+        url = f"{generation.dp_openai_server_base_urls[0]}/chat/completions"
+        payload = {
+            "model": _MODEL,
+            "messages": [{"role": "user", "content": "1 + 1 ="}],
+            "max_tokens": _MAX_NEW_TOKENS,
+            # The server only accepts the configured train/validation sampling.
+            "temperature": config["temperature"],
+            "top_p": config["top_p"],
+        }
+        # The server thread starts listening just after start_server returns.
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                resp = requests.post(url, json=payload, timeout=120)
+                break
+            except requests.ConnectionError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(1)
         assert resp.status_code == 200, resp.text
         assert resp.json()["choices"][0]["message"]["content"]
     finally:
