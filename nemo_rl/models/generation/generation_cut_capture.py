@@ -133,8 +133,6 @@ class _RequestCaptureState:
     capture_routed_experts: bool = False
     routed_experts_dtype: torch.dtype = torch.int16
     restored_routed_experts: torch.Tensor | None = None
-    # The engine's ID for this request, from its first output.
-    engine_request_id: str | None = None
     # Full-sequence routes from the request's final output.
     terminal_routed_experts: torch.Tensor | None = None
     # The engine's route pieces joined so far: a buffer that doubles when
@@ -1045,7 +1043,7 @@ class GenerationCutCaptureMixin:
         Runs after the freeze, without ``state.lock``, so decoding continues.
 
         Raises:
-            TimeoutError: the engine did not answer before ``deadline``.
+            TimeoutError: the engine's routes could not be read before ``deadline``.
             ValueError: the engine cannot name the request's routes.
         """
         with state.lock:

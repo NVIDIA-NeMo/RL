@@ -880,9 +880,15 @@ class _AsyncLLMHTTPClient:
         fall back to turn level.
 
         Raises:
-            RuntimeError: vLLM is not the release that state was verified on,
-                or its output processor lacks the fields read.
+            RuntimeError: progress reads are not enabled, vLLM is not the
+                release that state was verified on, or its output processor
+                lacks the fields read.
         """
+        if not self._progress_reads_enabled:
+            raise RuntimeError(
+                "router-replay prefix recovery reads routes under vLLM's output "
+                "lock; call enable_generation_progress_reads() first"
+            )
         installed = importlib.metadata.version("vllm")
         if Version(installed).release[:3] != _ROUTE_SNAPSHOT_VLLM_RELEASE:
             expected = ".".join(map(str, _ROUTE_SNAPSHOT_VLLM_RELEASE))
@@ -906,51 +912,63 @@ class _AsyncLLMHTTPClient:
     def snapshot_routed_experts(
         self, request_id: str, *, timeout_s: float | None
     ) -> list[Any] | None:
-        """Copy an active request's route chunks on the engine loop.
+        """Copy a request's route chunks from the cut's own thread.
 
         vLLM 0.29 keeps routed experts in ``OutputProcessor.RequestState``
         while decoding, only ever appends to them, and publishes them in
         ``CompletionOutput`` once the request finishes. A generation cut reads
-        them here, from its own thread, after freezing the call's tokens.
+        them here after freezing the call's tokens, under ``_progress_lock``
+        like ``read_generation_progress``: the read sees whole decode steps
+        and waits for at most one, instead of queuing behind everything else
+        on the engine loop. A request vLLM just finished is read from the
+        state ``_finish_request`` keeps until its consumer has the final
+        output, so a cut racing the completion still gets its routes.
 
         Returns:
-            The request's route chunks in order, or ``None`` once the request
-            has left vLLM.
+            The request's route chunks in order, or ``None`` once neither vLLM
+            nor that kept state holds the request.
 
         Raises:
-            TimeoutError: the engine loop did not answer within ``timeout_s``.
+            TimeoutError: vLLM held its output lock past ``timeout_s``.
             ValueError: more than one vLLM request serves ``request_id``, or its
                 state has no route chunks.
         """
-
-        async def snapshot() -> list[Any] | None:
-            return self._routed_expert_chunks_on_owner(request_id)
-
-        future = asyncio.run_coroutine_threadsafe(snapshot(), self._engine_loop)
+        if not self._progress_lock.acquire(
+            timeout=-1 if timeout_s is None else max(0.0, timeout_s)
+        ):
+            raise TimeoutError("vLLM held its output lock past the cut's deadline")
         try:
-            return future.result(timeout=timeout_s)
-        except TimeoutError:
-            future.cancel()
-            raise
+            return self._routed_expert_chunks(request_id)
+        finally:
+            self._progress_lock.release()
 
-    def _routed_expert_chunks_on_owner(self, request_id: str) -> list[Any] | None:
-        """List one request's route chunks while on the engine loop.
+    def _routed_expert_chunks(self, request_id: str) -> list[Any] | None:
+        """List one request's route chunks; the caller holds ``_progress_lock``.
 
         A shallow copy: vLLM appends new chunks but never rewrites one.
         """
-        output_processor = self._engine_client.output_processor
-        internal_ids = list(output_processor.external_req_ids.get(request_id, ()))
-        if not internal_ids:
-            return None
-        if len(internal_ids) != 1:
-            raise ValueError(
-                "router-replay prefix capture requires exactly one active "
-                f"vLLM request for {request_id!r}; found {len(internal_ids)}"
-            )
-        state = output_processor.request_states.get(internal_ids[0])
-        if state is None:
-            return None
-        # Checked per call, not at setup: only a live request has this field.
+        if request_id in self._finished_requests:
+            finished = self._finished_requests[request_id]
+            if finished is None:
+                raise ValueError(
+                    "router-replay prefix capture requires exactly one vLLM "
+                    f"request for {request_id!r}"
+                )
+            state = finished.request_state
+        else:
+            output_processor = self._engine_client.output_processor
+            internal_ids = list(output_processor.external_req_ids.get(request_id, ()))
+            if not internal_ids:
+                return None
+            if len(internal_ids) != 1:
+                raise ValueError(
+                    "router-replay prefix capture requires exactly one active "
+                    f"vLLM request for {request_id!r}; found {len(internal_ids)}"
+                )
+            state = output_processor.request_states.get(internal_ids[0])
+            if state is None:
+                return None
+        # Checked per call, not at setup: only a request's state has this field.
         chunks = getattr(state, "routed_experts_chunks", None)
         if chunks is None:
             raise ValueError("vLLM's request state has no routed_experts_chunks")
