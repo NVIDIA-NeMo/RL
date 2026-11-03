@@ -89,6 +89,7 @@ from nemo_rl.data.utils import (
     save_dataloader_state,
 )
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
+from nemo_rl.data_plane.schema import SAMPLER_TOPK_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     TOPO_RANK_UNKNOWN,
@@ -702,10 +703,7 @@ def setup(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     loss_config: ClippedPGLossConfig = master_config.loss_fn
-    if loss_config.score_centering:
-        raise ValueError(
-            "Score centering requires SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
-        )
+    _configure_legacy_score_centering(master_config)
     env_configs = master_config.env
     data_config = master_config.data
     grpo_config = master_config.grpo
@@ -2430,6 +2428,13 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     has_media = "media_token_validity_mask" in per_token_multimodal_fields or any(
         _owns_media(message) for message_log in message_logs for message in message_log
     )
+    sampler_topk_templates = {
+        key: message[key]
+        for message_log in message_logs
+        for message in message_log
+        for key in SAMPLER_TOPK_FIELDS
+        if key in message
+    }
     for message_log in message_logs:
         for message in message_log:
             role = cast(str, message["role"])
@@ -2444,6 +2449,13 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
                 message["generation_logprobs"] = torch.zeros_like(
                     token_ids, dtype=torch.float32
                 )
+            # Score centering: tokens the sampler did not generate get an
+            # all-zero top-k head; their token_loss_mask is 0.
+            for key, template in sampler_topk_templates.items():
+                if key not in message:
+                    message[key] = template.new_zeros(
+                        (len(token_ids), template.shape[-1])
+                    )
 
             if not has_media:
                 message.pop("media_token_validity_mask", None)
@@ -3329,6 +3341,66 @@ def _placeholder_seq_logprob_error_metrics() -> dict[str, float]:
     }
 
 
+def _configure_legacy_score_centering(master_config: MasterConfig) -> None:
+    """Validate score centering on the legacy GRPO trainer and raise vLLM's logprob cap.
+
+    ``grpo_train`` captures the sampler's top-k head in the async vLLM worker
+    (``policy.generation.top_logprobs``) and carries it through the message logs
+    into the Megatron packed loss; other trainers and backends do not.
+    """
+    policy_config = master_config.policy
+    generation_config = policy_config["generation"]
+    top_logprobs = generation_config.get("top_logprobs", 0)
+    if not master_config.loss_fn.score_centering:
+        if top_logprobs:
+            raise ValueError(
+                "policy.generation.top_logprobs > 0 is only read by "
+                "loss_fn.score_centering; set it to 0 or enable score centering"
+            )
+        return
+
+    vllm_cfg = generation_config.get("vllm_cfg") or {}
+    megatron_cfg = policy_config.get("megatron_cfg") or {}
+    packing_cfg = policy_config.get("sequence_packing") or {}
+    unsupported = []
+    if top_logprobs <= 0:
+        unsupported.append("policy.generation.top_logprobs > 0")
+    if generation_config["backend"] != "vllm" or not vllm_cfg.get("async_engine"):
+        unsupported.append("vllm backend with vllm_cfg.async_engine=true")
+    if (
+        master_config.grpo.async_grpo.enabled
+        or (master_config.data_plane or {}).get("enabled", False)
+        or should_use_nemo_gym(master_config)
+    ):
+        unsupported.append("synchronous grpo_train without data_plane or NeMo Gym")
+    if not megatron_cfg.get("enabled") or megatron_cfg.get("use_fused_linear_logprobs"):
+        unsupported.append("Megatron with use_fused_linear_logprobs=false")
+    if megatron_cfg.get("enabled") and megatron_cfg["context_parallel_size"] != 1:
+        unsupported.append("megatron_cfg.context_parallel_size=1")
+    if not (packing_cfg.get("enabled") and packing_cfg.get("fuse_loss")):
+        unsupported.append("sequence_packing.enabled=true and fuse_loss=true")
+    # The captured head must be the distribution the tokens were sampled from.
+    if generation_config["top_p"] != 1.0 or generation_config["top_k"] is not None:
+        unsupported.append("untruncated sampling (top_p=1, top_k=null)")
+    logprobs_mode = vllm_cfg.get("logprobs_mode")
+    if logprobs_mode not in (None, "raw_logprobs", "processed_logprobs") or (
+        generation_config["temperature"] != 1.0
+        and logprobs_mode != "processed_logprobs"
+    ):
+        unsupported.append("temperature=1 or vllm_cfg.logprobs_mode=processed_logprobs")
+    if unsupported:
+        raise ValueError(
+            "loss_fn.score_centering on the legacy GRPO trainer requires: "
+            + "; ".join(unsupported)
+        )
+
+    # vLLM rejects requests for more logprobs than max_logprobs (default 20).
+    vllm_kwargs = cast(VllmConfig, generation_config).setdefault("vllm_kwargs", {})
+    cap = vllm_kwargs.get("max_logprobs")
+    if cap is None or (cap != -1 and cap < top_logprobs):
+        vllm_kwargs["max_logprobs"] = top_logprobs
+
+
 def _validate_use_kl_in_reward_compat(master_config: MasterConfig) -> None:
     """Reject ``use_kl_in_reward`` when the KL term would read zero placeholder logprobs.
 
@@ -4178,6 +4250,10 @@ def _grpo_train_impl(
                     _preserve_router_replay_routed_experts(
                         train_data, flat_messages, master_config.policy
                     )
+                    if master_config.loss_fn.score_centering:
+                        # Token-aligned [B, S, k] sampler top-k, read by the loss.
+                        for key in SAMPLER_TOPK_FIELDS:
+                            train_data[key] = flat_messages[key]
                     train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]

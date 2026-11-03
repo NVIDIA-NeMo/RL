@@ -1,0 +1,168 @@
+defaults: ../../grpo_math_1B.yaml
+# DAPO-style GRPO on Qwen3-30B-A3B-Base, 4 nodes x 4 Blackwell GPUs, colocated.
+# Blockwise FP8 linear layers in trainer (TE) and rollout (vLLM + DeepGEMM),
+# vLLM fp8_per_token_head KV cache with matching trainer KV QAT, router replay,
+# token-level TIS and score centering over the sampler's top-32 head.
+grpo:
+  seed: 17
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  max_num_steps: 2000
+  max_num_epochs: 100
+  use_dynamic_sampling: true
+  batch_multiplier: 3
+  dynamic_sampling_max_gen_batches: 10
+  use_leave_one_out_baseline: false
+  skip_reference_policy_logprobs_calculation: true
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  reward_shaping:
+    enabled: true
+    max_response_length: ${policy.generation.max_new_tokens}
+    overlong_buffer_length: 2048
+    overlong_buffer_penalty: 1.0
+  val_period: 10
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 30
+  val_batch_size: 30
+  val_num_generations_per_prompt: 32
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10.0
+  token_level_loss: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2.0
+  score_centering: true
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-4n4g-megatron-ep8tp2-fp8-kvqat-r3-score-centering
+  save_period: 10
+  keep_top_k: 3
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Base
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 20480
+  logprob_chunk_size: 1024
+  make_sequence_length_divisible_by: 8
+  automodel_cfg:
+    enabled: false
+  router_replay:
+    enabled: true
+  sequence_packing:
+    enabled: true
+    fuse_loss: true
+  dynamic_batching:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    recompute_granularity: selective
+    recompute_modules: [moe]
+    defer_fp32_logits: true
+    # MoE recompute leaves dispatcher reference cycles; free them before vLLM wakes.
+    clear_memory_caches_before_refit: true
+    # Free the FP32 master shards too, so vLLM can wake its KV cache.
+    offload_optimizer_master_params: true
+    freeze_moe_router: false
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_hybridep_prepad_packed_inputs: true
+    kv_fp8_qat: true
+    fp8_cfg:
+      enabled: true
+      fp8: hybrid
+      fp8_recipe: blockwise
+      fp8_param: false
+      # Drop TE FP8 weight workspaces before refit so vLLM can wake its KV cache.
+      force_clear_fp8_caches: true
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_decay_style: constant
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False,max_split_size_mb:512,garbage_collection_threshold:0.8,per_process_memory_fraction:0.9
+      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: '0'
+  generation:
+    max_new_tokens: 20480
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    top_logprobs: 32
+    vllm_cfg:
+      async_engine: true
+      precision: fp8
+      use_deep_gemm: true
+      pow2_weight_scaling_factors: true
+      pow2_activation_scaling_factors: true
+      # Keep the MoE router in BF16 (blockwise FP8 has no quantization_ignore_patterns;
+      # lm_head is excluded by default).
+      quantization_ignored_layer_kws:
+        - .mlp.gate
+      kv_cache_dtype: fp8_per_token_head
+      logprobs_mode: raw_logprobs
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      # Refit through vLLM's layerwise reload so DeepGEMM MoE can repack scales.
+      refit_with_reload_api: true
+      max_model_len: ${policy.max_total_sequence_length}
+      enable_prefix_caching: true
+      env_vars:
+        VLLM_USE_DEEP_GEMM: '1'
+        VLLM_USE_DEEP_GEMM_E8M0: '1'
+    vllm_kwargs:
+      # Page-local FP8 KV layout, tuned Triton prefill and SM100 Gluon decode.
+      worker_cls: nemo_rl.models.generation.vllm.fp8_kv_attention.worker.Worker
+      max_num_seqs: 512
+      compilation_config:
+        # The SM100 decode scratch covers at most 512 rows (vLLM 0.29 defaults to 1024).
+        max_cudagraph_capture_size: 512
+      max_num_batched_tokens: 16384
+      enable_chunked_prefill: true
+      block_size: 64
+      attention_config:
+        backend: TRITON_ATTN
+      kernel_config:
+        linear_backend: deep_gemm
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-base-4n4g-megatron-ep8tp2-fp8-kvqat-r3-score-centering
+  wandb:
+    name: grpo-qwen3-30ba3b-base-4n4g-megatron-ep8tp2-fp8-kvqat-r3-score-centering
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4

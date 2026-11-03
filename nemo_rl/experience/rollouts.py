@@ -53,7 +53,7 @@ from nemo_rl.data.multimodal_utils import (
     extract_input_media_sources_from_responses_messages,
     resolve_to_image,
 )
-from nemo_rl.data_plane.schema import MASK_SAMPLE
+from nemo_rl.data_plane.schema import MASK_SAMPLE, SAMPLER_TOPK_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -860,6 +860,12 @@ async def generate_responses_async(
             assistant_message["routed_experts"] = slice_routed_experts(
                 routed_experts, int(input_length.item()), int(total_length.item())
             )
+        # Score centering: the sampler's top-k head per generated token, [T, k].
+        for key in SAMPLER_TOPK_FIELDS:
+            if key in generation_outputs:
+                assistant_message[key] = generation_outputs[key][
+                    i, input_length:total_length
+                ].clone()
 
         batch["message_log"][i].append(assistant_message)
 

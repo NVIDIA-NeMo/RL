@@ -108,6 +108,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_obj_from_pp_rank,
     broadcast_tensors_from_last_stage,
 )
+from nemo_rl.models.megatron.kv_qat import KVFP8QAT, validate_kv_fp8_qat_config
 from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     router_replay_layout,
@@ -1051,6 +1052,12 @@ class MegatronPolicyWorkerImpl(
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
             get_model_config(self.model).param_sync_func = param_sync_func
+
+        # Reproduce the rollout's FP8 per-token-head KV-cache rounding.
+        self.kv_qat = None
+        if self.cfg["megatron_cfg"].get("kv_fp8_qat"):
+            validate_kv_fp8_qat_config(self.cfg)
+            self.kv_qat = KVFP8QAT(self.model)
 
         # Reference construction must not advance the restored policy RNG.
         # Keep fresh-run RNG ordering unchanged, including PEFT warm starts.
@@ -3162,7 +3169,14 @@ class MegatronPolicyWorkerImpl(
 
             # - self.model is the original reference_model, now on CUDA
             # - self.reference_model is the original model, now on CPU
-            yield
+            # The reference policy keeps its original BF16 attention.
+            if self.kv_qat is not None:
+                self.kv_qat.enabled = False
+            try:
+                yield
+            finally:
+                if self.kv_qat is not None:
+                    self.kv_qat.enabled = True
 
             # Restore sampling_params
             self.sampling_params = saved_sampling_params
@@ -4944,6 +4958,21 @@ class MegatronPolicyWorkerImpl(
                 ):
                     if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
                         setattr(dispatcher, attr, None)
+                # Flex (HybridEP) keeps the same per-batch state on its comm manager;
+                # its token_probs close the same cycle. Each forward resets these.
+                manager = getattr(dispatcher, "_comm_manager", None)
+                if manager is None or getattr(manager, "handle", None) is not None:
+                    continue
+                for attr in (
+                    "routing_map",
+                    "topk_idx",
+                    "token_probs",
+                    "dispatched_probs",
+                    "tokens_per_expert",
+                    "num_permuted_tokens",
+                ):
+                    if isinstance(getattr(manager, attr, None), torch.Tensor):
+                        setattr(manager, attr, None)
         except Exception:
             pass
 
@@ -5031,7 +5060,36 @@ class MegatronPolicyWorkerImpl(
                 model.to(device=device, non_blocking=True)
         return model
 
+    def _move_optimizer_master_params(self, device: str):
+        """Move distributed-optimizer FP32 master shards in place.
+
+        ``shard_fp32_from_float16_groups`` holds the masters outside the optimizer
+        state dict, so ``move_optimizer`` alone leaves them on the GPU. The model's
+        main_param and the optimizer state keys reference these tensors, so only
+        ``.data`` is moved.
+        """
+        if self._uses_mxfp8_overlap_shared_param_buffer():
+            raise ValueError(
+                "offload_optimizer_master_params is not supported with shared MXFP8 buffers"
+            )
+        optimizers = (
+            self.optimizer.chained_optimizers
+            if isinstance(self.optimizer, ChainedOptimizer)
+            else [self.optimizer]
+        )
+        for optimizer in optimizers:
+            for group in getattr(optimizer, "shard_fp32_from_float16_groups", []):
+                for master in group:
+                    if master is None:
+                        continue  # precision-aware optimizers keep masters in state
+                    if device == "cpu":
+                        master.grad = None
+                    if master.is_cuda != (device == "cuda"):
+                        master.data = master.data.to(device)
+
     def move_optimizer(self, device: str):
+        if self.cfg["megatron_cfg"].get("offload_optimizer_master_params"):
+            self._move_optimizer_master_params(device)
         # Iterate through the state dictionaries for each parameter group
         if isinstance(self.optimizer, ChainedOptimizer):
             optimizer_state = self.optimizer.state

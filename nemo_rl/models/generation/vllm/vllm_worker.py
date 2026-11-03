@@ -852,6 +852,7 @@ class BaseVllmGenerationWorker:
         greedy: bool,
         stop_strings,
         max_new_tokens: Optional[int] = None,
+        top_logprobs: int = 0,
     ):
         top_k_cfg = self.cfg["top_k"]
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
@@ -862,12 +863,23 @@ class BaseVllmGenerationWorker:
             max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
         )
 
+        logprob_kwargs: dict[str, Any] = {"logprobs": 0}
+        if top_logprobs:
+            # Score centering reads the sampler's top-k head per token. Flat
+            # logprobs avoid per-token dicts, and detokenizing the head would
+            # slow rollouts, so it is kept only when stop strings need it.
+            logprob_kwargs = {
+                "logprobs": top_logprobs,
+                "flat_logprobs": True,
+                "detokenize": bool(stop_strings),
+            }
+
         return self.SamplingParams(
             temperature=temperature,
             top_p=self.cfg["top_p"],
             top_k=top_k_val,
             max_tokens=max_tokens,
-            logprobs=0,
+            **logprob_kwargs,
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,

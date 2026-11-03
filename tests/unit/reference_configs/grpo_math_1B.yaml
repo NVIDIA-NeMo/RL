@@ -255,6 +255,10 @@ policy:
     pipeline_dtype: ${policy.precision}
     sequence_parallel: false
     freeze_moe_router: true
+    # Quantize-dequantize post-RoPE K/V like vLLM's kv_cache_dtype=fp8_per_token_head (STE).
+    kv_fp8_qat: false
+    # Move FP32 optimizer master shards to CPU with the optimizer before refit.
+    offload_optimizer_master_params: false
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
