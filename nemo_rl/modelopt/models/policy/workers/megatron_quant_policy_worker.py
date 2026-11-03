@@ -13,12 +13,14 @@
 # limitations under the License.
 
 
+import copy
 import hashlib
 import json
 import os
 import warnings
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 
 import ray
@@ -35,7 +37,6 @@ from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuanti
 from modelopt.torch.quantization.utils import apply_without_qdq
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
-from nemo_rl.distributed.collectives import gather_jagged_object_lists
 from nemo_rl.modelopt.models.policy.workers.utils import (
     get_quantization_layer_spec,
     get_quantization_mamba_stack_spec,
@@ -43,10 +44,7 @@ from nemo_rl.modelopt.models.policy.workers.utils import (
     quantize_model,
     symlink_pre_quantized_model,
 )
-from nemo_rl.modelopt.utils import (
-    MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
-    resolve_nvfp4_real_quant_mode,
-)
+from nemo_rl.modelopt.utils import MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
@@ -154,8 +152,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         """Use a longer timeout only for ModelOpt real-quant refits."""
         super().maybe_init_zmq()
         if self._use_real_quant_refit():
-            self.zmq_socket.setsockopt(zmq.SNDTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
+            self.zmq_socket.setsockopt(
+                zmq.SNDTIMEO, MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
+            )
+            self.zmq_socket.setsockopt(
+                zmq.RCVTIMEO, MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
+            )
 
     def __init__(self, config, *args, **kwargs):
         """Initialize the MegatronQuantPolicyWorker."""
@@ -187,6 +189,18 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         )
         self._pre_load_checkpoint_hook = self._restore_modelopt_state_pre_load
         super().__init__(config, *args, **kwargs)
+
+        # Each materialized export group is one collective-complete conversion
+        # task. Rendezvous on CPU before advancing so rank-local consumers cannot
+        # make policy ranks enter the next model-parallel task out of order.
+        self._real_quant_refit_sync_group = (
+            torch.distributed.new_group(
+                backend="gloo",
+                timeout=timedelta(milliseconds=MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS),
+            )
+            if self._use_real_quant_refit() and torch.distributed.get_world_size() > 1
+            else None
+        )
 
         if hasattr(self, "reference_state_dict"):
             for name, item in self.model.state_dict().items():
@@ -455,112 +469,119 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             return super().save_checkpoint(*args, **kwargs)
 
     def _use_real_quant_refit(self) -> bool:
-        generation_cfg = self.cfg["generation"]
+        generation_cfg = self.cfg.get("generation")
         return (
-            generation_cfg["backend"] == "vllm"
-            and generation_cfg.get("quant_cfg") is not None
+            generation_cfg is not None
+            and generation_cfg["backend"] == "vllm"
             and bool(generation_cfg.get("real_quant"))
         )
 
-    def _get_real_quant_mode(self) -> str:
-        """Resolve and cross-check the training and rollout quantization modes."""
-        cached_mode = getattr(self, "_real_quant_mode", None)
-        if cached_mode is not None:
-            return cached_mode
-
-        policy_quant_cfg = self.cfg.get("quant_cfg")
-        generation_quant_cfg = self.cfg["generation"].get("quant_cfg")
-        policy_mode = resolve_nvfp4_real_quant_mode(policy_quant_cfg)
-        generation_mode = resolve_nvfp4_real_quant_mode(generation_quant_cfg)
-        if policy_mode != generation_mode:
-            raise ValueError(
-                "Real-quant refit requires matching policy and generation "
-                f"quantization modes, got {policy_mode} from {policy_quant_cfg!r} "
-                f"and {generation_mode} from {generation_quant_cfg!r}."
+    def _build_refit_conversion_tasks(
+        self, *, exclude_param_patterns: tuple[str, ...] = ()
+    ) -> list:
+        if not self._use_real_quant_refit():
+            # Fake refit folds weights locally; only input/KV amax need HF mappings.
+            return super()._build_refit_conversion_tasks(
+                exclude_param_patterns=("*weight_quantizer*", *exclude_param_patterns)
             )
-        self._real_quant_mode = policy_mode
-        return policy_mode
+
+        return self._get_modelopt_export_plan().conversion_tasks
+
+    def _get_modelopt_export_plan(self):
+        plan = getattr(self, "_modelopt_export_plan", None)
+        if plan is not None:
+            return plan
+
+        plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
+        self.refit_conversion_tasks = plan.conversion_tasks
+        self._modelopt_export_plan = plan
+        return plan
+
+    def get_real_quantization_config(self) -> dict:
+        """Return the canonical ModelOpt deployment config for vLLM."""
+        if not self._use_real_quant_refit():
+            raise RuntimeError("Real-quant refit is not enabled")
+        vllm_cfg = self.cfg["generation"]["vllm_cfg"]
+        if vllm_cfg["kv_cache_dtype"] != "auto":
+            raise ValueError(
+                "ModelOpt real-quant refit currently requires "
+                "generation.vllm_cfg.kv_cache_dtype=auto"
+            )
+        if self.draft_model is not None:
+            raise NotImplementedError(
+                "ModelOpt real-quant refit does not support speculative draft weights"
+            )
+        return copy.deepcopy(self._get_modelopt_export_plan().quantization_config)
+
+    def _iter_real_quant_refit_groups(
+        self,
+        kv_scales: dict[str, float] | None = None,
+    ) -> Generator[tuple[tuple[str, torch.Tensor], ...], None, None]:
+        """Export collective-complete ModelOpt deployment tensor groups."""
+        if kv_scales:
+            raise ValueError("Real-quant refit does not support KV-cache scale sync")
+        generation_cfg = self.cfg["generation"]
+        export_cpu_offload = generation_cfg["real_quant_export_cpu_offload"]
+        plan = self._get_modelopt_export_plan()
+        groups = iter(
+            self.megatron_bridge.export_hf_weight_groups_modelopt(
+                [self.model],
+                cpu=export_cpu_offload,
+                show_progress=False,
+                export_plan=plan,
+            )
+        )
+        while True:
+            if self._real_quant_refit_sync_group is not None:
+                torch.distributed.monitored_barrier(
+                    group=self._real_quant_refit_sync_group,
+                    timeout=timedelta(
+                        milliseconds=MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
+                    ),
+                    wait_all_ranks=True,
+                )
+            try:
+                group = next(groups)
+            except StopIteration:
+                return
+            try:
+                yield group
+            finally:
+                del group
 
     def _iter_real_quant_refit_params(
         self,
         kv_scales: dict[str, float] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Export packed NVFP4 weights and scales for real-quant vLLM rollout."""
-        from nemo_rl.modelopt.utils import (
-            DEFAULT_NVFP4_IGNORE,
-            matches_quant_ignore_pattern,
+        """Export canonical ModelOpt deployment tensors for non-IPC transports."""
+        groups = iter(self._iter_real_quant_refit_groups(kv_scales))
+        while True:
+            try:
+                group = next(groups)
+            except StopIteration:
+                return
+            try:
+                yield from group
+            finally:
+                del group
+
+    @torch.no_grad()
+    def stream_weights_via_ipc_zmq(self, buffer_size_bytes=0, kv_scales=None) -> None:
+        if not self._use_real_quant_refit():
+            return super().stream_weights_via_ipc_zmq(buffer_size_bytes, kv_scales)
+
+        self.maybe_init_zmq()
+
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
+
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=self._iter_real_quant_refit_groups(kv_scales),
+            buffer_size_bytes=buffer_size_bytes,
+            zmq_socket=self.zmq_socket,
+            rank=self.rank,
+            worker_name=str(self),
+            drain_between_groups=True,
         )
-
-        generation_cfg = self.cfg["generation"]
-        vllm_cfg = generation_cfg["vllm_cfg"]
-        ignore = generation_cfg.get("real_quant_ignore")
-        if ignore is None:
-            ignore = DEFAULT_NVFP4_IGNORE
-        mode = self._get_real_quant_mode()
-        export_cpu_offload = generation_cfg["real_quant_export_cpu_offload"]
-        plan = self.megatron_bridge.build_hf_modelopt_export_plan(
-            [self.model], conversion_tasks=self.refit_conversion_tasks
-        )
-        expected_algo = "NVFP4" if mode == "w4a4" else "W4A16_NVFP4"
-        if plan.quantization_config["quant_algo"] != expected_algo:
-            raise ValueError(
-                f"Calibrated ModelOpt export must use {expected_algo} to match rollout."
-            )
-        ignored_weights: list[str] = []
-        for task in plan.conversion_tasks:
-            if task.global_param_name not in plan.quantized_params:
-                continue
-            hf_param = task.mapping.hf_param
-            names = hf_param.values() if isinstance(hf_param, dict) else (hf_param,)
-            for name in names:
-                if matches_quant_ignore_pattern(name, ignore):
-                    ignored_weights.append(name)
-        # Expert conversion tasks are local; reject conflicts on every rank
-        # before any rank enters Bridge's export collectives.
-        if torch.distributed.is_initialized():
-            ignored_weights = gather_jagged_object_lists(ignored_weights)
-        if ignored_weights:
-            raise ValueError(
-                f"Calibrated quantized weights {sorted(set(ignored_weights))!r} "
-                "conflict with generation.real_quant_ignore; disable their "
-                "quantizers in policy.quant_cfg or remove the rollout exclusion."
-            )
-        yield from self.megatron_bridge.export_hf_weights_modelopt(
-            [self.model],
-            cpu=export_cpu_offload,
-            show_progress=False,
-            export_plan=plan,
-        )
-
-        if self.draft_model is not None:
-            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
-
-            for name, tensor in export_eagle_weights_to_hf(self.draft_model):
-                yield f"draft.{name}", tensor
-
-        if not vllm_cfg["kv_cache_dtype"].startswith("fp8"):
-            return
-
-        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
-            get_vllm_qkv_scale_names,
-        )
-
-        keys: list[str] = []
-        for layer_idx in range(self.megatron_bridge.transformer_config.num_layers):
-            keys.extend(get_vllm_qkv_scale_names(layer_idx).values())
-
-        for param_name in keys:
-            scale_value = (
-                kv_scales[param_name] if kv_scales and param_name in kv_scales else 1.0
-            )
-            yield (
-                param_name,
-                torch.tensor(
-                    scale_value,
-                    dtype=torch.float32,
-                    device="cuda",
-                ).reshape(1),
-            )
 
     @staticmethod
     def _find_weight_quantizer(
@@ -634,7 +655,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if name not in existing_names:
                     yield name, amax
 
-    def _iter_params_with_optional_kv_scales(self, kv_scales=None):
+    def _iter_params_with_optional_kv_scales(
+        self,
+        kv_scales: dict[str, float] | None = None,
+        conversion_tasks=None,
+        include_draft: bool = True,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Pre-fold weights on-the-fly via lazy proxy tasks.
 
         Wraps each conversion task so that reading task.param_weight returns
@@ -647,6 +673,10 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 with context about which parameter caused the failure.
         """
         if self._use_real_quant_refit():
+            if conversion_tasks is not None:
+                raise NotImplementedError(
+                    "ModelOpt real-quant refit does not support filtered conversion tasks"
+                )
             yield from self._iter_real_quant_refit_params(kv_scales)
             return
 
@@ -681,9 +711,11 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             def __getattr__(self, name):
                 return getattr(self._task, name)
 
+        if conversion_tasks is None:
+            conversion_tasks = self.refit_conversion_tasks
         folded_tasks = []
         skipped_fold = []
-        for task in self.refit_conversion_tasks:
+        for task in conversion_tasks:
             matched_wq = self._find_weight_quantizer(
                 task.megatron_module, task.param_weight
             )
@@ -705,17 +737,19 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 f"that share a module with weight_quantizer: {skipped_fold[:5]}"
             )
 
-        original_tasks = self.refit_conversion_tasks
-        self.refit_conversion_tasks = folded_tasks
         try:
             yielded_names = set()
-            for name, tensor in super()._iter_params_with_optional_kv_scales(kv_scales):
+            for name, tensor in super()._iter_params_with_optional_kv_scales(
+                kv_scales,
+                conversion_tasks=folded_tasks,
+                include_draft=include_draft,
+            ):
                 if "weight_quantizer" in name:
                     continue
                 yielded_names.add(name)
                 yield name, tensor
             yield from self._iter_input_quantizer_amax_params(
-                original_tasks,
+                conversion_tasks,
                 yielded_names,
             )
         except RuntimeError:
@@ -727,5 +761,3 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 f"{skipped_fold[:5] if skipped_fold else 'none'}. "
                 f"Cause: {e}"
             ) from e
-        finally:
-            self.refit_conversion_tasks = original_tasks

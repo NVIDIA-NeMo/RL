@@ -40,10 +40,12 @@ source-sensitive compatibility patches:
 import ast
 import asyncio
 import inspect
+import json
 import logging
 import os
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -66,7 +68,7 @@ _PATCH_FN = "_patch_vllm_tool_parser_namespace_tool"
 _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
-_RADIO_MARKER = "ls_param.data.fill_(initializer_factor)"
+_RADIO_MARKER = "and not ls_param.is_meta"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
@@ -429,7 +431,7 @@ def test_radio_layerscale_patch_loads_explicit_and_initializes_folded_weights(
     content = patched_radio_source.read_text()
     assert 'vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"' in content
     assert 'ls_name.endswith((".ls1", ".ls2"))' in content
-    assert "ls_param.data.fill_(initializer_factor)" in content
+    assert "and not ls_param.is_meta" in content
     assert "loaded_params.add(ls_name)" in content
 
 
@@ -451,7 +453,7 @@ def test_radio_layerscale_patch_keeps_values_loaded_by_earlier_refit_batches(
         for node in radio_model.body
         if isinstance(node, ast.FunctionDef) and node.name == "load_weights"
     )
-    namespace = {"default_weight_loader": default_weight_loader}
+    namespace = {"default_weight_loader": default_weight_loader, "torch": torch}
     exec(
         compile(ast.Module(body=[load_weights], type_ignores=[]), "<radio>", "exec"),
         namespace,
@@ -505,6 +507,67 @@ def test_radio_layerscale_patch_is_idempotent(patched_radio_source, monkeypatch)
     patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
 
     assert patched_radio_source.read_text() == before
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_radio_defaults_never_use_a_stale_base_checkpoint(tmp_path, indexed):
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    (actual / "model.safetensors").touch()
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"vision_model.encoder.weight": "base.safetensors"}})
+    )
+    if indexed:
+        (actual / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "vision_model.encoder.layer_scale1.lambda1": "actual.safetensors"
+                    }
+                }
+            )
+        )
+    config = SimpleNamespace(
+        model=str(actual),
+        revision=None,
+        hf_config=SimpleNamespace(
+            _name_or_path=str(base),
+            vision_config=SimpleNamespace(model_type="radio", layerscale_value=1.0),
+        ),
+    )
+    assert not patches._radio_has_identity_checkpoint(config)
+
+
+@pytest.mark.vllm
+def test_vision_loader_patches_upgrade_existing_outputs(
+    patched_radio_source, tmp_path, monkeypatch
+):
+    import vllm
+
+    previous, current = patch_snippets(_RADIO_PATCH_FN, "previous_snippet")
+    patched_radio_source.write_text(
+        patched_radio_source.read_text().replace(current, previous, 1)
+    )
+    patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
+    assert current in patched_radio_source.read_text()
+
+    model_file = tmp_path / "nano_nemotron_vl.py"
+    source = Path(vllm.__file__).parent / "model_executor/models/nano_nemotron_vl.py"
+    model_file.write_text(source.read_text())
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda relative: str(model_file))
+    patches._patch_vllm_radio_final_layernorm(logging.getLogger(__name__))
+    previous, current = patch_snippets(
+        "_patch_vllm_radio_final_layernorm", "previous_loader", "hook_loader"
+    )
+    model_file.write_text(model_file.read_text().replace(current, previous, 1))
+    patches._patch_vllm_radio_final_layernorm(logging.getLogger(__name__))
+    patches._patch_vllm_nano_vl_projector_loader(logging.getLogger(__name__))
+    final = model_file.read_text()
+    patches._patch_vllm_radio_final_layernorm(logging.getLogger(__name__))
+    patches._patch_vllm_nano_vl_projector_loader(logging.getLogger(__name__))
+    assert model_file.read_text() == final
 
 
 def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, caplog):
@@ -851,6 +914,7 @@ def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_radio_layerscale_loader",
         "_patch_vllm_radio_native_loader",
         "_patch_vllm_radio_final_layernorm",
+        "_patch_vllm_nano_vl_projector_loader",
         "_patch_vllm_glm_decoder_sequence_parallel_moe",
     ):
         monkeypatch.setattr(patches, patch_name, lambda _logger: None)
@@ -980,13 +1044,15 @@ def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
         *,
         extra_env_vars,
         nemotron_h_fp32_lm_head,
-        require_moe_routed_experts_capture: patch_calls.append(
-            {
-                "py": py,
-                "extra_env_vars": extra_env_vars,
-                "nemotron_h_fp32_lm_head": nemotron_h_fp32_lm_head,
-                "require_moe_routed_experts_capture": require_moe_routed_experts_capture,
-            }
+        require_moe_routed_experts_capture: (
+            patch_calls.append(
+                {
+                    "py": py,
+                    "extra_env_vars": extra_env_vars,
+                    "nemotron_h_fp32_lm_head": nemotron_h_fp32_lm_head,
+                    "require_moe_routed_experts_capture": require_moe_routed_experts_capture,
+                }
+            )
         ),
     )
 

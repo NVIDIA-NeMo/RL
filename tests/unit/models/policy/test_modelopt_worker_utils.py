@@ -146,7 +146,11 @@ def test_get_forward_loop_func_prefills_random_megatron_data(monkeypatch):
 
     loop = worker_utils.get_forward_loop_func(
         is_megatron=True,
-        tokenizer=None,
+        tokenizer=types.SimpleNamespace(
+            get_vocab=lambda: {str(i): i for i in range(4)},
+            all_special_ids=[],
+            added_tokens_decoder={},
+        ),
         dataset_name="random",
         batch_size=1,
         num_samples=1,
@@ -158,6 +162,70 @@ def test_get_forward_loop_func_prefills_random_megatron_data(monkeypatch):
     assert seen[0][0] == "model"
     torch.testing.assert_close(seen[0][1], input_ids)
     assert seen[0][2] is True
+
+
+def test_random_calibration_samples_sorted_ordinary_vocabulary(monkeypatch):
+    seen = []
+    vocab = {"text": 101, "image": 18, "alias": 101, "audio": 36, "word": 7}
+    tokenizer = types.SimpleNamespace(
+        get_vocab=lambda: vocab,
+        all_special_ids=[18],
+        added_tokens_decoder={
+            36: types.SimpleNamespace(special=True),
+            101: types.SimpleNamespace(special=False),
+        },
+    )
+    monkeypatch.setattr(
+        worker_utils.parallel_state, "get_context_parallel_world_size", lambda: 1
+    )
+
+    monkeypatch.setattr(
+        worker_utils,
+        "megatron_prefill",
+        lambda model, input_ids, **kwargs: seen.append(input_ids.clone()),
+    )
+    results = []
+    for vocab in (vocab, dict(reversed(list(vocab.items())))):
+        seen.clear()
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(42)
+            loop = worker_utils.get_forward_loop_func(
+                is_megatron=True,
+                tokenizer=tokenizer,
+                dataset_name="random",
+                batch_size=2,
+                num_samples=3,
+                sample_length=16,
+                device=torch.device("cpu"),
+            )
+        loop("model")
+        assert [tuple(batch.shape) for batch in seen] == [(2, 16), (1, 16)]
+        tokens = torch.cat(seen)
+        assert set(tokens.flatten().tolist()) == {7, 101}
+        assert tokens.dtype == torch.long and tokens.device.type == "cpu"
+        results.append(tokens)
+    torch.testing.assert_close(*results)
+
+
+def test_random_calibration_requires_ordinary_vocabulary(monkeypatch):
+    monkeypatch.setattr(
+        worker_utils.parallel_state, "get_context_parallel_world_size", lambda: 1
+    )
+    tokenizer = types.SimpleNamespace(
+        get_vocab=lambda: {"image": 18},
+        all_special_ids=[18],
+        added_tokens_decoder={},
+    )
+    with pytest.raises(ValueError, match="ordinary tokenizer IDs"):
+        worker_utils.get_forward_loop_func(
+            is_megatron=True,
+            tokenizer=tokenizer,
+            dataset_name="random",
+            batch_size=1,
+            num_samples=1,
+            sample_length=3,
+            device=torch.device("cpu"),
+        )
 
 
 def test_get_forward_loop_func_rejects_random_megatron_context_parallelism(
