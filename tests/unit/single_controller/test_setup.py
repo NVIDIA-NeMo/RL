@@ -3542,7 +3542,8 @@ def test_forest_router_is_validated_before_rollout_manager(
             ]
     if forest_training:
         trainer.worker_group.run_all_workers_single_data.assert_called_once_with(
-            "validate_forest_execution_padding"
+            "validate_forest_execution_padding",
+            exclude_padding_from_router_stats=False,
         )
     else:
         trainer.worker_group.run_all_workers_single_data.assert_not_called()

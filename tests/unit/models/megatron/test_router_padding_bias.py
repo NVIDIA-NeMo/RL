@@ -82,12 +82,75 @@ def test_forest_allows_bias_updates_but_keeps_other_router_guards(
     validate = module.MegatronPolicyWorkerImpl.validate_forest_execution_padding
     if rejected:
         with pytest.raises(ValueError, match="dropless per-token MoE routing"):
-            validate(worker)
+            validate(worker, exclude_padding_from_router_stats=False)
     else:
-        validate(worker)
+        validate(worker, exclude_padding_from_router_stats=False)
     assert config.moe_router_bias_update_rate == overrides.get(
         "moe_router_bias_update_rate", 0.0
     )
+
+
+def _unmaskable(*_args, **_kwargs):
+    raise ValueError(
+        "Expert-bias padding masks are unsupported for "
+        "HybridBlock chunkwise context parallelism."
+    )
+
+
+@pytest.mark.parametrize("critic", [False, True])
+@pytest.mark.parametrize("exclude", [False, True])
+def test_forest_router_exclusion_is_checked_only_when_requested(
+    monkeypatch, critic, exclude
+):
+    """Without the option, a model that cannot mask padding (e.g. chunkwise CP)
+    still runs; with it, setup fails instead of ignoring the option."""
+    from nemo_rl.models.policy.workers import megatron_policy_worker as policy
+    from nemo_rl.models.value.workers import megatron_value_worker as value
+
+    monkeypatch.setattr(policy, "_model_needs_router_padding_mask", _unmaskable)
+    monkeypatch.setattr(policy, "validate_forest_routers", lambda _model: None)
+    monkeypatch.setattr(value, "validate_forest_routers", lambda _model: None)
+    packing = {"sequence_packing": {"enabled": True}}
+    if critic:
+        worker = SimpleNamespace(
+            model=object(),
+            _policy_like_cfg=packing,
+            _forest_router_padding_mask=False,
+        )
+        validate = value.MegatronValueWorkerImpl.validate_forest_execution_padding
+    else:
+        worker = SimpleNamespace(model=object(), cfg=packing)
+        validate = policy.MegatronPolicyWorkerImpl.validate_forest_execution_padding
+
+    if exclude:
+        with pytest.raises(ValueError, match="exclude_padding_from_router_stats"):
+            validate(worker, exclude_padding_from_router_stats=True)
+    else:
+        validate(worker, exclude_padding_from_router_stats=False)
+        if critic:
+            assert worker._forest_router_padding_mask is False
+
+
+@pytest.mark.parametrize("needs_mask", [False, True])
+def test_forest_critic_masks_router_padding_when_requested(monkeypatch, needs_mask):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as policy
+    from nemo_rl.models.value.workers import megatron_value_worker as value
+
+    monkeypatch.setattr(
+        policy, "_model_needs_router_padding_mask", lambda *_a, **_k: needs_mask
+    )
+    monkeypatch.setattr(value, "validate_forest_routers", lambda _model: None)
+    worker = SimpleNamespace(
+        model=object(),
+        _policy_like_cfg={"sequence_packing": {"enabled": False}},
+        _forest_router_padding_mask=False,
+    )
+
+    value.MegatronValueWorkerImpl.validate_forest_execution_padding(
+        worker, exclude_padding_from_router_stats=True
+    )
+
+    assert worker._forest_router_padding_mask is needs_mask
 
 
 def _processed(monkeypatch, multiple, enabled=True, lengths=True):
@@ -471,3 +534,97 @@ def test_prepacked_hybridep_chunkwise_fallback(monkeypatch, caplog, chunkwise):
     assert model.config.moe_router_bias_update_rate == 0.001
     assert cfg["megatron_cfg"]["moe_flex_dispatcher_backend"] == "hybridep"
     assert len(caplog.records) == int(chunkwise)
+
+
+@pytest.mark.parametrize(
+    "excluded,expected",
+    [
+        ([True, False], [21, 22, 23, 24, 25]),
+        # A later excluded row must not shift the earlier rows' packed offsets.
+        ([False, True], [11, 12, 13]),
+        ([True, True], []),
+    ],
+)
+@pytest.mark.parametrize("pack", [False, True])
+def test_forest_excluded_rows_never_reach_expert_bias(
+    monkeypatch, pack, excluded, expected
+):
+    from nemo_rl.data_plane.schema import ROUTER_EXCLUDED_ROWS
+    from nemo_rl.models.megatron import data as module
+
+    monkeypatch.setattr(module, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(module, "get_context_parallel_world_size", lambda: 1)
+    batch = _packed_batch()
+    # Excluded rows are Forest padding: real-looking tokens that must not vote.
+    batch[ROUTER_EXCLUDED_ROWS] = torch.tensor(excluded)
+    kwargs = (
+        dict(
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            pad_individual_seqs_to_multiple_of=4,
+            create_packed_seq_padding_mask=True,
+        )
+        if pack
+        else dict(
+            pack_sequences=False,
+            pad_individual_seqs_to_multiple_of=1,
+            create_nonpacked_router_padding_mask=True,
+        )
+    )
+    processed = module.process_microbatch(batch, **kwargs)
+    counted = ~processed.padding_mask.reshape(-1)
+    tokens = processed.input_ids.reshape(-1)[counted]
+    assert tokens.tolist() == expected
+
+
+def test_router_cu_seqlens_collapses_excluded_rows_in_place():
+    from nemo_rl.data_plane.schema import ROUTER_EXCLUDED_ROWS
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron.data import _router_cu_seqlens
+
+    cu_seqlens = torch.tensor([0, 3, 8, 10], dtype=torch.int32)
+    assert _router_cu_seqlens(cu_seqlens, BatchedDataDict({})) is cu_seqlens
+    batch = BatchedDataDict({ROUTER_EXCLUDED_ROWS: torch.tensor([False, True, False])})
+    result = _router_cu_seqlens(cu_seqlens, batch)
+    assert result.dtype == torch.int32
+    assert result.tolist() == [0, 3, 3, 5]
+
+
+def test_router_valid_lengths_needs_one_flag_per_row():
+    from nemo_rl.data_plane.schema import ROUTER_EXCLUDED_ROWS
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron.data import _router_valid_lengths
+
+    lengths = torch.tensor([3, 5])
+    assert _router_valid_lengths(lengths, BatchedDataDict({})) is lengths
+    batch = BatchedDataDict({ROUTER_EXCLUDED_ROWS: torch.tensor([True, False, False])})
+    with pytest.raises(ValueError, match="one flag per row"):
+        _router_valid_lengths(lengths, batch)
+
+
+def test_forest_router_check_allows_bias_updates_but_not_capacity():
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        validate_forest_routers,
+    )
+
+    router = TopKRouter.__new__(TopKRouter)
+    torch.nn.Module.__init__(router)
+    router.routing_type = "none"
+    router.enable_expert_bias = True
+    router.frozen_expert_bias = False
+    router.config = SimpleNamespace(
+        moe_expert_capacity_factor=None,
+        moe_expert_rank_capacity_factor=None,
+        moe_pad_experts_for_cuda_graph_inference=False,
+        moe_token_dropping=False,
+        moe_router_load_balancing_type="none",
+        moe_aux_loss_coeff=0.0,
+        moe_router_bias_update_rate=0.001,
+    )
+    model = torch.nn.Sequential(router)
+    validate_forest_routers(model)
+    router.config.moe_expert_capacity_factor = 1.0
+    with pytest.raises(ValueError, match="dropless"):
+        validate_forest_routers(model)

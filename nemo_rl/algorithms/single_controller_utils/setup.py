@@ -2361,12 +2361,17 @@ def setup_single_controller(
         )
     if token_capture_cfg.forest_training:
         # Padding or borrowed inputs may appear in any step. Validate the loaded
-        # model before admitting rollouts, even if the first batch needs neither.
-        ray.get(
-            trainer.worker_group.run_all_workers_single_data(
-                "validate_forest_execution_padding"
-            )
-        )
+        # models before admitting rollouts, even if the first batch needs neither.
+        for consumer in (trainer, value):
+            if consumer is not None:
+                ray.get(
+                    consumer.worker_group.run_all_workers_single_data(
+                        "validate_forest_execution_padding",
+                        exclude_padding_from_router_stats=(
+                            token_capture_cfg.exclude_padding_from_router_stats
+                        ),
+                    )
+                )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,

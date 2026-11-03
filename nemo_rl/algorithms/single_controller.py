@@ -177,8 +177,10 @@ from nemo_rl.data_plane.observability import (
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
+    DP_VALUE_TRAIN_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
+    ROUTER_EXCLUDED_ROWS,
     SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -499,6 +501,14 @@ class SingleControllerActor:
             reference_logprobs_required=self._reference_logprobs_required,
             score_centering=master_config.loss_fn.score_centering,
         )
+        # Workers mask these rows out of expert-bias statistics only when fetched.
+        self._router_excluded_fields: tuple[str, ...] = (
+            (ROUTER_EXCLUDED_ROWS,)
+            if master_config.token_capture.forest_training
+            and master_config.token_capture.exclude_padding_from_router_stats
+            else ()
+        )
+        self._train_fields += self._router_excluded_fields
         self._dp_client = actor_args.dp_client
         if master_config.data_plane["backend"] == "mooncake_cpu":
             if actor_args.last_checkpoint_path is not None or (
@@ -6502,11 +6512,19 @@ class SingleControllerActor:
             full_meta = metas[0].concat(*metas[1:])
             for _ in range(num_epochs):
                 result = await asyncio.to_thread(
-                    self._value.train_from_meta, full_meta, value_loss_fn, gbs=gbs
+                    self._value.train_from_meta,
+                    full_meta,
+                    value_loss_fn,
+                    gbs=gbs,
+                    train_fields=(
+                        *DP_VALUE_TRAIN_FIELDS,
+                        *self._router_excluded_fields,
+                    ),
                 )
         else:
             # Split prepares the API for per-chunk value streaming in a later PR;
-            # this controller still trains the critic after policy refit.
+            # this controller still trains the critic after policy refit. Forest,
+            # the only source of router-excluded rows, requires whole_batch.
             for _ in range(num_epochs):
                 await asyncio.to_thread(
                     self._value.begin_train_step, value_loss_fn, gbs=gbs

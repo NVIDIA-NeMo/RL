@@ -19,7 +19,7 @@ pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
 from responses_api_models.vllm_model.tests import test_framework_context as gym
 
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTER_EXCLUDED_ROWS
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.environments.call_selection import select_captured_calls
 from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
@@ -1264,6 +1264,27 @@ def test_forest_shaping_and_observations_are_per_owner(
         ].item()
         == 0
     )
+
+
+def test_forest_rows_flag_padding_for_router_statistics(forest: ForestCapture) -> None:
+    records, _ = forest.capture([None, 0, None])
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [receipt(records, terminal=records[1])],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[selection(records)],
+        execution_row_multiple=4,
+    )
+    flags = [
+        forest.plane.rows["canonical", key][ROUTER_EXCLUDED_ROWS].item()
+        for key in result.meta.sample_ids
+    ]
+    assert flags == [False, False, True, True]
 
 
 def test_publication_identity_drift_preserves_staging(forest, monkeypatch):

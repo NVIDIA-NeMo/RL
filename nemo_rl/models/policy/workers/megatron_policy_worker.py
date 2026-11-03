@@ -273,6 +273,49 @@ def _model_has_chunkwise_cp(model: Any) -> bool:
     )
 
 
+def require_router_padding_exclusion(model: Any, *, pack_sequences: bool) -> bool:
+    """Back token_capture.exclude_padding_from_router_stats on one model.
+
+    Returns whether its expert-bias statistics need the padding mask, and
+    raises when the model cannot take one, so the option is never ignored.
+    """
+    try:
+        return _model_needs_router_padding_mask(model, pack_sequences=pack_sequences)
+    except ValueError as error:
+        raise ValueError(
+            f"token_capture.exclude_padding_from_router_stats=true: {error}"
+        ) from error
+
+
+def validate_forest_routers(model: Any) -> None:
+    """Reject routers that Forest execution padding could perturb.
+
+    Padding rows and failed owners' borrowed inputs run through the model, so
+    routing must be dropless and per-token.
+    """
+    # TODO: Exclude artificial inputs from expert-bias update counts; see
+    # https://github.com/NVIDIA-NeMo/RL/pull/4519. Allow configured updates
+    # meanwhile: dummy rows can affect the counts despite zero policy loss.
+    for chunk in _unwrapped_chunks(model):
+        for module in chunk.modules():
+            if not isinstance(module, Router):
+                continue
+            config = module.config
+            if (
+                not isinstance(module, TopKRouter)
+                or module.routing_type in ("sinkhorn", "quantile_balancing")
+                or config.moe_expert_capacity_factor is not None
+                or config.moe_expert_rank_capacity_factor is not None
+                or config.moe_pad_experts_for_cuda_graph_inference
+                or config.moe_token_dropping
+                or get_aux_loss_track_names(config)
+            ):
+                raise ValueError(
+                    "Forest execution padding requires dropless per-token MoE routing "
+                    "without auxiliary losses"
+                )
+
+
 def _model_needs_router_padding_mask(
     model: Any,
     *,
@@ -733,34 +776,22 @@ class MegatronPolicyWorkerImpl(
         """Return the route layout from the initialized Megatron model config."""
         return router_replay_layout(self._get_model_config())
 
-    def validate_forest_execution_padding(self) -> None:
+    def validate_forest_execution_padding(
+        self, *, exclude_padding_from_router_stats: bool
+    ) -> None:
         """Reject unqualified dummy-sensitive routers in the actual loaded model.
 
         Policy/reference logprobs and training use this same model (reference
         inference swaps weights only). Inspect nested routers, not just the outer
         VLM config, after checkpoint settings and provider overrides resolve.
+        With exclude_padding_from_router_stats, also require that the model can
+        mask those rows out of its expert-bias statistics.
         """
-        # TODO: Exclude artificial inputs from expert-bias update counts; see
-        # https://github.com/NVIDIA-NeMo/RL/pull/4519. Allow configured updates
-        # meanwhile: dummy rows can affect the counts despite zero policy loss.
-        for chunk in _unwrapped_chunks(self.model):
-            for module in chunk.modules():
-                if not isinstance(module, Router):
-                    continue
-                config = module.config
-                if (
-                    not isinstance(module, TopKRouter)
-                    or module.routing_type in ("sinkhorn", "quantile_balancing")
-                    or config.moe_expert_capacity_factor is not None
-                    or config.moe_expert_rank_capacity_factor is not None
-                    or config.moe_pad_experts_for_cuda_graph_inference
-                    or config.moe_token_dropping
-                    or get_aux_loss_track_names(config)
-                ):
-                    raise ValueError(
-                        "Forest execution padding requires dropless per-token MoE routing "
-                        "without auxiliary losses"
-                    )
+        validate_forest_routers(self.model)
+        if exclude_padding_from_router_stats:
+            require_router_padding_exclusion(
+                self.model, pack_sequences=self.cfg["sequence_packing"]["enabled"]
+            )
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
