@@ -273,7 +273,6 @@ def test_dflash_fp32_forward_and_input_gradients_match_dense_oracle() -> None:
     plan = replace(
         plan,
         anchor_positions=torch.tensor([2, 2], dtype=torch.int64),
-        trunk_lengths=torch.tensor([2, 2], dtype=torch.int64),
         query_positions=torch.tensor([[2, 3, 4], [2, 3, 4]], dtype=torch.int64),
         label_positions=torch.tensor([[2, 3, 4], [2, 3, 4]], dtype=torch.int64),
     )
@@ -317,6 +316,28 @@ def test_dflash_fp32_forward_and_input_gradients_match_dense_oracle() -> None:
         )
 
 
+def test_forward_projects_queries_only_for_block_slots() -> None:
+    body = DFlashBody(
+        _tiny_config(num_hidden_layers=1),
+        parallel_config=_fp32_parallel_config(),
+    )
+    plan = _plan(torch.ones((2, 5), dtype=torch.bool), gamma=2)
+    query_shapes: list[tuple[int, ...]] = []
+    hook = body.layers[0].self_attn.q_proj.register_forward_pre_hook(
+        lambda _module, inputs: query_shapes.append(tuple(inputs[0].shape))
+    )
+    try:
+        body(
+            target_taps=torch.randn(2, 5, 2, 8),
+            block_embeddings=torch.randn(2, 3, 8),
+            plan=plan,
+        )
+    finally:
+        hook.remove()
+
+    assert query_shapes == [(2, plan.block_size, 8)]
+
+
 def test_forward_builds_each_rope_table_once() -> None:
     torch.manual_seed(2027)
     body = DFlashBody(
@@ -351,7 +372,6 @@ def test_repeated_block_embeddings_become_slot_distinct_through_rope() -> None:
     plan = replace(
         plan,
         anchor_positions=torch.tensor([1], dtype=torch.int64),
-        trunk_lengths=torch.tensor([1], dtype=torch.int64),
         query_positions=torch.arange(1, 5, dtype=torch.int64)[None],
         label_positions=torch.arange(1, 5, dtype=torch.int64)[None],
     )
@@ -408,7 +428,6 @@ def test_rope_positions_do_not_wrap(position: int) -> None:
     base_plan = replace(
         base_plan,
         anchor_positions=torch.tensor([1], dtype=torch.int64),
-        trunk_lengths=torch.tensor([1], dtype=torch.int64),
         query_positions=torch.arange(1, 4, dtype=torch.int64)[None],
         label_positions=torch.arange(1, 4, dtype=torch.int64)[None],
     )

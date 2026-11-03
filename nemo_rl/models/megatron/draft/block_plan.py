@@ -51,12 +51,9 @@ class DFlashBatchPlan:
     block_size: int
     token_valid_mask: Tensor
     sample_rows: Tensor
-    anchor_ids: Tensor
     anchor_positions: Tensor
-    trunk_lengths: Tensor
     query_positions: Tensor
     label_positions: Tensor
-    block_valid: Tensor
     slot_valid: Tensor
     loss_mask: Tensor
     global_anchor_positions: Tensor
@@ -276,6 +273,8 @@ def build_dflash_batch_plan(
 ) -> DFlashBatchPlan:
     """Build a deterministic, device-resident DFlash anchor schedule.
 
+    Called by DFlashSpeculator.prepare_batch in PR #3757.
+
     The schedule for a row depends only on ``sample_ids[row]``,
     ``optimizer_step``, ``seed`` and the anchor slot. It does not depend on the
     row position, the microbatch split or the data-parallel rank. Thus, a
@@ -357,23 +356,9 @@ def build_dflash_batch_plan(
             torch.zeros_like(anchor_positions_2d),
         )
 
-    valid_prefix_counts = torch.cat(
-        (
-            torch.zeros((batch_size, 1), dtype=torch.int64, device=device),
-            token_valid_mask.cumsum(dim=1, dtype=torch.int64),
-        ),
-        dim=1,
-    )
-    trunk_lengths_2d = torch.gather(
-        valid_prefix_counts,
-        dim=1,
-        index=anchor_positions_2d,
-    )
-
     sample_rows = torch.arange(batch_size, device=device).repeat_interleave(
         anchors_per_sample
     )
-    anchor_ids = anchor_ids_2d.reshape(-1)
     anchor_positions = anchor_positions_2d.reshape(-1)
     block_valid = row_block_valid.repeat_interleave(anchors_per_sample)
 
@@ -401,12 +386,9 @@ def build_dflash_batch_plan(
         block_size=block_size,
         token_valid_mask=token_valid_mask,
         sample_rows=sample_rows,
-        anchor_ids=anchor_ids,
         anchor_positions=anchor_positions,
-        trunk_lengths=trunk_lengths_2d.reshape(-1),
         query_positions=query_positions,
         label_positions=query_positions,
-        block_valid=block_valid,
         slot_valid=slot_valid,
         loss_mask=loss_mask,
         global_anchor_positions=anchor_positions,

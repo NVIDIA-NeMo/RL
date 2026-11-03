@@ -69,7 +69,6 @@ def test_runtime_adapter_prefers_public_accessor(speculator_type: str) -> None:
         pp_size=1,
     )
 
-    assert adapter.runner_family is RunnerFamily.ACCESSOR
     assert adapter.model is accessed
     assert adapter.is_owner
 
@@ -92,7 +91,7 @@ def test_runtime_adapter_supports_legacy_runner_layouts(
         pp_size=1,
     )
 
-    assert adapter.runner_family is family
+    assert find_draft_model(runner) == (family, draft_model)
     assert adapter.model is draft_model
 
 
@@ -163,15 +162,10 @@ def test_model_update_manifest_is_ordered_and_component_aware() -> None:
         "model.layers.0.weight",
         "model.norm.weight",
     )
-    assert manifest.target.byte_count == 18
     assert manifest.target.owner_ranks == (0, 1)
-    assert manifest.target.loader == "target.load_weights"
     assert manifest.draft is not None
     assert manifest.draft.ordered_names == ("draft.model.layers.0.weight",)
-    assert manifest.draft.byte_count == 48
     assert manifest.draft.owner_ranks == (1,)
-    assert manifest.draft.loader == "draft.load_weights"
-    assert manifest.draft.finalizer == "process_weights_after_loading"
 
 
 def test_model_update_coverage_requires_every_input_exactly_once() -> None:

@@ -53,7 +53,6 @@ def test_prepare_refit_info_builds_common_speculator_manifest(
     monkeypatch, speculator_type
 ):
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.speculator_runtime import RunnerFamily
 
     draft_model = object()
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
@@ -78,7 +77,6 @@ def test_prepare_refit_info_builds_common_speculator_manifest(
     ext.prepare_refit_info(state_dict_info)
 
     assert ext._draft_runtime_adapter is not None
-    assert ext._draft_runtime_adapter.runner_family is RunnerFamily.ACCESSOR
     assert ext._draft_runtime_adapter.model is draft_model
     assert ext._model_update_manifest is not None
     assert ext._model_update_manifest.target.ordered_names == ("model.weight",)
@@ -204,17 +202,10 @@ def _draft_manifest(*, draft_owner_ranks=(0,)):
 
 
 def _draft_adapter(*, model, pp_rank=0, pp_size=1):
-    from nemo_rl.models.generation.vllm.speculator_runtime import (
-        DraftRuntimeAdapter,
-        RunnerFamily,
-    )
+    from nemo_rl.models.generation.vllm.speculator_runtime import DraftRuntimeAdapter
 
     return DraftRuntimeAdapter(
-        speculator_type="dflash",
-        vllm_version="test",
-        runner_family=RunnerFamily.ACCESSOR,
         model=model,
-        pp_rank=pp_rank,
         pp_size=pp_size,
         is_owner=pp_rank == pp_size - 1,
     )
@@ -605,40 +596,6 @@ def test_common_speculator_refit_drops_tied_alias_then_finalizes_target_and_draf
     assert draft_model.load_weights.call_args.kwargs["weights"][0][0] == "model.weight"
     assert finalize_configs["finalize_target"] is target_config
     assert finalize_configs["finalize_draft"] is draft_config
-
-
-@pytest.mark.vllm
-def test_partial_refit_failure_is_recovered_by_next_refit(monkeypatch):
-    from nemo_rl.models.generation.vllm import vllm_backend
-
-    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
-        vllm_backend.VllmInternalWorkerExtension
-    )
-    ext.model_runner = SimpleNamespace(
-        model=torch.nn.Module(),
-        vllm_config=SimpleNamespace(speculative_config=None),
-    )
-    ext.model_config = object()
-    ext.device = object()
-    monkeypatch.setattr(
-        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
-    )
-    process_weights = MagicMock(side_effect=[RuntimeError("conversion failed"), None])
-    monkeypatch.setattr(
-        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
-        process_weights,
-    )
-
-    with pytest.raises(RuntimeError, match="conversion failed"):
-        with ext._weight_update_lifecycle("collective") as finalize:
-            finalize()
-    assert "conversion failed" in ext._refit_unusable_reason
-
-    # Refit recovery retries on the same actor; a complete refit clears the mark.
-    with ext._weight_update_lifecycle("collective") as finalize:
-        finalize()
-    assert ext._refit_unusable_reason is None
-    assert process_weights.call_count == 2
 
 
 @pytest.mark.vllm

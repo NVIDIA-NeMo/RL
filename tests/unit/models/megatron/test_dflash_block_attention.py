@@ -36,9 +36,6 @@ pytestmark = [
 
 _PLAN_MODULE = "nemo_rl.models.megatron.draft.block_plan"
 _ATTENTION_MODULE = "nemo_rl.models.megatron.draft.block_attention"
-_BENCHMARK_PATH = (
-    Path(__file__).parents[4] / "tools/benchmark_dflash_block_attention.py"
-)
 
 
 @pytest.fixture
@@ -56,105 +53,6 @@ def _load_module(module_name: str) -> ModuleType:
             f"DFlash production contract is missing: {error}",
             pytrace=False,
         )
-
-
-def _load_benchmark() -> ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        "benchmark_dflash_block_attention",
-        _BENCHMARK_PATH,
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _small_benchmark_plan(benchmark: ModuleType) -> Any:
-    return benchmark._build_plan(
-        batch_size=1,
-        sequence_length=32,
-        anchors_per_sample=1,
-        block_size=16,
-        device=torch.device("cpu"),
-    )
-
-
-def test_benchmark_inputs_use_public_dflash_attention_geometry() -> None:
-    """Catches benchmark-only head geometry that production kernels never see."""
-    benchmark = _load_benchmark()
-    inputs = benchmark._make_inputs(
-        _small_benchmark_plan(benchmark),
-        device=torch.device("cpu"),
-    )
-
-    assert [tuple(tensor.shape) for tensor in inputs] == [
-        (1, 32, 8, 128),
-        (1, 32, 8, 128),
-        (1, 16, 32, 128),
-        (1, 16, 8, 128),
-        (1, 16, 8, 128),
-    ]
-
-
-def test_default_train_step_calls_production_block_only_attention(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Catches default timing of unused trunk-query attention."""
-    benchmark = _load_benchmark()
-    plan = _small_benchmark_plan(benchmark)
-    inputs = benchmark._make_inputs(plan, device=torch.device("cpu"))
-    calls = 0
-
-    def record_block_only_attention(**kwargs: Any) -> Tensor:
-        nonlocal calls
-        calls += 1
-        return _load_module(_ATTENTION_MODULE).dflash_block_only_attention(**kwargs)
-
-    monkeypatch.setattr(
-        benchmark,
-        "dflash_block_only_attention",
-        record_block_only_attention,
-        raising=False,
-    )
-    benchmark._train_step(plan, inputs)
-
-    assert calls == 1
-    assert all(tensor.grad is not None for tensor in inputs)
-
-
-def test_default_correctness_calls_production_block_only_attention(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Catches correctness evidence for a path the DFlash body does not execute."""
-    benchmark = _load_benchmark()
-    plan = _small_benchmark_plan(benchmark)
-    calls = 0
-
-    def record_block_only_attention(**kwargs: Any) -> Tensor:
-        nonlocal calls
-        calls += 1
-        return _load_module(_ATTENTION_MODULE).dflash_block_only_attention(**kwargs)
-
-    def run_without_cuda_timing(_device: torch.device, operation: Any) -> float:
-        operation()
-        return 0.0
-
-    monkeypatch.setattr(benchmark, "_build_plan", lambda **_kwargs: plan)
-    monkeypatch.setattr(benchmark, "_time_call", run_without_cuda_timing)
-    monkeypatch.setattr(
-        benchmark,
-        "dflash_block_only_attention",
-        record_block_only_attention,
-        raising=False,
-    )
-    record = benchmark._correctness_comparison(
-        device=torch.device("cpu"),
-        iterations=1,
-    )
-
-    assert calls == 2
-    assert record["kind"] == "block_only_forward_correctness_comparison"
-    assert record["attention_path"] == "dflash_block_only_attention"
 
 
 def _load_block_only_attention_contract() -> tuple[type[Any], Any]:
@@ -189,11 +87,6 @@ def _make_plan(
         dtype=torch.int64,
         device=device,
     )
-    sequence_positions = torch.arange(sequence_length, device=device)
-    trunk_lengths = (
-        token_valid_mask[sample_rows_tensor]
-        & (sequence_positions.unsqueeze(0) < anchors_tensor.unsqueeze(1))
-    ).sum(dim=1)
     safe_positions = torch.clamp(
         anchors_tensor.unsqueeze(1) + torch.arange(block_size, device=device),
         min=0,
@@ -204,12 +97,9 @@ def _make_plan(
     return plan_type(
         token_valid_mask=token_valid_mask,
         sample_rows=sample_rows_tensor,
-        anchor_ids=torch.arange(num_blocks, dtype=torch.int64, device=device),
         anchor_positions=anchors_tensor,
-        trunk_lengths=trunk_lengths,
         query_positions=safe_positions,
         label_positions=safe_positions.clone(),
-        block_valid=slot_valid.any(dim=1),
         slot_valid=slot_valid,
         loss_mask=loss_mask,
         global_anchor_positions=anchors_tensor,

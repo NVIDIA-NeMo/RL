@@ -134,22 +134,14 @@ def test_plan_has_fixed_shapes_and_excludes_conditioning_slot_from_loss() -> Non
     assert plan.block_size == 4
     assert plan.token_valid_mask.shape == (2, 17)
     assert plan.sample_rows.shape == (6,)
-    assert plan.anchor_ids.shape == (6,)
     assert plan.anchor_positions.shape == (6,)
-    assert plan.trunk_lengths.shape == (6,)
     assert plan.query_positions.shape == (6, 4)
     assert plan.label_positions.shape == (6, 4)
-    assert plan.block_valid.shape == (6,)
     assert plan.slot_valid.shape == (6, 4)
     assert plan.loss_mask.shape == (6, 4)
 
     assert torch.equal(plan.sample_rows, torch.tensor([0, 0, 0, 1, 1, 1]))
-    assert torch.equal(
-        plan.anchor_ids,
-        torch.tensor([2407, 2466, 2525, 2424, 2483, 2542]),
-    )
     assert torch.equal(plan.anchor_positions, torch.tensor([7, 4, 6, 7, 1, 7]))
-    assert torch.equal(plan.trunk_lengths, plan.anchor_positions)
     assert torch.equal(
         plan.query_positions,
         torch.tensor(
@@ -164,7 +156,6 @@ def test_plan_has_fixed_shapes_and_excludes_conditioning_slot_from_loss() -> Non
         ),
     )
     assert torch.equal(plan.label_positions, plan.query_positions)
-    assert plan.block_valid.all()
     assert plan.slot_valid.all()
     assert torch.equal(
         plan.loss_mask,
@@ -210,14 +201,11 @@ def test_anchor_identity_is_stable_across_batch_permutation_and_slicing() -> Non
         seed=5,
     )
 
-    full_ids = full.anchor_ids.reshape(3, 2)
     full_positions = full.anchor_positions.reshape(3, 2)
-    assert torch.equal(permuted.anchor_ids.reshape(3, 2), full_ids[permutation])
     assert torch.equal(
         permuted.anchor_positions.reshape(3, 2),
         full_positions[permutation],
     )
-    assert torch.equal(sliced.anchor_ids.reshape(2, 2), full_ids[1:])
     assert torch.equal(sliced.anchor_positions.reshape(2, 2), full_positions[1:])
 
 
@@ -235,11 +223,9 @@ def test_duplicate_sample_ids_intentionally_repeat_anchor_schedule() -> None:
         seed=8,
     )
 
-    anchor_ids = plan.anchor_ids.reshape(3, 4)
     anchors = plan.anchor_positions.reshape(3, 4)
-    assert torch.equal(anchor_ids[0], anchor_ids[2])
     assert torch.equal(anchors[0], anchors[2])
-    assert not torch.equal(anchor_ids[0], anchor_ids[1])
+    assert not torch.equal(anchors[0], anchors[1])
 
 
 def test_optimizer_step_and_seed_change_stable_anchor_identity() -> None:
@@ -271,8 +257,6 @@ def test_optimizer_step_and_seed_change_stable_anchor_identity() -> None:
         seed=12,
     )
 
-    assert torch.equal(next_step.anchor_ids - base.anchor_ids, torch.full((3,), 31))
-    assert torch.equal(next_seed.anchor_ids - base.anchor_ids, torch.full((3,), 43))
     assert not torch.equal(next_step.anchor_positions, base.anchor_positions)
     assert not torch.equal(next_seed.anchor_positions, base.anchor_positions)
 
@@ -317,16 +301,11 @@ def test_tail_and_empty_rows_emit_only_safe_invalid_slots() -> None:
     )
 
     assert torch.equal(
-        plan.block_valid,
-        torch.tensor([True, True, False, False, False, False]),
-    )
-    assert torch.equal(
         plan.query_positions[:2],
         torch.tensor([[1, 2, 3, 4], [0, 1, 2, 3]]),
     )
     assert torch.equal(plan.query_positions[2:], torch.zeros((4, 4), dtype=torch.int64))
     assert torch.equal(plan.label_positions[2:], torch.zeros((4, 4), dtype=torch.int64))
-    assert torch.equal(plan.trunk_lengths, torch.tensor([1, 0, 0, 0, 0, 0]))
     assert plan.slot_valid[:2].all()
     assert not plan.slot_valid[2:].any()
     assert not plan.loss_mask[:, 0].any()
@@ -349,13 +328,8 @@ def test_noncontiguous_masks_schedule_only_full_valid_windows() -> None:
         seed=0,
     )
 
-    assert plan.block_valid.all()
     assert set(plan.anchor_positions.tolist()) <= {1, 5}
     assert plan.slot_valid.all()
-    assert torch.equal(
-        plan.trunk_lengths,
-        torch.where(plan.anchor_positions == 1, 0, 3),
-    )
 
 
 def test_noncontiguous_mask_without_full_window_emits_safe_invalid_blocks() -> None:
@@ -370,7 +344,6 @@ def test_noncontiguous_mask_without_full_window_emits_safe_invalid_blocks() -> N
         seed=0,
     )
 
-    assert not plan.block_valid.any()
     assert torch.equal(plan.anchor_positions, torch.zeros(2, dtype=torch.int64))
     assert torch.equal(plan.query_positions, torch.zeros((2, 2), dtype=torch.int64))
     assert not plan.slot_valid.any()

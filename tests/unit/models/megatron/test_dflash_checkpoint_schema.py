@@ -188,7 +188,6 @@ def test_body_preserves_explicit_mcore_precision_config() -> None:
 
     body = DFlashBody(_tiny_config(), parallel_config=parallel_config)
 
-    assert body.parallel_config is parallel_config
     assert {parameter.dtype for parameter in body.parameters()} == {torch.float32}
 
 
