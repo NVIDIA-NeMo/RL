@@ -687,7 +687,7 @@ for it:
 
 | Signal | What it says |
 |---|---|
-| `rl.sft_v2.setup_loaders` (controller) over `rl.sft_v2.build_loader` (each owner) | the window the subprocesses are forked in and the first batches are built, which on a cold dataset is most of it. Both unbucketed, like every `setup` span, and both carry `rl.energon.worker_processes`, `rl.energon.workers_per_rank` and `rl.energon.batches_in_flight_per_rank` so the pool's size is on the trace |
+| `rl.sft_v2.setup_loaders` (controller) over `rl.sft_v2.build_loader` (each owner) | the window the subprocesses are forked in and the first batches are built, which on a cold dataset is most of it. Both unbucketed, like every `setup` span. The controller span carries `rl.energon.worker_processes`, `rl.energon.workers_per_rank` and `rl.energon.batches_in_flight_per_rank`, which is the only place the pool's size reaches telemetry at all — the loader config is in no resource attribute and on no other span |
 | `rl.sft_v2.read_batch` (each owner, per step) | the blocking dequeue alone. Near zero while the workers keep up; it is the span that grows when they stop |
 
 Read the wait off the spans, not off a metric. There is one `read_batch` span
