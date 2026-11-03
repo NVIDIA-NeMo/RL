@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import asyncio
-import contextvars
 import contextlib
+import contextvars
+import importlib.metadata
 import importlib.util
 import inspect
 import json
@@ -568,6 +569,152 @@ async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
     assert calls[0][1:] == (http_loop, http_thread)
     assert calls[1][1:] == (engine_loop, engine_thread)
     assert calls[2][1:] == (http_loop, http_thread)
+
+
+def test_async_vllm_http_client_reads_route_chunks_under_the_output_lock(
+    monkeypatch,
+) -> None:
+    """A cut reads routes from its own thread, never through the engine loop."""
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "0.29.0")
+    first = torch.tensor([[[1]], [[2]]], dtype=torch.int16)
+    second = torch.tensor([[[3]]], dtype=torch.int16)
+    chunks = [first, second]
+    finished_chunks = [torch.tensor([[[4]]], dtype=torch.int16)]
+    finished_state = types.SimpleNamespace(
+        request_id="internal-done",
+        external_req_id="done-request",
+        routed_experts_chunks=finished_chunks,
+        queue=types.SimpleNamespace(
+            output=types.SimpleNamespace(
+                outputs=[types.SimpleNamespace(finish_reason="stop", stop_reason=None)]
+            )
+        ),
+    )
+
+    class OutputProcessor:
+        def __init__(self) -> None:
+            self.external_req_ids = {
+                "external-request": ["internal-request"],
+                "forked-request": ["internal-a", "internal-b"],
+                "renamed-request": ["internal-renamed"],
+                "done-request": ["internal-done"],
+            }
+            self.request_states = {
+                "internal-request": types.SimpleNamespace(routed_experts_chunks=chunks),
+                "internal-renamed": types.SimpleNamespace(),
+                "internal-done": finished_state,
+            }
+
+        def process_outputs(self, *args, **kwargs) -> None:
+            return None
+
+        def _finish_request(self, req_state) -> None:
+            del self.request_states[req_state.request_id]
+            del self.external_req_ids[req_state.external_req_id]
+
+    processor = OutputProcessor()
+    engine = types.SimpleNamespace(
+        model_config=None,
+        renderer=None,
+        input_processor=None,
+        vllm_config=None,
+        output_processor=processor,
+    )
+    # Any use of the engine loop would fail on this mock.
+    client = _AsyncLLMHTTPClient(
+        engine, MagicMock(name="engine_loop", spec=[]), flat_logprobs=False
+    )
+    client.enable_generation_progress_reads()
+
+    snapshot = client.snapshot_routed_experts("external-request", timeout_s=5)
+    assert snapshot == [first, second]
+    # vLLM keeps appending to its list; the snapshot does not grow with it.
+    assert snapshot is not chunks
+    # vLLM finished this request, but its consumer has not taken the final
+    # output: a cut racing the completion still reads the request's routes.
+    client._serving_request_ids.add("done-request")
+    processor._finish_request(finished_state)
+    assert "done-request" not in processor.external_req_ids
+    assert client.snapshot_routed_experts("done-request", timeout_s=5) == (
+        finished_chunks
+    )
+    # A request neither vLLM nor the kept state holds has no routes.
+    assert client.snapshot_routed_experts("finished-request", timeout_s=5) is None
+    with pytest.raises(ValueError, match="exactly one active vLLM request"):
+        client.snapshot_routed_experts("forked-request", timeout_s=5)
+    # A renamed field fails only that call's cut, not the whole cut.
+    with pytest.raises(ValueError, match="no routed_experts_chunks"):
+        client.snapshot_routed_experts("renamed-request", timeout_s=5)
+
+    # vLLM processing an output holds the lock; the read waits at most until
+    # the cut's deadline.
+    held, release = threading.Event(), threading.Event()
+
+    def hold_lock() -> None:
+        with client._progress_lock:
+            held.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        assert held.wait(5)
+        with pytest.raises(TimeoutError, match="output lock"):
+            client.snapshot_routed_experts("external-request", timeout_s=0.01)
+    finally:
+        release.set()
+        holder.join(5)
+
+
+@pytest.mark.parametrize(
+    ("installed", "output_processor", "match"),
+    [
+        ("0.29.0", {"external_req_ids": {}, "request_states": {}}, None),
+        ("0.29.0+cu129", {"external_req_ids": {}, "request_states": {}}, None),
+        ("0.30.0", {"external_req_ids": {}, "request_states": {}}, "vLLM 0.30.0"),
+        ("0.29.0", {"external_req_ids": {}}, "OutputProcessor.request_states"),
+    ],
+    ids=["verified", "local_build", "other_release", "renamed_field"],
+)
+def test_async_vllm_http_client_checks_it_can_read_vllm_route_state(
+    monkeypatch, installed: str, output_processor: dict, match: str | None
+) -> None:
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: installed)
+    engine = types.SimpleNamespace(
+        model_config=None,
+        renderer=None,
+        input_processor=None,
+        vllm_config=None,
+        output_processor=types.SimpleNamespace(**output_processor),
+    )
+    # The check runs at setup, off the engine loop, after setup has enabled
+    # progress reads: routes are read under the same output lock.
+    client = _AsyncLLMHTTPClient(
+        engine, MagicMock(name="engine_loop"), flat_logprobs=False
+    )
+    client._progress_reads_enabled = True
+
+    if match is None:
+        client.check_route_snapshot_support()
+    else:
+        with pytest.raises(RuntimeError, match=match):
+            client.check_route_snapshot_support()
+
+
+def test_async_vllm_http_client_route_check_needs_progress_reads() -> None:
+    engine = types.SimpleNamespace(
+        model_config=None,
+        renderer=None,
+        input_processor=None,
+        vllm_config=None,
+        output_processor=types.SimpleNamespace(external_req_ids={}, request_states={}),
+    )
+    client = _AsyncLLMHTTPClient(
+        engine, MagicMock(name="engine_loop"), flat_logprobs=False
+    )
+
+    with pytest.raises(RuntimeError, match="enable_generation_progress_reads"):
+        client.check_route_snapshot_support()
 
 
 @pytest.mark.parametrize(
