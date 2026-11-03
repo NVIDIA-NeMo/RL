@@ -115,6 +115,7 @@ reward_penalties:
   penalize_duplicated_reasoning: true
   penalize_empty_final_answer: true
   penalize_unwanted_tokens: true
+  penalize_malformed_think_tag: true
   token_ids:
     unwanted: [12345]  # Replace with IDs from your model's tokenizer.
 env:
@@ -134,6 +135,13 @@ checked across all selected generated spans, including terminal tokens; prompt,
 tool, and abandoned-branch tokens do not count. The final-function-call exception
 for empty answers is preserved. Token IDs, logprobs, and training masks keep their
 existing behavior.
+
+The malformed think-tag check runs on each generated span. When think-tag IDs are
+configured or each tag is a single token, the tag counts must match the thinking mode
+set by the prompt; the decoded text must also contain no open tag and at most one
+close tag. Gym's message-level `has_malformed_thinking` flag is not used with
+capture. Non-finite generation logprobs are rejected at staging, and the rollout is
+masked as `capture_poisoned`.
 
 Both paths share the classification, text checks, token membership check, and
 shaping formula. For low-effort prompts:
@@ -166,8 +174,8 @@ reward substituted after shaping and penalties. This retains one reward
 observation per valid row, plus optional table data, in pending checkpoint state.
 Existing low/high effort means and exact length medians are preserved; `mean_reward_low`
 measures the shaped reward before penalties. Pending statistics survive recovery
-and are consumed once. Malformed-thinking penalties and message-level advantage
-overrides remain unsupported with capture and fail at setup.
+and are consumed once. Message-level advantage overrides remain unsupported with
+capture and fail at setup.
 
 ## Checkpointing and Replay Recovery
 
@@ -177,14 +185,25 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
-- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
+- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, including an empty list when none are held. Schema-3 checkpoints may omit an empty reserve.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
 The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
 
 On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
 
+Only the current `rollout_recovery.pt` schema is accepted, for every recovery
+level. Data-plane checkpoints written with an earlier schema, such as those from
+releases before turn-level recovery, cannot be resumed; start those runs in a
+new `checkpoint_dir`.
+
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
+
+[Forest-training runs](./context-compaction.md) recover the same way and need no extra settings.
+
+Restart does not resume a Gym tool call that was in progress, and it does not guarantee that external side effects happen exactly once. In token-capture runs, if Gym reports capture writes it could not confirm, the run stops instead of retrying, so no uncertain write is cleared or repeated.
+
+Every Megatron training resume (all algorithms, not only forest training) loads the saved RNG when the parallel layout supports it, and preserves it through reference-model and wrapper setup. Changing `seed` before a resume no longer reseeds the restored Megatron RNG. Fresh runs and PEFT warm starts are unchanged.
 
 ### Periodic rollout snapshots
 
@@ -301,9 +320,10 @@ checkpoint exists.
 
 :::{note}
 Completed groups are restored directly from the TQ snapshot. For unfinished
-token-capture groups, `rollout_recovery.default_granularity` controls both live
-failure and restart behavior:
+token-capture groups, `rollout_recovery.target_level` selects the requested
+restart boundary:
 
+- `turn` requests coordinated Gym participant recovery from the last saved turn.
 - `sibling` preserves each sealed sibling and redispatches only unfinished ones.
 - `prompt_group` retries every sibling in the group when any sibling is unfinished.
 
@@ -311,16 +331,100 @@ failure and restart behavior:
 `prompt_group` when every generation in a recovered group must come from the
 policy weights live at redispatch.
 
-`task_source_granularity_overrides` can select the policy using the Gym
+Turn recovery coordinates Gym and RL as one rollout-snapshot cut. Each prompt group
+is pinned to the Gym shard replica that accepted it. SC first closes its narrow
+`/run` dispatch admission gate; already-submitted requests, completion callbacks,
+finalization, and TQ writes remain live. Gym parks its participants and commits
+the subset of candidate episodes it still owns into the checkpoint's
+`gym-instances/` tree. Candidate replies already on the wire drain through the
+ordinary RL/TQ completion path. SC then acquires the exclusive data-plane
+barrier, verifies that the remaining Gym-owned episodes and their TQ staging
+keys match the Gym commit, and captures TQ plus the rollout ledger. Gym reports
+as restarts the episodes a participant cannot capture, such as rollouts on a
+restart-only resources server or on an agent without checkpoint support. SC
+leaves them out of the commit, does not wait for them, and records them in
+`gym_checkpoint.json`; they keep running, and after a crash they start over from
+their tasks. If any other candidate is neither exported by Gym nor drained before
+the deadline, the checkpoint aborts and every deployment is resumed.
+
+Because a restart-only server would make turn-level recovery quietly restart its
+rollouts, SC reads every Gym participant's checkpoint `mode` from discovery
+before the first rollout. If any server's mode is `restart_only` (the default for
+agents and resources servers), setup fails and names it, unless
+`rollout_recovery.allow_restart_only_gym_servers` is true, which accepts it with
+a warning. Each saved snapshot logs `gym_restarted_episodes`, the episodes that
+would start over after a crash.
+
+Gym leases are renewed throughout. Gym resumes as soon as the cut is captured,
+before SC writes its sidecars and publishes the snapshot, so new rollouts wait
+only for the Gym commit and the TQ capture, not for the publish. Gym's own
+coordination guide publishes first and resumes after; resuming first is safe
+because every Gym commit is already written and resume only reopens admission. A
+resume that still fails after a successful cut is logged as a warning instead of
+failing the snapshot: that deployment reopens on its own once its lease grace,
+`3 * token_capture.control_timeout_s`, runs out.
+
+Gym keeps a rollout it retired, or continued through a restore, refused by ID
+on every participant until the controller forgets it. Before each prepare,
+while Gym is idle, SC retires the episodes it dropped since the last snapshot
+and then forgets them, together with restored rollouts whose continued attempt
+has since sealed; RL never sends those rollout IDs again. A deployment that
+refuses the forget gets the retire again and then the forget. Forgetting is
+best effort: a deployment that still refuses keeps its rollouts queued for the
+next snapshot, since each costs one small entry, and the snapshot goes ahead.
+
+`rollout_recovery.gym_prepare_timeout_s` (default 300 seconds) bounds how long
+Gym gets to park its in-flight steps; raise it for long agent or environment
+steps. Every other Gym control call keeps `token_capture.control_timeout_s`. A
+snapshot whose Gym cannot park in time, or is unavailable, is skipped and
+retried under the `max_consecutive_failures` budget. The stall watchdog keeps
+counting while Gym is parked, so setup requires
+`async_rl.stall_watchdog.stall_timeout_s` to exceed `gym_prepare_timeout_s +
+2 * token_capture.control_timeout_s`; raise it together with the prepare
+timeout.
+
+Gym state is saved only in rollout snapshots. A trainer checkpoint never pauses
+Gym, so a slow or unavailable Gym cannot fail it. It wakes the snapshot loop,
+which captures Gym anchored to it as soon as the checkpoint is durable.
+
+On restart, SC validates that the episodes `gym_checkpoint.json` saves, together
+with those it records as restarts, are exactly the episodes owned by the rollout
+ledger, and that the saved Gym actor topology matches the live one. It restores
+Gym before starting rollout dispatch, advances each restored episode to its next
+attempt, and routes it back to the same Gym actor; recorded restarts start over
+from their tasks.
+If one shard replica fails restore, every replica conservatively retires its
+replacement attempts before the outer restore fails. This also covers a lost
+Ray reply where the remote restore may actually have succeeded, so a partially
+restored topology is never released for execution. A second checkpoint taken
+after restore but before redispatch includes the unclaimed restored attempt, so
+another crash does not lose the saved turn boundary.
+
+If no rollout snapshot follows the newest trainer checkpoint, SC restores that
+checkpoint on its own: completed groups come back from TQ and unfinished
+turn-level rollouts restart from their tasks. A rollout snapshot without its
+`gym_checkpoint.json` is refused.
+
+The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
+periodic rollout snapshots, `restore_mode: latest`, and the same named Gym
+shards and replica counts on restart. Only checkpoints using the current rollout
+recovery schema are accepted.
+
+`task_source_target_level_overrides` can coarsen the target using the Gym
 `task_source` embedded in the raw rollout row. Unlike `agent_ref`, this identity
 is available before Gym resolves the concrete agent and SC reserves the recovery
 group. When a row already carries an `agent_ref`, a matching
-`agent_granularity_overrides` entry wins over a matching task-source entry,
+`agent_target_level_overrides` entry wins over a matching task-source entry,
 mirroring Gym's concrete-route precedence. Otherwise the task-source override,
 then the global default, applies. The agent map also keeps datasets collated
 before Gym recorded `task_source` working, although re-collating them is
-recommended. Non-default policies require `token_capture.enabled: true`. The
-task source and resolved policy are persisted in `rollout_recovery.pt`, so
+recommended. Overrides may only select a coarser level than the global target,
+and are not supported with `turn` yet: a checkpointing Gym deployment exports
+every live episode, so a coarser route on it would fall outside the commit
+scope. Until Gym advertises group-scoring capabilities, configure group-scored routes
+such as GenRM explicitly as `prompt_group`. Non-default policies require
+`token_capture.enabled: true`. The task source and resolved policy are persisted
+in `rollout_recovery.pt`, so
 recovery does not reinterpret an existing group using changed configuration. A
 generation that already finished keeps its tokens in the token-capture staging
 area, so `sibling` reuses them unchanged; a redispatched sibling produces a new
@@ -354,7 +458,7 @@ Pick one of five modes with `sampler.name`. Each mode takes its own knobs, liste
 | `custom`       | Determined by the imported class.                                                                                       | Determined by the imported class.                                                                                 | `target: "module:ClassName"` — bring your own `PromptGroupSampler`.                                          |
 
 
-PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before the critic trains on the assembled full batch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true` and `loss_fn.force_on_policy_ratio: false`, unless using `loss_fn.use_cispo: true` with TIS correction as described in the [CISPO guide](cispo.md#configuration). Its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable.
+PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before critic training. By default each critic epoch uses the assembled full batch; `ppo.value_training_mode: split` instead replays the same chunks into one critic update per epoch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true` and `loss_fn.force_on_policy_ratio: false`, unless using `loss_fn.use_cispo: true` with TIS correction as described in the [CISPO guide](cispo.md#configuration). Its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable.
 
 ### Config → behavior map
 
@@ -373,10 +477,11 @@ The shipped exemplars cover three of the five modes:
 Field definitions:
 
 - `max_buffered_rollouts` — hard cap on unconsumed rollout groups buffered in the data plane. Validated at setup against the gated sampler's required capacity; a value too small deadlocks the rollout pump, so setup raises instead of silently blocking. Sized from the widest window the run ever uses, so `warmup_lookahead_versions` rather than `max_lookahead_versions` when it is set.
-- `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a chunk; the sampler may select more. Set to `num_prompts_per_step` for full-batch execution; lower for streaming. PPO streaming requires `ppo.ppo_epochs: 1`: value/policy/reference forwards, GAE and policy backward run per chunk, followed by one policy optimizer update and refit. The critic's `ppo.critic_ppo_epochs` updates each use the assembled full-step batch. Full-batch PPO also permits multiple policy epochs.
+- `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a chunk; the sampler may select more. Set to `num_prompts_per_step` for full-batch execution; lower for streaming. PPO streaming requires `ppo.ppo_epochs: 1`: value/policy/reference forwards, GAE and policy backward run per chunk, followed by one policy optimizer update and refit. Each critic epoch is one optimizer update over the same samples, assembled for `whole_batch` or replayed chunk by chunk for `split`. The minimum must be at least the setup-computed policy/value prompt-group multiple; static batching includes both training and inference microbatch sizes. Full-batch PPO also permits multiple policy epochs.
 - `sampler.warmup_lookahead_versions` (PPO, `in_order` only) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
 - `num_advantage_workers` — CPU Ray actors that run the advantage stage. `0` (the default) keeps it in the controller process, which is correct but both holds a whole cohort's advantage inputs in the controller's heap and blocks the controller's event loop for the duration of the computation — long enough at Ultra scale to miss Ray's actor liveness ping. A positive value moves both costs onto dedicated actors, placed off the dedicated Ray head so their host-memory peak does not land beside the controller. Only `grpo` and `opd` are sharded across the pool: every other `adv_estimator` also reduces over the whole batch, which a shard is not, so those run as one call on one actor and a larger pool buys them nothing. Each stage logs `advantage stage: N row(s) over M shard(s), pool=P` with the reason whenever `M` is 1. Under `data_plane.backend: mooncake_cpu` each actor is its own TransferQueue client and mounts a full `global_segment_size + local_buffer_size`, like each token-capture finalizer, so budget it on top of `gpus_per_node × (segment + buffer)`.
 - `log_full_train_data` — writes every consumed sample to `train_data_step<N>.jsonl` in the log dir. The advantage stage is what holds the untruncated tensors, so the stage writes the dump wherever it runs: with a pool each shard writes its own `train_data_step<N>.jsonl.part-<shard>` and the controller merges them in shard order on a completed optimizer step, assigning `idx` across the merged file. That requires the pool to share a filesystem with the controller: the log dir was controller-only before this, so a node-local one worked and now would not. The controller checks the merged row count against what the shards reported and fails the step rather than publishing a dump that is short a shard. The JSON serialization is the expensive part and scales with batch size × sequence length, so a pool also moves that cost off the controller; it is reported back per call and still shows up under the `train_data_dump` timer. Debug-only — leave it `false` for production runs.
+- `defer_async_checkpoint_finalize` — with `policy.megatron_cfg.checkpoint.async_save: true`, finalizes an async policy checkpoint at a later step boundary, once every rank's background write is done, instead of from a background thread whose blocking finalize holds the policy workers until the write lands. The train pump polls at the top of each step, before the step's first policy-worker call; the next save and training exit still finalize blocking, and so does teardown after a failure. `tmp_step_N` is renamed to `step_N` only after that finalize, and resume reads only `step_N`, so a crash in that window — typically one step — resumes from the previous checkpoint. It cannot be combined with rollout snapshots (`rollout_checkpointing.snapshot_attempt_interval_s`), and setup rejects that combination: a snapshot anchors on `step_N`, which a deferred finalize publishes only after training has moved past step N. Only non-colocated generation gains: a colocated refit, and PPO's per-chunk critic handoff, block on the finalize anyway. Time spent finalizing at a step boundary is reported as `timing/train/checkpoint_finalize`. Leave it `false` (the default) when `async_save` is off; setup rejects that combination.
 
 ## Implementation Structure
 
@@ -414,14 +519,14 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 #### 5. `_rollout_pump` and `_train_pump`
 
 - `_rollout_pump`: pulls prompts from the dataloader, calls `sampler.admit`, dispatches `RolloutManager.generate_and_push`, and honours `max_inflight_prompts` as a backpressure cap.
-- `_train_pump`: for each chunk, `sampler.evict → sampler.select → _value_stage (PPO only) → policy/reference logprobs → _advantage_stage → TQPolicy backward`. Streaming PPO accumulates gradients with `begin_train_step / train_microbatches_from_meta` across chunks, then runs `finish_train_step → policy refit → _value_train_epochs (full batch) → dp_client.clear_samples`.
+- `_train_pump`: for each chunk, `sampler.evict → sampler.select → _value_stage (PPO only) → policy/reference logprobs → _advantage_stage → TQPolicy backward`. Streaming PPO accumulates gradients with `begin_train_step / train_microbatches_from_meta` across chunks, then runs `finish_train_step → policy refit → _value_train_epochs (assembled or split) → dp_client.clear_samples`.
 
 ### Coordination Flow
 
 1. **Driver setup**: `setup_single_controller` builds the worker groups, virtual cluster, dp client, dataloader, `TQReplayBuffer`, `RolloutManager`, and weight synchronizer, and packs them into a `SingleControllerActorArgs` that the entrypoint cloudpickles into the actor.
 2. **Actor startup**: `SingleControllerActor` launches `_rollout_pump` and `_train_pump` concurrently as asyncio tasks; both share the same `TQReplayBuffer` and `StalenessSampler`.
 3. **Rollout pump loop**: `sampler.admit` gates dispatch against the current trainer version (returning a `target_step` for `in_order`); the pump then reserves a buffer slot, drives `RolloutManager.generate_and_push`, and commits with the observed `start_weight` / `end_weight`.
-4. **Train pump loop**: `sampler.evict` removes out-of-window groups, and `sampler.select` chooses the next chunk. For PPO, `_value_stage` computes critic values and `_advantage_stage` computes advantages. TQPolicy then updates the policy: full-batch PPO uses `ppo.ppo_epochs` updates, while streaming PPO accumulates gradients across chunks for one update. Streaming PPO refits the updated policy before `_value_train_epochs` trains the critic on the assembled full batch for `ppo.critic_ppo_epochs`. GRPO uses one TQPolicy optimizer step per RL step.
+4. **Train pump loop**: `sampler.evict` removes out-of-window groups, and `sampler.select` chooses the next chunk. For PPO, `_value_stage` computes critic values and `_advantage_stage` computes advantages. TQPolicy then updates the policy: full-batch PPO uses `ppo.ppo_epochs` updates, while streaming PPO accumulates gradients across chunks for one update. Streaming PPO refits the updated policy before `_value_train_epochs` performs `ppo.critic_ppo_epochs` critic updates, using the assembled batch in `whole_batch` mode or replaying chunks in `split` mode. GRPO uses one TQPolicy optimizer step per RL step.
 5. **Weight sync**: after each optimizer step the pump bumps the trainer version, clears rollout permission, asks the generation backend to pause in-flight work, calls the weight synchronizer, resumes generation, and re-opens the rollout pump for the next version. vLLM's native pause preserves active request state; backends without pause support warn and retain their existing refit behavior. In streaming PPO, it does the weight sync as soon as the policy training is finished, which is before the critic model training starts. This allows new batch generation with the updated policy weight overlapping with the critic training epochs.
 
    For non-colocated vLLM, freezing a request does not stop its end-to-end generation timeout. Size `NRL_VLLM_ASYNC_TIMEOUT_SECONDS` and, when the generation router is enabled, `async_rl.generation_router.backend_timeout_s` to cover the longest expected generation plus time spent paused for refit, including membership recovery and a possible retry. With a finite `async_rl.generation_fleet_health.refit_timeout_s`, pause, each transfer attempt, and resume each use that timeout plus a 60 s grace; these are separate call budgets, not a single total refit budget. When `refit_timeout_s` is `null`, pause and resume retain a 360 s budget each, but the collective transfer wait is unbounded, so no finite worst-case total pause duration is guaranteed.
@@ -544,7 +649,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
 - Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). Managed Dynamo (`backend: dynamo`) is supported on the native rollout path; see [Managed Dynamo generation](dynamo-generation.md#run-under-the-singlecontroller). SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
-- (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
+- (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, but each critic epoch must contain exactly `value.train_global_batch_size` samples in either value-training mode, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported. Managed Dynamo pauses its engines before every refit because its weight update is unsafe while requests run, but that is not the drain gate: running requests finish on the old weights, while queued requests and later turns of a multi-turn rollout run on the new ones.
