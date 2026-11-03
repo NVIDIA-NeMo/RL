@@ -41,6 +41,7 @@ import torch
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
+    _apply_async_sample_masks,
     _binary_participation,
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
@@ -290,6 +291,9 @@ class AdvantageOutcome:
     reward_partial: RewardPartial
     advantage_partial: AdvantagePartial
     seq_logprob_error_metrics: Optional[dict[str, float]] = None
+    # Per-reason masked-row counts for this call's rows; the step-close
+    # reduction sums each key across calls.
+    sample_mask_metrics: Optional[dict[str, int]] = None
     # OPD's running moments, as this call's contribution rather than a total.
     opd_stat_sum: float = 0.0
     opd_stat_sumsq: float = 0.0
@@ -392,7 +396,6 @@ class AdvantageComputer:
             tensor_field(data, adv_cfg.truncated_field)
         ).bool()
 
-        num_mask_sample_filtered = int(mask_sample.sum().item())
         has_response_tokens = token_mask[:, 1:].bool().any(dim=-1)
         # A context-only segment has no physical loss row, but its empty mask
         # must not invalidate an owner whose other segments have training tokens.
@@ -406,9 +409,21 @@ class AdvantageComputer:
             owner_sample_mask = torch.where(
                 owner_rows & ~has_response_tokens, 1.0, sample_mask
             )
-        final_sample_mask = owner_sample_mask * (~mask_sample).to(sample_mask.dtype)
-        if cfg.algo.overlong_filtering:
-            final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
+        # Token-capture rejection placeholders arrive with sample_mask 0 and no
+        # other marker, so on this path num_masked_seqs_by_loss_multiplier also
+        # counts them (they are reported separately as
+        # finalize/capture_failure_reason_*_count).
+        mask_batch = BatchedDataDict(
+            {
+                "loss_multiplier": owner_sample_mask,
+                "truncated": truncated,
+                "mask_sample": mask_sample,
+            }
+        )
+        sample_mask_metrics, num_mask_sample_filtered = _apply_async_sample_masks(
+            mask_batch, overlong_filtering=cfg.algo.overlong_filtering
+        )
+        final_sample_mask = mask_batch["loss_multiplier"]
 
         owner_batch = None
         if logical:
@@ -486,6 +501,11 @@ class AdvantageComputer:
             )
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
+            # SingleController rejects seq_logprob_error_in_loss, so this count is
+            # always pre-training and disjoint from the reasons attributed above.
+            sample_mask_metrics["num_masked_seqs_total"] += int(
+                seq_error_metrics["num_masked_seqs_by_logprob_error"]
+            )
 
         if owner_batch is not None:
             owned_rows = owner_batch.row_owner >= 0
@@ -714,6 +734,10 @@ class AdvantageComputer:
             reward_partial=reward_partial,
             advantage_partial=advantage_partial,
             seq_logprob_error_metrics=seq_error_metrics,
+            # The reason counts are per physical row, but a Forest batch masks
+            # owners whole and its execution padding arrives masked, so they
+            # would misreport it.
+            sample_mask_metrics=None if logical else sample_mask_metrics,
             opd_stat_sum=opd_stat_sum,
             opd_stat_sumsq=opd_stat_sumsq,
             opd_stat_count=opd_stat_count,

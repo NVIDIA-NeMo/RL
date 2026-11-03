@@ -15,10 +15,7 @@
 """Turn a finished vLLM rollout into NeMo RL's per-sample generation output.
 
 The worker's ``_serve_rollout`` builds the result; ``rollout_output`` assembles
-the output tensors from it. The two are apart so a host that builds the result
-on the engine and assembles the output elsewhere returns what ``generate_async``
-returns. A rollout feature added here, such as router replay (R3), then behaves
-the same on every path.
+its output tensors for ``generate_async``.
 """
 
 import logging

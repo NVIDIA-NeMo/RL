@@ -321,14 +321,14 @@ def _as_routed_experts_tensor(
     return tensor.to(dtype=dtype)
 
 
-def off_policy_sampling_error(
+def check_sampling_param(
     *,
     temperature: Optional[float],
     top_p: Optional[float],
     top_k: Optional[int],
     generation_config: Any,
-) -> Optional[str]:
-    """Why an HTTP rollout request would sample off-policy, or None if it would not.
+) -> None:
+    """Reject an HTTP rollout request that would sample off-policy.
 
     Request sampling must match NeMo RL's exactly, or inference runs off-policy and
     destabilizes training. Validation rollouts are the one exception: they carry the
@@ -347,11 +347,17 @@ def off_policy_sampling_error(
             once the caller sends the request with top_k=-1.
         generation_config: ``policy.generation``, with the train and validation
             sampling parameters.
+
+    Raises:
+        ValueError: The request's top_k is set, its top_p is unset, or its
+            temperature and top_p match neither sampling profile.
     """
     if top_k not in (None, -1):
-        return f"Top k sampling parameter must be unset, empty, or -1. Got `{top_k}`"
+        raise ValueError(
+            f"Top k sampling parameter must be unset, empty, or -1. Got `{top_k}`"
+        )
     if top_p is None:
-        return (
+        raise ValueError(
             "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
             "resolved by vLLM from the model's generation_config.json and would "
             "bypass the on-policy sampling check."
@@ -365,8 +371,8 @@ def off_policy_sampling_error(
         and top_p == generation_config["val_top_p"]
     )
     if is_train_sampling or is_val_sampling:
-        return None
-    return (
+        return
+    raise ValueError(
         f"request sampling (temperature={temperature}, top_p={top_p}) matches neither "
         f"the train sampling params (temperature={generation_config['temperature']}, "
         f"top_p={generation_config['top_p']}) nor the validation sampling params "
@@ -596,10 +602,7 @@ def chat_routed_experts(
             r3_stats["actual_routes"],
             r3_stats["expected_routes"],
         )
-    # Base64 envelope instead of .tolist(): nested JSON int lists cost
-    # ~1s of CPU per serialize/parse hop at long context lengths and get
-    # re-validated at every gym HTTP hop; a single string passes through
-    # the gym chain opaquely.
+    # Keep routes opaque across Gym HTTP hops to avoid nested-list validation.
     return encode_routed_experts(routed_experts.to(dtype=routed_experts_dtype))
 
 
