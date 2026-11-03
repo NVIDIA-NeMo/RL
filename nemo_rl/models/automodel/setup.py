@@ -343,13 +343,9 @@ def validate_and_prepare_config(
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]
     model_name = config["model_name"]
-    # Determine which head the shared Automodel setup should instantiate. PPO
-    # value models use the token-level regression reward-model path even though
-    # they are not standalone reward models trained by examples/run_rm.py.
-    reward_model_cfg = config.get("reward_model_cfg", {})
-    is_reward_model = reward_model_cfg.get("enabled", False)
-    is_regression_reward_model = (
-        is_reward_model and reward_model_cfg.get("reward_model_type") == "regression"
+    # PPO values use the shared token-level regression setup.
+    is_reward_model = (
+        "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]
     )
 
     # Validate sequence packing
@@ -380,19 +376,6 @@ def validate_and_prepare_config(
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
     cp_size_cfg = config["automodel_cfg"]["context_parallel_size"]
-    # Policies may fall back to ring-efficient attention for CP, including in
-    # float32. Token-level regression value models require ring-flash for GQA,
-    # so validate the value-model precision constraint here.
-    if (
-        is_regression_reward_model
-        and cp_size_cfg > 1
-        and dtype not in (torch.float16, torch.bfloat16)
-    ):
-        raise ValueError(
-            "Context parallel for regression reward models requires "
-            "precision='float16' or 'bfloat16' "
-            "because its ring-flash attention kernel does not support float32 inputs."
-        )
     attn_impl = (
         "flash_attention_2"
         if (enable_seq_packing and cp_size_cfg == 1)
@@ -418,7 +401,12 @@ def validate_and_prepare_config(
 
     if is_reward_model:
         # Validate reward model configuration
-        rm_type = reward_model_cfg["reward_model_type"]
+        rm_type = config["reward_model_cfg"]["reward_model_type"]
+        if rm_type == "bradley_terry" and cp_size_cfg > 1:
+            raise NotImplementedError(
+                "Context parallelism is not supported for Bradley-Terry reward "
+                "models. Set context_parallel_size=1."
+            )
         if enable_seq_packing and rm_type != "regression":
             raise NotImplementedError(
                 "Sequence packing is only supported for token-level regression "
@@ -902,25 +890,12 @@ def setup_model_and_optimizer(
     from torch.nn.attention import SDPBackend
 
     if cp_size > 1:
-        is_regression_reward_model = (
-            is_reward_model
-            and config["reward_model_cfg"]["reward_model_type"] == "regression"
-        )
-        if is_regression_reward_model:
-            # The different kernel is selected by the token-level regression
-            # path used by PPO values, not by a difference in model backbone.
-            # PyTorch's ring-efficient CP kernel cannot merge GQA outputs when
-            # num_attention_heads != num_key_value_heads (for example Qwen2):
-            # its output and logsumexp head dimensions diverge. Force ring-flash
-            # for DTensor value models, which use regression reward model setup.
-            sdpa_method = [SDPBackend.FLASH_ATTENTION]
-        else:
-            # Preserve policy CP support for float32 through ring-efficient
-            # attention while preferring ring-flash for lower precision inputs.
-            sdpa_method = [
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-            ]
+        # Match Automodel's CP context: MATH is incompatible with DTensor.
+        # https://github.com/NVIDIA-NeMo/Automodel/blob/b916107a5ce8e77a3f18682f8b0eaa46a4b54389/nemo_automodel/components/distributed/context_parallel/utils.py#L103-L109
+        sdpa_method = [
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+        ]
     elif config["automodel_cfg"]["activation_checkpointing"]:
         # For activation checkpointing, we must disable the cudnn SDPA backend because
         # it may not be selected during recomputation.

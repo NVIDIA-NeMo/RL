@@ -33,9 +33,8 @@ def right_shift_values(values: torch.Tensor) -> torch.Tensor:
 def gather_and_right_shift_values(
     values: torch.Tensor,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    sequence_dim: int = 1,
 ) -> torch.Tensor:
     """Restore global CP sequence order before value temporal alignment."""
     if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
-        values = allgather_cp_sharded_tensor(values, cp_group, seq_dim=sequence_dim)
+        values = allgather_cp_sharded_tensor(values, cp_group, seq_dim=1)
     return right_shift_values(values)

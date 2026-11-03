@@ -53,7 +53,6 @@ def _prepare_cp1(
     model: Any,
     processed_inputs: ProcessedInputs,
     *,
-    is_reward_model: bool = False,
     allow_flash_attn_args: bool = True,
 ) -> PreparedModelForward:
     return prepare_model_forward(
@@ -62,7 +61,6 @@ def _prepare_cp1(
         device_mesh=None,
         cp_size=1,
         padding_token_id=0,
-        is_reward_model=is_reward_model,
         allow_flash_attn_args=allow_flash_attn_args,
     )
 
@@ -427,9 +425,7 @@ class TestModelForward:
     def test_forward_reward_model_allows_flash_attn(
         self, mock_model, processed_inputs_with_flash
     ):
-        prepared = _prepare_cp1(
-            mock_model, processed_inputs_with_flash, is_reward_model=True
-        )
+        prepared = _prepare_cp1(mock_model, processed_inputs_with_flash)
         model_forward(mock_model, prepared.model_batch)
 
         mock_model.assert_called_once()
@@ -1153,7 +1149,7 @@ class TestForwardWithPostProcessingFn:
         # Call forward_with_post_processing_fn
         result, metrics, _ = forward_with_post_processing_fn(
             model=mock_model,
-            prepared=_prepare_cp1(mock_model, processed_inputs, is_reward_model=True),
+            prepared=_prepare_cp1(mock_model, processed_inputs),
             post_processing_fn=score_post_processor,
             processed_mb=processed_mb,
         )

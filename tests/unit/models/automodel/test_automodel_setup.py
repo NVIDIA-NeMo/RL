@@ -202,6 +202,42 @@ class TestValidateAndPrepareConfig:
         assert isinstance(result, RuntimeConfig)
         assert result.is_reward_model is True
 
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_context_parallel_bradley_terry_raises_error(
+        self, mock_dynamo, mock_autoconfig_class, mock_config, mock_autoconfig, cp_size
+    ):
+        """Sequence-level reward heads cannot use token-level CP restoration."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_config["automodel_cfg"]["context_parallel_size"] = cp_size
+        mock_config["reward_model_cfg"] = {
+            "enabled": True,
+            "reward_model_type": "bradley_terry",
+        }
+
+        with pytest.raises(NotImplementedError, match="Bradley-Terry reward models"):
+            validate_and_prepare_config(mock_config, None, 0)
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_context_parallel_regression_reward_model_is_supported(
+        self, mock_dynamo, mock_autoconfig_class, mock_config, mock_autoconfig
+    ):
+        """The sequence-level guard must not reject token-level PPO values."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_config["automodel_cfg"]["context_parallel_size"] = 2
+        mock_config["reward_model_cfg"] = {
+            "enabled": True,
+            "reward_model_type": "regression",
+        }
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert result.is_reward_model
+        assert result.attn_impl == "sdpa"
+        assert mock_autoconfig.num_labels == 1
+
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
@@ -226,47 +262,33 @@ class TestValidateAndPrepareConfig:
                 rank=0,
             )
 
+    @pytest.mark.parametrize("is_reward_model", [False, True])
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
-    def test_context_parallel_float32_policy_is_supported(
+    def test_context_parallel_float32_is_supported(
         self,
         mock_dynamo,
         mock_resolve_class,
         mock_autoconfig_class,
         mock_config,
         mock_autoconfig,
+        is_reward_model,
     ):
-        """Policy CP preserves its existing float32 ring-efficient path."""
+        """Policy and value heads share the same CP precision constraints."""
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
         mock_resolve_class.return_value = Mock
         mock_config["precision"] = "float32"
         mock_config["automodel_cfg"]["context_parallel_size"] = 2
+        mock_config["reward_model_cfg"] = {
+            "enabled": is_reward_model,
+            "reward_model_type": "regression",
+        }
 
         result = validate_and_prepare_config(mock_config, None, 0)
 
         assert result.dtype == torch.float32
-        assert result.is_reward_model is False
-
-    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
-    def test_context_parallel_float32_regression_reward_model_raises_error(
-        self,
-        mock_dynamo,
-        mock_config,
-    ):
-        """Value-style regression models require ring-flash-compatible precision."""
-        mock_config["precision"] = "float32"
-        mock_config["automodel_cfg"]["context_parallel_size"] = 2
-        mock_config["reward_model_cfg"] = {
-            "enabled": True,
-            "reward_model_type": "regression",
-        }
-
-        with pytest.raises(
-            ValueError,
-            match="Context parallel for regression reward models requires",
-        ):
-            validate_and_prepare_config(mock_config, None, 0)
+        assert result.is_reward_model is is_reward_model
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -1350,6 +1372,8 @@ class TestSetupModelAndOptimizer:
         assert call_kwargs["max_position_embeddings"] == 4096
         assert "config" not in call_kwargs
 
+    @pytest.mark.parametrize("cp_size", [1, 2])
+    @pytest.mark.parametrize("is_reward_model", [False, True])
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_and_optimizer_no_optimizer(
@@ -1361,9 +1385,19 @@ class TestSetupModelAndOptimizer:
         mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
+        cp_size,
+        is_reward_model,
     ):
-        """Test model setup without optimizer initialization."""
+        """Policy and value setup share the CP SDPA allowlist."""
+        from torch.nn.attention import SDPBackend
+
         mock_get_rank.return_value = 0
+        mock_distributed_context.cp_size = cp_size
+        mock_runtime_config.is_reward_model = is_reward_model
+        mock_config["reward_model_cfg"] = {
+            "enabled": is_reward_model,
+            "reward_model_type": "regression",
+        }
 
         mock_model = MagicMock()
         mock_model.state_dict.return_value = {}
@@ -1385,6 +1419,11 @@ class TestSetupModelAndOptimizer:
         assert result.scheduler is None
         call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
         assert call_kwargs["torch_dtype"] == mock_runtime_config.dtype
+        assert call_kwargs["sdpa_method"] == (
+            [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+            if cp_size > 1
+            else None
+        )
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")

@@ -345,7 +345,6 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                     padding_token_id=self.tokenizer.pad_token_id or 0,
                     autocast_context_factory=self._autocast_context,
                     forward_only=eval_mode,
-                    is_reward_model=True,  # Value models use reward model architecture
                     allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
@@ -458,7 +457,6 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                     device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=True,
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
@@ -471,9 +469,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                         processed_mb=processed_mb,
                         sequence_dim=sequence_dim,
                     )
-                    # ScorePostProcessor has already restored the canonical CP
-                    # order. Shift only after that gather so cross-shard token
-                    # boundaries match the Megatron value convention.
+                    # Shift after restoring global CP order.
                     values = right_shift_values(values)
 
                 # Skip dummy batches

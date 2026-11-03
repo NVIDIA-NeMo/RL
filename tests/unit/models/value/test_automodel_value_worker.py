@@ -16,7 +16,7 @@
 Worker-level tests use a tiny Qwen2 model on a small Ray cluster, mirroring
 `test_megatron_value_worker.py`. They cover:
 
-  * value head (regression head, `num_labels=1`) on the DTensor V2 backbone
+  * value head (regression head, `num_labels=1`) on the Automodel backbone
   * `get_values` forward pass (shape + finiteness), incl. TP / SP / CP /
     dynamic batching
   * `train` step with `MseValueLossFn` (loss is finite + non-negative)
@@ -25,7 +25,7 @@ Worker-level tests use a tiny Qwen2 model on a small Ray cluster, mirroring
   * Multi-step training drives loss down
   * Checkpoint save+load round-trip preserves the trained value head
 
-DTensor V2 value workers do not support pipeline parallelism. Sequence packing
+Automodel value workers do not support pipeline parallelism. Sequence packing
 and context parallelism are exercised separately because they are incompatible
 with each other.
 """
@@ -455,6 +455,7 @@ def value_setup(request, tiny_qwen2_model_path, tmp_path):
         (2, 1, 1, {"precision": "bfloat16"}),
         (2, 2, 1, {"sequence_parallel": True}),
         (2, 1, 2, {"precision": "bfloat16"}),
+        (2, 1, 2, {"precision": "bfloat16", "dynamic_batching": True}),
         (2, 1, 1, {"dynamic_batching": True}),
         (2, 2, 1, {"sequence_packing": True}),
     ],
@@ -465,6 +466,7 @@ def value_setup(request, tiny_qwen2_model_path, tmp_path):
         "2gpu_dp2_bf16",
         "2gpu_tp2sp",
         "2gpu_cp2",
+        "2gpu_cp2_dynbatch",
         "2gpu_dp2_dynbatch",
         "2gpu_tp2_seqpack",
     ],
@@ -505,6 +507,7 @@ def test_value_worker_init_and_get_values(value_setup):
         (2, 2, 1, {}),
         (2, 2, 1, {"sequence_parallel": True}),
         (2, 1, 2, {"precision": "bfloat16"}),
+        (2, 1, 2, {"precision": "bfloat16", "dynamic_batching": True}),
         (2, 1, 1, {"dynamic_batching": True}),
         (2, 2, 1, {"sequence_packing": True}),
     ],
@@ -514,6 +517,7 @@ def test_value_worker_init_and_get_values(value_setup):
         "2gpu_tp2",
         "2gpu_tp2sp",
         "2gpu_cp2",
+        "2gpu_cp2_dynbatch",
         "2gpu_dp2_dynbatch",
         "2gpu_tp2_seqpack",
     ],
@@ -547,12 +551,14 @@ def test_value_worker_train_step(value_setup):
     [
         (2, {"sequence_parallel": True}),
         (1, {"context_parallel": True}),
+        (1, {"context_parallel": True, "dynamic_batching": True}),
         (1, {"dynamic_batching": True}),
         (2, {"sequence_packing": True}),
     ],
     ids=[
         "sequence_parallel",
         "context_parallel",
+        "context_parallel_dynamic_batching",
         "dynamic_batching",
         "sequence_packing",
     ],
@@ -594,7 +600,7 @@ def test_value_worker_parallelism_equivalence(
         )
         _equiv_gpus = max(tp, 2 if feature_updates.get("context_parallel") else 1)
         cluster = RayVirtualCluster(
-            name=f"test-dtensor-value-equiv-{feature_id}",
+            name=f"test-automodel-value-equiv-{feature_id}",
             bundle_ct_per_node_list=[_equiv_gpus],
             use_gpus=True,
             num_gpus_per_node=_equiv_gpus,
@@ -655,9 +661,7 @@ def test_value_worker_parallelism_equivalence(
         # Padded positions can differ legitimately; the contract is only that
         # valid token values match.
         mask = attention_mask.bool()
-        # Ring attention changes BF16 reduction order slightly relative to the
-        # unsharded reference. The synthetic CP ordering test above separately
-        # guards against incorrect shard reassembly.
+        # Allow BF16 ring-reduction noise; ordering is checked separately.
         cp_enabled = feature_updates.get("context_parallel", False)
         torch.testing.assert_close(
             values_feat[mask],
@@ -674,33 +678,18 @@ def test_value_worker_parallelism_equivalence(
             cluster.shutdown()
 
 
-def _summarize_train_metrics(results: dict[str, Any]) -> dict[str, Any]:
-    """Reduce a ``Value.train`` result to backend-order-invariant scalars.
-
-    ``loss`` and the per-microbatch stats (``values_mean``/``returns_mean``/
-    ``residual_sq_mean``) are each normalized by ``global_valid_toks`` inside
-    ``MseValueLossFn``, so summing over microbatches recovers the global value
-    regardless of how the batch was split into microbatches.
-    """
-    mb = results["all_mb_metrics"]
-    return {
-        "loss": float(torch.as_tensor(results["loss"]).sum().item()),
-        "values_mean": float(sum(mb["values_mean"])),
-        "returns_mean": float(sum(mb["returns_mean"])),
-        "residual_sq_mean": float(sum(mb["residual_sq_mean"])),
-    }
-
-
 @pytest.mark.hf_gated
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize(
     ("tp", "feature_updates"),
     [
         (1, {"context_parallel": True}),
+        (1, {"context_parallel": True, "dynamic_batching": True}),
         (2, {"sequence_packing": True}),
     ],
     ids=[
         "context_parallel",
+        "context_parallel_dynamic_batching",
         "sequence_packing",
     ],
 )
@@ -772,6 +761,7 @@ def test_value_worker_train_forward_equivalence(
             config=config,
             tokenizer=tokenizer,
             weights_path=Path(weights_path) if load else None,
+            seed=42,
             name_prefix=f"lm_value_{'feat' if load else 'src'}",
         )
         try:
@@ -795,7 +785,7 @@ def test_value_worker_train_forward_equivalence(
     cluster = None
     try:
         cluster = RayVirtualCluster(
-            name=f"test-dtensor-value-train-equiv-{feature_id}",
+            name=f"test-automodel-value-train-equiv-{feature_id}",
             bundle_ct_per_node_list=[equiv_gpus],
             use_gpus=True,
             num_gpus_per_node=equiv_gpus,

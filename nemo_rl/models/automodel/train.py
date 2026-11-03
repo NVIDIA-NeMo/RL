@@ -97,7 +97,6 @@ def _build_model_batch(
     model: nn.Module,
     processed_inputs: ProcessedInputs,
     *,
-    is_reward_model: bool,
     allow_flash_attn_args: bool,
     clone_model_tensors: bool,
 ) -> dict[str, Any]:
@@ -159,14 +158,12 @@ def prepare_model_forward(
     device_mesh: Optional[DeviceMesh],
     cp_size: int,
     padding_token_id: int,
-    is_reward_model: bool,
     allow_flash_attn_args: bool,
 ) -> PreparedModelForward:
     """Prepare the model batch and resolve Automodel CP state when active."""
     model_batch = _build_model_batch(
         model,
         processed_inputs,
-        is_reward_model=is_reward_model,
         allow_flash_attn_args=allow_flash_attn_args,
         clone_model_tensors=cp_size > 1,
     )
@@ -452,7 +449,6 @@ def automodel_forward_backward(
     padding_token_id: int,
     autocast_context_factory: Callable[[], AbstractContextManager[Any]],
     forward_only: bool = False,
-    is_reward_model: bool = False,
     allow_flash_attn_args: bool = True,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
@@ -481,7 +477,6 @@ def automodel_forward_backward(
         padding_token_id: Token ID used for Automodel sequence padding.
         autocast_context_factory: Worker-owned precision context factory.
         forward_only: If True, skip backward pass
-        is_reward_model: Whether this is a reward model
         allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
@@ -535,7 +530,6 @@ def automodel_forward_backward(
                 device_mesh=device_mesh,
                 cp_size=cp_size,
                 padding_token_id=padding_token_id,
-                is_reward_model=is_reward_model,
                 allow_flash_attn_args=allow_flash_attn_args,
             )
 
