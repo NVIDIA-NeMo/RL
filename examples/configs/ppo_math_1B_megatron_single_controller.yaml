@@ -327,7 +327,8 @@ value:
   # (see nemo_rl/algorithms/swe_privileged_critic.py); a row without one fails the
   # run. value.max_total_sequence_length and any enabled value packing/dynamic
   # batching token budget must cover policy.max_total_sequence_length +
-  # max_total_tokens + 256. Cannot be combined with on-policy distillation teachers.
+  # max_total_tokens + 256. Requires ppo.value_training_mode: whole_batch. Cannot
+  # be combined with on-policy distillation teachers.
   swe_privileged_critic:
     enabled: false
     # Token budget for the whole reference block, spent in priority order

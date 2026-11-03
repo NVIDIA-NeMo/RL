@@ -506,6 +506,8 @@ class SwePrivilegePrefixStore:
         Raises:
             ValueError: No golden patch resolves for the instance. Training on
                 would silently produce a blind critic under a privileged label.
+            ValueError: The rendered block exceeds ``privilege_budget_tokens``,
+                so critic rows could outgrow the validated sequence lengths.
         """
         group_id = _only_group_id(meta)
         prompt_idx = (meta.tags[0] if meta.tags else {}).get(_PROMPT_IDX_TAG)
@@ -526,6 +528,14 @@ class SwePrivilegePrefixStore:
             prefix, stats = await asyncio.to_thread(
                 render_reference_prefix, fields, self._tokenizer, self._cfg
             )
+            budget = privilege_budget_tokens(self._cfg)
+            if prefix.numel() > budget:
+                raise ValueError(
+                    f"SWE privileged critic: the reference block for {key!r} "
+                    f"renders to {prefix.numel()} tokens, over the {budget}-token "
+                    "budget (max_total_tokens plus template slack) the critic "
+                    "sequence lengths were validated for."
+                )
             self._prefixes[key] = prefix
             self._stats[key] = stats
         if group_id not in self._group_keys:

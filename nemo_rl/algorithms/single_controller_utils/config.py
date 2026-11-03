@@ -1283,9 +1283,9 @@ def _validate_swe_privileged_critic(master_config: MasterConfig) -> None:
     privilege_cfg = resolve_swe_privileged_critic_config(value_cfg)
     if value_cfg is None or privilege_cfg is None:
         return
-    if master_config.ppo is not None and (
-        master_config.ppo.value_training_mode != "whole_batch"
-    ):
+    ppo_config = master_config.ppo
+    assert ppo_config is not None  # a value block implies the PPO path
+    if ppo_config.value_training_mode != "whole_batch":
         raise ValueError(
             "value.swe_privileged_critic requires ppo.value_training_mode="
             "whole_batch: the split value-training path does not splice the "

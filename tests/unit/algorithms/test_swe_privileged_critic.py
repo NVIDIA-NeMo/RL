@@ -184,6 +184,23 @@ def test_release_resolves_forest_padding_rows_by_their_group_tag():
     assert len(store) == 0
 
 
+def test_enrich_rejects_a_block_rendered_over_the_budget():
+    # A template whose own overhead outgrows the slack would push critic rows
+    # past the sequence lengths startup validated; fail when the prefix is built.
+    class _VerboseTemplate(_CharTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            return "#" * 300 + super().apply_chat_template(messages, **kwargs)
+
+    store = spc.SwePrivilegePrefixStore(
+        _VerboseTemplate(),
+        spc.SwePrivilegedCriticConfig(enabled=True, max_total_tokens=64),
+    )
+
+    with pytest.raises(ValueError, match="over the 320-token budget"):
+        asyncio.run(store.enrich(_meta("ga", 1, [4]), _env_info("a")))
+    assert len(store) == 0
+
+
 def test_enrich_fails_loudly_without_a_golden_patch():
     store = _store()
     with pytest.raises(ValueError, match="no golden patch"):
