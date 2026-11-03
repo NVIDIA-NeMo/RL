@@ -18,8 +18,6 @@ from nemo_rl.algorithms.sft_v2 import (
     ENERGON_IN_FLIGHT_ATTR,
     ENERGON_WORKER_PROCESSES_ATTR,
     ENERGON_WORKERS_PER_RANK_ATTR,
-    LOADER_LATENCY_MAX_KEY,
-    LOADER_READ_MAX_KEY,
     SFT_V2_TEED_METRICS,
     SFTSingleControllerActor,
     SFTV2SaveState,
@@ -33,17 +31,6 @@ from nemo_rl.telemetry.instrumentation import (
 )
 from nemo_rl.telemetry.metrics import map_teed_scalars
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-
-
-def _envelope(*, load_seconds: float, read_seconds: float) -> SimpleNamespace:
-    """One loader owner's step envelope, with only the fields the step reads."""
-    return SimpleNamespace(
-        meta=SimpleNamespace(sample_ids=["sample"]),
-        valid_tokens=4,
-        source_ids=("sample",),
-        load_seconds=load_seconds,
-        read_seconds=read_seconds,
-    )
 
 
 def _loader_setup_controller(tracer, *, energon: dict) -> object:
@@ -71,7 +58,6 @@ def _loader_setup_controller(tracer, *, energon: dict) -> object:
 def test_sft_v2_step_metrics_have_otel_series() -> None:
     values = {
         "loader_latency_max": 0.2,
-        "loader_read_max": 0.05,
         "policy_time": 1.5,
         "total_step_time": 1.8,
         "valid_tokens_per_second": 100.0,
@@ -101,7 +87,6 @@ def test_sft_v2_step_spans_follow_the_enabled_groups(
                 valid_tokens=4,
                 source_ids=("sample",),
                 load_seconds=0.2,
-                read_seconds=0.05,
             )
         ]
     )
@@ -198,41 +183,6 @@ def test_sft_v2_checkpointing_span_covers_the_whole_save(monkeypatch, tmp_path) 
         phase: checkpointing.context.span_id
         for phase in ("init_tmp", "policy_write", "loader_dump", "finalize_handoff")
     }
-
-
-def test_sft_v2_read_wait_is_reported_apart_from_the_whole_loader_call() -> None:
-    """``load_seconds`` cannot stand in for the Energon queue wait.
-
-    It also covers prepare, register and publish, which run on the policy
-    worker. Only the dequeue says whether the worker subprocesses kept up, so a
-    step that waited on them has to be distinguishable from one that spent the
-    same time publishing -- here the slow rank is slow in opposite halves.
-    """
-    controller_cls = SFTSingleControllerActor.__ray_metadata__.modified_class
-    controller = object.__new__(controller_cls)
-    controller._tracer = None
-    controller._save_state = SFTV2SaveState(0, 0, 0, "placement")
-    controller._loss_fn = object()
-    controller._owner_call = MagicMock()
-    controller._trainer = MagicMock()
-    controller._trainer.finish_train_step.return_value = {
-        "loss": 1.0,
-        "grad_norm": 0.5,
-        "all_mb_metrics": {},
-    }
-    controller._load_envelopes = MagicMock(
-        return_value=[
-            # Waited on the queue, published quickly.
-            _envelope(load_seconds=0.9, read_seconds=0.8),
-            # Found a batch waiting, then spent the time publishing it.
-            _envelope(load_seconds=1.2, read_seconds=0.1),
-        ]
-    )
-
-    metrics = controller._run_train_step()
-
-    assert metrics[LOADER_LATENCY_MAX_KEY] == 1.2
-    assert metrics[LOADER_READ_MAX_KEY] == 0.8
 
 
 def test_sft_v2_setup_loaders_span_records_the_energon_worker_pool() -> None:

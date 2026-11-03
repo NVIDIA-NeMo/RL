@@ -54,7 +54,6 @@ def _envelope(rank: int, *, source_count: int = 1) -> StepEnvelope:
         field_names=("input_ids",),
         sequence_lengths=(8,),
         load_seconds=0.1 + rank * 0.1,
-        read_seconds=0.01 + rank * 0.02,
         valid_tokens=4,
     )
 

@@ -689,14 +689,18 @@ for it:
 |---|---|
 | `rl.sft_v2.setup_loaders` (controller) over `rl.sft_v2.build_loader` (each owner) | the window the subprocesses are forked in and the first batches are built, which on a cold dataset is most of it. Both unbucketed, like every `setup` span, and both carry `rl.energon.worker_processes`, `rl.energon.workers_per_rank` and `rl.energon.batches_in_flight_per_rank` so the pool's size is on the trace |
 | `rl.sft_v2.read_batch` (each owner, per step) | the blocking dequeue alone. Near zero while the workers keep up; it is the span that grows when they stop |
-| `rl.sft_v2.loader.read.duration.max` (metric, per step) | the same wait, maxed across owners, on the controller's timeline — so starvation is visible without pulling traces |
 
-`rl.sft_v2.loader.latency.max` is a wider interval and cannot be read this way:
-it covers prepare, register and publish too, all of which run on the policy
-worker itself.
+Read the wait off the spans, not off a metric. There is one `read_batch` span
+per owner per step, so a cold start shows up at full resolution — on a 30-step
+run it is the difference between 2.8 s on step 1 and 0.6 ms thereafter. The
+teed gauges are sampled on the exporter's interval with last-value semantics,
+which at a 10 s interval and 1.5 s steps is roughly one step in seven and
+whichever one happened to precede the tick. `rl.sft_v2.loader.latency.max` is
+subject to that and to a second limit: it covers prepare, register and publish
+as well as the dequeue, all of which run on the policy worker itself.
 
-The queue *depth* at dequeue time is not exported, so a pool that is keeping up
-and one that is barely keeping up both read as a near-zero wait.
+The queue *depth* at dequeue time is not exported either, so a pool that is
+keeping up and one that is barely keeping up both read as a near-zero wait.
 
 ## Coverage gaps
 

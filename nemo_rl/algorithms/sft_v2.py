@@ -77,7 +77,6 @@ from nemo_rl.utils.path_utils import (
 from nemo_rl.utils.timer import TimeoutChecker
 
 LOADER_LATENCY_MAX_KEY = "loader_latency_max"
-LOADER_READ_MAX_KEY = "loader_read_max"
 POLICY_TIME_KEY = "policy_time"
 TOTAL_STEP_TIME_KEY = "total_step_time"
 VALID_TOKENS_PER_SECOND_KEY = "valid_tokens_per_second"
@@ -94,16 +93,6 @@ SFT_V2_TEED_METRICS = (
         "rl.sft_v2.loader.latency.max",
         unit="s",
         description="Slowest data-loader rank per SFT v2 step.",
-    ),
-    TeedMetric(
-        LOADER_READ_MAX_KEY,
-        "rl.sft_v2.loader.read.duration.max",
-        unit="s",
-        description=(
-            "Longest wait on the Energon worker queue per SFT v2 step, across "
-            "data-loader ranks. The workers run ahead of training, so this is "
-            "near zero while they keep up and rises when they stop."
-        ),
     ),
     TeedMetric(
         POLICY_TIME_KEY,
@@ -450,7 +439,6 @@ class SFTSingleControllerActor:
         loader_latency_max = max(loader_seconds)
         metrics: dict[str, Any] = {
             LOADER_LATENCY_MAX_KEY: loader_latency_max,
-            LOADER_READ_MAX_KEY: max(envelope.read_seconds for envelope in envelopes),
             "loader_latency_mean": statistics.fmean(loader_seconds),
             "loader_copy_imbalance": loader_latency_max - min(loader_seconds),
             POLICY_TIME_KEY: policy_seconds,

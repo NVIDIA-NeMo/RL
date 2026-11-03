@@ -144,7 +144,6 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             except StopIteration:
                 self._sft_loader_iterator = iter(self._sft_loader)
                 batch = next(self._sft_loader_iterator)
-        read_seconds = time.monotonic() - started
 
         with managed_span(RLSpanGroup.DATA_PROCESSING, "rl.sft_v2.prepare_batch"):
             prepared = prepare_sft_batch(
@@ -211,7 +210,6 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             sequence_lengths=lengths,
             # The controller waits for the whole call, including publishing.
             load_seconds=time.monotonic() - started,
-            read_seconds=read_seconds,
             valid_tokens=valid_tokens,
         )
         self._sft_active_envelope = envelope
