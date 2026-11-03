@@ -629,10 +629,14 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
 
     # Generation backends with a destination-side HFToLocalParamMap adapter.
     backend = generation.get("backend")
-    if backend not in ("vllm", "megatron"):
+    if backend not in ("vllm", "megatron", "sglang"):
         violations.append(
-            f"policy.generation.backend must be 'vllm' or 'megatron' (got {backend!r})."
+            "policy.generation.backend must be 'vllm', 'megatron', or 'sglang' "
+            f"(got {backend!r})."
         )
+
+    if backend == "sglang":
+        violations.extend(sglang_nccl_reshard_violations(policy, generation))
 
     if backend == "vllm" and vllm_kwargs.get("enable_eplb"):
         violations.append(
@@ -841,6 +845,41 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "nccl_reshard_refit cannot be enabled with the current config:\n"
             + "\n".join(f"  - {v}" for v in violations)
         )
+
+
+def sglang_nccl_reshard_violations(policy: Any, generation: Any) -> list[str]:
+    """Return unsupported settings for the dense BF16 SGLang reshard path."""
+    config = generation["sglang_cfg"]
+    server = config["sglang_server_config"]
+    megatron = policy["megatron_cfg"]
+    violations = []
+    if generation["colocated"]["enabled"]:
+        violations.append("SGLang NCCL reshard requires non-colocated generation.")
+    if not megatron["enabled"]:
+        violations.append("SGLang NCCL reshard requires Megatron training.")
+    if policy["automodel_cfg"]["enabled"]:
+        violations.append("SGLang NCCL reshard does not support Automodel training.")
+    if policy["precision"] != "bfloat16" or (megatron.get("fp8_cfg") or {}).get(
+        "enabled"
+    ):
+        violations.append("SGLang NCCL reshard requires unquantized BF16 training.")
+    if config["quantization"]["scheme"] != "bf16":
+        violations.append("SGLang NCCL reshard requires BF16 generation weights.")
+    if config.get("dtype") not in (None, "auto", "bfloat16"):
+        violations.append("SGLang NCCL reshard generation dtype must be bfloat16.")
+    if config.get("kv_cache_dtype") not in (None, "auto", "bfloat16"):
+        violations.append("SGLang NCCL reshard requires an unquantized KV cache.")
+    if config["pp_size"] != 1 or config["ep_size"] != 1 or config["dp_size"] != 1:
+        violations.append("SGLang NCCL reshard requires generation PP=EP=DP=1.")
+    if server.get("num_gpus") not in (None, config["tp_size"]):
+        violations.append("SGLang NCCL reshard currently supports one rollout engine.")
+    if server["pause_generation_mode"] == "in_place":
+        violations.append("SGLang NCCL reshard requires abort or retract pause mode.")
+    if server["needs_offload"]:
+        violations.append("SGLang NCCL reshard currently requires needs_offload=false.")
+    if config["sglang_fault_tolerance_config"].get("use_fault_tolerance"):
+        violations.append("SGLang NCCL reshard engine recovery is not supported yet.")
+    return violations
 
 
 def build_nccl_reshard_refit_info(

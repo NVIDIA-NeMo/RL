@@ -56,6 +56,7 @@ for those cases.
 | MCore native refit | Megatron | Megatron | Supports MCore's configured copy-service backend. |
 | SGLang NCCL weight-update group | SGLang | Megatron | Trainer rank 0 broadcasts finalized HF tensors to the engine leaders. |
 | NCCL reshard | vLLM or Megatron | Megatron | Supports BF16 and the documented FP8/MXFP8 combinations; see the [NCCL Reshard Refit design](../design-docs/nccl-reshard-refit.md). |
+| NCCL reshard | SGLang | Megatron | Experimental dense Qwen2 BF16 only; one engine within one node, generation PP=EP=DP=1, memory offload and fault tolerance disabled. |
 | Sparse delta | vLLM | Megatron | BF16/FP16, unquantized rollout only. |
 | NIXL, full weights | vLLM | Automodel or Megatron | Supports the standard full-weight FP8 loader. Automodel FP8 KV-cache scale transfer is not yet supported. |
 | NIXL, sharded experts | vLLM | Automodel or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
@@ -213,6 +214,36 @@ policy:
 `offload_policy_before_refit` also works with this transport. The reshard moves
 only parameters, so releasing gradient buffers, optimizer state, and caches
 before transfer is safe.
+
+For experimental SGLang NCCL reshard, use dense Qwen2 BF16 weights with Megatron
+training and one rollout engine. Keep the engine within one node and disable
+memory offload and fault tolerance:
+
+```yaml
+policy:
+  precision: bfloat16
+  generation:
+    backend: sglang
+    refit_transport: nccl_reshard
+    colocated:
+      enabled: false
+    sglang_cfg:
+      tp_size: 2
+      pp_size: 1
+      ep_size: 1
+      dp_size: 1
+      quantization:
+        scheme: bf16
+      sglang_server_config:
+        num_gpus: 2
+        needs_offload: false
+        pause_generation_mode: abort
+      sglang_fault_tolerance_config:
+        use_fault_tolerance: false
+```
+
+SGLang's optimized path rejects MoE and quantized weights. A failed transfer
+keeps generation paused and requires restarting the run.
 
 For sparse delta, select one data plane and configure its scope:
 

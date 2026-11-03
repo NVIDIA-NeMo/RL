@@ -28,8 +28,12 @@ single `ValueError` listing every violation. The current requirements are:
   path uses IPC and is unaffected by this feature.
 * **Megatron training backend** — `policy.megatron_cfg.enabled=true` (the Automodel
   training backend is not supported yet.).
-* **vLLM or Megatron generation backend** — `policy.generation.backend` must be
-  `vllm` or `megatron` (SGLang and TRTLLM are not supported yet).
+* **vLLM, Megatron, or SGLang generation backend** — `policy.generation.backend`
+  must be `vllm`, `megatron`, or `sglang`. SGLang currently supports dense Qwen2
+  BF16 weights on one engine that fits on one node, with generation PP=EP=DP=1,
+  `sglang_server_config.needs_offload=false`, and fault tolerance disabled.
+  MoE, quantized training/generation and quantized KV cache are rejected.
+  TRTLLM is not supported yet.
 * Training-side Megatron supports expert tensor parallelism when the generation
   destination is Megatron. A vLLM destination still requires
   `expert_tensor_parallel_size: 1`. Custom PP layouts
@@ -162,6 +166,14 @@ The feature is integrated into the `nemo_rl/weight_sync/` framework. For vLLM,
 For Megatron generation, the existing `MegatronWeightSynchronizer` retains ownership of
 the inference-engine lifecycle and delegates only the transfer to an
 `NcclReshardWeightSynchronizer`.
+
+For SGLang, `SGLangNcclReshardWeightSynchronizer` owns pause, cache invalidation,
+weight-update sessions and resume, and delegates communication and transfer to the
+same mover. A registered SGLang custom weight loader receives control metadata over
+HTTP; weight payloads travel over NCCL. Dense gate/up shards write into the two
+halves of SGLang's fused `gate_up_proj`; down shards write into `down_proj`.
+Miscellaneous full tensors use SGLang's standard model loader. An interrupted
+transfer is terminal and leaves serving paused until the run is restarted.
 
 ### Quantized parameter support
 

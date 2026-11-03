@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import multiprocessing
 import os
@@ -397,6 +398,37 @@ class SGLangGenerationWorker:
         """Open one engine-side session before the first refit bucket."""
         return self._make_request("begin_weight_update", {})
 
+    def nccl_reshard_command(self, operation: str, payload: dict) -> bool:
+        """Send control metadata to the registered GPU-side reshard loader."""
+        # Torch is optional in the lightweight serving actor's import path.
+        import torch
+
+        from nemo_rl.models.generation.sglang.utils.nccl_reshard import (
+            SGLANG_RESHARD_LOADER,
+        )
+        from nemo_rl.models.generation.sglang.utils.train_utils import (
+            MultiprocessingSerializer,
+        )
+
+        control = torch.tensor(list(json.dumps(payload).encode()), dtype=torch.uint8)
+        # CPU shared-memory descriptors are consumed once by each deserializer.
+        serialized = [
+            MultiprocessingSerializer.serialize([(operation, control)], output_str=True)
+            for _ in range(self.sglang_cfg["sglang_cfg"]["tp_size"])
+        ]
+        response = self._make_request(
+            "update_weights_from_tensor",
+            {
+                "serialized_named_tensors": serialized,
+                "load_format": SGLANG_RESHARD_LOADER,
+                "flush_cache": False,
+                "selector": "target",
+            },
+        )
+        if response is None or not response["success"]:
+            raise RuntimeError(f"SGLang reshard {operation!r} failed: {response!r}.")
+        return True
+
     def end_weight_update(self):
         """Finalize quantized layouts after the last refit bucket."""
         return self._make_request("end_weight_update", {})
@@ -521,6 +553,13 @@ class SGLangGenerationWorker:
             # always enable draft weights cpu backup so that we run training without mtp weights.
             "enable_draft_weights_cpu_backup": True,
         }
+
+        if self.sglang_cfg.get("refit_transport") == "nccl_reshard":
+            from nemo_rl.models.generation.sglang.utils.nccl_reshard import (
+                SGLANG_RESHARD_LOADER,
+            )
+
+            kwargs["custom_weight_loader"] = [SGLANG_RESHARD_LOADER]
 
         for key in [
             "dtype",
