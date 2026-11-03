@@ -75,7 +75,8 @@ call each other. Every call the controller makes:
 | Where | Call |
 |---|---|
 | `_run_pumps`, before the pumps start | `environment_checkpoint.check_startup()`, the weight sync, then `_rollout_restorer.restore()`; if it returns `True`, the controller turns on ledger-recorded dispatch |
-| `_run_pumps` | `_rollout_snapshots.run()` as a background task when `snapshot_attempt_interval_s` is set, and `stop_requested` when it returns |
+| `_run_pumps` | `_rollout_snapshots.run()` as a background task when rollout snapshots are on (`snapshot_attempt_interval_s` set or turn-level recovery), and `stop_requested` when it returns |
+| `_train_pump` | `_rollout_snapshots.save_at_deadline()` after the trainer checkpoint `checkpoint_must_save_by` triggers, before the loop stops |
 | Rollout pump, before the dataloader | `_rollout_restorer.redispatch_restored(launch, admit)` when dispatch records prompt groups |
 | Train pump | `begin_optimizer_commit(drain_snapshot=...)` where the model update lands, `end_optimizer_commit()` once the step's TQ cleanup and counters publish |
 | `_save_checkpoint` | `async with _rollout_snapshots.trainer_checkpoint():` around the whole trainer save, after publishing any save still pending |
