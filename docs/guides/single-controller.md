@@ -52,7 +52,7 @@ For numerical parity, run the fixed-data test in the AutoModel environment:
 uv run --extra automodel python -m torch.distributed.run --standalone --nproc-per-node=4 \
   tests/functional/automodel_sc_full_batch_parity.py \
   --model /path/to/gemma-4-E2B-it --output /path/to/parity-results \
-  --source-sha "$(git rev-parse HEAD)" --wandb-project nemorl-gemma4
+  --source-sha "$(git rev-parse HEAD)"
 ```
 
 See the [AutoModel full-batch design](../design-docs/automodel-single-controller-full-batch.md)
