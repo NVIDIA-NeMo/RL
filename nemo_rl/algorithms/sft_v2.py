@@ -190,26 +190,26 @@ def _energon_fanout_attributes(data_config: Mapping[str, Any]) -> dict[str, int]
     and rejecting a config the worker would have accepted would fail a run from
     the telemetry path, which nothing else in that path does.
     """
+    # ``data["energon"]`` is the raw YAML mapping or an already-validated
+    # ``EnergonLoaderConfig``; ``build_energon_sft_loader`` takes both.
     energon = data_config.get("energon")
-
-    def setting(name: str) -> int:
-        # ``data["energon"]`` is the raw YAML mapping or an already-validated
-        # ``EnergonLoaderConfig``; ``build_energon_sft_loader`` takes both.
+    settings: dict[str, int] = {}
+    for name in ("num_workers", "prefetch_factor"):
         value = (
             energon.get(name)
             if isinstance(energon, Mapping)
             else getattr(energon, name, None)
         )
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-        return EnergonLoaderConfig.model_fields[name].default
+        if not isinstance(value, int) or isinstance(value, bool):
+            value = EnergonLoaderConfig.model_fields[name].default
+        settings[name] = value
 
-    workers = setting("num_workers")
+    workers = settings["num_workers"]
     return {
         ENERGON_WORKERS_PER_RANK_ATTR: workers,
         # num_workers=0 loads in the policy process itself, so there is no
         # subprocess and no queue. Zero is the honest reading, not a gap.
-        ENERGON_IN_FLIGHT_ATTR: workers * setting("prefetch_factor"),
+        ENERGON_IN_FLIGHT_ATTR: workers * settings["prefetch_factor"],
     }
 
 
