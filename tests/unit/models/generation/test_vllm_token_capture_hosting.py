@@ -37,6 +37,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -2411,6 +2412,7 @@ class _EngineRoutes:
         self.by_call: dict[str, torch.Tensor] = {}
         self.reads: list[str] = []
         self.error: Exception | None = None
+        self._pieces: dict[str, list[torch.Tensor]] = {}
 
     def __call__(
         self, model_call_id: str, *, timeout_s: float | None
@@ -2419,7 +2421,20 @@ class _EngineRoutes:
         if self.error is not None:
             raise self.error
         routes = self.by_call.get(model_call_id)
-        return None if routes is None else _route_pieces(routes)
+        if routes is None:
+            return None
+        # vLLM keeps each published piece and only appends, so a later read
+        # returns the same piece objects followed by the new ones. Routes a
+        # test replaced outright stand for a different request's pieces.
+        pieces = self._pieces.get(model_call_id, [])
+        if len(pieces) > routes.shape[0] or not all(
+            torch.equal(piece, routes[row : row + 1])
+            for row, piece in enumerate(pieces)
+        ):
+            pieces = []
+        pieces.extend(_route_pieces(routes)[len(pieces) :])
+        self._pieces[model_call_id] = pieces
+        return list(pieces)
 
 
 def _router_replay_worker(
@@ -2712,30 +2727,48 @@ def test_router_replay_bad_routes_fail_only_that_call_and_every_checkpoint_goes_
     assert cut("checkpoint-2") == {"c1": "durable_prefix", "c2": "durable_prefix"}
 
 
-def test_router_replay_joins_only_the_route_pieces_vllm_added_since_the_last_cut() -> (
-    None
-):
+def test_router_replay_route_buffer_copies_only_new_rows_as_it_grows() -> None:
+    """A cut costs the rows decoded since the last one, not the history."""
     worker, request, _ = _router_replay_call(_MemorySink())
     state = worker._capture_calls[id(request)]
     pieces = _route_pieces(_routes(1, 2, 3))
 
-    assert state.absorb_engine_route_pieces(pieces).flatten().tolist() == [1, 2, 3]
-    # Pieces already joined are not converted again: a changed old piece is
-    # ignored, and only the appended one is read.
+    first = state.absorb_engine_route_pieces(pieces)
+    buffer = state.engine_route_buffer
+    assert len(buffer) == 3
+    # Full, so the next rows double the buffer once. Joined pieces are not
+    # read again: a changed old piece is ignored, only the new one is read.
     pieces[0] = _routes(99)
     pieces.append(_routes(4))
-    assert state.absorb_engine_route_pieces(pieces).flatten().tolist() == [1, 2, 3, 4]
-    assert state.engine_route_piece_count == 4
+    second = state.absorb_engine_route_pieces(pieces)
+    grown = state.engine_route_buffer
+    assert len(grown) == 6
+    # Within capacity, rows land in the same buffer without copying the rest.
+    pieces.append(_routes(5))
+    third = state.absorb_engine_route_pieces(pieces)
+    assert state.engine_route_buffer is grown
+    assert third.flatten().tolist() == [1, 2, 3, 4, 5]
+    # Routes a cut already read never change.
+    assert first.flatten().tolist() == [1, 2, 3]
+    assert second.flatten().tolist() == [1, 2, 3, 4]
+    assert third.dtype == state.routed_experts_dtype
 
 
 @pytest.mark.parametrize(
     ("pieces", "match"),
     [
-        ([torch.zeros((2, 4, 2)), torch.zeros((1, 3, 2))], "dimension"),
-        ([torch.zeros(3)], r"\[rows, layers, topk\]"),
+        (
+            [
+                torch.zeros((2, 4, 2), dtype=torch.int16),
+                torch.zeros((1, 3, 2), dtype=torch.int16),
+            ],
+            r"integer \[rows, layers, topk\]",
+        ),
+        ([torch.zeros(3, dtype=torch.int16)], r"integer \[rows, layers, topk\]"),
+        ([torch.zeros((2, 4, 2))], r"integer \[rows, layers, topk\]"),
         ([], "has not routed any token"),
     ],
-    ids=["mismatched", "not_3d", "empty"],
+    ids=["mismatched", "not_3d", "not_integer", "empty"],
 )
 def test_vllm_route_pieces_that_do_not_fit_are_a_route_error(pieces, match) -> None:
     worker, request, _ = _router_replay_call(_MemorySink())
@@ -2743,15 +2776,72 @@ def test_vllm_route_pieces_that_do_not_fit_are_a_route_error(pieces, match) -> N
 
     with pytest.raises(ValueError, match=match):
         state.absorb_engine_route_pieces(pieces)
+    # A rejected read leaves the buffer as it was.
+    assert state.engine_route_buffer is None
+    assert state.engine_route_piece_count == 0
 
 
-def test_vllm_route_list_that_shrank_is_a_route_error() -> None:
+@pytest.mark.parametrize(
+    ("piece_dtypes", "routed_experts_dtype"),
+    [
+        ((np.uint8, np.uint8), torch.int16),
+        ((np.uint8, np.uint8), torch.int8),
+        ((np.uint16, np.uint16), torch.int16),
+        ((np.uint8, np.int32), torch.int16),
+    ],
+    ids=["uint8_to_int16", "uint8_to_int8", "uint16", "mixed_dtypes"],
+)
+def test_vllm_numpy_route_pieces_join_in_bulk_and_only_once(
+    piece_dtypes, routed_experts_dtype
+) -> None:
+    """vLLM publishes unsigned numpy pieces; the cache keeps signed routes."""
     worker, request, _ = _router_replay_call(_MemorySink())
     state = worker._capture_calls[id(request)]
-    state.absorb_engine_route_pieces(_route_pieces(_routes(1, 2, 3)))
+    state.routed_experts_dtype = routed_experts_dtype
+    pieces = [
+        np.full((2, 3, 2), value, dtype=dtype)
+        for value, dtype in enumerate(piece_dtypes, start=1)
+    ]
 
-    with pytest.raises(ValueError, match="shrank"):
-        state.absorb_engine_route_pieces(_route_pieces(_routes(1, 2)))
+    first = state.absorb_engine_route_pieces(pieces).clone()
+    pieces.append(np.full((1, 3, 2), 7, dtype=piece_dtypes[0]))
+    second = state.absorb_engine_route_pieces(pieces)
+
+    assert second.dtype == routed_experts_dtype
+    assert second[:, 0, 0].tolist() == [1, 1, 2, 2, 7]
+    assert torch.equal(second[:4], first)
+    assert state.engine_route_piece_count == 3
+
+
+@pytest.mark.parametrize(
+    ("later_read", "match"),
+    [
+        (
+            lambda pieces: [*pieces, torch.zeros((1, 2, 1), dtype=torch.int16)],
+            "changed model dimensions",
+        ),
+        (lambda pieces: pieces[:-1], "shrank"),
+        (lambda pieces: [*pieces[:-1], _routes(3)], "replaced"),
+        # Numpy would wrap expert 200 into the int8 cache as -56, a wrong expert.
+        (lambda pieces: [*pieces, _routes(200)], "do not fit"),
+    ],
+    ids=["other_model_dims", "shrank", "replaced", "id_overflow"],
+)
+def test_vllm_later_route_reads_that_do_not_fit_are_a_route_error(
+    later_read, match
+) -> None:
+    """Rows already joined are never read again, so a bad later read fails the
+    cut and leaves the buffer as it was, instead of drifting from vLLM."""
+    worker, request, _ = _router_replay_call(_MemorySink())
+    state = worker._capture_calls[id(request)]
+    state.routed_experts_dtype = torch.int8
+    pieces = _route_pieces(_routes(1, 2, 3))
+    joined = state.absorb_engine_route_pieces(pieces).clone()
+
+    with pytest.raises(ValueError, match=match):
+        state.absorb_engine_route_pieces(later_read(pieces))
+    assert (state.engine_route_piece_count, state.engine_route_rows) == (3, 3)
+    assert torch.equal(torch.from_numpy(state.engine_route_buffer[:3]), joined)
 
 
 def test_router_replay_short_engine_routes_fail_the_cut_instead_of_padding() -> None:
