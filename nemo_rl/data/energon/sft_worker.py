@@ -43,6 +43,12 @@ from nemo_rl.telemetry.instrumentation import (
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 
+# Span attributes on rl.sft_v2.build_loader: which logical loader shard this
+# is, out of how many, and whether it resumed from a checkpoint.
+ENERGON_RANK_ATTR = "rl.energon.rank"
+ENERGON_WORLD_SIZE_ATTR = "rl.energon.world_size"
+ENERGON_RESTORED_ATTR = "rl.energon.restored"
+
 
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
@@ -86,16 +92,16 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         logical_rank = parallel_state.get_data_parallel_rank()
         logical_world_size = parallel_state.get_data_parallel_world_size()
-        # The only span covering the Energon worker subprocesses, which the
-        # loader's first iteration forks and which emit nothing themselves --
-        # no tracer is installed in them, and installing one would mean an
-        # exporter per subprocess. With read_batch below it is all there is.
+        # Builds the loader object. iter() only creates energon's generator, so
+        # the worker subprocesses fork on the first read_batch, not here.
         with umbrella_span(
             RLSpanGroup.U_SETUP,
             "rl.sft_v2.build_loader",
-            logical_rank=logical_rank,
-            logical_world_size=logical_world_size,
-            restored=restored_state is not None,
+            **{
+                ENERGON_RANK_ATTR: logical_rank,
+                ENERGON_WORLD_SIZE_ATTR: logical_world_size,
+                ENERGON_RESTORED_ATTR: restored_state is not None,
+            },
         ):
             self._sft_loader = build_energon_sft_loader(
                 data_config=data_config,
@@ -240,8 +246,7 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         if self._sft_active_envelope is not None:
             raise RuntimeError("Cannot checkpoint an uncommitted SFT batch.")
         # Energon drains the worker subprocesses to snapshot their offsets, so
-        # this is loader cost inside the checkpoint rather than part of the
-        # policy write the controller's checkpointing span otherwise covers.
+        # this is loader cost inside the checkpoint, not part of the policy write.
         with managed_span(RLSpanGroup.CHECKPOINT, "rl.sft_v2.loader_state_dict"):
             return self._sft_loader.state_dict()
 

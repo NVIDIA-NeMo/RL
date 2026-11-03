@@ -673,23 +673,26 @@ to a thread pool would read as batch-shaped.
 
 ## The Energon worker pool
 
-SFT v2 loads through Energon, which forks `data.energon.num_workers`
-`DataLoader` subprocesses behind each loader owner on the loader's first
-iteration. Nothing installs a tracer in them — that would mean an OTLP exporter
-per subprocess and a span per batch per process — so they are covered from the
-consuming side, which is where the answer matters: the workers run ahead of
-training, so what a reader needs is whether a batch was ready when the step
-asked for it, not how long it took to build.
+SFT v2 loads through Energon, which runs `data.energon.num_workers` `DataLoader`
+subprocesses behind each loader owner. Nothing installs a tracer in them — that
+would mean an OTLP exporter per subprocess and a span per batch per process — so
+they are covered from the consuming side, which is where the answer matters: the
+workers run ahead of training, so what a reader needs is whether a batch was
+ready when the step asked for it, not how long it took to build.
+
+They start later than the span names suggest. `SavableDataLoader.__iter__`
+returns a generator, so building the loader forks nothing; the subprocesses
+start on the first `next()`, inside step 1's `read_batch`.
 
 | Signal | What it says |
 |---|---|
-| `rl.sft_v2.setup_loaders` (controller) over `rl.sft_v2.build_loader` (each owner) | the window the subprocesses are forked in and the first batches built. Unbucketed, like every `setup` span. The controller span carries `rl.energon.workers_per_rank` and `rl.energon.batches_in_flight_per_rank` — the only record of the pool's size anywhere in telemetry. Per rank; multiply by the `logical_world_size` on any `build_loader` child for the job total |
-| `rl.sft_v2.read_batch` (each owner, per step) | the blocking dequeue alone. Near zero while the workers keep up; the span that grows when they stop |
+| `rl.sft_v2.setup_loaders` (controller) over `rl.sft_v2.build_loader` (each owner) | building the loader objects — dataset resolution, task encoder, cache pool — and **not** the worker subprocesses. Unbucketed, like every `setup` span. The controller span carries `rl.energon.workers_per_rank` and `rl.energon.batches_in_flight_per_rank`, the only record of the pool's size anywhere in telemetry; multiply by the `rl.energon.world_size` on any `build_loader` child for the job total |
+| `rl.sft_v2.read_batch` (each owner, per step) | the blocking dequeue. Near zero while the workers keep up; the span that grows when they stop, and the span that contains worker startup on step 1 |
 
 Read the wait off the spans, not a metric. There is one `read_batch` span per
-owner per step, so a cold start shows at full resolution — 2.8 s on step 1
-against 0.6 ms after, on one 30-step run. The teed gauges are sampled on the
-exporter's interval with last-value semantics, which at a 10 s interval and
+owner per step, so worker startup is visible at full resolution — 2.8 s on
+step 1 against 0.6 ms after, on one 30-step run. The teed gauges are sampled on
+the exporter's interval with last-value semantics, which at a 10 s interval and
 1.5 s steps is roughly one step in seven. `rl.sft_v2.loader.latency.max` is
 subject to that and covers prepare, register and publish as well as the
 dequeue.

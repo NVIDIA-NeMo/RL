@@ -34,7 +34,7 @@ from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX, SetupTimingMetr
 from nemo_rl.algorithms.sft import SFTConfig
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.energon.config import EnergonLoaderConfig, EnergonSourceConfig
+from nemo_rl.data.energon.config import EnergonSourceConfig
 from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data.energon.topology import (
     DataLoaderPlacementPlan,
@@ -59,6 +59,7 @@ from nemo_rl.telemetry.instrumentation import (
     accepts_trace_context,
     iteration_scope,
     managed_span,
+    remote_trace_context,
     trace_context_kwargs,
     umbrella_span,
     umbrella_trace_fn,
@@ -179,37 +180,21 @@ def _restore_save_state(
 
 
 def _energon_fanout_attributes(data_config: Mapping[str, Any]) -> dict[str, int]:
-    """How many Energon worker subprocesses a rank forks, and their queue depth.
+    """How many Energon worker subprocesses a rank will fork, and their queue depth.
 
-    The only record that the subprocesses exist: the loader forks them, not
-    NeMo-RL, and nothing installs a tracer in them. Per rank, because the span
-    these land on has one ``rl.sft_v2.build_loader`` child per rank carrying
-    ``logical_world_size``.
+    Per rank, because the span these land on has one ``rl.sft_v2.build_loader``
+    child per rank carrying ``rl.energon.world_size``. Empty without an energon
+    block, which the worker rejects with a message worth reaching.
 
-    Read against the model's defaults rather than validated: this feeds a span,
-    and rejecting a config the worker would have accepted would fail a run from
-    the telemetry path, which nothing else in that path does.
+    ``num_workers=0`` loads in the policy process, so both read 0 rather than
+    going absent: there is genuinely no subprocess and no queue.
     """
-    # ``data["energon"]`` is the raw YAML mapping or an already-validated
-    # ``EnergonLoaderConfig``; ``build_energon_sft_loader`` takes both.
     energon = data_config.get("energon")
-    settings: dict[str, int] = {}
-    for name in ("num_workers", "prefetch_factor"):
-        value = (
-            energon.get(name)
-            if isinstance(energon, Mapping)
-            else getattr(energon, name, None)
-        )
-        if not isinstance(value, int) or isinstance(value, bool):
-            value = EnergonLoaderConfig.model_fields[name].default
-        settings[name] = value
-
-    workers = settings["num_workers"]
+    if energon is None:
+        return {}
     return {
-        ENERGON_WORKERS_PER_RANK_ATTR: workers,
-        # num_workers=0 loads in the policy process itself, so there is no
-        # subprocess and no queue. Zero is the honest reading, not a gap.
-        ENERGON_IN_FLIGHT_ATTR: workers * settings["prefetch_factor"],
+        ENERGON_WORKERS_PER_RANK_ATTR: energon.num_workers,
+        ENERGON_IN_FLIGHT_ATTR: energon.num_workers * energon.prefetch_factor,
     }
 
 
@@ -239,7 +224,12 @@ class SFTSingleControllerActor:
     _defer_checkpoint_finalize: bool = False
     _pending_checkpoint_path: Optional[str] = None
 
-    def __init__(self, master_config: MasterConfig, actor_args: SFTV2ActorArgs) -> None:
+    def __init__(
+        self,
+        master_config: MasterConfig,
+        actor_args: SFTV2ActorArgs,
+        trace_carrier: Optional[dict[str, str]] = None,
+    ) -> None:
         telemetry = init_telemetry_worker(
             rank=0, world_size=1, worker_group="sft_v2_controller"
         )
@@ -267,7 +257,10 @@ class SFTSingleControllerActor:
         self._defer_checkpoint_finalize = (
             master_config.sft.defer_async_checkpoint_finalize
         )
-        self._setup_loaders()
+        # Ray cannot carry the context into a constructor the way
+        # @accepts_trace_context does for a method, so the driver hands it over.
+        with remote_trace_context(trace_carrier):
+            self._setup_loaders()
 
     @accepts_trace_context
     def run_with_trace_context(self) -> dict[str, Any]:
@@ -334,10 +327,8 @@ class SFTSingleControllerActor:
             "placement_fingerprint": self._placement_plan.placement_hash,
             "only_unmask_final": config.sft.only_unmask_final,
         }
-        # Runs from __init__, between the startup spans and rl.sft_v2.job, so
-        # without this span it is a gap on the controller timeline rather than
-        # a phase -- and it is where every Energon worker subprocess is forked
-        # and the prefetch queues fill, which on a cold dataset is most of it.
+        # Builds the loader objects only. Energon's iter() returns a generator,
+        # so the worker subprocesses fork on step 1's first read_batch.
         with umbrella_span(
             RLSpanGroup.U_SETUP,
             "rl.sft_v2.setup_loaders",
@@ -521,11 +512,8 @@ class SFTSingleControllerActor:
         # The workers would wait for a still-pending save anyway; publish it first.
         self._finish_pending_save(blocking=True)
         step = self._save_state.total_steps
-        # Covers the save's loop-blocking part: with async_save off that is all of
-        # it, so the span is the gap between two rl.sft_v2.step spans. The durable
-        # tail is rl.checkpoint.finalize, and under defer_async_checkpoint_finalize
-        # the handoff moves out to _finish_pending_save too. rl.iteration comes from
-        # the caller's iteration_scope.
+        # Covers the save's loop-blocking part only; the durable tail is
+        # rl.checkpoint.finalize.
         with managed_span(
             RLSpanGroup.CHECKPOINT, "rl.sft_v2.checkpointing", tracer=self._tracer
         ):
@@ -553,9 +541,8 @@ class SFTSingleControllerActor:
             save_checkpoint_object(
                 loader_states, os.path.join(checkpoint_path, "sft_v2_loaders.pt")
             )
-            # Keep this last: the rename it leads to waits only for the policy's
-            # async weight write, so anything written into checkpoint_path after it
-            # races the rename.
+            # Keep last: the rename waits only on the policy's async weight
+            # write, so a later write into checkpoint_path races it.
             if self._defer_checkpoint_finalize:
                 self._pending_checkpoint_path = checkpoint_path
             else:
@@ -710,6 +697,8 @@ def setup_sft_v2(
     num_nodes = cluster_config.num_nodes
     segment_size = cluster_config.segment_size
     node_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
+    megatron_config = cast(dict[str, Any], master_config.policy["megatron_cfg"])
+    megatron_config["train_iters"] = _max_train_steps(master_config)
     cluster_started = time.monotonic()
     cluster = RayVirtualCluster(
         name="sft_v2_cluster",
@@ -722,15 +711,10 @@ def setup_sft_v2(
         segment_size=segment_size,
         node_resource_constraints=node_constraints,
     )
-    # Placement is lazy: __init__ only stores fields, and the bundles are
-    # scheduled on the first get_placement_groups(), which blocks on
-    # pg.ready(). Called here so the wait is measured rather than charged to
-    # policy_init, where RayWorkerGroup would otherwise trigger it. Idempotent,
-    # so RayWorkerGroup reuses these groups.
+    # Lazy and idempotent: scheduling the bundles here measures the pg.ready()
+    # wait instead of charging it to policy_init, and RayWorkerGroup reuses them.
     cluster.get_placement_groups()
     cluster_seconds = time.monotonic() - cluster_started
-    megatron_config = cast(dict[str, Any], master_config.policy["megatron_cfg"])
-    megatron_config["train_iters"] = _max_train_steps(master_config)
     policy_started = time.monotonic()
     trainer = TQPolicy(
         cluster=cluster,
@@ -769,16 +753,8 @@ def setup_sft_v2(
     loss_fn = NLLLossFn(
         use_fused_linear_logprobs=megatron_config["use_fused_linear_logprobs"]
     )
-    # cluster_init is the placement-group wait; policy_init covers the worker
-    # builds and the model load, the bulk of a large-MoE start. What is left of
-    # total_setup is this function's own validation and resume reads.
-    #
-    # policy_init is not comparable with the other algorithms', which exclude the
-    # placement wait only when a config pre-creates the groups for a different
-    # reason -- node constraints in grpo/ppo, a segment size in single_controller
-    # -- and report no cluster_init either way. There the wait is inside
-    # policy_init or in no phase at all; here it is always its own. total_setup is
-    # the only phase that means the same thing across algorithms.
+    # Only total_setup compares across algorithms: elsewhere the placement wait
+    # falls inside policy_init or into no phase, where here it is cluster_init.
     setup_timing = SetupTimingMetrics(
         policy_init_time_s=policy_seconds,
         total_setup_time_s=time.monotonic() - setup_started,

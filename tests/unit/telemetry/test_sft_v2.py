@@ -22,6 +22,7 @@ from nemo_rl.algorithms.sft_v2 import (
     SFTV2SaveState,
     _energon_fanout_attributes,
 )
+from nemo_rl.data.energon.config import EnergonLoaderConfig
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
     TRACE_CARRIER_KWARG,
@@ -32,13 +33,20 @@ from nemo_rl.telemetry.metrics import map_teed_scalars
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 
-def _loader_setup_controller(tracer, *, energon: dict) -> object:
-    """A controller with just enough state for ``_setup_loaders``, over 2 DP ranks."""
+def _loader_setup_controller(tracer, **energon: object) -> object:
+    """A controller with just enough state for ``_setup_loaders``, over 2 DP ranks.
+
+    ``data["energon"]`` is a model, not a mapping: ``MasterConfig`` validates it
+    on the driver, so the controller never sees the raw YAML.
+    """
     controller_cls = SFTSingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
     controller._tracer = tracer
     controller._master_config = SimpleNamespace(
-        data={"max_input_seq_length": 128, "energon": energon},
+        data={
+            "max_input_seq_length": 128,
+            "energon": EnergonLoaderConfig(model_family="qwen", **energon),
+        },
         policy={
             "train_global_batch_size": 4,
             "make_sequence_length_divisible_by": 8,
@@ -195,7 +203,9 @@ def test_sft_v2_setup_loaders_span_records_the_energon_worker_pool() -> None:
         NemoLensConfig(enabled=True, span_groups="per_step"),
         span_exporter=exporter,
     )
-    controller = _loader_setup_controller(handle.tracer, energon={"num_workers": 8})
+    controller = _loader_setup_controller(
+        handle.tracer, num_workers=4, prefetch_factor=3
+    )
 
     with patch("nemo_rl.algorithms.sft_v2.ray.get", return_value=[True, True]):
         controller._setup_loaders()
@@ -203,9 +213,8 @@ def test_sft_v2_setup_loaders_span_records_the_energon_worker_pool() -> None:
 
     (span,) = exporter.get_finished_spans()
     assert span.name == "rl.sft_v2.setup_loaders"
-    assert span.attributes[ENERGON_WORKERS_PER_RANK_ATTR] == 8
-    # num_workers x the default prefetch_factor of 2.
-    assert span.attributes[ENERGON_IN_FLIGHT_ATTR] == 16
+    assert span.attributes[ENERGON_WORKERS_PER_RANK_ATTR] == 4
+    assert span.attributes[ENERGON_IN_FLIGHT_ATTR] == 12
     # Startup work fans out across the loader ranks, so it stays unbucketed.
     assert "rl.bucket" not in span.attributes
 
@@ -213,10 +222,10 @@ def test_sft_v2_setup_loaders_span_records_the_energon_worker_pool() -> None:
 def test_sft_v2_in_process_loading_reports_no_worker_pool() -> None:
     """``num_workers=0`` loads in the policy process, so the honest count is 0.
 
-    Falling back to the model default here would invent eight processes that
-    do not exist, which is worse than the gap this span closes.
+    Reported rather than omitted: an absent attribute reads as telemetry that
+    failed, where 0 reads as the pool that is genuinely not there.
     """
-    controller = _loader_setup_controller(None, energon={"num_workers": 0})
+    controller = _loader_setup_controller(None, num_workers=0)
 
     attributes = _energon_fanout_attributes(controller._master_config.data)
 
@@ -224,22 +233,13 @@ def test_sft_v2_in_process_loading_reports_no_worker_pool() -> None:
     assert attributes[ENERGON_IN_FLIGHT_ATTR] == 0
 
 
-def test_sft_v2_worker_pool_attributes_survive_a_config_the_model_would_reject() -> (
-    None
-):
+def test_sft_v2_worker_pool_attributes_are_absent_without_an_energon_block() -> None:
     """A span must not be the thing that fails a run.
 
-    ``_setup_loaders`` runs before the worker validates anything, so reading
-    the config strictly here would turn a loader misconfiguration into a
-    telemetry traceback with the real error never reached.
+    ``build_energon_sft_loader`` rejects a missing block with a message worth
+    reaching, so the span cannot raise a ``KeyError`` ahead of it.
     """
-    attributes = _energon_fanout_attributes(
-        {"energon": {"num_workers": "eight", "prefetch_factor": None}}
-    )
-
-    # The model defaults, rather than a raise or a missing attribute.
-    assert attributes[ENERGON_WORKERS_PER_RANK_ATTR] == 8
-    assert attributes[ENERGON_IN_FLIGHT_ATTR] == 16
+    assert _energon_fanout_attributes({"max_input_seq_length": 128}) == {}
 
 
 def test_sft_v2_owner_calls_carry_the_caller_trace_context() -> None:
