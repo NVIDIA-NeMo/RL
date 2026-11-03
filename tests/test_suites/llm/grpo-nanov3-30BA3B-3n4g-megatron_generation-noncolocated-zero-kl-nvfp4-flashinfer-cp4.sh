@@ -2,12 +2,13 @@
 # Five-step GB200 test for zero train/generation KL on Nemotron Nano v3 30B-A3B with
 # per-token NVFP4 routed experts on FlashInfer. Training and refit stay BF16; each
 # training MoE forward runs generation's NVFP4 kernel (moe_training_matches_inference)
-# and the TE recompute pass supplies the backward.
+# and the TE recompute pass supplies the backward. Training runs TP2 x a2a CP4 x EP4 on
+# two nodes against generation at CP1 on the third.
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=2
+NUM_NODES=3
 GPUS_PER_NODE=4
 STEPS_PER_RUN=5
 MAX_STEPS=5
@@ -37,6 +38,9 @@ uv run --no-sync tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # The recipe must have switched the batch-invariant kernels on.
 grep -F -q "[zero_train_gen_mismatch] batch-invariant kernels enabled: backend=te_native collective=ordered flash_attention_version=4" $RUN_LOG
+
+# Training must have run with context parallelism; generation is always CP1.
+grep -F -q "'context_parallel_size': 4" $RUN_LOG
 
 MAX_RECORDED_STEP=$(jq -r 'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' $JSON_METRICS)
 if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then

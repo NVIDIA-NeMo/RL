@@ -27,7 +27,7 @@ tests/test_suites/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-ze
 tests/test_suites/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-mxfp8-cp4.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8-flashinfer.sh
-tests/test_suites/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer-cp4.sh
 
 # BF16 FlashInfer TRTLLM + NCCL reshard numerical correctness
 tests/test_suites/llm/grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.sh

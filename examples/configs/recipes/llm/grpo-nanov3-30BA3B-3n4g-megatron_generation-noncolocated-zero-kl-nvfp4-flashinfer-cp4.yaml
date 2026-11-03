@@ -2,9 +2,10 @@
 # FlashInfer. Training and refit stay BF16; generation quantizes the experts to NVFP4,
 # and each training MoE forward runs the same kernel on the same quantization
 # (moe_training_matches_inference) with the backward from the TE recompute pass.
+# Training runs TP2 x a2a CP4 x EP4 on two nodes; generation stays at CP=1 on the third.
 #
-# Needs Megatron-LM PR #7798 and flashinfer-python>=0.7.0 (the per-token NVFP4 Relu2
-# MoE kernels).
+# Needs Megatron-LM PRs #7798 and #8935 (batch-invariant a2a context parallelism) and
+# flashinfer-python>=0.7.0 (the per-token NVFP4 Relu2 MoE kernels).
 defaults: ../../grpo_math_1B.yaml
 grpo:
   max_num_steps: 5
@@ -12,7 +13,7 @@ grpo:
   num_generations_per_prompt: 4
 checkpointing:
   enabled: false
-  checkpoint_dir: results/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+  checkpoint_dir: results/grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer-cp4
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
   tokenizer:
@@ -43,6 +44,8 @@ policy:
       TRITON_CACHE_AUTOTUNING: '1'
     bias_activation_fusion: false
     tensor_model_parallel_size: 2
+    context_parallel_size: 4
+    cp_comm_type: a2a
     expert_model_parallel_size: 4
     sequence_parallel: true
     moe_router_dtype: fp32
@@ -81,12 +84,12 @@ policy:
         gpus_per_node: ${cluster.gpus_per_node}
         num_nodes: 1
 logger:
-  log_dir: logs/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+  log_dir: logs/grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer-cp4
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+    name: grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer-cp4
 cluster:
   gpus_per_node: 4
-  num_nodes: 2
+  num_nodes: 3
