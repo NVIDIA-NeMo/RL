@@ -58,8 +58,8 @@ dependencies = [
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with every backend-specific pin (5.5.4 through
-  # 5.16.1). Environments without a backend extra resolve to the upper bound.
-  "transformers>=5.5.0,<=5.16.1",
+  # 5.20.2). Environments without a backend extra resolve to the upper bound.
+  "transformers>=5.5.0,<=5.20.2",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -148,20 +148,25 @@ automodel = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
-  "transformers==5.12.1",
+  # Mirrors nemo-automodel's own `transformers==5.18.0` pin (Automodel main).
+  "transformers==5.18.0",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
+  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.19.0",
+  # Keep in sync with [tool.uv.sources] deep_ep in 3rdparty/Automodel-workspace/Automodel/pyproject.toml.
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@96e3d1fc77be942438673e88b07be21d454af8a9",
 ]
 vllm = [
-  # ABI of the vLLM 0.29.0 cu130 wheels.
+  # vLLM main (0c81a03, 0.30.0.dev0) built from source against torch 2.13.0 so it shares the
+  # ABI of the colocated automodel/mcore policy workers. vLLM's own metadata pins torch==2.14.0,
+  # so its requirements are supplied via [[tool.uv.dependency-metadata]] without the torch pins.
+  # Build with: VLLM_VERSION_OVERRIDE=0.30.0.dev0+main.0c81a03 TORCH_CUDA_ARCH_LIST=<arch> uv sync --extra vllm
   "torch==2.13.0",
   "torchvision==0.28.0",
-  "transformers==5.12.1",
+  # 5.20+ ships muse_spark natively (needed by the driver and vLLM workers); vLLM main allows <5.21.0.
+  "transformers==5.20.2",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
@@ -169,14 +174,14 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  # PyPI publishes the default cu130 wheels for both supported architectures.
-  # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
-  "vllm==0.29.0",
+  # Source build needs libdw-dev/libelf-dev (deep_gemm JIT headers) in addition to the CUDA toolkit.
+  "vllm",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.18",
-  "flashinfer-cubin==0.6.18",
-  "flashinfer-jit-cache==0.6.18",
-  "nvidia-cutlass-dsl[cu13]==4.6.2",
+  "flashinfer-python==0.7.2.post1",
+  "flashinfer-cubin==0.7.2.post1",
+  # flashinfer-jit-cache 0.7.2.post1 (x86_64) depends on flashinfer-jit-cache-sm110a, which the
+  # flashinfer index only publishes for aarch64, so it is unresolvable; kernels are JIT-compiled instead.
+  "nvidia-cutlass-dsl[cu13]==4.8.0",
 ]
 sglang = [
   # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
@@ -328,6 +333,8 @@ test = [
 # build_wheel triggers the actual ~60-min compilation (during `uv sync --extra trtllm`).
 tensorrt-llm = { path = "3rdparty/TensorRT-LLM-workspace" }
 nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = true }
+# vLLM main; see the `vllm` extra and the vllm [[tool.uv.dependency-metadata]] entry for why torch is not pinned by vLLM itself.
+vllm = { git = "https://github.com/vllm-project/vllm.git", rev = "0c81a0371f586cc50a0daad6d216fbac21cf1a2d", extra = "vllm" }
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge", editable = true }
 # Keep Gym as an editable path dependency rather than a workspace member. Both
 # projects define a ``vllm`` extra with intentionally different server stacks;
@@ -427,6 +434,7 @@ no-build-isolation-package = [
   "deep_gemm",
   "deep_ep",
   "flash_mla",
+  "vllm",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
   "tensorrt-llm",             # custom PEP 517 backend calls build-custom-trtllm.sh; needs torch/CUDA from main venv
 ]
@@ -447,7 +455,7 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu13]==2.18.0",
+  "transformer-engine[pytorch,core_cu13]==2.19.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
@@ -529,7 +537,7 @@ constraint-dependencies = [
   # Megatron-LM's [tool.uv.sources] (uv errors loudly on mismatch after a submodule bump).
   "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0",
   "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca",
-  # Same story for megatron-fsdp, which nemo-automodel (r0.6.0) resolves from a
+  # Same story for megatron-fsdp, which nemo-automodel (main) resolves from a
   # Megatron-LM fork via its own [tool.uv.sources] instead of PyPI. Keep this URL/rev
   # in sync with 3rdparty/Automodel-workspace/Automodel/pyproject.toml.
   "megatron-fsdp @ git+https://github.com/yuhezhang-ai/Megatron-LM.git@455389c480af6b3acdca74c7830c68b3274eb083#subdirectory=megatron/core/distributed/fsdp/src",
@@ -613,6 +621,90 @@ torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
 # `Killed "$CICC_PATH/cicc"`) on both x86 and aarch64. 4 jobs x 4 threads built cleanly on
 # both architectures (2h47m aarch64, ~2h x86 alongside TE/flash-mla).
 flash-attn = { MAX_JOBS = "4" }
+
+[[tool.uv.dependency-metadata]]
+name = "vllm"
+# Must equal VLLM_VERSION_OVERRIDE used at build time. Requires-Dist copied from vLLM 0c81a03 minus
+# torch/torchvision/torchaudio/torchcodec (torch==2.14.0 upstream; provided by the extra at 2.13.0).
+version = "0.30.0.dev0+main.0c81a03"
+requires-dist = [
+  "regex",
+  "cachetools",
+  "psutil",
+  "sentencepiece",
+  "numpy",
+  "requests>=2.33.0",
+  "certifi>=2026.10.19",
+  "tqdm",
+  "blake3",
+  "py-cpuinfo",
+  "transformers<5.21.0,>=5.16.1",
+  "huggingface_hub>=1.31.0",
+  "tokenizers>=0.23.2",
+  "safetensors>=0.6.2",
+  "protobuf!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*,>=5.29.6; platform_machine != \"s390x\"",
+  "protobuf==7.36.1; platform_machine == \"s390x\"",
+  "fastapi[standard]<0.137.0,>=0.133.0",
+  "starlette>=1.0.1",
+  "aiohttp>=3.14.4",
+  "multidict>=6.9.1",
+  "openai>=2.25.0",
+  "pydantic>=2.12.0",
+  "orjson>=3.11.6",
+  "prometheus_client>=0.18.0",
+  "pillow>=13.0.0",
+  "prometheus-fastapi-instrumentator>=8.0.0",
+  "tiktoken>=0.6.0",
+  "lm-format-enforcer==0.11.3",
+  "llguidance<1.8.0,>=1.7.0; platform_machine == \"x86_64\" or platform_machine == \"arm64\" or platform_machine == \"aarch64\" or platform_machine == \"ppc64le\" or platform_machine == \"s390x\"",
+  "outlines_core==0.2.14",
+  "lark==1.2.2",
+  "xgrammar==0.2.8; platform_machine == \"x86_64\" or platform_machine == \"aarch64\" or platform_machine == \"arm64\" or platform_machine == \"s390x\" or platform_machine == \"ppc64le\"",
+  "typing_extensions>=4.10",
+  "filelock>=3.20.3",
+  "partial-json-parser",
+  "jsonschema>=4.23.0",
+  "pyzmq>=25.0.0",
+  "msgspec",
+  "mistral_common[image]>=1.11.6",
+  "opencv-python-headless>=4.13.0",
+  "pyyaml",
+  "six>=1.16.0; python_version > \"3.11\"",
+  "setuptools<81.0.0,>=78.1.1; python_version > \"3.11\"",
+  "einops",
+  "compressed-tensors==0.17.0",
+  "depyf==0.20.0",
+  "cloudpickle",
+  "watchfiles",
+  "python-json-logger",
+  "ninja",
+  "pybase64",
+  "cbor2",
+  "ijson",
+  "setproctitle",
+  "oss-harmony>=0.0.11",
+  "anthropic>=0.71.0",
+  "model-hosting-container-standards<1.0.0,>=0.1.14",
+  # Relaxed from upstream `mcp>=2.2.0`: nemo-gym requires mcp<2 and both land in the same worker environments.
+  "mcp<3.0.0,>=1.28.1",
+  "opentelemetry-sdk>=1.27.0",
+  "opentelemetry-api>=1.27.0",
+  "opentelemetry-exporter-otlp>=1.27.0",
+  "opentelemetry-semantic-conventions-ai>=0.4.1",
+  "numba==0.65.0",
+  "PyNvVideoCodec==2.0.4",
+  "flashinfer-python==0.7.2.post1",
+  "apache-tvm-ffi==0.1.11",
+  "tilelang==0.1.12",
+  "nvidia-cudnn-frontend>=1.31.0",
+  "nvtx==0.2.15",
+  "fastsafetensors>=0.3.3",
+  "instanttensor>=0.2.2",
+  "nvidia-cutlass-dsl[cu13]==4.8.0",
+  "quack-kernels==0.6.5",
+  "tokenspeed-mla==2.0.3; platform_system == \"Linux\"",
+  "humming-kernels[cu13]==0.1.18",
+]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]

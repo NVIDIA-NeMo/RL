@@ -128,6 +128,29 @@ def _refresh_hpc_modules_after_layerwise_reload(model: torch.nn.Module) -> None:
             module.process_weights_after_loading(model)
 
 
+def _rearm_router_output_multiplier(model: torch.nn.Module, model_config: Any) -> None:
+    """Re-arm vLLM Muse Spark's one-shot router output-multiplier fold before a refit.
+
+    ``fold_router_output_multiplier`` multiplies ``output_multiplier`` into the router weight
+    during ``process_weights_after_loading`` and then clears ``router_output_multiplier``, so
+    it only ever folds once. A refit loads *unfolded* router weights over the already-folded
+    ones and re-runs ``process_weights_after_loading``; with the multiplier cleared nothing
+    folds, and the router weight ends up ``1 / output_multiplier`` (sqrt(32) for Muse Spark)
+    times too large, which skews expert routing (generation/training KL ~0.25 vs ~1e-3).
+    No-op for models without the folding hook and before the first fold.
+    """
+    multiplier = getattr(model_config.hf_text_config, "output_multiplier", None)
+    if multiplier is None:
+        return
+    for module in model.modules():
+        if (
+            hasattr(module, "fold_router_output_multiplier")
+            and module.router_output_multiplier is None
+        ):
+            module.router_output_multiplier = multiplier
+            module.moe_router.router_output_multiplier = multiplier
+
+
 def _unquantized_flashinfer_trtllm_modules(
     model: torch.nn.Module,
 ) -> list[torch.nn.Module]:
@@ -1707,6 +1730,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         )
 
         def finalize() -> None:
+            _rearm_router_output_multiplier(self.model_runner.model, self.model_config)
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
                     self.model_runner.model, self.model_config, self.device

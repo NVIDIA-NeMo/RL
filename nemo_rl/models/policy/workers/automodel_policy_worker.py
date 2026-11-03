@@ -32,7 +32,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from torch import nn
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -262,6 +262,22 @@ def _module_params_generator(
     for name, tensor in state_dict.items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
+        if isinstance(tensor, DTensor) and not _is_lora_merge_target(module_map, name):
+            shard_local_tensors = _adapt_sharded_tensor_to_hf(model, name, tensor)
+            if shard_local_tensors is not None:
+                for adapted_fqn, adapted_tensor in shard_local_tensors:
+                    refit_dtype = _refit_tensor_dtype(
+                        adapted_fqn, adapted_tensor, target_dtype
+                    )
+                    # Cast and lay out the local shard first, then gather: the
+                    # gathered tensor already is the refit tensor, so the full-size
+                    # unadapted tensor and its contiguous copy never coexist
+                    # (2 x 16 GiB per grouped-expert tensor of Muse Spark).
+                    local_ready = adapted_tensor.to(refit_dtype).contiguous()
+                    yield adapted_fqn, local_ready.full_tensor().contiguous()
+                    del local_ready, adapted_tensor
+                del shard_local_tensors
+                continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
         merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
 
@@ -325,6 +341,52 @@ def _assert_lora_modules_reachable(
 
 
 @torch.no_grad()
+def _is_lora_merge_target(module_map: dict[str, nn.Module], fqn: str) -> bool:
+    """Whether ``_maybe_merge_lora_weight`` rewrites this tensor (it needs the gathered base)."""
+    if not fqn.endswith(".weight"):
+        return False
+    return isinstance(module_map.get(fqn[: -len(".weight")]), LinearLoRA)
+
+
+def _adapt_sharded_tensor_to_hf(
+    model_part: nn.Module, fqn: str, tensor: DTensor
+) -> Optional[list[tuple[str, torch.Tensor]]]:
+    """Adapt a dim-0-sharded DTensor to HF format before gathering it, when equivalent.
+
+    Gathering first and adapting afterwards holds the gathered tensor and a
+    contiguous copy of its adapted layout at the same time. When every placement
+    shards dim 0 (or replicates) and the state-dict adapter only applies view
+    operations that leave dim 0 untouched (for example Muse Spark's
+    ``transpose(-1, -2)`` of grouped experts), adapting the shards and gathering
+    along dim 0 yields the same tensors without that extra full-size copy.
+
+    Returns:
+        The adapted DTensors, or ``None`` when the shard-local path does not apply
+        and the caller must gather first.
+    """
+    if any(
+        not isinstance(placement, (Shard, Replicate))
+        or (isinstance(placement, Shard) and placement.dim != 0)
+        for placement in tensor.placements
+    ):
+        return None
+    # Probe the adapter on a meta tensor of the full shape: no memory, no comms.
+    probe = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
+    for _, probe_out in _maybe_adapt_tensor_to_hf(model_part, fqn, probe):
+        is_view_of_probe = probe_out is probe or probe_out._base is probe
+        keeps_dim0 = (
+            probe_out.dim() > 0
+            and probe_out.shape[0] == probe.shape[0]
+            and probe_out.stride(0) == probe.stride(0)
+        )
+        if not (is_view_of_probe and keeps_dim0):
+            return None
+    adapted = _maybe_adapt_tensor_to_hf(model_part, fqn, tensor)
+    if not all(isinstance(out, DTensor) for _, out in adapted):
+        return None
+    return adapted
+
+
 def _maybe_merge_lora_weight(
     module_map: dict[str, nn.Module],
     fqn: str,

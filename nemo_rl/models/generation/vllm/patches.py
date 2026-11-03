@@ -118,8 +118,6 @@ def _patch_vllm_init_workers_ray(
         that moves upstream the py_executable injection silently stops
         happening, so the caller must not report success unconditionally.
     """
-    file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
-
     old_line = "self._init_workers_ray(placement_group)"
     new_line = (
         "self._init_workers_ray(placement_group, "
@@ -127,12 +125,18 @@ def _patch_vllm_init_workers_ray(
     )
 
     applied = False
-    with _locked_file_patch(file_to_patch) as (content, write_back):
-        if new_line in content:
-            applied = True  # already patched by another worker on this node
-        elif old_line in content:
-            write_back(content.replace(old_line, new_line))
-            applied = True
+    try:
+        file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
+    except RuntimeError:
+        # vLLM main deleted the v1 Ray executor; RayExecutorV2 is the only backend.
+        file_to_patch = None
+    if file_to_patch is not None:
+        with _locked_file_patch(file_to_patch) as (content, write_back):
+            if new_line in content:
+                applied = True  # already patched by another worker on this node
+            elif old_line in content:
+                write_back(content.replace(old_line, new_line))
+                applied = True
 
     env_vars_to_copy = ["RAY_ENABLE_UV_RUN_RUNTIME_ENV", *(extra_env_vars or [])]
     existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
@@ -951,6 +955,13 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
     with _locked_file_patch(file_to_patch) as (content, write_back):
         if all(new in content for _, new in replacements):
             return
+        if (
+            "self.vision_final_layernorm" in content
+            and "_vision_final_layernorm_enabled" not in content
+        ):
+            # vLLM main carries the checkpoint-backed final LayerNorm natively.
+            logger.info("vLLM already provides the final vision LayerNorm; skipping.")
+            return
         if any(content.count(old) != 1 for old, _ in replacements):
             raise RuntimeError(
                 "Final vision LayerNorm patch requires the vLLM 0.29 model source "
@@ -1422,7 +1433,9 @@ def _apply_vllm_patches(
     # _init_workers_ray; the patch is only load-bearing when it is set to "0".
     # Reporting the same way in both cases either cries wolf or hides a real
     # break, so branch on it.
-    uses_v1_executor = not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
+    # vLLM main removed the v1 Ray executor together with this env var, leaving RayExecutorV2 as
+    # the only backend, so a missing attribute means "V2".
+    uses_v1_executor = not getattr(envs, "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", True)
     applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
 
     if applied and uses_v1_executor:

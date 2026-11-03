@@ -140,7 +140,8 @@ def set_refit_manifest_names(names: set[str] | None) -> None:
 
 def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
-        if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
+        # vLLM main removed this env var (RayExecutorV2 is the only backend); missing means "V2".
+        if getattr(envs, "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", True):
             from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
 
             original_initialize_worker = RayWorkerProc.initialize_worker

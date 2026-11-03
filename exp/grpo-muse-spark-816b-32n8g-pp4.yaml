@@ -1,0 +1,149 @@
+
+defaults: ../examples/configs/grpo_math_1B.yaml
+
+grpo:
+  max_num_epochs: 10
+  max_num_steps: 10000
+  use_leave_one_out_baseline: false
+  # reference_policy_kl_penalty is 0, so reference logprobs are unused: skip that full-model forward.
+  skip_reference_policy_logprobs_calculation: true
+  max_val_samples: 240
+  val_batch_size: 240
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 2
+  truncated_importance_sampling_type: tis
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/grpo-muse-spark-816b-32n8g-pp4
+  metric_name: null # Keep the latest checkpoint instead of the best metric.
+  keep_top_k: 1
+  save_period: 5
+  checkpoint_must_save_by: 00:03:45:00
+policy:
+  model_name: /apps/models/Muse-Spark-Open-816B-A42B
+  precision: bfloat16
+  # Fixed 1 GiB refit staging buffers. Without this the default (30% of free memory, ~11 GiB here)
+  # is still allocated while a 16 GiB grouped-expert tensor is gathered, and refit OOMs
+  refit_buffer_size_gb: 1
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 3072
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: true
+  make_sequence_length_divisible_by: 64
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+  scheduler:
+    - name: torch.optim.lr_scheduler.LinearLR
+      kwargs:
+        start_factor: 1.0e-08
+        end_factor: 1.0
+        total_iters: 10
+    - name: torch.optim.lr_scheduler.ConstantLR
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones:
+        - 10
+  automodel_cfg:
+    pipeline_parallel_size: 4
+    expert_parallel_size: 64
+    context_parallel_size: 1
+    # Must be set explicitly under PP; false = per-microbatch reduce-scatter, the non-PP memory profile.
+    defer_fsdp_grad_sync: false
+    activation_checkpointing: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    pipeline:
+      pp_schedule: 1f1b
+      # 512 samples / DP64 = 8 per DP rank = 8 micro-batches of 1 sample: one schedule call per update,
+      # no padding. 1f1b needs M >= pipeline_parallel_size.
+      microbatches_per_step: 8
+    moe_parallelizer:
+      ignore_router_for_ac: true
+      # Keep params sharded between forward and backward; there is no spare memory for unsharded copies.
+      reshard_after_forward: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch_fp32
+        experts: torch_mm
+        dispatcher: hybridep
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  generation:
+    max_new_tokens: 2048
+    vllm_kwargs:
+      language_model_only: true
+      mm_encoder_tp_mode: data
+    vllm_cfg:
+      precision: bfloat16
+      # Engine = 64 GPUs: TP8 (inside a node) x PP8 (across nodes), EP = TP = 8, 4 engines on 256 GPUs.
+      # An engine needs >= 64 GPUs: BF16 weights are ~1527 GiB, i.e. ~24 GiB/GPU at 64 GPUs but ~95 GiB/GPU at 16,
+      # which OOMs while vLLM builds the MoE weights (job 21037843).
+      # The 64 GPUs cannot come from vLLM data parallelism or a larger TP:
+      #   * Muse's BF16 MoE on Hopper (Triton route-major path) requires vLLM DP1 and PCP1
+      #     (vllm/models/muse_spark/nvidia/muse_moe_runner.py), so expert_parallel_size must equal TP (job 21039368).
+      #   * TP must divide the 16 KV heads (MuseSpark1xQKVOGateParallelLinear), so TP <= 16.
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 8
+      expert_parallel_size: 8
+      # NeMo-RL requires the async engine when vLLM PP > 1.
+      async_engine: true
+      env_vars:
+        # FlashInfer's all-reduce JIT-compiles trtllm_mnnvl_comm on the first forward (minutes per node);
+        # at 32 nodes that exceeded vLLM's 300 s execute-model timeout and killed every engine (job 21150630).
+        # TP8 stays inside a node, so the prebuilt custom / symm-mem / NCCL all-reduce backends suffice.
+        VLLM_ALLREDUCE_USE_FLASHINFER: "0"
+        # Headroom for other first-call kernel compiles (Triton MoE configs, FlashInfer JIT: the image's
+        # flashinfer-jit-cache does not match flashinfer-python, so its kernels are JIT-compiled).
+        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "3600"
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
+      max_model_len: 3072
+    colocated:
+      enabled: true
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemorl-muse
+    name: grpo-muse-spark-816b-32n8g-pp4
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32
