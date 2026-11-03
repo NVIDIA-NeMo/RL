@@ -18,6 +18,8 @@ For the full list of supported models, see
   AutoModel, including Context Parallel layouts for the text-only variants.
 - **[MiniMax](minimax/index.md)** — MiniMax-M3 GRPO with AutoModel training
   and BF16 vLLM generation, including validated scope and known limitations.
+- **[Muse](muse/index.md)** — Muse Spark GRPO with AutoModel training using
+  pipeline and expert parallelism, and BF16 vLLM generation.
 - **[Nemotron](nemotron/index.md)** — post-training recipes for Nemotron 3
   Nano, Nano Omni, Super, Ultra, and Nemotron 3.5 Lightning, spanning the
   Megatron and AutoModel backends.
@@ -35,6 +37,7 @@ deepseek/index.md
 glm/index.md
 gemma/index.md
 minimax/index.md
+muse/index.md
 nemotron/index.md
 qwen/index.md
 ```
