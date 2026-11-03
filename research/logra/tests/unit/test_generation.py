@@ -12,69 +12,64 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generation-worker interface and media-alignment regression tests."""
+"""Generation-worker interface and exact-token media regression tests."""
 
-import inspect
-from unittest.mock import Mock
+from dataclasses import dataclass
 
 import pytest
-from logra import generation
-from logra.generation import CuaGenerationWorkerImpl
-from nemo_rl.data.captured_media import CapturedMedia
+from logra.generation import CuaGenerationWorker, CuaGenerationWorkerImpl
+
 from nemo_rl.models.generation.openai_server_utils import PrefixSplice
+from nemo_rl.models.generation.vllm.utils import remap_multimodal_placeholders
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorker,
     VllmAsyncGenerationWorkerImpl,
 )
 
 
-def test_capture_override_accepts_every_base_keyword() -> None:
-    base = inspect.signature(VllmAsyncGenerationWorkerImpl._capture_request_media)
-    keywords = {
-        name: None
-        for name, param in base.parameters.items()
-        if param.kind is inspect.Parameter.KEYWORD_ONLY
-    }
-    inspect.signature(CuaGenerationWorkerImpl._capture_request_media).bind(
-        None, {}, **keywords
+def test_cua_uses_native_worker_without_a_second_media_remap() -> None:
+    assert CuaGenerationWorker is VllmAsyncGenerationWorker
+    assert CuaGenerationWorkerImpl is VllmAsyncGenerationWorkerImpl
+
+
+@pytest.mark.parametrize("history_length", [0, 1, 3, 5])
+def test_uncaptured_continuation_remaps_images_once(history_length: int) -> None:
+    @dataclass
+    class ImageSpan:
+        offset: int
+        length: int
+
+    image = [17, 18, 18, 19]
+    rendered_prefix = [1, *image, 5]
+    exact_prefix = [1, *image, *([5] * history_length)]
+    template = [*rendered_prefix, *image, 9]
+    final = [*exact_prefix, *image, 9]
+    spans = [ImageSpan(1, len(image)), ImageSpan(len(rendered_prefix), len(image))]
+    placeholders = {"image": spans}
+    prompt = {"prompt_token_ids": template, "mm_placeholders": placeholders}
+    splice = PrefixSplice(
+        token_ids=final,
+        model_cut_end=len(exact_prefix),
+        template_cut_start=len(rendered_prefix),
     )
-
-
-@pytest.mark.parametrize("has_admission", [False, True])
-@pytest.mark.parametrize("has_splice", [False, True])
-def test_capture_forwards_core_keywords_and_aligns_only_uncaptured_splices(
-    monkeypatch: pytest.MonkeyPatch, has_admission: bool, has_splice: bool
-) -> None:
     worker = object.__new__(CuaGenerationWorkerImpl)
-    engine_prompt = {"prompt_token_ids": [1, 2]}
-    admission = object() if has_admission else None
-    splice = (
-        PrefixSplice(token_ids=[3, 4], model_cut_end=1, template_cut_start=1)
-        if has_splice
-        else None
-    )
-    captured = Mock(spec=CapturedMedia)
-    capture = Mock(return_value=captured)
-    align = Mock()
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture
-    )
-    monkeypatch.setattr(generation, "align_image_placeholders", align)
 
-    result = worker._capture_request_media(
-        engine_prompt,
-        admission=admission,
-        splice=splice,
-        verify_retained_media=True,
+    media = worker._capture_request_media(
+        prompt, admission=None, splice=splice, verify_retained_media=True
     )
 
-    capture.assert_called_once_with(
-        engine_prompt,
-        admission=admission,
+    assert media is None
+    # The caller remaps uncaptured requests after this hook returns. The old
+    # override shifted spans here too, causing out-of-bounds ranges on growth.
+    assert prompt["prompt_token_ids"] == template
+    assert prompt["mm_placeholders"] is placeholders
+    assert [span.offset for span in spans] == [1, len(rendered_prefix)]
+    remapped = remap_multimodal_placeholders(
+        template_token_ids=template,
+        final_token_ids=final,
+        mm_placeholders=placeholders,
         splice=splice,
-        verify_retained_media=True,
     )
-    assert result is captured
-    if admission is None and splice is not None:
-        align.assert_called_once_with(engine_prompt, splice.token_ids)
-    else:
-        align.assert_not_called()
+    assert [span.offset for span in remapped["image"]] == [1, len(exact_prefix)]
+    for span in remapped["image"]:
+        assert final[span.offset : span.offset + span.length] == image

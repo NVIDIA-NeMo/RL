@@ -12,36 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUA media alignment at NeMo RL's generation-worker extension point."""
+"""Compatibility names for native vLLM generation and exact-token media remapping."""
 
-from typing import Any
-
-import ray
-
-from logra.osworld import align_image_placeholders
-from nemo_rl.data.captured_media import CapturedMedia
-from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    VllmAsyncGenerationWorkerImpl,
+    VllmAsyncGenerationWorker as CuaGenerationWorker,
+)
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorkerImpl as CuaGenerationWorkerImpl,
 )
 
-
-class CuaGenerationWorkerImpl(VllmAsyncGenerationWorkerImpl):
-    def _capture_request_media(
-        self,
-        engine_prompt: dict[str, Any],
-        *,
-        admission: Any | None,
-        splice: PrefixSplice | None = None,
-        **kwargs: Any,
-    ) -> CapturedMedia | None:
-        if admission is None and splice is not None:
-            align_image_placeholders(engine_prompt, splice.token_ids)
-        return super()._capture_request_media(
-            engine_prompt, admission=admission, splice=splice, **kwargs
-        )
-
-
-@ray.remote
-class CuaGenerationWorker(CuaGenerationWorkerImpl):  # pragma: no cover
-    pass
+__all__ = ["CuaGenerationWorker", "CuaGenerationWorkerImpl"]

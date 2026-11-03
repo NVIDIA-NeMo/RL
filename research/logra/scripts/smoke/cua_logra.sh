@@ -41,6 +41,10 @@ updates = [row for row in records if "train" in row]
 assert [row["step"] for row in updates] == [1], "Expected exactly one completed training update"
 for key in ("loss", "grad_norm", "score"):
     assert math.isfinite(updates[0]["train"][key]), key
-assert any("validation" in row for row in records), "Missing final held-out evaluation"
+assert updates[0]["train"]["global_valid_toks"] > 0, "No training tokens"
+assert updates[0]["train"]["infrastructure_failure_rate"] == 0, "Training rollout failed"
+validation = [row for row in records if "validation" in row]
+assert len(validation) == 1 and validation[0]["step"] == 1, "Missing final held-out evaluation"
+assert validation[0]["validation"]["infrastructure_failure_rate"] == 0, "Evaluation rollout failed"
 print("CUA_FUNCTIONAL_OK: one update and final evaluation")
 CHECK
