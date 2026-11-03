@@ -35,7 +35,7 @@ from torch.distributed.checkpoint.planner import LoadItemType
 CHUNK_BYTES = 16 << 20
 WINDOW_BYTES = 1 << 30
 # sha256 of inspect.getsource(FileSystemReader.read_data) in torch 2.11-2.13 (same code).
-READ_DATA_SHA256 = "86ad890ac621f4f563ee5f66a2059ebb3a3ba022a58d91d4e23d757405c691be"
+READ_DATA_SHA256 = "86ad890ac621f4f563ee5f66a2059ebb3a3ba022a58d91d4e23d757405c691be"  # pragma: allowlist secret
 _original_read_data = dcp_fs.FileSystemReader.read_data
 
 
