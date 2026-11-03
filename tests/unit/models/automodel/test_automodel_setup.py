@@ -1392,8 +1392,10 @@ class TestSetupModelAndOptimizer:
         from torch.nn.attention import SDPBackend
 
         mock_get_rank.return_value = 0
-        mock_distributed_context.cp_size = cp_size
-        mock_runtime_config.is_reward_model = is_reward_model
+        mock_distributed_context = mock_distributed_context._replace(cp_size=cp_size)
+        mock_runtime_config = mock_runtime_config._replace(
+            is_reward_model=is_reward_model
+        )
         mock_config["reward_model_cfg"] = {
             "enabled": is_reward_model,
             "reward_model_type": "regression",
