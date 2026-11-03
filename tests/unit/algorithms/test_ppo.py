@@ -655,11 +655,26 @@ def test_create_advantage_estimator_raw_reward():
         ppo=PPOConfig(
             adv_estimator={"name": "raw_reward", "normalize_advantages": True},
         ),
-        loss_fn={"reference_policy_kl_penalty": 0.0},
+        loss_fn=_make_loss_config(kl_penalty=0.0),
     )
 
     estimator = _create_advantage_estimator(master_config)
     assert isinstance(estimator, RawRewardAdvantageEstimator)
+
+
+def test_create_advantage_estimator_rejects_kl_in_reward_without_gae():
+    """raw_reward ignores the KL, and the loss drops it under use_kl_in_reward."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.ppo import _create_advantage_estimator
+
+    master_config = SimpleNamespace(
+        ppo=PPOConfig(adv_estimator={"name": "raw_reward"}),
+        loss_fn=_make_loss_config(kl_penalty=0.1, use_kl_in_reward=True),
+    )
+
+    with pytest.raises(ValueError, match="use_kl_in_reward"):
+        _create_advantage_estimator(master_config)
 
 
 def test_ppo_schema_rejects_unsupported_estimator_name():
@@ -722,7 +737,7 @@ def test_create_advantage_estimator_rejects_unsupported_name():
         ppo=PPOConfig.model_construct(
             adv_estimator=GAEConfig.model_construct(name="grpo")
         ),
-        loss_fn={"reference_policy_kl_penalty": 0.0},
+        loss_fn=_make_loss_config(kl_penalty=0.0),
     )
 
     with pytest.raises(ValueError, match="only supports 'gae' or 'raw_reward'"):
