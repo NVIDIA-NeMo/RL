@@ -2541,6 +2541,7 @@ def _fake_gym_run_helper(monkeypatch, gym_mod, gym_cli, gym_rollout_collection):
     """Capture the global config `_spinup` hands to Gym, without starting one."""
     from unittest.mock import MagicMock
 
+    import nemo_gym.server_utils as gym_server_utils
     from omegaconf import OmegaConf
 
     started = []
@@ -2556,6 +2557,11 @@ def _fake_gym_run_helper(monkeypatch, gym_mod, gym_cli, gym_rollout_collection):
 
     monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
     monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    # _spinup resolves the rollout client up front, which would otherwise reach
+    # the head server the fake RunHelper never started.
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
     monkeypatch.setattr(gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
     return started
 
