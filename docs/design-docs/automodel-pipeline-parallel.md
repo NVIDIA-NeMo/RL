@@ -1,235 +1,156 @@
 # Automodel Pipeline Parallelism
 
-This design note describes pipeline parallelism (PP) in NeMo RL's Automodel policy
-worker as implemented. Automodel's `AutoPipeline` splits the model into stages and
-builds the PyTorch schedule (`torch.distributed.pipelining`), which runs the forward
-and backward passes and the inter-stage communication. NeMo RL owns everything with
-RL semantics: batch planning, the loss, gradient normalization and clipping, the
-optimizer step, logprobs, the reference policy, checkpoints, and weight refit.
+This note describes pipeline parallelism (PP) in the Automodel policy worker. PP is
+supported for SFT and GRPO with the 1F1B schedule, one stage per PP rank, as in the
+Megatron backend.
 
-The schedule is 1F1B, which places one stage on each PP rank, as in NeMo RL's
-Megatron backend. Interleaved and V-shaped schedules, which place several stages on
-one rank, are not supported (Section 8).
+The work is split between Automodel and NeMo RL:
 
-## 1. Configuration
+| Owner | Responsibilities |
+| --- | --- |
+| Automodel | Splitting the model into stages (`AutoPipeline`), building the PyTorch schedule (`torch.distributed.pipelining`), forward and backward passes, inter-stage communication |
+| NeMo RL | Batch planning, the RL loss, gradient normalization and clipping, the optimizer step, logprobs, the reference policy, checkpoints, and weight refit |
+
+NeMo RL code lives in `nemo_rl/models/automodel/pipeline_parallel.py`; the worker
+branches on `worker.pipeline`, which is `None` without PP.
+
+## Configuration
 
 ```yaml
 policy:
   train_micro_batch_size: 2
-  logprob_batch_size: 2              # must equal train_micro_batch_size
-  sequence_packing:
-    enabled: false
-  dynamic_batching:
-    enabled: false
+  logprob_batch_size: 2           # must equal train_micro_batch_size
   automodel_cfg:
-    pipeline_parallel_size: 2
-    defer_fsdp_grad_sync: false      # must be set explicitly; see Section 6
+    pipeline_parallel_size: 2     # omitted means 1
+    defer_fsdp_grad_sync: false   # required with PP; false is recommended
     pipeline:
-      microbatches_per_step: 8       # required, >= pipeline_parallel_size
+      microbatches_per_step: 8    # required; >= pipeline_parallel_size
 ```
 
-`pipeline_parallel_size` is optional in `AutomodelConfig`; an absent key means 1.
-The `pipeline` block is the Pydantic model `AutomodelPipelineConfig`
-(`nemo_rl/models/policy/__init__.py`):
-
-| Field | Meaning |
+| Key | Description |
 | --- | --- |
-| `microbatches_per_step` (M) | Microbatches of `train_micro_batch_size` samples per schedule call, at least `pipeline_parallel_size`. Required: M trades the pipeline bubble (about `(pp - 1) / (M + pp - 1)` of each call) against receive-buffer memory (one buffer per microbatch on every non-first stage) and padding (all M microbatches share one sequence length). |
+| `pipeline.microbatches_per_step` (M) | Microbatches of `train_micro_batch_size` samples per schedule call. Larger M shrinks the bubble, about `(pp - 1) / (M + pp - 1)` of each call, but costs one receive buffer per microbatch on every non-first stage and more padding, since all M microbatches share one sequence length. |
+| `defer_fsdp_grad_sync` | `true` reduce-scatters gradients once per schedule call and keeps a stage's unsharded parameters and fp32 gradients resident for the whole call. `false` reduce-scatters after every microbatch, which matches the non-PP memory profile. |
 
-The block rejects unknown keys, so schedule settings such as `pp_schedule` or
-`layers_per_stage` fail at startup.
+The `pipeline` block rejects unknown keys, so schedule settings such as `pp_schedule`
+fail at startup.
 
 The Ray worker layout is `[PP, DP, CP, TP]` and Automodel's mesh is
 `(pp, dp_replicate, dp_shard, cp, tp)`, so ranks line up. Data is sharded over DP and
-replicated within each PP group; DP size is `world_size / (pp * cp * tp)`.
+replicated within a PP group. Expert parallelism is built inside each stage, so
+`expert_parallel_size` must divide the `dp * cp * tp` ranks of one stage (for example,
+EP8 with PP2 on 16 GPUs).
 
-Expert parallelism composes with PP: Automodel builds the expert mesh inside each
-pipeline stage, so `expert_parallel_size` must divide the `dp * cp * tp` ranks of one
-stage (for example EP8 with PP2 on 16 GPUs). Multi-token-prediction heads (such as
-Qwen3.5-MoE's MTP layer) are not placed on any stage; RL training does not use them.
-
-### 1.1 Validation
+## Constraints
 
 `validate_automodel_pipeline_config` (`nemo_rl/models/policy/utils.py`) runs in
-`Policy.__init__` before any worker is created and rejects:
+`Policy.__init__` before workers start. With PP > 1 it rejects:
 
-- A missing `pipeline` block, an implicit `defer_fsdp_grad_sync`, or
-  `logprob_batch_size != train_micro_batch_size`.
-- `M < pp_size`: 1F1B needs at least one microbatch per stage.
+- A missing `pipeline` block or `defer_fsdp_grad_sync`, `M < pipeline_parallel_size`,
+  or `logprob_batch_size != train_micro_batch_size`.
 - Sequence packing, dynamic batching, sequence parallelism, CPU offload,
-  LoRA, draft co-training, router replay, reward models, ModelOpt quantization,
-  multimodal (VLM) models, non-colocated generation, and any `refit_transport`.
-- Models whose embedding and LM head share one weight (`tie_word_embeddings`).
-- A nonzero `automodel_cfg.clear_cache_every_n_steps`: periodic microbatch cache
-  clearing is not supported under PP. Leave it unset, or set it to `null` or `0`.
-  The usual cache clearing at the end of `train()` still runs.
+  `clear_cache_every_n_steps`, LoRA, draft co-training, router replay, reward models,
+  ModelOpt quantization, VLMs, non-colocated generation, and `refit_transport`.
+- Models with `tie_word_embeddings=true`.
 
-PP supports SFT and GRPO. SFT additionally requires
-`sft.val_micro_batch_size == policy.train_micro_batch_size`. DPO rejects PP at setup
-because it runs microbatches of `2 * train_micro_batch_size`.
-Top-k logits, full logits, and reward scoring raise `NotImplementedError` in the worker.
+SFT also requires `sft.val_micro_batch_size == policy.train_micro_batch_size`. DPO
+rejects PP at setup because it runs microbatches of `2 * train_micro_batch_size`. The
+Automodel value worker rejects PP. Top-k logits and full logits raise
+`NotImplementedError` in the worker.
 
-## 2. Pipeline Stage
+## Design
 
-`setup_model_and_optimizer` passes a `PipelineConfig` built by `build_pipeline_config`
-to `DistributedSetup`, and Automodel's `from_pretrained` returns an `AutoPipeline`. The
-NeMo RL-owned fields are:
+### Setup
 
-| Field | Value | Why |
+`build_pipeline_config` (`nemo_rl/models/automodel/setup.py`) passes a `PipelineConfig`
+to `DistributedSetup`, and `from_pretrained` returns an `AutoPipeline`:
+
+| Field | Value | Reason |
 | --- | --- | --- |
-| `pp_schedule` | `1F1B` | One stage per PP rank. |
+| `pp_schedule` | `1F1B` | One stage per rank. |
 | `pp_microbatch_size`, `pp_batch_size` | `mbs`, `mbs * M` | One schedule call runs M microbatches. |
-| `scale_grads_in_schedule` | `False` | The loss function already applies the non-PP backward scale (Section 4). |
-| `pp_seq_len` | `max_total_sequence_length` | Stage shapes are precomputed, so the schedule uses static stage metadata instead of shape inference. |
-| `dtype` | FSDP `output_dtype` (fp32) | Activations between stages carry the mixed-precision output dtype, not the parameter dtype. |
+| `scale_grads_in_schedule` | `False` | `pipeline_loss_fn` applies the non-PP backward scale. |
+| `pp_seq_len` | `max_total_sequence_length` | Static stage shapes; no shape inference. |
+| `dtype` | FSDP `output_dtype` (fp32) | Dtype of activations sent between stages. |
 | `loss_fn` | `pipeline_loss_fn` | The RL loss runs on the last stage. |
 
-Under 1F1B each rank owns one stage, `AutoPipeline.parts[0]`. Setup treats that stage
-as the model, so `worker.model`, `worker.optimizer`, and `worker.scheduler` are the
-stage, its optimizer, and its LR scheduler, as in the Megatron worker, and
-`worker.pipeline` holds the `AutoPipeline` (`None` without PP). Lifecycle code (mode
-switches, zero-grad, clipping, optimizer and scheduler steps, offload, reference swap)
-is the same with and without PP; only execution (Section 4), logprobs, refit, and the
-checkpoint's optimizer namespace (Section 5) branch on `worker.pipeline`. Worker
-features with no PP implementation either raise in the worker or are rejected by
-validation (Section 1.1), so no non-PP code path runs on a single stage.
+The rank's stage, `AutoPipeline.parts[0]`, becomes `worker.model`, so the optimizer,
+scheduler, mode switches, clipping, offload, and reference-weight swap are the same
+code as without PP.
 
-## 3. Training Loop
+### Batch Planning
 
-`train()` keeps the non-PP loop: each global batch is one optimizer update, and only
-the forward and backward pass branches on `worker.pipeline`:
+`plan_execution_batches` splits a rank's data into execution batches of `mbs * M`
+samples, one per schedule call:
+
+- The call count is all-reduced (max) over DP, so every DP rank issues the same FSDP
+  collectives. The tail is padded with copies of the first sample whose `sample_mask`
+  and `token_mask` are zero.
+- Models whose `forward` names a `padding_mask` parameter (Automodel's MoE models) also
+  get a mask that is true on padding rows, so routers exclude them from the auxiliary
+  loss and expert load.
+- Each row's sample ID is passed as the schedule `target`. The schedule splits it with
+  the inputs, and the loss function uses it to find the microbatch.
+- With CP, `ContextParallelSharder(num_chunks=M)` shards the whole execution batch once.
+  The loss function maps targets and logprobs through the same sharder.
+- Every call uses the data's sequence length, because re-initializing a stage clears
+  FSDP gradients.
+
+### Loss Function
+
+The schedule calls `pipeline_loss_fn(logits, sample_ids, context=PipelineCallContext)` on
+the last stage for each microbatch. It calls `post_process_logits`, the same
+temperature, masking, loss, and logprob path the non-PP worker uses, and records results
+by microbatch index, so a repeated call overwrites instead of double-counting.
+
+| Mode | Returns | Records |
+| --- | --- | --- |
+| `train` | `loss * dp * cp / cp_gradient_fanout`; zero for padding microbatches | loss and metrics |
+| `eval` | detached loss | loss and metrics |
+| `logprobs` | zero | token logprobs |
+
+In `eval` and `logprobs` mode the logits storage is freed after use, and the runner
+clears the stage's forward cache after each call.
+
+### Training Step
+
+`train()` keeps the non-PP loop, one optimizer update per global batch:
 
 ```text
-process_global_batch          global valid sequence/token counts, summed over DP
-optimizer.zero_grad
-PP=1: automodel_forward_backward
-PP>1: plan_execution_batches -> pipeline_forward_backward (schedule calls)
-clip (PP-aware) -> optimizer.step
-...                           (next global batch)
-PP>1: broadcast losses and metrics from the last stage
-zero_grad, scheduler.step, empty_cache, aggregate metrics
+process_global_batch            valid sequence and token counts, reduced over DP
+plan_execution_batches
+pipeline_forward_backward       M microbatches per schedule call; grads accumulate
+clip_grad_norm                  norm reduced over the PP group
+optimizer.step
+...
+broadcast losses and metrics from the last stage
 ```
 
-The normalization counts are known before any schedule call runs, so the loss is
-normalized exactly as without PP.
+Clipping uses `scale_grads_and_clip_grad_norm(pp_enabled=True, num_label_tokens=None)`.
+A non-`None` `num_label_tokens` would rescale gradients the loss already normalized.
 
-## 4. Pipeline Execution
+### Logprobs, Checkpoints, Refit
 
-### 4.1 Batch Planning
+- **Logprobs** run `schedule.eval()`. The last stage broadcasts the result, so every PP
+  rank returns the same tensor.
+- **Checkpoints** pass the PP rank and group to Automodel's checkpointer and namespace
+  optimizer state by stage index (`optimizer_part_ids`).
+- **Refit.** `PipelineWeightExporter` gathers each stage's tensor list once, then
+  broadcasts each tensor from its owning stage, so every PP rank yields the full model's
+  `(name, tensor)` stream with Hugging Face names. It backs `prepare_refit_info` and the
+  colocated CUDA IPC and SGLang refit paths. Every PP rank must consume the whole
+  stream.
+- **Offload.** `offload_before_refit` releases the stage's forward cache and receive
+  buffers before rollout; the next schedule call reallocates them.
+- **TransferQueue.** The replica group is the flattened `(pp, cp, tp)` sub-mesh, so one
+  rank per DP replica writes back.
 
-`plan_execution_batches` (`nemo_rl/models/automodel/pipeline_parallel.py`) turns the data
-of one global batch (or one logprob request) into execution batches of `mbs * M` samples. The
-tail is padded with copies of the first sample whose `sample_mask` and `token_mask` are
-zero, and the number of execution batches is all-reduced (max) over the DP group, so
-every DP rank issues the same number of schedule calls and FSDP collectives. Every
-execution batch keeps the data's padded sequence length.
+## Limitations
 
-Zeroing a padding row's loss does not hide it from MoE routers: the router auxiliary
-loss injects its gradient regardless of the main loss, and the gate bias update counts
-every routed token. Models whose `forward` names a `padding_mask` parameter (Automodel's
-MoE models) therefore also receive one that is true on padding rows and false on real
-rows, which matches the all-ones attention mask real rows get without PP. Their routers
-drop the padding rows from the auxiliary loss and the expert load; a microbatch of only
-padding rows contributes neither.
-
-Each row gets a sample ID (its position in the planned data). The schedule receives the
-IDs as the loss `target` and splits them along dim 0 exactly like the model inputs.
-
-With context parallelism, Automodel's `ContextParallelSharder` shards each execution
-batch once for all of its microbatches (`num_chunks=M`), as Automodel's own pipeline
-trainer does. The schedule call runs inside the sharder's context, which may shard the
-inputs in place, so the stage shapes are set from the input length inside it: the local
-shard for the generic round-robin layout, or the full length for models that shard in
-their own forward and describe their local activations through
-`get_pipeline_stage_metas`. The microbatches' canonical data stays unsharded, and the
-loss function maps each microbatch's targets and logprobs through the same sharder, which
-is valid because the layout depends only on the sequence position.
-
-### 4.2 Loss Function
-
-`pipeline_loss_fn` (`nemo_rl/models/automodel/pipeline_parallel.py`) is the
-schedule's `loss_fn`. The schedule calls it on the last stage once per microbatch as
-`loss_fn(logits, sample_ids, context=PipelineCallContext)`. It maps the IDs to
-the microbatch they select and calls `post_process_logits`, the same temperature,
-masking, logprob, and loss path the non-PP worker uses. Results are written by
-microbatch index, so an extra call (for example during dynamic metadata inference)
-overwrites instead of double-counting.
-
-| Mode | Returned value | Recorded result |
-| --- | --- | --- |
-| `train` | `loss * dp_size * cp_size / cp_gradient_fanout` (the non-PP backward scale; zero for padding microbatches) | detached loss and metrics |
-| `eval` | detached loss | loss and metrics; the logits storage is freed |
-| `logprobs` | zero | token logprobs; the logits storage is freed |
-
-Forward-only calls keep every microbatch's output in the stage's forward cache until
-the next call, so the loss function frees the logits storage after use and the runner calls
-`stage.clear_runtime_states()` after each forward-only call.
-
-### 4.3 Numerics
-
-- Global counts are reduced over the DP group only; PP ranks hold the same data.
-- Gradients are clipped with `scale_grads_and_clip_grad_norm(pp_enabled=True,
-  pp_axis_name="pp", num_label_tokens=None)`. `num_label_tokens=None` keeps the helper
-  from dividing gradients by `num_label_tokens / dp_group_size`, which would scale them
-  up by DP x CP.
-- Losses and metrics are computed on the last stage and broadcast within the PP group
-  after each update; `get_logprobs` broadcasts the logprobs tensor, so every PP rank
-  returns the same output, as `Policy` expects.
-
-### 4.4 Stage Re-initialization
-
-Re-initializing a stage (on a sequence-length change or a train/eval switch) clears
-FSDP gradients in the pinned PyTorch/Automodel versions. All execution batches of an
-update therefore use the data's sequence length, and the worker never switches mode
-within an update.
-
-## 5. Logprobs, Reference Policy, Offload, Checkpoints, and Refit
-
-- **Logprobs** run `schedule.eval()` under `torch.no_grad()` with the sample IDs as
-  target; the reference policy swaps the weights of the local stage.
-- **Offload.** `offload_before_refit` releases PP runtime state (forward cache and the
-  per-microbatch activation and gradient receive buffers) before the rollout engine
-  runs; the next schedule call reallocates them.
-- **Checkpoints** save and load each rank's stage through the same path as the whole
-  model; Automodel's checkpointer gets the PP rank and group, and optimizer state is
-  namespaced by the stage index (`optimizer_part_ids`), as in Automodel's own pipeline
-  trainer.
-- **Refit.** `PipelineWeightExporter` (`nemo_rl/models/automodel/pipeline_parallel.py`)
-  makes every PP rank produce the full model's `(name, tensor)` stream: each stage lists
-  its tensors (the same per-module stream as the non-PP refit: full tensors, Hugging
-  Face names, refit dtypes), the lists are gathered in PP rank order (stage order under
-  1F1B) once and cached with a check for duplicated names, and each tensor is broadcast
-  from its owning stage within the PP group. The exporter replaces `automodel_params_generator` for
-  colocated CUDA IPC (vLLM, TRT-LLM) and colocated SGLang refit, and its
-  `refit_info()` replaces `prepare_refit_info`. It does not assume its consumer is
-  same-GPU IPC, so enabling non-colocated refit later needs no exporter change.
-
-## 6. FSDP Gradient Synchronization
-
-By default PyTorch PP disables FSDP gradient sync and resharding for every microbatch
-and reduce-scatters once at the end of the schedule call; unsynchronized gradients
-accumulate in `reduce_dtype` (fp32), keeping unsharded parameters and fp32 gradients of
-a stage resident for the whole call. Automodel maps `defer_fsdp_grad_sync=false` to a
-per-microbatch reduce-scatter, which matches the memory profile of the non-PP path. PP
-configurations must therefore set `defer_fsdp_grad_sync` explicitly; `false` is
-recommended.
-
-## 7. TransferQueue Coordinates
-
-`_local_coords` includes `pipeline_parallel` and the replica group is the flattened
-`(pp, cp, tp)` sub-mesh, so exactly one rank of each DP replica writes back to TQ.
-
-## 8. Limitations and Follow-ups
-
-- Streaming (SingleController) updates are not supported. They would implement the
-  worker's `begin_train_step` / `train_microbatch` / `finish_train_step` contract, which
-  normalizes at finish, and need an upstream fix that preserves gradients across stage
-  re-initialization.
-- Inputs whose batch dimension is not dim 0, as reported by a model's
-  `get_pipeline_kwargs_chunk_dims` hook (for example multimodal M-RoPE position IDs),
-  are rejected when a batch is planned. Text-only inputs of such models run.
-- Only 1F1B is supported. Interleaved 1F1B would roughly halve the bubble (about 3%
-  instead of 6% of the training phase at PP=2, M=16; more at larger PP and smaller M)
-  but places several stages on one rank, as do V-shaped schedules; zero-bubble
-  schedules also split the backward pass. Supporting them needs per-rank lists of
-  stages, optimizers, and schedulers again.
+- Only 1F1B. Interleaved and V-shaped schedules place several stages on one rank and
+  would need per-rank lists of stages, optimizers, and schedulers.
+- Inputs that a model's `get_pipeline_kwargs_chunk_dims` hook splits along a non-batch
+  dimension are rejected when a batch is planned, for example Qwen3.5-MoE's M-RoPE
+  `position_ids`, which its CP hook also produces for text-only inputs.
+- SingleController streaming updates need an upstream fix that preserves gradients
+  across stage re-initialization.
