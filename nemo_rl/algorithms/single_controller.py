@@ -219,7 +219,7 @@ from nemo_rl.experience.rollout_recovery import (
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
-from nemo_rl.experience.rollouts import get_effort_config
+from nemo_rl.experience.rollouts import get_effort_config, get_nemo_gym_thinking_tags
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
@@ -2154,7 +2154,7 @@ class SingleControllerActor:
         self._finalizer_rewards_by_group.pop(request.group_id, None)
 
     async def _finalize_with_actor(
-        self, request: "ReassemblyRequest"
+        self, request: "ReassemblyRequest", rollout_metrics: dict[str, Any]
     ) -> Optional["FinalizedGroup"]:
         """Finalize and index one group atomically with respect to TQ saves.
 
@@ -2246,10 +2246,31 @@ class SingleControllerActor:
                     )
                 else:
                     try:
+                        meta = finalized.meta
+                        # Gym rollout metrics and the finalizer's verified token
+                        # metrics are disjoint; one sidecar carries both.
+                        overlap = (
+                            rollout_metrics.keys() & finalized.token_metrics.keys()
+                        )
+                        if overlap:
+                            raise RuntimeError(
+                                f"group {request.group_id}: rollout and finalizer "
+                                f"metrics both report {sorted(overlap)!r}"
+                            )
+                        group_metrics = {**rollout_metrics, **finalized.token_metrics}
+                        if group_metrics:
+                            # Same ROLLOUT_METRICS sidecar the echo path's commit writes.
+                            meta = replace(
+                                meta,
+                                extra_info={
+                                    **meta.extra_info,
+                                    ROLLOUT_METRICS: [group_metrics],
+                                },
+                            )
                         await self._buffer.commit_finalized(
                             cut,
                             request.group_id,
-                            finalized.meta,
+                            meta,
                             finalized.group_min_wv,
                             finalized.group_max_wv,
                             staging_keys=finalized.staging_keys,
@@ -2460,13 +2481,13 @@ class SingleControllerActor:
                             # spans under it must be gated on PER_PROMPT.
                             with per_prompt_scope():
                                 if lineage_group_id is None:
-                                    request = await self._rollout_manager.generate_for_finalization(
+                                    captured = await self._rollout_manager.generate_for_finalization(
                                         prompt,
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
                                     )
                                 else:
-                                    request = await self._rollout_manager.generate_for_finalization(
+                                    captured = await self._rollout_manager.generate_for_finalization(
                                         prompt,
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
@@ -2478,7 +2499,7 @@ class SingleControllerActor:
                             if not generation_permit_released:
                                 sem.release()
                                 generation_permit_released = True
-                            if request is None:
+                            if captured is None:
                                 # Dropped within the infra budget: nothing was
                                 # committed, so the train pump will never release
                                 # this permit, and the step it was stamped for
@@ -2498,7 +2519,10 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return
-                            finalized = await self._finalize_with_actor(request)
+                            request, rollout_metrics = captured
+                            finalized = await self._finalize_with_actor(
+                                request, rollout_metrics
+                            )
                             if finalized is None:
                                 # Finalizer dropped the group as a structural
                                 # outcome (e.g. router replay with no routed
@@ -3871,7 +3895,11 @@ class SingleControllerActor:
                         for name, values in step_finalizer_metrics.items()
                         if values
                         and not name.startswith(
-                            ("finalize/penalty_count/", "finalize/effort/")
+                            (
+                                "finalize/penalty_count/",
+                                "finalize/effort/",
+                                "finalize/truncated_count",
+                            )
                         )
                     }
                 )
@@ -4820,6 +4848,7 @@ class SingleControllerActor:
         return CaptureRewardSettings.from_configs(
             self._master_config.reward_penalties,
             get_effort_config(self._master_config.env),
+            get_nemo_gym_thinking_tags(self._master_config.env),
         )
 
     async def _capture_rollout_checkpoint_cut(
