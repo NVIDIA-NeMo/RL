@@ -55,7 +55,6 @@ from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
-    ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
     SAMPLER_TOPK_LOGPROBS_FIELD,
     SAMPLER_TOPK_TOKEN_IDS_FIELD,
@@ -204,6 +203,9 @@ class FinalizedGroup:
     # group (the caller does not read these when dropped is True).
     valid_row_count: int = 0
     total_row_count: int = 0
+    # Token metrics counted from the verified rows. The controller merges them
+    # with the Gym rollout metrics into the group's ROLLOUT_METRICS sidecar.
+    token_metrics: dict[str, Any] = field(default_factory=dict)
 
 
 def _capture_token_metrics(
@@ -1086,8 +1088,7 @@ class RolloutReassembler:
                     key = f"finalize/truncated_count/{context.agent_name}"
                     metrics[key] = metrics.get(key, 0.0) + truncated
 
-        # Reuse the ordinary replay metric channel; finalizer timing counters stay
-        # scalar-only. Compute before _publish_rows appends execution padding.
+        # Compute before _publish_rows appends execution padding.
         token_metrics = _capture_token_metrics(
             rows,
             [tag["logical_slot"] for tag in logical.tags]
@@ -1111,8 +1112,7 @@ class RolloutReassembler:
             canonical_sample_ids=canonical_sample_ids,
             loss_multiplier=loss_multiplier,
         )
-        if finalized.meta is not None:
-            finalized.meta.extra_info[ROLLOUT_METRICS] = [token_metrics]
+        finalized.token_metrics = token_metrics
         return finalized
 
     def _truncated_flags(

@@ -2247,13 +2247,24 @@ class SingleControllerActor:
                 else:
                     try:
                         meta = finalized.meta
-                        if rollout_metrics:
+                        # Gym rollout metrics and the finalizer's verified token
+                        # metrics are disjoint; one sidecar carries both.
+                        overlap = (
+                            rollout_metrics.keys() & finalized.token_metrics.keys()
+                        )
+                        if overlap:
+                            raise RuntimeError(
+                                f"group {request.group_id}: rollout and finalizer "
+                                f"metrics both report {sorted(overlap)!r}"
+                            )
+                        group_metrics = {**rollout_metrics, **finalized.token_metrics}
+                        if group_metrics:
                             # Same ROLLOUT_METRICS sidecar the echo path's commit writes.
                             meta = replace(
                                 meta,
                                 extra_info={
                                     **meta.extra_info,
-                                    ROLLOUT_METRICS: [rollout_metrics],
+                                    ROLLOUT_METRICS: [group_metrics],
                                 },
                             )
                         await self._buffer.commit_finalized(

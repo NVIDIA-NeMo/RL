@@ -1906,9 +1906,8 @@ class AsyncNemoGymRolloutImpl:
             completions[0].env_extras or {}
         )
         if receipt_mode:
-            # A receipt knows context lengths, not generation lengths. Exact
-            # output metrics are emitted after staged tensors are verified by
-            # the reassembler; delta_len includes input and is not a proxy.
+            # The finalizer reports all token metrics from the verified rows;
+            # receipts only supply the turn count here.
             if self._forest_training:
                 manifests = [
                     [
@@ -1929,15 +1928,7 @@ class AsyncNemoGymRolloutImpl:
                     )
                     for c in completions
                 ]
-            # .get with 0: _assemble_receipt ships raw ledger rows unvalidated
-            # when CallRecord validation fails (it only stamps
-            # capture_poisoned), so a malformed row must degrade a metric, not
-            # fail the group as a deterministic data failure.
             turn_count = [len(m) for m in manifests]
-            total_tokens = [
-                max((entry.get("cum_len", 0) for entry in m), default=0)
-                for m in manifests
-            ]
         else:
             turn_count = [
                 sum(1 for m in c.message_log if m["role"] == "user")
@@ -1991,7 +1982,11 @@ class AsyncNemoGymRolloutImpl:
             "turns_per_sample/p95": pct(turn_count, 95),
             "turns_per_sample/p99": pct(turn_count, 99),
             # token metrics
-            **calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
+            **(
+                calculate_single_metric(total_tokens, n, "total_tokens_per_sample")
+                if not receipt_mode
+                else {}
+            ),
             **termination_metrics,
         }
 
@@ -2021,6 +2016,7 @@ class AsyncNemoGymRolloutImpl:
                         "gen_tokens_per_sample",
                         "max_gen_tokens_per_turn",
                         "mean_gen_tokens_per_sample",
+                        "total_tokens_per_sample",
                     )
                 )
             }
@@ -2040,14 +2036,13 @@ class AsyncNemoGymRolloutImpl:
                 )
 
         # Emit authoritative live token metrics after full-result metrics so
-        # similarly named environment metadata cannot overwrite them. In receipt
-        # mode these come from the manifest-derived token counts above.
-        rollout_metrics.update(
-            calculate_single_metric(
-                total_tokens, n, f"{agent_name}/total_tokens_per_sample"
-            )
-        )
+        # similarly named environment metadata cannot overwrite them.
         if not receipt_mode:
+            rollout_metrics.update(
+                calculate_single_metric(
+                    total_tokens, n, f"{agent_name}/total_tokens_per_sample"
+                )
+            )
             rollout_metrics.update(
                 calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample")
             )

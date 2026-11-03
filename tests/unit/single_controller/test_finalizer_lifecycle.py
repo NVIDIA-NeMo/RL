@@ -195,6 +195,52 @@ def test_capture_rollout_metrics_ride_on_the_committed_meta() -> None:
     assert meta.extra_info == {"existing": 1}
 
 
+def _token_metrics_result(token_metrics: dict[str, Any]) -> FinalizedGroup:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    return FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        token_metrics=token_metrics,
+    )
+
+
+@pytest.mark.parametrize("rollout_metrics", [{"turns_per_sample/mean": 2.0}, {}])
+def test_finalizer_token_metrics_and_rollout_metrics_share_one_sidecar(
+    rollout_metrics: dict[str, float],
+) -> None:
+    """Neither source overwrites the other, including on partial-retry groups."""
+    token_metrics = {"gen_tokens_per_sample/mean": 7.0}
+    result = _token_metrics_result(token_metrics)
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+
+    asyncio.run(ctrl._finalize_with_actor(_request(), rollout_metrics))
+
+    committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
+    assert committed_meta.extra_info[ROLLOUT_METRICS] == [
+        {**rollout_metrics, **token_metrics}
+    ]
+
+
+def test_overlapping_finalizer_and_rollout_metrics_fail_the_commit() -> None:
+    result = _token_metrics_result({"gen_tokens_per_sample/mean": 7.0})
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+
+    with pytest.raises(RuntimeError, match="both report"):
+        asyncio.run(
+            ctrl._finalize_with_actor(_request(), {"gen_tokens_per_sample/mean": 1.0})
+        )
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+
+
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancel", "missing_route"])
 def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
     outcome: str,

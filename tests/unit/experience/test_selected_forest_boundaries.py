@@ -1310,7 +1310,8 @@ def test_capture_lengths_count_unique_generations_before_padding(
         reward_log_contexts=[RewardLogContext("agent", None)],
     )
     assert result.meta is not None and result.meta.size == 4
-    metrics = result.meta.extra_info[ROLLOUT_METRICS][0]
+    assert ROLLOUT_METRICS not in result.meta.extra_info
+    metrics = result.token_metrics
     # This harness generates exactly one token per model call. Contexts and
     # duplicated ancestors in sibling rows must not change that population.
     assert metrics["gen_tokens_per_sample/histogram"] == [len(selected)]
