@@ -37,7 +37,7 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
 from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -131,8 +131,9 @@ class FinalizedRollout:
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
     # One length per owned call, even when adjacent generations have no input gap.
     generation_lengths: tuple[int, ...] = ()
-    # Tokens the owned calls generated, by the weight version each call began on.
-    tokens_by_version: dict[int, int] = field(default_factory=dict)
+    # (model call ID, weight version stamped when it began, tokens it generated)
+    # for the same owned calls.
+    call_versions: tuple[tuple[str, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -208,17 +209,9 @@ class FinalizedGroup:
     # Token metrics counted from the verified rows. The controller merges them
     # with the Gym rollout metrics into the group's ROLLOUT_METRICS sidecar.
     token_metrics: dict[str, Any] = field(default_factory=dict)
-    # Tokens the verified rollouts' trained calls generated, by the weight
-    # version each call began on; empty when dropped.
-    tokens_by_version: dict[int, int] = field(default_factory=dict)
-
-
-def _tokens_by_version(calls: Iterable[tuple[int, int]]) -> dict[int, int]:
-    """Sum ``(weight_version, tokens)`` pairs by version."""
-    totals: dict[int, int] = {}
-    for version, tokens in calls:
-        totals[version] = totals.get(version, 0) + tokens
-    return totals
+    # Each trained call's (model call ID, weight version it began on, tokens it
+    # generated), across the group's verified rollouts; empty when dropped.
+    call_versions: list[tuple[str, int, int]] = field(default_factory=list)
 
 
 def _capture_token_metrics(
@@ -722,8 +715,8 @@ class RolloutReassembler:
                 for call_id, _, length in row.link_spans
                 if call_id not in loss_excluded_call_ids
             ),
-            tokens_by_version=_tokens_by_version(
-                (records_by_call[call_id].weight_version, length)
+            call_versions=tuple(
+                (call_id, records_by_call[call_id].weight_version, length)
                 for call_id, _, length in row.link_spans
                 if call_id not in loss_excluded_call_ids
             ),
@@ -1422,9 +1415,7 @@ class RolloutReassembler:
             meta=meta,
             group_min_wv=group_min_wv,
             group_max_wv=group_max_wv,
-            tokens_by_version=_tokens_by_version(
-                pair for row in valid_rows for pair in row.tokens_by_version.items()
-            ),
+            call_versions=[call for row in valid_rows for call in row.call_versions],
             staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
             canonical_output_tokens=sum(
                 int(mask) for row in valid_rows for mask in row.token_mask

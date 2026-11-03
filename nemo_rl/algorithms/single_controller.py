@@ -1406,10 +1406,8 @@ class SingleControllerActor:
                     # Canonical TQ rows plus replay metadata now own the completed
                     # group; keep only unfinished work in the lineage sidecar.
                     ledger.discard_group(cut, request.group_id)
-                    self._rollout_trace.emit(
-                        "group_published",
-                        group_id=request.group_id,
-                        tokens_by_version=finalized.tokens_by_version,
+                    self._rollout_trace.emit_group_published(
+                        request.group_id, finalized.call_versions
                     )
                     self._rollout_manager.record_canonical_publication(
                         finalized.canonical_output_tokens
@@ -4472,6 +4470,15 @@ class SingleControllerActor:
                     f"   {len(self._inflight_by_group_id)} in-flight rollout group(s) paused",
                     flush=True,
                 )
+                if (
+                    self._rollout_trace.enabled
+                    and self._master_config.token_capture.enabled
+                ):
+                    # Where each running captured call switches to the new weights.
+                    for progress in await asyncio.to_thread(
+                        self._gen.captured_call_progress
+                    ):
+                        self._rollout_trace.emit_refit_cut(**progress)
             refit_started = True
             await self._sync_weights_within(kv_scales, "first")
         except (RefitAborted, RayActorError) as failure:

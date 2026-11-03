@@ -200,8 +200,12 @@ token and training on it, comes from the same file:
 python -m nemo_rl.algorithms.rollout_checkpointing.trace <log_dir>/rollout_trace.jsonl
 ```
 
-Each call's tokens count under the version the call began on, so a call that
-runs across a refit counts as slightly older than it is.
+Each call's tokens count under the version it began on until a `refit_cut`, and
+under the version the following `weights_synced` installed from there on, so a
+call that runs across a refit is split exactly. vLLM reports each running call's
+token count from its output-processor request state, which has no public API; a
+backend that does not report it counts every token of a call under the version
+the call began on.
 
 ## Rules for New Code
 
