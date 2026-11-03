@@ -44,10 +44,7 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
-from nemo_rl.environments.nemo_gym_task import (
-    get_nemo_gym_attribution_key,
-    get_nemo_gym_task_input,
-)
+from nemo_rl.environments.nemo_gym_task import get_nemo_gym_attribution_key
 from nemo_rl.experience.dynamic_sampling import (
     StepRewardStats,
     drain_step_reward_metrics,
@@ -72,6 +69,7 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
@@ -1263,26 +1261,13 @@ class AsyncNemoGymRolloutImpl:
         # sample. Row-level redispatch reuses these rows and keeps the same ID.
         template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
 
-        # We do not translate max_seq_len into row-level max_tokens here because that would
-        # change semantics from "total sequence length" to "max new tokens".
-        responses_create_params = get_nemo_gym_task_input(template_row).get(
-            "responses_create_params"
-        )
-        if not isinstance(responses_create_params, dict):
-            raise TypeError(
-                "Each NeMo-Gym task input must contain a responses_create_params dict"
-            )
-        responses_create_params["temperature"] = self._generation_config["temperature"]
-        responses_create_params["top_p"] = self._generation_config["top_p"]
-
-        # Configure max_output_tokens to respect the max_new_tokens setting.
-        # Will clamp max_output_tokens in vllm_worker_async.py so that input + output <= max_seq_len
-        existing = responses_create_params.get("max_output_tokens")
-        responses_create_params["max_output_tokens"] = (
-            min(existing, self._generation_config["max_new_tokens"])
-            if existing is not None
-            else self._generation_config["max_new_tokens"]
-        )
+        # Gym applies these to the agent's model calls. A row-level max_seq_len limit
+        # would mean "max new tokens", not "total sequence length", so none is set.
+        template_row[NEMO_GYM_MODEL_SAMPLING_KEY] = {
+            "temperature": self._generation_config["temperature"],
+            "top_p": self._generation_config["top_p"],
+            "max_output_tokens": self._generation_config["max_new_tokens"],
+        }
 
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
         if rollout_ids is not None:

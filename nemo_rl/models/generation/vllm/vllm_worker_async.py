@@ -58,6 +58,10 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_MODEL_SAMPLING_HEADER,
+    NEMO_GYM_MODEL_SAMPLING_NULL,
+)
 from nemo_rl.experience.route_assembly import boundary_route_rows
 from nemo_rl.models.generation.prefix_recovery import (
     CaptureRegistry,
@@ -2085,38 +2089,43 @@ class VllmAsyncGenerationWorkerImpl(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
             # Accept train and validation profiles; reject off-policy requests.
-            # vLLM fills an unset top_k/min_p/repetition_penalty from
-            # generation_config.json when vllm_kwargs sets generation_config="auto",
-            # so pin top_k to the matched profile's (as
-            # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params does)
-            # and disable min_p and the repetition penalty. vLLM applies these and
-            # the presence/frequency penalties and logit bias before sampling; the
-            # trainer replays none of them, so a request may not set them.
-            top_k = check_sampling_param(
-                temperature=request.temperature,
-                top_p=request.top_p,
-                top_k=request.top_k,
-                generation_config=generation_config,
-            )
-            assert request.min_p in (None, 0.0), (
-                f"request min_p={request.min_p} is not supported; leave it unset"
-            )
-            assert request.repetition_penalty in (None, 1.0), (
-                f"request repetition_penalty={request.repetition_penalty} is not "
-                "supported; leave it unset"
-            )
-            assert request.presence_penalty in (None, 0.0), (
-                f"request presence_penalty={request.presence_penalty} is not "
-                "supported; leave it unset"
-            )
-            assert request.frequency_penalty in (None, 0.0), (
-                f"request frequency_penalty={request.frequency_penalty} is not "
-                "supported; leave it unset"
-            )
-            assert not request.logit_bias, "request logit_bias is not supported"
-            request.top_k = top_k
-            request.min_p = 0.0
-            request.repetition_penalty = 1.0
+            # Gym marks an untrained caller's call, such as an LLM judge's, which keeps its own sampling.
+            if (
+                raw_request.headers.get(NEMO_GYM_MODEL_SAMPLING_HEADER)
+                != NEMO_GYM_MODEL_SAMPLING_NULL
+            ):
+                # vLLM fills an unset top_k/min_p/repetition_penalty from
+                # generation_config.json when vllm_kwargs sets generation_config="auto",
+                # so pin top_k to the matched profile's (as
+                # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params does)
+                # and disable min_p and the repetition penalty. vLLM applies these and
+                # the presence/frequency penalties and logit bias before sampling; the
+                # trainer replays none of them, so a request may not set them.
+                top_k = check_sampling_param(
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    top_k=request.top_k,
+                    generation_config=generation_config,
+                )
+                assert request.min_p in (None, 0.0), (
+                    f"request min_p={request.min_p} is not supported; leave it unset"
+                )
+                assert request.repetition_penalty in (None, 1.0), (
+                    f"request repetition_penalty={request.repetition_penalty} is not "
+                    "supported; leave it unset"
+                )
+                assert request.presence_penalty in (None, 0.0), (
+                    f"request presence_penalty={request.presence_penalty} is not "
+                    "supported; leave it unset"
+                )
+                assert request.frequency_penalty in (None, 0.0), (
+                    f"request frequency_penalty={request.frequency_penalty} is not "
+                    "supported; leave it unset"
+                )
+                assert not request.logit_bias, "request logit_bias is not supported"
+                request.top_k = top_k
+                request.min_p = 0.0
+                request.repetition_penalty = 1.0
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
