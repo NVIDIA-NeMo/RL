@@ -2729,6 +2729,74 @@ class TestSetup:
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         fake_gym_shards.shutdown.assert_not_called()
 
+    def test_setup_tail_starts_communicator_and_actor_pools_together(
+        self, patched_factories
+    ):
+        """The refit communicator rendezvous and both actor pools have no shared
+        state, so setup starts them together: each waits here for the other two,
+        which a serial order could never satisfy."""
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.reward_penalties = RewardPenaltyConfig(
+            penalize_duplicated_reasoning=True,
+            penalize_empty_final_answer=True,
+            penalize_unwanted_tokens=True,
+            penalize_malformed_think_tag=False,
+            token_ids={"unwanted": [99], "think_open": 12, "think_close": 13},
+        )
+        mc.token_capture.enabled = True
+        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {"effort_levels": None}}
+        mc.async_rl.num_advantage_workers = 1
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        together = threading.Barrier(3, timeout=30)
+        fake_finalizers = [MagicMock(name="finalizer")]
+        fake_advantage = [MagicMock(name="advantage")]
+
+        def _create_finalizers(*args: Any, **kwargs: Any) -> list[Any]:
+            together.wait()
+            return fake_finalizers
+
+        def _create_advantage(*args: Any, **kwargs: Any) -> list[Any]:
+            together.wait()
+            return fake_advantage
+
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = lambda: together.wait()
+        tokenizer = MagicMock(pad_token_id=9)
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
+                side_effect=_create_finalizers,
+            ),
+            patch(
+                "nemo_rl.algorithms.advantage_actor.create_advantage_actors",
+                side_effect=_create_advantage,
+            ),
+        ):
+            actor_args, _ = setup_single_controller(mc, tokenizer)
+
+        weight_sync.init_communicator.assert_called_once_with()
+        assert actor_args.weight_synchronizer is weight_sync
+        assert actor_args.finalizer_actors == fake_finalizers
+        assert actor_args.advantage_actors == fake_advantage
+        assert not together.broken
+
     @pytest.mark.parametrize("think_tag_penalty", [False, True])
     @pytest.mark.parametrize("with_processor", [True, False])
     @pytest.mark.parametrize("with_opd", [True, False])
