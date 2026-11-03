@@ -249,9 +249,10 @@ class SGLangGeneration(GenerationInterface):
                 }.items()
             }
 
-            # Trainer and engine must agree on the NCCL transport; sglang's
-            # scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0.
-            env_vars["NCCL_CUMEM_ENABLE"] = "0"
+            # Native M2N requires symmetric memory before NCCL initializes.
+            env_vars["NCCL_CUMEM_ENABLE"] = (
+                "1" if self.sglang_cfg.get("refit_transport") == "nccl_reshard" else "0"
+            )
 
             # Explicitly pass CUDA_VISIBLE_DEVICES through to the engine actor so
             # all engines see the same global value (Ray would otherwise remap it
