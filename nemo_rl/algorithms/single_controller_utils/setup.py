@@ -1347,10 +1347,6 @@ def setup_single_controller(
     )
     if generation_prefix_cuts_enabled:
         # The vLLM-only check ran above with the other turn/prefix checks.
-        if capture_media:
-            raise NotImplementedError(
-                "generation-prefix recovery does not yet support multimodal capture"
-            )
         if router_replay_enabled(master_config.policy):
             raise NotImplementedError(
                 "generation-prefix recovery does not yet support router replay"
