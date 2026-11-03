@@ -92,17 +92,16 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         logical_rank = parallel_state.get_data_parallel_rank()
         logical_world_size = parallel_state.get_data_parallel_world_size()
+        # Bound rather than unpacked inline: a dict literal of bools narrows to
+        # dict[str, bool], which pyrefly reads as a candidate for ``tracer``.
+        attributes: dict[str, Any] = {
+            ENERGON_RANK_ATTR: logical_rank,
+            ENERGON_WORLD_SIZE_ATTR: logical_world_size,
+            ENERGON_RESTORED_ATTR: restored_state is not None,
+        }
         # Builds the loader object. iter() only creates energon's generator, so
         # the worker subprocesses fork on the first read_batch, not here.
-        with umbrella_span(
-            RLSpanGroup.U_SETUP,
-            "rl.sft_v2.build_loader",
-            **{
-                ENERGON_RANK_ATTR: logical_rank,
-                ENERGON_WORLD_SIZE_ATTR: logical_world_size,
-                ENERGON_RESTORED_ATTR: restored_state is not None,
-            },
-        ):
+        with umbrella_span(RLSpanGroup.U_SETUP, "rl.sft_v2.build_loader", **attributes):
             self._sft_loader = build_energon_sft_loader(
                 data_config=data_config,
                 source=data_config["train"],

@@ -26,6 +26,7 @@ from nemo_rl.data.energon.config import EnergonLoaderConfig
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
     TRACE_CARRIER_KWARG,
+    current_trace_carrier,
     iteration_scope,
     umbrella_span,
 )
@@ -136,9 +137,8 @@ def test_sft_v2_checkpointing_span_covers_the_whole_save(monkeypatch, tmp_path) 
     the finalization handoff outside, and ``rl.checkpoint.finalize`` parents to
     whatever is open when ``begin_finalization`` runs.
 
-    The wait on a deferred save counts too. It is the previous checkpoint's,
-    but it blocks this step, and leaving it outside made the span read shorter
-    than the gap it is supposed to explain.
+    The wait on a deferred save counts too: it is the previous checkpoint's,
+    but it blocks this step.
     """
     exporter = InMemorySpanExporter()
     handle = setup_telemetry(
@@ -207,6 +207,69 @@ def test_sft_v2_checkpointing_span_covers_the_whole_save(monkeypatch, tmp_path) 
     }
 
 
+def test_sft_v2_controller_constructor_parents_setup_loaders_to_the_driver() -> None:
+    """``__init__`` builds the loaders, and Ray carries no context into one.
+
+    ``@accepts_trace_context`` only works on a method the driver calls through
+    ``.remote()``; a constructor has nowhere to put the kwarg, so the carrier
+    is an argument instead. Without it the whole setup subtree re-roots while
+    ``rl.sft_v2.driver`` is open on the driver and looks fine from the code.
+    """
+    exporter = InMemorySpanExporter()
+    handle = setup_telemetry(
+        NemoLensConfig(enabled=True, span_groups="per_step"),
+        span_exporter=exporter,
+    )
+    controller_cls = SFTSingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    template = _loader_setup_controller(handle.tracer, num_workers=2)
+    actor_args = SimpleNamespace(
+        trainer=template._trainer,
+        loss_fn=MagicMock(),
+        train_cluster=MagicMock(),
+        placement_plan=template._placement_plan,
+        save_state=SFTV2SaveState(0, 0, 0, "placement"),
+        loader_states=None,
+        setup_timing=MagicMock(),
+    )
+    master_config = MagicMock()
+    master_config.data = template._master_config.data
+    master_config.policy = template._master_config.policy
+    master_config.sft = SimpleNamespace(
+        only_unmask_final=False, defer_async_checkpoint_finalize=False
+    )
+
+    with umbrella_span(RLSpanGroup.U_JOB, "rl.sft_v2.driver", tracer=handle.tracer):
+        # Captured on the driver, inside its job span, as run_sft_v2 does.
+        carrier = current_trace_carrier()
+
+    # Constructed outside that block on purpose. The actor is a separate
+    # process, where the driver's context is not ambient, so a test that runs
+    # __init__ under the open span passes whether or not the carrier is read.
+    with (
+        patch(
+            "nemo_rl.algorithms.sft_v2.init_telemetry_worker",
+            return_value=SimpleNamespace(tracer=handle.tracer),
+        ),
+        patch("nemo_rl.algorithms.sft_v2.Logger"),
+        patch("nemo_rl.algorithms.sft_v2.CheckpointManager"),
+        patch("nemo_rl.algorithms.sft_v2.TimeoutChecker"),
+        patch("nemo_rl.algorithms.sft_v2._max_train_steps", return_value=1),
+        patch("nemo_rl.algorithms.sft_v2.ray.get", return_value=[True, True]),
+    ):
+        controller_cls.__init__(
+            controller, master_config, actor_args, trace_carrier=carrier
+        )
+    handle.shutdown()
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    assert set(spans) >= {"rl.sft_v2.driver", "rl.sft_v2.setup_loaders"}
+    assert (
+        spans["rl.sft_v2.setup_loaders"].parent.span_id
+        == spans["rl.sft_v2.driver"].context.span_id
+    )
+
+
 def test_sft_v2_setup_loaders_span_records_the_energon_worker_pool() -> None:
     """The subprocesses emit nothing, so the span is the only place they appear.
 
@@ -246,15 +309,6 @@ def test_sft_v2_in_process_loading_reports_no_worker_pool() -> None:
 
     assert attributes[ENERGON_WORKERS_PER_RANK_ATTR] == 0
     assert attributes[ENERGON_IN_FLIGHT_ATTR] == 0
-
-
-def test_sft_v2_worker_pool_attributes_are_absent_without_an_energon_block() -> None:
-    """A span must not be the thing that fails a run.
-
-    ``build_energon_sft_loader`` rejects a missing block with a message worth
-    reaching, so the span cannot raise a ``KeyError`` ahead of it.
-    """
-    assert _energon_fanout_attributes({"max_input_seq_length": 128}) == {}
 
 
 def test_sft_v2_owner_calls_carry_the_caller_trace_context() -> None:

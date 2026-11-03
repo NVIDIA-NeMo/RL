@@ -183,15 +183,12 @@ def _energon_fanout_attributes(data_config: Mapping[str, Any]) -> dict[str, int]
     """How many Energon worker subprocesses a rank will fork, and their queue depth.
 
     Per rank, because the span these land on has one ``rl.sft_v2.build_loader``
-    child per rank carrying ``rl.energon.world_size``. Empty without an energon
-    block, which the worker rejects with a message worth reaching.
+    child per rank carrying ``rl.energon.world_size``.
 
     ``num_workers=0`` loads in the policy process, so both read 0 rather than
     going absent: there is genuinely no subprocess and no queue.
     """
-    energon = data_config.get("energon")
-    if energon is None:
-        return {}
+    energon = data_config["energon"]
     return {
         ENERGON_WORKERS_PER_RANK_ATTR: energon.num_workers,
         ENERGON_IN_FLIGHT_ATTR: energon.num_workers * energon.prefetch_factor,
@@ -500,9 +497,6 @@ class SFTSingleControllerActor:
         is the one value that cannot double-count: the phases nest and the worker
         builds run concurrently, so summing across phases multiplies startup
         rather than measuring it.
-
-        Not routed through ``print_setup_timing_summary``: that asserts a
-        generation-init phase, which this algorithm has no backend for.
         """
         self._logger.log_metrics(
             setup_timing.to_metrics_dict(), step=0, prefix=SETUP_TIMING_PREFIX
@@ -515,9 +509,8 @@ class SFTSingleControllerActor:
         with managed_span(
             RLSpanGroup.CHECKPOINT, "rl.sft_v2.checkpointing", tracer=self._tracer
         ):
-            # The workers would wait for a still-pending save anyway; publish it
-            # first. Inside the span because the wait blocks the training loop,
-            # which is what this span measures, and grpo counts it the same way.
+            # The workers would wait for a still-pending save anyway, and that
+            # wait blocks the loop, which is what this span measures.
             self._finish_pending_save(blocking=True)
             loader_states = self._loader_state_dicts()
             if len(loader_states) != self._placement_plan.logical_world_size:
