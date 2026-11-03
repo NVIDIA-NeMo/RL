@@ -364,4 +364,3 @@ def test_suite_scripts_have_no_local_paths(all_test_suites):
             assert local_prefix not in text, (
                 f"{script} contains a local path ({local_prefix})"
             )
-

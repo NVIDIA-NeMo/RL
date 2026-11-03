@@ -206,14 +206,7 @@ def _check_required_keys(config_file: str, config: DictConfig) -> None:
     elif "teachers" in config_dict or (
         "loss_fn" in config_dict and "projection_matrix_path" in config_dict["loss_fn"]
     ):
-        # Cross-tokenizer off-policy distillation also has a top-level
-        # ``distillation`` block, so it must be matched before the generic
-        # ``distillation`` branch below. The multi-teacher cross-tokenizer config
-        # is identified by its top-level ``teachers`` list (online distillation
-        # uses a singular ``teacher``); the per-(student, teacher) projection path
-        # now lives at ``teachers[i].aligner.projection_matrix_path`` rather than
-        # ``loss_fn``. The legacy ``loss_fn.projection_matrix_path`` check is kept
-        # as a fallback for any single-teacher config that still carries it.
+        # Match xtoken first because its configs also have a distillation block.
         master_config_class = XTokenOffPolicyDistillationMasterConfig
         config_type = "xtoken_off_policy_distillation"
     elif "distillation" in config_dict:
@@ -338,9 +331,11 @@ def _check_single_controller_config(config: DictConfig) -> None:
     config_dict = OmegaConf.to_container(config, resolve=True)
     if "async_rl" not in config_dict:
         pytest.skip("Not a SingleController config")
+
     # Validate the SingleController config
     master_config = SingleControllerMasterConfig.model_validate(config_dict)
     validate_single_controller_config(master_config)
+
     # Validate the ClippedPGLossFn against the OPD full config
     ClippedPGLossFn(master_config.loss_fn, opd_full=get_opd_full_config(master_config))
 
