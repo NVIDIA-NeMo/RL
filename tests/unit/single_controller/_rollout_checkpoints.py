@@ -26,6 +26,7 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
     RolloutRuntimeState,
     TrainingProgress,
 )
+from nemo_rl.algorithms.rollout_checkpointing.trace import RolloutTrace
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
 
 
@@ -69,6 +70,7 @@ def attach_rollout_checkpointing(controller: Any) -> None:
             current_epoch=getattr(controller, "_current_epoch", 0),
         ),
         log_metrics=controller._log_telemetry_metrics,
+        trace=getattr(controller, "_rollout_trace", RolloutTrace(None)),
     )
     controller._rollout_snapshots = RolloutSnapshotter(
         parts,

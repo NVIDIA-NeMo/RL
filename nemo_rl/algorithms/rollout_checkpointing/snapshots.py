@@ -239,13 +239,14 @@ class RolloutSnapshotter(_UsesRolloutParts):
         async with self._save_lock:
             yield
 
-    def trainer_checkpoint_published(self) -> None:
-        """Wake the pump once a trainer checkpoint is published.
+    def trainer_checkpoint_published(self, step: int) -> None:
+        """Wake the pump once the trainer checkpoint for ``step`` is published.
 
         A trainer checkpoint holds no environment state, so the pump waits for
         it to be durable, off the training loop, and then captures the
         environment anchored to it.
         """
+        self._trace.emit("trainer_checkpoint_published", step=step)
         if self._environment_checkpoint.holds_rollout_state:
             self._wakeup.set()
 
@@ -652,6 +653,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     barrier_requested = time.monotonic()
                     async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
                         barrier_acquired = time.monotonic()
+                        cut_wall_time = time.time()
                         if (
                             self._optimizer_commit_in_progress
                             or self._read_progress().train_steps != expected_train_step
@@ -741,6 +743,14 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 checkpoint_metrics,
                 step=expected_train_step,
                 prefix="timing/rollout_checkpoint",
+            )
+            self._trace.emit(
+                "snapshot_published",
+                path=str(final_path),
+                step=expected_train_step,
+                trainer_version=expected_trainer_version,
+                # When the saved rollout state was captured.
+                cut_time=cut_wall_time,
             )
             print(
                 "rollout checkpoint save completed: "

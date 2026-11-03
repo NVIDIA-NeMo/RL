@@ -48,6 +48,7 @@ from nemo_rl.experience.reward_penalties import (
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
     from nemo_rl.algorithms.async_utils.staleness_sampler import PromptGroupSampler
+    from nemo_rl.algorithms.rollout_checkpointing.trace import RolloutTrace
     from nemo_rl.experience.rollout_manager import RolloutManager
 
 
@@ -159,6 +160,8 @@ class RolloutParts:
     read_progress: Callable[[], TrainingProgress]
     # The controller's telemetry logger.
     log_metrics: Callable[..., None]
+    # The per-rollout event log; a no-op unless rollout_checkpointing.trace is set.
+    trace: RolloutTrace
 
 
 class _UsesRolloutParts:
@@ -179,3 +182,4 @@ class _UsesRolloutParts:
         self._rollout_runtime = parts.runtime_state
         self._read_progress = parts.read_progress
         self._log_metrics = parts.log_metrics
+        self._trace = parts.trace
