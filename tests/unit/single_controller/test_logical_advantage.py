@@ -379,6 +379,8 @@ def test_filter_metric_counts_owners_not_segments_or_padding(
     ctrl = _controller(meta, data)
     asyncio.run(ctrl._advantage_stage(meta))
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [expected_count]
+    # Per-row reason counts would count segments and padding, so none are kept.
+    assert ctrl._step_log_dict["sample_mask_metrics"] == []
     assert (
         data["sample_mask"][:3].tolist()
         == [float(not any(row < 3 for row in flagged_rows))] * 3
