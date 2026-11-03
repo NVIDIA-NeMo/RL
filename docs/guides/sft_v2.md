@@ -1,6 +1,6 @@
 # SFT v2 with an Energon CLEVR dataset
 
-This guide runs Qwen2.5-VL-3B-Instruct supervised fine-tuning with the Megatron backend on two GPUs. It starts with the public CLEVR-CoGenT data, prepares the indexed Energon dataset expected by the recipe, and launches `examples/run_sft_v2.py`. Run the commands from the repository root inside a NeMo RL container on a machine with two GPUs. For cluster allocation and container setup, see [Cluster Setup](../cluster.md) and [Installation](../about/installation.md).
+This guide runs Qwen2.5-VL-3B-Instruct supervised fine-tuning with the Megatron backend on two GPUs. It starts with the public CLEVR-CoGenT data, prepares the indexed Energon dataset expected by the recipe, and launches `examples/run_sft_v2.py`. Run the commands from the repository root inside a NeMo RL container on a machine with at least two GPUs. For cluster allocation and container setup, see [Cluster Setup](../cluster.md) and [Installation](../about/installation.md).
 
 ## 1. Get the code and environment
 
@@ -14,7 +14,7 @@ cd /opt/nemo-rl
 git submodule update --init --recursive
 ```
 
-On HSG, the `sft_v2_docs` rem project already has a checkout at `/home/rohitkumarj/code/RL/nemo-rl-sft_v2_docs` and uses `rl.nightly.sep30.2026.sqsh`. Its standard container mount maps the shared host data tree to `/data`. Use a two-GPU allocation for the training command below.
+On HSG, the `sft_v2_docs` rem project already has a checkout at `/home/rohitkumarj/code/RL/nemo-rl-sft_v2_docs` and uses `rl.nightly.sep30.2026.sqsh`. Its standard container mount maps the shared host data tree to `/data`. The project's `coreai_dlalgo_nemorl` account requires a four-GPU allocation; set `CUDA_VISIBLE_DEVICES=0,1` inside that allocation for this two-GPU recipe.
 
 ## 2. Prepare CLEVR for Energon
 
