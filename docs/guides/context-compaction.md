@@ -241,7 +241,8 @@ published group. With few rollouts per group, per-group padding can multiply
 the rows each step trains on. `forest_pad_source` picks the copied rows: `row0`
 (default) repeats the batch's first row; `cyclic` takes rows 0, 1, 2, and so on.
 A rollout snapshot taken during a step keeps that step's padding copies; resume
-deletes them before checking the replay inventory.
+deletes them before checking the replay inventory. Streaming PPO trains each chunk
+separately, so this scope pads every chunk.
 
 With `ppo.adv_estimator.whiten_execution_padding: true`, these copies also join
 the advantage whitening; they still carry no loss.

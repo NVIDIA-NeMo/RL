@@ -1489,7 +1489,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             warnings.warn(
                 "Streaming PPO with ppo.adv_estimator.normalize_advantages=true "
                 "normalizes GAE advantages per chunk instead of across the full "
-                "batch. Changing chunk boundaries can change normalized advantages.",
+                "batch. Changing chunk boundaries can change normalized advantages. "
+                "Set async_rl.min_groups_for_streaming_train to "
+                "ppo.num_prompts_per_step for full-batch PPO.",
                 stacklevel=2,
             )
 
@@ -1498,9 +1500,11 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         failure_config.max_skipped_prompts
         + failure_config.max_consecutive_dropped_prompts
     )
-    if drop_budget > 0:
+    # Forest critics train on the step's actual rows (gbs = its row count), so a
+    # short step is fine there.
+    if drop_budget > 0 and not master_config.token_capture.forest_training:
         raise ValueError(
-            "PPO on the SingleController path requires "
+            "PPO on the SingleController path without Forest training requires "
             "async_rl.rollout_failure.max_skipped_prompts=0 and "
             "max_consecutive_dropped_prompts=0, but they sum to "
             f"{drop_budget}. A drop shortens the step, but the critic split API "
@@ -1557,6 +1561,16 @@ def resolve_ppo_chunk_alignment(
     value_config = master_config.value
     if value_config is None:
         raise ValueError("PPO requires a value model configuration")
+    ppo_config = master_config.ppo
+    assert ppo_config is not None
+    min_groups = master_config.async_rl.min_groups_for_streaming_train
+    min_remaining_groups = (
+        (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
+    )
+    if master_config.token_capture.forest_training:
+        # Forest groups vary in row count, and execution padding already aligns
+        # every chunk to both models, so any group count works.
+        return 1, min_remaining_groups
 
     def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
         if config["dynamic_batching"]["enabled"] or (
@@ -1571,8 +1585,6 @@ def resolve_ppo_chunk_alignment(
         sample_multiple(master_config.policy, policy_dp),
         sample_multiple(value_config, value_dp),
     )
-    ppo_config = master_config.ppo
-    assert ppo_config is not None
     group_multiple = sample_alignment // math.gcd(
         sample_alignment, ppo_config.num_generations_per_prompt
     )
@@ -1581,16 +1593,12 @@ def resolve_ppo_chunk_alignment(
             "PPO num_prompts_per_step must be divisible by the policy/value "
             f"group multiple ({group_multiple}) to avoid an incomplete final chunk"
         )
-    min_groups = master_config.async_rl.min_groups_for_streaming_train
     if min_groups < group_multiple:
         raise ValueError(
             "PPO min_groups_for_streaming_train must be at least the "
             f"policy/value group multiple ({group_multiple}) so each chunk "
             "contains complete microbatches on every DP rank"
         )
-    min_remaining_groups = (
-        (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
-    )
     return group_multiple, min_remaining_groups
 
 

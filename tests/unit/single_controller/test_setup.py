@@ -4386,6 +4386,16 @@ def test_forest_startup_rejects_split_value_training(forest_config):
         validate_single_controller_config(mc)
 
 
+@pytest.mark.parametrize(
+    "field", ["max_skipped_prompts", "max_consecutive_dropped_prompts"]
+)
+def test_forest_startup_accepts_ppo_drop_budget(forest_config, field):
+    # The Forest critic trains on the step's actual rows, so a short step fits.
+    mc = _forest_ppo_config(forest_config)
+    setattr(mc.async_rl.rollout_failure, field, 1)
+    validate_single_controller_config(mc)
+
+
 def test_forest_startup_rejects_unsupported_critic_shape(forest_config):
     mc = _forest_ppo_config(forest_config)
     mc.value["dynamic_batching"] = {"enabled": True}
