@@ -908,7 +908,8 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                     "value train step has no valid training tokens or sequences"
                 )
             inv_n = 1.0 / denominator
-            self.model.scale_gradients(inv_n)
+            count = counts[1 if state.loss_fn.loss_type == LossType.TOKEN_LEVEL else 0]
+            self.model.scale_gradients(count.reciprocal())
             if self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
                 "overlap_grad_reduce"
             ]:

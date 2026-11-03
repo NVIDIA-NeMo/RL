@@ -373,16 +373,10 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 # FlashMLA derives its version from the Git revision in setup.py. Keep this pin
 # synchronized with the static dependency metadata below.
 flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
-# Pinned to 43fd41a58 (2026-08-15, release cherry-pick branch). It carries #2054 ("Fix vLLM
-# 0.24+ compatibility": the vLLM plugin registers on `RoutedExperts`; the older plugin
-# registered on `fused_moe.layer.FusedMoE`, which vLLM >= 0.28 removed, and NeMo-RL's explicit
-# re-import then failed with "RowParallelLinear already registered") but NOT 2ded5aba3
-# (#1550, 2026-08-07). Do not move to a revision that contains #1550 without porting
-# nemo_rl/modelopt: its per-expert `GroupedQuantizer` modules break the Megatron fakequant
-# DDP hook bookkeeping (`KeyError: GroupedQuantizer(...)` in `disable_forward_pre_hook`) and
-# real-quant dist-checkpoint sharding validation (`Invalid access pattern for
-# ShardedTensor(... experts.N.linear_fc1.weight_quantizer._amax`).
-nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "43fd41a58d52c4e6e5dec1d1ff5989ecc737ae1a" }
+# Minimum merged revision with the canonical weight-export API used by Bridge.
+# Includes grouped checkpoint sharding fixes; the ModelOpt worker hides all
+# AnyQuantizer containers when toggling DDP hooks.
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "83b1e69609e2bfcf4d7b1f3975e1112826e65bbf" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.7.0" }
 flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }

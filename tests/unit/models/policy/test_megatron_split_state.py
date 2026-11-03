@@ -678,11 +678,14 @@ class TestFinish:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        device = w._train_step_state["local_valid_toks"].device
         w.finish_train_step()
-        # scale_gradients should have been called with some 1/N scalar < 1
         w.model.scale_gradients.assert_called_once()
         arg = w.model.scale_gradients.call_args.args[0]
-        assert 0 < arg <= 1.0
+        assert isinstance(arg, torch.Tensor)
+        torch.testing.assert_close(
+            arg, torch.tensor(1 / 2048, dtype=torch.float64, device=device)
+        )
 
     def test_restores_first_step_param_sync_after_success(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
