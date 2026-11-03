@@ -25,7 +25,7 @@ loss_fn:
   # NOTE: the per-(student, teacher) projection matrix path now lives at
   # `teachers[i].aligner.projection_matrix_path` (see below), not here. The
   # knobs in this block are shared across all teachers.
-  # See docs/guides/xtoken-off-policy-distillation.md for how to produce the
+  # See docs/guides/cross-tokenizer-distillation.md for how to produce the
   # projection file.
   # Loss-mode selection (shared default; override per teacher via
   # teachers[i].gold_loss / .xtoken_loss in `sum` mode):

@@ -35,10 +35,12 @@ from nemo_rl.models.automodel.data import (
     make_processed_microbatch_iterator,
 )
 from nemo_rl.models.automodel.train import (
+    FullLogitsPostProcessor,
     LogprobsPostProcessor,
     LossPostProcessor,
     PreparedModelForward,
     ScorePostProcessor,
+    SparseLogitsPostProcessor,
     TopkLogitsPostProcessor,
     apply_temperature_scaling,
     automodel_forward_backward,
@@ -649,6 +651,49 @@ class TestLossPostProcessor:
         # Verify the wrapper was called instead of raw loss_fn
         mock_wrapper_instance.assert_called_once()
 
+    @patch("nemo_rl.models.automodel.train.SequencePackingLossWrapper")
+    @patch("nemo_rl.models.automodel.train.CSDSequencePackingLossWrapper")
+    def test_csd_packing_selects_axis_aware_wrapper_only(
+        self,
+        mock_csd_wrapper_class,
+        mock_generic_wrapper_class,
+        base_cfg,
+        mock_cp_mesh,
+        processed_inputs_with_flash,
+    ):
+        from nemo_rl.algorithms.loss.csd import CSDLossFn
+
+        loss_fn = object.__new__(CSDLossFn)
+        wrapper = MagicMock(return_value=(torch.tensor(0.5), {}))
+        mock_csd_wrapper_class.return_value = wrapper
+        processor = LossPostProcessor(
+            loss_fn=loss_fn,
+            cfg=base_cfg,
+            cp_mesh=mock_cp_mesh,
+            cp_size=1,
+            dp_size=1,
+            enable_seq_packing=True,
+        )
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(1, 8, dtype=torch.long),
+                "sample_mask": torch.ones(1),
+            }
+        )
+
+        processor(
+            logits=torch.randn(1, 8, 4),
+            data_dict=data,
+            processed_inputs=processed_inputs_with_flash,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+            cp_sharder=None,
+        )
+
+        mock_csd_wrapper_class.assert_called_once()
+        mock_generic_wrapper_class.assert_not_called()
+        wrapper.assert_called_once()
+
     def test_loss_processor_initialization(
         self,
         base_cfg,
@@ -824,6 +869,134 @@ class TestTopkLogitsPostProcessor:
 
         assert vals.shape == (batch_size, seq_len, k)
         assert idx.shape == (batch_size, seq_len, k)
+
+
+# =====================
+# Test SparseLogitsPostProcessor
+# =====================
+@pytest.mark.automodel
+class TestSparseLogitsPostProcessor:
+    def test_row_topk_logz_padding_and_forced_label(self, base_cfg, monkeypatch):
+        """Sparse export keeps exact logZ, ignores padded vocab columns, and
+        ships forced labels beside the unchanged natural top-k."""
+        from nemo_rl.algorithms.x_token.loss_utils import (
+            materialize_sparse_teacher_rows,
+        )
+
+        group = object()
+        mesh = MagicMock()
+        mesh.get_group.return_value = group
+
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda _group: 0)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group: 1)
+
+        processor = SparseLogitsPostProcessor(
+            cfg=base_cfg,
+            tp_mesh=mesh,
+            cp_mesh=mesh,
+            cp_size=1,
+            k=3,
+            temperature=2.0,
+            vocab_size=5,
+            gt_filter_topk=2,
+        )
+        # Column 5 is padded lm-head vocabulary. Its enormous value must not
+        # affect top-k support or the exact full-real-vocabulary normalizer.
+        logits = torch.tensor(
+            [[[5.0, 4.0, 3.0, 2.0, -7.0, 1000.0], [0.0, 1.0, 2.0, 3.0, 4.0, 900.0]]]
+        )
+        # Row 1 is read for two labels, as the last row of an unshifted first
+        # chunk is.
+        data = BatchedDataDict(
+            {
+                "force_include_token_ids": torch.tensor(
+                    [[[4, -1], [4, 1]]], dtype=torch.long
+                )
+            }
+        )
+
+        (
+            values,
+            token_ids,
+            log_z,
+            natural_tail_indices,
+            forced_logits,
+            forced_indices,
+            forced_in_topk,
+        ) = processor(
+            logits=logits,
+            data_dict=data,
+            processed_inputs=MagicMock(),
+            original_batch_size=1,
+            original_seq_len=2,
+            cp_sharder=None,
+        )
+
+        assert torch.equal(
+            token_ids, torch.tensor([[[0, 1, 2], [2, 3, 4]]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            values, torch.tensor([[[5.0, 4.0, 3.0], [2.0, 3.0, 4.0]]])
+        )
+        torch.testing.assert_close(
+            log_z, torch.logsumexp(logits[..., :5] / 2.0, dim=-1)
+        )
+        assert torch.equal(
+            natural_tail_indices, torch.tensor([[2, 2]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            forced_logits, torch.tensor([[[-7.0, 0.0], [4.0, 1.0]]])
+        )
+        assert torch.equal(forced_indices, data["force_include_token_ids"].int())
+        # Membership is against the natural top-gt_filter_topk (2) ids.
+        assert torch.equal(
+            forced_in_topk, torch.tensor([[[False, False], [True, False]]])
+        )
+
+        # Each request gets its own support: label 4 on row 0 evicts the tail
+        # (id 2); on row 1 label 4 is natural while label 1 evicts id 2.
+        rows = materialize_sparse_teacher_rows(
+            values[0, [0, 1, 1]],
+            token_ids[0, [0, 1, 1]],
+            natural_tail_indices[0, [0, 1, 1]],
+            forced_logits[0, [0, 1, 1]],
+            forced_indices[0, [0, 1, 1]],
+            forced_in_topk[0, [0, 1, 1]],
+            torch.tensor([4, 4, 1]),
+            real_vocab_size=5,
+        )
+        torch.testing.assert_close(
+            rows[0], torch.tensor([[5.0, 4.0, -7.0], [2.0, 3.0, 4.0], [1.0, 3.0, 4.0]])
+        )
+        assert torch.equal(
+            rows[1],
+            torch.tensor([[0, 1, 4], [2, 3, 4], [1, 3, 4]], dtype=torch.int32),
+        )
+        assert torch.equal(rows[2], torch.tensor([False, True, False]))
+
+    def test_requires_force_include_token_ids(self, base_cfg, monkeypatch):
+        mesh = MagicMock()
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda _group: 0)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group: 1)
+        processor = SparseLogitsPostProcessor(
+            cfg=base_cfg,
+            tp_mesh=mesh,
+            cp_mesh=mesh,
+            cp_size=1,
+            k=2,
+            temperature=1.0,
+            vocab_size=3,
+        )
+
+        with pytest.raises(KeyError, match="force_include_token_ids"):
+            processor(
+                logits=torch.zeros(1, 2, 3),
+                data_dict=BatchedDataDict({}),
+                processed_inputs=MagicMock(),
+                original_batch_size=1,
+                original_seq_len=2,
+                cp_sharder=None,
+            )
 
 
 # =====================
@@ -1256,7 +1429,6 @@ class TestAutomodelForwardBackward:
     def test_forward_backward_multiple_microbatches(
         self,
         mock_model,
-        mock_loss_fn,
         base_cfg,
         mock_device_mesh,
         mock_cp_mesh,
@@ -1297,9 +1469,16 @@ class TestAutomodelForwardBackward:
                 )
             )
 
+        from nemo_rl.algorithms.loss.csd import CSDLossFn
+
+        # Only CSD losses receive the global alignment-chunk counts.
+        csd_loss_fn = MagicMock(spec=CSDLossFn)
+        csd_loss_fn.return_value = (torch.tensor(0.5), {"loss": 0.5})
+        csd_loss_fn.input_type = LossInputType.LOGIT
+
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(
-            loss_fn=mock_loss_fn,
+            loss_fn=csd_loss_fn,
             cfg=base_cfg,
             cp_mesh=mock_cp_mesh,
             cp_size=1,
@@ -1307,6 +1486,7 @@ class TestAutomodelForwardBackward:
         )
 
         # Call automodel_forward_backward in forward_only mode
+        global_valid_chunks_by_idx = {0: torch.tensor(37)}
         results = automodel_forward_backward(
             model=mock_model,
             data_iterator=iter(processed_mbs),
@@ -1317,6 +1497,7 @@ class TestAutomodelForwardBackward:
             forward_only=True,
             global_valid_seqs=torch.tensor(batch_size * num_microbatches),
             global_valid_toks=torch.tensor(batch_size * seq_len * num_microbatches),
+            global_valid_chunks_by_idx=global_valid_chunks_by_idx,
         )
 
         # Verify results
@@ -1326,7 +1507,11 @@ class TestAutomodelForwardBackward:
         assert mock_model.call_count == num_microbatches
 
         # Verify loss function was called num_microbatches times
-        assert mock_loss_fn.call_count == num_microbatches
+        assert csd_loss_fn.call_count == num_microbatches
+        assert all(
+            call.kwargs["global_valid_chunks_by_idx"] is global_valid_chunks_by_idx
+            for call in csd_loss_fn.call_args_list
+        )
 
     @patch("nemo_rl.models.automodel.train.prepare_model_forward")
     def test_forward_backward_enters_prepared_and_autocast_contexts(
@@ -2093,6 +2278,57 @@ class TestTopkLogitsPostProcessorSeqPacking:
             expected_idx[i, : end - start] = seq_idx
         torch.testing.assert_close(vals, expected_vals)
         torch.testing.assert_close(idx, expected_idx)
+
+
+@pytest.mark.automodel
+class TestFullLogitsPostProcessorSeqPacking:
+    def test_restores_one_dense_row_per_logical_sample(self):
+        processor = FullLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": True}},
+            cp_mesh=None,
+            cp_size=1,
+            enable_seq_packing=True,
+        )
+        processed_inputs = MagicMock()
+        processed_inputs.flash_attn_kwargs.cu_seqlens_q = torch.tensor(
+            [0, 3, 5], dtype=torch.int32
+        )
+        processed_inputs.flash_attn_kwargs.cu_seqlens_q_padded = torch.tensor(
+            [0, 4, 6], dtype=torch.int32
+        )
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(2, 6, dtype=torch.long),
+                "input_lengths": torch.tensor([3, 2]),
+            }
+        )
+        packed_logits = torch.tensor(
+            [
+                [
+                    [1.0, 101.0],
+                    [2.0, 102.0],
+                    [3.0, 103.0],
+                    [99.0, 199.0],
+                    [10.0, 110.0],
+                    [11.0, 111.0],
+                ]
+            ]
+        )
+
+        restored = processor(
+            logits=packed_logits,
+            data_dict=data,
+            processed_inputs=processed_inputs,
+            original_batch_size=2,
+            original_seq_len=6,
+            cp_sharder=None,
+        )
+
+        assert restored.shape == (2, 6, 2)
+        assert torch.equal(restored[0, :3], packed_logits[0, :3].float())
+        assert torch.equal(restored[1, :2], packed_logits[0, 4:6].float())
+        assert torch.count_nonzero(restored[0, 3:]) == 0
+        assert torch.count_nonzero(restored[1, 2:]) == 0
 
 
 # =====================

@@ -45,6 +45,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.xtoken_off_policy_distillation as xt_mod
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
+from nemo_rl.algorithms.x_token.loss_utils import LocalizedAlignment
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
     TeacherAlignerConfig,
@@ -61,6 +62,7 @@ from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollatorConfig,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import cp_shift_next
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.config import (
     load_config,
@@ -169,6 +171,7 @@ def _make_master_config(
                 "make_sequence_length_divisible_by": 8,
                 "train_global_batch_size": 1,
                 "train_micro_batch_size": 1,
+                "offload_optimizer_for_logprob": False,
                 "tokenizer": {"name": "student-tok"},
             },
             "teachers": [
@@ -455,6 +458,8 @@ def test_teacher_aligner_config_explicit_values_serialize_and_stay_out_of_policy
     assert dumped["aligner"] == {
         "projection_matrix_path": "/tmp/projection.pt",
         "drop_first_assistant_chunk_kl": True,
+        "student_to_teacher_table_path": None,
+        "teacher_to_student_table_path": None,
     }
     assert "projection_matrix_path" not in dumped
     assert "aligner" not in teacher.policy_config()
@@ -1151,6 +1156,25 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _weight_score(
+    fn: CrossTokenizerDistillationLossFn,
+    logits: torch.Tensor,
+    *,
+    ids: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Score full-sequence inputs as ``_teacher_score_inputs`` hands them over at CP=1."""
+    token_mask = token_mask.float()
+    return fn._teacher_weight_score(
+        logits,
+        next_ids=cp_shift_next(ids, None, fill=0),
+        next_mask=cp_shift_next(token_mask, None, fill=0.0),
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+    )
+
+
 @pytest.mark.parametrize("metric", ["ce", "entropy", "max_prob"])
 @pytest.mark.parametrize(
     "mask", [[1, 1, 1, 0, 0], [0, 0, 1, 1, 0]], ids=["padding", "chat"]
@@ -1169,7 +1193,9 @@ def test_teacher_weight_score_uses_only_scored_positions(
     token_mask = torch.tensor([mask] * batch, dtype=torch.float32)
     sample_mask = torch.ones(batch)
 
-    score = fn._teacher_weight_score(logits, ids, token_mask, sample_mask)
+    score = _weight_score(
+        fn, logits, ids=ids, token_mask=token_mask, sample_mask=sample_mask
+    )
 
     # CE scores the next token, so the preceding logit predicts each target.
     # In particular, the last prompt logit predicts the first assistant token.
@@ -1182,8 +1208,12 @@ def test_teacher_weight_score_uses_only_scored_positions(
     logits_corrupt[..., 0][~scored_logits] = 10.0
     ids_corrupt = ids.clone()
     ids_corrupt[~token_mask.bool()] = 0
-    score_corrupt = fn._teacher_weight_score(
-        logits_corrupt, ids_corrupt, token_mask, sample_mask
+    score_corrupt = _weight_score(
+        fn,
+        logits_corrupt,
+        ids=ids_corrupt,
+        token_mask=token_mask,
+        sample_mask=sample_mask,
     )
 
     assert torch.allclose(score, score_corrupt, atol=1e-5)
@@ -1192,7 +1222,9 @@ def test_teacher_weight_score_uses_only_scored_positions(
     # the score, ruling out a mask that accidentally excludes the answer too.
     logits_answer = logits.clone()
     logits_answer[..., 1][scored_logits] = 10.0
-    score_answer = fn._teacher_weight_score(logits_answer, ids, token_mask, sample_mask)
+    score_answer = _weight_score(
+        fn, logits_answer, ids=ids, token_mask=token_mask, sample_mask=sample_mask
+    )
     assert score_answer > score
 
 
@@ -1207,12 +1239,14 @@ def test_teacher_weight_score_masks_dropped_samples():
     token_mask = torch.ones(2, 4)
     sample_mask = torch.tensor([1.0, 0.0])  # second sample dropped
 
-    score = fn._teacher_weight_score(logits, ids, token_mask, sample_mask)
+    score = _weight_score(
+        fn, logits, ids=ids, token_mask=token_mask, sample_mask=sample_mask
+    )
 
     logits_corrupt = logits.clone()
     logits_corrupt[1] = 1e4  # corrupt the dropped sample
-    score_corrupt = fn._teacher_weight_score(
-        logits_corrupt, ids, token_mask, sample_mask
+    score_corrupt = _weight_score(
+        fn, logits_corrupt, ids=ids, token_mask=token_mask, sample_mask=sample_mask
     )
 
     assert torch.allclose(score, score_corrupt, atol=1e-5)
@@ -1483,7 +1517,7 @@ def _dynamic_weights_fn(alpha, scores):
     fn.num_teachers = len(scores)
     fn.alpha = alpha
     fn.normalize_teacher_by_vocab = False
-    fn._teacher_score_inputs = lambda i, *a, **k: (None, None, None)
+    fn._teacher_score_inputs = lambda i, *a, **k: (None, None, None, None)
     it = iter([torch.tensor(float(s)) for s in scores])
     fn._teacher_weight_score = lambda *a, **k: next(it)
     return fn
@@ -1496,7 +1530,7 @@ def test_compute_dynamic_weights_softmax_over_teachers():
     data = {"input_ids": torch.zeros(1, 1), "sample_mask": torch.ones(1)}
 
     weights = _dynamic_weights_fn(1.0, [1.0, 0.0])._compute_dynamic_weights(
-        data, {}, {}
+        data, {}, {}, cp_group=None
     )
     expected = torch.softmax(torch.tensor([1.0, 0.0]), dim=0)
     assert len(weights) == 2
@@ -1507,11 +1541,190 @@ def test_compute_dynamic_weights_softmax_over_teachers():
 
     # alpha multiplies the scores before softmax: a larger alpha sharpens onto
     # the top-scoring teacher.
-    sharp = _dynamic_weights_fn(8.0, [1.0, 0.0])._compute_dynamic_weights(data, {}, {})
+    sharp = _dynamic_weights_fn(8.0, [1.0, 0.0])._compute_dynamic_weights(
+        data, {}, {}, cp_group=None
+    )
     assert sharp[0].item() == pytest.approx(
         torch.softmax(torch.tensor([8.0, 0.0]), dim=0)[0].item()
     )
     assert sharp[0].item() > weights[0].item()
+
+
+# ---------------------------------------------------------------------------
+# teacher scoring with the student at CP>1 matches the unsharded batch
+# ---------------------------------------------------------------------------
+
+
+def _scoring_fixture() -> dict[str, torch.Tensor]:
+    """Teacher 0 is cross-tokenizer (its own ids and mask), teacher 1 same-vocab.
+
+    Logits are near uniform, so every next-token CE is close to log(16).
+    Teacher 0 predicts its token at position 1 from position 0 well. Teacher 1
+    predicts the token at position 3 from position 2 with near certainty, so the
+    pair across the CP=2 boundary (positions 2 -> 3) decides select_teacher.
+    """
+    generator = torch.Generator().manual_seed(0)
+    teacher_logits = 0.1 * torch.randn(2, 6, 16, generator=generator)
+    teacher_logits[:, 0, 8] += 1.0
+    same_vocab_logits = 0.1 * torch.randn(2, 6, 16, generator=generator)
+    same_vocab_logits[:, 2, 9] += 20.0
+    return {
+        "teacher_logits": teacher_logits,
+        "teacher_ids": torch.tensor([[0, 8, 3, 0, 5, 0], [1, 8, 4, 0, 6, 0]]),
+        "teacher_mask": torch.tensor([[1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 0, 0]]),
+        "same_vocab_logits": same_vocab_logits,
+        "student_ids": torch.tensor([[0, 5, 0, 9, 5, 0], [1, 6, 0, 9, 6, 0]]),
+    }
+
+
+def _scoring_inputs(
+    fx: dict[str, torch.Tensor], window: slice
+) -> tuple[
+    dict[str, torch.Tensor], dict[int, torch.Tensor], dict[int, LocalizedAlignment]
+]:
+    """Batch, per-teacher logits and alignments for one contiguous window."""
+    ids = fx["student_ids"]
+    token_mask = torch.ones_like(ids)
+    sample_mask = torch.ones(ids.shape[0])
+    student_fields = {
+        "sample_mask": sample_mask,
+        "student_input_ids": ids[:, window],
+        "student_token_mask": token_mask[:, window],
+    }
+    aligns = {
+        0: LocalizedAlignment(
+            **student_fields,
+            teacher_input_ids=fx["teacher_ids"][:, window],
+            teacher_token_mask=fx["teacher_mask"][:, window],
+        ),
+        1: LocalizedAlignment(**student_fields),
+    }
+    logits = {
+        0: fx["teacher_logits"][:, window],
+        1: fx["same_vocab_logits"][:, window],
+    }
+    # The batch carries the full teacher sequence, as the collator emits it.
+    data = {
+        "input_ids": ids,
+        "sample_mask": sample_mask,
+        "teacher_0_input_ids": fx["teacher_ids"],
+        "teacher_0_token_mask": fx["teacher_mask"],
+    }
+    return data, logits, aligns
+
+
+def _expected_scores(
+    fx: dict[str, torch.Tensor], metric: str, *, drop_boundary: bool = False
+) -> torch.Tensor:
+    """Each teacher's score over the whole sequence, computed without CP.
+
+    ``drop_boundary`` leaves out the next-token pair across the CP=2 boundary,
+    as a rank-local score would.
+    """
+    cases = [
+        (fx["teacher_logits"], fx["teacher_ids"], fx["teacher_mask"]),
+        (
+            fx["same_vocab_logits"],
+            fx["student_ids"],
+            torch.ones_like(fx["student_ids"]),
+        ),
+    ]
+    scores = []
+    for logits, ids, mask in cases:
+        mask = mask.float()
+        if metric == "ce":
+            ce = torch.nn.functional.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.shape[-1]),
+                ids[:, 1:].reshape(-1),
+                reduction="none",
+            ).view(ids.shape[0], -1)
+            target_mask = mask[:, 1:].clone()
+            if drop_boundary:
+                target_mask[:, ids.shape[1] // 2 - 1] = 0
+            scores.append(-(ce * target_mask).sum() / target_mask.sum())
+            continue
+        probs = torch.softmax(logits, dim=-1)
+        if metric == "entropy":
+            value = (probs * torch.log(probs + 1e-10)).sum(dim=-1)
+        else:
+            value = probs.max(dim=-1).values
+        scores.append((value * mask).sum() / mask.sum())
+    return torch.stack(scores)
+
+
+def _run_teacher_scoring_cp(
+    rank: int, world_size: int, init_file: str, metric: str | None
+) -> None:
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        cp_group = dist.new_group(ranks=list(range(world_size)))
+        fx = _scoring_fixture()
+        fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+        fn.num_teachers = 2
+        fn.alpha = 1.0
+        fn.normalize_teacher_by_vocab = False
+        fn.sum_weights_metric = metric
+        fn.projection_matrix_paths = ["projection.pt", None]
+        fn._compute_teacher_kd = lambda i, *args, **kwargs: (torch.tensor(0.0), {})
+
+        width = fx["student_ids"].shape[1] // world_size
+        window = slice(rank * width, (rank + 1) * width)
+        mode_kd = fn._select_teacher_kd if metric is None else fn._sum_kd
+        for group, part in ((None, slice(None)), (cp_group, window)):
+            data, logits, aligns = _scoring_inputs(fx, part)
+            _, metrics = mode_kd(
+                torch.zeros(()),
+                data,
+                logits,
+                aligns,
+                torch.tensor(1.0),
+                tp_group=None,
+                cp_group=group,
+            )
+            if metric is None:
+                # Lowest next-token CE wins; scores are negated CEs.
+                expected = int(torch.argmax(_expected_scores(fx, "ce")))
+                assert metrics["selected_teacher"] == expected
+            else:
+                weights = torch.tensor([metrics["weight_t0"], metrics["weight_t1"]])
+                expected_weights = torch.softmax(_expected_scores(fx, metric), dim=0)
+                torch.testing.assert_close(
+                    weights, expected_weights, rtol=1e-5, atol=1e-6
+                )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not has_gloo(), reason="gloo backend unavailable")
+@pytest.mark.parametrize(
+    "metric",
+    [None, "ce", "entropy", "max_prob"],
+    ids=["select_teacher", "weights_ce", "weights_entropy", "weights_max_prob"],
+)
+def test_teacher_scoring_on_cp2_matches_cp1(tmp_path, metric):
+    """Teacher selection and dynamic weights on CP=2 match the unsharded batch.
+
+    Each CP rank holds its window of every teacher's logits. The window's last
+    position is scored against the first token of the next rank's window.
+    """
+    fx = _scoring_fixture()
+    # The pair across the CP boundary must decide the selection, or a
+    # rank-local score could pass this test.
+    with_boundary = int(torch.argmax(_expected_scores(fx, "ce")))
+    without_boundary = int(torch.argmax(_expected_scores(fx, "ce", drop_boundary=True)))
+    assert with_boundary != without_boundary
+    mp.spawn(
+        _run_teacher_scoring_cp,
+        args=(2, str(tmp_path / "gloo_init"), metric),
+        nprocs=2,
+        join=True,
+    )
 
 
 # ---------------------------------------------------------------------------
