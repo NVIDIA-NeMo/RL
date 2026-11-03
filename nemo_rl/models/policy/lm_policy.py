@@ -60,6 +60,7 @@ from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
+    validate_lora_refit_policy_config,
 )
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
@@ -70,6 +71,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     collect_sharded_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
+from nemo_rl.utils.path_utils import checkpoint_abspath
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -148,9 +150,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             get_actor_python_env(extension_fqn)
 
         if weights_path:
-            weights_path = os.path.abspath(weights_path)
+            weights_path = checkpoint_abspath(weights_path)
         if optimizer_path:
-            optimizer_path = os.path.abspath(optimizer_path)
+            optimizer_path = checkpoint_abspath(optimizer_path)
 
         worker_builder_cls_fqn: str
         tp_size = 1
@@ -159,6 +161,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         megatron_enabled = bool(config.get("megatron_cfg", {}).get("enabled", False))
         automodel_enabled = bool(config.get("automodel_cfg", {}).get("enabled", False))
+        validate_lora_refit_policy_config(config)
         # Normalize in place: every downstream reader (workers, setup, train)
         # accesses draft config by attribute, so a hand-built PolicyConfig has
         # to be validated here rather than only inside MasterConfig.
@@ -1549,6 +1552,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """
         futures = self.worker_group.run_all_workers_single_data("finalize_async_save")
         ray.get(futures)
+
+    def poll_async_save(self) -> bool:
+        """Finalize the in-flight async checkpoint write if every worker finished it.
+
+        Does not wait for the write. Returns True when no async save is pending,
+        after which the checkpoint directory may be renamed from tmp_step_N/ to
+        step_N/.
+        """
+        futures = self.worker_group.run_all_workers_single_data("poll_async_save")
+        results = ray.get(futures)
+        if len(set(results)) != 1:
+            raise RuntimeError(
+                f"Workers disagree on async checkpoint completion: {results}"
+            )
+        return results[0]
 
     def shutdown(self) -> bool:
         """Shut down all HF workers and clean up resources."""

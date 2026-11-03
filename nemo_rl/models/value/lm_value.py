@@ -32,6 +32,7 @@ from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface, ValueOutputSpec
+from nemo_rl.utils.path_utils import checkpoint_abspath
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -45,6 +46,7 @@ class Value(ValueInterface):
         cluster: RayVirtualCluster,
         config: ValueConfig,
         tokenizer: PreTrainedTokenizerBase,
+        seed: int,
         name_prefix: str = "lm_value",
         workers_per_node: Optional[Union[int, list[int]]] = None,
         init_optimizer: bool = True,
@@ -57,6 +59,8 @@ class Value(ValueInterface):
             cluster: Ray virtual cluster for distributed training
             config: Configuration for the value model
             tokenizer: Tokenizer for the model
+            seed: Seed applied by Automodel value workers before model construction;
+                Megatron ignores it
             name_prefix: Prefix for worker names
             workers_per_node: Number of workers per node
             init_optimizer: Whether to initialize the optimizer
@@ -64,9 +68,9 @@ class Value(ValueInterface):
             optimizer_path: Path to load optimizer state from
         """
         if weights_path:
-            weights_path = os.path.abspath(weights_path)
+            weights_path = checkpoint_abspath(weights_path)
         if optimizer_path:
-            optimizer_path = os.path.abspath(optimizer_path)
+            optimizer_path = checkpoint_abspath(optimizer_path)
 
         worker_builder_cls: str
         tp_size = 1
@@ -158,6 +162,7 @@ class Value(ValueInterface):
         pre_init_queue = RayQueue()
         worker_kwargs = {
             "tokenizer": tokenizer,
+            "seed": seed,
             "init_optimizer": init_optimizer,
             "weights_path": weights_path,
             "optimizer_path": optimizer_path,

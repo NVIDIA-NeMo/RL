@@ -74,7 +74,13 @@ def _prepare_multimodal_sharing(
             return
         if isinstance(item, dict):
             content_type = item.get("type")
-            typed_media = content_type in MULTIMODAL_CONTENT_TYPES
+            # "type" is not always a content-type string: text rows carry tool
+            # / JSON-schema dicts where item["type"] is itself a dict, which is
+            # unhashable and would crash the set-membership test.
+            typed_media = (
+                isinstance(content_type, str)
+                and content_type in MULTIMODAL_CONTENT_TYPES
+            )
             for key, child in item.items():
                 visit(
                     child,
@@ -893,7 +899,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 for shard_indice in range(shard_size):
                     # use the max seqlen of all shards to calculate the total number of tokens in the mb
                     # this ensures each DP rank has the same batch size each iteration which is
-                    # required for FSDP2 and megatron policies.
+                    # required for Automodel and megatron policies.
                     max_seqlen_this_shard_indice = 0
                     chunk_start = chunk_idx * shard_size
                     chunk_end = (chunk_idx + 1) * shard_size
