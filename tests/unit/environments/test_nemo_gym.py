@@ -42,6 +42,7 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.nemo_gym import (
     ExternalServiceReadinessConfig,
     NemoGym,
@@ -134,8 +135,10 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
         ]
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
-                del head_server_config
+            def run_examples(
+                self, examples, head_server_config, route_failures_to_sidecar=False
+            ):
+                del head_server_config, route_failures_to_sidecar
                 for row in examples:
                     row["agent_ref"] = {"name": "resolved_agent"}
 
@@ -149,6 +152,7 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
+            _forest_training = False
             _tokenizer = object()
             # run_rollouts is a thin span-opening wrapper that delegates the
             # streaming to _stream_rollouts, so the mock has to supply the real
@@ -1428,6 +1432,8 @@ openai_model:
         model_name=nemo_gym_vllm_generation.cfg["model_name"],
         base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
         initial_global_config_dict=safe_load(yaml_str),
+        checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+        turn_checkpointing_enabled=False,
     )
     env = NemoGym.options(
         runtime_env={
@@ -2063,8 +2069,10 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         postprocess_calls = []
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
-                del head_server_config
+            def run_examples(
+                self, examples, head_server_config, route_failures_to_sidecar=False
+            ):
+                del head_server_config, route_failures_to_sidecar
                 content = examples[0]["responses_create_params"]["input"][0]["content"]
                 assert content[0]["video_url"].startswith("data:video/mp4;base64,")
                 assert content[1]["image_url"].startswith("data:image/png;base64,")
@@ -2083,6 +2091,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             # streaming to _stream_rollouts, so the mock has to supply the real
             # one for the generator below to produce anything.
             _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
+            _forest_training = False
 
             def _require_spinup(self):
                 pass
@@ -2114,7 +2123,14 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         ):
             streamed_results.append(result)
 
-        assert postprocess_calls == [(nemo_gym_row, nemo_gym_result, tokenizer, True)]
+        assert postprocess_calls == [
+            (
+                nemo_gym_row,
+                nemo_gym_result,
+                tokenizer,
+                True,
+            )
+        ]
         assert streamed_results[0][0] == 7
         assert streamed_results[0][1] == nemo_gym_row["agent_ref"]
         assert streamed_results[0][2] == {"message_log": []}
@@ -2160,7 +2176,10 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
                 return [" ".join(map(str, token_ids)) for token_ids in batches]
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples(
+                self, examples, head_server_config, route_failures_to_sidecar=False
+            ):
+                del route_failures_to_sidecar
                 assert head_server_config.backend == "megatron"
                 dispatched_row = examples[0]
                 dispatched_part = dispatched_row["responses_create_params"]["input"][0][
@@ -2202,6 +2221,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             _tokenizer = _Tokenizer()
             _processor = None
             _token_capture_enabled = False
+            _forest_training = False
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
@@ -2470,6 +2490,7 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
 
     import nemo_gym.cli as gym_cli
     import nemo_gym.rollout_collection as gym_rollout_collection
+    import nemo_gym.server_utils as gym_server_utils
     from omegaconf import OmegaConf
 
     import nemo_rl.environments.nemo_gym as nemo_gym_mod
@@ -2489,6 +2510,9 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
 
     monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
     monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
     monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
     monkeypatch.delenv("NEMO_RL_POLICY_API_KEY", raising=False)
 

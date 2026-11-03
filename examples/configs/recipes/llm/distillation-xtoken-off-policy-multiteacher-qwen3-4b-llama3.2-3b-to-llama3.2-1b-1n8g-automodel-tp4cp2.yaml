@@ -11,6 +11,7 @@ data:
 policy:
   train_global_batch_size: 8
   max_total_sequence_length: 1024
+  make_sequence_length_divisible_by: 2
   automodel_cfg:
     tensor_parallel_size: 4
     context_parallel_size: 2
@@ -50,7 +51,7 @@ teachers:
     train_micro_batch_size: 1
     logprob_batch_size: 1
     max_total_sequence_length: 1024
-    make_sequence_length_divisible_by: 1
+    make_sequence_length_divisible_by: 2
     precision: "bfloat16"
     logprob_chunk_size: null
     offload_optimizer_for_logprob: false
@@ -97,7 +98,7 @@ teachers:
     train_micro_batch_size: 1
     logprob_batch_size: 1
     max_total_sequence_length: 1024
-    make_sequence_length_divisible_by: 1
+    make_sequence_length_divisible_by: 2
     precision: "bfloat16"
     logprob_chunk_size: null
     offload_optimizer_for_logprob: false

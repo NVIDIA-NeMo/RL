@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="665" viewBox="0 0 1040 665" role="img" aria-labelledby="title desc"><title id="title">3. Select accepted calls, then build the training rows</title><desc id="desc">Capture contains c1 to c2 and a new root c3 branching to rejected c4 and accepted c5. Returned history selects c1, c2, c3 and c5. Backward walks from selected endpoints c2 and c5 reconstruct two training rows with one rollout reward.</desc>
+<!-- Visual conventions adapted from Terry Kong’s PR #4124 review illustrations. -->
+<rect width="1040" height="665" fill="#0d1117" rx="12"/>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif}.mono{font-family:Menlo,monospace}</style>
+<defs><marker id="arr-dim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#a7b0bc"/></marker></defs>
+<defs><marker id="arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#58a6ff"/></marker></defs>
+<defs><marker id="arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#bc8cff"/></marker></defs>
+<defs><marker id="arr-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#d29922"/></marker></defs>
+<defs><marker id="arr-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#3fb950"/></marker></defs>
+<text x="28" y="39" font-size="25" fill="#e6edf3" font-weight="700">3. Select accepted calls, then build the training rows</text>
+<text x="32" y="88" font-size="18" fill="#bc8cff" font-weight="700">① Captured calls</text>
+<text x="369" y="88" font-size="18" fill="#d29922" font-weight="700">② Selected paths</text>
+<text x="722" y="88" font-size="18" fill="#3fb950" font-weight="700">③ Training rows</text>
+<path d="M335 106V557" fill="none" stroke="#30363d" stroke-width="1.7"/>
+<path d="M687 106V557" fill="none" stroke="#30363d" stroke-width="1.7"/>
+<text x="369" y="128" font-size="15" fill="#58a6ff">Returned accepted history</text>
+<rect x="369" y="143" width="64" height="36" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="401.0" y="167.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c1</text>
+<rect x="445" y="143" width="64" height="36" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="477.0" y="167.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c2</text>
+<rect x="521" y="143" width="64" height="36" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="553.0" y="167.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c3</text>
+<rect x="597" y="143" width="64" height="36" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="629.0" y="167.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c5</text>
+<path d="M515 181L515 220" fill="none" stroke="#58a6ff" stroke-width="1.7" marker-end="url(#arr-blue)"/>
+<text x="538" y="211" font-size="13" fill="#a7b0bc">match IDs / hashes</text>
+<rect x="40" y="246" width="64" height="42" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="72" y="273" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c1</text>
+<rect x="223" y="246" width="64" height="42" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="255" y="273" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c2</text>
+<path d="M106 267L220 267" fill="none" stroke="#a7b0bc" stroke-width="1.7" marker-end="url(#arr-dim)"/>
+<text x="40" y="339" font-size="15" fill="#d29922">context rewrite</text>
+<path d="M40 352H287" fill="none" stroke="#d29922" stroke-width="1.7" stroke-dasharray="5 5"/>
+<rect x="40" y="404" width="64" height="42" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="72" y="431" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c3</text>
+<rect x="223" y="364" width="64" height="42" rx="8" fill="#161b22" stroke="#f85149" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="255" y="391" font-size="18" fill="#f85149" font-weight="700" text-anchor="middle">c4</text>
+<rect x="223" y="474" width="64" height="42" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="255" y="501" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c5</text>
+<path d="M106 418L220 389" fill="none" stroke="#a7b0bc" stroke-width="1.7" marker-end="url(#arr-dim)"/>
+<path d="M106 436L220 491" fill="none" stroke="#a7b0bc" stroke-width="1.7" marker-end="url(#arr-dim)"/>
+<text x="232" y="349" font-size="13" fill="#f85149">rejected</text>
+<text x="40" y="469" font-size="14" fill="#a7b0bc">new root</text>
+<text x="223" y="540" font-size="14" fill="#a7b0bc">retry</text>
+<rect x="382" y="246" width="64" height="42" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="414" y="273" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c1</text>
+<rect x="573" y="246" width="64" height="42" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="605" y="273" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c2</text>
+<rect x="568" y="241" width="74" height="52" rx="12" fill="none" stroke="#d29922"/>
+<path d="M570 267L449 267" fill="none" stroke="#d29922" stroke-width="1.7" marker-end="url(#arr-amber)"/>
+<text x="510" y="246" font-size="13" fill="#d29922" text-anchor="middle">walk back</text>
+<rect x="382" y="430" width="64" height="42" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="414" y="457" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c3</text>
+<rect x="573" y="430" width="64" height="42" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="605" y="457" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">c5</text>
+<rect x="568" y="425" width="74" height="52" rx="12" fill="none" stroke="#d29922"/>
+<path d="M570 451L449 451" fill="none" stroke="#d29922" stroke-width="1.7" marker-end="url(#arr-amber)"/>
+<text x="510" y="430" font-size="13" fill="#d29922" text-anchor="middle">walk back</text>
+<text x="379" y="514" font-size="16" fill="#d29922">Endpoints: c2, c5</text>
+<path d="M643 267L711 267" fill="none" stroke="#3fb950" stroke-width="1.7" marker-end="url(#arr-green)"/>
+<path d="M643 451L711 451" fill="none" stroke="#3fb950" stroke-width="1.7" marker-end="url(#arr-green)"/>
+<text x="725" y="230" font-size="18" fill="#3fb950" font-weight="700">s0</text>
+<rect x="722" y="247" width="62" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="753.0" y="273.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">P</text>
+<rect x="792" y="247" width="62" height="40" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+<text x="823.0" y="273.0" font-size="18" fill="#3fb950" font-weight="700" text-anchor="middle">A1</text>
+<rect x="862" y="247" width="62" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="893.0" y="273.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">O2</text>
+<rect x="932" y="247" width="62" height="40" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+<text x="963.0" y="273.0" font-size="18" fill="#3fb950" font-weight="700" text-anchor="middle">A2</text>
+<text x="725" y="414" font-size="18" fill="#3fb950" font-weight="700">s1</text>
+<rect x="722" y="431" width="62" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="753.0" y="457.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">P′</text>
+<rect x="792" y="431" width="62" height="40" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+<text x="823.0" y="457.0" font-size="18" fill="#3fb950" font-weight="700" text-anchor="middle">A3</text>
+<rect x="862" y="431" width="62" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="893.0" y="457.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">O4</text>
+<rect x="932" y="431" width="62" height="40" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+<text x="963.0" y="457.0" font-size="18" fill="#3fb950" font-weight="700" text-anchor="middle">A5</text>
+<path d="M997 285H1015V469H997" fill="none" stroke="#3fb950" stroke-width="1.7"/>
+<text x="724" y="518" font-size="17" fill="#3fb950" font-weight="700">One rollout reward</text>
+<text x="725" y="551" font-size="14" fill="#a7b0bc">P′: rewritten prompt</text>
+<path d="M28 577H1012" fill="none" stroke="#30363d" stroke-width="1.7"/>
+<text x="28" y="612" font-size="19" fill="#bc8cff" font-weight="700">5 captured calls</text>
+<text x="310" y="612" font-size="19" fill="#58a6ff" font-weight="700">4 accepted calls</text>
+<text x="613" y="612" font-size="19" fill="#3fb950" font-weight="700">2 rows</text>
+<text x="824" y="612" font-size="19" fill="#3fb950" font-weight="700">1 rollout</text>
+<path d="M239 605L284 605" fill="none" stroke="#a7b0bc" stroke-width="1.7" marker-end="url(#arr-dim)"/>
+<path d="M528 605L589 605" fill="none" stroke="#a7b0bc" stroke-width="1.7" marker-end="url(#arr-dim)"/>
+<path d="M719 605L798 605" fill="none" stroke="#a7b0bc" stroke-width="1.7" marker-end="url(#arr-dim)"/>
+<text x="28" y="647" font-size="12" fill="#a7b0bc">Illustrative tokens · visual conventions adapted from Terry Kong</text>
+</svg>

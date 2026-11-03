@@ -29,7 +29,7 @@ from typing import Any, Mapping, Optional
 from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.experience.reward_penalties import CaptureRewardSettings
-from nemo_rl.experience.rollouts import get_effort_config
+from nemo_rl.experience.rollouts import get_effort_config, get_nemo_gym_thinking_tags
 
 ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 3
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
@@ -70,6 +70,7 @@ _BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS = frozenset(
         "policy.optimizer",
         "policy.scheduler",
         "rollout_checkpointing",
+        "rollout_recovery.gym_prepare_timeout_s",
         "token_capture.capture_dir",
         "token_capture.control_auth_token",
         "token_capture.control_timeout_s",
@@ -231,6 +232,8 @@ class RolloutSnapshotManifest:
     mutation_version: int
     rolled_back_train_group_count: int
     bootstrap_fingerprint: Optional[str]
+    # None preserves the trainer counter when loading an older snapshot.
+    next_nemo_gym_task_index: Optional[int] = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> RolloutSnapshotManifest:
@@ -255,6 +258,15 @@ class RolloutSnapshotManifest:
             raise ValueError(
                 "rollout snapshot bootstrap_fingerprint must be a string or null"
             )
+        next_nemo_gym_task_index = raw.get("next_nemo_gym_task_index")
+        if next_nemo_gym_task_index is not None and (
+            not isinstance(next_nemo_gym_task_index, int)
+            or isinstance(next_nemo_gym_task_index, bool)
+            or next_nemo_gym_task_index < 0
+        ):
+            raise ValueError(
+                "rollout snapshot next_nemo_gym_task_index must be a non-negative integer"
+            )
         manifest = cls(
             schema_version=raw["schema_version"],
             base_train_step=raw["base_train_step"],
@@ -264,6 +276,7 @@ class RolloutSnapshotManifest:
             mutation_version=raw["mutation_version"],
             rolled_back_train_group_count=raw["rolled_back_train_group_count"],
             bootstrap_fingerprint=fingerprint,
+            next_nemo_gym_task_index=next_nemo_gym_task_index,
         )
         if manifest.schema_version != ROLLOUT_SNAPSHOT_SCHEMA_VERSION:
             raise ValueError(
@@ -336,6 +349,7 @@ def _normalize_capture_reward_config(dumped: dict[str, Any]) -> None:
     settings = CaptureRewardSettings.from_configs(
         RewardPenaltyConfig.model_validate(dumped["reward_penalties"]),
         get_effort_config(dumped["env"]),
+        get_nemo_gym_thinking_tags(dumped["env"]),
     ).to_state()
     dumped["reward_penalties"] = settings["penalties"]
     gym = dumped["env"].get("nemo_gym")
