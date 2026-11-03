@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import MagicMock, call, create_autospec, patch
 
 import pytest
 
@@ -87,6 +87,7 @@ def _valid_setup_config(
         "val_period": 0,
         "val_at_start": False,
         "val_at_end": False,
+        "defer_async_checkpoint_finalize": False,
     }
     sft.update(sft_overrides or {})
     data = {
@@ -263,6 +264,185 @@ def test_save_checkpoint_uses_policy_signature_and_terminal_step(
     )
 
 
+def _deferred_save_controller(tmp_path: Path) -> object:
+    controller = _save_controller()
+    controller._save_state.total_steps = 10
+    controller._defer_checkpoint_finalize = True
+    controller._trainer = create_autospec(Policy, instance=True)
+    controller._placement_plan = SimpleNamespace(logical_world_size=2)
+    controller._loader_state_dicts = MagicMock(return_value=[{}, {}])
+    controller._checkpointer = MagicMock()
+    controller._checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    controller._checkpointer.save_optimizer = True
+    return controller
+
+
+def test_save_checkpoint_finalizes_in_background_by_default(tmp_path: Path) -> None:
+    controller = _deferred_save_controller(tmp_path)
+    controller._defer_checkpoint_finalize = False
+
+    controller._save_checkpoint({})
+
+    controller._checkpointer.begin_finalization.assert_called_once_with(
+        str(tmp_path), wait_fn=controller._trainer.finalize_async_save
+    )
+    assert controller._pending_checkpoint_path is None
+
+
+def test_deferred_save_leaves_the_checkpoint_pending(tmp_path: Path) -> None:
+    controller = _deferred_save_controller(tmp_path)
+
+    controller._save_checkpoint({})
+
+    controller._trainer.save_checkpoint.assert_called_once()
+    controller._trainer.finalize_async_save.assert_not_called()
+    controller._checkpointer.begin_finalization.assert_not_called()
+    assert controller._pending_checkpoint_path == str(tmp_path)
+
+
+def test_pending_save_publishes_only_after_a_successful_poll(tmp_path: Path) -> None:
+    controller = _deferred_save_controller(tmp_path)
+    controller._pending_checkpoint_path = str(tmp_path)
+    controller._trainer.poll_async_save.side_effect = [False, True]
+
+    # Writes still running: training continues, nothing is published.
+    controller._finish_pending_save(blocking=False)
+    controller._checkpointer.begin_finalization.assert_not_called()
+    assert controller._pending_checkpoint_path == str(tmp_path)
+
+    controller._finish_pending_save(blocking=False)
+    controller._checkpointer.begin_finalization.assert_called_once_with(str(tmp_path))
+    assert controller._pending_checkpoint_path is None
+    controller._trainer.finalize_async_save.assert_not_called()
+
+    # Nothing pending: no further worker calls.
+    controller._finish_pending_save(blocking=False)
+    assert controller._trainer.poll_async_save.call_count == 2
+
+
+def test_blocking_finish_waits_for_the_write_then_publishes(tmp_path: Path) -> None:
+    controller = _deferred_save_controller(tmp_path)
+    controller._pending_checkpoint_path = str(tmp_path)
+    order = MagicMock()
+    order.attach_mock(controller._trainer.finalize_async_save, "finalize")
+    order.attach_mock(controller._checkpointer.begin_finalization, "publish")
+
+    controller._finish_pending_save(blocking=True)
+
+    assert order.mock_calls == [call.finalize(), call.publish(str(tmp_path))]
+    controller._trainer.poll_async_save.assert_not_called()
+    assert controller._pending_checkpoint_path is None
+
+
+def test_next_save_publishes_the_pending_one_first(tmp_path: Path) -> None:
+    controller = _deferred_save_controller(tmp_path)
+    previous = str(tmp_path / "tmp_step_5")
+    controller._pending_checkpoint_path = previous
+    order = MagicMock()
+    order.attach_mock(controller._trainer.finalize_async_save, "finalize")
+    order.attach_mock(controller._checkpointer.begin_finalization, "publish")
+    order.attach_mock(controller._trainer.save_checkpoint, "save")
+
+    controller._save_checkpoint({})
+
+    assert [c[0] for c in order.mock_calls] == ["finalize", "publish", "save"]
+    assert order.mock_calls[1] == call.publish(previous)
+    assert controller._pending_checkpoint_path == str(tmp_path)
+
+
+def test_run_polls_before_each_step_and_finalizes_at_exit() -> None:
+    controller = _save_controller()
+    controller._max_steps = 3
+    controller._logger = MagicMock()
+    controller._checkpointer = MagicMock()
+    controller._close_loaders = MagicMock()
+    controller._save_checkpoint = MagicMock()
+    controller._timeout = MagicMock()
+    controller._timeout.check_save.return_value = False
+    controller._finish_pending_save = MagicMock()
+    order = MagicMock()
+    order.attach_mock(controller._finish_pending_save, "finish")
+
+    def advance() -> dict[str, Any]:
+        order.step()
+        controller._save_state.total_steps += 1
+        return {}
+
+    controller._run_train_step = MagicMock(side_effect=advance)
+    with patch("nemo_rl.algorithms.sft_v2.shutdown_telemetry"):
+        controller.run()
+
+    assert order.mock_calls == [
+        call.finish(blocking=False),
+        call.step(),
+        call.finish(blocking=False),
+        call.step(),
+        call.finish(blocking=False),
+        call.step(),
+        call.finish(blocking=True),
+        # Teardown's publish; a no-op once the exit path has published.
+        call.finish(blocking=True),
+    ]
+
+
+def _failing_run_controller(tmp_path: Path) -> object:
+    """Deferred-save controller whose step after a pending save raises."""
+    controller = _deferred_save_controller(tmp_path)
+    controller._pending_checkpoint_path = str(tmp_path)
+    # The step-10 save is pending; step 11 then raises.
+    controller._max_steps = controller._save_state.total_steps + 1
+    controller._logger = MagicMock()
+    controller._close_loaders = MagicMock()
+    controller._timeout = MagicMock()
+    controller._run_train_step = MagicMock(
+        side_effect=RuntimeError("injected train failure")
+    )
+    # The writes are still running at the step's poll.
+    controller._trainer.poll_async_save.return_value = False
+    return controller
+
+
+def test_run_failure_still_publishes_the_pending_save(tmp_path: Path) -> None:
+    controller = _failing_run_controller(tmp_path)
+    order = MagicMock()
+    order.attach_mock(controller._trainer.finalize_async_save, "finalize")
+    order.attach_mock(controller._checkpointer.begin_finalization, "publish")
+    order.attach_mock(controller._checkpointer.shutdown, "close")
+
+    with (
+        patch("nemo_rl.algorithms.sft_v2.shutdown_telemetry"),
+        pytest.raises(RuntimeError, match="injected train failure"),
+    ):
+        controller.run()
+
+    # Published before checkpoint close, which joins the rename.
+    assert order.mock_calls == [
+        call.finalize(),
+        call.publish(str(tmp_path)),
+        call.close(),
+    ]
+    assert controller._pending_checkpoint_path is None
+
+
+def test_failed_teardown_publish_does_not_mask_the_run_failure(
+    tmp_path: Path,
+) -> None:
+    controller = _failing_run_controller(tmp_path)
+    controller._trainer.finalize_async_save.side_effect = RuntimeError(
+        "injected finalize failure"
+    )
+
+    with (
+        patch("nemo_rl.algorithms.sft_v2.shutdown_telemetry"),
+        pytest.raises(RuntimeError, match="injected train failure"),
+        pytest.warns(UserWarning, match="pending checkpoint publish failed"),
+    ):
+        controller.run()
+
+    controller._checkpointer.begin_finalization.assert_not_called()
+    controller._checkpointer.shutdown.assert_called_once()
+
+
 def test_checkpoint_metric_tags_the_configured_train_metric() -> None:
     controller = _save_controller(metric_name="train:loss")
 
@@ -299,6 +479,19 @@ def test_checkpoint_metric_rejects_a_metric_no_step_produces() -> None:
             "fixed batching",
         ),
         ({"sft_overrides": {"val_period": 10}}, "has no validation loop"),
+        (
+            {"sft_overrides": {"defer_async_checkpoint_finalize": True}},
+            "requires policy.megatron_cfg.checkpoint.async_save",
+        ),
+        (
+            {
+                "sft_overrides": {"defer_async_checkpoint_finalize": True},
+                "policy_overrides": {
+                    "megatron_cfg": {"checkpoint": {"async_save": False}}
+                },
+            },
+            "requires policy.megatron_cfg.checkpoint.async_save",
+        ),
         (
             {"data_overrides": {"validation": {"path": "/dataset"}}},
             "reads no validation source",

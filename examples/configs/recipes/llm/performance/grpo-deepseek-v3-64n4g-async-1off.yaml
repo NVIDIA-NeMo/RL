@@ -16,6 +16,7 @@ policy:
     num_layers_in_first_pipeline_stage: 7
     num_layers_in_last_pipeline_stage: 6
   generation:
+    refit_transport: nccl_reshard
     colocated:
       resources:
         gpus_per_node: 4

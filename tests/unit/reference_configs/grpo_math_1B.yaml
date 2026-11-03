@@ -6,6 +6,10 @@ grpo:
   max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
+  # Rows that vote in the advantage statistics (group baseline/std, GDPO/Reinforce++
+  # batch normalization, dynamic-sampling admission): include (default) every row,
+  # masked rewards too; exclude only rows with a nonzero loss weight. Loss masks unchanged.
+  masked_reward_policy: include
   use_leave_one_out_baseline: true
   val_period: 10
   val_start_at: -1
@@ -133,6 +137,9 @@ loss_fn:
   positive_example_nll_weight: 0.0
   metrics_level: "full"
   enable_torch_compile: false
+  # Score centering (https://arxiv.org/abs/2609.20807): subtract the sampler-expected
+  # score per token, using the captured top-k (needs policy.generation.top_logprobs > 0).
+  score_centering: false
 
 checkpointing:
   enabled: true
@@ -217,6 +224,10 @@ policy:
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     cuda_graph_impl: "none"
     cuda_graph_modules: []
@@ -421,6 +432,7 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    top_logprobs: 0  # Sampler candidates per token for score centering; 0 disables collection.
     val_temperature: ${.temperature}
     val_top_p: ${.top_p}
     val_top_k: ${.top_k}
@@ -438,6 +450,7 @@ policy:
     # mcore for native refit.
     # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
     refit_transport: null
+    lora_refit_mode: native
     worker_extension_cls_fqn: null
     # Keep real-quant export tensors on CPU by default. Set false only for
     # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
@@ -509,6 +522,8 @@ policy:
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
+      flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
+      output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
       http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.
       reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).
@@ -576,6 +591,7 @@ env:
 logger:
   log_dir: "logs"  # Base directory for all logs
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  extra_backends: []
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging

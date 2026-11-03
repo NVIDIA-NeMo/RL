@@ -50,7 +50,7 @@ One consequence worth knowing: registration is an *import side effect*, so a gro
 |---|---|---|
 | `job` | base | the whole-run root span (`rl.<algo>.job`) |
 | `setup` | RL | startup, before the first step: `rl.startup` and the `rl.setup.*` phases under it |
-| `checkpoint` | base | `rl.<algo>.checkpointing` — staging, which is what blocks the loop; `rl.checkpoint.finalize` — the asynchronous tail, open until the checkpoint is durable. See [Checkpoint spans](#a-checkpoint-takes-two-spans) |
+| `checkpoint` | base | `rl.<algo>.checkpointing` — staging, which is what blocks the loop; `rl.checkpoint.finalize` — the asynchronous tail, open until the checkpoint is durable. See [Checkpoint spans](#a-checkpoint-takes-two-spans). Also the Single-Controller's trace-only `rl.sc.rollout_checkpoint.save` (see [below](#trace-only-the-rollout-checkpoint-save)) |
 | `evaluate` | base | `rl.<algo>.evaluate` |
 | `model_init` | base | `rl.vllm.load_model` (generation worker), `rl.policy.load_model` / `rl.value.load_model` (training workers) |
 | `step` | base | `rl.<algo>.step` (one per training step) |
@@ -104,7 +104,7 @@ The controlling group is shown for each; a span is emitted whenever its group is
 | **DPO** | `rl.dpo.job`, `rl.dpo.step`, `rl.dpo.policy_training`, `rl.dpo.checkpointing`, `rl.dpo.evaluate` |
 | **RM** | `rl.rm.job`, `rl.rm.step`, `rl.rm.checkpointing`, `rl.rm.evaluate` |
 | **Distillation** | `rl.distillation.job`, `rl.distillation.step`, `rl.distillation.data_processing`, `rl.distillation.generation`, `rl.distillation.teacher_logprob_inference`, `rl.distillation.policy_training`, `rl.distillation.checkpointing`, `rl.distillation.evaluate` |
-| **SingleController** | `rl.sc.job`, `rl.sc.step`, `rl.sc.logprob_inference_prep`, `rl.sc.policy_and_reference_logprobs`, `rl.sc.value_inference_prep`, `rl.sc.value_inference`, `rl.sc.advantage_calculation`, `rl.sc.training_prep`, `rl.sc.policy_training`, `rl.sc.policy_optimizer_step`, `rl.sc.value_training`, `rl.sc.checkpointing` — opened inside the `SingleControllerActor`, which is where the run actually lives |
+| **SingleController** | `rl.sc.job`, `rl.sc.step`, `rl.sc.logprob_inference_prep`, `rl.sc.policy_and_reference_logprobs`, `rl.sc.value_inference_prep`, `rl.sc.value_inference`, `rl.sc.advantage_calculation`, `rl.sc.training_prep`, `rl.sc.policy_training`, `rl.sc.policy_optimizer_step`, `rl.sc.value_training`, `rl.sc.checkpointing`, `rl.sc.rollout_checkpoint.save` — opened inside the `SingleControllerActor`, which is where the run actually lives |
 | **SingleController** (rollout) | `rl.sc.generate_and_push` — `per_prompt` group (umbrella, so unbucketed), one span per dispatch attempt; and `idle/buffer_starvation` / `idle/refit_bubble` reusing async GRPO's `efficiency` category names. `rl.idle.buffer_starvation` is one span per *wait*, not per poll — the pump retries every 5 ms, so a span per iteration would bury a startup stall under thousands of them; it carries `rl.idle.polls` |
 | **Transfer queue** | `rl.data_plane.<op>` — `data_plane` group, or `per_prompt` when the caller is a rollout; emitted wherever a data-plane client is built (SC actor, `TQPolicy` / `TQValue` workers) |
 | **NeMo-Gym** | `rl.gym.run_rollouts` — one span per dispatch in the `NemoGym` actor, carrying `rl.gym.batch_size`; the HTTP calls Gym makes nest under it — see [NeMo-Gym spans](#nemo-gym-spans-cross-the-http-boundary). `rollout` group from the sync batch path, `per_prompt` from the single controller, which dispatches one per prompt. Umbrella either way, so unbucketed: these overlap |
@@ -254,7 +254,7 @@ so the call site shows which of the two it is — see
 |---|---|
 | `job`, `step`, `rollout`, `model_init`, `evaluate`, `setup`, `per_prompt` (aliased `U_JOB`, `U_STEP`, …) | *(none — umbrella)* |
 | `generation`, `reward`, `policy_update` | `productive` |
-| `data_processing`, `data_plane`, `checkpoint`, `logprob`, `advantage` | `overhead` — except `rl.checkpoint.finalize`, which is unbucketed because it overlaps the next step (see below) |
+| `data_processing`, `data_plane`, `checkpoint`, `logprob`, `advantage` | `overhead` — except `rl.checkpoint.finalize` and `rl.sc.rollout_checkpoint.save`, which are unbucketed because they overlap training (see below) |
 | `efficiency` | `idle` for the two driver-side phases; *none* for the two collector-side ones (see below) |
 
 Rolled-up `rl.goodput` is **monitor-derived**, not emitted by NeMo-RL.
@@ -373,6 +373,27 @@ labelled `rl.efficiency.measurement="collector_wall_clock"` — sequential and s
 real durations, unlike the batch-worker categories, but on the collector's
 timeline rather than the driver's. See
 [Metrics — always filter on `rl.efficiency.measurement`](metrics.md#always-filter-on-rlefficiencymeasurement).
+
+#### Trace-only: the rollout checkpoint save
+
+The Single-Controller's background snapshot pump emits one
+`rl.sc.rollout_checkpoint.save` span per completed rollout save, in the
+`checkpoint` group but **without** `rl.bucket`. The pump runs while training
+continues, so an `overhead` bucket would charge wall clock the trainer spent
+productively a second time. The trainer checkpoint, `rl.sc.checkpointing`,
+stops the loop and keeps its `overhead` bucket.
+
+The span is rebuilt from the timings logged under `timing/rollout_checkpoint`
+rather than opened around the save: it ends at `telemetry/wall_time_seconds` and
+starts `total_save_seconds` earlier. Only the phase durations are known, not
+their offsets, so they are attributes rather than child spans:
+`rl.checkpoint.<logger key>` for each phase and volume field (for example
+`rl.checkpoint.barrier_wait_seconds`, `rl.checkpoint.replay_rows`), plus
+`rl.checkpoint.snapshot_sequence` and `rl.iteration` to tie a slow save to its
+snapshot. Restore emits no span: its phases run at different times in driver
+setup and in the controller. The `rl.checkpoint.*` metrics cover every save and
+restore regardless of span groups; see
+[Metrics](metrics.md#rollout-checkpoint-metrics-rlcheckpoint).
 
 #### Still reserved: the rest of the collector-side categories
 
