@@ -90,6 +90,10 @@ policy:
       ckpt_assume_constant_structure: false
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 2

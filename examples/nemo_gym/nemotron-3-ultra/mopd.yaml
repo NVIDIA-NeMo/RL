@@ -336,7 +336,7 @@ policy:
     stop_strings: null
     # TP=8 EP=8: EP=TP so vllm_dp_size=1, async_engine=true works with NeMo Gym.
     # Same memory as EP=1 but uses all-to-all for expert routing.
-    # EP > TP blocked by https://github.com/NVIDIA-NeMo/RL/issues/1101.
+    # EP=TP keeps vLLM DP disabled for this recipe.
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}

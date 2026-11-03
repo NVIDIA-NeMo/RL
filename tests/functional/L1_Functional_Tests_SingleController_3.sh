@@ -48,7 +48,11 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller
 
 # Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
 # custodying token lineage and the finalizer publishing training rows.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+# Score centering through capture, canonical TQ columns, trainer gather and loss.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_gym_single_controller.sh
+# BrowseComp hides old tool results; valid rows must prove a context boundary.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_context_compaction.sh
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and
 # redispatch only its unfinished peer after restoring the step checkpoint.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
@@ -59,6 +63,9 @@ run_test fast env SC_SIBLING_RECOVERY_GENERATION_BACKEND=megatron uv run --no-sy
 # Periodic native-TQ snapshot while a streamed step owns only part of its
 # rollout batch, followed by SIGKILL and rollback to the durable trainer anchor.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
+# Two-process Gym turn-level recovery against a stateful Workplace Assistant
+# server: a restored episode resumes on its Gym instance as its next attempt.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_turn_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

@@ -21,6 +21,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
+    validate_vllm_async_actor_settings,
     validate_vllm_quantization_config,
 )
 
@@ -147,3 +148,52 @@ def test_configure_generation_config_validates_refit_prequantize() -> None:
 
     with pytest.raises(ValueError, match="requires precision='fp8' and is_mx=true"):
         configure_generation_config(generation_config, tokenizer)
+
+
+@pytest.mark.parametrize(
+    ("vllm_cfg", "match"),
+    [
+        (
+            {"flat_logprobs": True, "async_engine": False, "expose_http_server": True},
+            "flat_logprobs only applies",
+        ),
+        (
+            {"flat_logprobs": True, "async_engine": True, "expose_http_server": False},
+            "flat_logprobs only applies",
+        ),
+        (
+            {"output_loop_yield_budget_ms": 20, "async_engine": False},
+            "output_loop_yield_budget_ms requires async_engine",
+        ),
+        (
+            {"output_loop_yield_budget_ms": 0, "async_engine": True},
+            "output_loop_yield_budget_ms must be positive",
+        ),
+    ],
+)
+def test_async_actor_settings_reject_ignored_options(
+    vllm_cfg: dict, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        validate_vllm_async_actor_settings(cast(VllmConfig, {"vllm_cfg": vllm_cfg}))
+
+
+@pytest.mark.parametrize(
+    "vllm_cfg",
+    [
+        {},
+        {"flat_logprobs": False, "output_loop_yield_budget_ms": None},
+        {
+            "flat_logprobs": True,
+            "output_loop_yield_budget_ms": 20,
+            "async_engine": True,
+            "expose_http_server": True,
+        },
+    ],
+)
+def test_async_actor_settings_accept_supported_options(vllm_cfg: dict) -> None:
+    validate_vllm_async_actor_settings(cast(VllmConfig, {"vllm_cfg": vllm_cfg}))
+
+
+def test_async_actor_settings_allow_omitted_vllm_cfg() -> None:
+    validate_vllm_async_actor_settings(cast(VllmConfig, {}))
