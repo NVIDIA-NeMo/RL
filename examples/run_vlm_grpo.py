@@ -80,6 +80,12 @@ def main() -> None:
         # processor or vLLM workers.  In particular, this overrides vLLM
         # VideoMediaIO's independent 32-frame default for 64-frame recipes.
         materialize_vllm_video_config(config.policy, config.data)
+        if config.env.get("should_use_nemo_gym"):
+            raise ValueError(
+                "env.should_use_nemo_gym=true: run this config with "
+                "examples/nemo_gym/run_grpo_nemo_gym.py, which prepares the "
+                "NeMo-Gym config and binds the Gym actor. This launcher does neither."
+            )
         print("Applied CLI overrides")
 
     # Print config

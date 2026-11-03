@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import weakref
+from typing import Any
+
+import pytest
+import ray.cloudpickle
+import torch
+
 from nemo_rl.environments.nemo_gym import NemoGym
+from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 
 
 class _Tokenizer:
@@ -24,7 +32,20 @@ def _routes(num_tokens: int) -> list[list[list[int]]]:
     return [[[token_idx, token_idx + 100]] for token_idx in range(num_tokens)]
 
 
-def test_nemo_gym_postprocess_slices_routed_experts():
+def test_nemo_gym_postprocess_slices_routed_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decoded_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def track_decode(payload: Any, dtype: torch.dtype) -> torch.Tensor:
+        assert all(reference() is None for reference in decoded_refs)
+        decoded = decode_routed_experts(payload, dtype=dtype)
+        decoded_refs.append(weakref.ref(decoded))
+        return decoded
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym.decode_routed_experts", track_decode
+    )
     first_turn_routes = _routes(3)
     first_turn_routes[-1] = [[0, 1]]
     second_turn_routes = _routes(7)
@@ -67,6 +88,18 @@ def test_nemo_gym_postprocess_slices_routed_experts():
     assert message_log[2]["routed_experts"].tolist() == second_turn_routes[3:5]
     assert message_log[3]["token_ids"].tolist() == [6, 7]
     assert message_log[3]["routed_experts"].tolist() == second_turn_routes[5:7]
+    assert all(reference() is None for reference in decoded_refs)
+
+    restored = ray.cloudpickle.loads(ray.cloudpickle.dumps(result, protocol=5))
+    for payload in (result, restored):
+        for message, expected in zip(payload["message_log"], message_log):
+            routes = message["routed_experts"]
+            assert torch.equal(routes, expected["routed_experts"])
+            assert routes.storage_offset() == 0
+            assert (
+                routes.untyped_storage().nbytes()
+                == routes.numel() * routes.element_size()
+            )
 
 
 def test_nemo_gym_postprocess_tolerates_missing_routed_experts_when_configured():
@@ -106,8 +139,6 @@ def test_nemo_gym_postprocess_tolerates_missing_routed_experts_when_configured()
 
 
 def test_nemo_gym_postprocess_casts_routed_experts_to_configured_dtype():
-    import torch
-
     nemo_gym_result = {
         "response": {
             "output": [
