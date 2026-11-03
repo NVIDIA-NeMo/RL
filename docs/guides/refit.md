@@ -245,6 +245,23 @@ policy:
 SGLang's optimized path rejects MoE and quantized weights. A failed transfer
 keeps generation paused and requires restarting the run.
 
+The native transfer uses `nccl-extensions==0.1.0` with NCCL 2.30.7 in both worker
+environments. To provision the optional `nccl_m2n` extra in the cached worker
+environments, run these commands from the repository root before launching:
+
+```bash
+UV_PROJECT_ENVIRONMENT=venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker \
+  uv sync --locked --extra mcore --extra nemo_gym --extra nccl_m2n --no-install-project
+UV_PROJECT_ENVIRONMENT=venvs/nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker \
+  uv sync --locked --extra sglang --extra nccl_m2n --no-install-project
+```
+
+Use your `NEMO_RL_VENV_DIR` in place of `venvs` when it is customized. NeMo RL
+enables the symmetric-memory allocator before initializing the communicators.
+The startup log identifies native transfer as
+`reshard path: real nccl.m2n.reshard`; environments missing the extension use the
+Python exact-transfer implementation.
+
 For sparse delta, select one data plane and configure its scope:
 
 ```yaml

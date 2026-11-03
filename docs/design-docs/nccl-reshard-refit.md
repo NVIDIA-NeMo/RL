@@ -444,10 +444,12 @@ xferdtensor(src_tensor, src_mesh, src_placement,
             process_group, stream=None)
 ```
 
-and dispatches to one of two transports:
+and selects an implementation:
 
-* **Core NCCL reshard** — the reshard operation provided by the **nccl4py
-  wrapper** (`nccl.m2n.reshard`). When the package is accessible, this is the default:
+* **Core NCCL reshard** — the reshard operation provided by
+  [NCCL Extensions](https://github.com/NVIDIA/nccl-extensions)
+  (`nccl.m2n.reshard`), using an NCCL4Py communicator. When installed in both
+  worker environments, this is the default:
   the local shards, mesh rank grids, and placements are handed to the NCCL library,
   which executes the cross-mesh redistribution natively.
 * **`xferdtensor_python_impl`** (`nemo_rl/weight_sync/xferdtensor_python.py`) — a pure
@@ -462,8 +464,12 @@ and dispatches to one of two transports:
   tensor to the destination ranks, which then discard the unused parts. While not performant,
   it guarantees functionally correct outputs.
 
-Both transports honor the `stream` argument so the transfer is ordered with the caller's
+All implementations honor the `stream` argument so the transfer is ordered with the caller's
 `pre`/`post` staging work on one CUDA stream.
+
+The pinned NCCL Extensions 0.1.0 release requires NCCL 2.30.7. Native M2N also
+requires symmetric memory, so SGLang NCCL reshard selects `NCCL_CUMEM_ENABLE=1`
+in both the training and serving processes before either initializes NCCL.
 
 
 ## Expected Performance
