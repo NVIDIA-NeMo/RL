@@ -515,8 +515,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         )
 
         keys: list[str] = []
-        for layer_idx in range(self.megatron_bridge.transformer_config.num_layers):
-            keys.extend(get_vllm_qkv_scale_names(layer_idx).values())
+        for attention_prefix in self._get_fp8_kv_attention_prefixes().values():
+            keys.extend(get_vllm_qkv_scale_names(attention_prefix).values())
 
         for param_name in keys:
             scale_value = (

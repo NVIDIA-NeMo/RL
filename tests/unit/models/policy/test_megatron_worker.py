@@ -285,6 +285,150 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     assert not isinstance(megatron_forwarded, list)
 
 
+def _hybrid_attention_tasks() -> list[Any]:
+    """Bridge tasks of a NemotronH-like model: Mamba layer 0, attention layer 4, MTP."""
+
+    def task(global_param_name: str, hf_param: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            global_param_name=global_param_name,
+            mapping=SimpleNamespace(hf_param=hf_param),
+        )
+
+    def qkv(layer: str) -> dict[str, str]:
+        return {p: f"{layer}.mixer.{p}_proj.weight" for p in "qkv"}
+
+    return [
+        task(
+            "decoder.layers.0.mixer.in_proj.weight",
+            "backbone.layers.0.mixer.in_proj.weight",
+        ),
+        task(
+            "decoder.layers.4.self_attention.linear_qkv.weight",
+            qkv("backbone.layers.4"),
+        ),
+        None,
+        task(
+            "mtp.layers.0.mtp_model_layer.layers.0.self_attention.linear_qkv.weight",
+            qkv("mtp.layers.0"),
+        ),
+    ]
+
+
+def _fp8_kv_worker() -> Any:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = _hybrid_attention_tasks()
+    worker._fp8_kv_attention_prefixes = None
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=MagicMock(return_value=iter(()))
+    )
+    worker.cfg = {
+        "generation": {"backend": "vllm", "vllm_cfg": {"kv_cache_dtype": "fp8_e4m3"}}
+    }
+    return worker
+
+
+def test_fp8_kv_scales_are_emitted_only_for_hybrid_attention_layers() -> None:
+    worker = _fp8_kv_worker()
+    kv_scales = {"backbone.layers.4.mixer.attn.k_scale": 0.5}
+
+    emitted = {
+        name: tensor.item()
+        for name, tensor in worker._iter_params_with_optional_kv_scales(kv_scales)
+    }
+
+    # vLLM's own Attention parameter names, only for attention layers (no Mamba
+    # layer 0); MTP attention keeps its own HF namespace.
+    assert emitted == {
+        "backbone.layers.4.mixer.attn.q_scale": 1.0,
+        "backbone.layers.4.mixer.attn.k_scale": 0.5,
+        "backbone.layers.4.mixer.attn.v_scale": 1.0,
+        "mtp.layers.0.mixer.attn.q_scale": 1.0,
+        "mtp.layers.0.mixer.attn.k_scale": 1.0,
+        "mtp.layers.0.mixer.attn.v_scale": 1.0,
+    }
+
+
+@pytest.mark.parametrize("include_q", [True, False])
+def test_calibrate_qkv_fp8_scales_keys_hybrid_and_mtp_attention(
+    include_q: bool,
+) -> None:
+    class CoreAttention(torch.nn.Module):
+        def forward(self, q, k, v):
+            return q
+
+    def attention_block() -> torch.nn.Module:
+        return torch.nn.ModuleDict(
+            {"self_attention": torch.nn.ModuleDict({"core_attention": CoreAttention()})}
+        )
+
+    # Mirrors Megatron's wrapped module tree: module.decoder.layers.<i> and the MTP block.
+    model = torch.nn.ModuleDict(
+        {
+            "module": torch.nn.ModuleDict(
+                {
+                    "decoder": torch.nn.ModuleDict(
+                        {"layers": torch.nn.ModuleDict({"4": attention_block()})}
+                    ),
+                    "mtp": torch.nn.ModuleDict(
+                        {
+                            "layers": torch.nn.ModuleDict(
+                                {
+                                    "0": torch.nn.ModuleDict(
+                                        {
+                                            "mtp_model_layer": torch.nn.ModuleDict(
+                                                {
+                                                    "layers": torch.nn.ModuleDict(
+                                                        {"0": attention_block()}
+                                                    )
+                                                }
+                                            )
+                                        }
+                                    )
+                                }
+                            )
+                        }
+                    ),
+                }
+            )
+        }
+    )
+
+    def get_logprobs(**_: Any) -> None:
+        core = model["module"]["decoder"]["layers"]["4"]["self_attention"]
+        core["core_attention"](
+            torch.full((2,), 4.48), torch.full((2,), 8.96), torch.ones(2)
+        )
+        mtp = model["module"]["mtp"]["layers"]["0"]["mtp_model_layer"]["layers"]["0"]
+        mtp["self_attention"]["core_attention"](
+            torch.ones(2), torch.ones(2), torch.full((2,), 44.8)
+        )
+
+    worker = _fp8_kv_worker()
+    worker.model = model
+    worker.get_logprobs = get_logprobs
+
+    result = worker.calibrate_qkv_fp8_scales(data=None, margin=1.0, include_q=include_q)
+
+    expected = {
+        "backbone.layers.4.mixer.attn.k_scale": 0.02,
+        "backbone.layers.4.mixer.attn.v_scale": 1 / 448,
+        "mtp.layers.0.mixer.attn.k_scale": 1 / 448,
+        "mtp.layers.0.mixer.attn.v_scale": 0.1,
+    }
+    if include_q:
+        expected["backbone.layers.4.mixer.attn.q_scale"] = 0.01
+        expected["mtp.layers.0.mixer.attn.q_scale"] = 1 / 448
+    assert result["layers"].keys() == expected.keys()
+    for name, value in expected.items():
+        assert result["layers"][name] == pytest.approx(value)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_local_hf_shards_follow_bridge_specs(dtype: torch.dtype) -> None:
     from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec

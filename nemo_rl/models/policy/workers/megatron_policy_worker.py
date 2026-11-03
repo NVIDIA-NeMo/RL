@@ -1169,6 +1169,8 @@ class MegatronPolicyWorkerImpl(
         self.refit_conversion_tasks = None
         self.refit_conversion_tasks_current_index = None
         self.refit_param_info_mcore = None
+        # Megatron attention module -> HF attention module; names the FP8 KV scales.
+        self._fp8_kv_attention_prefixes: Optional[dict[str, str]] = None
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
@@ -3680,6 +3682,28 @@ class MegatronPolicyWorkerImpl(
             self.zmq_socket.setsockopt(zmq.SNDTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
             self.zmq_socket.setsockopt(zmq.RCVTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
 
+    def _get_fp8_kv_attention_prefixes(self) -> dict[str, str]:
+        """Return the Megatron -> HF attention module names that own FP8 KV scales."""
+        if self._fp8_kv_attention_prefixes is None:
+            from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+                get_hf_attention_prefixes,
+            )
+
+            conversion_tasks = self.refit_conversion_tasks
+            if conversion_tasks is None:
+                conversion_tasks = self.megatron_bridge.get_conversion_tasks(
+                    [self.model]
+                )
+            prefixes = get_hf_attention_prefixes(conversion_tasks)
+            if not prefixes:
+                raise ValueError(
+                    "FP8 KV cache needs per-layer attention scales, but no "
+                    "'self_attention.linear_qkv' weight was found in the "
+                    "Megatron-Bridge conversion tasks of this model."
+                )
+            self._fp8_kv_attention_prefixes = prefixes
+        return self._fp8_kv_attention_prefixes
+
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
@@ -3755,11 +3779,9 @@ class MegatronPolicyWorkerImpl(
             return
 
         # Append KV (and potentially Q) scale entries to match metadata.
-        num_layers = self.megatron_bridge.transformer_config.num_layers
         keys: list[str] = []
-        for layer_idx in range(num_layers):
-            scale_names = get_vllm_qkv_scale_names(layer_idx)
-            keys.extend(scale_names.values())
+        for attention_prefix in self._get_fp8_kv_attention_prefixes().values():
+            keys.extend(get_vllm_qkv_scale_names(attention_prefix).values())
 
         for param_name in keys:
             if kv_scales and param_name in kv_scales:
@@ -5276,7 +5298,9 @@ class MegatronPolicyWorkerImpl(
 
         Returns:
             { "format": "fp8", "percentile": float, "margin": float,
-              "layers": { layer_name: {"k_scale": float, "v_scale": float[, "q_scale": float] } } }
+              "layers": { vllm_scale_param_name: float } }, keyed by
+            ``fp8_train_utils.get_vllm_qkv_scale_names`` for every attention layer
+            (MTP included).
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
             convert_calibration_to_vllm_format,
@@ -5304,12 +5328,20 @@ class MegatronPolicyWorkerImpl(
         layer_to_samples_v: dict[str, list[float]] = defaultdict(list)
         hook_handles = []
 
+        attention_prefixes = self._get_fp8_kv_attention_prefixes()
+
         def _extract_layer_key(module_name: str) -> str:
-            # Expected format: "module.decoder.layers.<idx>.self_attention.query_key_value"
-            m = re.search(r"module\.decoder\.layers\.(\d+)", module_name)
-            if m is not None:
-                return f"layer_{m.group(1)}"
-            return module_name
+            # "module.module.decoder.layers.4.self_attention.core_attention" (or an
+            # MTP layer) -> the HF attention module that owns its vLLM scales.
+            megatron_prefix = re.sub(r"^(module\.)+", "", module_name).removesuffix(
+                ".core_attention"
+            )
+            if megatron_prefix not in attention_prefixes:
+                raise ValueError(
+                    f"No HF attention module for {module_name!r}; known Megatron "
+                    f"attention modules: {sorted(attention_prefixes)}"
+                )
+            return attention_prefixes[megatron_prefix]
 
         # Hook to capture q/k/v after q/k norm and RoPE
         def _pre_hook_builder_core_attention(module_name: str):
@@ -5339,7 +5371,7 @@ class MegatronPolicyWorkerImpl(
         matched_modules = []
         # Try to register forward_pre_hook on core_attention first
         for name, module in self.model.named_modules():
-            if "self_attention.core_attention" in name:
+            if name.endswith("self_attention.core_attention"):
                 try:
                     handle = module.register_forward_pre_hook(
                         _pre_hook_builder_core_attention(name)
