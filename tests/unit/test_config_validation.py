@@ -191,11 +191,8 @@ def _check_required_keys(config_file: str, config: DictConfig) -> None:
     validate_config_section(config_dict, master_config_class, config_file)
 
 
-@pytest.mark.parametrize("config_file", config_files)
-def test_single_controller_configs_pass_single_controller_validation(config_file):
-    config_dict = OmegaConf.to_container(
-        load_config_with_inheritance(config_file), resolve=True
-    )
+def _check_single_controller_config(config: DictConfig) -> None:
+    config_dict = OmegaConf.to_container(config, resolve=True)
     if "async_rl" not in config_dict:
         pytest.skip("Not a SingleController config")
     validate_single_controller_config(
@@ -432,22 +429,16 @@ def _check_automodel_moe_dispatcher(config_file: str, config: DictConfig) -> Non
         )
 
 
-@pytest.mark.parametrize("config_file", config_files)
-def test_check_nccl_reshard_refit_support_on_all_configs(config_file: str) -> None:
-    config_dict = OmegaConf.to_container(
-        load_config_with_inheritance(config_file), resolve=True
-    )
+def _check_nccl_reshard_refit_support(config: DictConfig) -> None:
+    config_dict = OmegaConf.to_container(config, resolve=True)
     generation = (config_dict.get("policy") or {}).get("generation") or {}
     if generation.get("refit_transport") != "nccl_reshard":
         pytest.skip("Not an nccl_reshard recipe")
     check_nccl_reshard_refit_support(SimpleNamespace(policy=config_dict["policy"]))
 
 
-@pytest.mark.parametrize("config_file", config_files)
-def test_validate_batch_invariant_mode_on_all_configs(config_file: str) -> None:
-    config_dict = OmegaConf.to_container(
-        load_config_with_inheritance(config_file), resolve=True
-    )
+def _check_batch_invariant_mode(config: DictConfig) -> None:
+    config_dict = OmegaConf.to_container(config, resolve=True)
     policy = config_dict.get("policy") or {}
     if not (policy.get("megatron_cfg") or {}).get("batch_invariant_mode"):
         pytest.skip("batch_invariant_mode is not enabled")
@@ -471,28 +462,39 @@ def test_base_exemplars_pin_flash_attention_to_fa2():
                 assert megatron_cfg.get("flash_attention_version") == 2, path.name
 
 
-@pytest.mark.parametrize("config_file", full_config_files)
-def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
-    """Load each shipped config once and report each applicable check separately."""
-    config = load_config_with_inheritance(config_file)
-    if config_file in config_files:
-        with subtests.test(check="required_keys"):
-            _check_required_keys(config_file, deepcopy(config))
-        with subtests.test(check="tp_size_accuracy"):
-            _check_tp_size_accuracy(config_file, deepcopy(config))
-
-    with subtests.test(check="outdated_config"):
-        _check_outdated_config(config_file, deepcopy(config))
-
-    if config_file in config_files:
-        with subtests.test(check="automodel_moe_dispatcher"):
-            _check_automodel_moe_dispatcher(config_file, deepcopy(config))
-
-
-@pytest.mark.parametrize("path", full_config_files)
-def test_shipped_configs_have_no_local_paths(path: str) -> None:
+def _check_no_local_paths(path: str) -> None:
     text = Path(path).read_text().lower()
     for local_prefix in ("/lustre/", "/scratch/", "/home/"):
         assert local_prefix not in text, (
             f"{path} contains a local path ({local_prefix})"
         )
+
+
+@pytest.mark.parametrize("config_file", full_config_files)
+def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
+    """Load each shipped config once and report each applicable check separately."""
+    # Check for local paths first, before loading the config.
+    with subtests.test(check="local_paths"):
+        _check_no_local_paths(config_file)
+
+    # Load the config
+    config = load_config_with_inheritance(config_file)
+
+    # Check each applicable check separately for all configs.
+    with subtests.test(check="outdated_config"):
+        _check_outdated_config(config_file, deepcopy(config))
+
+    # Check each applicable check separately if the config is in examples/configs.
+    if config_file in config_files:
+        with subtests.test(check="required_keys"):
+            _check_required_keys(config_file, deepcopy(config))
+        with subtests.test(check="tp_size_accuracy"):
+            _check_tp_size_accuracy(config_file, deepcopy(config))
+        with subtests.test(check="automodel_moe_dispatcher"):
+            _check_automodel_moe_dispatcher(config_file, deepcopy(config))
+        with subtests.test(check="single_controller"):
+            _check_single_controller_config(deepcopy(config))
+        with subtests.test(check="nccl_reshard_refit_support"):
+            _check_nccl_reshard_refit_support(deepcopy(config))
+        with subtests.test(check="batch_invariant_mode"):
+            _check_batch_invariant_mode(deepcopy(config))
