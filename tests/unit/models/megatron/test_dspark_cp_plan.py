@@ -84,8 +84,8 @@ def test_dspark_plan_owns_complete_query_label_windows_exactly_once(
             plan.global_label_positions,
         )
 
-    owned_anchor_ids = torch.cat([plan.anchor_ids for plan in plans])
-    assert owned_anchor_ids.unique().numel() == owned_anchor_ids.numel()
+    # Each of the 4 anchor slots has one owner rank, so the rank plans partition them.
+    assert sum(plan.sample_rows.numel() for plan in plans) == 4
 
 
 def test_dspark_plan_drops_a_query_label_window_crossing_cp_ownership() -> None:

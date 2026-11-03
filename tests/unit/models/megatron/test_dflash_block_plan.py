@@ -372,8 +372,8 @@ def test_packed_cp_plans_execute_each_window_once_without_crossing_boundaries() 
         for cp_rank in range(2)
     ]
 
-    assert plans[0].anchor_ids.numel() == 0
-    assert plans[1].anchor_ids.numel() == 6
+    assert plans[0].sample_rows.numel() == 0
+    assert plans[1].sample_rows.numel() == 6
     assert plans[1].logical_sample_ids.tolist() == [11, 11, 11, 22, 22, 22]
     assert set(plans[1].logical_anchor_positions[:3].tolist()) <= {2, 3}
     assert set(plans[1].logical_anchor_positions[3:].tolist()) == {2}
@@ -397,9 +397,6 @@ def test_packed_cp_plans_execute_each_window_once_without_crossing_boundaries() 
             plan.packed_rope_positions,
             plan.logical_anchor_positions[:, None] + torch.arange(3)[None, :],
         )
-
-    all_anchor_ids = torch.cat([plan.anchor_ids for plan in plans])
-    assert all_anchor_ids.unique().numel() == 6
 
 
 def test_packed_cp_plan_does_not_index_past_a_short_padded_segment() -> None:

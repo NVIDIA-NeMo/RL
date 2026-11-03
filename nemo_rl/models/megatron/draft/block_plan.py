@@ -184,7 +184,6 @@ def _build_partitioned_dflash_batch_plan(
     ).repeat_interleave(anchors_per_sample)
     selected_mask = local_selected.reshape(-1)
     sample_rows = all_sample_rows[selected_mask]
-    anchor_ids = anchor_ids_2d.reshape(-1)[selected_mask]
     logical_anchor_positions = logical_anchor_positions_2d.reshape(-1)[selected_mask]
     owner_cp_ranks = selected_owner_ranks_2d.reshape(-1)[selected_mask]
     global_anchor_positions = global_anchor_positions_2d.reshape(-1)[selected_mask]
@@ -192,26 +191,8 @@ def _build_partitioned_dflash_batch_plan(
     local_query_positions = sequence_layout.cp_global_to_local[global_query_positions]
     local_anchor_positions = local_query_positions[:, 0]
     boundary_valid_mask = sequence_layout.packed_valid_mask[global_query_positions]
-    block_valid = torch.ones(
-        anchor_ids.shape,
-        dtype=torch.bool,
-        device=device,
-    )
-    slot_valid = boundary_valid_mask & block_valid[:, None]
+    slot_valid = boundary_valid_mask
     loss_mask = slot_valid & (slot_offsets[None, :] > 0)
-    valid_prefix_counts = torch.cat(
-        (
-            torch.zeros((batch_size, 1), dtype=torch.int64, device=device),
-            token_valid_mask.cumsum(dim=1, dtype=torch.int64),
-        ),
-        dim=1,
-    )
-    trunk_lengths_2d = torch.gather(
-        valid_prefix_counts,
-        dim=1,
-        index=logical_anchor_positions_2d,
-    )
-    trunk_lengths = trunk_lengths_2d.reshape(-1)[selected_mask]
     packed_segment_starts = segment_starts[sample_rows]
     packed_segment_ends = (segment_starts + sequence_layout.logical_lengths)[
         sample_rows
@@ -226,12 +207,9 @@ def _build_partitioned_dflash_batch_plan(
         block_size=block_size,
         token_valid_mask=token_valid_mask,
         sample_rows=sample_rows,
-        anchor_ids=anchor_ids,
         anchor_positions=local_anchor_positions,
-        trunk_lengths=trunk_lengths,
         query_positions=local_query_positions,
         label_positions=local_query_positions,
-        block_valid=block_valid,
         slot_valid=slot_valid,
         loss_mask=loss_mask,
         global_anchor_positions=global_anchor_positions,
@@ -445,12 +423,9 @@ def build_dspark_batch_plan(
         block_size=block_size,
         token_valid_mask=extended.token_valid_mask,
         sample_rows=extended.sample_rows,
-        anchor_ids=extended.anchor_ids,
         anchor_positions=extended.anchor_positions,
-        trunk_lengths=extended.trunk_lengths,
         query_positions=query_positions,
         label_positions=label_positions,
-        block_valid=extended.block_valid,
         slot_valid=slot_valid,
         loss_mask=slot_valid,
         global_anchor_positions=extended.global_anchor_positions,

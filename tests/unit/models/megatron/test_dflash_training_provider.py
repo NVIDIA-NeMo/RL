@@ -184,7 +184,7 @@ def test_dflash_provider_prepares_forward_and_raw_position_bins() -> None:
     output = data["dflash_output"]
     assert isinstance(output, DFlashForwardOutput)
     assert output.hidden.shape == (4, 3, hidden_size)
-    assert output.plan.anchor_ids.shape == (4,)
+    assert output.plan.anchor_positions.shape == (4,)
 
     teacher_logits = torch.randn(
         batch_size,
