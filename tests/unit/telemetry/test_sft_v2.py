@@ -4,7 +4,7 @@
 """SFT v2 spans and metric declarations use the shared RL telemetry path."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from nemo.lens import NemoLensConfig, setup_telemetry
@@ -15,12 +15,19 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 
 from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX, SetupTimingMetrics
 from nemo_rl.algorithms.sft_v2 import (
+    ENERGON_IN_FLIGHT_ATTR,
+    ENERGON_WORKER_PROCESSES_ATTR,
+    ENERGON_WORKERS_PER_RANK_ATTR,
+    LOADER_LATENCY_MAX_KEY,
+    LOADER_READ_MAX_KEY,
     SFT_V2_TEED_METRICS,
     SFTSingleControllerActor,
     SFTV2SaveState,
+    _energon_fanout_attributes,
 )
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
+    TRACE_CARRIER_KWARG,
     iteration_scope,
     umbrella_span,
 )
@@ -28,9 +35,43 @@ from nemo_rl.telemetry.metrics import map_teed_scalars
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 
+def _envelope(*, load_seconds: float, read_seconds: float) -> SimpleNamespace:
+    """One loader owner's step envelope, with only the fields the step reads."""
+    return SimpleNamespace(
+        meta=SimpleNamespace(sample_ids=["sample"]),
+        valid_tokens=4,
+        source_ids=("sample",),
+        load_seconds=load_seconds,
+        read_seconds=read_seconds,
+    )
+
+
+def _loader_setup_controller(tracer, *, energon: dict) -> object:
+    """A controller with just enough state for ``_setup_loaders``, over 2 DP ranks."""
+    controller_cls = SFTSingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    controller._tracer = tracer
+    controller._master_config = SimpleNamespace(
+        data={"max_input_seq_length": 128, "energon": energon},
+        policy={
+            "train_global_batch_size": 4,
+            "make_sequence_length_divisible_by": 8,
+        },
+        sft=SimpleNamespace(only_unmask_final=False),
+    )
+    controller._placement_plan = SimpleNamespace(
+        logical_world_size=2, placement_hash="placement"
+    )
+    controller._loader_states = None
+    controller._trainer = MagicMock()
+    controller._trainer.worker_group.run_all_workers_single_data.return_value = []
+    return controller
+
+
 def test_sft_v2_step_metrics_have_otel_series() -> None:
     values = {
         "loader_latency_max": 0.2,
+        "loader_read_max": 0.05,
         "policy_time": 1.5,
         "total_step_time": 1.8,
         "valid_tokens_per_second": 100.0,
@@ -60,6 +101,7 @@ def test_sft_v2_step_spans_follow_the_enabled_groups(
                 valid_tokens=4,
                 source_ids=("sample",),
                 load_seconds=0.2,
+                read_seconds=0.05,
             )
         ]
     )
@@ -156,6 +198,132 @@ def test_sft_v2_checkpointing_span_covers_the_whole_save(monkeypatch, tmp_path) 
         phase: checkpointing.context.span_id
         for phase in ("init_tmp", "policy_write", "loader_dump", "finalize_handoff")
     }
+
+
+def test_sft_v2_read_wait_is_reported_apart_from_the_whole_loader_call() -> None:
+    """``load_seconds`` cannot stand in for the Energon queue wait.
+
+    It also covers prepare, register and publish, which run on the policy
+    worker. Only the dequeue says whether the worker subprocesses kept up, so a
+    step that waited on them has to be distinguishable from one that spent the
+    same time publishing -- here the slow rank is slow in opposite halves.
+    """
+    controller_cls = SFTSingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    controller._tracer = None
+    controller._save_state = SFTV2SaveState(0, 0, 0, "placement")
+    controller._loss_fn = object()
+    controller._owner_call = MagicMock()
+    controller._trainer = MagicMock()
+    controller._trainer.finish_train_step.return_value = {
+        "loss": 1.0,
+        "grad_norm": 0.5,
+        "all_mb_metrics": {},
+    }
+    controller._load_envelopes = MagicMock(
+        return_value=[
+            # Waited on the queue, published quickly.
+            _envelope(load_seconds=0.9, read_seconds=0.8),
+            # Found a batch waiting, then spent the time publishing it.
+            _envelope(load_seconds=1.2, read_seconds=0.1),
+        ]
+    )
+
+    metrics = controller._run_train_step()
+
+    assert metrics[LOADER_LATENCY_MAX_KEY] == 1.2
+    assert metrics[LOADER_READ_MAX_KEY] == 0.8
+
+
+def test_sft_v2_setup_loaders_span_records_the_energon_worker_pool() -> None:
+    """The subprocesses emit nothing, so the span is the only place they appear.
+
+    Eight workers behind each of two loader ranks is sixteen processes, and the
+    count a reader needs is that one -- not the per-rank setting, which is what
+    the config holds.
+    """
+    exporter = InMemorySpanExporter()
+    handle = setup_telemetry(
+        NemoLensConfig(enabled=True, span_groups="per_step"),
+        span_exporter=exporter,
+    )
+    controller = _loader_setup_controller(handle.tracer, energon={"num_workers": 8})
+
+    with patch("nemo_rl.algorithms.sft_v2.ray.get", return_value=[True, True]):
+        controller._setup_loaders()
+    handle.shutdown()
+
+    (span,) = exporter.get_finished_spans()
+    assert span.name == "rl.sft_v2.setup_loaders"
+    assert span.attributes[ENERGON_WORKER_PROCESSES_ATTR] == 16
+    assert span.attributes[ENERGON_WORKERS_PER_RANK_ATTR] == 8
+    # num_workers x the default prefetch_factor of 2.
+    assert span.attributes[ENERGON_IN_FLIGHT_ATTR] == 16
+    # Startup work fans out across the loader ranks, so it stays unbucketed.
+    assert "rl.bucket" not in span.attributes
+
+
+def test_sft_v2_in_process_loading_reports_no_worker_pool() -> None:
+    """``num_workers=0`` loads in the policy process, so the honest count is 0.
+
+    Falling back to the model default here would invent sixteen processes that
+    do not exist, which is worse than the gap this span closes.
+    """
+    controller = _loader_setup_controller(None, energon={"num_workers": 0})
+
+    attributes = _energon_fanout_attributes(
+        controller._master_config.data, loader_ranks=2
+    )
+
+    assert attributes[ENERGON_WORKER_PROCESSES_ATTR] == 0
+    assert attributes[ENERGON_IN_FLIGHT_ATTR] == 0
+
+
+def test_sft_v2_worker_pool_attributes_survive_a_config_the_model_would_reject() -> (
+    None
+):
+    """A span must not be the thing that fails a run.
+
+    ``_setup_loaders`` runs before the worker validates anything, so reading
+    the config strictly here would turn a loader misconfiguration into a
+    telemetry traceback with the real error never reached.
+    """
+    attributes = _energon_fanout_attributes(
+        {"energon": {"num_workers": "eight", "prefetch_factor": None}}, loader_ranks=2
+    )
+
+    # The model defaults, rather than a raise or a missing attribute.
+    assert attributes[ENERGON_WORKERS_PER_RANK_ATTR] == 8
+    assert attributes[ENERGON_IN_FLIGHT_ATTR] == 16
+
+
+def test_sft_v2_owner_calls_carry_the_caller_trace_context() -> None:
+    """Without this the loader's clear lands in its own root trace, once a step.
+
+    ``_owner_call`` names its method with a runtime string, so the carrier is
+    the only thing tying ``commit_sft_batch`` -- and the ``rl.data_plane.clear``
+    it opens on the worker -- back to the step that asked for it.
+    """
+    handle = setup_telemetry(
+        NemoLensConfig(enabled=True, span_groups="per_step"),
+        span_exporter=InMemorySpanExporter(),
+    )
+    controller_cls = SFTSingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    controller._trainer = MagicMock()
+    controller._trainer.worker_group.run_all_workers_single_data.return_value = []
+
+    with (
+        umbrella_span(RLSpanGroup.U_JOB, "rl.sft_v2.job", tracer=handle.tracer),
+        patch("nemo_rl.algorithms.sft_v2.ray.get", return_value=[]),
+    ):
+        controller._owner_call("commit_sft_batch")
+    handle.shutdown()
+
+    kwargs = (
+        controller._trainer.worker_group.run_all_workers_single_data.call_args.kwargs
+    )
+    assert kwargs[TRACE_CARRIER_KWARG]
 
 
 def test_sft_v2_setup_timing_reaches_the_logger_under_the_teed_prefix() -> None:

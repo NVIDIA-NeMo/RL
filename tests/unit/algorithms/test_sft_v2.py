@@ -54,6 +54,7 @@ def _envelope(rank: int, *, source_count: int = 1) -> StepEnvelope:
         field_names=("input_ids",),
         sequence_lengths=(8,),
         load_seconds=0.1 + rank * 0.1,
+        read_seconds=0.01 + rank * 0.02,
         valid_tokens=4,
     )
 
@@ -682,6 +683,7 @@ def test_setup_loaders_passes_canonical_geometry_and_nested_packing(
         placement_hash="placement",
     )
     controller._loader_states = [{"shard": 0}, {"shard": 1}] if restored else None
+    controller._tracer = None
     controller._trainer = MagicMock()
     futures = [object(), object()]
     controller._trainer.worker_group.run_all_workers_single_data.return_value = futures

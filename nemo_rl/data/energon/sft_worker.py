@@ -36,7 +36,11 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
-from nemo_rl.telemetry.instrumentation import accepts_trace_context, managed_span
+from nemo_rl.telemetry.instrumentation import (
+    accepts_trace_context,
+    managed_span,
+    umbrella_span,
+)
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 
@@ -60,6 +64,7 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._sft_logical_world_size: Optional[int] = None
         super().__init__(*args, **kwargs)
 
+    @accepts_trace_context
     def setup_sft_dataloader(
         self,
         *,
@@ -81,22 +86,34 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         logical_rank = parallel_state.get_data_parallel_rank()
         logical_world_size = parallel_state.get_data_parallel_world_size()
-        self._sft_loader = build_energon_sft_loader(
-            data_config=data_config,
-            source=data_config["train"],
-            processor=self._sft_processor,
-            batch_size=batch_size,
-            max_sequence_length=max_sequence_length,
-            sequence_length_pad_multiple=sequence_length_pad_multiple,
-            split_role="train",
+        # The only span covering the Energon worker subprocesses. They are
+        # forked by the loader's first iteration and emit nothing themselves --
+        # no tracer is installed in them, and installing one would mean an
+        # exporter per subprocess -- so this span, plus the read wait measured
+        # per step below, is the whole picture of them from this side.
+        with umbrella_span(
+            RLSpanGroup.U_SETUP,
+            "rl.sft_v2.build_loader",
             logical_rank=logical_rank,
             logical_world_size=logical_world_size,
-            placement_fingerprint=placement_fingerprint,
-            only_unmask_final=only_unmask_final,
-        )
-        if restored_state is not None:
-            self._sft_loader.load_state_dict(restored_state)
-        self._sft_loader_iterator = iter(self._sft_loader)
+            restored=restored_state is not None,
+        ):
+            self._sft_loader = build_energon_sft_loader(
+                data_config=data_config,
+                source=data_config["train"],
+                processor=self._sft_processor,
+                batch_size=batch_size,
+                max_sequence_length=max_sequence_length,
+                sequence_length_pad_multiple=sequence_length_pad_multiple,
+                split_role="train",
+                logical_rank=logical_rank,
+                logical_world_size=logical_world_size,
+                placement_fingerprint=placement_fingerprint,
+                only_unmask_final=only_unmask_final,
+            )
+            if restored_state is not None:
+                self._sft_loader.load_state_dict(restored_state)
+            self._sft_loader_iterator = iter(self._sft_loader)
         self._sft_logical_rank = logical_rank
         self._sft_logical_world_size = logical_world_size
         return True
@@ -127,6 +144,7 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             except StopIteration:
                 self._sft_loader_iterator = iter(self._sft_loader)
                 batch = next(self._sft_loader_iterator)
+        read_seconds = time.monotonic() - started
 
         with managed_span(RLSpanGroup.DATA_PROCESSING, "rl.sft_v2.prepare_batch"):
             prepared = prepare_sft_batch(
@@ -193,12 +211,14 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             sequence_lengths=lengths,
             # The controller waits for the whole call, including publishing.
             load_seconds=time.monotonic() - started,
+            read_seconds=read_seconds,
             valid_tokens=valid_tokens,
         )
         self._sft_active_envelope = envelope
         self._sft_next_batch_index += 1
         return envelope
 
+    @accepts_trace_context
     def commit_sft_batch(self) -> None:
         """Release the active process-local batch after a successful step."""
         envelope = self._require_active_envelope()
@@ -208,20 +228,27 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         )
         self._sft_active_envelope = None
 
+    @accepts_trace_context
     def abort_sft_batch(self) -> None:
         """Release the active batch after a failed policy step."""
         if self._sft_active_envelope is None:
             return
         self.commit_sft_batch()
 
+    @accepts_trace_context
     def sft_dataloader_state_dict(self) -> dict[str, Any]:
         """Capture this logical loader state after its batch is committed."""
         if self._sft_loader is None:
             raise RuntimeError("The SFT Energon loader is not configured on this rank.")
         if self._sft_active_envelope is not None:
             raise RuntimeError("Cannot checkpoint an uncommitted SFT batch.")
-        return self._sft_loader.state_dict()
+        # Energon drains the worker subprocesses to snapshot their offsets, so
+        # this is loader cost inside the checkpoint rather than part of the
+        # policy write the controller's checkpointing span otherwise covers.
+        with managed_span(RLSpanGroup.CHECKPOINT, "rl.sft_v2.loader_state_dict"):
+            return self._sft_loader.state_dict()
 
+    @accepts_trace_context
     def close_sft_dataloader(self) -> None:
         """Clear local batch state and release the loader reference."""
         self.abort_sft_batch()

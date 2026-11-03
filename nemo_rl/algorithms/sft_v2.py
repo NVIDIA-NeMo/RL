@@ -22,7 +22,7 @@ import time
 import warnings
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Mapping, Optional, cast
 
 import numpy as np
 import ray
@@ -34,7 +34,7 @@ from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX, SetupTimingMetr
 from nemo_rl.algorithms.sft import SFTConfig
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.energon.config import EnergonSourceConfig
+from nemo_rl.data.energon.config import EnergonLoaderConfig, EnergonSourceConfig
 from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data.energon.topology import (
     DataLoaderPlacementPlan,
@@ -77,9 +77,16 @@ from nemo_rl.utils.path_utils import (
 from nemo_rl.utils.timer import TimeoutChecker
 
 LOADER_LATENCY_MAX_KEY = "loader_latency_max"
+LOADER_READ_MAX_KEY = "loader_read_max"
 POLICY_TIME_KEY = "policy_time"
 TOTAL_STEP_TIME_KEY = "total_step_time"
 VALID_TOKENS_PER_SECOND_KEY = "valid_tokens_per_second"
+
+# Span attributes describing the Energon worker pool; see
+# :func:`_energon_fanout_attributes`.
+ENERGON_WORKER_PROCESSES_ATTR = "rl.energon.worker_processes"
+ENERGON_WORKERS_PER_RANK_ATTR = "rl.energon.workers_per_rank"
+ENERGON_IN_FLIGHT_ATTR = "rl.energon.batches_in_flight_per_rank"
 
 SFT_V2_TEED_METRICS = (
     TeedMetric(
@@ -87,6 +94,16 @@ SFT_V2_TEED_METRICS = (
         "rl.sft_v2.loader.latency.max",
         unit="s",
         description="Slowest data-loader rank per SFT v2 step.",
+    ),
+    TeedMetric(
+        LOADER_READ_MAX_KEY,
+        "rl.sft_v2.loader.read.duration.max",
+        unit="s",
+        description=(
+            "Longest wait on the Energon worker queue per SFT v2 step, across "
+            "data-loader ranks. The workers run ahead of training, so this is "
+            "near zero while they keep up and rises when they stop."
+        ),
     ),
     TeedMetric(
         POLICY_TIME_KEY,
@@ -171,6 +188,49 @@ def _restore_save_state(
     known = {item.name for item in fields(SFTV2SaveState)}
     defaults.update({key: value for key, value in loaded.items() if key in known})
     return SFTV2SaveState(**defaults)
+
+
+def _energon_setting(energon: Any, name: str) -> int:
+    """One Energon loader setting, falling back to the model's own default.
+
+    ``data["energon"]`` reaches here either as the raw mapping from the YAML or
+    as an already-validated ``EnergonLoaderConfig``; ``build_energon_sft_loader``
+    accepts both, so this has to as well.
+    """
+    value = (
+        energon.get(name)
+        if isinstance(energon, Mapping)
+        else getattr(energon, name, None)
+    )
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return EnergonLoaderConfig.model_fields[name].default
+
+
+def _energon_fanout_attributes(
+    data_config: Mapping[str, Any], *, loader_ranks: int
+) -> dict[str, int]:
+    """How many Energon worker subprocesses this run has, and their queue depth.
+
+    These are the only record that the subprocesses exist. They are forked by
+    the loader rather than by NeMo-RL, nothing installs a tracer in them, and
+    the only span that sees them at all is the loader build they happen under.
+
+    Read off the config against the model's defaults rather than by validating
+    it: this feeds a span, and a read strict enough to reject a config the
+    worker would have accepted would fail a run from the telemetry path, which
+    nothing else in that path does.
+    """
+    energon = data_config.get("energon")
+    workers = _energon_setting(energon, "num_workers")
+    return {
+        ENERGON_WORKER_PROCESSES_ATTR: workers * loader_ranks,
+        ENERGON_WORKERS_PER_RANK_ATTR: workers,
+        # num_workers=0 loads in the policy process itself, so there is neither
+        # a subprocess nor a queue in front of it. Both products are 0, which
+        # is the honest reading rather than a missing value.
+        ENERGON_IN_FLIGHT_ATTR: workers * _energon_setting(energon, "prefetch_factor"),
+    }
 
 
 def _max_train_steps(master_config: MasterConfig) -> int:
@@ -294,26 +354,39 @@ class SFTSingleControllerActor:
             "placement_fingerprint": self._placement_plan.placement_hash,
             "only_unmask_final": config.sft.only_unmask_final,
         }
-        if self._loader_states is None:
-            futures = self._trainer.worker_group.run_all_workers_single_data(
-                "setup_sft_dataloader",
-                run_rank_0_only_axes=list(REPLICATED_AXES),
-                **common_kwargs,
-            )
-        else:
-            if len(self._loader_states) != self._placement_plan.logical_world_size:
-                raise ValueError(
-                    "The checkpoint must contain one loader state per logical DP shard."
+        # Runs from __init__, between the startup spans and rl.sft_v2.job, so
+        # without this span it is a gap on the controller timeline rather than
+        # a phase -- and it is where every Energon worker subprocess is forked
+        # and the prefetch queues fill, which on a cold dataset is most of it.
+        with umbrella_span(
+            RLSpanGroup.U_SETUP,
+            "rl.sft_v2.setup_loaders",
+            tracer=self._tracer,
+            **_energon_fanout_attributes(
+                config.data, loader_ranks=self._placement_plan.logical_world_size
+            ),
+        ):
+            if self._loader_states is None:
+                futures = self._trainer.worker_group.run_all_workers_single_data(
+                    "setup_sft_dataloader",
+                    run_rank_0_only_axes=list(REPLICATED_AXES),
+                    **common_kwargs,
+                    **trace_context_kwargs(),
                 )
-            futures = self._trainer.worker_group.run_all_workers_multiple_data(
-                "setup_sft_dataloader",
-                restored_state=self._loader_states,
-                run_rank_0_only_axes=list(REPLICATED_AXES),
-                common_kwargs=common_kwargs,
-            )
-        results = ray.get(futures)
-        if results != [True] * self._placement_plan.logical_world_size:
-            raise RuntimeError(f"Unexpected SFT loader setup results: {results!r}.")
+            else:
+                if len(self._loader_states) != self._placement_plan.logical_world_size:
+                    raise ValueError(
+                        "The checkpoint must contain one loader state per logical DP shard."
+                    )
+                futures = self._trainer.worker_group.run_all_workers_multiple_data(
+                    "setup_sft_dataloader",
+                    restored_state=self._loader_states,
+                    run_rank_0_only_axes=list(REPLICATED_AXES),
+                    common_kwargs={**common_kwargs, **trace_context_kwargs()},
+                )
+            results = ray.get(futures)
+            if results != [True] * self._placement_plan.logical_world_size:
+                raise RuntimeError(f"Unexpected SFT loader setup results: {results!r}.")
 
     def _load_envelopes(self) -> list[StepEnvelope]:
         futures = self._trainer.worker_group.run_all_workers_single_data(
@@ -377,6 +450,7 @@ class SFTSingleControllerActor:
         loader_latency_max = max(loader_seconds)
         metrics: dict[str, Any] = {
             LOADER_LATENCY_MAX_KEY: loader_latency_max,
+            LOADER_READ_MAX_KEY: max(envelope.read_seconds for envelope in envelopes),
             "loader_latency_mean": statistics.fmean(loader_seconds),
             "loader_copy_imbalance": loader_latency_max - min(loader_seconds),
             POLICY_TIME_KEY: policy_seconds,
@@ -415,6 +489,7 @@ class SFTSingleControllerActor:
         futures = self._trainer.worker_group.run_all_workers_single_data(
             method_name,
             run_rank_0_only_axes=list(REPLICATED_AXES),
+            **trace_context_kwargs(),
         )
         return ray.get(futures)
 

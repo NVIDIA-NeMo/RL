@@ -30,6 +30,11 @@ class StepEnvelope:
     field_names: tuple[str, ...]
     sequence_lengths: tuple[int, ...]
     load_seconds: float
+    # The blocking dequeue alone, which load_seconds cannot be read as: that
+    # also covers prepare, register and publish, all of which run on the policy
+    # worker itself. Only this part is time spent waiting on the Energon worker
+    # subprocesses, so only this part answers whether they are keeping up.
+    read_seconds: float
     valid_tokens: int
 
 

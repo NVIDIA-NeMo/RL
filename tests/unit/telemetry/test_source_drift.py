@@ -31,6 +31,10 @@ _SPAN_EMITTING_DIRS = (
     _REPO / "nemo_rl" / "models" / "policy",
     _REPO / "nemo_rl" / "models" / "value",
     _REPO / "nemo_rl" / "distributed",
+    # The Energon SFT worker lives here. Left out until its loader-lifecycle
+    # spans arrived, which meant read_batch and prepare_batch were documented
+    # by hand and nothing would have noticed a third name going undocumented.
+    _REPO / "nemo_rl" / "data",
     _REPO / "nemo_rl" / "data_plane",
     _REPO / "nemo_rl" / "environments",
     _REPO / "nemo_rl" / "utils",
@@ -629,11 +633,15 @@ def _dispatch_targets(
         return [(name, _sends_carrier(node))] if name in decorated else []
     if called in indirect:
         # A call into a helper that forwards the method name it is handed.
+        # Either spelling: a helper taking only the name is naturally called
+        # positionally, and reading keywords alone made that look like the
+        # decorator was dead weight rather than like an unread call site --
+        # which would have been answered by shaping the call to suit this.
+        constants = [*node.args, *(keyword.value for keyword in node.keywords)]
         named = {
-            keyword.value.value
-            for keyword in node.keywords
-            if isinstance(keyword.value, ast.Constant)
-            and keyword.value.value in decorated
+            constant.value
+            for constant in constants
+            if isinstance(constant, ast.Constant) and constant.value in decorated
         }
         return [(name, indirect[called]) for name in sorted(named)]
     return []
