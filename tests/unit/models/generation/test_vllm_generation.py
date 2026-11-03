@@ -4447,7 +4447,9 @@ def test_vllm_generation_with_megatron_training(
             for output in (generation_results, final_generation):
                 assert output["generation_lengths"].tolist() == [8] * len(prompts)
                 for index, input_length in enumerate(input_lengths.tolist()):
-                    generated_logprobs = output["logprobs"][index, input_length : input_length + 8]
+                    generated_logprobs = output["logprobs"][
+                        index, input_length : input_length + 8
+                    ]
                     assert generated_logprobs.numel() == 8
                     assert torch.isfinite(generated_logprobs).all(), generated_logprobs
 
