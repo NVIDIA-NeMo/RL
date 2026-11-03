@@ -78,12 +78,8 @@ def find_draft_model(model_runner: Any) -> tuple[RunnerFamily, Any | None] | Non
 class WeightComponentManifest:
     """Ordered transport and loading contract for one model component."""
 
-    component: Literal["target", "draft"]
     ordered_names: tuple[str, ...]
-    byte_count: int
     owner_ranks: tuple[int, ...]
-    loader: str
-    finalizer: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,30 +104,15 @@ class ModelUpdateManifest:
             name for name in state_dict_info if name.startswith("draft.")
         )
 
-        def byte_count(names: tuple[str, ...]) -> int:
-            total = 0
-            for name in names:
-                shape, dtype = state_dict_info[name]
-                total += int(torch.Size(shape).numel()) * dtype.itemsize
-            return total
-
         target = WeightComponentManifest(
-            component="target",
             ordered_names=target_names,
-            byte_count=byte_count(target_names),
             owner_ranks=target_owner_ranks,
-            loader="target.load_weights",
-            finalizer="process_weights_after_loading",
         )
         draft = None
         if draft_names:
             draft = WeightComponentManifest(
-                component="draft",
                 ordered_names=draft_names,
-                byte_count=byte_count(draft_names),
                 owner_ranks=draft_owner_ranks,
-                loader="draft.load_weights",
-                finalizer="process_weights_after_loading",
             )
         return cls(target=target, draft=draft)
 
@@ -146,10 +127,6 @@ class ModelUpdateCoverage:
         if manifest.draft is not None:
             self._expected.update(manifest.draft.ordered_names)
         self._covered: set[str] = set()
-
-    @property
-    def has_draft(self) -> bool:
-        return self._manifest.draft is not None
 
     def _record(self, names: Sequence[str]) -> None:
         incoming: set[str] = set()
@@ -211,11 +188,7 @@ class ModelUpdateCoverage:
 class DraftRuntimeAdapter:
     """Capability-driven access to a live vLLM speculative model."""
 
-    speculator_type: SpeculatorType
-    vllm_version: str
-    runner_family: RunnerFamily
     model: Any | None
-    pp_rank: int
     pp_size: int
     is_owner: bool
 
@@ -260,11 +233,7 @@ class DraftRuntimeAdapter:
                 f"runner_family={family.value}: owner draft model is unavailable"
             )
         return cls(
-            speculator_type=speculator_type,
-            vllm_version=vllm_version,
-            runner_family=family,
             model=model,
-            pp_rank=pp_rank,
             pp_size=pp_size,
             is_owner=is_owner,
         )
