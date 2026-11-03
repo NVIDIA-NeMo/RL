@@ -63,7 +63,25 @@ pytestmark = pytest.mark.run_first
 register_omegaconf_resolvers()
 
 
-def validate_config_section(
+absolute_path = os.path.abspath(__file__)
+configs_dir = Path(
+    os.path.join(os.path.dirname(absolute_path), "../../examples/configs")
+).resolve()
+config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
+assert len(config_files) > 0, "No config files found"
+
+# Every shipped config tree. Configs outside examples/configs receive only the
+# outdated-config and local-path checks; their manifests and templates
+# may lack the training schema or contain unset environment interpolations.
+repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
+full_config_files = config_files + [
+    path
+    for extra in ("examples/nemo_gym", "research")
+    for path in glob.glob(str(repo_root / extra / "**/*.yaml"), recursive=True)
+]
+
+
+def _validate_config_section(
     section_config: Dict[str, Any],
     config_class: Type,
     config_file: str,
@@ -109,22 +127,57 @@ def validate_config_section(
         ) from e
 
 
-absolute_path = os.path.abspath(__file__)
-configs_dir = Path(
-    os.path.join(os.path.dirname(absolute_path), "../../examples/configs")
-).resolve()
-config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
-assert len(config_files) > 0, "No config files found"
+def _sync_trainer_names(tree: ast.Module) -> set[str]:
+    """Names this launcher may call its synchronous trainer by.
 
-# Every shipped config tree. Configs outside examples/configs receive only the
-# outdated-config and local-path checks; their manifests and templates
-# may lack the training schema or contain unset environment interpolations.
-repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
-full_config_files = config_files + [
-    path
-    for extra in ("examples/nemo_gym", "research")
-    for path in glob.glob(str(repo_root / extra / "**/*.yaml"), recursive=True)
-]
+    Two shapes ship: ``run_grpo_nemo_gym.py`` calls ``grpo_train`` directly,
+    while ``run_vlm_grpo.py`` binds whatever ``select_sync_trainer`` returned
+    and calls that. Return one or the other, never their union -- a launcher
+    that calls the factory and then ignores it in favour of ``grpo_train`` is
+    the silent-legacy-trainer bug, and a union would pass it.
+    """
+    bound = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "select_sync_trainer"
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    return bound or {"grpo_train"}
+
+
+def _check_no_local_paths(path: str) -> None:
+    text = Path(path).read_text().lower()
+    for local_prefix in ("/lustre/", "/scratch/", "/home/"):
+        assert local_prefix not in text, (
+            f"{path} contains a local path ({local_prefix})"
+        )
+
+
+def _check_outdated_config(config_file: str, config: DictConfig) -> None:
+    """Test that every shipped config passes the same checks the entrypoints run.
+
+    Reusing check_outdated_config keeps this from drifting: a check added there is
+    enforced on the shipped configs without a second implementation here.
+    """
+    # Eval configs have a different structure from training configs, so the entrypoint
+    # checks do not apply to them. run_eval.py skips them for the same reason.
+    if "/evals/" in config_file:
+        pytest.skip("eval configs have a different structure from training configs")
+
+    print(f"\nValidating config file: {config_file}")
+
+    # resolve=False: the checked keys are never interpolations, and resolving would fail
+    # on the configs that interpolate an env var CI does not set.
+    config_dict = OmegaConf.to_container(config, resolve=False)
+
+    try:
+        check_outdated_config(config_dict)
+    except ValueError as e:
+        raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
 
 
 def _check_required_keys(config_file: str, config: DictConfig) -> None:
@@ -188,7 +241,95 @@ def _check_required_keys(config_file: str, config: DictConfig) -> None:
         )
 
     # Validate the entire config using the appropriate MasterConfig
-    validate_config_section(config_dict, master_config_class, config_file)
+    _validate_config_section(config_dict, master_config_class, config_file)
+
+
+def _check_tp_size_accuracy(config_file: str, config: DictConfig) -> None:
+    """Check that a config file in examples/configs has no TP size >= 4 accuracy issues.
+
+    There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.
+    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause.
+    """
+
+    skip_config_files = [
+        "grpo-qwen3-30ba3b-4n8g-40K.yaml",
+        "grpo-qwen3-30ba3b-8n8g-megatron.yaml",
+        "grpo-qwen3-32b-4n8g.yaml",
+        "grpo-qwen3-32b-8n8g-async-1off.yaml",
+        "grpo-gemma3-27b-it-8n8g-automodel-tp8-actckpt-long.yaml",
+        "grpo-gemma3-27b-it-8n4g-automodel-tp4-actckpt-long.yaml",
+    ]
+    if os.path.basename(config_file) in skip_config_files:
+        pytest.skip(
+            f"Skipping config file {config_file} because it sets NRL_IGNORE_TP_ACCURACY_CHECK=1"
+        )
+
+    print(f"\nValidating config file: {config_file}")
+
+    config_dict = OmegaConf.to_container(config, resolve=True)
+
+    # Skip if config does not have policy or logprob_batch_size
+    if "policy" not in config_dict or "logprob_batch_size" not in config_dict["policy"]:
+        return
+
+    # Skip if config set force_on_policy_ratio to True
+    if "loss_fn" in config_dict and config_dict["loss_fn"].get(
+        "force_on_policy_ratio", False
+    ):
+        return
+
+    # Check if TP size >= 4 and train_micro_batch_size != logprob_batch_size
+    if config_dict["policy"]["megatron_cfg"]["enabled"]:
+        tp_size = config_dict["policy"]["megatron_cfg"]["tensor_model_parallel_size"]
+    else:
+        tp_size = config_dict["policy"]["automodel_cfg"]["tensor_parallel_size"]
+
+    train_micro_bs = config_dict["policy"]["train_micro_batch_size"]
+    logprob_bs = config_dict["policy"]["logprob_batch_size"]
+
+    if tp_size >= 4 and train_micro_bs != logprob_bs:
+        raise AssertionError(
+            f"Config file {config_file} has TP size >= 4 accuracy issues. "
+            "Please set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value."
+        )
+
+
+def _check_automodel_moe_dispatcher(config_file: str, config: DictConfig) -> None:
+    skip_config_files = [
+        "grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.yaml",
+    ]
+    if os.path.basename(config_file) in skip_config_files:
+        pytest.skip(
+            f"Skipping config file {config_file} because DeepSeek-V4 pads each CP rank's slice in its own CP sharder"
+        )
+
+    automodel_cfg = OmegaConf.select(config, "policy.automodel_cfg")
+    if (
+        automodel_cfg is None
+        or not automodel_cfg.enabled
+        or automodel_cfg.get("expert_parallel_size", 1) <= 1
+    ):
+        pytest.skip("Not an AutoModel expert-parallel recipe")
+
+    backend = automodel_cfg.automodel_kwargs.backend
+    assert "enable_deepep" not in backend
+    if backend.get("dispatcher") != "hybridep":
+        return
+    assert backend.get("experts") is not None, (
+        f"{config_file}: HybridEP must explicitly select an experts backend"
+    )
+
+    # HybridEP's combine kernel asserts each rank's slice after the CP split is a
+    # multiple of 64, so the global width must be a multiple of 64 * CP.
+    alignment = 64 * automodel_cfg.get("context_parallel_size", 1)
+    assert config.policy.make_sequence_length_divisible_by % alignment == 0, (
+        f"{config_file}: make_sequence_length_divisible_by must be a multiple of {alignment}"
+    )
+    dynamic_batching = OmegaConf.select(config, "policy.dynamic_batching")
+    if dynamic_batching is not None and dynamic_batching.enabled:
+        assert dynamic_batching.sequence_length_round % alignment == 0, (
+            f"{config_file}: dynamic_batching.sequence_length_round must be a multiple of {alignment}"
+        )
 
 
 def _check_single_controller_config(config: DictConfig) -> None:
@@ -200,26 +341,52 @@ def _check_single_controller_config(config: DictConfig) -> None:
     )
 
 
-def _sync_trainer_names(tree: ast.Module) -> set[str]:
-    """Names this launcher may call its synchronous trainer by.
+def _check_nccl_reshard_refit_support(config: DictConfig) -> None:
+    config_dict = OmegaConf.to_container(config, resolve=True)
+    generation = (config_dict.get("policy") or {}).get("generation") or {}
+    if generation.get("refit_transport") != "nccl_reshard":
+        pytest.skip("Not an nccl_reshard recipe")
+    check_nccl_reshard_refit_support(SimpleNamespace(policy=config_dict["policy"]))
 
-    Two shapes ship: ``run_grpo_nemo_gym.py`` calls ``grpo_train`` directly,
-    while ``run_vlm_grpo.py`` binds whatever ``select_sync_trainer`` returned
-    and calls that. Return one or the other, never their union -- a launcher
-    that calls the factory and then ignores it in favour of ``grpo_train`` is
-    the silent-legacy-trainer bug, and a union would pass it.
-    """
-    bound = {
-        target.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Name)
-        and node.value.func.id == "select_sync_trainer"
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    }
-    return bound or {"grpo_train"}
+
+def _check_batch_invariant_mode(config: DictConfig) -> None:
+    config_dict = OmegaConf.to_container(config, resolve=True)
+    policy = config_dict.get("policy") or {}
+    if not (policy.get("megatron_cfg") or {}).get("batch_invariant_mode"):
+        pytest.skip("batch_invariant_mode is not enabled")
+    validate_batch_invariant_mode(policy).raise_if_invalid(
+        "batch_invariant_mode=True failed validation:"
+    )
+
+
+@pytest.mark.parametrize("config_file", full_config_files)
+def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
+    """Load each shipped config once and report each applicable check separately."""
+    # Check for local paths first, before loading the config.
+    with subtests.test(check="local_paths"):
+        _check_no_local_paths(config_file)
+
+    # Load the config
+    config = load_config_with_inheritance(config_file)
+
+    # Check each applicable check separately for all configs.
+    with subtests.test(check="outdated_config"):
+        _check_outdated_config(config_file, deepcopy(config))
+
+    # Check each applicable check separately if the config is in examples/configs.
+    if config_file in config_files:
+        with subtests.test(check="required_keys"):
+            _check_required_keys(config_file, deepcopy(config))
+        with subtests.test(check="tp_size_accuracy"):
+            _check_tp_size_accuracy(config_file, deepcopy(config))
+        with subtests.test(check="automodel_moe_dispatcher"):
+            _check_automodel_moe_dispatcher(config_file, deepcopy(config))
+        with subtests.test(check="single_controller"):
+            _check_single_controller_config(deepcopy(config))
+        with subtests.test(check="nccl_reshard_refit_support"):
+            _check_nccl_reshard_refit_support(deepcopy(config))
+        with subtests.test(check="batch_invariant_mode"):
+            _check_batch_invariant_mode(deepcopy(config))
 
 
 @pytest.mark.parametrize(
@@ -318,135 +485,6 @@ def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
     )
 
 
-def _check_tp_size_accuracy(config_file: str, config: DictConfig) -> None:
-    """Check that a config file in examples/configs has no TP size >= 4 accuracy issues.
-
-    There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.
-    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause.
-    """
-
-    skip_config_files = [
-        "grpo-qwen3-30ba3b-4n8g-40K.yaml",
-        "grpo-qwen3-30ba3b-8n8g-megatron.yaml",
-        "grpo-qwen3-32b-4n8g.yaml",
-        "grpo-qwen3-32b-8n8g-async-1off.yaml",
-        "grpo-gemma3-27b-it-8n8g-automodel-tp8-actckpt-long.yaml",
-        "grpo-gemma3-27b-it-8n4g-automodel-tp4-actckpt-long.yaml",
-    ]
-    if os.path.basename(config_file) in skip_config_files:
-        pytest.skip(
-            f"Skipping config file {config_file} because it sets NRL_IGNORE_TP_ACCURACY_CHECK=1"
-        )
-
-    print(f"\nValidating config file: {config_file}")
-
-    config_dict = OmegaConf.to_container(config, resolve=True)
-
-    # Skip if config does not have policy or logprob_batch_size
-    if "policy" not in config_dict or "logprob_batch_size" not in config_dict["policy"]:
-        return
-
-    # Skip if config set force_on_policy_ratio to True
-    if "loss_fn" in config_dict and config_dict["loss_fn"].get(
-        "force_on_policy_ratio", False
-    ):
-        return
-
-    # Check if TP size >= 4 and train_micro_batch_size != logprob_batch_size
-    if config_dict["policy"]["megatron_cfg"]["enabled"]:
-        tp_size = config_dict["policy"]["megatron_cfg"]["tensor_model_parallel_size"]
-    else:
-        tp_size = config_dict["policy"]["automodel_cfg"]["tensor_parallel_size"]
-
-    train_micro_bs = config_dict["policy"]["train_micro_batch_size"]
-    logprob_bs = config_dict["policy"]["logprob_batch_size"]
-
-    if tp_size >= 4 and train_micro_bs != logprob_bs:
-        raise AssertionError(
-            f"Config file {config_file} has TP size >= 4 accuracy issues. "
-            "Please set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value."
-        )
-
-
-def _check_outdated_config(config_file: str, config: DictConfig) -> None:
-    """Test that every shipped config passes the same checks the entrypoints run.
-
-    Reusing check_outdated_config keeps this from drifting: a check added there is
-    enforced on the shipped configs without a second implementation here.
-    """
-    # Eval configs have a different structure from training configs, so the entrypoint
-    # checks do not apply to them. run_eval.py skips them for the same reason.
-    if "/evals/" in config_file:
-        pytest.skip("eval configs have a different structure from training configs")
-
-    print(f"\nValidating config file: {config_file}")
-
-    # resolve=False: the checked keys are never interpolations, and resolving would fail
-    # on the configs that interpolate an env var CI does not set.
-    config_dict = OmegaConf.to_container(config, resolve=False)
-
-    try:
-        check_outdated_config(config_dict)
-    except ValueError as e:
-        raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
-
-
-def _check_automodel_moe_dispatcher(config_file: str, config: DictConfig) -> None:
-    skip_config_files = [
-        "grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.yaml",
-    ]
-    if os.path.basename(config_file) in skip_config_files:
-        pytest.skip(
-            f"Skipping config file {config_file} because DeepSeek-V4 pads each CP rank's slice in its own CP sharder"
-        )
-
-    automodel_cfg = OmegaConf.select(config, "policy.automodel_cfg")
-    if (
-        automodel_cfg is None
-        or not automodel_cfg.enabled
-        or automodel_cfg.get("expert_parallel_size", 1) <= 1
-    ):
-        pytest.skip("Not an AutoModel expert-parallel recipe")
-
-    backend = automodel_cfg.automodel_kwargs.backend
-    assert "enable_deepep" not in backend
-    if backend.get("dispatcher") != "hybridep":
-        return
-    assert backend.get("experts") is not None, (
-        f"{config_file}: HybridEP must explicitly select an experts backend"
-    )
-
-    # HybridEP's combine kernel asserts each rank's slice after the CP split is a
-    # multiple of 64, so the global width must be a multiple of 64 * CP.
-    alignment = 64 * automodel_cfg.get("context_parallel_size", 1)
-    assert config.policy.make_sequence_length_divisible_by % alignment == 0, (
-        f"{config_file}: make_sequence_length_divisible_by must be a multiple of {alignment}"
-    )
-    dynamic_batching = OmegaConf.select(config, "policy.dynamic_batching")
-    if dynamic_batching is not None and dynamic_batching.enabled:
-        assert dynamic_batching.sequence_length_round % alignment == 0, (
-            f"{config_file}: dynamic_batching.sequence_length_round must be a multiple of {alignment}"
-        )
-
-
-def _check_nccl_reshard_refit_support(config: DictConfig) -> None:
-    config_dict = OmegaConf.to_container(config, resolve=True)
-    generation = (config_dict.get("policy") or {}).get("generation") or {}
-    if generation.get("refit_transport") != "nccl_reshard":
-        pytest.skip("Not an nccl_reshard recipe")
-    check_nccl_reshard_refit_support(SimpleNamespace(policy=config_dict["policy"]))
-
-
-def _check_batch_invariant_mode(config: DictConfig) -> None:
-    config_dict = OmegaConf.to_container(config, resolve=True)
-    policy = config_dict.get("policy") or {}
-    if not (policy.get("megatron_cfg") or {}).get("batch_invariant_mode"):
-        pytest.skip("batch_invariant_mode is not enabled")
-    validate_batch_invariant_mode(policy).raise_if_invalid(
-        "batch_invariant_mode=True failed validation:"
-    )
-
-
 def test_base_exemplars_pin_flash_attention_to_fa2():
     # flash-attn-4 is installed in the mcore extra; without an explicit pin TE
     # would pick FA4 for every Megatron run. Only batch-invariant recipes use 4.
@@ -460,41 +498,3 @@ def test_base_exemplars_pin_flash_attention_to_fa2():
             )
             if isinstance(megatron_cfg, dict) and "apply_rope_fusion" in megatron_cfg:
                 assert megatron_cfg.get("flash_attention_version") == 2, path.name
-
-
-def _check_no_local_paths(path: str) -> None:
-    text = Path(path).read_text().lower()
-    for local_prefix in ("/lustre/", "/scratch/", "/home/"):
-        assert local_prefix not in text, (
-            f"{path} contains a local path ({local_prefix})"
-        )
-
-
-@pytest.mark.parametrize("config_file", full_config_files)
-def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
-    """Load each shipped config once and report each applicable check separately."""
-    # Check for local paths first, before loading the config.
-    with subtests.test(check="local_paths"):
-        _check_no_local_paths(config_file)
-
-    # Load the config
-    config = load_config_with_inheritance(config_file)
-
-    # Check each applicable check separately for all configs.
-    with subtests.test(check="outdated_config"):
-        _check_outdated_config(config_file, deepcopy(config))
-
-    # Check each applicable check separately if the config is in examples/configs.
-    if config_file in config_files:
-        with subtests.test(check="required_keys"):
-            _check_required_keys(config_file, deepcopy(config))
-        with subtests.test(check="tp_size_accuracy"):
-            _check_tp_size_accuracy(config_file, deepcopy(config))
-        with subtests.test(check="automodel_moe_dispatcher"):
-            _check_automodel_moe_dispatcher(config_file, deepcopy(config))
-        with subtests.test(check="single_controller"):
-            _check_single_controller_config(deepcopy(config))
-        with subtests.test(check="nccl_reshard_refit_support"):
-            _check_nccl_reshard_refit_support(deepcopy(config))
-        with subtests.test(check="batch_invariant_mode"):
-            _check_batch_invariant_mode(deepcopy(config))
