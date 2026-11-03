@@ -1550,7 +1550,10 @@ def test_below_valid_fraction_outcome_substitutes_or_closes_short(
         _init_pump_ledgers(ctrl)
         ctrl._finalizer_actors = [object()]
         ctrl._finalize_with_actor = AsyncMock(side_effect=[rejected, committed])
-        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        # in_order stamps the batch for step 0, so the step the finalize cut
+        # replaces into (or credits short) is visible.
+        ctrl._buffer = _RecordingBuffer()
+        ctrl._sampler = InOrderSampler(ctrl._buffer, max_lookahead_versions=1)
         ctrl._dataloader = [
             BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
         ]
@@ -1566,6 +1569,14 @@ def test_below_valid_fraction_outcome_substitutes_or_closes_short(
 
         await ctrl._rollout_pump()
 
+        # The finalize cut decides replacement and shortfall from these, so the
+        # pump must pass the stamped step and its replacement count.
+        assert [call.kwargs for call in ctrl._finalize_with_actor.await_args_list] == [
+            {"target_step": 0, "replacements_used": 0}
+        ] + ([{"target_step": 0, "replacements_used": 1}] if has_spare else [])
+        # The finalize cut owns the shortfall credit; the pump adds none.
+        assert ctrl._rollout_runtime.batch_shortfall == {}
+        assert ctrl._rollout_exhausted.is_set()
         assert ctrl._rollout_manager.stats.committed == int(has_spare)
         assert ctrl._buffer_capacity._value == int(not has_spare)
         assert ctrl._inflight_rollouts == 0

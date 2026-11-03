@@ -523,13 +523,21 @@ def test_below_threshold_group_never_becomes_selectable() -> None:
     assert ctrl._available_finalizers.qsize() == 1
 
 
-def test_below_threshold_replacement_is_reserved_in_the_cleanup_cut() -> None:
-    """The rejected group's ledger discard and its spare's reservation share a cut."""
+@pytest.mark.parametrize("recovery", [True, False])
+def test_below_threshold_replacement_is_reserved_in_the_cleanup_cut(
+    recovery: bool,
+) -> None:
+    """The rejected group's ledger discard and its spare's reservation share a cut.
+
+    Without rollout recovery the spare is not reserved here: the pump never
+    discards a lineage it did not get, so generate_for_finalization must own it.
+    """
     spare = {"idx": 99}
     ctrl = _controller(
         SimpleNamespace(finalize=_RemoteFinalize(result=_below_threshold_result()))
     )
     _below_threshold(ctrl, spares=[spare])
+    ctrl._rollout_recovery_enabled = recovery
     ctrl._rollout_recovery_ledger.__contains__.return_value = True
     ctrl._rollout_manager.reserve_prompt_group.return_value = "spare-group"
 
@@ -541,19 +549,24 @@ def test_below_threshold_replacement_is_reserved_in_the_cleanup_cut() -> None:
         valid_count=1,
         total_count=2,
         replacement=spare,
-        lineage_group_id="spare-group",
+        lineage_group_id="spare-group" if recovery else None,
         reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
     )
     ctrl._buffer.commit_finalized.assert_not_awaited()
     ctrl._buffer.abort.assert_called_once_with("group")
+    ctrl._rollout_recovery_ledger.discard_group.assert_called_once()
     (discard_cut, discarded), _ = ctrl._rollout_recovery_ledger.discard_group.call_args
-    (reserve_cut, reserved), kwargs = (
-        ctrl._rollout_manager.reserve_prompt_group.call_args
-    )
     assert discarded == "group"
-    assert reserved is spare
-    assert kwargs == {"target_step": 3}
-    assert reserve_cut is discard_cut
+    if recovery:
+        ctrl._rollout_manager.reserve_prompt_group.assert_called_once()
+        (reserve_cut, reserved), kwargs = (
+            ctrl._rollout_manager.reserve_prompt_group.call_args
+        )
+        assert reserved is spare
+        assert kwargs == {"target_step": 3}
+        assert reserve_cut is discard_cut
+    else:
+        ctrl._rollout_manager.reserve_prompt_group.assert_not_called()
     assert not ctrl._rollout_runtime.replacement_reserve
     assert ctrl._rollout_runtime.batch_shortfall == {}
 
