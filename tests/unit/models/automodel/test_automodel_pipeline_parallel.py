@@ -14,6 +14,8 @@
 
 """Unit tests for Automodel pipeline-parallel batch planning and the loss adapter."""
 
+from __future__ import annotations
+
 from contextlib import nullcontext
 from typing import Any
 
