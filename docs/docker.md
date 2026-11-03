@@ -14,14 +14,14 @@ docker buildx build -f docker/Dockerfile \
 
 # Self-contained build (specific git ref):
 docker buildx build -f docker/Dockerfile \
-    --build-arg NRL_GIT_REF=r0.6.0 \
-    --tag <registry>/nemo-rl:r0.6.0 \
+    --build-arg NRL_GIT_REF=r0.8.0 \
+    --tag <registry>/nemo-rl:r0.8.0 \
     --push .
 
 # Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL):
 docker buildx build -f docker/Dockerfile \
-    --build-arg NRL_GIT_REF=r0.6.0 \
-    --tag <registry>/nemo-rl:r0.6.0 \
+    --build-arg NRL_GIT_REF=r0.8.0 \
+    --tag <registry>/nemo-rl:r0.8.0 \
     --push https://github.com/NVIDIA-NeMo/RL.git
 
 # Local NeMo RL source override:
@@ -69,6 +69,22 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 
 > [!NOTE]
 > If you skip vLLM, SGLang, or TRT-LLM during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.
+
+## Stripping the uv Cache
+
+By default, the release image keeps `uv`'s download cache (`/opt/nemo_rl_cache/uv`) on disk. This lets the image's unprivileged runtime user re-run `uv run --extra <backend>` fully offline, since every wheel it could need is already cached in the image. The tradeoff is a larger image.
+
+For size-sensitive builds that don't need that offline capability, drop the cache from the final image with `STRIP_UV_CACHE`:
+
+```sh
+docker buildx build -f docker/Dockerfile \
+    --build-arg STRIP_UV_CACHE=1 \
+    --tag <registry>/nemo-rl:latest \
+    .
+```
+
+> [!NOTE]
+> On a long-lived local builder, BuildKit's cache mount (keyed by base image, uv version, and the HybridEP setting) persists across builds regardless of `STRIP_UV_CACHE` -- it just controls whether a copy also ships in the image layers. To reset that mount, run `docker buildx prune --filter type=exec.cachemount`.
 
 ## Custom Setup Commands
 

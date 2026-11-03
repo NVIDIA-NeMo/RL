@@ -136,6 +136,10 @@ policy:
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     cuda_graph_impl: "none"
     cuda_graph_modules: []
@@ -305,6 +309,7 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  extra_backends: []
   wandb:
     project: "dpo-dev"
     name: "dpo"
