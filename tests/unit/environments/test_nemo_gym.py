@@ -213,6 +213,7 @@ def test_spinup_nemo_gym_rejects_truncation_with_router_replay():
             tokenizer=object(),
             enable_router_replay=True,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
 
