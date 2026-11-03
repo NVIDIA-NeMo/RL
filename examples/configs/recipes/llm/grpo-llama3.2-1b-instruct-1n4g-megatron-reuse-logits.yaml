@@ -1,0 +1,9 @@
+defaults: ./grpo-llama3.2-1b-instruct-1n8g-megatron-reuse-logits.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n4g-megatron-reuse-logits
+logger:
+  log_dir: logs/grpo-llama3.2-1b-instruct-1n4g-megatron-reuse-logits
+  wandb:
+    name: grpo-llama3.2-1b-instruct-1n4g-megatron-reuse-logits
+cluster:
+  gpus_per_node: 4
