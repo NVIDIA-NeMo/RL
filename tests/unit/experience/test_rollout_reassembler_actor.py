@@ -28,7 +28,10 @@ import torch
 import nemo_rl.experience.rollout_reassembler_actor as actor_module
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
+from nemo_rl.distributed.actor_environments import (
+    NEMO_GYM_ACTOR_FQN,
+    ROLLOUT_REASSEMBLER_ACTOR_FQN,
+)
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
 )
@@ -249,33 +252,23 @@ def test_forbidden_keys_cover_gym_staging_fields() -> None:
 
 
 def test_local_actor_names_match_their_definitions() -> None:
-    from nemo_rl.environments.nemo_gym import NEMO_GYM_ACTOR_FQN
+    from nemo_rl.environments.nemo_gym import NemoGym
 
-    assert actor_module._GYM_ACTOR_FQN == NEMO_GYM_ACTOR_FQN
-    # Ray's modified class keeps __module__ and __name__ but not __qualname__.
-    actor_class = RolloutReassemblerActor.__ray_metadata__.modified_class
-    assert (
-        actor_module._REASSEMBLER_ACTOR_FQN
-        == f"{actor_class.__module__}.{actor_class.__name__}"
+    gym_class = NemoGym.__ray_metadata__.modified_class
+    finalizer_class = RolloutReassemblerActor.__ray_metadata__.modified_class
+    assert NEMO_GYM_ACTOR_FQN == f"{gym_class.__module__}.{gym_class.__name__}"
+    assert ROLLOUT_REASSEMBLER_ACTOR_FQN == (
+        f"{finalizer_class.__module__}.{finalizer_class.__name__}"
     )
 
 
 @pytest.mark.parametrize(
-    "gym_is_setup", [False, True], ids=["gym-not-prepared", "gym-prepared"]
-)
-@pytest.mark.parametrize(
-    "allow_gym_env_reuse", [False, True], ids=["reuse-disabled", "reuse-enabled"]
-)
-@pytest.mark.parametrize(
-    ("gym_extras", "gym_python", "reuse_gym_env"),
+    ("gym_python", "reuse_gym_env"),
     [
-        (["nemo_gym"], "/test/shared-python", True),
-        (["nemo_gym", "vllm"], "/test/shared-python", False),
-        (["nemo_gym"], "/test/custom-gym-python", False),
-        (None, "/test/shared-python", False),
-        (["nemo_gym"], None, False),
+        ("/test/shared-python", True),
+        ("/test/custom-gym-python", False),
     ],
-    ids=["compatible", "different-extras", "different-python", "no-extras", "no-env"],
+    ids=["matching-commands", "different-commands"],
 )
 @pytest.mark.parametrize(
     ("startup_fails", "cleanup_fails"),
@@ -283,26 +276,17 @@ def test_local_actor_names_match_their_definitions() -> None:
     ids=["ready", "startup-failure", "cleanup-failure"],
 )
 def test_factory_selects_compatible_environment_and_waits_for_dependencies(
-    gym_is_setup: bool,
-    allow_gym_env_reuse: bool,
-    gym_extras: list[str] | None,
-    gym_python: str | None,
+    gym_python: str,
     reuse_gym_env: bool,
     startup_fails: bool,
     cleanup_fails: bool,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    actor_fqn = actor_module._REASSEMBLER_ACTOR_FQN
-    gym_fqn = actor_module._GYM_ACTOR_FQN
-    assert ACTOR_ENVIRONMENTS[actor_fqn] == ["nemo_gym"]
-    assert ACTOR_ENVIRONMENTS[gym_fqn] == ["nemo_gym"]
-    monkeypatch.setitem(ACTOR_ENVIRONMENTS, gym_fqn, gym_extras)
+    actor_fqn = ROLLOUT_REASSEMBLER_ACTOR_FQN
+    gym_fqn = NEMO_GYM_ACTOR_FQN
     monkeypatch.setitem(ACTOR_ENVIRONMENT_REGISTRY, actor_fqn, "/test/shared-python")
-    if gym_python is None:
-        monkeypatch.delitem(ACTOR_ENVIRONMENT_REGISTRY, gym_fqn)
-    else:
-        monkeypatch.setitem(ACTOR_ENVIRONMENT_REGISTRY, gym_fqn, gym_python)
+    monkeypatch.setitem(ACTOR_ENVIRONMENT_REGISTRY, gym_fqn, gym_python)
     config = RolloutReassemblerActorConfig(
         partition_id="canonical",
         staging_partition="staging",
@@ -321,19 +305,11 @@ def test_factory_selects_compatible_environment_and_waits_for_dependencies(
 
     def resolve_env(actor_name: str) -> dict[str, str]:
         if actor_name == gym_fqn:
-            assert gym_is_setup
             return prepared_gym_env
         assert actor_name == actor_fqn
         return runtime_env
 
     with (
-        patch.object(
-            actor_module, "ACTOR_ENVIRONMENTS", wraps=ACTOR_ENVIRONMENTS
-        ) as dependency_registry,
-        patch(
-            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
-            wraps=ACTOR_ENVIRONMENT_REGISTRY,
-        ) as python_registry,
         patch.object(
             actor_module, "make_actor_runtime_env", side_effect=resolve_env
         ) as make_env,
@@ -352,8 +328,6 @@ def test_factory_selects_compatible_environment_and_waits_for_dependencies(
                     dp_config,
                     config,
                     num_workers=2,
-                    try_reuse_gym_env_for_finalizers=allow_gym_env_reuse,
-                    gym_is_setup=gym_is_setup,
                 )
             assert exc_info.value is startup_error
             assert kill.call_args_list == [call(actor) for actor in actors]
@@ -368,19 +342,13 @@ def test_factory_selects_compatible_environment_and_waits_for_dependencies(
                     dp_config,
                     config,
                     num_workers=2,
-                    try_reuse_gym_env_for_finalizers=allow_gym_env_reuse,
-                    gym_is_setup=gym_is_setup,
                 )
                 == actors
             )
             kill.assert_not_called()
 
-        should_reuse = allow_gym_env_reuse and gym_is_setup and reuse_gym_env
-        make_env.assert_called_once_with(gym_fqn if should_reuse else actor_fqn)
-        if not allow_gym_env_reuse or not gym_is_setup:
-            dependency_registry.get.assert_not_called()
-            python_registry.get.assert_not_called()
-        expected_runtime = prepared_gym_env if should_reuse else runtime_env
+        make_env.assert_called_once_with(gym_fqn if reuse_gym_env else actor_fqn)
+        expected_runtime = prepared_gym_env if reuse_gym_env else runtime_env
         assert options.call_args_list == [call(runtime_env=expected_runtime)] * 2
         assert (
             options.return_value.remote.call_args_list == [call(dp_config, config)] * 2

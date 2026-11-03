@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -25,7 +24,10 @@ from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.schema import forest_row_ids
-from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
+from nemo_rl.distributed.actor_environments import (
+    NEMO_GYM_ACTOR_FQN,
+    ROLLOUT_REASSEMBLER_ACTOR_FQN,
+)
 from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import (
     FinalizedGroup,
@@ -40,14 +42,6 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import RewardPenaltyConfig
     from nemo_rl.experience.rollouts import EffortLevelsConfig
     from nemo_rl.models.policy import TokenizerConfig
-
-logger = logging.getLogger(__name__)
-# Keep these names consistent with the actor registry and Gym's NEMO_GYM_ACTOR_FQN.
-# Use local strings to avoid importing the Gym implementation just for its name.
-_REASSEMBLER_ACTOR_FQN = (
-    "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
-)
-_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 
 
 @dataclass(frozen=True)
@@ -257,45 +251,19 @@ def create_rollout_reassembler_actors(
     config: RolloutReassemblerActorConfig,
     *,
     num_workers: int,
-    try_reuse_gym_env_for_finalizers: bool,
-    gym_is_setup: bool,
 ) -> list[Any]:
     """Construct and validate the pool after TQ partitions are registered."""
     if num_workers <= 0:
         raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
-    runtime_env = None
-    if try_reuse_gym_env_for_finalizers and gym_is_setup:
-        # Local import, as in make_actor_runtime_env: the registry pulls in
-        # virtual_cluster and reads pyproject.toml, which finalizer workers that
-        # import this module do not need.
-        from nemo_rl.distributed.ray_actor_environment_registry import (
-            ACTOR_ENVIRONMENT_REGISTRY,
-        )
+    # Deferred: the registry loads driver-only virtual-cluster dependencies.
+    from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 
-        # Match declarations and resolved environments: deployments can override
-        # either actor's Python executable independently of its dependency extras.
-        finalizer_extras = ACTOR_ENVIRONMENTS.get(_REASSEMBLER_ACTOR_FQN)
-        gym_extras = ACTOR_ENVIRONMENTS.get(_GYM_ACTOR_FQN)
-        finalizer_python = ACTOR_ENVIRONMENT_REGISTRY.get(_REASSEMBLER_ACTOR_FQN)
-        gym_python = ACTOR_ENVIRONMENT_REGISTRY.get(_GYM_ACTOR_FQN)
-        reuse_gym_env = (
-            finalizer_extras is not None
-            and gym_extras is not None
-            and set(finalizer_extras) == set(gym_extras)
-            and finalizer_python is not None
-            and finalizer_python == gym_python
-        )
-        if reuse_gym_env:
-            runtime_env = make_actor_runtime_env(_GYM_ACTOR_FQN)
-        logger.info(
-            "Finalizer runtime: %s (%s)",
-            _GYM_ACTOR_FQN if runtime_env is not None else _REASSEMBLER_ACTOR_FQN,
-            "reuse prepared compatible Gym environment"
-            if runtime_env is not None
-            else "use dedicated environment; Gym dependencies or Python environment differ",
-        )
-    if runtime_env is None:
-        runtime_env = make_actor_runtime_env(_REASSEMBLER_ACTOR_FQN)
+    same_env = get_actor_python_env(
+        ROLLOUT_REASSEMBLER_ACTOR_FQN
+    ) == get_actor_python_env(NEMO_GYM_ACTOR_FQN)
+    runtime_env = make_actor_runtime_env(
+        NEMO_GYM_ACTOR_FQN if same_env else ROLLOUT_REASSEMBLER_ACTOR_FQN
+    )
     actors = [
         RolloutReassemblerActor.options(runtime_env=runtime_env).remote(
             dp_config, config
