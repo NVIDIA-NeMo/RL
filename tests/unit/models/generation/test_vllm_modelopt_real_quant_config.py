@@ -1314,7 +1314,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     extension.zmq_socket = FakeSocket()
     extension.state_dict_info = state_dict_info
     extension.maybe_init_zmq = lambda: None
-    extension._load_weights = lambda _weights: None
+    extension._load_weights = lambda _weights, coverage=None: None
     extension.model_runner.model.load_weights = extension._load_weights
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
@@ -1435,8 +1435,17 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(
         }
     )
     extension.maybe_init_zmq = lambda: None
+    extension._model_update_manifest = (
+        base_backend.ModelUpdateManifest.from_state_dict_info(
+            extension.state_dict_info,
+            target_owner_ranks=(0,),
+            draft_owner_ranks=(),
+        )
+    )
+    coverage = extension._new_model_update_coverage()
+    extension._new_model_update_coverage = lambda: coverage
 
-    def load_weights(weights):
+    def load_weights(weights, *, coverage=None):
         calls.append(("load", extension.zmq_socket.batch_index))
         retained.append(weights)
         for name, weight in weights:
@@ -1449,10 +1458,10 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(
     extension._load_weights = lambda _: pytest.fail("owned IPC must load directly")
     original_prepare = extension._prepare_ipc_weight_buffer
 
-    def prepare_buffer(buffer, size):
+    def prepare_buffer(buffer, size, *, coverage=None):
         if failure == "prepare":
             raise RuntimeError("prepare failed")
-        owned, loader = original_prepare(buffer, size)
+        owned, loader = original_prepare(buffer, size, coverage=coverage)
         # dtype views retain storage, not necessarily this Python Tensor wrapper.
         owned_storage_refs.append(StorageWeakRef(owned.untyped_storage()))
         return owned, loader
@@ -1567,7 +1576,14 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(
             assert all(ref.expired() for ref in owned_storage_refs)
         with pytest.raises(RuntimeError, match="unusable after a failed"):
             extension.update_weights_via_ipc_zmq()
+    if success:
+        coverage.require_complete()
+    else:
+        with pytest.raises(RuntimeError, match="missing keys"):
+            coverage.require_complete()
     if failure in ("load", "load_and_fence"):
+        # A failed native loader must not have recorded this key as loaded.
+        coverage.record_loaded(("decoder.weight",))
         assert "IPC weight batch load failed" in caplog.text
         assert "decoder.weight" in caplog.text
 
@@ -1638,7 +1654,7 @@ def test_ipc_packet_ownership_preserves_deferred_views(monkeypatch, real_quant):
     backend = _import_vllm_quant_backend(monkeypatch)
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     pending = []
-    loader = lambda weights: pending.extend(weights)
+    loader = lambda weights, coverage=None: pending.extend(weights)
     extension.model_runner = types.SimpleNamespace(
         model=types.SimpleNamespace(load_weights=loader)
     )
@@ -1816,3 +1832,17 @@ def test_resolve_quant_cfg_rejects_recipe_without_quant_cfg(monkeypatch):
 
     with pytest.raises(ValueError, match="must contain a 'quant_cfg'"):
         resolve_quant_cfg("missing-quant-cfg")
+
+
+def test_real_quant_prepare_refit_info_rejects_draft_manifest(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension._is_real_quant_model = lambda: True
+
+    with pytest.raises(RuntimeError, match="does not support draft finalization"):
+        extension.prepare_refit_info(
+            {
+                "model.layers.0.mlp.up_proj.weight": ((4, 4), torch.uint8),
+                "draft.layers.0.self_attn.qkv_proj.weight": ((4, 4), torch.bfloat16),
+            }
+        )

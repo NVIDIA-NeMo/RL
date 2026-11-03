@@ -28,6 +28,7 @@ from nemo_rl.modelopt.models.generation.vllm_quant_moe_amax import (
 from nemo_rl.modelopt.utils import MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
 from nemo_rl.models.generation.vllm.checkpoint_engine import VllmCheckpointEngineMixin
 from nemo_rl.models.generation.vllm.patches import modelopt_moe_amax_aliases
+from nemo_rl.models.generation.vllm.speculator_runtime import ModelUpdateCoverage
 from nemo_rl.models.generation.vllm.vllm_backend import (
     VllmInternalWorkerExtension,
     WeightUpdateTransport,
@@ -83,6 +84,12 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         state_dict_info: dict[str, Any],
         serialized_fp8_config: Optional[dict[str, Any]] = None,
     ) -> Optional[list[str]]:
+        if self._is_real_quant_model() and any(
+            name.startswith("draft.") for name in state_dict_info
+        ):
+            raise RuntimeError(
+                "ModelOpt real-quant refit does not support draft finalization"
+            )
         # Real ModelOpt refits must not enter legacy FP8 prequantization.
         return super().prepare_refit_info(
             state_dict_info,
@@ -90,13 +97,26 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         )
 
     def _prepare_ipc_weight_buffer(
-        self, buffer: torch.Tensor, used_bytes: int
+        self,
+        buffer: torch.Tensor,
+        used_bytes: int,
+        *,
+        coverage: ModelUpdateCoverage | None = None,
     ) -> tuple[torch.Tensor, Callable[[Iterable[tuple[str, torch.Tensor]]], Any]]:
         if self._is_real_quant_model():
             # Own only the used bytes once: native reload can retain views until
             # later packets complete a layer. Never reuse this owned storage.
-            return buffer[:used_bytes].clone(), self.model_runner.model.load_weights
-        return super()._prepare_ipc_weight_buffer(buffer, used_bytes)
+            def load_weights(weights: Iterable[tuple[str, torch.Tensor]]) -> Any:
+                if not isinstance(weights, list):
+                    weights = list(weights)
+                input_names = tuple(name for name, _ in weights)
+                result = self.model_runner.model.load_weights(weights)
+                if coverage is not None:
+                    coverage.record_loaded(input_names)
+                return result
+
+            return buffer[:used_bytes].clone(), load_weights
+        return super()._prepare_ipc_weight_buffer(buffer, used_bytes, coverage=coverage)
 
     def _can_load_ipc_weights_after_ack(self) -> bool:
         if not self._is_real_quant_model():
@@ -169,11 +189,15 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             skip_fp8_conversion=skip_fp8_conversion or self._is_real_quant_model(),
         )
 
-    def _load_weights(self, weights):
+    def _load_weights(self, weights, *, coverage: ModelUpdateCoverage | None = None):
+        weights = list(weights)
+        input_names = tuple(name for name, _ in weights)
         if self._is_real_quant_model():
             # Native reload owns placement. A default-device mode here also
             # dispatches every metadata operation through Python.
-            self._load_full_hf_weights(list(weights))
+            self._load_full_hf_weights(weights)
+            if coverage is not None:
+                coverage.record_loaded(input_names)
             return
 
         weights = route_moe_input_quantizer_amax(
@@ -202,7 +226,10 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             contexts.enter_context(
                 self._attach_input_quantizer_amax_loaders(self.model_runner.model)
             )
-            return super()._load_weights(remapped_weights)
+            result = super()._load_weights(remapped_weights)
+        if coverage is not None:
+            coverage.record_loaded(input_names)
+        return result
 
     def get_weight_snapshot(self, name: str) -> torch.Tensor:
         """Return a Ray-serializable CPU copy for before/after comparison."""

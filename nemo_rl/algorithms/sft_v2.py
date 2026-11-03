@@ -67,6 +67,7 @@ from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.path_utils import (
     load_checkpoint_object,
     path_exists,
@@ -240,6 +241,9 @@ class SFTSingleControllerActor:
                     # the one that just finished.
                     with iteration_scope(self._save_state.total_steps + 1):
                         self._finish_pending_save(blocking=False)
+                        maybe_gpu_profile_step(
+                            self._trainer, self._save_state.total_steps + 1
+                        )
                         metrics = self._run_train_step()
                         self._logger.log_metrics(metrics, self._save_state.total_steps)
                         metric = self._checkpoint_metric(metrics)

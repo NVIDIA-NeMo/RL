@@ -10,3 +10,4 @@ Shape and honesty of the visible comment, beyond what the skill already says.
 - **A worked example must show a state the code can reach, under one mode, with the trigger point marked; run the exact example you publish.** (#3429, #3369)
 - **For a stall or hang, ask for a unit test that fails today and passes once fixed, wrapped in `asyncio.wait_for`.** The repo has no global pytest timeout (#4266). Details: [stall-comments-link-page-and-ask-for-test](details/stall-comments-link-page-and-ask-for-test.md).
 - **The reviewer's own side questions are answered in chat, not in the author-facing body, unless they become an ask.** (#4326)
+- **When a finding breaks a rule in a skill or a `skills/contributing/references/` file, link to that rule instead of explaining it again in the comment.**

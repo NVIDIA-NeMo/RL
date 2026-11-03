@@ -680,11 +680,14 @@ class TestFinish:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        device = w._train_step_state["local_valid_toks"].device
         w.finish_train_step()
-        # scale_gradients should have been called with some 1/N scalar < 1
         w.model.scale_gradients.assert_called_once()
         arg = w.model.scale_gradients.call_args.args[0]
-        assert 0 < arg <= 1.0
+        assert isinstance(arg, torch.Tensor)
+        torch.testing.assert_close(
+            arg, torch.tensor(1 / 2048, dtype=torch.float64, device=device)
+        )
 
     def test_restores_first_step_param_sync_after_success(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -794,7 +797,7 @@ class TestFinish:
         # local_valid_toks accumulated = 2048; with mocked all_reduce as no-op,
         # global_valid_toks == 2048 → inv_n = 1/2048
         arg = w.model.scale_gradients.call_args.args[0]
-        assert arg == pytest.approx(1.0 / 2048.0, rel=1e-4)
+        assert arg.item() == pytest.approx(1.0 / 2048.0, rel=1e-4)
 
     def test_picks_global_valid_seqs_for_sequence_level_loss(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -803,7 +806,7 @@ class TestFinish:
         w.finish_train_step()
         # local_valid_seqs = 8 → inv_n = 1/8
         arg = w.model.scale_gradients.call_args.args[0]
-        assert arg == pytest.approx(1.0 / 8.0, rel=1e-4)
+        assert arg.item() == pytest.approx(1.0 / 8.0, rel=1e-4)
 
     @pytest.mark.parametrize("token_level_loss", [False, True])
     @pytest.mark.parametrize("draft_loss_weight", [0.0, 0.5, 1.0])
@@ -1014,7 +1017,9 @@ class TestFinish:
         w.finish_train_step()
 
         # The main loss gets 1/8; MTP additionally gets 8/2048, for net 1/2048.
-        assert w.model.scale_gradients.call_args.args[0] == pytest.approx(1.0 / 8.0)
+        assert w.model.scale_gradients.call_args.args[0].item() == pytest.approx(
+            1.0 / 8.0
+        )
         expected_mtp_grad = torch.full((4,), 8.0 / 2048.0)
         torch.testing.assert_close(mtp_param.main_grad, expected_mtp_grad)
         torch.testing.assert_close(grad_seen_by_finalize[0], expected_mtp_grad)

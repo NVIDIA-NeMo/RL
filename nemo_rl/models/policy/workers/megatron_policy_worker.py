@@ -88,6 +88,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NvFp4PerTokenRolloutConfig,
 )
 from nemo_rl.models.megatron.common import (
+    clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
 )
@@ -1360,13 +1361,14 @@ class MegatronPolicyWorkerImpl(
         # Multiplying by G/K, with K the global surviving token count, restores
         # S/K: the same normalization as filtering before training. Apply this
         # correction before optimizer.step() so gradient clipping sees S/K.
-        token_factor = float((global_valid_toks / token_denominator).item())
+        token_scale = global_valid_toks / token_denominator
+        token_factor = float(token_scale.item())
         sequence_factor = float((global_valid_seqs / sequence_denominator).item())
         if not eval_mode:
             # Finish any overlap on the comm stream before touching the reduced
             # gradient buffers (including distributed-optimizer gradient shards).
             torch.cuda.synchronize()
-            self.model.scale_gradients(token_factor)
+            self.model.scale_gradients(token_scale)
         metrics = [
             rescale_loss_metrics(
                 m,
@@ -2349,14 +2351,15 @@ class MegatronPolicyWorkerImpl(
             n_true = global_valid_toks
         else:
             n_true = global_valid_seqs
-        n_safe = n_true if n_true.item() > 0 else torch.tensor(1.0, device="cuda")
-        inv_n = float((1.0 / n_safe).item())
+        n_safe = n_true if n_true.item() > 0 else torch.ones_like(n_true)
+        gradient_scale = n_safe.reciprocal()
+        inv_n = float(gradient_scale.item())
 
         # Rescale all locally-accumulated gradients by 1/N. The reduce
         # below sees the rescaled grads; for all_reduce the result is the
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
-        self.model.scale_gradients(inv_n)
+        self.model.scale_gradients(gradient_scale)
         if draft_step_state.active:
             draft_step_state.correct_main_grads(
                 self.model.parameters(),
@@ -4894,7 +4897,7 @@ class MegatronPolicyWorkerImpl(
             self._clear_fp8_caches()
 
         if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
-            self._clear_rope_and_moe_dispatcher_caches()
+            clear_transient_megatron_caches(self.model)
 
         torch.randn(1).cuda()  # wake up torch allocator
         if (
@@ -4915,59 +4918,6 @@ class MegatronPolicyWorkerImpl(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
         no_grad.__exit__(None, None, None)
-
-    def _clear_rope_and_moe_dispatcher_caches(self) -> None:
-        """Clear rotary-embedding and MoE dispatcher caches repopulated by forwards."""
-        # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
-        # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
-        # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
-        # runs at different sequence lengths, the cache fills quickly and the tensors
-        # anchor large CUDA segments.
-        try:
-            from megatron.core.models.common.embeddings.rotary_pos_embedding import (
-                RotaryEmbedding,
-            )
-
-            RotaryEmbedding.forward.cache_clear()
-        except Exception:
-            pass
-
-        # Clear MoE token dispatcher persistent routing tensors.
-        #
-        # MoETokenDispatcher is a plain Python class (NOT an nn.Module), so iterating
-        # self.model.modules() never yields it. We must access it via the token_dispatcher
-        # attribute on MoELayer nn.Module objects.
-        #
-        # When recompute_mlp=True and fp8=True,
-        # transformer_layer._forward_mlp wraps self.mlp (the MoE layer) with te_checkpoint.
-        # te_checkpoint._CheckpointFunction.backward recomputes the forward with
-        # torch.enable_grad(), which causes dispatch_preprocess to store
-        #   dispatcher.probs = routing_probs   (with grad_fn, under enable_grad)
-        # This creates a reference cycle:
-        #   _CheckpointFunctionBackward → ctx → ctx.run_function=mlp
-        #   → mlp.token_dispatcher.probs → probs.grad_fn → ... → _CheckpointFunctionBackward
-        #
-        # Breaking this cycle by nulling dispatcher.probs frees BOTH:
-        #   - the routing tensors
-        #   - the te_checkpoint ctx saved tensors
-        try:
-            for module in self.model.modules():
-                if not hasattr(module, "token_dispatcher"):
-                    continue
-                dispatcher = module.token_dispatcher
-                if dispatcher is None:
-                    continue
-                for attr in (
-                    "probs",  # AllToAll + AllGather
-                    "routing_map",  # AllToAll
-                    "reversed_local_input_permutation_mapping",  # AllToAll
-                    "local_probs",  # AllGather
-                    "local_map",  # AllGather
-                ):
-                    if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
-                        setattr(dispatcher, attr, None)
-        except Exception:
-            pass
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):

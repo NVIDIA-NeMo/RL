@@ -34,6 +34,7 @@ from megatron.core.utils import unwrap_model
 from modelopt.torch.quantization.nn import AnyQuantizer
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+from modelopt.torch.quantization.utils import apply_without_qdq
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.modelopt.models.policy.workers.utils import (
@@ -320,8 +321,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             load_modelopt_state(unwrapped_model, model_path)
 
     @contextmanager
-    def hide_tensor_quantizers(self):
-        """Temporarily hide ModelOpt quantizers from recursive module iteration."""
+    def hide_quantizers(self):
+        """Temporarily hide ModelOpt quantizers from DDP module iteration."""
         from megatron.core.distributed import DistributedDataParallel
 
         if not isinstance(self.model, DistributedDataParallel):
@@ -343,13 +344,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             inner_module.named_modules = original_named_modules
 
     def enable_forward_pre_hook(self):
-        """Enable forward pre-hook while hiding ModelOpt quantizers."""
-        with self.hide_tensor_quantizers():
+        """Enable forward pre-hook, hiding ModelOpt quantizers."""
+        with self.hide_quantizers():
             super().enable_forward_pre_hook()
 
     def disable_forward_pre_hook(self, param_sync=True):
-        """Disable forward pre-hook while hiding ModelOpt quantizers."""
-        with self.hide_tensor_quantizers():
+        """Disable forward pre-hook, hiding ModelOpt quantizers."""
+        with self.hide_quantizers():
             super().disable_forward_pre_hook(param_sync=param_sync)
 
     @contextmanager
@@ -692,7 +693,15 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if w is None:
                     return None
                 try:
-                    return self._wq(w.float()).to(w.dtype)
+                    rows = getattr(
+                        self._task.megatron_module,
+                        "_modelopt_unquantized_output_rows",
+                        None,
+                    )
+                    folded = self._wq(w.float()).to(w.dtype, copy=rows is not None)
+                    if rows is not None:
+                        folded[rows] = apply_without_qdq(self._wq, w[rows]).to(w.dtype)
+                    return folded
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to apply weight quantizer for param "

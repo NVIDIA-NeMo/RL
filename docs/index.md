@@ -326,6 +326,7 @@ guides/cispo.md
 guides/prorlv2.md
 guides/swe-rl-qwen3.md
 guides/grpo.md
+guides/score-centering.md
 guides/length-penalty.md
 guides/ppo.md
 guides/grpo-deepscaler.md
@@ -407,6 +408,7 @@ design-docs/dspark-auxiliary-heads.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
 design-docs/token-capture-ledger.md
+design-docs/dflash-draft-body.md
 ```
 
 ```{toctree}
