@@ -1,10 +1,24 @@
 ---
 name: contributing
-description: Contribution conventions for NeMo-RL. Covers PR title format, commit sign-off, and CI triggering.
-when_to_use: Opening a PR; writing a commit message; triggering CI; 'PR title format', 'sign-off', 'conventional commits', 'how do I trigger CI', during code review of PR process.
+description: Contribution conventions for NeMo-RL. Covers the rules every code change follows, PR title format, commit sign-off, and CI triggering.
+when_to_use: Writing or changing code; asking about code conventions (config keys and defaults, error handling, style, copyright headers); removing, renaming or reshaping a config key; opening a PR; writing a commit message; triggering CI; 'PR title format', 'sign-off', 'conventional commits', 'how do I trigger CI', during code review.
 ---
 
 # Contributing Conventions
+
+## Rules for Every Code Change
+
+The rules live in `references/`, one file per theme. Before writing or changing code, read all of them. Reviews check against the same files. A rule that ends with `Contributing Details:` has step-by-step instructions in `references/details/`; read them when the rule applies. A `Review Details:` link is the review lesson a rule came from and is not needed to write code.
+
+| File | Covers |
+|------|--------|
+| [comments-docstrings-and-docs](references/comments-docstrings-and-docs.md) | comments, docstrings and docs a change adds, edits or moves |
+| [config](references/config.md) | config a change adds, reads or overrides, and config models built in tests |
+| [copyright](references/copyright.md) | NVIDIA copyright header on files a change adds |
+| [dead-code](references/dead-code.md) | names a change adds, removes or stops using |
+| [error-handling](references/error-handling.md) | exceptions a change catches, and misconfigurations it must reject |
+| [linting-and-formatting](references/linting-and-formatting.md) | style of the Python and shell a change writes: naming, signatures, types, imports |
+| [reuse-and-precedent](references/reuse-and-precedent.md) | helpers, mechanisms, components, files and CI a change adds, where the repo may already have one |
 
 ## PR Title Format
 
