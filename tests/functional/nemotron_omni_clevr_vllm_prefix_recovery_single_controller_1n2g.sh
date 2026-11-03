@@ -41,22 +41,8 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-${DETECTED_CUDA_ARCH}}"
 EXP_NAME=$(basename "$0" .sh)
 TEST_DIR="${SCRIPT_DIR}/${EXP_NAME}"
 OMNI_CONFIG="${PROJECT_ROOT}/examples/nemo_gym/vlm_grpo_nemotron_omni_clevr_vllm_token_capture_single_controller.yaml"
-RECOVERY_HOOK="${SCRIPT_DIR}/_single_controller_turn_recovery_hook.py"
-SNAPSHOT_HELPER="${SCRIPT_DIR}/_gym_prefix_recovery_snapshot.py"
-CHECKPOINT_DIR="${TEST_DIR}/recovery-checkpoints"
-PHASE1_LOG="${TEST_DIR}/phase1.log"
-PHASE2_LOG="${TEST_DIR}/phase2.log"
-PHASE1_EVENTS="${TEST_DIR}/phase1-events.jsonl"
-PHASE2_EVENTS="${TEST_DIR}/phase2-events.jsonl"
-# Each phase writes into its own logger.log_dir: phase two's trained rows are
-# read back from the only experiment directory under RECOVERY_LOG_DIR.
-PHASE1_LOG_DIR="${TEST_DIR}/phase1-logs"
-RECOVERY_LOG_DIR="${TEST_DIR}/recovery-logs"
-RECOVERY_STAGING_KEYS="${TEST_DIR}/recovery-staging-keys.jsonl"
-PHASE2_METRICS="${TEST_DIR}/phase2-metrics.json"
-SELECTION_FILE="${TEST_DIR}/selected-snapshot.json"
-SELECTED_BACKUP="${TEST_DIR}/selected-snapshot"
-TEST_DATA="${TEST_DIR}/test-data.jsonl"
+source "${SCRIPT_DIR}/_gym_prefix_recovery_phases.sh"
+set_prefix_recovery_paths
 
 # One prompt group per list length, each with its own solid-color image. The
 # list keeps decode long enough to be cut mid-generation; distinct images mean
@@ -150,8 +136,8 @@ with open(os.environ["TEST_DATA"], "w") as output:
             output.write(json.dumps(row) + "\n")
 PY
 
-source "${SCRIPT_DIR}/_gym_prefix_recovery_phases.sh"
 install_phase_cleanup "${CHECKPOINT_DIR}" "${SELECTED_BACKUP}"
+prefix_recovery_overrides
 
 # The Omni CLEVR token-capture topology (one Megatron training GPU with a frozen
 # language model, one async vLLM GPU) plus the text prefix-recovery settings.
@@ -192,48 +178,10 @@ COMMON_OVERRIDES=(
     policy.generation.temperature=1.0
     policy.generation.top_p=0.000001
     ++async_rl.generation_fleet_health.refit_timeout_s=null
-    policy.max_total_sequence_length="${MAX_MODEL_LEN}"
-    policy.train_global_batch_size="${TRAIN_GLOBAL_BATCH_SIZE}"
-    policy.train_micro_batch_size=1
     data_plane.simple.num_storage_units=2
-    # Keep each step's prompt membership fixed across runs.
-    data.shuffle=false
-    data.train.data_path="${TEST_DATA}"
-    data.validation.data_path="${TEST_DATA}"
-    grpo.seed=1234
-    grpo.num_prompts_per_step="${NUM_PROMPTS}"
-    grpo.num_generations_per_prompt="${NUM_GENERATIONS}"
-    grpo.max_num_steps="${MAX_STEPS}"
-    grpo.val_period=0
-    grpo.val_at_start=false
-    grpo.val_at_end=false
-    async_rl.sampler.name=in_order
-    async_rl.sampler.max_lookahead_versions=0
-    async_rl.min_groups_for_streaming_train="${NUM_PROMPTS}"
-    async_rl.max_inflight_prompts="${NUM_PROMPTS}"
-    async_rl.max_buffered_rollouts="${NUM_PROMPTS}"
     ++async_rl.rollout_failure.nemo_gym.rollout_timeout_s=600
-    ++async_rl.stall_watchdog.interval_s=10
     ++async_rl.stall_watchdog.stall_timeout_s=900
-    ++async_rl.stall_watchdog.stall_action=abort
-    ++token_capture.enabled=true
-    ++rollout_recovery.target_level=prefix
-    ++rollout_checkpointing.snapshot_attempt_interval_s="${SNAPSHOT_INTERVAL_S}"
-    ++rollout_checkpointing.keep_latest_k=16
-    ++rollout_checkpointing.restore_mode=latest
-    checkpointing.enabled=true
-    checkpointing.checkpoint_dir="${CHECKPOINT_DIR}"
-    checkpointing.metric_name=null
-    # Only the final trainer checkpoint is read (training_info and the retired
-    # prefix-key check); every Omni save writes the full 30B model.
-    checkpointing.save_period="${MAX_STEPS}"
-    ++checkpointing.save_data_plane=true
-    # Each run dumps its trained rows (train_data_step*.jsonl in its log dir)
-    # for verify-completion.
-    ++async_rl.log_full_train_data=true
-    logger.tensorboard_enabled=true
-    logger.wandb_enabled=false
-    logger.monitor_gpus=false
+    "${PREFIX_RECOVERY_OVERRIDES[@]}"
 )
 
 OMNI_CMD=(
@@ -242,60 +190,13 @@ OMNI_CMD=(
     "${COMMON_OVERRIDES[@]}"
 )
 
-echo "=== Phase 1: publish a checkpoint holding an active multimodal generation prefix ==="
-command -v setsid >/dev/null
-setsid env \
-    SC_GYM_RECOVERY_TEST_EVENTS="${PHASE1_EVENTS}" \
-    "${OMNI_CMD[@]}" \
-        logger.log_dir="${PHASE1_LOG_DIR}" \
-        "$@" >"${PHASE1_LOG}" 2>&1 &
-PHASE1_PID=$!
-
-# Every prompt group must hold a recoverable prefix, so each distinct image is
+# Every prompt group holds a recoverable prefix, so each distinct image is
 # restored and verified at least once.
-uv run --no-sync python "${SNAPSHOT_HELPER}" select \
-    "${CHECKPOINT_DIR}/bootstrap/rollout_snapshots" \
-    "${SELECTION_FILE}" \
-    "${PHASE1_PID}" \
-    "${PHASE1_LOG}" \
-    "${SNAPSHOT_TIMEOUT_S}" \
-    "${SELECTED_BACKUP}" \
-    --stateless-resources \
-    --min-cut-groups "${NUM_PROMPTS}"
+run_prefix_recovery_phases \
+    "publish a checkpoint holding an active multimodal generation prefix" \
+    "reprocess the images, verify them, and finish each suffix" \
+    OMNI_CMD "$@"
 
-stop_phase1
-SNAPSHOT_DIR=$(uv run --no-sync python -c \
-    'import json, sys; print(json.load(open(sys.argv[1]))["snapshot"])' \
-    "${SELECTION_FILE}")
-SNAPSHOT_ROOT=$(dirname "${SNAPSHOT_DIR}")
-
-# Recover exactly the prefix selected above. A newer periodic snapshot or a
-# trainer checkpoint would represent work performed after the simulated crash.
-rm -rf "${SNAPSHOT_ROOT}"
-mkdir -p "${SNAPSHOT_ROOT}"
-cp -a "${SELECTED_BACKUP}" "${SNAPSHOT_DIR}"
-for trainer_checkpoint in "${CHECKPOINT_DIR}"/step_*; do
-    if [[ -d "${trainer_checkpoint}" ]]; then
-        rm -rf "${trainer_checkpoint}"
-    fi
-done
-
-echo "=== Phase 2: reprocess the images, verify them, and finish each suffix ==="
-# Do not cut the replacement requests again while they consume the prefix.
-timeout --signal=TERM --kill-after=30s "${RUN_TIMEOUT_S}s" \
-    env \
-        SC_GYM_RECOVERY_TEST_EVENTS="${PHASE2_EVENTS}" \
-        SC_PREFIX_RECOVERY_STAGING_KEYS="${RECOVERY_STAGING_KEYS}" \
-    "${OMNI_CMD[@]}" \
-        ++rollout_checkpointing.snapshot_attempt_interval_s="${PHASE2_SNAPSHOT_INTERVAL_S}" \
-        logger.log_dir="${RECOVERY_LOG_DIR}" \
-        "$@" 2>&1 | tee "${PHASE2_LOG}"
-
-grep -Fq "Selected rollout recovery snapshot: ${SNAPSHOT_DIR}" "${PHASE2_LOG}"
-grep -q "Native TQ checkpoint restored and validated" "${PHASE2_LOG}"
-grep -q "Loaded .* unfinished rollout group(s)" "${PHASE2_LOG}"
-grep -q "generation prefix restored:" "${PHASE2_LOG}"
-grep -q "train step ${MAX_STEPS}/${MAX_STEPS}" "${PHASE2_LOG}"
 # A media mismatch is rejected with retained_media_changed and the call is
 # retried from the prompt, which would otherwise pass as a fresh rollout.
 if grep -q "retained_media_changed" "${PHASE2_LOG}"; then
@@ -312,21 +213,6 @@ uv run --no-sync tests/check_metrics.py "${PHASE2_METRICS}" \
     'min(data["train/finalize/media_row_rate"]) == 1' \
     'all_finite(data["train/reward"])'
 
-uv run --no-sync python "${SNAPSHOT_HELPER}" verify-restore \
-    "${SELECTION_FILE}" \
-    "${PHASE1_EVENTS}" \
-    "${PHASE2_EVENTS}" \
-    "${PHASE2_LOG}" \
-    "${CHECKPOINT_DIR}/step_${MAX_STEPS}/training_info.json" \
-    "${MAX_STEPS}"
-
-# Each restored call completed exactly once, its trained row begins that call
-# with the exact restored prefix, and no restored prefix row was still live
-# when training read its step.
-uv run --no-sync python "${SNAPSHOT_HELPER}" verify-completion \
-    "${SELECTION_FILE}" \
-    "${RECOVERY_LOG_DIR}" \
-    "${RECOVERY_STAGING_KEYS}" \
-    "${PHASE2_LOG}"
+verify_prefix_recovery
 
 echo "Omni CLEVR multimodal generation-prefix recovery test passed"

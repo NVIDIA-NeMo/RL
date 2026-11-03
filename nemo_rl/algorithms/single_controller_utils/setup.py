@@ -1377,12 +1377,6 @@ def setup_single_controller(
     generation_prefix_cuts_enabled = (
         master_config.rollout_recovery.generation_prefix_cuts_enabled
     )
-    if generation_prefix_cuts_enabled:
-        # The vLLM-only check ran above with the other turn/prefix checks.
-        if router_replay_enabled(master_config.policy):
-            raise NotImplementedError(
-                "generation-prefix recovery does not yet support router replay"
-            )
     if capture_media:
         if not uses_image_placeholder(processor):
             raise ValueError(

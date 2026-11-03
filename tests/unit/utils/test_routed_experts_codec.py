@@ -35,12 +35,19 @@ def test_round_trip_preserves_values_and_wire_dtype(dtype):
     decoded = decode_routed_experts(payload, dtype=torch.int32)
     assert decoded.dtype == torch.int32
     assert torch.equal(decoded, routes.to(torch.int32))
+    # Without a dtype, the wire dtype is kept, by empty envelopes too.
+    assert torch.equal(decode_routed_experts(payload), routes)
+    assert decode_routed_experts(payload).dtype == dtype
+    empty = decode_routed_experts(encode_routed_experts(routes[:0]))
+    assert empty.dtype == dtype and empty.shape == (0, 3, 2)
 
 
 def test_decode_accepts_legacy_nested_lists():
     decoded = decode_routed_experts([[[1, 2]], [[3, 4]]], dtype=torch.int16)
     assert decoded.dtype == torch.int16
     assert decoded.tolist() == [[[1, 2]], [[3, 4]]]
+    # Without a dtype, legacy lists read as int16.
+    assert decode_routed_experts([[[1, 2]]]).dtype == torch.int16
 
 
 def test_decode_rejects_malformed_payloads():

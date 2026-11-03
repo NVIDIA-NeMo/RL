@@ -371,7 +371,8 @@ def verify_completion(args: argparse.Namespace) -> None:
     Each restored call must complete once, close its trained row, and start
     with the exact prefix the worker restored (``_assert_prefix_boundary``); no
     row may be trained twice, and no restored prefix row may still be live when
-    training reads the step.
+    training reads the step. With ``--require-routes``, each must also stage
+    for training the routes it restored.
     """
     selection = read_json(Path(args.selection_file))
     records = load_training_records(
@@ -379,7 +380,10 @@ def verify_completion(args: argparse.Namespace) -> None:
     )
     _rows_by_identity(records)
     starts = _assert_prefix_boundary(
-        selection, Path(args.phase2_log).read_text(), records
+        selection,
+        Path(args.phase2_log).read_text(),
+        records,
+        require_routes=args.require_routes,
     )
     _assert_retired_prefix_keys(selection, records)
     print(f"restored prefixes completed and trained: {sorted(starts)!r}", flush=True)
@@ -418,6 +422,8 @@ def _parser() -> argparse.ArgumentParser:
     completion.add_argument("recovery_log_dir")
     completion.add_argument("recovery_staging_keys")
     completion.add_argument("phase2_log")
+    # Router replay: also require each restored call to stage its restored routes.
+    completion.add_argument("--require-routes", action="store_true")
     completion.set_defaults(func=verify_completion)
     return parser
 
