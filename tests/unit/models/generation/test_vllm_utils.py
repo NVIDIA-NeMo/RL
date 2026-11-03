@@ -37,6 +37,7 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
     encode_counter_key,
+    extract_generation_logprobs,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -815,6 +816,34 @@ def test_attach_token_information_to_chat_response_choices_rejects_invalid_struc
 
     with pytest.raises(RuntimeError, match=error_match):
         attach_token_information_to_chat_response_choices(response, final_res)
+
+
+def _position(token_id: int, logprob: float) -> dict:
+    return {token_id: SimpleNamespace(logprob=logprob)}
+
+
+def test_extract_generation_logprobs_reads_only_the_positions_asked_for():
+    # A live container may already hold a later step; it is left unread.
+    logprobs = [_position(12, -0.1), _position(13, -0.2), _position(14, -0.3)]
+
+    assert extract_generation_logprobs([12, 13], logprobs, start=0) == [-0.1, -0.2]
+    assert extract_generation_logprobs([13], logprobs, start=1) == [-0.2]
+    assert extract_generation_logprobs([], None, start=3) == []
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "logprobs", "error_match"),
+    [
+        ([12], None, "did not include logprobs"),
+        ([12, 13], [_position(12, -0.1)], "token_count=2, logprob_count=1"),
+        ([12], [_position(99, -0.1)], "did not include the selected token"),
+    ],
+)
+def test_extract_generation_logprobs_rejects_inconsistent_outputs(
+    token_ids, logprobs, error_match
+):
+    with pytest.raises(RuntimeError, match=error_match):
+        extract_generation_logprobs(token_ids, logprobs, start=0)
 
 
 def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields():
