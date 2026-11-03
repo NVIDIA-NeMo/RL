@@ -94,7 +94,7 @@ See [Data Format Translation](#data-format-translation) for the field layout of 
 }
 ```
 
-`task_input` must contain `responses_create_params`, because NeMo RL writes the policy's `temperature`, `top_p`, and `max_output_tokens` there. A taskset whose rows lack it fails on its first batch.
+NeMo RL passes `task_input` to the Environment Server unchanged. It sends the policy's sampling values beside the task, as described under **Data flow**, and no longer writes them into `responses_create_params`. Tasksets routed to `single_agent_turn` or `single_agent_turn_legacy` still need `responses_create_params` in `task_input`, because the Environment Server reads it. Multi-agent tasksets such as `nemo_user_sim` are not supported yet.
 
 Rollout metrics for these rows are named after the taskset instead of an agent, for example `openmathreasoning/truncation_rate`.
 
@@ -416,7 +416,7 @@ flowchart LR
 - **Responses API** (NeMo Gym): OpenAI Responses API format with `input`, `tools`, and multi-turn conversation
 - **Chat Completions** (vLLM): OpenAI Chat Completions format for the actual inference call
 
-**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`; the collector wraps each task in an episode request containing `episode_id` and `task`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`.
+**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and adds the policy's sampling values for the rollout's phase beside the task, as `_ng_model_sampling`: `temperature` and `top_p` (or `val_temperature` and `val_top_p` for validation), and `max_new_tokens` as `max_output_tokens`. Gym carries them to every model call of the agent NeMo RL trains, and Gym's model server applies them, keeping a smaller output limit the call asks for. On the vLLM backend, calls from agents NeMo RL does not train, such as a verifier's LLM judge, keep their own sampling. The vLLM HTTP server checks the trained agent's calls against the train or validation values and skips the calls Gym marks with `x-ng-sampling: null`. Recipes cannot set `sampling_overrides` on `policy_model`; NeMo RL itself pins only `logprobs` and `top_logprobs` there, for score centering. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`; the collector wraps each task in an episode request containing `episode_id` and `task`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`.
 
 The Agent sends Responses API requests to the Model Server, which translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). NeMo RL validates materialized-task episode replies and extracts successful results before the usual result processing. Token IDs, logprobs, and rewards then populate the final Result.
 
