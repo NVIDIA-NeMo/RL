@@ -344,7 +344,11 @@ def _normalize_nemo_gym_episode_result(
         and ("result" in reply or "failure" in reply)
     ):
         # single_agent_turn_legacy reports episode failures in a flat HTTP 200 body.
-        if isinstance(reply, Mapping) and reply.get("_ng_failure_class"):
+        # Other failure classes, such as judge_failed, mark a scored result.
+        if (
+            isinstance(reply, Mapping)
+            and reply.get("_ng_failure_class") == "environment_server_failed"
+        ):
             detail = (
                 f"NeMo-Gym task {row['task_id']} failed: "
                 f"{reply.get('_ng_failure_message')}"

@@ -108,6 +108,19 @@ def test_materialized_task_keeps_flat_compatibility_results_opaque() -> None:
     assert _normalize_nemo_gym_episode_result(row, reply) is reply
 
 
+def test_compatibility_judge_failure_stays_a_masked_result() -> None:
+    row = _row()
+    _prepare([row])
+    reply = {
+        "reward": 0.0,
+        "response": {},
+        "mask_sample": True,
+        "failure_kind": "judge_failed",
+        "_ng_failure_class": "judge_failed",
+    }
+    assert _normalize_nemo_gym_episode_result(row, reply) is reply
+
+
 def test_materialized_task_preparation_rejects_missing_destination():
     with pytest.raises(ValueError, match="No environment server route"):
         _prepare_materialized_nemo_gym_rows([_row()], {})
