@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import nemo_rl.models.generation.vllm.vllm_generation as vg
+from nemo_rl.models.generation.openai_server_utils import encode_token_ids_b64
 from nemo_rl.models.generation.vllm.config import (
     resolve_vllm_disagg_frontend_config,
     resolve_vllm_disagg_layout,
@@ -18,7 +19,6 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
     _is_prefill_leg,
     _supplied_prompt_token_ids,
 )
-from nemo_rl.models.generation.openai_server_utils import encode_token_ids_b64
 
 
 def _config(disaggregation=None, *, colocated=False, **vllm_overrides):
@@ -75,6 +75,8 @@ def _bare_generation(cfg, *, world_size=8):
     gen._disagg_frontend_urls = []
     gen._stamped_engine_roles = {}
     gen._engine_env_vars = {}
+    gen._frontends_marked_ready = False
+    gen._frontend_kv_hashing = {}
     gen._engine_roles, gen._engine_widths, gen.num_replicas = vg.plan_engines(
         world_size,
         layout=gen._disagg_cfg,
@@ -195,9 +197,9 @@ def test_config_with_engine_roles_stamps_identity_and_node_local_ports(monkeypat
     ]
     cluster = MagicMock()
     cluster.get_placement_groups.return_value = [MagicMock(), MagicMock()]
-    monkeypatch.setattr(
-        vg, "_node_of_placement_groups", lambda pgs: {0: "node-a", 1: "node-b"}
-    )
+    node_of_bundle = {(0, b): "node-a" for b in range(8)}
+    node_of_bundle.update({(1, b): "node-b" for b in range(8)})
+    monkeypatch.setattr(vg, "_node_of_bundles", lambda pgs: node_of_bundle)
 
     stamped = gen._config_with_engine_roles(cfg, bundles, cluster)
     roles = stamped["vllm_cfg"]["_engine_roles"]
@@ -229,13 +231,53 @@ def test_config_with_engine_roles_stamps_identity_and_node_local_ports(monkeypat
     assert "_engine_roles" not in cfg["vllm_cfg"]
 
 
+def test_frontends_are_re_marked_ready_after_a_refit(monkeypatch):
+    # Ray replays only __init__ on an actor restart, so the driver repeats the
+    # readiness RPC after every weight update.
+    cfg = _config({"enabled": True})
+    gen = _bare_generation(cfg, world_size=4)
+    actor = MagicMock()
+    gen._disagg_actors = [actor]
+    monkeypatch.setattr(vg.ray, "get", lambda refs, **kw: refs)
+    gen._remark_frontends_ready()  # before the first mark: nothing to replay
+    actor.mark_engines_ready.remote.assert_not_called()
+    monkeypatch.setattr(gen, "_kv_hashing_for_frontends", lambda: {"block_size": 16})
+    gen._mark_frontends_ready()
+    gen._remark_frontends_ready()
+    assert actor.mark_engines_ready.remote.call_args_list == [
+        (((), {"block_size": 16})),
+        (((), {"block_size": 16})),
+    ]
+
+
+def test_unified_pg_port_slots_restart_on_each_physical_node(monkeypatch):
+    # One unified PG whose eight bundles span two nodes: the node-local port
+    # slots must restart on the second node, not keep counting fleet-wide.
+    cfg = _config({"enabled": True})
+    gen = _bare_generation(cfg, world_size=8)
+    bundles = [(0, [0, 1]), (0, [2, 3]), (0, [4, 5]), (0, [6, 7])]
+    node_of_bundle = {(0, b): ("node-a" if b < 4 else "node-b") for b in range(8)}
+    monkeypatch.setattr(vg, "_node_of_bundles", lambda pgs: node_of_bundle)
+    stamped = gen._config_with_engine_roles(cfg, bundles, MagicMock())
+    roles = stamped["vllm_cfg"]["_engine_roles"]
+    assert [
+        roles[k]["env"]["VLLM_PORT"] for k in ("0:0,1", "0:2,3", "0:4,5", "0:6,7")
+    ] == [7000, 7100, 7000, 7100]
+    assert [
+        roles[k]["env"]["VLLM_NIXL_SIDE_CHANNEL_PORT"]
+        for k in ("0:0,1", "0:2,3", "0:4,5", "0:6,7")
+    ] == [8556, 8557, 8556, 8557]
+
+
 def test_kv_cache_aware_routing_gives_prefill_engines_an_events_port(monkeypatch):
     cfg = _config(
         {"enabled": True, "frontend_tokenize": True},
         disagg_frontend={"prefill_router": "kv_cache_aware"},
     )
     gen = _bare_generation(cfg, world_size=4)
-    monkeypatch.setattr(vg, "_node_of_placement_groups", lambda pgs: {0: "n"})
+    monkeypatch.setattr(
+        vg, "_node_of_bundles", lambda pgs: {(0, b): "n" for b in range(4)}
+    )
     stamped = gen._config_with_engine_roles(
         cfg, [(0, [0, 1]), (0, [2, 3])], MagicMock()
     )
@@ -264,7 +306,9 @@ def test_placement_groups_are_sized_by_the_widest_engine_and_refuse_colocation()
         )
 
 
-def test_resume_after_refit_resets_every_engine_and_the_frontends_first(monkeypatch):
+def test_resume_after_refit_clears_the_frontends_first_and_resumes_decode_before_prefill(
+    monkeypatch,
+):
     gen = _bare_generation(_config(_DISAGG), world_size=6)
     order = []
     gen.worker_group.run_single_worker_single_data = MagicMock(
@@ -294,8 +338,10 @@ def test_resume_after_refit_resets_every_engine_and_the_frontends_first(monkeypa
     monkeypatch.setattr(vg.ray, "wait", lambda refs, num_returns, timeout: (refs, []))
 
     assert gen.resume_generation_after_refit(timeout_s=1.0) is True
-    resets = [o for o in order if o[0] == "engine"]
-    assert resets == [("engine", "reset_prefix_cache_async", i) for i in (0, 2, 4)]
+    # No engine-side prefix-cache reset: vLLM refuses it while frozen decode
+    # requests hold blocks, so recompute_kv_cache_after_weight_updates is
+    # refused at setup and resume only drops the frontends' decode-side state.
+    assert [o for o in order if o[0] == "engine"] == []
     assert ("frontend", "clear") in order
     resumes = [o for o in order if o[0] == "resume"]
     # Decode engines (owners 2, 4) resume before the prefill engine (owner 0).
@@ -425,29 +471,71 @@ def test_server_side_leg_helpers():
     assert not _is_prefill_leg(SimpleNamespace(kv_transfer_params=None))
 
 
-def test_disagg_engine_env_defaults_keep_nccl_plugin_out_of_nixl_engines():
+def test_disagg_engine_env_defaults_for_nixl_engines():
     assert vg.disagg_engine_env_defaults(_config(_DISAGG)) == {
-        "NCCL_NET_PLUGIN": "none"
+        "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+        "NCCL_NET_PLUGIN": "none",
     }
     assert vg.disagg_engine_env_defaults(_config()) == {}
+    # Host-staged KV never registers GPU memory with UCX, so NCCL keeps its
+    # plugin; the Mamba state layout is NixlConnector's requirement regardless.
+    assert vg.disagg_engine_env_defaults(
+        _config(
+            _DISAGG,
+            kv_transfer={"kv_connector": "NixlConnector", "kv_buffer_device": "cpu"},
+        )
+    ) == {"VLLM_SSM_CONV_STATE_LAYOUT": "DS"}
     assert (
         vg.disagg_engine_env_defaults(
-            _config(
-                _DISAGG,
-                kv_transfer={
-                    "kv_connector": "NixlConnector",
-                    "kv_buffer_device": "cpu",
-                },
-            )
+            _config(_DISAGG, kv_transfer={"kv_connector": "OtherConnector"})
         )
         == {}
     )
-    assert (
-        vg.disagg_engine_env_defaults(
-            _config(_DISAGG, kv_transfer={"kv_connector": "MooncakeConnector"})
-        )
-        == {}
+
+
+def test_render_settings_come_from_the_prefill_engines_kwargs():
+    cfg = _config(_DISAGG, prefill_engine={"vllm_kwargs": {"revision": "abc"}})
+    # Added to the shared block after the roles were resolved, as grpo.setup
+    # adds hf_overrides.
+    cfg["vllm_kwargs"]["tokenizer_mode"] = "auto"
+    settings = _bare_generation(cfg, world_size=6)._render_settings()
+    assert settings.engine_kwargs == {"tokenizer_mode": "auto", "revision": "abc"}
+    assert settings.max_model_len == 4096
+
+
+def _sc_master_config(cfg, *, recompute=False, token_capture=False):
+    """The SingleController MasterConfig shape validate_settings reads."""
+    return SimpleNamespace(
+        policy={"generation": cfg},
+        # SC nulls the legacy async_grpo block (it reads async_rl instead).
+        grpo=SimpleNamespace(async_grpo=None),
+        async_rl=SimpleNamespace(recompute_kv_cache_after_weight_updates=recompute),
+        token_capture=SimpleNamespace(enabled=token_capture),
     )
+
+
+def test_validate_settings_treats_every_sc_refit_as_in_flight():
+    # Without disaggregation nothing here applies, whatever async_rl says.
+    VllmGeneration.validate_settings(_sc_master_config(_config(), recompute=True))
+    # SC always pauses the engines with rollouts in flight, so the refit guard
+    # applies without any grpo.async_grpo flag: KV must be kept ...
+    VllmGeneration.validate_settings(_sc_master_config(_config(_DISAGG)))
+    with pytest.raises(ValueError, match="recompute_kv_cache_after_weight_updates"):
+        VllmGeneration.validate_settings(
+            _sc_master_config(_config(_DISAGG), recompute=True)
+        )
+    # ... and bidirectional transfer is out.
+    bidirectional = _config(_DISAGG, disagg_frontend={"bidirectional_kv_xfer": True})
+    with pytest.raises(ValueError, match="bidirectional_kv_xfer"):
+        VllmGeneration.validate_settings(_sc_master_config(bidirectional))
+
+
+def test_validate_settings_refuses_ledger_token_capture_under_disaggregation():
+    with pytest.raises(ValueError, match="token_capture"):
+        VllmGeneration.validate_settings(
+            _sc_master_config(_config(_DISAGG), token_capture=True)
+        )
+    VllmGeneration.validate_settings(_sc_master_config(_config(), token_capture=True))
 
 
 def test_effective_vllm_kwargs_merges_late_shared_keys_under_the_role_block():

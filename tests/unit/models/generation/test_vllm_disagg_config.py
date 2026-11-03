@@ -1,7 +1,5 @@
 """The vLLM backend's prefill/decode disaggregation config: schemas, resolvers, guards."""
 
-from types import SimpleNamespace
-
 import pytest
 
 from nemo_rl.models.generation.interfaces import DisaggConfig
@@ -9,7 +7,6 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_ENGINE_ARG_KEYS,
     VllmDisaggFrontendConfig,
     VllmKvTransferConfig,
-    hybrid_ssm_requires_homogeneous_tp,
     resolve_vllm_connector_profile,
     resolve_vllm_disagg_frontend_config,
     resolve_vllm_kv_transfer_config,
@@ -210,12 +207,11 @@ def test_validation_accepts_a_dense_layout_with_ep_one():
             dict(disagg_frontend={"prefill_router": "kv_cache_aware"}),
             "frontend_tokenize",
         ),
+        # vLLM's Mooncake connector speaks a router-minted handshake the relay
+        # cannot provide, so it deliberately has no profile.
         (
-            dict(
-                disagg_frontend={"bidirectional_kv_xfer": True},
-                kv_transfer={"kv_connector": "MooncakeConnector"},
-            ),
-            "not supported by the MooncakeConnector",
+            dict(kv_transfer={"kv_connector": "MooncakeConnector"}),
+            "No connector profile for kv_connector='MooncakeConnector'",
         ),
     ],
 )
@@ -242,19 +238,19 @@ def test_validation_refuses_a_non_default_refit_transport():
         validate_vllm_disaggregation(resolve_vllm_role_overrides(cfg))
 
 
-def test_hybrid_ssm_models_need_equal_tp_across_roles():
-    mamba = SimpleNamespace(model_type="nemotron_h")
-    dense = SimpleNamespace(model_type="qwen3")
-    assert hybrid_ssm_requires_homogeneous_tp(mamba)
-    assert not hybrid_ssm_requires_homogeneous_tp(dense)
-    assert hybrid_ssm_requires_homogeneous_tp(
-        SimpleNamespace(model_type="custom", hybrid_override_pattern="M*M*")
+def test_bidirectional_needs_a_profile_that_supports_it(monkeypatch):
+    from nemo_rl.models.generation.vllm import kv_connector_profiles as profiles
+
+    one_way = profiles.ConnectorProfile(
+        name="OneWayConnector", producer_role="kv_producer", consumer_role="kv_consumer"
     )
-    uneven = _disagg(prefill_engine={"tensor_parallel_size": 4})
-    with pytest.raises(ValueError, match="Mamba/SSM layers"):
-        validate_vllm_disaggregation(uneven, hf_config=mamba)
-    validate_vllm_disaggregation(uneven, hf_config=dense)
-    validate_vllm_disaggregation(_disagg(), hf_config=mamba)
+    monkeypatch.setitem(profiles.CONNECTOR_PROFILES, one_way.name, one_way)
+    cfg = _disagg(
+        disagg_frontend={"bidirectional_kv_xfer": True},
+        kv_transfer={"kv_connector": "OneWayConnector"},
+    )
+    with pytest.raises(ValueError, match="not supported by the OneWayConnector"):
+        validate_vllm_disaggregation(cfg)
 
 
 def test_kv_cache_aware_needs_frontend_tokenize_and_is_then_accepted():
@@ -268,16 +264,40 @@ def test_kv_cache_aware_needs_frontend_tokenize_and_is_then_accepted():
     assert DisaggConfig.model_validate(cfg["disaggregation"]).frontend_tokenize
 
 
-def test_bidirectional_kv_xfer_is_refused_with_in_flight_weight_updates():
+def test_in_flight_refit_guard_refuses_recompute_and_bidirectional():
     from nemo_rl.models.generation.vllm.config import (
         validate_vllm_disaggregation_for_refit,
     )
 
-    cfg = _disagg(disagg_frontend={"bidirectional_kv_xfer": True})
-    # Fine without in-flight updates; fine with them while bidirectional is off
-    # or disaggregation itself is off.
-    validate_vllm_disaggregation_for_refit(cfg, in_flight_weight_updates=False)
-    validate_vllm_disaggregation_for_refit(_disagg(), in_flight_weight_updates=True)
-    validate_vllm_disaggregation_for_refit(_config(), in_flight_weight_updates=True)
+    bidirectional = _disagg(disagg_frontend={"bidirectional_kv_xfer": True})
+    # Nothing to check without in-flight updates, or without disaggregation.
+    validate_vllm_disaggregation_for_refit(
+        bidirectional,
+        in_flight_weight_updates=False,
+        recompute_kv_cache_after_weight_updates=True,
+    )
+    validate_vllm_disaggregation_for_refit(
+        _config(),
+        in_flight_weight_updates=True,
+        recompute_kv_cache_after_weight_updates=True,
+    )
+    # In-flight updates under disaggregation keep the KV: vLLM's cache reset
+    # raises while a decode request still waits for remote KV ...
+    validate_vllm_disaggregation_for_refit(
+        _disagg(),
+        in_flight_weight_updates=True,
+        recompute_kv_cache_after_weight_updates=False,
+    )
+    with pytest.raises(ValueError, match="recompute_kv_cache_after_weight_updates"):
+        validate_vllm_disaggregation_for_refit(
+            _disagg(),
+            in_flight_weight_updates=True,
+            recompute_kv_cache_after_weight_updates=True,
+        )
+    # ... and the decode engines must not pin blocks for the next turn.
     with pytest.raises(ValueError, match="bidirectional_kv_xfer"):
-        validate_vllm_disaggregation_for_refit(cfg, in_flight_weight_updates=True)
+        validate_vllm_disaggregation_for_refit(
+            bidirectional,
+            in_flight_weight_updates=True,
+            recompute_kv_cache_after_weight_updates=False,
+        )

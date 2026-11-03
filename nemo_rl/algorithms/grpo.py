@@ -143,12 +143,12 @@ from nemo_rl.models.generation.trtllm.config import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
-    vllm_replica_width,
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
     validate_vllm_disaggregation_for_refit,
+    vllm_replica_width,
 )
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
@@ -717,10 +717,17 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+        async_grpo = grpo_config.async_grpo
         validate_vllm_disaggregation_for_refit(
             cast(VllmConfig, generation_config),
             in_flight_weight_updates=bool(
-                grpo_config.async_grpo.in_flight_weight_updates
+                async_grpo is not None
+                and async_grpo.enabled
+                and async_grpo.in_flight_weight_updates
+            ),
+            recompute_kv_cache_after_weight_updates=bool(
+                async_grpo is not None
+                and async_grpo.recompute_kv_cache_after_weight_updates
             ),
         )
     elif generation_config["backend"] == "dynamo":

@@ -30,8 +30,10 @@ from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
+    _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.disagg_layout import deep_merge, engine_key
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     GenerationDatumSpec,
@@ -43,16 +45,15 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineRpcMixin,
 )
-from nemo_rl.models.generation.disagg_layout import deep_merge, engine_key
 from nemo_rl.models.generation.vllm.config import (
-    vllm_kv_transfer_config_for_role,
-    vllm_role_engine_config,
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
     resolve_vllm_video_config,
     validate_nvfp4_pertoken_model,
+    vllm_kv_transfer_config_for_role,
     vllm_nemotron_h_fp32_lm_head_enabled,
+    vllm_role_engine_config,
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
@@ -910,8 +911,6 @@ class BaseVllmGenerationWorker:
         and this applies them before the engine (and the subprocesses it
         spawns, which inherit this environment) comes up.
         """
-        from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
-
         entry = self._disagg_engine
         for name, value in entry["env"].items():
             os.environ[name] = str(value)

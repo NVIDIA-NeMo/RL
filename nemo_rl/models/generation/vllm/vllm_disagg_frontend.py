@@ -33,17 +33,29 @@ import copy
 import hashlib
 import json
 import logging
+import secrets
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+import aiohttp
 import ray
+import requests
 
+from nemo_rl.distributed.virtual_cluster import (
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.models.generation.openai_server_utils import (
     decode_token_ids_b64,
     encode_token_ids_b64,
+)
+from nemo_rl.models.generation.vllm.chat_render import (
+    FrontendChatRenderer,
+    RenderSettings,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,27 +124,53 @@ _LOCAL_HOSTS = frozenset({None, "", "localhost", "127.0.0.1", "0.0.0.0", "::1"})
 # --------------------------------------------------------------------------- #
 
 
-def conversation_key(body: dict[str, Any]) -> Optional[str]:
-    """The key a trajectory's turns share, or None for a one-off request.
+def conversation_id(body: dict[str, Any]) -> Optional[str]:
+    """NeMo-Gym's own id for the conversation, or None when it sent none.
 
-    NeMo-Gym sends its session id as ``conversation_params.conversation_id``
-    when ``forward_session_id_as_conversation_id`` is on; that is the stable
-    key. Without it the first message of the conversation is hashed: every
-    turn of a trajectory repeats its opening message verbatim, so the hash is
-    the same across turns while unrelated conversations differ.
+    Gym sends its session id as ``conversation_params.conversation_id`` when
+    ``forward_session_id_as_conversation_id`` is on. Unlike
+    :func:`conversation_key` this never falls back to message content, so two
+    conversations can share it only if Gym says they are one.
     """
     params = body.get("conversation_params")
     if isinstance(params, dict) and params.get("conversation_id"):
         return str(params["conversation_id"])
-    messages = body.get("messages")
-    if isinstance(messages, list) and messages:
-        opening = {
-            k: v for k, v in messages[0].items() if k not in _MESSAGE_TOKEN_FIELDS
-        }
-        return hashlib.sha256(
-            json.dumps(opening, sort_keys=True, default=str).encode()
-        ).hexdigest()
     return None
+
+
+def conversation_key(body: dict[str, Any]) -> Optional[str]:
+    """The key a trajectory's turns share for *routing*, or None for a one-off request.
+
+    Gym's ``conversation_id`` when present (its model server sends one per
+    rollout under ``forward_session_id_as_conversation_id``). Otherwise the
+    conversation's opening exchange is hashed: the messages up to and including
+    the first user turn, which every later turn of a trajectory repeats
+    verbatim, so the hash is stable across turns. The first message alone would
+    not do -- an environment's system prompt is shared by every task, and
+    hashing it pins a whole run to one prefill engine. The fallback still
+    unites the G samples of one prompt, which is harmless for routing (they
+    share the prompt's prefix) but not for KV bookkeeping, which is why the
+    conversation cache keys on :func:`conversation_id` alone.
+    """
+    cid = conversation_id(body)
+    if cid is not None:
+        return cid
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    opening: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            opening.append(message)
+            continue
+        opening.append(
+            {k: v for k, v in message.items() if k not in _MESSAGE_TOKEN_FIELDS}
+        )
+        if message.get("role") == "user":
+            break
+    return hashlib.sha256(
+        json.dumps(opening, sort_keys=True, default=str).encode()
+    ).hexdigest()
 
 
 # --------------------------------------------------------------------------- #
@@ -187,8 +225,8 @@ def build_prefill_leg(
     initial_params: dict[str, Any],
     cached_decode_params: Optional[dict[str, Any]] = None,
     frontend_prompt_ids: Optional[list[int]] = None,
-    ids_as_b64: bool = False,
-    return_prompt_ids_b64: bool = False,
+    ids_as_b64: bool,
+    return_prompt_ids_b64: bool,
 ) -> dict[str, Any]:
     """The prefill engine's request for ``body``.
 
@@ -248,8 +286,8 @@ def build_decode_leg(
     *,
     prefill_response: dict[str, Any],
     prefill_host: str,
-    ids_as_b64: bool = False,
-    strip_message_history: bool = False,
+    ids_as_b64: bool,
+    strip_message_history: bool,
 ) -> dict[str, Any]:
     """The decode engine's request: ``body`` plus the prefill engine's handshake.
 
@@ -348,7 +386,7 @@ class ConversationRouter(LoadBalancingRouter):
     frontend, so nothing is shared.
     """
 
-    def __init__(self, num_engines: int, *, table_size: int = 100_000) -> None:
+    def __init__(self, num_engines: int, *, table_size: int) -> None:
         super().__init__(num_engines)
         self._table: OrderedDict[str, int] = OrderedDict()
         self._table_size = table_size
@@ -359,12 +397,15 @@ class ConversationRouter(LoadBalancingRouter):
         idx = self._table.get(key)
         if idx is None:
             idx = super().pick(None, prompt_ids)
-        else:
-            self._table.move_to_end(key)
+        self._remember(key, idx)
+        return idx
+
+    def _remember(self, key: str, idx: int) -> None:
+        """Record ``key -> idx`` as most recent; evict the oldest past the table size."""
         self._table[key] = idx
+        self._table.move_to_end(key)
         while len(self._table) > self._table_size:
             self._table.popitem(last=False)
-        return idx
 
     def forget_all(self) -> None:
         self._table.clear()
@@ -580,7 +621,7 @@ class KvCacheAwareRouter(ConversationRouter):
         num_engines: int,
         *,
         hasher: Optional[RequestBlockHasher] = None,
-        table_size: int = 100_000,
+        table_size: int,
     ) -> None:
         super().__init__(num_engines, table_size=table_size)
         self.index = BlockHashIndex(num_engines)
@@ -601,8 +642,7 @@ class KvCacheAwareRouter(ConversationRouter):
         self.hits += 1
         idx = min(owners, key=lambda i: (self.inflight[i], i))
         if key is not None:
-            self._table[key] = idx
-            self._table.move_to_end(key)
+            self._remember(key, idx)
         return idx
 
 
@@ -712,10 +752,13 @@ class RelaySettings:
     # kv_cache_aware: the ZMQ endpoints of the prefill engines' event
     # publishers (one per prefill engine, in prefill-pool order) and the
     # publisher topic. Hashing parameters arrive with mark_engines_ready.
-    kv_events_endpoints: tuple[str, ...] = ()
-    kv_events_topic: str = ""
+    kv_events_endpoints: tuple[str, ...]
+    kv_events_topic: str
     # frontend_tokenize: None renders on the engines.
-    render_settings: Optional[Any] = None
+    render_settings: Optional[RenderSettings]
+    # vllm_cfg.http_server_api_key_required: the bearer token the engines
+    # check. The frontend requires it on its own routes and forwards it.
+    api_key: Optional[str]
 
 
 class FrontendRelay:
@@ -765,12 +808,14 @@ class FrontendRelay:
         self._engines_ready = False
         self._event_subscribers: list[KvEventSubscriber] = []
         self._session: Any = None
+        self._warned_no_conversation_id = False
         self.stats: dict[str, int] = {
             "requests": 0,
             "prefill_errors": 0,
             "decode_errors": 0,
             "frontend_tokenized": 0,
             "frontend_tokenize_fallbacks": 0,
+            "turns_without_conversation_id": 0,
         }
 
     # -- lifecycle -------------------------------------------------------- #
@@ -780,33 +825,54 @@ class FrontendRelay:
         return self._engines_ready
 
     def mark_engines_ready(
-        self, *, block_size: Optional[int] = None, hash_algo: Optional[str] = None
+        self,
+        *,
+        block_size: Optional[int] = None,
+        hash_algo: Optional[str] = None,
+        hashing_may_follow: bool = False,
     ) -> None:
         """Start serving requests; wire the KV-aware router now that engines exist.
 
         Deferred until here because under ``defer_model_load`` the frontend is
         up, and Gym already holds its URL, while the engines still load.
+        Idempotent: the driver repeats it after every weight update so a
+        frontend Ray restarted in between (which replays only ``__init__``)
+        recovers. ``hashing_may_follow`` lets a restarted frontend serve before
+        that call brings the kv_cache_aware hashing parameters; until then the
+        KV-aware router falls back to its load-based choice.
         """
         router = self.prefill_router
-        if isinstance(router, KvCacheAwareRouter):
+        if self._engines_ready and (
+            not isinstance(router, KvCacheAwareRouter) or router.hasher is not None
+        ):
+            return
+        if isinstance(router, KvCacheAwareRouter) and router.hasher is None:
             if block_size is None or hash_algo is None:
-                raise ValueError(
-                    "kv_cache_aware routing needs the engines' block_size and "
-                    "prefix_caching_hash_algo to hash prompts like they do"
+                if not hashing_may_follow:
+                    raise ValueError(
+                        "kv_cache_aware routing needs the engines' block_size and "
+                        "prefix_caching_hash_algo to hash prompts like they do"
+                    )
+                logger.warning(
+                    "serving with kv_cache_aware routing degraded to its fallback "
+                    "until the driver reports the engines' hashing parameters"
                 )
-            router.hasher = RequestBlockHasher(
-                block_size=block_size, hash_algo=hash_algo
-            )
-            for engine_idx, endpoint in enumerate(self.settings.kv_events_endpoints):
-                subscriber = KvEventSubscriber(
-                    engine_idx=engine_idx,
-                    endpoint=endpoint,
-                    topic=self.settings.kv_events_topic,
-                    index=router.index,
-                    lock=router.index_lock,
+            else:
+                router.hasher = RequestBlockHasher(
+                    block_size=block_size, hash_algo=hash_algo
                 )
-                subscriber.start()
-                self._event_subscribers.append(subscriber)
+                for engine_idx, endpoint in enumerate(
+                    self.settings.kv_events_endpoints
+                ):
+                    subscriber = KvEventSubscriber(
+                        engine_idx=engine_idx,
+                        endpoint=endpoint,
+                        topic=self.settings.kv_events_topic,
+                        index=router.index,
+                        lock=router.index_lock,
+                    )
+                    subscriber.start()
+                    self._event_subscribers.append(subscriber)
         self._engines_ready = True
 
     def install_renderer(self, renderer: Any) -> None:
@@ -825,11 +891,13 @@ class FrontendRelay:
 
     # -- HTTP plumbing ---------------------------------------------------- #
 
-    async def _client(self) -> Any:
-        # Deferred: aiohttp lives in the generation venv; created on the
-        # serving loop so the connection pool belongs to it.
-        import aiohttp
+    async def aclose(self) -> None:
+        """Close the engine connection pool; runs on the serving loop at shutdown."""
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
 
+    async def _client(self) -> aiohttp.ClientSession:
+        # Created on the serving loop so the connection pool belongs to it.
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=self.settings.request_timeout_s)
             self._session = aiohttp.ClientSession(
@@ -840,20 +908,18 @@ class FrontendRelay:
         return self._session
 
     async def _post_json(
-        self, endpoint: EngineEndpoint, path: str, payload: dict[str, Any]
+        self,
+        endpoint: EngineEndpoint,
+        path: str,
+        payload: dict[str, Any],
+        headers: Optional[dict[str, str]] = None,
     ) -> tuple[int, dict[str, Any]]:
         session = await self._client()
-        async with session.post(endpoint.base_url + path, json=payload) as resp:
+        async with session.post(
+            endpoint.base_url + path, json=payload, headers=headers
+        ) as resp:
             raw = await resp.read()
-        try:
-            body = json.loads(raw) if raw else {}
-        except ValueError:
-            body = {
-                "error": {"message": raw.decode(errors="replace"), "code": resp.status}
-            }
-        if not isinstance(body, dict):
-            body = {"error": {"message": "non-object JSON from engine", "code": 502}}
-        return resp.status, body
+        return resp.status, _parse_engine_body(raw, resp.status)
 
     # -- the two legs ----------------------------------------------------- #
 
@@ -871,12 +937,21 @@ class FrontendRelay:
         self.stats["frontend_tokenized"] += 1
         return ids
 
-    async def relay(self, path: str, body: dict[str, Any]) -> tuple[int, Any, bool]:
+    async def relay(
+        self,
+        path: str,
+        body: dict[str, Any],
+        *,
+        authorization: Optional[str] = None,
+    ) -> tuple[int, Any, bool]:
         """Serve one request. Returns ``(status, payload, streaming)``.
 
         ``payload`` is a dict for JSON responses, or an async byte iterator when
         the client asked to stream and the decode leg is being streamed through.
+        ``authorization`` is the client's header, forwarded to both engines,
+        which check the same bearer token the frontend does.
         """
+        headers = {"Authorization": authorization} if authorization else None
         self.stats["requests"] += 1
         if not self._engines_ready:
             return (
@@ -892,12 +967,33 @@ class FrontendRelay:
             )
 
         key = conversation_key(body)
+        cid = conversation_id(body)
+        if cid is None:
+            self.stats["turns_without_conversation_id"] += 1
+            if not self._warned_no_conversation_id:
+                self._warned_no_conversation_id = True
+                logger.warning(
+                    "requests reach the disaggregation frontend without "
+                    "conversation_params.conversation_id; routing falls back to "
+                    "hashing each conversation's opening exchange and "
+                    "bidirectional_kv_xfer caches nothing. Set "
+                    "forward_session_id_as_conversation_id: true on NeMo-Gym's "
+                    "model server for per-rollout keys."
+                )
+        # Decode-side handshakes are keyed by Gym's conversation id only: the
+        # opening-exchange fallback would let one sample's blocks seed another
+        # sample of the same prompt. Without the id the turn prefills cold.
+        cache_key = cid if self.conversation_cache is not None else None
+        if self.conversation_cache is not None and cache_key is None:
+            self.stats["bidirectional_uncached_turns"] = (
+                self.stats.get("bidirectional_uncached_turns", 0) + 1
+            )
         frontend_ids = (
             await self._frontend_prompt_ids(body) if path == CHAT_PATH else None
         )
         cached = (
-            self.conversation_cache.get(key)
-            if self.conversation_cache is not None and key is not None
+            self.conversation_cache.get(cache_key)
+            if self.conversation_cache is not None and cache_key is not None
             else None
         )
         prefill_leg = build_prefill_leg(
@@ -913,9 +1009,9 @@ class FrontendRelay:
         self.prefill_router.acquire(p_idx)
         try:
             p_status, p_body = await self._post_json(
-                self.prefill[p_idx], path, prefill_leg
+                self.prefill[p_idx], path, prefill_leg, headers
             )
-        except Exception as e:  # noqa: BLE001 - any transport failure is a 502 to Gym
+        except (OSError, asyncio.TimeoutError, aiohttp.ClientError) as e:
             self.stats["prefill_errors"] += 1
             return (
                 502,
@@ -945,13 +1041,33 @@ class FrontendRelay:
         if body.get("stream"):
             # Streamed through as-is; nothing is read off the stream, so
             # bidirectional state is not updated for streamed turns (Gym does
-            # not stream).
-            return 200, self._stream_decode(d_idx, path, decode_leg), True
+            # not stream). The engine's status is checked before the stream is
+            # handed back, so an engine error is still an error to the client.
+            session = await self._client()
+            try:
+                resp = await session.post(
+                    self.decode[d_idx].base_url + path, json=decode_leg, headers=headers
+                )
+            except (OSError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                self.decode_router.release(d_idx)
+                self.stats["decode_errors"] += 1
+                return (
+                    502,
+                    _error_body(f"decode engine {d_idx} unreachable: {e}", 502),
+                    False,
+                )
+            if resp.status >= 400:
+                raw = await resp.read()
+                resp.release()
+                self.decode_router.release(d_idx)
+                self.stats["decode_errors"] += 1
+                return resp.status, _parse_engine_body(raw, resp.status), False
+            return 200, self._stream_decode(d_idx, resp), True
         try:
             d_status, d_body = await self._post_json(
-                self.decode[d_idx], path, decode_leg
+                self.decode[d_idx], path, decode_leg, headers
             )
-        except Exception as e:  # noqa: BLE001 - any transport failure is a 502 to Gym
+        except (OSError, asyncio.TimeoutError, aiohttp.ClientError) as e:
             self.stats["decode_errors"] += 1
             return (
                 502,
@@ -966,20 +1082,34 @@ class FrontendRelay:
 
         # The decode engine's handshake is the frontend's business, not Gym's.
         decode_params = d_body.pop("kv_transfer_params", None)
-        if self.conversation_cache is not None and key is not None and decode_params:
-            self.conversation_cache.put(key, decode_params)
+        if (
+            self.conversation_cache is not None
+            and cache_key is not None
+            and decode_params
+        ):
+            self.conversation_cache.put(cache_key, decode_params)
         return 200, d_body, False
 
-    async def _stream_decode(self, d_idx: int, path: str, leg: dict[str, Any]) -> Any:
-        session = await self._client()
+    async def _stream_decode(self, d_idx: int, resp: aiohttp.ClientResponse) -> Any:
+        # The engine slot and the response are held until the stream is
+        # drained; a response the client never reads keeps both.
         try:
-            async with session.post(
-                self.decode[d_idx].base_url + path, json=leg
-            ) as resp:
-                async for chunk in resp.content.iter_any():
-                    yield chunk
+            async for chunk in resp.content.iter_any():
+                yield chunk
         finally:
+            resp.release()
             self.decode_router.release(d_idx)
+
+
+def _parse_engine_body(raw: bytes, status: int) -> dict[str, Any]:
+    """An engine's response body as a dict; non-JSON bodies become error objects."""
+    try:
+        body = json.loads(raw) if raw else {}
+    except ValueError:
+        return {"error": {"message": raw.decode(errors="replace"), "code": status}}
+    if not isinstance(body, dict):
+        return {"error": {"message": "non-object JSON from engine", "code": 502}}
+    return body
 
 
 def _error_body(message: str, code: int) -> dict[str, Any]:
@@ -997,7 +1127,40 @@ def create_frontend_app(relay: FrontendRelay) -> Any:
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse, StreamingResponse
 
-    app = FastAPI()
+    @asynccontextmanager
+    async def _lifespan(_: Any) -> Any:
+        try:
+            yield
+        finally:
+            # uvicorn runs this when the server is told to exit: the engine
+            # connection pool is closed on the loop that owns it.
+            await relay.aclose()
+
+    app = FastAPI(lifespan=_lifespan)
+
+    api_key = relay.settings.api_key
+    if api_key:
+        # The engines refuse OpenAI routes without this token
+        # (vllm_worker_async.install_http_server_api_key_check); the frontend
+        # stands in front of them, so it must refuse the same requests.
+        expected = f"Bearer {api_key}".encode()
+
+        @app.middleware("http")
+        async def _require_bearer_token(request: Request, call_next: Any) -> Any:
+            if request.url.path.startswith("/v1/"):
+                supplied = (request.headers.get("Authorization") or "").encode()
+                if not secrets.compare_digest(supplied, expected):
+                    return JSONResponse(
+                        status_code=401,
+                        content={
+                            "error": {
+                                "message": "missing or invalid bearer token",
+                                "type": "authentication_error",
+                                "code": 401,
+                            }
+                        },
+                    )
+            return await call_next(request)
 
     @app.get("/health")
     async def health() -> JSONResponse:
@@ -1043,7 +1206,9 @@ def create_frontend_app(relay: FrontendRelay) -> Any:
             )
         if not isinstance(body, dict):
             return JSONResponse(_error_body("request body must be an object", 400), 400)
-        status, payload, streaming = await relay.relay(path, body)
+        status, payload, streaming = await relay.relay(
+            path, body, authorization=request.headers.get("Authorization")
+        )
         if streaming:
             return StreamingResponse(payload, media_type="text/event-stream")
         return JSONResponse(content=payload, status_code=status)
@@ -1065,11 +1230,6 @@ def start_server(
     """Serve ``app`` in a daemon thread; returns ``(thread, base_url, server)``."""
     # Deferred: uvicorn lives in the generation venv.
     import uvicorn
-
-    from nemo_rl.distributed.virtual_cluster import (
-        _get_free_port_local,
-        _get_node_ip_local,
-    )
 
     if port == 0:
         port = _get_free_port_local()
@@ -1098,8 +1258,6 @@ def start_server(
 
 def wait_ready(base_url: str, timeout_s: float = 300.0) -> None:
     """Block until the frontend answers /health."""
-    import requests
-
     health = base_url.rsplit("/v1", 1)[0] + "/health"
     deadline = time.monotonic() + timeout_s
     while True:
@@ -1115,6 +1273,45 @@ def wait_ready(base_url: str, timeout_s: float = 300.0) -> None:
         time.sleep(0.5)
 
 
+def _is_reconstructed_actor() -> bool:
+    """Whether this process is a Ray actor that Ray has restarted at least once."""
+    if not ray.is_initialized():
+        return False
+    context = ray.get_runtime_context()
+    if context.get_actor_id() is None:
+        return False
+    return bool(context.was_current_actor_reconstructed)
+
+
+# Per-engine budget of the restart probe below; the constructor must stay quick.
+_RESTART_PROBE_TIMEOUT_S = 2.0
+
+
+def engines_answer(
+    addrs: list[tuple[str, int]], *, api_key: Optional[str], timeout_s: float
+) -> bool:
+    """Whether every engine HTTP server at ``addrs`` serves requests right now.
+
+    ``/tokenize`` is the cheapest route NeMo RL's engine server exposes (it has
+    no ``/health``); a port that is reserved but not yet serving refuses the
+    connection, and a loading engine's server is not up at all.
+    """
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+    for host, port in addrs:
+        try:
+            response = requests.post(
+                f"http://{host}:{port}/tokenize",
+                json={"prompt": "ready", "add_special_tokens": False},
+                headers=headers,
+                timeout=timeout_s,
+            )
+        except requests.RequestException:
+            return False
+        if response.status_code != 200:
+            return False
+    return True
+
+
 # --------------------------------------------------------------------------- #
 #  The actor
 # --------------------------------------------------------------------------- #
@@ -1127,8 +1324,8 @@ class FrontendServeArgs:
     prefill_addrs: list[tuple[str, int]]
     decode_addrs: list[tuple[str, int]]
     settings: RelaySettings
-    engines_ready: bool = False
-    kv_hashing: dict[str, Any] = field(default_factory=dict)
+    engines_ready: bool
+    kv_hashing: dict[str, Any]
 
 
 class DisaggFrontendImpl:
@@ -1176,13 +1373,28 @@ class DisaggFrontendImpl:
         )
         if serve_args.settings.render_settings is not None:
             # Built once; loading the tokenizer and HF config takes seconds.
-            from nemo_rl.models.generation.vllm.chat_render import FrontendChatRenderer
-
             self._relay.install_renderer(
                 FrontendChatRenderer(serve_args.settings.render_settings)
             )
         if serve_args.engines_ready:
             self._relay.mark_engines_ready(**serve_args.kv_hashing)
+        elif _is_reconstructed_actor() and engines_answer(
+            serve_args.prefill_addrs + serve_args.decode_addrs,
+            api_key=serve_args.settings.api_key,
+            timeout_s=_RESTART_PROBE_TIMEOUT_S,
+        ):
+            # Ray replays only __init__ on an actor restart, so the driver's
+            # readiness RPC is lost until its next weight update. Engines that
+            # answer finished loading before this restart: serve now, and let
+            # that RPC bring the kv_cache_aware hashing parameters (they are
+            # not in the constructor arguments).
+            logger.info(
+                "disagg frontend %d for replica %d was restarted and its engines "
+                "answer; serving",
+                self._frontend_idx,
+                self._replica_idx,
+            )
+            self._relay.mark_engines_ready(hashing_may_follow=True)
         self._thread, self._base_url, self._server = start_server(
             create_frontend_app(self._relay), port=self._port
         )

@@ -43,10 +43,6 @@ from nemo_rl.models.generation.interfaces import DisaggConfig
 Role = Literal["prefill", "decode"]
 ROLES: tuple[Role, Role] = ("prefill", "decode")
 
-# Role blocks and the frontend/transport blocks are *about* the engines, not
-# settings of one engine, so they never flow into a resolved role config.
-_ROLE_BLOCK_KEYS: tuple[str, ...] = ("prefill_engine", "decode_engine")
-
 
 def as_dict(raw: Any) -> dict[str, Any]:
     """A config block as a plain dict: ``None`` is empty, a model dumps its set fields."""

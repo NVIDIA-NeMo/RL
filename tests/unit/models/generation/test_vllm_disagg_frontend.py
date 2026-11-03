@@ -1,6 +1,7 @@
 """The vLLM disaggregation frontend: legs, routers, bidirectional state, relay."""
 
 import asyncio
+import copy
 import hashlib
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ from nemo_rl.models.generation.vllm.vllm_disagg_frontend import (
     DisaggFrontendImpl,
     EngineEndpoint,
     FrontendRelay,
+    FrontendServeArgs,
     KvCacheAwareRouter,
     KvEventSubscriber,
     LoadBalancingRouter,
@@ -80,7 +82,7 @@ def test_conversation_key_prefers_the_gym_session_id():
     assert conversation_key(_gym_body()) == "sess-1"
 
 
-def test_conversation_key_falls_back_to_the_opening_message_and_is_turn_stable():
+def test_conversation_key_falls_back_to_the_opening_exchange_and_is_turn_stable():
     turn1 = {"messages": [{"role": "user", "content": "q"}]}
     turn2 = {
         "messages": [
@@ -96,6 +98,26 @@ def test_conversation_key_falls_back_to_the_opening_message_and_is_turn_stable()
     assert conversation_key({"prompt": "x"}) is None
 
 
+def test_conversation_key_tells_tasks_apart_behind_a_shared_system_prompt():
+    # An environment's system prompt opens every task's conversation; keying
+    # on it alone would route the whole run to one prefill engine.
+    system = {"role": "system", "content": "You are a SWE agent."}
+    task_a = {"messages": [system, {"role": "user", "content": "fix bug A"}]}
+    task_b = {"messages": [system, {"role": "user", "content": "fix bug B"}]}
+    assert conversation_key(task_a) != conversation_key(task_b)
+    # The G samples of one prompt share its opening exchange (and its prefix).
+    assert conversation_key(task_a) == conversation_key(copy.deepcopy(task_a))
+    # Later turns repeat the exchange, token fields and all, and stay put.
+    later = {
+        "messages": task_a["messages"]
+        + [
+            {"role": "assistant", "content": "ok", "prompt_token_ids": [1]},
+            {"role": "tool", "content": "diff"},
+        ]
+    }
+    assert conversation_key(later) == conversation_key(task_a)
+
+
 # -------------------------------------------------------------------------- #
 #  Legs
 # -------------------------------------------------------------------------- #
@@ -103,7 +125,9 @@ def test_conversation_key_falls_back_to_the_opening_message_and_is_turn_stable()
 
 def test_prefill_leg_is_one_token_non_streaming_and_carries_the_cold_marker():
     body = _gym_body()
-    leg = build_prefill_leg(body, initial_params=_INITIAL)
+    leg = build_prefill_leg(
+        body, initial_params=_INITIAL, ids_as_b64=False, return_prompt_ids_b64=False
+    )
     assert leg["max_tokens"] == 1
     assert leg["stream"] is False
     assert leg["return_token_ids"] is True
@@ -131,7 +155,11 @@ def test_prefill_leg_reflags_a_cached_decode_handshake_for_bidirectional_pull():
         "do_remote_prefill": False,
     }
     leg = build_prefill_leg(
-        _gym_body(), initial_params=_INITIAL, cached_decode_params=cached
+        _gym_body(),
+        initial_params=_INITIAL,
+        cached_decode_params=cached,
+        ids_as_b64=False,
+        return_prompt_ids_b64=False,
     )
     assert leg["kv_transfer_params"]["remote_block_ids"] == [[7, 8]]
     assert leg["kv_transfer_params"]["do_remote_decode"] is True
@@ -147,6 +175,7 @@ def test_prefill_leg_attaches_frontend_ids_and_drops_the_prefix_but_keeps_messag
         initial_params=_INITIAL,
         frontend_prompt_ids=[9, 9, 9],
         ids_as_b64=as_b64,
+        return_prompt_ids_b64=False,
     )
     if as_b64:
         assert decode_token_ids_b64(leg["prompt_token_ids_b64"]) == [9, 9, 9]
@@ -182,7 +211,11 @@ def _prefill_response(**extra):
 
 def test_decode_leg_relays_the_handshake_opaquely_and_fixes_a_default_host():
     leg = build_decode_leg(
-        _gym_body(), prefill_response=_prefill_response(), prefill_host="10.0.0.7"
+        _gym_body(),
+        prefill_response=_prefill_response(),
+        prefill_host="10.0.0.7",
+        ids_as_b64=False,
+        strip_message_history=False,
     )
     params = leg["kv_transfer_params"]
     assert params["some_future_key"] == {"opaque": 1}
@@ -201,7 +234,13 @@ def test_decode_leg_relays_the_handshake_opaquely_and_fixes_a_default_host():
 def test_decode_leg_keeps_a_real_remote_host():
     resp = _prefill_response()
     resp["kv_transfer_params"]["remote_host"] = "10.0.0.9"
-    leg = build_decode_leg(_gym_body(), prefill_response=resp, prefill_host="10.0.0.7")
+    leg = build_decode_leg(
+        _gym_body(),
+        prefill_response=resp,
+        prefill_host="10.0.0.7",
+        ids_as_b64=False,
+        strip_message_history=False,
+    )
     assert leg["kv_transfer_params"]["remote_host"] == "10.0.0.9"
 
 
@@ -223,7 +262,11 @@ def test_decode_leg_b64_and_history_stripping():
 def test_decode_leg_requires_a_handshake_and_prompt_ids():
     with pytest.raises(RelayError) as e:
         build_decode_leg(
-            _gym_body(), prefill_response={"choices": []}, prefill_host="h"
+            _gym_body(),
+            prefill_response={"choices": []},
+            prefill_host="h",
+            ids_as_b64=False,
+            strip_message_history=False,
         )
     assert e.value.status == 502
     with pytest.raises(RelayError, match="prompt_token_ids"):
@@ -231,6 +274,8 @@ def test_decode_leg_requires_a_handshake_and_prompt_ids():
             _gym_body(),
             prefill_response=_prefill_response(prompt_token_ids=None),
             prefill_host="h",
+            ids_as_b64=False,
+            strip_message_history=False,
         )
 
 
@@ -239,6 +284,8 @@ def test_completions_decode_leg_hands_over_a_token_prompt():
         {"model": "m", "prompt": "hello", "max_tokens": 3},
         prefill_response=_prefill_response(),
         prefill_host="h",
+        ids_as_b64=False,
+        strip_message_history=False,
     )
     assert leg["prompt"] == [1, 2, 3, 4, 5, 6]
     assert "prompt_token_ids" not in leg["kv_transfer_params"]
@@ -311,7 +358,7 @@ def test_block_hash_index_returns_the_deepest_owner():
 
 def test_kv_cache_aware_router_prefers_the_engine_holding_the_prefix():
     hasher = _fake_hasher()
-    router = KvCacheAwareRouter(2, hasher=hasher)
+    router = KvCacheAwareRouter(2, hasher=hasher, table_size=100)
     prompt = [1, 2, 3, 4, 5, 6]
     router.index.store(1, hasher.hashes(prompt[:4]))
     router.acquire(0)
@@ -327,7 +374,7 @@ def test_kv_cache_aware_router_prefers_the_engine_holding_the_prefix():
 
 
 def test_kv_event_subscriber_applies_batches_to_the_index():
-    router = KvCacheAwareRouter(1, hasher=_fake_hasher())
+    router = KvCacheAwareRouter(1, hasher=_fake_hasher(), table_size=100)
     sub = KvEventSubscriber(
         engine_idx=0,
         endpoint="tcp://x",
@@ -394,6 +441,10 @@ def _settings(**overrides):
         decode_strip_message_history=False,
         request_timeout_s=30.0,
         prefill_router_table_size=100,
+        kv_events_endpoints=(),
+        kv_events_topic="",
+        render_settings=None,
+        api_key=None,
     )
     base.update(overrides)
     return RelaySettings(**base)
@@ -407,9 +458,11 @@ class _FakeEngines:
         self.prefill_status = prefill_status
         self.decode_status = decode_status
         self.decode_kv = decode_kv
+        self.headers = []
 
-    async def post(self, endpoint, path, payload):
+    async def post(self, endpoint, path, payload, headers=None):
         self.calls.append((endpoint.port, path, payload))
+        self.headers.append(headers)
         if endpoint.port < 9000:  # prefill pool
             if self.prefill_status != 200:
                 return self.prefill_status, {
@@ -516,9 +569,10 @@ def test_relay_bidirectional_round_trip_feeds_the_next_prefill_leg():
         }
     )
     relay = _relay(engines, bidirectional_kv_xfer=True)
-    asyncio.run(relay.relay(CHAT_PATH, _gym_body()))
+    conv = {"conversation_params": {"conversation_id": "c1"}}
+    asyncio.run(relay.relay(CHAT_PATH, _gym_body(**conv)))
     assert len(relay.conversation_cache) == 1
-    asyncio.run(relay.relay(CHAT_PATH, _gym_body()))
+    asyncio.run(relay.relay(CHAT_PATH, _gym_body(**conv)))
     second_prefill_leg = engines.calls[2][2]
     params = second_prefill_leg["kv_transfer_params"]
     assert params["remote_block_ids"] == [[3, 4]]
@@ -527,6 +581,34 @@ def test_relay_bidirectional_round_trip_feeds_the_next_prefill_leg():
     assert len(relay.conversation_cache) == 1
     assert relay.invalidate_conversation_cache() == 1
     assert len(relay.conversation_cache) == 0
+
+
+def test_bidirectional_cache_needs_gyms_conversation_id():
+    # Two GRPO samples of one prompt share the opening message; without Gym's
+    # conversation id neither may inherit the other's decode-side blocks.
+    engines = _FakeEngines(
+        decode_kv={"remote_block_ids": [[3, 4]], "remote_engine_id": "d0"}
+    )
+    relay = _relay(engines, bidirectional_kv_xfer=True)
+    body = _gym_body()
+    body.pop("conversation_params", None)
+    asyncio.run(relay.relay(CHAT_PATH, copy.deepcopy(body)))
+    asyncio.run(relay.relay(CHAT_PATH, copy.deepcopy(body)))
+    assert len(relay.conversation_cache) == 0
+    assert engines.calls[2][2]["kv_transfer_params"] == _INITIAL
+    assert relay.stats["bidirectional_uncached_turns"] == 2
+    assert relay.stats["turns_without_conversation_id"] == 2
+    # Routing still keeps the shared prefix on one prefill engine.
+    assert engines.calls[0][0] == engines.calls[2][0]
+
+
+def test_relay_forwards_the_bearer_token_to_both_legs():
+    engines = _FakeEngines()
+    relay = _relay(engines)
+    asyncio.run(relay.relay(CHAT_PATH, _gym_body(), authorization="Bearer k"))
+    assert engines.headers == [{"Authorization": "Bearer k"}] * 2
+    asyncio.run(relay.relay(CHAT_PATH, _gym_body()))
+    assert engines.headers[2:] == [None, None]
 
 
 def test_relay_uses_the_frontend_renderer_and_falls_back_on_failure():
@@ -593,3 +675,111 @@ def test_frontend_app_serves_health_and_relays_chat():
         ).status_code
         == 400
     )
+
+
+def test_frontend_app_requires_the_engines_bearer_token():
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from nemo_rl.models.generation.vllm.vllm_disagg_frontend import create_frontend_app
+
+    engines = _FakeEngines()
+    relay = _relay(engines, api_key="secret")
+    client = TestClient(create_frontend_app(relay))
+    assert client.get("/health").status_code == 200
+    assert client.post(CHAT_PATH, json=_gym_body()).status_code == 401
+    assert (
+        client.post(
+            CHAT_PATH, json=_gym_body(), headers={"Authorization": "Bearer wrong"}
+        ).status_code
+        == 401
+    )
+    ok = client.post(
+        CHAT_PATH, json=_gym_body(), headers={"Authorization": "Bearer secret"}
+    )
+    assert ok.status_code == 200
+    assert engines.headers == [{"Authorization": "Bearer secret"}] * 2
+
+
+def test_mark_engines_ready_is_idempotent():
+    relay = _relay(_FakeEngines())
+    relay.mark_engines_ready()
+    relay.mark_engines_ready()
+    assert relay.engines_ready
+
+
+def test_restarted_frontend_serves_when_its_engines_answer(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_disagg_frontend as frontend
+
+    monkeypatch.setattr(
+        frontend,
+        "start_server",
+        lambda app, *, port: (
+            SimpleNamespace(is_alive=lambda: True),
+            "http://127.0.0.1:1/v1",
+            SimpleNamespace(),
+        ),
+    )
+    probes = []
+    monkeypatch.setattr(
+        frontend,
+        "engines_answer",
+        lambda addrs, *, api_key, timeout_s: probes.append((addrs, api_key)) or True,
+    )
+    serve_args = FrontendServeArgs(
+        prefill_addrs=[("10.0.0.1", 8001)],
+        decode_addrs=[("10.0.0.2", 9001)],
+        settings=_settings(api_key="k"),
+        engines_ready=False,
+        kv_hashing={},
+    )
+    # A fresh (deferred-load) frontend waits for the driver's readiness RPC ...
+    monkeypatch.setattr(frontend, "_is_reconstructed_actor", lambda: False)
+    fresh = DisaggFrontendImpl(replica_idx=0, port=0, serve_args=serve_args)
+    assert fresh._relay.engines_ready is False and probes == []
+    # ... a restarted one, which Ray re-creates with the same arguments,
+    # probes the engines and serves at once.
+    monkeypatch.setattr(frontend, "_is_reconstructed_actor", lambda: True)
+    restarted = DisaggFrontendImpl(replica_idx=0, port=0, serve_args=serve_args)
+    assert restarted._relay.engines_ready is True
+    assert probes == [([("10.0.0.1", 8001), ("10.0.0.2", 9001)], "k")]
+
+
+def test_engines_answer_requires_every_engine_to_serve(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_disagg_frontend as frontend
+
+    calls = []
+
+    def fake_post(url, *, json, headers, timeout):
+        calls.append((url, headers))
+        if url.startswith("http://down:"):
+            raise frontend.requests.ConnectionError("refused")
+        return SimpleNamespace(status_code=200 if "://ok" in url else 503)
+
+    monkeypatch.setattr(frontend.requests, "post", fake_post)
+    assert frontend.engines_answer([("ok1", 1), ("ok2", 2)], api_key="k", timeout_s=1.0)
+    assert calls[0] == ("http://ok1:1/tokenize", {"Authorization": "Bearer k"})
+    assert not frontend.engines_answer(
+        [("ok1", 1), ("down", 3)], api_key=None, timeout_s=1.0
+    )
+    assert not frontend.engines_answer([("busy", 4)], api_key=None, timeout_s=1.0)
+
+
+def test_kv_cache_aware_relay_can_serve_before_its_hashing_arrives(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_disagg_frontend as frontend
+
+    # The real hasher imports vLLM's hashing helpers; the wiring is the point here.
+    monkeypatch.setattr(
+        frontend, "RequestBlockHasher", lambda **kw: SimpleNamespace(**kw)
+    )
+    relay = FrontendRelay(
+        prefill=[EngineEndpoint("10.0.0.1", 8001)],
+        decode=[EngineEndpoint("10.0.0.2", 9001)],
+        settings=_settings(prefill_router="kv_cache_aware"),
+    )
+    with pytest.raises(ValueError, match="block_size"):
+        relay.mark_engines_ready()
+    relay.mark_engines_ready(hashing_may_follow=True)
+    assert relay.engines_ready and relay.prefill_router.hasher is None
+    relay.mark_engines_ready(block_size=16, hash_algo="sha256")
+    assert relay.prefill_router.hasher is not None

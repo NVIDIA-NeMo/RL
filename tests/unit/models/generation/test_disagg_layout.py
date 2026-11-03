@@ -253,3 +253,24 @@ def test_unified_pg_slicing_consumes_the_sorted_bundles_per_engine_width():
     ]
     with pytest.raises(ValueError, match="needs 6 bundles"):
         slice_engines_on_unified_pg([0, 1, 2, 3], [4, 2])
+
+
+def test_per_node_tiling_refuses_to_leave_gpus_idle():
+    # Both engines fit on the first node; the second node has nothing to hold.
+    with pytest.raises(ValueError, match=r"4 GPU\(s\) are left over with no engines"):
+        tile_engines_on_per_node_pgs(
+            pg_bundle_counts=[4, 4],
+            pg_order=[0, 1],
+            engine_widths=[2, 2],
+            replica_width_gpus=4,
+        )
+
+
+def test_per_node_tiling_refuses_to_run_fewer_engines_than_planned():
+    with pytest.raises(ValueError, match="Only 2 of 3 engines fit"):
+        tile_engines_on_per_node_pgs(
+            pg_bundle_counts=[4],
+            pg_order=[0],
+            engine_widths=[2, 2, 2],
+            replica_width_gpus=6,
+        )

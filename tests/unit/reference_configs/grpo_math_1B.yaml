@@ -73,7 +73,7 @@ grpo:
     # when transient generation errors are expected and acceptable to drop.
     max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: true # Set false to retain pre-update KV caches (avoids repeated prefill).
+    recompute_kv_cache_after_weight_updates: true # Set false to retain pre-update KV caches (avoids repeated prefill). Must be false under policy.generation.disaggregation with in-flight updates on the vLLM backend.
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -524,10 +524,16 @@ policy:
         bidirectional_kv_xfer: false
         decode_tokids_b64: false
         decode_strip_message_history: false
+        conversation_cache_ttl_s: 450.0
+        request_timeout_s: 1800
+        prefill_router_table_size: 100000
+        connector_profile: null
       kv_transfer:
         kv_connector: NixlConnector
+        kv_connector_module_path: null
         kv_connector_extra_config: {}
         kv_load_failure_policy: fail
+        kv_buffer_device: cuda
     vllm_kwargs: {}
     colocated:
       # true: generation shares training GPUs

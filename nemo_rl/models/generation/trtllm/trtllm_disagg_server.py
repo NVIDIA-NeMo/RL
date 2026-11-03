@@ -413,11 +413,9 @@ def _build_frontend_tokenizer(
     off-policy tokens (the adapter shadow-validates a sample under
     NRL_TRTLLM_TOKENIZE_SHADOW_RATE).
     """
-    import base64
-
-    import numpy as np
     from transformers import AutoConfig, AutoTokenizer
 
+    from nemo_rl.models.generation.openai_server_utils import encode_token_ids_b64
     from nemo_rl.models.generation.trtllm.trtllm_http_server import (
         build_spliced_prompt_ids,
         normalize_chat_inputs,
@@ -442,7 +440,7 @@ def _build_frontend_tokenizer(
             model_config,
             effective,
         )
-        return base64.b64encode(np.asarray(ids, dtype=np.int32).tobytes()).decode()
+        return encode_token_ids_b64(ids)
 
     return _tokenize
 

@@ -22,15 +22,13 @@ checkpointing:
 grpo:
   async_grpo:
     # The sibling runs synchronously; async is what exercises refit against
-    # live disaggregated engines.
+    # live disaggregated engines. in_flight_weight_updates (true) and
+    # recompute_kv_cache_after_weight_updates (false) are inherited: in-flight
+    # requests keep their KV across a weight update, as on the TRT-LLM
+    # disaggregation path, and the vLLM backend refuses the recompute variant
+    # under disaggregation (a decode request still receiving KV holds blocks
+    # the cache reset needs free).
     enabled: true
-    in_flight_weight_updates: true
-    # In-flight requests keep their KV across a weight update, as on the
-    # TRT-LLM disaggregation path; every engine and every frontend drops its
-    # reusable caches after each update instead
-    # (VllmGeneration.resume_generation_after_refit), so the next turn of a
-    # conversation re-prefills under the new weights.
-    recompute_kv_cache_after_weight_updates: false
 
 policy:
   megatron_cfg:
@@ -38,7 +36,6 @@ policy:
     context_parallel_size: 4
 
   generation:
-    backend: vllm
     colocated:
       enabled: false
       resources:
@@ -61,11 +58,9 @@ policy:
       # Per-role widths are identical here, so the top-level TP is also the
       # per-engine width; no prefill_engine / decode_engine overrides needed.
       tensor_parallel_size: 2
-      max_model_len: ${policy.max_total_sequence_length}
       gpu_memory_utilization: 0.7
-      async_engine: true
-      # Every engine needs an address for the frontend to reach it.
-      expose_http_server: true
+      # async_engine and expose_http_server, both required by disaggregation
+      # (the frontends reach every engine over HTTP), are inherited as true.
       disagg_frontend:
         prefill_router: conversation
         decode_router: load_balancing
@@ -97,10 +92,24 @@ policy:
         # engines against a full engine-side render.
         NRL_VLLM_TOKENIZE_SHADOW_RATE: "0.1"
     vllm_kwargs:
-      mamba_cache_mode: "none"
       # Required, not a tuning knob: this dataset's prompts run to ~37k tokens.
       enable_chunked_prefill: true
       max_num_batched_tokens: 16384
+
+env:
+  nemo_gym:
+    initial_global_config_dict:
+      policy_model:
+        responses_api_models:
+          vllm_model:
+            # Gym's session id (one per rollout) rides every request as
+            # conversation_params.conversation_id. The frontends route a
+            # trajectory's turns to one prefill engine on it (and, with
+            # bidirectional_kv_xfer, cache decode-side handshakes per
+            # conversation). Without it they hash the conversation's opening
+            # exchange instead, which cannot tell the samples of one prompt
+            # apart.
+            forward_session_id_as_conversation_id: true
 
 logger:
   log_dir: logs/grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-swe1

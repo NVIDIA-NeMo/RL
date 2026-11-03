@@ -64,7 +64,7 @@ grpo:
     # when transient generation errors are expected and acceptable to drop.
     max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: true # Set false to retain pre-update KV caches (avoids repeated prefill).
+    recompute_kv_cache_after_weight_updates: true # Set false to retain pre-update KV caches (avoids repeated prefill). Must be false under policy.generation.disaggregation with in-flight updates on the vLLM backend.
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -617,6 +617,17 @@ policy:
         # history (the relayed ids carry the whole prefix).
         decode_tokids_b64: false
         decode_strip_message_history: false
+        # bidirectional_kv_xfer only: seconds a frontend remembers a
+        # conversation's decode-side blocks; keep below the decode engine's
+        # decoder_kv_blocks_ttl so it never offers blocks already freed.
+        conversation_cache_ttl_s: 450.0
+        # Per-leg HTTP timeout: a turn can prefill tens of thousands of tokens
+        # and decode for minutes behind other requests.
+        request_timeout_s: 1800
+        # Conversations the conversation router remembers per frontend (LRU).
+        prefill_router_table_size: 100000
+        # Handshake protocol of a custom connector; built-in ones need none.
+        connector_profile: null
       # The KV connector every engine of a replica is built with: the vLLM
       # counterpart of trtllm_kwargs.cache_transceiver_config. kv_role follows
       # the engine's role (prefill -> kv_producer, decode -> kv_consumer).
@@ -625,8 +636,12 @@ policy:
       # decoder_kv_blocks_ttl). Defaults live on VllmKvTransferConfig.
       kv_transfer:
         kv_connector: NixlConnector
+        # Module path of a connector not built into vLLM; null for built-ins.
+        kv_connector_module_path: null
         kv_connector_extra_config: {}
         kv_load_failure_policy: fail
+        # Where the connector stages KV: cuda (GPU to GPU) or cpu.
+        kv_buffer_device: cuda
     vllm_kwargs: {}
     colocated:
       # true: generation shares training GPUs

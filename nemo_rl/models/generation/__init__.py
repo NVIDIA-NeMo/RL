@@ -24,10 +24,10 @@ from nemo_rl.models.generation.trtllm.config import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import (
-    resolve_vllm_role_overrides,
-    validate_vllm_disaggregation,
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    resolve_vllm_role_overrides,
     validate_nvfp4_pertoken_generation,
+    validate_vllm_disaggregation,
     validate_vllm_quantization_config,
 )
 

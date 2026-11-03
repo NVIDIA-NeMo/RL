@@ -31,12 +31,15 @@ from typing import (
 import numpy as np
 import ray
 from ray.util.placement_group import PlacementGroup
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH,
+    DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW,
     DEFAULT_DISAGG_KV_EVENTS_PORT_RANGE_HIGH,
     DEFAULT_DISAGG_KV_EVENTS_PORT_RANGE_LOW,
     DEFAULT_DISAGG_KV_SIDE_CHANNEL_PORT_RANGE_HIGH,
@@ -59,19 +62,22 @@ from nemo_rl.models.generation.fleet_health import (
     HealthyShardSelector,
 )
 from nemo_rl.models.generation.interfaces import (
+    DisaggConfig,
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
     agreed_media_columns,
 )
+from nemo_rl.models.generation.vllm.chat_render import RenderSettings
 from nemo_rl.models.generation.vllm.config import (
+    HTTP_SERVING_CHAT_DEFAULT_KWARGS,
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
     VllmDisaggFrontendConfig,
     resolve_vllm_connector_profile,
-    resolve_vllm_kv_transfer_config,
     resolve_vllm_disagg_frontend_config,
     resolve_vllm_disagg_layout,
+    resolve_vllm_kv_transfer_config,
     validate_vllm_disaggregation,
     validate_vllm_disaggregation_for_refit,
     validate_vllm_quantization_config,
@@ -90,6 +96,12 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
+from nemo_rl.models.generation.vllm.vllm_disagg_frontend import (
+    DisaggFrontendActor,
+    FrontendServeArgs,
+    RelaySettings,
+)
+from nemo_rl.models.generation.vllm.vllm_worker import effective_vllm_kwargs
 from nemo_rl.telemetry.instrumentation import trace_fn
 from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
 from nemo_rl.telemetry.setup import get_telemetry_handle
@@ -115,14 +127,6 @@ logger = logging.getLogger(__name__)
 _KV_EVENTS_TOPIC = "nemo-rl-kv"
 
 
-def _load_hf_config_for_validation(model_name: str) -> Any:
-    """The model's HF config, for setup-time checks that depend on the architecture."""
-    # Deferred: transformers is heavy and only this check needs it here.
-    from transformers import AutoConfig
-
-    return AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-
-
 def _bundles_in_node_order(pg: PlacementGroup) -> list[int]:
     """A unified PG's bundle indices sorted by (node id, bundle index)."""
     pg_table = ray.util.placement_group_table(pg)
@@ -135,24 +139,24 @@ def _bundles_in_node_order(pg: PlacementGroup) -> list[int]:
     return flat
 
 
-def _node_of_placement_groups(placement_groups: list[PlacementGroup]) -> dict[int, str]:
-    """Physical node behind each per-node placement group, by PG index.
+def _node_of_bundles(
+    placement_groups: list[PlacementGroup],
+) -> dict[tuple[int, int], str]:
+    """Physical node behind each ``(PG index, bundle index)``.
 
-    Empty for a unified PG, whose single index spans several nodes; callers
-    then fall back to the PG index as the node key, which is only used to
-    number engines on a node and is harmless when every engine is wider than
-    one anyway.
+    Read from Ray's placement-group table, so per-node PGs and a unified PG
+    whose bundles span several nodes are handled alike. Bundles missing from
+    the table fall back to the PG index as their node key in the caller, which
+    only affects how engines are numbered on a node.
     """
-    if len(placement_groups) <= 1:
-        return {}
-    node_of_pg: dict[int, str] = {}
+    node_of_bundle: dict[tuple[int, int], str] = {}
     for pg_idx, pg in enumerate(placement_groups):
         bundles_to_node = (
             ray.util.placement_group_table(pg).get("bundles_to_node_id") or {}
         )
-        if bundles_to_node:
-            node_of_pg[pg_idx] = next(iter(bundles_to_node.values()))
-    return node_of_pg
+        for bundle_idx, node_id in bundles_to_node.items():
+            node_of_bundle[(pg_idx, int(bundle_idx))] = node_id
+    return node_of_bundle
 
 
 def http_server_api_key_and_worker_config(
@@ -239,7 +243,16 @@ def _record_vllm_generation_metrics(
 def disagg_engine_env_defaults(config: VllmConfig) -> dict[str, str]:
     """Environment every disaggregated engine process gets unless the recipe says otherwise.
 
-    NIXL's wheel bundles its own CUDA-enabled UCX, but a UCX that is already
+    Two variables, both for the NIXL connector; ``vllm_cfg.env_vars`` wins over
+    either.
+
+    ``VLLM_SSM_CONV_STATE_LAYOUT=DS``: NixlConnector moves a Mamba/SSM layer's
+    conv state in three reads and asserts the dim-first ("DS") state layout at
+    worker start, while vLLM's default is "SD". Inert for models without such
+    layers, so every NIXL engine gets it.
+
+    ``NCCL_NET_PLUGIN=none`` (GPU-staged KV only): NIXL's wheel bundles its
+    own CUDA-enabled UCX, but a UCX that is already
     loaded in the process wins when NIXL's UCX plugin binds. In the NGC/HPC-X
     based containers NCCL's network plugin (``libnccl-net.so``, found through
     the loader cache) pulls HPC-X's UCX -- built without CUDA memory support --
@@ -247,32 +260,58 @@ def disagg_engine_env_defaults(config: VllmConfig) -> dict[str, str]:
     registration then fails with "VRAM memory is detected as host by UCX".
     Keeping NCCL's plugin out of the engines leaves NCCL its built-in IB and
     socket transports and lets NIXL use the UCX it ships. Only the NIXL
-    connector registering GPU memory needs this; ``vllm_cfg.env_vars`` wins.
+    connector registering GPU memory needs this.
     """
     if not resolve_vllm_disagg_layout(config).enabled:
         return {}
     kv_transfer = resolve_vllm_kv_transfer_config(config)
-    if (
-        kv_transfer.kv_connector != "NixlConnector"
-        or kv_transfer.kv_buffer_device != "cuda"
-    ):
+    if kv_transfer.kv_connector != "NixlConnector":
         return {}
-    return {"NCCL_NET_PLUGIN": "none"}
+    env = {"VLLM_SSM_CONV_STATE_LAYOUT": "DS"}
+    if kv_transfer.kv_buffer_device == "cuda":
+        env["NCCL_NET_PLUGIN"] = "none"
+    return env
 
 
 class VllmGeneration(GenerationInterface):
+    # Prefill/decode disaggregation state. The class-level values are the
+    # "off" defaults, so an instance created without __init__ (several unit
+    # tests build one with __new__) behaves as an aggregated deployment;
+    # __init__ replaces them with the resolved per-instance values.
+    _disagg_cfg: DisaggConfig = DisaggConfig()
+    _disagg_frontend_cfg: Optional[VllmDisaggFrontendConfig] = None
+
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
         generation_config = cast(VllmConfig, master_config.policy["generation"])
         assert_reload_refit_config_supported(generation_config)
-        async_cfg = getattr(getattr(master_config, "grpo", None), "async_grpo", None)
+        if not resolve_vllm_disagg_layout(generation_config).enabled:
+            return
+        # SingleController has no drain-before-refit mode: every weight update
+        # pauses the engines with rollouts in flight, and whether that pause
+        # clears their caches is async_rl.recompute_kv_cache_after_weight_updates
+        # (grpo.async_grpo is nulled on this entrypoint, so it says nothing).
         validate_vllm_disaggregation_for_refit(
             generation_config,
-            in_flight_weight_updates=bool(
-                getattr(async_cfg, "in_flight_weight_updates", False)
+            in_flight_weight_updates=True,
+            recompute_kv_cache_after_weight_updates=bool(
+                master_config.async_rl.recompute_kv_cache_after_weight_updates
             ),
         )
+        # Ledger-authoritative token capture resolves a request's on-policy
+        # prefix from the ledger (``ng_capture``), not from its messages. The
+        # frontend drops ``ng_capture`` from the prefill leg (capture may only
+        # complete on the decode leg), so the prefill engine would compute KV
+        # for the re-tokenized conversation while the decode leg splices the
+        # ledger prefix in: KV for one sequence, prompt for another.
+        if master_config.token_capture.enabled:
+            raise ValueError(
+                "policy.generation.disaggregation.enabled cannot be combined with "
+                "token_capture.enabled on the vLLM backend: the prefill engine "
+                "never sees the ledger prefix the decode leg splices in. Disable "
+                "one of the two."
+            )
 
     @staticmethod
     def init_cluster_placement_groups(
@@ -348,16 +387,8 @@ class VllmGeneration(GenerationInterface):
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
         self.model_parallel_size = self.tp_size * self.pp_size
 
-        # Prefill/decode disaggregation. Validated once here rather than per
-        # access: every default lives on the schema, so the rest of this class
-        # reads attributes instead of re-deriving a default per key.
-        self._disagg_cfg = resolve_vllm_disagg_layout(config)
-        self._disagg_frontend_cfg: Optional[VllmDisaggFrontendConfig] = None
-        if self._disagg_cfg.enabled:
-            validate_vllm_disaggregation(
-                config, hf_config=_load_hf_config_for_validation(self.cfg["model_name"])
-            )
-            self._disagg_frontend_cfg = resolve_vllm_disagg_frontend_config(config)
+        # Prefill/decode disaggregation. The containers come first so that a
+        # deployment rejected by the validation below still shuts down cleanly.
         # One frontend actor per (replica, frontend) and the URLs they serve;
         # stay empty unless disaggregation is on. See _start_disagg_frontends.
         self._disagg_actors: list[ray.actor.ActorHandle] = []
@@ -368,6 +399,18 @@ class VllmGeneration(GenerationInterface):
         self._engine_env_vars: dict[str, str] = {}
         # The engine addresses the frontends were given, in engine order.
         self._disagg_engine_addrs: list[dict[str, Any]] = []
+        # Whether the frontends have been told the engines serve, and with
+        # which hashing parameters; replayed to a frontend Ray restarts.
+        self._frontends_marked_ready = False
+        self._frontend_kv_hashing: dict[str, Any] = {}
+        # Validated once here rather than per access: every default lives on
+        # the schema, so the rest of this class reads attributes instead of
+        # re-deriving a default per key.
+        self._disagg_cfg = resolve_vllm_disagg_layout(config)
+        self._disagg_frontend_cfg = None
+        if self._disagg_cfg.enabled:
+            validate_vllm_disaggregation(config)
+            self._disagg_frontend_cfg = resolve_vllm_disagg_frontend_config(config)
 
         # Per-engine role and width, in engine order -- the single source of
         # truth for how the cluster is sliced. Without disaggregation every
@@ -910,7 +953,7 @@ class VllmGeneration(GenerationInterface):
         assert frontend is not None
         profile = resolve_vllm_connector_profile(self.cfg)
         kv_events = frontend.prefill_router == "kv_cache_aware"
-        node_of_pg = _node_of_placement_groups(cluster.get_placement_groups())
+        node_of_bundle = _node_of_bundles(cluster.get_placement_groups())
 
         engines_per_replica = self.num_engines // self.num_replicas
         engine_roles: dict[str, dict[str, Any]] = {}
@@ -926,19 +969,26 @@ class VllmGeneration(GenerationInterface):
             replica_idx = engine_index // engines_per_replica
             # Node-local slot: the engine's ordinal among the engines on its
             # node, which is what every per-node port band is indexed by.
-            node = node_of_pg.get(pg_idx, f"pg{pg_idx}")
+            node = node_of_bundle.get((pg_idx, bundles[0]), f"pg{pg_idx}")
             slot = slot_on_node.get(node, 0)
             slot_on_node[node] = slot + 1
             side_channel_port = DEFAULT_DISAGG_KV_SIDE_CHANNEL_PORT_RANGE_LOW + slot
             assert side_channel_port < DEFAULT_DISAGG_KV_SIDE_CHANNEL_PORT_RANGE_HIGH, (
                 f"{slot + 1} engines on one node exceed the KV side-channel port band"
             )
-            env: dict[str, Any] = {
-                # Deterministic VLLM_PORT per engine; configure_worker's slot
-                # arithmetic assumes equal widths and would collide here.
-                "VLLM_PORT": DEFAULT_VLLM_PORT_RANGE_LOW
-                + slot * DEFAULT_VLLM_PORTS_PER_ENGINE,
-            }
+            # Deterministic VLLM_PORT per engine; configure_worker's slot
+            # arithmetic assumes equal widths and would collide here. The
+            # rendezvous band ends where the frontend band starts.
+            vllm_port = (
+                DEFAULT_VLLM_PORT_RANGE_LOW + slot * DEFAULT_VLLM_PORTS_PER_ENGINE
+            )
+            assert (
+                vllm_port + DEFAULT_VLLM_PORTS_PER_ENGINE
+                <= DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
+            ), (
+                f"{slot + 1} engines on one node run VLLM_PORT into the frontend port band"
+            )
+            env: dict[str, Any] = {"VLLM_PORT": vllm_port}
             if profile.side_channel_port_env is not None:
                 env[profile.side_channel_port_env] = side_channel_port
             entry: dict[str, Any] = {
@@ -1034,33 +1084,36 @@ class VllmGeneration(GenerationInterface):
         assert not missing, f"engines {missing} reported no HTTP address"
         return reported
 
-    def _render_settings(self) -> Any:
+    def _render_settings(self) -> RenderSettings:
         """What the frontends need to render exactly like the engines' servers."""
-        from nemo_rl.models.generation.vllm.chat_render import RenderSettings
-
         vllm_cfg = self.cfg["vllm_cfg"]
-        serving = dict(vllm_cfg.get("http_server_serving_chat_kwargs") or {})
+        serving = HTTP_SERVING_CHAT_DEFAULT_KWARGS | dict(
+            vllm_cfg.get("http_server_serving_chat_kwargs") or {}
+        )
         # Same normalization as vllm_worker_async._setup_vllm_openai_api_server:
         # vLLM's spelling first, the older recipe spelling as the fallback.
         template_kwargs = serving.get("default_chat_template_kwargs")
         if template_kwargs is None:
             template_kwargs = serving.get("chat_template_kwargs")
-        vllm_kwargs = self.cfg.get("vllm_kwargs") or {}
+        # The prefill engines' kwargs, role overrides and late-added shared
+        # keys included: the renderer's ModelConfig must come from the same
+        # AsyncEngineArgs the engine builds (tokenizer, tokenizer_mode,
+        # revision, hf_overrides, config_format, ...).
+        engine_kwargs = effective_vllm_kwargs(
+            self.cfg, vllm_role_engine_config(self.cfg, "prefill"), disaggregated=True
+        )
         return RenderSettings(
             model_name=self.cfg["model_name"],
-            chat_template=serving.get("chat_template"),
-            chat_template_content_format=serving.get(
-                "chat_template_content_format", "auto"
-            ),
+            chat_template=serving["chat_template"],
+            chat_template_content_format=serving["chat_template_content_format"],
             default_chat_template_kwargs=dict(template_kwargs or {}),
-            enable_auto_tools=bool(serving.get("enable_auto_tools", True)),
+            enable_auto_tools=bool(serving["enable_auto_tools"]),
             tool_parser=serving.get("tool_parser"),
             reasoning_parser=serving.get("reasoning_parser"),
             tool_parser_plugin=vllm_cfg.get("tool_parser_plugin"),
             reasoning_parser_plugin=vllm_cfg.get("reasoning_parser_plugin"),
-            hf_overrides=dict(vllm_kwargs.get("hf_overrides") or {}),
+            engine_kwargs=engine_kwargs,
             max_model_len=int(vllm_cfg["max_model_len"]),
-            config_format=vllm_kwargs.get("config_format"),
         )
 
     def _kv_hashing_for_frontends(self) -> dict[str, Any]:
@@ -1090,14 +1143,6 @@ class VllmGeneration(GenerationInterface):
             return self._disagg_frontend_urls
         self._disagg_engine_addrs = list(addrs)
 
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-        from nemo_rl.models.generation.vllm.vllm_disagg_frontend import (
-            DisaggFrontendActor,
-            FrontendServeArgs,
-            RelaySettings,
-        )
-
         disagg = self._disagg_cfg
         frontend = self._disagg_frontend_cfg
         assert frontend is not None
@@ -1114,6 +1159,20 @@ class VllmGeneration(GenerationInterface):
             f"{self.num_replicas} * {n_fe} > 256"
         )
         base_port = disagg.frontend_base_port
+        # Frontends share their nodes with the engines' own bands (VLLM_PORT,
+        # KV side channel, KV events), so every frontend port must stay inside
+        # the frontend band.
+        assert (
+            DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
+            <= base_port
+            < base_port + self.num_replicas * n_fe
+            <= DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH
+        ), (
+            f"frontend ports {base_port}..{base_port + self.num_replicas * n_fe - 1} "
+            "must lie in the frontend port band "
+            f"[{DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW}, "
+            f"{DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH})"
+        )
         render_settings = self._render_settings() if disagg.frontend_tokenize else None
         kv_hashing = self._kv_hashing_for_frontends() if engines_ready else {}
 
@@ -1145,6 +1204,7 @@ class VllmGeneration(GenerationInterface):
                 kv_events_endpoints=kv_events_endpoints,
                 kv_events_topic=_KV_EVENTS_TOPIC,
                 render_settings=render_settings,
+                api_key=self.http_server_api_key,
             )
             serve_args = FrontendServeArgs(
                 prefill_addrs=[(a["host"], a["port"]) for a in prefill_addrs],
@@ -1204,10 +1264,17 @@ class VllmGeneration(GenerationInterface):
         )
 
     def _mark_frontends_ready(self) -> None:
-        kv_hashing = self._kv_hashing_for_frontends()
+        self._frontend_kv_hashing = self._kv_hashing_for_frontends()
+        self._frontends_marked_ready = True
+        self._remark_frontends_ready()
+
+    def _remark_frontends_ready(self) -> None:
+        """(Re)send the readiness RPC to every frontend; a no-op before the first mark."""
+        if not self._frontends_marked_ready or not self._disagg_actors:
+            return
         ray.get(
             [
-                actor.mark_engines_ready.remote(**kv_hashing)
+                actor.mark_engines_ready.remote(**self._frontend_kv_hashing)
                 for actor in self._disagg_actors
             ]
         )
@@ -2495,6 +2562,11 @@ class VllmGeneration(GenerationInterface):
         own pause then completes at once (no engine waits on a decode engine
         unless bidirectional KV transfer pins blocks there; see
         validate_vllm_disaggregation_for_refit).
+
+        ``clear_cache`` is False here by construction: that same validation
+        refuses recompute_kv_cache_after_weight_updates under disaggregation,
+        because vLLM's cache reset raises while a decode request that is not
+        running still holds blocks for KV in transit.
         """
         by_role = self._engine_owner_workers_by_role()
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
@@ -2527,13 +2599,19 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Worker group is not initialized")
 
         if self._disagg_cfg.enabled:
-            # In-flight requests keep their KV across the update (the pause
-            # preserved it), but nothing may *reuse* pre-update blocks: the next
-            # turn of every conversation re-prefills under the new weights, on
-            # the prefill engines and on the decode engines alike. TRT-LLM does
-            # this inside its refit; here it is explicit, before resuming.
-            ray.get(self._run_on_engines("reset_prefix_cache_async"))
+            # No cache reset here. An in-flight update under disaggregation
+            # never clears the engines' caches (recompute_kv_cache_after_weight_updates
+            # is refused at setup: vLLM's reset raises while a decode request
+            # still holds blocks for KV in transit), so pre-update blocks stay
+            # reusable until evicted -- the trade the aggregated path makes
+            # with the flag off. What is specific to disaggregation is the
+            # frontends' memory of decode-side blocks (bidirectional_kv_xfer):
+            # those handshakes point at pre-update KV and must not seed the
+            # next prefill.
             self._invalidate_frontend_conversation_caches()
+            # A frontend Ray restarted meanwhile came back not ready (Ray
+            # replays __init__, not the readiness RPC); re-marking is idempotent.
+            self._remark_frontends_ready()
             # Decode engines first: the moment a prefill engine resumes it
             # finishes frozen prefills and leases their blocks to decode
             # engines that must be running to read them.

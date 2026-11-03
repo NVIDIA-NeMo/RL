@@ -40,6 +40,8 @@ if TYPE_CHECKING:
     from fastapi import FastAPI, Request
 
 from nemo_rl.models.generation.openai_server_utils import (
+    decode_token_ids_b64,
+    encode_token_ids_b64,
     replace_prefix_tokens,
 )
 
@@ -249,13 +251,7 @@ def _context_leg_response(
     # The orchestrator asks for the base64 int32 buffer when it wants to relay a
     # string instead of materialising the int list on its event loop.
     if return_prompt_token_ids_b64:
-        import base64
-
-        import numpy as np
-
-        response["prompt_token_ids_b64"] = base64.b64encode(
-            np.asarray(prompt_token_ids, dtype=np.int32).tobytes()
-        ).decode("ascii")
+        response["prompt_token_ids_b64"] = encode_token_ids_b64(prompt_token_ids)
     else:
         response["prompt_token_ids"] = prompt_token_ids
 
@@ -423,13 +419,7 @@ def create_app(
         supplied = body.get("prompt_token_ids") or body.get("prompt_token_ids_b64")
         if isinstance(supplied, str):
             # Same int32 buffer encoding openai_server.py uses on this hop.
-            import base64
-
-            import numpy as np
-
-            supplied = np.frombuffer(
-                base64.b64decode(supplied), dtype=np.int32
-            ).tolist()
+            supplied = decode_token_ids_b64(supplied)
 
         if supplied:
             adj_prompt = list(supplied)

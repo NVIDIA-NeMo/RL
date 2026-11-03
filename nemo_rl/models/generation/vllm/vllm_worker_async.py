@@ -65,7 +65,10 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
-from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.vllm.config import (
+    HTTP_SERVING_CHAT_DEFAULT_KWARGS,
+    parse_nvfp4_pertoken_rollout,
+)
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -1403,6 +1406,7 @@ class VllmAsyncGenerationWorkerImpl(
                         request,
                         res[1][0]["prompt_token_ids"],
                         admission=admission,
+                        prefix_token_ids=capture_prefix_token_ids,
                         media=media,
                     )
                     return res
@@ -1621,16 +1625,9 @@ class VllmAsyncGenerationWorkerImpl(
         class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
             pass
 
-        serving_chat_default_kwargs = dict(
-            response_role="assistant",
-            request_logger=None,
-            chat_template=None,
-            chat_template_content_format="auto",
-            enable_auto_tools=True,
-        )
-        serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
-            "http_server_serving_chat_kwargs", dict()
-        )
+        serving_chat_kwargs = HTTP_SERVING_CHAT_DEFAULT_KWARGS | self.cfg[
+            "vllm_cfg"
+        ].get("http_server_serving_chat_kwargs", dict())
         # The embedded server is constructed directly instead of through
         # vLLM's CLI, where chat-template file paths are normally loaded.
         # OnlineRenderer expects literal Jinja content; passing a path makes

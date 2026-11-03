@@ -59,6 +59,19 @@ class VllmVideoConfig(BaseModel):
     temporal_patch_size: PositiveInt
 
 
+# Defaults the embedded OpenAI chat server is built with when a recipe leaves
+# ``vllm_cfg.http_server_serving_chat_kwargs`` (a pass-through to vLLM's
+# ``OpenAIServingChat``) unset. The engines' HTTP server and the disaggregation
+# frontends both render from these, so they live in one place.
+HTTP_SERVING_CHAT_DEFAULT_KWARGS: dict[str, Any] = {
+    "response_role": "assistant",
+    "request_logger": None,
+    "chat_template": None,
+    "chat_template_content_format": "auto",
+    "enable_auto_tools": True,
+}
+
+
 class VllmEngineArgs(BaseModel, extra="forbid"):
     """One role's engine overrides: ``vllm_cfg.{prefill,decode}_engine``.
 
@@ -827,82 +840,69 @@ def vllm_kv_transfer_config_for_role(
 
 
 def validate_vllm_disaggregation_for_refit(
-    config: VllmConfig, *, in_flight_weight_updates: bool
+    config: VllmConfig,
+    *,
+    in_flight_weight_updates: bool,
+    recompute_kv_cache_after_weight_updates: bool,
 ) -> None:
     """Reject disaggregation settings that cannot survive an in-flight refit.
 
     An in-flight weight update pauses every engine with vLLM's "keep" mode,
-    which completes only once the engine is idle -- and a finished request
-    whose blocks the KV connector still holds counts as work. Under
-    ``bidirectional_kv_xfer`` every decode engine pins each finished turn's
-    blocks for ``decoder_kv_blocks_ttl`` (vLLM default 480 s) so the next
-    turn's prefill can pull them back, and vLLM offers no call to release them
-    early, so the pause would block for up to that TTL on every update.
+    which freezes the in-flight requests in place.
+
+    * ``recompute_kv_cache_after_weight_updates`` makes that pause clear the
+      engine's caches: vLLM preempts the running requests and then requires
+      every KV block to be free. Under disaggregation some blocks belong to
+      requests that are not running -- a decode request whose KV is still
+      arriving from (or queued behind) the prefill engine, or a finished
+      prefill whose blocks the decode engine has not read yet -- so the reset
+      raises ("waiting for remote KV transfer, which is not supported yet")
+      and the engine is lost. In-flight requests therefore keep their KV
+      across an update and the prefix caches are left to eviction, as the
+      aggregated path does with the flag off.
+    * The pause completes only once the engine holds no connector-pinned
+      blocks. Under ``bidirectional_kv_xfer`` every decode engine pins each
+      finished turn's blocks for ``decoder_kv_blocks_ttl`` (vLLM default
+      480 s) so the next turn's prefill can pull them back, and vLLM offers
+      no call to release them early, so the pause would block for up to that
+      TTL on every update.
     """
     if not in_flight_weight_updates:
         return
     layout = resolve_vllm_disagg_layout(config)
     if not layout.enabled:
         return
+    if recompute_kv_cache_after_weight_updates:
+        raise ValueError(
+            "recompute_kv_cache_after_weight_updates=true cannot be combined with "
+            "in-flight weight updates under policy.generation.disaggregation on the "
+            "vLLM backend: clearing an engine's KV cache at the pause needs every "
+            "block to be free, and a decode request still waiting for its KV from "
+            "the prefill engine (or a finished prefill the decode engine has not "
+            "read yet) holds blocks, so vLLM raises and the engine dies. Set it to "
+            "false: in-flight requests keep their KV across the update, as on the "
+            "TRT-LLM disaggregation path."
+        )
     frontend = resolve_vllm_disagg_frontend_config(config)
     if frontend.bidirectional_kv_xfer:
         raise ValueError(
             "policy.generation.vllm_cfg.disagg_frontend.bidirectional_kv_xfer=true "
-            "cannot be combined with grpo.async_grpo.in_flight_weight_updates=true: "
-            "vLLM completes the in-flight pause only once an engine holds no "
+            "cannot be combined with in-flight weight updates "
+            "(grpo.async_grpo.in_flight_weight_updates, or any SingleController "
+            "run): vLLM completes the in-flight pause only once an engine holds no "
             "connector-pinned blocks, and bidirectional KV transfer pins every "
             "finished turn's blocks on the decode engines for decoder_kv_blocks_ttl. "
             "Turn one of the two off."
         )
 
 
-# Model types whose Mamba/SSM layers vLLM's NixlConnector can hand over only
-# between engines of equal TP (the recurrent state has no head-splitting
-# remap yet). Checked by name and by the HF config attributes hybrid models
-# carry, so a new hybrid model is caught even if its name is not listed.
-_HYBRID_SSM_MODEL_TYPES = frozenset(
-    {
-        "nemotron_h",
-        "nemotron_h_omni",
-        "mamba",
-        "mamba2",
-        "jamba",
-        "bamba",
-        "zamba2",
-        "falcon_h1",
-        "granitemoehybrid",
-        "qwen3_next",
-        "lfm2",
-        "plamo2",
-    }
-)
-_HYBRID_SSM_CONFIG_ATTRS = (
-    "hybrid_override_pattern",
-    "layers_block_type",
-    "mamba_d_state",
-)
-
-
-def hybrid_ssm_requires_homogeneous_tp(hf_config: Any) -> bool:
-    """Whether ``hf_config`` describes a model with Mamba/SSM layers."""
-    text_config = getattr(hf_config, "text_config", None) or hf_config
-    model_type = str(getattr(text_config, "model_type", "") or "").lower()
-    if model_type in _HYBRID_SSM_MODEL_TYPES:
-        return True
-    return any(
-        getattr(text_config, attr, None) is not None
-        for attr in _HYBRID_SSM_CONFIG_ATTRS
-    )
-
-
-def validate_vllm_disaggregation(
-    config: VllmConfig, *, hf_config: Any | None = None
-) -> None:
+def validate_vllm_disaggregation(config: VllmConfig) -> None:
     """Refuse at setup the disaggregation configs that would run wrong or hang.
 
-    ``config`` must be role-resolved. ``hf_config`` enables the hybrid-SSM TP
-    check when the caller has it; the driver passes it, pure-config callers
-    may not.
+    ``config`` must be role-resolved. Model-architecture limits (which layer
+    types a connector can move, and at which TP ratios) are vLLM's to check:
+    its connector worker raises at engine start, and a list kept here would
+    drift from it.
     """
     layout = resolve_vllm_disagg_layout(config)
     if not layout.enabled:
@@ -963,15 +963,3 @@ def validate_vllm_disaggregation(
             "generation.disaggregation.frontend_tokenize=true: the frontend hashes "
             "the prompt's blocks itself to match them against the engines' events."
         )
-    if hf_config is not None and hybrid_ssm_requires_homogeneous_tp(hf_config):
-        tps = {
-            role: int(vllm_role_engine_config(config, role)["tensor_parallel_size"])
-            for role in disagg_layout.ROLES
-        }
-        if tps["prefill"] != tps["decode"]:
-            raise ValueError(
-                "This model has Mamba/SSM layers, whose recurrent state vLLM's KV "
-                "connector can only hand over between engines of equal tensor "
-                f"parallelism; got prefill TP {tps['prefill']} and decode TP "
-                f"{tps['decode']}. Give both roles the same tensor_parallel_size."
-            )

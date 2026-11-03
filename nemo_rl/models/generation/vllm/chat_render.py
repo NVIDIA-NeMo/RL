@@ -58,10 +58,13 @@ class RenderSettings:
     reasoning_parser: str | None
     tool_parser_plugin: str | None
     reasoning_parser_plugin: str | None
-    # ``vllm_kwargs`` keys that shape the HF config the renderer sees.
-    hf_overrides: dict[str, Any]
+    # The prefill engines' effective ``vllm_kwargs``. ``AsyncEngineArgs`` is
+    # built from them exactly as the engine does, so every key that shapes the
+    # HF config or the tokenizer (``hf_overrides``, ``tokenizer``,
+    # ``tokenizer_mode``, ``revision``, ``config_format``, ...) reaches the
+    # renderer's ``ModelConfig``.
+    engine_kwargs: dict[str, Any]
     max_model_len: int
-    config_format: str | None
 
 
 def last_assistant_prefix(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -98,6 +101,7 @@ class FrontendChatRenderer:
             tokenizer_args_from_config,
         )
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
+        from vllm.utils.mistral import is_mistral_tokenizer
 
         if settings.tool_parser_plugin:
             ToolParserManager.import_tool_parser(settings.tool_parser_plugin)
@@ -106,15 +110,21 @@ class FrontendChatRenderer:
                 settings.reasoning_parser_plugin
             )
 
+        # The engine builds AsyncEngineArgs(**vllm_kwargs) (vllm_worker_async),
+        # so the renderer's ModelConfig comes from the same arguments and every
+        # tokenizer- and config-shaping key reaches it. compilation_config is
+        # engine-only and may still be a dict here (the worker converts it).
         engine_args_kwargs: dict[str, Any] = {
-            "model": settings.model_name,
-            "trust_remote_code": True,
-            "hf_overrides": dict(settings.hf_overrides),
-            "max_model_len": settings.max_model_len,
-            "skip_tokenizer_init": False,
+            key: value
+            for key, value in settings.engine_kwargs.items()
+            if key != "compilation_config"
         }
-        if settings.config_format is not None:
-            engine_args_kwargs["config_format"] = settings.config_format
+        engine_args_kwargs.update(
+            model=settings.model_name,
+            trust_remote_code=True,
+            max_model_len=settings.max_model_len,
+            skip_tokenizer_init=False,
+        )
         model_config = AsyncEngineArgs(**engine_args_kwargs).create_model_config()
         if MULTIMODAL_REGISTRY.supports_multimodal_inputs(model_config):
             raise ValueError(
@@ -124,6 +134,15 @@ class FrontendChatRenderer:
             )
 
         tokenizer = cached_tokenizer_from_config(model_config)
+        if is_mistral_tokenizer(tokenizer):
+            raise ValueError(
+                "disaggregation.frontend_tokenize does not support Mistral "
+                f"tokenizers ({settings.model_name}): the engine's render path "
+                "runs Mistral-specific request rewriting (tool-call "
+                "serialization, id truncation) that the frontend does not "
+                "replicate. Disable frontend_tokenize to render on the prefill "
+                "engines."
+            )
         renderer_mode, *_ = tokenizer_args_from_config(model_config)
         # The engine's server resolves a chat-template file path to its
         # content before handing it to the renderer; do the same.
@@ -159,6 +178,14 @@ class FrontendChatRenderer:
             reasoning_parser=settings.reasoning_parser,
             default_chat_template_kwargs=settings.default_chat_template_kwargs,
         )
+        if self._online_renderer.use_harmony:
+            raise ValueError(
+                "disaggregation.frontend_tokenize does not support gpt-oss "
+                f"(harmony) models ({settings.model_name}): the engine renders "
+                "them through vLLM's harmony path, which bypasses the chat "
+                "template and the prefix splice the frontend performs. Disable "
+                "frontend_tokenize to render on the prefill engines."
+            )
         self._settings = settings
 
     @property
@@ -206,28 +233,24 @@ class FrontendChatRenderer:
             ChatCompletionRequest,
         )
 
-        # Only the fields that shape rendering reach the vLLM request model;
-        # the Gym-only ones (ng_capture, required_prefix_token_ids, ...) are
-        # read here and would be rejected or ignored there.
+        # Every field vLLM's request model declares reaches it, so whatever
+        # shapes rendering there (tools, chat_template_kwargs, reasoning_effort,
+        # truncation, ...) shapes it here; the Gym-only fields (ng_capture,
+        # required_prefix_token_ids, ...) are read here and would be rejected
+        # there.
         render_fields = {
-            k: v
-            for k, v in body.items()
-            if k
-            in (
-                "model",
-                "messages",
-                "tools",
-                "tool_choice",
-                "chat_template",
-                "chat_template_kwargs",
-                "add_generation_prompt",
-                "continue_final_message",
-                "add_special_tokens",
-                "documents",
-                "cache_salt",
-            )
+            k: v for k, v in body.items() if k in ChatCompletionRequest.model_fields
         }
         render_fields.setdefault("model", self._settings.model_name)
+        # The engine renders with the output budget set to 1 (its max-length
+        # check then reserves one token; the real budget is clamped in later),
+        # so a near-limit prompt it accepts has to render here as well.
+        if (
+            render_fields.get("max_tokens") is not None
+            or render_fields.get("max_completion_tokens") is not None
+        ):
+            render_fields["max_tokens"] = 1
+            render_fields["max_completion_tokens"] = None
         # A deep copy: vLLM's renderer rewrites the conversation in place
         # (``_postprocess_messages`` turns each tool call's JSON-string
         # ``arguments`` into a dict for the chat template), and the body is

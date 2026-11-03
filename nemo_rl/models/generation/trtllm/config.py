@@ -142,10 +142,6 @@ def resolve_disagg_layout(config: TrtllmConfig) -> DisaggConfig:
     return disagg_layout.resolve_disagg_layout(config)
 
 
-def _deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
-    return disagg_layout.deep_merge(base, update)
-
-
 def resolve_role_overrides(config: TrtllmConfig) -> TrtllmConfig:
     """Resolve ``trtllm_cfg.{prefill,decode}_engine`` into complete engine configs.
 

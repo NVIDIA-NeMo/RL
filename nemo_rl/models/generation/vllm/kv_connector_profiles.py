@@ -77,20 +77,14 @@ NIXL_PROFILE = ConnectorProfile(
     side_channel_port_env="VLLM_NIXL_SIDE_CHANNEL_PORT",
 )
 
-# Mooncake speaks a different handshake vocabulary (remote_bootstrap_addr,
-# transfer_id) with no block ids in it, which is exactly why the frontend
-# relays the prefill response's dict without reading its keys.
-MOONCAKE_PROFILE = ConnectorProfile(
-    name="MooncakeConnector",
-    producer_role="kv_producer",
-    consumer_role="kv_consumer",
-    initial_prefill_params={"do_remote_decode": True, "do_remote_prefill": False},
-    supports_bidirectional=False,
-)
-
+# vLLM's MooncakeConnector has no profile on purpose: its handshake is not the
+# relayed shape this module describes. Its prefill engine returns no
+# ``kv_transfer_params`` (the scheduler's ``request_finished`` hands back
+# None), and both legs must already carry a ``transfer_id`` plus the prefill
+# engine's ``remote_bootstrap_addr`` that a router mints *before* the prefill
+# leg is sent. Fronting it takes a router-minted handshake, not a relayed one.
 CONNECTOR_PROFILES: dict[str, ConnectorProfile] = {
     NIXL_PROFILE.name: NIXL_PROFILE,
-    MOONCAKE_PROFILE.name: MOONCAKE_PROFILE,
 }
 
 
