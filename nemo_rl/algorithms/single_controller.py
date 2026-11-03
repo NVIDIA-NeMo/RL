@@ -6518,6 +6518,23 @@ class SingleControllerActor:
             await self._ppo_worker_call(self._value.finish_inference, **resident_kwargs)
         return meta.with_fields([self._advantage_cfg.values_field])
 
+    async def _ppo_worker_call(
+        self, function: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """Drain an in-flight worker call before cancellation can abort/offload it.
+
+        Cancelling to_thread does not stop its thread or the Ray RPC. Shield it
+        so epoch cleanup cannot race with a backward pass or optimizer update.
+        """
+        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                raise
+
     async def _value_train_epochs(
         self, metas: list[KVBatchMeta], *, num_epochs: int
     ) -> dict[str, Any]:
