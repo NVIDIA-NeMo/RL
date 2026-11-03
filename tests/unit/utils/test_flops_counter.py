@@ -41,3 +41,28 @@ def test_flops_counter(model_name, gbs, seqlen, expected_flops):
     assert abs(flops_tracker.total_flops - expected_flops) / expected_flops <= 0.05, (
         f"Expected {expected_flops} flops, got {flops_tracker.total_flops}"
     )
+
+
+def test_qwen2_flops_count_gqa_kv_projections():
+    # Qwen2.5-Math-1.5B shapes: 12 query heads share 2 KV heads (head_dim 128).
+    from nemo_rl.utils.flops_formulas import FLOPSConfig, qwen2
+
+    hs, layers, ffn, vocab, seq = 1536, 28, 8960, 151936, 4096
+    heads, kv_heads = 12, 2
+    kv_proj = kv_heads * (hs // heads)
+    # fwd+bwd = 3 * 2 * MACs; causal attention scores count half of QK^T and AV.
+    attn = layers * seq * (hs * hs + 2 * hs * kv_proj + hs * hs + seq * hs)
+    mlp = layers * seq * 3 * hs * ffn
+    expected = 6 * (attn + mlp + seq * hs * vocab)
+
+    config = FLOPSConfig(
+        gbs=1,
+        enc_seq_len=seq,
+        hs=hs,
+        layers=layers,
+        ffn_hs=ffn,
+        vocab_size=vocab,
+        query_groups=kv_heads,
+        attention_heads=heads,
+    )
+    assert qwen2(config) == pytest.approx(expected)

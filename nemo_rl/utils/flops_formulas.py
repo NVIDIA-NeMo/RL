@@ -145,7 +145,7 @@ def qwen2(config: FLOPSConfig):
         * hidden_size
         * hidden_size
         * (
-            (2 + 1)  # QKV gemm
+            (2 * config.query_groups / config.attention_heads + 1)  # QKV gemm
             + (
                 seq_len / hidden_size * 2 * (0.5 if causal_self_attn else 1)
             )  # attention
