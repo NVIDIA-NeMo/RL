@@ -24,6 +24,7 @@ Injected into TRT-LLM's RayGPUWorker via ``ray_worker_extension_cls``.
 """
 
 import gc
+import inspect
 import os
 from collections import OrderedDict
 from typing import Any, Optional
@@ -659,8 +660,11 @@ class NcclExtension(WorkerExtension):
 
         This copies upstream TRT-LLM code at the pinned ``[tool.trtllm].ref``:
         the per-module branch of ``_load_weights_impl_v2``
-        (tensorrt_llm/_torch/models/modeling_utils.py) and the
-        ``preprocess_weights`` call of the model's ``load_weights``. It skips the
+        (tensorrt_llm/_torch/models/modeling_utils.py) and, for mappers that
+        take ``allow_partial_loading`` (Qwen3.5), the ``preprocess_weights``
+        call of the model's ``load_weights``. Other mappers (Qwen3 MoE) inherit
+        the base no-op that returns None, and their models never call it, so
+        it is skipped. It skips the
         ``params_map`` rename, ``should_skip_module``,
         ``does_require_special_handling`` and ``mark_consumed`` steps, which do
         not apply to routed-expert stacks; re-check this copy on every TRT-LLM
@@ -674,7 +678,9 @@ class NcclExtension(WorkerExtension):
         mapper = model_loader.weight_mapper
         if mapper is None:
             return weights
-        weights = mapper.preprocess_weights(weights, allow_partial_loading=True)
+        preprocess = mapper.preprocess_weights
+        if "allow_partial_loading" in inspect.signature(preprocess).parameters:
+            weights = preprocess(weights, allow_partial_loading=True)
         # "<prefix>.<expert>.<projection>.<leaf>" -> "<prefix>"
         prefixes = {name.rsplit(".", 3)[0] for name in weights if name.count(".") >= 3}
         leftover = dict(weights)
