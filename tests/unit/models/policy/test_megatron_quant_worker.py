@@ -1083,3 +1083,49 @@ class TestFindWeightQuantizer:
         module = _MultiWeightQuantModule(num_weights=3)
         unknown = nn.Parameter(torch.randn(4, 4))
         assert _find_wq(module, unknown) is None
+
+
+@requires_weight_folding
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_folded_refit_preserves_unquantized_output_rows(monkeypatch, dtype):
+    from modelopt.torch.quantization.utils import apply_without_qdq
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    module = _SingleWeightQuantModule().to(dtype=dtype)
+    with torch.no_grad():
+        module.weight.copy_(torch.linspace(-1.37, 1.43, 16).reshape(4, 4))
+    module.weight_quantizer.amax = torch.tensor(2.0)
+    module.weight_quantizer.pre_quant_scale = torch.tensor([[0.75, 1.25, 0.875, 1.125]])
+    module._modelopt_unquantized_output_rows = slice(2, 4)
+    original = module.weight.detach().clone()
+    quantized = module.weight_quantizer(module.weight.float()).to(dtype)
+    unquantized = apply_without_qdq(module.weight_quantizer, module.weight[2:]).to(
+        dtype
+    )
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant"] = False
+    worker.refit_conversion_tasks = [
+        SimpleNamespace(
+            param_name="in_proj.weight",
+            global_param_name="in_proj.weight",
+            param_weight=module.weight,
+            megatron_module=module,
+        )
+    ]
+
+    def export_weights(self, kv_scales=None):
+        for task in self.refit_conversion_tasks:
+            yield task.param_name, task.param_weight
+
+    monkeypatch.setattr(
+        MegatronPolicyWorkerImpl, "_iter_params_with_optional_kv_scales", export_weights
+    )
+    exported = dict(worker._iter_params_with_optional_kv_scales())["in_proj.weight"]
+    torch.testing.assert_close(exported[:2], quantized[:2], rtol=0, atol=0)
+    torch.testing.assert_close(exported[2:], unquantized, rtol=0, atol=0)
+    assert not torch.equal(exported[2:], quantized[2:])
+    torch.testing.assert_close(module.weight, original, rtol=0, atol=0)
+    assert module.weight_quantizer.is_enabled
