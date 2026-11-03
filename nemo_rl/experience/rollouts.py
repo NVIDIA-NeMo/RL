@@ -2379,10 +2379,6 @@ def apply_reward_penalties(
                     )
                     or DEFAULT_THINKING_TAGS
                 )
-                if len(thinking_tags) < 2:
-                    raise ValueError(
-                        "reward_penalties.thinking_tags must contain open and close tags"
-                    )
                 think_open_text, think_close_text = thinking_tags[:2]
                 output_items = (
                     result["full_result"].get("response", {}).get("output", [])
