@@ -499,6 +499,60 @@ def test_forest_retains_shared_checkpoint_requirements(
     patched_factories["_build_trainer"].assert_not_called()
 
 
+@pytest.mark.parametrize("packing", [False, True])
+def test_forest_ppo_restores_discovered_checkpoint(
+    tmp_path: Path, patched_factories: dict[str, Any], packing: bool
+) -> None:
+    mc = _forest_ppo_config(_make_forest_master_config())
+    mc.policy["sequence_packing"]["enabled"] = packing
+    mc.value["sequence_packing"]["enabled"] = packing
+    mc.checkpointing.update(
+        checkpoint_dir=str(tmp_path), enabled=True, save_data_plane=True, save_period=1
+    )
+    checkpoint = tmp_path / "step_3"
+    for component in ("policy", "value"):
+        (checkpoint / component / "weights").mkdir(parents=True)
+        (checkpoint / component / "optimizer").mkdir()
+    (checkpoint / DATA_PLANE_CHECKPOINT_DIR).mkdir()
+    (checkpoint / REPLAY_BUFFER_METADATA_FILENAME).touch()
+    (checkpoint / "training_info.json").write_text(json.dumps(vars(_save_state())))
+    torch.save({"cursor": 3}, checkpoint / "train_dataloader.pt")
+    policy = patched_factories["fake_policy"]
+    policy.cfg = mc.policy
+    policy.sharding_annotations.get_axis_size.return_value = 1
+    policy.load_data_plane_checkpoint.return_value = _native_tq_metadata()
+    value = MagicMock(name="value")
+    value.cfg = mc.value
+    value.sharding_annotations.get_axis_size.return_value = 1
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    with (
+        patch.object(
+            sc_setup_mod, "_build_value", return_value=(value, 0.0)
+        ) as build_value,
+        patch.object(sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()),
+        patch.object(sc_setup_mod.ray, "get", return_value=None),
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[MagicMock()],
+        ),
+    ):
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    assert actor_args.last_checkpoint_path == str(checkpoint)
+    assert actor_args.save_state.current_step == 3
+    assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
+    assert actor_args.value_handle is value
+    policy.load_data_plane_checkpoint.assert_called_once_with(
+        checkpoint / DATA_PLANE_CHECKPOINT_DIR
+    )
+    trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
+    assert trainer_kwargs["weights_path"] == checkpoint / "policy" / "weights"
+    assert trainer_kwargs["optimizer_path"] == checkpoint / "policy" / "optimizer"
+    value_kwargs = build_value.call_args.kwargs
+    assert value_kwargs["weights_path"] == checkpoint / "value" / "weights"
+    assert value_kwargs["optimizer_path"] == checkpoint / "value" / "optimizer"
+
+
 def test_build_generation_constructs_dynamo_from_normalized_config():
     """DynamoGeneration receives the generation config setup already validated."""
     master_config = _make_master_config(backend="dynamo")
@@ -3591,6 +3645,51 @@ def test_forest_padding_scope_picks_who_pads(patched_factories, scope: str) -> N
     )
 
 
+@pytest.mark.parametrize("exclude_router_stats", [False, True])
+def test_forest_ppo_validates_policy_and_critic_before_rollout_manager(
+    patched_factories, exclude_router_stats: bool
+) -> None:
+    mc = _forest_ppo_config(_make_forest_master_config())
+    mc.token_capture = TokenCaptureConfig(
+        enabled=True,
+        forest_training=True,
+        exclude_padding_from_router_stats=exclude_router_stats,
+    )
+    trainer = patched_factories["fake_policy"]
+    trainer.cfg = mc.policy
+    trainer.sharding_annotations.get_axis_size.return_value = 1
+    value = MagicMock(name="value")
+    value.cfg = mc.value
+    # Critic DP 3 makes the Forest multiple differ from the policy's (1).
+    value.sharding_annotations.get_axis_size.return_value = 3
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    trainer_check = trainer.worker_group.run_all_workers_single_data.return_value
+    value_check = value.worker_group.run_all_workers_single_data.return_value
+    events: list[Any] = []
+
+    def rollout_manager(**kwargs):
+        events.append(("rollout_manager", kwargs["execution_row_multiple"]))
+
+    with (
+        patch.object(sc_setup_mod, "_build_value", return_value=(value, 0.0)),
+        patch.object(sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()),
+        patch.object(sc_setup_mod.ray, "get", side_effect=events.append),
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[],
+        ),
+        patch.object(sc_setup_mod, "RolloutManager", side_effect=rollout_manager),
+    ):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+    assert events == [trainer_check, value_check, ("rollout_manager", 3)]
+    for consumer in (trainer, value):
+        consumer.worker_group.run_all_workers_single_data.assert_called_once_with(
+            "validate_forest_execution_padding",
+            exclude_padding_from_router_stats=exclude_router_stats,
+        )
+
+
 class TestAdaptiveLossRestore:
     def test_resume_restores_adaptive_ppo_clip_state(self, tmp_path, patched_factories):
         checkpoint_path = tmp_path / "step_3"
@@ -4301,7 +4400,13 @@ def forest_config():
     ],
 )
 def test_forest_startup_rejects_unsupported_setting(forest_config, path, value, reason):
-    obj = forest_config
+    _set_config_path(forest_config, path, value)
+    with pytest.raises(ValueError, match=reason):
+        validate_single_controller_config(forest_config)
+
+
+def _set_config_path(mc: MasterConfig, path: str, value: Any) -> None:
+    obj = mc
     *parents, key = path.split(".")
     for name in parents:
         obj = obj[name] if isinstance(obj, dict) else getattr(obj, name)
@@ -4309,8 +4414,6 @@ def test_forest_startup_rejects_unsupported_setting(forest_config, path, value, 
         obj[key] = value
     else:
         setattr(obj, key, value)
-    with pytest.raises(ValueError, match=reason):
-        validate_single_controller_config(forest_config)
 
 
 @pytest.mark.parametrize("field", ["train_micro_batch_size", "logprob_batch_size"])
@@ -4408,6 +4511,33 @@ def test_forest_startup_rejects_ppo_without_gae(forest_config):
         validate_single_controller_config(
             _forest_ppo_config(forest_config, name="raw_reward")
         )
+
+
+@pytest.mark.parametrize(
+    "path,value,reason",
+    [
+        ("ppo.invalid_tool_call_advantage", 0.0, "message-level advantage"),
+        ("ppo.malformed_thinking_advantage", 0.0, "message-level advantage"),
+        ("loss_fn.use_kl_in_reward", True, "loss_fn.use_kl_in_reward"),
+        # The PPO path needs a Megatron critic before Forest checks its shape.
+        ("value.megatron_cfg.enabled", False, "requires a Megatron critic"),
+        (
+            "value.megatron_cfg.virtual_pipeline_model_parallel_size",
+            2,
+            "non-interleaved Megatron",
+        ),
+        ("value.train_micro_batch_size", 0, "positive integers"),
+        # A set value logprob_batch_size joins the critic's row multiple.
+        ("value.logprob_batch_size", 0, "positive integers"),
+    ],
+)
+def test_forest_ppo_startup_rejects_unsupported_setting(
+    forest_config, path, value, reason
+):
+    mc = _forest_ppo_config(forest_config)
+    _set_config_path(mc, path, value)
+    with pytest.raises(ValueError, match=reason):
+        validate_single_controller_config(mc)
 
 
 @pytest.mark.parametrize("value_packing", [False, True])

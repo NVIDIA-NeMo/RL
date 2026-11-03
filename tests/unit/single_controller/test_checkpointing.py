@@ -38,6 +38,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import threading
 import warnings
@@ -53,6 +54,7 @@ import yaml
 from pydantic import ValidationError
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     LEGACY_REPLAY_BUFFER_FILENAME,
@@ -78,6 +80,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     _RolloutCheckpointSaveResult,
@@ -1140,6 +1143,93 @@ def test_forest_checkpoint_metadata_compatibility(
             validate_forest_checkpoint_metadata(
                 metadata, forest_training=mode, execution_row_multiple=multiple
             )
+
+
+def _forest_consumer(dp_size: int, **cfg: Any) -> SimpleNamespace:
+    """A fixed-batch Megatron trainer or critic as setup sizes Forest rows for it."""
+    return SimpleNamespace(
+        cfg={
+            "megatron_cfg": {"enabled": True},
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
+            **cfg,
+        },
+        sharding_annotations=SimpleNamespace(get_axis_size=lambda _: dp_size),
+    )
+
+
+@pytest.mark.parametrize(
+    ("critic", "current"),
+    [
+        ({}, 12),
+        ({"dp_size": 3}, 36),
+        ({"train_micro_batch_size": 5}, 20),
+        ({"logprob_batch_size": 5}, 60),
+    ],
+)
+def test_forest_ppo_checkpoint_pins_the_critic_row_multiple(
+    tmp_path: Path, critic: dict[str, int], current: int
+) -> None:
+    """A PPO checkpoint saves the policy/critic lcm; a critic reshape fails resume."""
+    mc = _actor_master_config(tmp_path, max_num_steps=1, data_plane_checkpoint=True)
+    mc.token_capture.forest_training = True
+    algo_cfg = PPOConfig.model_construct()
+    # Policy and reference forwards: DP 2 x lcm(train 2, logprob 2) = 4.
+    policy = _forest_consumer(2, train_micro_batch_size=2, logprob_batch_size=2)
+
+    def row_multiple(*, dp_size: int = 1, **cfg: int) -> int:
+        # Critic: DP x lcm(train MBS, logprob_batch_size when set); 1 x 3 by default.
+        value = _forest_consumer(dp_size, **({"train_micro_batch_size": 3} | cfg))
+        return sc_setup_mod._forest_execution_row_multiple(mc, algo_cfg, policy, value)
+
+    policy_only = sc_setup_mod._forest_execution_row_multiple(
+        mc, algo_cfg, policy, None
+    )
+    assert policy_only == 4
+    saved = row_multiple()
+    assert saved == math.lcm(policy_only, 3) == 12
+    dp_client = _FakeDPClient()
+
+    async def _save() -> None:
+        actor = _ACTOR_CLS(
+            mc, _make_actor_args(dp_client=dp_client), SetupTimingMetrics()
+        )
+        actor._rollout_manager.execution_row_multiple = saved
+        try:
+            await actor._save_data_plane_checkpoint(
+                str(tmp_path / "tmp_step_1"),
+                train_steps=1,
+                trainer_version=1,
+                current_epoch=0,
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+    asyncio.run(_save())
+    metadata = dp_client.save_calls[0]["metadata"]
+    assert metadata["forest_training"] is True
+    assert metadata["forest_execution_row_multiple"] == 12
+
+    actor = _ACTOR_CLS(
+        mc,
+        _make_actor_args(
+            last_checkpoint_path=str(tmp_path), data_plane_checkpoint_metadata=metadata
+        ),
+        SetupTimingMetrics(),
+    )
+    actor._rollout_manager.execution_row_multiple = row_multiple(**critic)
+    assert actor._rollout_manager.execution_row_multiple == current
+    try:
+        if current == saved:
+            actor._validate_forest_checkpoint_metadata()
+        else:
+            with pytest.raises(
+                ValueError,
+                match=f"forest execution padding mismatch: saved=12, current={current}",
+            ):
+                actor._validate_forest_checkpoint_metadata()
+    finally:
+        actor._checkpointer.shutdown()
 
 
 def _sealed_recovery_ledger(staging_key: str) -> RolloutRecoveryLedger:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Actual train-pump/GRPO composition; storage, learner and sampler are doubles."""
+"""Actual train-pump/GRPO and PPO composition; storage, learners and sampler are doubles."""
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
@@ -22,16 +22,21 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler, InOrderSampler
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import AdvantageComputer
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
-from tests.unit.single_controller.test_logical_advantage import _batch, _controller
+from tests.unit.single_controller.test_logical_advantage import (
+    _batch,
+    _controller,
+    _ppo_controller,
+)
 from tests.unit.single_controller.test_single_controller_actor import (
     _DroppingSampler,
     _FullStepSampler,
     _NoOpTrainer,
+    _NoOpValue,
     _SequenceSampler,
     _train_pump_controller,
 )
@@ -350,3 +355,222 @@ def test_forest_partial_step_still_requires_complete_retained_groups(
     ctrl._trainer.train_microbatches_from_meta.assert_not_called()
     ctrl._trainer.finish_train_step.assert_not_called()
     assert ctrl._trainer_version == ctrl._train_steps == 0
+
+
+def _ppo_setup(
+    monkeypatch,
+    *,
+    streaming: bool = False,
+    ppo_epochs: int = 1,
+    critic_epochs: int = 2,
+    **kwargs,
+):
+    """``_setup`` switched to PPO/GAE with a recording critic.
+
+    Full-batch PPO receives the whole step as one chunk; streaming keeps one
+    chunk per prompt group. Values are stored so the real GAE stage runs.
+    """
+    ctrl, metas = _setup(monkeypatch, **kwargs)
+    stage = _ppo_controller(*_batch([("a", [(0.0, 1), (1.0, 1)])]))
+    stage._algo_cfg.num_prompts_per_step = ctrl._algo_cfg.num_prompts_per_step
+    stage._algo_cfg.max_num_steps = 1
+    ctrl._algo_cfg = stage._algo_cfg
+    ctrl._is_ppo = True
+    ctrl._streaming_ppo = streaming
+    # Forest PPO takes any group count (see resolve_ppo_chunk_alignment).
+    min_groups = ctrl._async_cfg.min_groups_for_streaming_train
+    ctrl._ppo_group_multiple = 1
+    ctrl._ppo_min_remaining_groups = (
+        (min_groups + 1) // 2 if min_groups < ctrl._algo_cfg.num_prompts_per_step else 0
+    )
+    ctrl._ppo_epochs = ppo_epochs
+    ctrl._critic_ppo_epochs = critic_epochs
+    calls: list[str] = []
+    ctrl._value = _NoOpValue(calls, prefix="critic.")
+    ctrl._value.train_from_meta = MagicMock(side_effect=ctrl._value.train_from_meta)
+    ctrl._value_loss_fn = MagicMock(name="value_loss_fn")
+    ctrl._advantage_estimator = stage._advantage_estimator
+    ctrl._advantage_stage_config = stage._advantage_stage_config
+    ctrl._advantage_computer = AdvantageComputer(
+        ctrl._dp_client,
+        config=ctrl._advantage_stage_config,
+        advantage_estimator=ctrl._advantage_estimator,
+    )
+    ids = ctrl._dp_client.list_sample_ids("train")
+    values = torch.rand(len(ids), 3, generator=torch.Generator().manual_seed(0))
+    ctrl._dp_client.put_samples(
+        ids, "train", TensorDict({"values": values}, batch_size=[len(ids)])
+    )
+    if not streaming and kwargs.get("failure") is None:
+        ctrl._sampler = _FullStepSampler(metas[0].concat(*metas[1:]))
+    ctrl._trainer.finish_train_step.side_effect = lambda: (
+        calls.append("policy.finish_train_step") or {}
+    )
+
+    async def sync_weights(**kwargs) -> int:
+        calls.append("refit")
+        return 0
+
+    ctrl._sync_weights = AsyncMock(side_effect=sync_weights)
+    return ctrl, metas, calls
+
+
+def _critic_calls(ctrl):
+    return ctrl._value.train_from_meta.call_args_list
+
+
+def test_full_batch_ppo_trains_every_forest_row_per_epoch(monkeypatch):
+    ctrl, metas, calls = _ppo_setup(monkeypatch, ppo_epochs=2, critic_epochs=3)
+    all_ids = [key for meta in metas for key in meta.sample_ids]
+    assert len(all_ids) == 10  # Two padded groups, padding included.
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    submitted = [
+        call.args[0]
+        for call in ctrl._trainer.train_microbatches_from_meta.call_args_list
+    ]
+    assert [meta.sample_ids for meta in submitted] == [all_ids, all_ids]
+    # Full-batch PPO closes one policy optimizer step per actor epoch.
+    assert ctrl._trainer.begin_train_step.call_count == 2
+    assert calls.count("policy.finish_train_step") == 2
+    critic = _critic_calls(ctrl)
+    assert len(critic) == 3
+    for call in critic:
+        assert call.args[0].sample_ids == all_ids
+        assert call.kwargs["gbs"] == len(all_ids)
+    assert calls.index("refit") < calls.index("critic.prepare_for_training")
+    ctrl._sync_weights.assert_awaited_once()
+    assert ctrl._trainer_version == ctrl._train_steps == 1
+    assert ctrl._consumed_samples == 2
+    assert not ctrl._dp_client.list_sample_ids("train")
+
+
+def test_streaming_ppo_steps_once_and_trains_critic_on_all_chunks(monkeypatch):
+    ctrl, metas, calls = _ppo_setup(monkeypatch, streaming=True)
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    submitted = [
+        call.args[0]
+        for call in ctrl._trainer.train_microbatches_from_meta.call_args_list
+    ]
+    assert [meta.sample_ids for meta in submitted] == [
+        meta.sample_ids for meta in metas
+    ]
+    ctrl._trainer.begin_train_step.assert_called_once()
+    assert calls.count("policy.finish_train_step") == 1
+    all_ids = [key for meta in metas for key in meta.sample_ids]
+    critic = _critic_calls(ctrl)
+    assert len(critic) == 2
+    for call in critic:
+        assert call.args[0].sample_ids == all_ids
+        assert call.kwargs["gbs"] == len(all_ids) == 10
+    assert calls.count("critic.get_values_from_meta") == len(metas)
+    # Policy update, then refit, then critic training.
+    assert (
+        calls.index("policy.finish_train_step")
+        < calls.index("refit")
+        < calls.index("critic.prepare_for_training")
+    )
+    assert ctrl._trainer_version == ctrl._train_steps == 1
+    assert not ctrl._dp_client.list_sample_ids("train")
+
+
+@pytest.mark.parametrize(
+    "failure,trained_chunks,reason",
+    [
+        ("missing_version", 0, "integer generation versions"),
+        ("boolean_version", 0, "integer generation versions"),
+        ("duplicate", 1, "new, complete logical groups"),
+        ("short", 1, "before a complete training step"),
+        ("group_tally", 0, "new, complete logical groups"),
+        ("missing_segment", 0, "every segment exactly once"),
+    ],
+)
+def test_invalid_logical_batch_never_trains_critic_or_steps_ppo(
+    monkeypatch, failure, trained_chunks, reason
+):
+    ctrl, _, calls = _ppo_setup(monkeypatch, streaming=True, failure=failure)
+    initial_ids = set(ctrl._dp_client.list_sample_ids("train"))
+    with pytest.raises((ValueError, RuntimeError), match=reason):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    assert ctrl._trainer.train_microbatches_from_meta.call_count == trained_chunks
+    assert "policy.finish_train_step" not in calls
+    assert "critic.prepare_for_training" not in calls
+    ctrl._value.train_from_meta.assert_not_called()
+    ctrl._sync_weights.assert_not_awaited()
+    assert ctrl._trainer_version == ctrl._train_steps == ctrl._consumed_samples == 0
+    assert set(ctrl._dp_client.list_sample_ids("train")) == initial_ids
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_all_invalid_forest_owners_refuse_the_ppo_step(monkeypatch, streaming):
+    """Full batch fails right after GAE; streaming fails when the step closes."""
+    ctrl, _, calls = _ppo_setup(monkeypatch, streaming=streaming)
+    ids = ctrl._dp_client.list_sample_ids("train")
+    ctrl._dp_client.put_samples(
+        ids,
+        "train",
+        TensorDict(
+            {"mask_sample": torch.ones(len(ids), dtype=torch.bool)},
+            batch_size=[len(ids)],
+        ),
+    )
+    with pytest.raises(RuntimeError, match="no valid response tokens"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    assert calls.count("critic.get_values_from_meta") == (2 if streaming else 1)
+    ctrl._trainer.train_microbatches_from_meta.assert_not_called()
+    assert "policy.finish_train_step" not in calls
+    ctrl._value.train_from_meta.assert_not_called()
+    ctrl._sync_weights.assert_not_awaited()
+    assert ctrl._trainer_version == ctrl._train_steps == 0
+
+
+class _AligningDroppingSampler(_DroppingSampler):
+    """Also applies the real sampler's group-alignment checks to each select."""
+
+    def __init__(self, meta: KVBatchMeta, *, credit_in_evict: bool) -> None:
+        super().__init__(meta, credit_in_evict=credit_in_evict)
+        self.group_multiples: list[int] = []
+
+    async def select(self, **kwargs):
+        self.group_multiples.append(kwargs.get("group_multiple", 1))
+        # No candidates, so this only validates and never claims.
+        await BaseSampler._finalize_selection(
+            self,
+            [],
+            kwargs["min_prompt_groups"],
+            kwargs["max_prompt_groups"],
+            group_multiple=kwargs.get("group_multiple", 1),
+            min_remaining_groups=kwargs.get("min_remaining_groups", 0),
+        )
+        return await super().select(**kwargs)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("credit_in_evict", [False, True])
+def test_forest_ppo_partial_step_trains_critic_on_surviving_rows(
+    monkeypatch, streaming, credit_in_evict
+):
+    """A dropped group shrinks both models' step to the surviving rows."""
+    ctrl, metas, calls = _ppo_setup(monkeypatch, streaming=streaming, failure="short")
+    sampler = _AligningDroppingSampler(metas[0], credit_in_evict=credit_in_evict)
+    sampler.ctrl = ctrl
+    ctrl._sampler = sampler
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+    ctrl._rollout_exhausted.clear()
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    survivors = metas[0].sample_ids
+    assert len(survivors) == 4  # One group of three segments plus padding.
+    if streaming:
+        # Forest skips the streaming group alignment a drop cannot satisfy.
+        assert set(sampler.group_multiples) == {1}
+    (trained,) = ctrl._trainer.train_microbatches_from_meta.call_args_list
+    assert trained.args[0].sample_ids == survivors
+    assert calls.count("policy.finish_train_step") == 1
+    critic = _critic_calls(ctrl)
+    assert len(critic) == 2
+    for call in critic:
+        assert call.args[0].sample_ids == survivors
+        assert call.kwargs["gbs"] == len(survivors)
+    assert ctrl._trainer_version == ctrl._train_steps == ctrl._consumed_samples == 1
+    metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert metrics["dropped_prompt_groups"] == 1
+    assert not ctrl._dp_client.list_sample_ids("train")

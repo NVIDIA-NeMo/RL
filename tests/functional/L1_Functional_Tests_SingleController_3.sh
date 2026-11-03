@@ -53,6 +53,10 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_gym_single_controller.sh
 # BrowseComp hides old tool results; valid rows must prove a context boundary.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_context_compaction.sh
+# The same Forest rows with checkpoints, resumed from step 2 to step 4.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_context_compaction_resume.sh
+# PPO (GAE, Megatron critic) on the same Forest rows, with checkpoint/resume.
+run_test fast uv run --no-sync bash ./tests/functional/ppo_async_gym_single_controller_context_compaction.sh
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and
 # redispatch only its unfinished peer after restoring the step checkpoint.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
