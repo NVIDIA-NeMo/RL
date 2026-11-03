@@ -12,6 +12,8 @@ For the full list of supported models, see
 
 - **[DeepSeek](deepseek/index.md)** — DeepSeek V4 Flash GRPO with AutoModel
   training and block-FP8 vLLM generation.
+- **[Flint](flint/flint.md)** — native 49-layer AutoModel and SGLang GRPO,
+  pinned runtime fixes, and a completed 100-step DAPO reference run.
 - **[GLM](glm/index.md)** — GLM-5.1 and GLM-5.2 GRPO recipes on the Megatron
   backend, colocated and non-colocated with vLLM.
 - **[Gemma](gemma/index.md)** — Gemma 4 text-only DAPO and VLM GRPO recipes on
@@ -32,6 +34,7 @@ Other model-specific guides currently live directly under
 :hidden:
 
 deepseek/index.md
+flint/flint.md
 glm/index.md
 gemma/index.md
 minimax/index.md

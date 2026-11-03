@@ -6,6 +6,14 @@ not a claim of compatibility with newer upstream revisions. The public PR target
 the `flint-support` integration branch at that tested baseline. Upstream history
 and inherited GitHub workflows are retained.
 
+The current [Flint model guide](../../docs/guides/models/flint/flint.md) documents
+the completed 100-step LR `1e-7` run, its nine-panel results figure, and the
+validated dependency stack. Use the new
+`grpo-flint-49layer-8n4g-dapo-3072-shaping-lr1e-7.yaml` recipe for that setup.
+`runtime/` packages the reviewed overlays and FlashInfer binary-verification
+guards as a layer over the private native base image. Its `stack.json` pins
+the private inputs and approved binary; it does not vendor those artifacts.
+
 ## Implementation
 
 The changes under `nemo_rl/` preserve model-declared FP32 parameters during
@@ -23,6 +31,12 @@ private source trees:
   holder so FSDP activation-checkpoint recomputation has a nonempty input tuple.
 * `sglang-hybrid-kv-offload.patch`: propagate memory-saver configuration into
   both hybrid KV pool leaves. The JSON manifest records exact source hashes.
+* `fa4-learned-sink-fix.patch`: the learned-sink SM100 FA4 correction included
+  in the native serving image. Apply with `-p3` at the installed `sglang/` root.
+* `flashinfer-pr4319.patch`: BF16 intermediate-buffer physical-capacity fix.
+  Apply with `-p1` at FlashInfer's `data/` root, then rebuild the SM100 library.
+  Source patching alone does not replace the precompiled AOT module. The
+  runtime layer installs the validated library and checks its actual load path.
 
 The separate Automodel model implementation remains a dependency:
 <https://github.com/snowmanwwg/Automodel-private-20261017/pull/1>.
@@ -36,7 +50,7 @@ Pinned dependencies from the tested image:
 | SGLang/Miles | `3003d70f680d41c59d1b7acbf65cb47795dfd19e` |
 | Custom image | `flint-nemorl-terry-20261019-arm64-native-01.sqsh` |
 
-## Recipes and operational tools
+## Historical recipes and operational tools
 
 The four-layer and full 49-layer smoke recipes live under
 `examples/configs/recipes/llm/`. The two eight-node DAPO recipes preserve the
@@ -58,7 +72,7 @@ script unchanged: stage a new run directory, configure paths and a unique W&B
 ID, and inspect its expected-resume and stop-marker guards first. The previous
 experiment was explicitly stopped and must not be restarted.
 
-The new run's `apply_runtime_overlays.py` additionally records the router
+The archived `apply_runtime_overlays.py` additionally records the router
 `router_policy`/`policy` compatibility shim. Its launcher scopes
 `CUDA_LAUNCH_BLOCKING=1` to SGLang, uses a fatal-process guard, and prevents W&B
 source/diff artifact uploads. The scripts preserve four-hour regular-batch
@@ -77,14 +91,15 @@ uv run --no-project --with pytest --with torch --with 'pydantic>=2' --with packa
 ```
 
 Historical GPU evidence established four-layer training/refit and full 49-layer
-training plus optimizer resume. The earlier long run recorded 48 steps and was
-stopped by the user; its latest durable checkpoint is step 45. It did not finish
-50 steps. The new 4096-generation run is separate and was only in startup when
-this change collection was prepared. No new GPU rerun is implied by this PR.
+training plus optimizer resume. Later, run `9dd6d432e98d` completed 100 steps
+using the pinned PR 4319 binary, 3072-token generation, shaping enabled, and LR
+`1e-7`. The guide distinguishes this result from the earlier smoke and ablation
+runs. No new GPU training was performed for the documentation and packaging.
 
 Known limits remain: full-logits parity is unverified; ordinary parameter
 payload finiteness and optimizer-moment equality were not exhaustively audited.
-The FlashInfer TRT-LLM serving failure was intermittent and is not claimed fixed.
+The PR 4319 backport addresses the identified BF16 MoE allocation failure; it
+does not establish that every earlier CUDA or serving failure had that cause.
 The old checkpoint-save exception coincided with quota exhaustion, but causality
 was not established. Do not interpret successful smoke tests as resolving those
 issues.
@@ -96,7 +111,18 @@ Generated validation output is kept outside Git.
 GPU functional tests require NVIDIA infrastructure and private model assets.
 Public CI results must be assessed separately from the historical validation.
 
-Fresh packaging checks: 30 CPU compatibility tests passed with Transformers
+Initial integration packaging checks: 30 CPU compatibility tests passed with Transformers
 5.18.0; 36 runtime-tool tests passed; 10 step-zero tensor audit tests passed.
 Python parsing, shell syntax, credential-pattern scanning, and Git whitespace
 checks passed. GPU training was not rerun as part of packaging this PR.
+
+The current runtime package passes 21 CPU tests for bundle rejection, mapped
+library identity, worker forwarding, overlay guards, and actor-profile routing:
+
+```bash
+uv run --no-project python -m unittest discover -s integrations/flint/runtime/tests -q
+```
+
+The new recipe expands to the recorded run's settings, changing only output
+paths and W&B identifiers. The AutoModel, hybrid-KV, and PR 4319 patches were
+also applied to captured baseline sources and matched their expected hashes.

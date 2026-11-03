@@ -61,3 +61,13 @@ code_snapshots*/
 # Named rather than ignoring the directory shape: tests/test_suites/llm/
 # performance/ sits at that depth and is tracked.
 /tests/test_suites/**/metrics.json
+
+# Private inputs for the isolated Flint runtime image.
+/.flint-build/
+
+# Published metric data and figures for the Flint model guide.
+!docs/guides/models/flint/results/
+!docs/guides/models/flint/results/*.json
+!docs/guides/models/flint/results/*.png
+!docs/guides/models/flint/results/*.svg
+!docs/guides/models/flint/results/plot.py

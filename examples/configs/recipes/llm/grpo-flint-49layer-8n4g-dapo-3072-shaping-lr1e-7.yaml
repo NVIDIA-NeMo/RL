@@ -1,0 +1,89 @@
+defaults: grpo-flint-49layer-1n4g-automodel-sglang-actckpt-quick.yaml
+grpo:
+  max_num_epochs: 1000
+  max_num_steps: 100
+  val_period: 5
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 960
+  val_batch_size: 960
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: 3072
+checkpointing:
+  checkpoint_dir: /flint-run/checkpoints
+  keep_top_k: 2
+  save_period: 5
+  checkpoint_must_save_by: 00:03:00:00
+policy:
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 4
+  automodel_cfg:
+    context_parallel_size: 2
+    automodel_kwargs:
+      backend:
+        attn: te
+  dynamic_batching:
+    enabled: true
+  optimizer:
+    kwargs:
+      lr: 1.0e-07
+      weight_decay: 0.1
+      betas:
+      - 0.9
+      - 0.95
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  generation:
+    max_new_tokens: 3072
+    sglang_cfg:
+      context_length: 4096
+      max_total_tokens: 32768
+      chunked_prefill_size: 1024
+      max_prefill_tokens: 4096
+      sglang_router_config:
+        router_policy: round_robin
+      sglang_server_config:
+        num_gpus: 32
+        num_gpus_per_engine: 1
+data:
+  _override_: true
+  max_input_seq_length: 1024
+  shuffle: true
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: math_hf_data_processor
+    env_name: math
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: /flint-run/logs
+  wandb_enabled: true
+  wandb:
+    project: Flint GRPO
+    name: flint-dapo-3072-shaping-lr1e-7
+    id: ${oc.env:WANDB_RUN_ID}
+    resume: allow
+cluster:
+  num_nodes: 8

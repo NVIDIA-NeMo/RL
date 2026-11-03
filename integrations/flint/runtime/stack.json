@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "note": "SHA256 values are integrity checksums, not credentials.",
+  "platform": "Linux AArch64, GB200 / SM100, CUDA 13.0",
+  "base_image": "flint-nemorl-terry-20261019-arm64-native-01.sqsh",
+  "automodel_commit": "d7cdb35446e2f44f232f0005a4bb5ecda3ce85c6",
+  "sglang_commit": "3003d70f680d41c59d1b7acbf65cb47795dfd19e",
+  "python": "3.13.14",
+  "ray": "2.58.0",
+  "torch": "2.11.0+cu130",
+  "transformers": {
+    "driver": "5.18.0",
+    "training": "5.18.0",
+    "sglang": "5.12.1"
+  },
+  "transformer_engine": "2.19.0",
+  "flashinfer": {
+    "python": "0.6.16.post1",
+    "cubin": "0.6.16.post1",
+    "jit_cache": "0.6.16.post1+cu130",
+    "upstream_pr": "https://github.com/flashinfer-ai/flashinfer/pull/4319",
+    "manifest_sha256": "9895306c87a69bab22280744969bdb6d0cda787c2477bd81a5d3573c32bc355b",
+    "library_sha256": "1eef60f86e0e44cedbb92c30b17a90d38923cf9533954023cd7fbd8f78d51577",
+    "source_sha256": "7fba3ab844031058f6381ea01751a7f595fbde6931bf35346f944c306b1c0f0f"
+  },
+  "flint_sglang_sources_sha256": {
+    "__init__.py": "f5bed5ae26bfa56ffd5c87e4a127eee2bb2f2e9344c79db5205fc1e5c2ea2cc2",
+    "configuration_flint.py": "924b82b35424e11b7c0c7f464ef8ece5821699e11ec1d7cb984ea690c4e8898c",
+    "model.py": "466abeda48ac434113194f15b0a20ef96bd1f6091e1e8cb066c683003e25e0b0",
+    "plugin.py": "90f998d3f55a3eab3f8eb5d9ec2801bc56c23adc242b87169200452e8ab70e29",
+    "refit.py": "c905f84a696538ec048c91aaeeef88dc44fac1ee9e8bce4d220baffc60b34168"
+  },
+  "fa4_interface_sha256": "6ead08491135efdf2bf40d649a0f5ad732542287c530240ea1726a5c64f8ade3"
+}

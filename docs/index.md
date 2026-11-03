@@ -313,6 +313,9 @@ cluster.md
 guides/sft-openmathinstruct2.md
 ```
 
+The [Flint model guide](guides/models/flint/flint.md) covers the native
+AutoModel/SGLang runtime and its 100-step GRPO reference results.
+
 ```{toctree}
 :caption: Guides
 
