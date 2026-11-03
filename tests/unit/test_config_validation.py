@@ -117,7 +117,7 @@ full_config_files = config_files + [
 
 
 def _check_required_keys(config_file: str, config: DictConfig) -> None:
-    """Test that all config files in examples/configs have all required keys for their respective sections."""
+    """Check that a config file in examples/configs has all required keys for its sections."""
 
     print(f"\nValidating config file: {config_file}")
 
@@ -303,7 +303,7 @@ def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
 
 
 def _check_tp_size_accuracy(config_file: str, config: DictConfig) -> None:
-    """Test that all config files in examples/configs have no TP size >= 4 accuracy issues.
+    """Check that a config file in examples/configs has no TP size >= 4 accuracy issues.
 
     There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.
     Related document: https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause.
