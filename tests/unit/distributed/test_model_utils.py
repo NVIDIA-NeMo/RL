@@ -2385,12 +2385,13 @@ def single_rank_gloo_group(tmp_path):
     torch.distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize("score_centering", [False, True])
-def test_packed_logits_reuse_is_off_under_score_centering(
-    single_rank_gloo_group, monkeypatch, score_centering
+@pytest.mark.parametrize(
+    "reuse,chunk_size", [(False, 2), (True, 2), (True, None)], ids=str
+)
+def test_packed_logits_reuse_follows_the_flag_and_chunking(
+    single_rank_gloo_group, monkeypatch, reuse, chunk_size
 ):
-    """Score centering reads the packed logits a second time, so the chunked logprob
-    must not be allowed to write its grad into their storage."""
+    """The chunked logprob reuses the logits' storage only when asked and chunked."""
     from types import SimpleNamespace
 
     from nemo_rl.algorithms.loss import loss_input as loss_input_module
@@ -2407,9 +2408,7 @@ def test_packed_logits_reuse_is_off_under_score_centering(
         loss_input_module, "from_parallel_logits_to_logprobs_packed_sequences", spy
     )
     _, _, logits, data = _score_centering_packed_inputs()
-    loss_fn = SimpleNamespace(
-        input_type=LossInputType.LOGPROB, score_centering=score_centering
-    )
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=False)
     loss_input_module.prepare_packed_loss_input(
         logits,
         data,
@@ -2418,9 +2417,33 @@ def test_packed_logits_reuse_is_off_under_score_centering(
         (0, 8, 20),
         vocab_parallel_rank=0,
         vocab_parallel_group=single_rank_gloo_group,
-        chunk_size=2,
+        chunk_size=chunk_size,
+        reuse_logits_storage=reuse,
     )
-    assert seen == [not score_centering]
+    assert seen == [reuse and chunk_size is not None]
+
+
+def test_packed_logits_reuse_rejects_score_centering(single_rank_gloo_group):
+    """Score centering reads the packed logits again, so reuse must fail loudly."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+    from nemo_rl.algorithms.loss.loss_input import prepare_packed_loss_input
+
+    _, _, logits, data = _score_centering_packed_inputs()
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
+    with pytest.raises(ValueError, match="reuse_logits_storage"):
+        prepare_packed_loss_input(
+            logits,
+            data,
+            loss_fn,
+            (0, 5, 12),
+            (0, 8, 20),
+            vocab_parallel_rank=0,
+            vocab_parallel_group=single_rank_gloo_group,
+            chunk_size=2,
+            reuse_logits_storage=True,
+        )
 
 
 def test_score_centering_chunked_grad_with_activation_logits(single_rank_gloo_group):

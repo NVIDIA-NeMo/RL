@@ -2086,6 +2086,21 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
         assert config["megatron_cfg"]["defer_fp32_logits"], (
             "defer_fp32_logits must be True if logprob_chunk_size is set"
         )
+    if config["megatron_cfg"].get("reuse_logits_storage"):
+        sequence_packing = config.get("sequence_packing")
+        chunk_size = config.get("logprob_chunk_size")
+        if not (
+            sequence_packing is not None
+            and sequence_packing["enabled"]
+            and sequence_packing.get("fuse_loss")
+            and isinstance(chunk_size, int)
+            and chunk_size > 0
+        ):
+            raise ValueError(
+                "policy.megatron_cfg.reuse_logits_storage=true requires "
+                "sequence_packing.enabled=true, sequence_packing.fuse_loss=true and "
+                "a positive policy.logprob_chunk_size"
+            )
 
 
 def _create_checkpoint_config(

@@ -258,13 +258,20 @@ def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group, dtype=torch.float32
 
 
 def _run_compare_sequence_packing_wrappers(
-    rank, world_size, cp_size, tp_size, chunk_size=None, dtype=torch.float32
+    rank,
+    world_size,
+    cp_size,
+    tp_size,
+    chunk_size=None,
+    reuse_logits_storage=False,
+    dtype=torch.float32,
 ):
     """Compare SequencePackingFusionLossWrapper vs SequencePackingLossWrapper.
 
     Verifies that the fused wrapper produces identical loss values and
     backward gradients w.r.t. vocab-parallel logits, and that it writes the
-    grad into the packed logits' storage iff ``chunk_size`` is set.
+    grad into the packed logits' storage iff reuse is requested and
+    ``chunk_size`` is set.
     """
     _my_cp_rank, my_tp_rank, cp_group, tp_group = _setup_2d_process_groups(
         rank, world_size, cp_size, tp_size
@@ -285,8 +292,11 @@ def _run_compare_sequence_packing_wrappers(
 
     candidate_wrapper = SequencePackingFusionLossWrapper(
         loss_fn=base_loss_fn,
-        # With chunk_size the fused path writes the grad into the logits' storage.
-        prepare_fn=functools.partial(prepare_packed_loss_input, chunk_size=chunk_size),
+        prepare_fn=functools.partial(
+            prepare_packed_loss_input,
+            chunk_size=chunk_size,
+            reuse_logits_storage=reuse_logits_storage,
+        ),
         cu_seqlens_q=to_cpu_int_tuple(tc["cu_seqlens"]),
         cu_seqlens_q_padded=to_cpu_int_tuple(tc["cu_seqlens_padded"]),
         vocab_parallel_rank=my_tp_rank,
@@ -317,10 +327,12 @@ def _run_compare_sequence_packing_wrappers(
     (candidate_loss / cp_size).backward()
     candidate_grad = candidate_logits.grad.clone()
 
-    # The chunked fused path writes the grad into the packed logits' storage.
+    # Only the chunked fused path with reuse on writes the grad into the logits.
     reused = not torch.equal(candidate_packed_logits.detach(), packed_before)
-    assert reused == (chunk_size is not None), (
-        f"reuse={reused} with chunk_size={chunk_size} on rank {rank}"
+    expected_reuse = reuse_logits_storage and chunk_size is not None
+    assert reused == expected_reuse, (
+        f"reuse={reused} with chunk_size={chunk_size}, "
+        f"reuse_logits_storage={reuse_logits_storage} on rank {rank}"
     )
 
     # Sanity: gradients must be non-None and non-zero
@@ -455,10 +467,14 @@ def _run_compare_sequence_packing_wrappers_with_sampling(
     ],
     ids=lambda cp_tp: f"cp{cp_tp[0]}_tp{cp_tp[1]}",
 )
-@pytest.mark.parametrize("chunk_size", [None, 3], ids=["nochunk", "chunk3"])
+@pytest.mark.parametrize(
+    "chunk_size,reuse_logits_storage",
+    [(None, True), (3, False), (3, True)],
+    ids=["nochunk-reuse", "chunk3", "chunk3-reuse"],
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
 def test_sequence_packing_fusion_vs_baseline(
-    distributed_test_runner, cp_tp, chunk_size, dtype
+    distributed_test_runner, cp_tp, chunk_size, reuse_logits_storage, dtype
 ):
     """Compare SequencePackingFusionLossWrapper vs SequencePackingLossWrapper.
 
@@ -475,6 +491,7 @@ def test_sequence_packing_fusion_vs_baseline(
         cp_size=cp_size,
         tp_size=tp_size,
         chunk_size=chunk_size,
+        reuse_logits_storage=reuse_logits_storage,
         dtype=dtype,
     )
     distributed_test_runner(test_fn, world_size=world_size)

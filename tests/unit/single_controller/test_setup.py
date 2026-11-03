@@ -4520,6 +4520,7 @@ def test_minf_image_preprocessing_emits_float32_pixels():
             }
         },
         {"megatron_cfg": {"enabled": True, "use_fused_linear_logprobs": True}},
+        {"megatron_cfg": {"enabled": True, "reuse_logits_storage": True}},
     ],
 )
 def test_score_centering_rejects_unsupported_trainer_logits(backend_cfg):
