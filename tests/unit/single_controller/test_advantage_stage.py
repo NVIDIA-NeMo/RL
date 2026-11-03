@@ -503,6 +503,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "reward_partial",
         "advantage_partial",
         "seq_logprob_error_metrics",
+        # A few per-reason masked-row counts, not the masks themselves.
+        "sample_mask_metrics",
         # OPD's moments, as this call's contribution rather than a total.
         "opd_stat_sum",
         "opd_stat_sumsq",

@@ -3494,3 +3494,196 @@ def test_vocab_parallel_gather_columns_tp_sharded(monkeypatch):
     ref[..., idx].float().backward(grad_out)
     torch.testing.assert_close(shards[0].grad, ref.grad[..., :v_local])
     torch.testing.assert_close(shards[1].grad, ref.grad[..., v_local:])
+
+
+# ---------------------------------------------------------------------------
+# Score centering (arXiv:2609.20807)
+# ---------------------------------------------------------------------------
+
+
+def _score_centering_distributions(vocab: int, *, seed: int):
+    """Trainer logits z and a sampler q that disagrees with p on a 4-token head.
+
+    The head holds p's two likeliest and two rarest tokens, with sampler masses
+    that push p / q out of the TIS band [0.2, 5] on both sides, so truncation is
+    active and plain TIS keeps a drift. q's tail is exactly ``rho * p``, the
+    paper's top-k tail model, so the centering identity is exact rather than
+    approximate.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    z = torch.randn(vocab, generator=generator, dtype=torch.float64)
+    p = torch.softmax(z, -1)
+    order = torch.argsort(p, descending=True)
+    head = torch.cat([order[:2], order[-2:]])
+    tail = torch.ones(vocab, dtype=torch.bool)
+    tail[head] = False
+    q = torch.empty_like(p)
+    q[head] = torch.tensor([0.02, 0.3, 0.4, 0.1], dtype=torch.float64)
+    q[tail] = p[tail] * (1.0 - q[head].sum()) / p[tail].sum()
+    ratios = p[head] / q[head]
+    assert (ratios > 5.0).any() and (ratios < 0.2).any()
+    return z, q, head
+
+
+def _expected_gradient_under_sampler(loss_fn, z, q, head, advantage=1.0):
+    """E_{y ~ q}[grad_z loss(y)] for one generated token with the given advantage."""
+    top_k = head.numel()
+    expected = torch.zeros_like(z)
+    for y in range(z.numel()):
+        logits = z.clone().requires_grad_(True)
+        logprobs = torch.log_softmax(logits, -1)
+        # A two-token row: position 0 is the prompt, position 1 the sampled token.
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.tensor([[0, y]]),
+                "advantages": torch.tensor([[0.0, advantage]], dtype=torch.float64),
+                # The trainer's own previous log-prob: one optimizer step per batch.
+                "prev_logprobs": torch.stack(
+                    [torch.zeros(()), logprobs[y].detach()]
+                ).unsqueeze(0),
+                "generation_logprobs": torch.stack(
+                    [torch.zeros(()), q[y].log()]
+                ).unsqueeze(0),
+                "reference_policy_logprobs": torch.zeros(1, 2, dtype=torch.float64),
+                "token_mask": torch.tensor([[0.0, 1.0]], dtype=torch.float64),
+                "sample_mask": torch.tensor([1.0], dtype=torch.float64),
+                "sampler_topk_logprobs": torch.stack(
+                    [torch.zeros(top_k, dtype=torch.float64), q[head].log()]
+                ).unsqueeze(0),
+            }
+        )
+        loss, metrics = loss_fn(
+            next_token_logprobs=logprobs[y].reshape(1, 1),
+            policy_logprobs_at_sampler_topk=logprobs[head].reshape(1, 1, top_k),
+            data=data,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+        )
+        loss.backward()
+        expected += q[y] * logits.grad
+    return expected, metrics
+
+
+@pytest.mark.parametrize("token_level_loss", [True, False])
+@pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop", "adaptive-ppo-clip"])
+def test_score_centering_cancels_the_drift_under_the_sampler(mode, token_level_loss):
+    """With the switch on, the sampler-expected update is zero under a constant advantage.
+
+    That is the paper's defining property: a constant advantage carries no
+    learning signal, and any remaining update is drift toward the sampler.
+    """
+    z, q, head = _score_centering_distributions(12, seed=0)
+    truncated = mode in ("tis", "icepop", "adaptive-ppo-clip")
+    common = dict(
+        reference_policy_kl_penalty=0.0,
+        token_level_loss=token_level_loss,
+        use_importance_sampling_correction=mode != "off",
+        truncated_importance_sampling_type=mode if truncated else None,
+        truncated_importance_sampling_ratio=5.0 if truncated else None,
+        truncated_importance_sampling_ratio_min=0.2 if truncated else None,
+        # adaptive-ppo-clip requires it; prev_logprobs is the trainer's own, so
+        # the other modes' gradients are the same either way.
+        force_on_policy_ratio=mode == "adaptive-ppo-clip",
+    )
+    plain = ClippedPGLossFn(ClippedPGLossConfig(**common))
+    centered = ClippedPGLossFn(ClippedPGLossConfig(score_centering=True, **common))
+
+    drift, _ = _expected_gradient_under_sampler(plain, z, q, head)
+    if mode != "is":
+        assert drift.abs().max() > 1e-3
+
+    cancelled, metrics = _expected_gradient_under_sampler(centered, z, q, head)
+    torch.testing.assert_close(cancelled, torch.zeros_like(z), atol=1e-9, rtol=0.0)
+    torch.testing.assert_close(
+        torch.tensor(metrics["score_centering_head_mass"], dtype=torch.float64),
+        q[head].sum(),
+    )
+    assert "score_centering_head_mass" in centered.metric_normalizations
+    assert "score_centering_head_mass" not in plain.metric_normalizations
+
+
+def _shared_ratio_tail_distributions(tail_ratio: float):
+    """Trainer logits z and a sampler q whose tail tokens share one ratio p / q.
+
+    The head holds three tokens with ratios p / q of 80, 5.3 and 0.1, and a
+    free token that normalizes q. The tail is exactly ``p / tail_ratio``, the
+    paper's top-k tail model, so the whole tail sits at ``1 / rho =
+    tail_ratio`` and a ratio filter keeps or drops it whole.
+    """
+    generator = torch.Generator().manual_seed(18)
+    z = torch.randn(16, generator=generator, dtype=torch.float64) * 2.0
+    p = torch.softmax(z, -1)
+    order = torch.argsort(p, descending=True)
+    fixed, free = order[[0, 2, -1]], order[1]
+    head = torch.cat([fixed, free.reshape(1)])
+    tail = torch.ones(16, dtype=torch.bool)
+    tail[head] = False
+    q = torch.empty_like(p)
+    q[fixed] = p[fixed] / torch.tensor([80.0, 5.3, 0.1], dtype=torch.float64)
+    q[tail] = p[tail] / tail_ratio
+    q[free] = 1.0 - q[fixed].sum() - q[tail].sum()
+    assert q[free] > 0
+    return z, q, head
+
+
+# Ratios against adaptive-ppo-clip's lo = 0.2, hi = 5 + k and outer = 50: the
+# head's 80 is dropped for either sign of the advantage, its 5.3 for a positive
+# one unless k = 0.5 lifts hi past it, and its 0.1 for a negative one. A tail at
+# ratio 60 is dropped for either sign, at 8.0 for a positive advantage, at 0.1
+# for a negative one, and at 1.0 never.
+@pytest.mark.parametrize("k", [0.0, 0.5])
+@pytest.mark.parametrize("tail_ratio", [1.0, 0.1, 8.0, 60.0])
+@pytest.mark.parametrize("advantage", [1.0, -1.0], ids=["positive", "negative"])
+def test_score_centering_cancels_the_adaptive_ppo_clip_drift(advantage, tail_ratio, k):
+    """adaptive-ppo-clip's closed form holds for kept and dropped head ids and tails.
+
+    The filter keeps a token at its raw ratio or drops it by the sign of its
+    advantage, with an upper bound the controller moves between steps; the
+    centering must follow both, and keep or drop the modeled tail whole.
+    """
+    z, q, head = _shared_ratio_tail_distributions(tail_ratio)
+    common = dict(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type="adaptive-ppo-clip",
+        truncated_importance_sampling_ratio=5.0,
+        truncated_importance_sampling_ratio_min=0.2,
+        force_on_policy_ratio=True,
+    )
+    plain = ClippedPGLossFn(ClippedPGLossConfig(**common))
+    centered = ClippedPGLossFn(ClippedPGLossConfig(score_centering=True, **common))
+    for loss_fn in (plain, centered):
+        loss_fn.set_adaptive_ppo_clip_k(k)
+
+    drift, _ = _expected_gradient_under_sampler(plain, z, q, head, advantage=advantage)
+    assert drift.abs().max() > 1e-3
+
+    cancelled, _ = _expected_gradient_under_sampler(
+        centered, z, q, head, advantage=advantage
+    )
+    torch.testing.assert_close(cancelled, torch.zeros_like(z), atol=1e-9, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type="seq-mask-tis",
+            truncated_importance_sampling_ratio=2.0,
+            truncated_importance_sampling_ratio_min=0.5,
+        ),
+        dict(
+            use_importance_sampling_correction=True,
+            sequence_level_importance_ratios=True,
+            token_level_loss=False,
+        ),
+    ],
+)
+def test_score_centering_rejects_unsupported_importance_sampling(overrides):
+    with pytest.raises(AssertionError, match="score_centering composes only"):
+        ClippedPGLossFn(
+            ClippedPGLossConfig(
+                reference_policy_kl_penalty=0.0, score_centering=True, **overrides
+            )
+        )
