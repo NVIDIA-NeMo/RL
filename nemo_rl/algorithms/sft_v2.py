@@ -509,14 +509,16 @@ class SFTSingleControllerActor:
         )
 
     def _save_checkpoint(self, metric: dict[str, float]) -> None:
-        # The workers would wait for a still-pending save anyway; publish it first.
-        self._finish_pending_save(blocking=True)
         step = self._save_state.total_steps
         # Covers the save's loop-blocking part only; the durable tail is
         # rl.checkpoint.finalize.
         with managed_span(
             RLSpanGroup.CHECKPOINT, "rl.sft_v2.checkpointing", tracer=self._tracer
         ):
+            # The workers would wait for a still-pending save anyway; publish it
+            # first. Inside the span because the wait blocks the training loop,
+            # which is what this span measures, and grpo counts it the same way.
+            self._finish_pending_save(blocking=True)
             loader_states = self._loader_state_dicts()
             if len(loader_states) != self._placement_plan.logical_world_size:
                 raise RuntimeError(

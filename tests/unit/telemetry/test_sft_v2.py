@@ -135,6 +135,10 @@ def test_sft_v2_checkpointing_span_covers_the_whole_save(monkeypatch, tmp_path) 
     all of it: a span around the policy write alone leaves the loader dump and
     the finalization handoff outside, and ``rl.checkpoint.finalize`` parents to
     whatever is open when ``begin_finalization`` runs.
+
+    The wait on a deferred save counts too. It is the previous checkpoint's,
+    but it blocks this step, and leaving it outside made the span read shorter
+    than the gap it is supposed to explain.
     """
     exporter = InMemorySpanExporter()
     handle = setup_telemetry(
@@ -176,6 +180,11 @@ def test_sft_v2_checkpointing_span_covers_the_whole_save(monkeypatch, tmp_path) 
     controller._checkpointer.begin_finalization = MagicMock(
         side_effect=_record("finalize_handoff")
     )
+    # A save from the previous step still waiting to be published.
+    controller._pending_checkpoint_path = str(tmp_path / "tmp_step_6")
+    controller._trainer.finalize_async_save = MagicMock(
+        side_effect=_record("pending_wait")
+    )
 
     with iteration_scope(7):
         controller._save_checkpoint({"loss": 1.0})
@@ -188,7 +197,13 @@ def test_sft_v2_checkpointing_span_covers_the_whole_save(monkeypatch, tmp_path) 
     assert checkpointing.attributes[RL_ITERATION_ATTR] == 7
     assert open_span == {
         phase: checkpointing.context.span_id
-        for phase in ("init_tmp", "policy_write", "loader_dump", "finalize_handoff")
+        for phase in (
+            "pending_wait",
+            "init_tmp",
+            "policy_write",
+            "loader_dump",
+            "finalize_handoff",
+        )
     }
 
 
