@@ -455,6 +455,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             ),
             tool_parser=self.engine_cfg.get("tool_parser"),
             reasoning_parser=self.engine_cfg.get("reasoning_parser"),
+            chat_template=self.engine_cfg.get("chat_template"),
         )
         # host:port of the URL just returned; the disagg server is configured
         # with addresses, not URLs.
