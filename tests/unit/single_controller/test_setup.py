@@ -1224,7 +1224,7 @@ class TestSetup:
 
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
 
-    def test_turn_recovery_requires_periodic_snapshots(self):
+    def test_turn_recovery_rejects_a_config_that_never_saves(self):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
@@ -1232,10 +1232,13 @@ class TestSetup:
         }
         mc.token_capture.enabled = True
         mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_on_trainer_checkpoint=False
+        )
 
         with pytest.raises(
             ValueError,
-            match="target_level='turn' requires.*snapshot_attempt_interval_s",
+            match="target_level='turn' would never save environment state",
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 

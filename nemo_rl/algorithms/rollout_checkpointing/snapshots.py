@@ -244,10 +244,14 @@ class RolloutSnapshotter(_UsesRolloutParts):
 
         A trainer checkpoint holds no environment state, so the pump waits for
         it to be durable, off the training loop, and then captures the
-        environment anchored to it.
+        environment anchored to it, unless
+        ``rollout_checkpointing.snapshot_on_trainer_checkpoint`` is off.
         """
         self._trace.emit("trainer_checkpoint_published", step=step)
-        if self._environment_checkpoint.holds_rollout_state:
+        if (
+            self._environment_checkpoint.holds_rollout_state
+            and self._master_config.rollout_checkpointing.snapshot_on_trainer_checkpoint
+        ):
             self._wakeup.set()
 
     async def _save_data_plane_checkpoint(
@@ -708,6 +712,10 @@ class RolloutSnapshotter(_UsesRolloutParts):
             self._last_snapshot_mutation_version = snapshot_cut.mutation_version
             self._last_missing_anchor = None
             save_completed = time.monotonic()
+            if self._environment_checkpoint.holds_rollout_state:
+                # The deadline's trainer checkpoint is followed by a snapshot
+                # like this one, so the deadline must leave time for both.
+                self._timeout.save_reserve_seconds = save_completed - save_started
             checkpoint_metrics = {
                 "snapshot_sequence": float(snapshot_sequence),
                 "total_save_seconds": save_completed - save_started,
@@ -823,40 +831,72 @@ class RolloutSnapshotter(_UsesRolloutParts):
             prefix=ROLLOUT_CHECKPOINT_OUTCOME_PREFIX,
         )
 
-    async def run(self) -> None:
-        """Persist rollout state periodically, including during streamed train."""
-        snapshot_attempt_interval_s = (
+    def _failure_reason(self, error: Exception) -> RolloutCheckpointAttemptReason:
+        """Classify a failed snapshot; only ``invariant_error`` is not retryable."""
+        if isinstance(error, TimeoutError):
+            return "timeout"
+        if isinstance(error, OSError):
+            return "io_error"
+        if self._environment_checkpoint.is_unavailable(error):
+            # Nothing RL holds changed, so the next attempt can retry.
+            return "gym_unavailable"
+        return "invariant_error"
+
+    def _seconds_until_next_attempt(self) -> Optional[float]:
+        """How long the pump waits for a wakeup before attempting anyway.
+
+        ``None`` waits only for a trainer checkpoint's wakeup. Before the first
+        train step the pump also wakes at the checkpoint deadline, since no
+        train step will reach it.
+        """
+        waits = []
+        interval_s = (
             self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
         )
-        if snapshot_attempt_interval_s is None:
-            raise RuntimeError("rollout checkpoint pump started while disabled")
+        if interval_s is not None:
+            waits.append(interval_s)
+        if self._read_progress().train_steps == 0:
+            until_deadline = self._timeout.seconds_until_save()
+            if until_deadline is not None:
+                # A deadline snapshot that was skipped retries once a second.
+                waits.append(max(until_deadline, 1.0))
+        return min(waits, default=None)
+
+    async def run(self) -> None:
+        """Save rollout snapshots on schedule, including during streamed train.
+
+        Attempts one every ``snapshot_attempt_interval_s`` when set, soon after
+        each trainer checkpoint that asks for one, and at the checkpoint
+        deadline when it arrives before the first train step.
+        """
         consecutive_failures = 0
         consecutive_discards = 0
         while True:
             try:
                 await asyncio.wait_for(
                     self._wakeup.wait(),
-                    timeout=snapshot_attempt_interval_s,
+                    timeout=self._seconds_until_next_attempt(),
                 )
             except TimeoutError:
                 pass
+            woken = self._wakeup.is_set()
             self._wakeup.clear()
             attempt_started = time.monotonic()
             deadline_due = (
                 self._read_progress().train_steps == 0 and self._timeout.would_save()
             )
+            if (
+                not woken
+                and not deadline_due
+                and self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
+                is None
+            ):
+                # A wait timed for a deadline that the first train step now handles.
+                continue
             try:
                 result = await self.save_snapshot(force=deadline_due)
             except Exception as error:
-                if isinstance(error, TimeoutError):
-                    failure_reason: RolloutCheckpointAttemptReason = "timeout"
-                elif isinstance(error, OSError):
-                    failure_reason = "io_error"
-                elif self._environment_checkpoint.is_unavailable(error):
-                    # Nothing RL holds changed, so the next attempt can retry.
-                    failure_reason = "gym_unavailable"
-                else:
-                    failure_reason = "invariant_error"
+                failure_reason = self._failure_reason(error)
                 self._log_outcome(
                     outcome="failed",
                     reason=failure_reason,
@@ -905,3 +945,46 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 )
                 self._stop_event.set()
                 return
+
+    async def save_at_deadline(self) -> None:
+        """Save the environment state the deadline's trainer checkpoint lacks.
+
+        The run stops after this, so nothing later would snapshot it. A failure
+        that leaves checkpoint state consistent only warns: the trainer
+        checkpoint is durable, and a restore from it redoes the unfinished turns.
+        """
+        if not self._environment_checkpoint.holds_rollout_state:
+            return
+        # The pump need not also answer the trainer checkpoint's wakeup.
+        self._wakeup.clear()
+        attempt_started = time.monotonic()
+        try:
+            result = await self.save_snapshot(force=True)
+        except Exception as error:
+            failure_reason = self._failure_reason(error)
+            self._log_outcome(
+                outcome="failed",
+                reason=failure_reason,
+                attempt_duration_seconds=time.monotonic() - attempt_started,
+            )
+            if failure_reason == "invariant_error":
+                raise
+            warnings.warn(
+                "rollout snapshot at the checkpoint deadline failed; a restore "
+                "redoes the unfinished turns from the trainer checkpoint: "
+                f"{type(error).__name__}: {error}",
+                stacklevel=2,
+            )
+            return
+        self._log_outcome(
+            outcome="completed" if result.saved else "skipped",
+            reason=result.reason,
+            attempt_duration_seconds=time.monotonic() - attempt_started,
+        )
+        if not result.saved:
+            warnings.warn(
+                "rollout snapshot at the checkpoint deadline was skipped "
+                f"({result.reason}); a restore redoes the unfinished turns from "
+                "the trainer checkpoint",
+                stacklevel=2,
+            )
