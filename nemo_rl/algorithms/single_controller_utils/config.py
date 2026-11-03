@@ -41,10 +41,15 @@ from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     RewardPenaltyConfig,
 )
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data_plane.schema import (
@@ -56,13 +61,17 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
     ClusterConfig,
 )
+from nemo_rl.environments.call_selection import resolve_selection_policy
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
-from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.experience.rollout_recovery import (
+    RecoveryGranularity,
+    RecoveryTargetLevel,
+)
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
 )
-from nemo_rl.models.policy import MegatronConfig, PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -318,8 +327,9 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # with RefitAborted -- still far better than hanging forever inside NCCL, but choose
     # the deadline knowing there is no second chance.
     #
-    # None disarms it: no watchdog thread is started and the refit path is byte-identical
-    # to before. Set it well above a healthy refit, because the cost of firing early is
+    # None disables the collective watchdog and controller's transfer deadline.
+    # Generation pause/resume still have a 360s timeout. Set this well above a healthy
+    # refit, because the cost of firing early is
     # aborting a run that was merely slow, while the cost of firing late is only that a
     # wedge lasts longer before it is broken.
     #
@@ -474,6 +484,20 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
     log_full_train_data: bool = False
+    # Where the dump above is written: the JSONL writer by default, or an external
+    # DebugWriter selected by target.
+    debug_writer: DebugWriterConfig = Field(default_factory=DebugWriterConfig)
+    # Finalize async policy checkpoints (policy.megatron_cfg.checkpoint.async_save)
+    # at a later step boundary, once every rank's background write is done, instead
+    # of from a background thread whose blocking finalize holds the policy workers
+    # until the write lands. tmp_step_N is renamed to step_N after that finalize; the
+    # next save and training exit still finalize blocking. Shortens steps only with
+    # non-colocated generation: colocated refits finish the write before offloading.
+    # Cost: until the finalize, only tmp_step_N exists and resume ignores it, so a
+    # crash in that window (typically one step) resumes from the previous checkpoint.
+    # Teardown after a controller-side failure still publishes it. Cannot be combined
+    # with rollout snapshots (rollout_checkpointing.snapshot_attempt_interval_s).
+    defer_async_checkpoint_finalize: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
@@ -493,7 +517,7 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         default_factory=GenerationRouterConfig
     )
     # Recompute generation KV caches after each weight update.
-    recompute_kv_cache_after_weight_updates: bool = False
+    recompute_kv_cache_after_weight_updates: bool = True
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
     # Cap on in-flight generate_and_push calls in the rollout pump.
@@ -666,59 +690,119 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Fixed CPU finalizer pool size; actors are never automatically replaced.
     num_reassembler_workers: PositiveInt = 2
 
+    # Reconstruct selected capture paths as rows of one logical rollout.
+    # Recovery persists selections across retries and trainer/rollout checkpoints.
+    # Requires unit dataset loss weights.
+    forest_training: bool = False
+    # returned_history preserves the harness-selected trajectory (default).
+    # all_captured includes every captured call, including abandoned attempts.
+    # Custom policies use an importable package.module:function path.
+    selection_policy: str = "returned_history"
+
+    @model_validator(mode="after")
+    def validate_selection_policy(self) -> "TokenCaptureConfig":
+        resolve_selection_policy(self.selection_policy)
+        if self.selection_policy != "returned_history" and not self.forest_training:
+            raise ValueError(
+                f"selection_policy={self.selection_policy} requires forest_training=true"
+            )
+        return self
+
 
 @dataclass(frozen=True)
 class TaskSourceRecoveryGranularity:
-    """Recovery granularity selected for a prompt-group reservation.
+    """Resolved retry and restore policy for a prompt-group reservation.
 
-    ``task_source`` is copied from the raw Gym row when present. ``granularity``
-    is selected from an explicit agent override, a task-source override, or the
-    global default.
+    ``task_source`` is copied from the raw Gym row when present. ``restore_level``
+    is the configured restart target. Until Gym advertises group-scoring
+    capabilities, ``granularity`` is derived from that target and explicit
+    task-source or agent overrides.
     """
 
     task_source: Optional[str]
-    granularity: RecoveryGranularity
+    restore_level: RecoveryTargetLevel
+
+    @property
+    def granularity(self) -> RecoveryGranularity:
+        return self.restore_level.granularity
 
 
 class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """Retry and restore policy for unfinished token-capture prompt groups.
 
-    ``sibling`` (the default) preserves completed generations and retries only
-    the missing ones. Prefer it when reusing work and avoiding repeated long-tail
-    generations matters more than keeping a group on one policy version.
-
-    ``prompt_group`` discards and regenerates every sibling when any generation
-    is unfinished. It costs a full group per recovery, but keeps the regenerated
-    group on the policy weights live at redispatch instead of mixing those results
-    with older sealed siblings.
-
-    The resolved value is persisted on each ledger group, so restoring a saved
-    group does not reinterpret it using a newer configuration. The same
-    granularity governs failures handled in-process and after a process restart.
+    ``turn`` requests Gym participant recovery, ``sibling`` preserves completed
+    generations and restarts unfinished siblings, and ``prompt_group`` restarts
+    every sibling in an unfinished group. Overrides may only make a particular
+    task source or agent coarser than the global target.
     """
 
-    default_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING
+    target_level: RecoveryTargetLevel = RecoveryTargetLevel.SIBLING
     # Keyed by ``extra_env_info.task_source``, which is available before Gym
     # resolves the concrete agent used to execute the row.
-    task_source_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+    task_source_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
     # Keyed by ``extra_env_info.agent_ref.name`` when the input row already has
     # a concrete Gym route. A matching agent override wins over task_source.
-    agent_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+    agent_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
+    # Seconds Gym gets to park its in-flight steps; see the exemplar YAML.
+    gym_prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
+    # With target_level='turn', a Gym server whose checkpoint mode is
+    # restart_only (the default for agents and resources servers) starts every
+    # in-flight rollout over after a crash. False fails setup and names such
+    # servers; true accepts them with a warning.
+    allow_restart_only_gym_servers: bool = False
 
     @model_validator(mode="after")
-    def _reject_removed_override_keys(self) -> "RolloutRecoveryConfig":
-        """Reject the removed task-name map instead of silently ignoring it."""
-        removed = {"task_granularity_overrides"}.intersection(self.model_extra or {})
-        if removed:
+    def _validate_restart_only_opt_in(self) -> "RolloutRecoveryConfig":
+        """Reject the restart-only opt-in where Gym does not checkpoint rollouts."""
+        if (
+            self.allow_restart_only_gym_servers
+            and self.target_level is not RecoveryTargetLevel.TURN
+        ):
             raise ValueError(
-                f"rollout_recovery fields {sorted(removed)!r} were replaced by "
-                "task_source_granularity_overrides"
+                "rollout_recovery.allow_restart_only_gym_servers applies only to "
+                "target_level='turn'; with "
+                f"target_level={self.target_level.value!r} every unfinished "
+                "rollout already starts over"
             )
         return self
+
+    @model_validator(mode="after")
+    def _validate_target_overrides(self) -> "RolloutRecoveryConfig":
+        """Reject overrides finer than the global target."""
+        for mapping_name, overrides in (
+            (
+                "task_source_target_level_overrides",
+                self.task_source_target_level_overrides,
+            ),
+            ("agent_target_level_overrides", self.agent_target_level_overrides),
+        ):
+            finer = sorted(
+                name
+                for name, level in overrides.items()
+                if level.rank < self.target_level.rank
+            )
+            if finer:
+                raise ValueError(
+                    f"{mapping_name} may only force a coarser recovery level than "
+                    f"target_level={self.target_level.value!r}; invalid={finer!r}"
+                )
+            if self.target_level is RecoveryTargetLevel.TURN and overrides:
+                # A checkpointing Gym deployment exports every live episode, so
+                # a coarser route on it would fall outside the commit scope.
+                raise ValueError(
+                    f"{mapping_name} is not supported with target_level='turn' "
+                    f"yet; got {sorted(overrides)!r}"
+                )
+        return self
+
+    @property
+    def turn_checkpointing_enabled(self) -> bool:
+        """Whether Gym participant state is required for the requested target."""
+        return self.target_level is RecoveryTargetLevel.TURN
 
     def resolve_for_prompt(
         self, prompt: Mapping[str, Any]
@@ -740,6 +824,7 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                 if raw_agent_name is not None and not isinstance(raw_agent_name, str):
                     raise TypeError("prompt agent_ref.name must be a string or None")
                 agent_name = raw_agent_name
+        target_level = self.target_level
         if agent_name is not None:
             if task_source is None:
                 warnings.warn(
@@ -749,14 +834,21 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                     FutureWarning,
                     stacklevel=2,
                 )
-            override = self.agent_granularity_overrides.get(agent_name)
+            override = self.agent_target_level_overrides.get(agent_name)
             if override is not None:
-                return TaskSourceRecoveryGranularity(task_source, override)
-        if task_source is not None:
-            override = self.task_source_granularity_overrides.get(task_source)
-            if override is not None:
-                return TaskSourceRecoveryGranularity(task_source, override)
-        return TaskSourceRecoveryGranularity(task_source, self.default_granularity)
+                target_level = override
+            elif task_source is not None:
+                target_level = self.task_source_target_level_overrides.get(
+                    task_source, target_level
+                )
+        elif task_source is not None:
+            target_level = self.task_source_target_level_overrides.get(
+                task_source, target_level
+            )
+        return TaskSourceRecoveryGranularity(
+            task_source=task_source,
+            restore_level=target_level,
+        )
 
 
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
@@ -865,6 +957,82 @@ class MasterConfig(BaseModel, extra="allow"):
         return self
 
 
+def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
+    """Keep the initial Forest objective identical at startup and before fanout."""
+    unsupported = {
+        "grpo.adv_estimator.name": grpo.adv_estimator.name != "grpo",
+        "loss_fn.token_level_loss": not loss.token_level_loss,
+        "loss_fn.sequence_level_importance_ratios": loss.sequence_level_importance_ratios,
+        "loss_fn.truncated_importance_sampling_type": loss.truncated_importance_sampling_type
+        == "seq-mask-tis",
+        "loss_fn.use_kl_in_reward": loss.use_kl_in_reward,
+        "loss_fn.positive_example_nll_weight": loss.positive_example_nll_weight != 0,
+        "grpo.use_dynamic_sampling": grpo.use_dynamic_sampling,
+        "grpo.reward_shaping.enabled": grpo.reward_shaping.enabled,
+        "grpo.reward_scaling.enabled": grpo.reward_scaling.enabled,
+        "grpo.calculate_advantages_on_gpu": bool(grpo.calculate_advantages_on_gpu),
+        "grpo.invalid_tool_call_advantage": grpo.invalid_tool_call_advantage
+        is not None,
+        "grpo.malformed_thinking_advantage": grpo.malformed_thinking_advantage
+        is not None,
+    }
+    bad = [name for name, enabled in unsupported.items() if enabled]
+    if bad:
+        raise ValueError(
+            "Forest training (token_capture.forest_training) requires standard token-level GRPO; "
+            f"unsupported settings: {', '.join(bad)}"
+        )
+
+
+def logprob_passes_required(
+    master_config: MasterConfig, algo_cfg: GRPOConfig | PPOConfig
+) -> tuple[bool, bool]:
+    """Return policy/reference forward requirements for both setup and execution."""
+    return (
+        not (
+            master_config.loss_fn.force_on_policy_ratio
+            and algo_cfg.seq_logprob_error_threshold is None
+        ),
+        bool(
+            master_config.loss_fn.reference_policy_kl_penalty > 0
+            and not algo_cfg.skip_reference_policy_logprobs_calculation
+        ),
+    )
+
+
+def forest_execution_row_multiple(
+    policy: PolicyConfig, *, dp_size: int, logprobs_required: bool
+) -> int:
+    """Common row divisibility for fixed or packed Megatron consumers.
+
+    Policy and reference forwards share this trainer's mesh and logprob MBS.
+    Packed consumers form their own bins and only need complete DP shards.
+    Non-interleaved PP admits any positive microbatch count; interleaved PP
+    and dynamic batching require separate qualification.
+    """
+    if (
+        not policy["megatron_cfg"]["enabled"]
+        or policy["dynamic_batching"]["enabled"]
+        or policy["megatron_cfg"].get("virtual_pipeline_model_parallel_size")
+        is not None
+    ):
+        raise ValueError(
+            "Forest execution padding requires fixed or packed, non-interleaved Megatron"
+        )
+    if policy["sequence_packing"]["enabled"]:
+        if type(dp_size) is not int or dp_size < 1:
+            raise ValueError("Forest consumer DP size must be a positive integer")
+        return dp_size
+    sizes = [policy["train_micro_batch_size"]]
+    if logprobs_required:
+        sizes.append(policy["logprob_batch_size"])
+    if any(type(size) is not int or size < 1 for size in [dp_size, *sizes]):
+        raise ValueError(
+            "Forest consumer DP and microbatch sizes must be positive integers"
+        )
+    return dp_size * math.lcm(*sizes)
+
+
 def is_ppo_run(master_config: MasterConfig) -> bool:
     """Whether this SingleController run trains a PPO critic alongside the policy.
 
@@ -969,6 +1137,18 @@ def _validate_opd_full_config(
             "reconstructed from its hidden states would not, silently optimizing a "
             "mismatched objective. Use teacher_payload='logits', where both sides "
             "come from the same scaled tensor."
+        )
+
+    if generation_config is not None and need_top_k_or_top_p_filtering(
+        TrainingSamplingParams(
+            top_k=generation_config["top_k"], top_p=generation_config["top_p"]
+        )
+    ):
+        warnings.warn(
+            "on_policy_distillation.full does not apply top-k/top-p filtering "
+            "to policy logprobs or the full-vocabulary KL. "
+            "policy.generation.top_k/top_p are still applied during rollout.",
+            stacklevel=2,
         )
 
     if full_cfg.teacher_payload == "logits":
@@ -1217,13 +1397,13 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
 
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
-    # setup_data_plane unconditionally, so a DTensor critic dies in Ray with the
+    # setup_data_plane unconditionally, so an Automodel critic dies in Ray with the
     # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
     value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
     if not value_megatron_cfg.get("enabled"):
         raise ValueError(
             "PPO on the SingleController path requires a Megatron critic "
-            "(value.megatron_cfg.enabled=true). The DTensor value worker does not "
+            "(value.megatron_cfg.enabled=true). The Automodel value worker does not "
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
@@ -1343,6 +1523,30 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
 
+    if async_config.defer_async_checkpoint_finalize:
+        megatron_cfg = master_config.policy.get("megatron_cfg")
+        megatron_checkpoint_cfg = (
+            megatron_cfg.get("checkpoint")
+            if megatron_cfg is not None and megatron_cfg["enabled"]
+            else None
+        )
+        if megatron_checkpoint_cfg is None or not megatron_checkpoint_cfg.get(
+            "async_save"
+        ):
+            raise ValueError(
+                "async_rl.defer_async_checkpoint_finalize requires the Megatron "
+                "policy backend with policy.megatron_cfg.checkpoint.async_save=true."
+            )
+        # A rollout snapshot needs step_N published while training is still on
+        # step N; a deferred finalize publishes it at a later step boundary.
+        if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
+            raise ValueError(
+                "async_rl.defer_async_checkpoint_finalize cannot be combined with "
+                "rollout_checkpointing.snapshot_attempt_interval_s: rollout snapshots "
+                "need each step's policy checkpoint published before the next "
+                "optimizer step, and a deferred finalize publishes it later."
+            )
+
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
     )
@@ -1351,6 +1555,83 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "reward_penalties require the NeMo-Gym rollout path "
             "(env.should_use_nemo_gym=true) on SingleController"
         )
+
+    generation_cfg = master_config.policy["generation"]
+    top_logprobs = generation_cfg.get("top_logprobs", 0)
+    if (
+        isinstance(top_logprobs, bool)
+        or not isinstance(top_logprobs, int)
+        or top_logprobs < 0
+    ):
+        raise ValueError("policy.generation.top_logprobs must be a nonnegative integer")
+    if top_logprobs > 0 and not master_config.loss_fn.score_centering:
+        raise ValueError(
+            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering; "
+            "set it to 0 or enable score centering"
+        )
+    if top_logprobs > 0:
+        if master_config.policy["generation"]["backend"] != "vllm":
+            raise ValueError(
+                "policy.generation.top_logprobs requires the vllm generation backend"
+            )
+        if not master_config.token_capture.enabled:
+            raise ValueError(
+                "policy.generation.top_logprobs requires token_capture.enabled=true"
+            )
+    if master_config.loss_fn.score_centering:
+        if top_logprobs == 0:
+            raise ValueError(
+                "loss_fn.score_centering requires policy.generation.top_logprobs > 0"
+            )
+        generation_cfg = master_config.policy["generation"]
+        temperature = generation_cfg["temperature"]
+        logprobs_mode = (generation_cfg.get("vllm_cfg") or {}).get("logprobs_mode")
+        if logprobs_mode is None:
+            logprobs_mode = (generation_cfg.get("vllm_kwargs") or {}).get(
+                "logprobs_mode"
+            )
+        if temperature <= 0 or not math.isfinite(temperature):
+            raise ValueError(
+                "loss_fn.score_centering requires a finite positive sampling temperature"
+            )
+        if logprobs_mode not in (None, "raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                "loss_fn.score_centering requires log probabilities, not raw/processed logits"
+            )
+        if logprobs_mode != "processed_logprobs" and temperature != 1.0:
+            raise ValueError(
+                "loss_fn.score_centering requires policy.generation.vllm_cfg.logprobs_mode="
+                "processed_logprobs when policy.generation.temperature != 1.0"
+            )
+        if (
+            generation_cfg.get("top_p") != 1.0
+            or generation_cfg.get("top_k") is not None
+        ):
+            raise ValueError(
+                "loss_fn.score_centering needs unfiltered sampling "
+                "(policy.generation.top_p=1, top_k=null) so the captured top-k is "
+                "the sampling distribution"
+            )
+
+        automodel_cfg = master_config.policy.get("automodel_cfg")
+        if automodel_cfg is not None and automodel_cfg["enabled"]:
+            enabled_automodel_cfg = cast(AutomodelConfig, automodel_cfg)
+            if (
+                enabled_automodel_cfg["tensor_parallel_size"] > 1
+                or enabled_automodel_cfg["context_parallel_size"] > 1
+            ):
+                raise ValueError(
+                    "loss_fn.score_centering supports Automodel only with "
+                    "tensor_parallel_size=1 and context_parallel_size=1; use Megatron for TP/CP"
+                )
+        megatron_cfg = master_config.policy.get("megatron_cfg") or {}
+        if megatron_cfg.get("enabled") and megatron_cfg.get(
+            "use_fused_linear_logprobs"
+        ):
+            raise ValueError(
+                "loss_fn.score_centering needs vocabulary logits; disable "
+                "policy.megatron_cfg.use_fused_linear_logprobs"
+            )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(
@@ -1389,10 +1670,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
             )
-        if master_config.loss_fn.force_on_policy_ratio:
+        if (
+            master_config.loss_fn.force_on_policy_ratio
+            and not master_config.loss_fn.use_cispo
+        ):
             raise ValueError(
                 "the ready_first sampler requires "
-                "loss_fn.force_on_policy_ratio=false so prev_logprobs are used"
+                "loss_fn.force_on_policy_ratio=false unless loss_fn.use_cispo=true"
             )
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no
@@ -1413,22 +1697,75 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     token_capture_config = master_config.token_capture
     recovery_config = master_config.rollout_recovery
-    if not token_capture_config.enabled and (
-        recovery_config.default_granularity is not RecoveryGranularity.SIBLING
-        or recovery_config.task_source_granularity_overrides
-        or recovery_config.agent_granularity_overrides
+    if (
+        not token_capture_config.enabled
+        and not recovery_config.turn_checkpointing_enabled
+        and (
+            recovery_config.target_level is not RecoveryTargetLevel.SIBLING
+            or recovery_config.task_source_target_level_overrides
+            or recovery_config.agent_target_level_overrides
+        )
     ):
         raise ValueError(
             "non-default rollout_recovery policies require "
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
         )
+    if token_capture_config.forest_training:
+        if master_config.grpo is None:
+            raise ValueError("forest training requires GRPO")
+        if not token_capture_config.enabled:
+            raise ValueError(
+                "token_capture.forest_training requires token_capture.enabled=true"
+            )
+        if (
+            master_config.grpo.invalid_tool_call_advantage is not None
+            or master_config.grpo.malformed_thinking_advantage is not None
+        ):
+            raise ValueError(
+                "forest training does not support message-level advantage overrides"
+            )
+        if token_capture_config.defer_routed_experts_to_policy:
+            raise ValueError("forest training requires direct routed-expert assembly")
+        validate_forest_objective(master_config.grpo, master_config.loss_fn)
+        if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
+            raise ValueError(
+                "Forest does not support reward penalties or on-policy distillation"
+            )
+        # Validate the fixed-batch policy shape before workers/generation start.
+        # Setup recomputes Q from the actual trainer DP mesh.
+        forest_execution_row_multiple(
+            master_config.policy, dp_size=1, logprobs_required=True
+        )
+    if recovery_config.turn_checkpointing_enabled:
+        # A turn snapshot holds rollout dispatch through Gym's prepare, commit and
+        # drain, and the stall watchdog keeps counting meanwhile.
+        gym_park_s = (
+            recovery_config.gym_prepare_timeout_s
+            + 2 * token_capture_config.control_timeout_s
+        )
+        stall_s = async_config.stall_watchdog.stall_timeout_s
+        if stall_s <= gym_park_s:
+            raise ValueError(
+                f"async_rl.stall_watchdog.stall_timeout_s ({stall_s}) must be > "
+                "rollout_recovery.gym_prepare_timeout_s + 2 * "
+                f"token_capture.control_timeout_s ({gym_park_s}); a turn snapshot "
+                "can hold rollout dispatch that long."
+            )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
     ):
         raise ValueError(
             "token_capture.defer_routed_experts_to_policy requires "
             "token_capture.enabled=true"
+        )
+    policy_config = master_config.policy
+    if token_capture_config.defer_routed_experts_to_policy and not (
+        "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
+    ):
+        raise NotImplementedError(
+            "token_capture.defer_routed_experts_to_policy is only wired for the Megatron "
+            "policy; the Automodel worker does not assemble deferred routes."
         )
     if (
         token_capture_config.enabled

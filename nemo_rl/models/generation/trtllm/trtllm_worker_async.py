@@ -327,6 +327,33 @@ class TrtllmAsyncGenerationWorkerImpl:
         # they can override anything above for advanced tuning.
         llm_kwargs.update(extra_trtllm_kwargs)
 
+        if engine_cfg.get("is_mx") and engine_cfg["precision"] != "fp8":
+            raise ValueError("engine_cfg.is_mx=True requires precision='fp8'")
+
+        if engine_cfg["precision"] == "fp8":
+            # Imported here: TRT-LLM is an optional dependency.
+            from tensorrt_llm.llmapi.llm_args import MoeConfig
+            from transformers import AutoConfig
+
+            from nemo_rl.models.generation.trtllm.quantization.fp8 import (
+                configure_fp8_llm_kwargs,
+                configure_fp8_moe_backend,
+                validate_model_type,
+            )
+
+            validate_model_type(
+                AutoConfig.from_pretrained(
+                    self.model_name, trust_remote_code=True
+                ).model_type
+            )
+
+            is_mx = bool(engine_cfg.get("is_mx"))
+            configure_fp8_llm_kwargs(llm_kwargs, is_mx=is_mx)
+
+            # Block-FP8 needs the TRTLLM MoE backend (DeepGEMM would resmooth to
+            # E8M0); MXFP8 uses CUTLASS or CuTe DSL. Other MoeConfig fields kept.
+            configure_fp8_moe_backend(llm_kwargs, MoeConfig, is_mx=is_mx)
+
         # Propagate the nsight runtime_env down to TRT-LLM's internal Ray GPU
         # workers.  The outer actor's @ray.remote nsight config does NOT inherit
         # into TRT-LLM's RayExecutor workers (ray_executor.py sets an explicit
@@ -501,9 +528,10 @@ class TrtllmAsyncGenerationWorkerImpl:
                 without draining in-flight requests (in-flight weight
                 update). Default True preserves the original drain-first
                 behavior.
-            recompute_kv: If True (and ``drain=False``), preempt all
-                in-flight requests after the refit so the scheduler
-                re-prefills them under the new weights.
+            recompute_kv: If True, re-prefill in-flight requests under the new
+                weights and reset the prefix cache after the refit
+                (``recompute_kv_cache_after_weight_updates``). If False,
+                in-flight requests keep their current KV cache.
         """
         assert self.llm is not None
         try:
@@ -511,10 +539,16 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "update_weights_from_collective",
                 kwargs={"drain": drain, "recompute_kv": recompute_kv},
             )
-            worker_result = results[0] if results else True
-            if not worker_result:
+            if not results:
+                print("Error: TRT-LLM weight update returned no worker results.")
+                return False
+            failed_workers = [
+                (rank, result) for rank, result in enumerate(results) if not result
+            ]
+            if failed_workers:
                 print(
-                    f"Error: TRT-LLM worker failed to update weights. Result: {worker_result}"
+                    "Error: TRT-LLM workers failed to update weights. "
+                    f"Results: {failed_workers}"
                 )
                 return False
             return True
@@ -523,16 +557,24 @@ class TrtllmAsyncGenerationWorkerImpl:
             import traceback
 
             traceback.print_exc()
-            return False
+            # Raise instead of returning False so the engine-side cause reaches
+            # the caller.
+            raise RuntimeError(f"TRT-LLM collective weight update failed: {e!r}") from e
 
     async def update_weights_via_ipc_zmq_async(self) -> bool:
         assert self.llm is not None
         try:
             results = await self.llm.collective_rpc("update_weights_via_ipc_zmq")
-            worker_result = results[0] if results else True
-            if not worker_result:
+            if not results:
+                print("Error: TRT-LLM IPC weight update returned no worker results.")
+                return False
+            failed_workers = [
+                (rank, result) for rank, result in enumerate(results) if not result
+            ]
+            if failed_workers:
                 print(
-                    f"Error: TRT-LLM worker failed to update weights via IPC. Result: {worker_result}"
+                    "Error: TRT-LLM workers failed to update weights via IPC. "
+                    f"Results: {failed_workers}"
                 )
                 return False
             return True
@@ -541,7 +583,9 @@ class TrtllmAsyncGenerationWorkerImpl:
             import traceback
 
             traceback.print_exc()
-            return False
+            # Raise instead of returning False so the engine-side cause reaches
+            # the caller.
+            raise RuntimeError(f"TRT-LLM IPC weight update failed: {e!r}") from e
 
     async def report_device_id_async(self) -> list[str]:
         assert self.llm is not None

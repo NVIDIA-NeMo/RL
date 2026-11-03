@@ -32,9 +32,14 @@ source-sensitive compatibility patches:
 * ``modelopt_moe_amax_aliases`` adapts nested ModelOpt buffers to vLLM's
   MoE refit loader. Its lifecycle and installed-loader compatibility are
   checked here, alongside the source patches.
+* ``install_output_loop_yield`` patches AsyncLLM's output loops at runtime. Its
+  yield and reader-budget behavior is checked against a stand-in client, and a
+  canary fails if the pinned vLLM moves the calls it relies on.
 """
 
 import ast
+import asyncio
+import inspect
 import logging
 import os
 import sys
@@ -61,7 +66,7 @@ _PATCH_FN = "_patch_vllm_tool_parser_namespace_tool"
 _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
-_RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
+_RADIO_MARKER = "ls_param.data.fill_(initializer_factor)"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
@@ -410,7 +415,7 @@ def test_namespace_tool_stub_never_matches(patched_tool_parser_source):
 def test_radio_layerscale_patch_anchor_still_matches_installed_vllm(
     patched_radio_source,
 ):
-    """Pin the vLLM 0.25.1 RADIO loader shape used by the source patch."""
+    """Pin the RADIO loader shape used by the source patch."""
     content = patched_radio_source.read_text()
     assert _RADIO_MARKER in content
     assert "Skip layer-scale entries that vLLM doesn't use" not in content
@@ -423,9 +428,71 @@ def test_radio_layerscale_patch_loads_explicit_and_initializes_folded_weights(
 ):
     content = patched_radio_source.read_text()
     assert 'vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"' in content
-    assert 'name.endswith((".ls1", ".ls2"))' in content
-    assert "param.data.fill_(initializer_factor)" in content
-    assert "loaded_params.add(name)" in content
+    assert 'ls_name.endswith((".ls1", ".ls2"))' in content
+    assert "ls_param.data.fill_(initializer_factor)" in content
+    assert "loaded_params.add(ls_name)" in content
+
+
+@pytest.mark.vllm
+def test_radio_layerscale_patch_keeps_values_loaded_by_earlier_refit_batches(
+    patched_radio_source,
+):
+    """Refit calls load_weights once per batch; a later batch must not reset LayerScale."""
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    tree = ast.parse(patched_radio_source.read_text())
+    radio_model = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "RadioModel"
+    )
+    load_weights = next(
+        node
+        for node in radio_model.body
+        if isinstance(node, ast.FunctionDef) and node.name == "load_weights"
+    )
+    namespace = {"default_weight_loader": default_weight_loader}
+    exec(
+        compile(ast.Module(body=[load_weights], type_ignores=[]), "<radio>", "exec"),
+        namespace,
+    )
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ls1 = torch.nn.Parameter(torch.full((4,), float("nan")))
+            self.ls2 = torch.nn.Parameter(torch.full((4,), float("nan")))
+
+    class _Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([_Layer()])
+
+    class _Inner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _Encoder()
+
+    class _Radio(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(initializer_factor=1.0)
+            self.model = _Inner()
+
+    model = _Radio()
+    layer = model.model.encoder.layers[0]
+    with torch.no_grad():
+        namespace["load_weights"](
+            model, [("radio_model.model.blocks.0.ls1", torch.full((4,), 0.1))]
+        )
+        assert torch.allclose(layer.ls1, torch.full((4,), 0.1))
+        assert torch.allclose(layer.ls2, torch.ones(4))
+
+        # A later batch carrying no vision weights (e.g. LLM-only) must not
+        # reset the explicitly loaded ls1 back to initializer_factor.
+        namespace["load_weights"](model, [])
+    assert torch.allclose(layer.ls1, torch.full((4,), 0.1))
+    assert torch.allclose(layer.ls2, torch.ones(4))
 
 
 @pytest.mark.vllm
@@ -449,7 +516,7 @@ def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, c
         patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
-    assert "vLLM 0.25.1 source shape was not found" in caplog.text
+    assert "load_weights tail anchor was not found" in caplog.text
 
 
 @pytest.mark.vllm
@@ -1012,3 +1079,181 @@ def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_pat
 
     assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
     assert ray_executor.read_text() == once
+
+
+# install_output_loop_yield
+
+
+class _FakeAsyncMPClient:
+    async def get_output_async(self):
+        return "outputs"
+
+
+class _FakeSocket:
+    """Mimics zmq.asyncio's recv_multipart: returns a future, done if a message waits."""
+
+    def __init__(self):
+        self.message_waiting = True
+        self.calls = 0
+
+    def recv_multipart(self, *args, **kwargs):
+        self.calls += 1
+        future = asyncio.get_running_loop().create_future()
+        if self.message_waiting:
+            future.set_result(["frame"])
+        else:
+            asyncio.get_running_loop().call_soon(future.set_result, ["frame"])
+        return future
+
+
+@pytest.fixture
+def fake_core_client(monkeypatch):
+    """Stand-in for vllm.v1.engine.core_client with a fresh AsyncMPClient class."""
+    client_cls = type("AsyncMPClient", (_FakeAsyncMPClient,), {})
+    module = types.ModuleType("vllm.v1.engine.core_client")
+    module.AsyncMPClient = client_cls
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.core_client", module)
+    return client_cls
+
+
+def _fake_llm():
+    socket = _FakeSocket()
+    llm = SimpleNamespace(
+        engine_core=SimpleNamespace(resources=SimpleNamespace(output_socket=socket))
+    )
+    return llm, socket
+
+
+def _count_sleeps(monkeypatch):
+    sleeps = []
+    real_sleep = patches.asyncio.sleep
+
+    async def counting_sleep(delay):
+        sleeps.append(delay)
+        await real_sleep(delay)
+
+    monkeypatch.setattr(patches.asyncio, "sleep", counting_sleep)
+    return sleeps
+
+
+@pytest.mark.asyncio
+async def test_output_handler_yields_once_per_step(fake_core_client, monkeypatch):
+    llm, _ = _fake_llm()
+    patches.install_output_loop_yield(llm, reader_budget_s=0.02)
+    sleeps = _count_sleeps(monkeypatch)
+
+    assert await fake_core_client().get_output_async() == "outputs"
+    assert sleeps == [0]
+
+
+def test_class_patch_is_installed_once(fake_core_client):
+    patches.install_output_loop_yield(_fake_llm()[0], reader_budget_s=0.02)
+    patched = fake_core_client.get_output_async
+    patches.install_output_loop_yield(_fake_llm()[0], reader_budget_s=0.02)
+
+    assert fake_core_client.get_output_async is patched
+
+
+@pytest.mark.asyncio
+async def test_reader_yields_only_after_budget(fake_core_client, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(patches.time, "monotonic", lambda: now[0])
+    llm, socket = _fake_llm()
+    patches.install_output_loop_yield(llm, reader_budget_s=0.02)
+    sleeps = _count_sleeps(monkeypatch)
+    recv = llm.engine_core.resources.output_socket.recv_multipart
+
+    # Messages already waiting: each receive returns a done future.
+    now[0] += 0.01
+    assert await recv() == ["frame"]
+    assert sleeps == []  # 10 ms of continuous work, within the 20 ms budget
+
+    now[0] += 0.015
+    await recv()
+    assert sleeps == [0]  # 25 ms since the budget started: yield and restart it
+
+    now[0] += 0.01
+    await recv()
+    assert sleeps == [0]
+    assert socket.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_reader_budget_restarts_after_a_real_wait(fake_core_client, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(patches.time, "monotonic", lambda: now[0])
+    llm, socket = _fake_llm()
+    patches.install_output_loop_yield(llm, reader_budget_s=0.02)
+    sleeps = _count_sleeps(monkeypatch)
+    recv = llm.engine_core.resources.output_socket.recv_multipart
+
+    # The socket is empty: the receive's future is pending, so the loop gets its turn.
+    socket.message_waiting = False
+    now[0] += 0.05
+    assert await recv() == ["frame"]
+    assert sleeps == []
+
+    # The budget restarted when that message arrived, not when the reader started.
+    socket.message_waiting = True
+    now[0] += 0.01
+    await recv()
+    assert sleeps == []
+
+
+def test_missing_vllm_internals_fail_loudly(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.engine.core_client",
+        types.ModuleType("vllm.v1.engine.core_client"),
+    )
+    with pytest.raises(RuntimeError, match="output_loop_yield_budget_ms"):
+        patches.install_output_loop_yield(_fake_llm()[0], reader_budget_s=0.02)
+
+
+def test_missing_output_socket_fails_loudly(fake_core_client):
+    with pytest.raises(RuntimeError, match="output_loop_yield_budget_ms"):
+        patches.install_output_loop_yield(SimpleNamespace(), reader_budget_s=0.02)
+
+
+def test_non_positive_budget_is_rejected(fake_core_client):
+    with pytest.raises(ValueError, match="positive"):
+        patches.install_output_loop_yield(_fake_llm()[0], reader_budget_s=0)
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_pinned_vllm_output_loops_match_the_patch() -> None:
+    """Fail if the pinned vLLM moves the output-loop calls this patch relies on."""
+    core_client = pytest.importorskip("vllm.v1.engine.core_client")
+    async_llm = pytest.importorskip("vllm.v1.engine.async_llm")
+    zmq = pytest.importorskip("zmq")
+    zmq_asyncio = pytest.importorskip("zmq.asyncio")
+
+    # output_handler awaits get_output_async once per engine step.
+    assert inspect.iscoroutinefunction(core_client.AsyncMPClient.get_output_async)
+    output_handler = inspect.getsource(async_llm.AsyncLLM._run_output_handler)
+    assert "engine_core.get_output_async()" in output_handler, (
+        "vLLM's output_handler no longer awaits get_output_async; "
+        "the output_handler yield is dead"
+    )
+
+    # The socket reader looks recv_multipart up on the client's output socket on
+    # every message, so the per-instance override takes effect.
+    reader = inspect.getsource(core_client.AsyncMPClient._ensure_output_queue_task)
+    assert "resources.output_socket" in reader
+    assert "await output_socket.recv_multipart(" in reader, (
+        "vLLM's output-socket reader no longer awaits output_socket.recv_multipart; "
+        "the reader budget is dead"
+    )
+
+    # The reader budget tells a waited receive from a waiting message by future.done().
+    context = zmq_asyncio.Context()
+    socket = context.socket(zmq.PULL)
+    try:
+        future = socket.recv_multipart(copy=False)
+        assert asyncio.isfuture(future)
+        assert not future.done()
+        future.cancel()
+    finally:
+        socket.close(linger=0)
+        context.term()

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import pprint
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -21,16 +22,25 @@ import pytest
 import ray
 import torch
 import torch.nn as nn
+from transformers import AutoModelForCausalLM
 
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn, NLLLossFn
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import AutomodelKwargs, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointManager
-from tests.unit.test_utils import SimpleLossFn
+from nemo_rl.utils.flops_tracker import FLOPTracker, get_hf_config
+from tests.unit.test_utils import SimpleLossFn, UnitSequenceLossFn
 
 try:
+    from nemo_automodel.components.moe.megatron.token_dispatcher import (
+        MoEFlexTokenDispatcher,
+    )
+
     import nemo_rl.models.policy.workers.automodel_policy_worker as worker_mod
     from nemo_rl.models.automodel.config import (
         ModelAndOptimizerState,
@@ -39,110 +49,13 @@ try:
     from nemo_rl.models.policy.workers.automodel_policy_worker import (
         AutomodelPolicyWorkerImpl,
         _maybe_adapt_tensor_to_hf,
+        automodel_lora_params_generator,
         automodel_params_generator,
     )
 
     NEMO_AUTOMODEL_AVAILABLE = True
 except ImportError:
     NEMO_AUTOMODEL_AVAILABLE = False
-
-
-class _FakeTrainableModel:
-    def __init__(self):
-        self.train_called = False
-        self.eval_called = False
-
-    def train(self):
-        self.train_called = True
-
-    def eval(self):
-        self.eval_called = True
-
-
-@pytest.mark.automodel
-@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
-    worker = object.__new__(AutomodelPolicyWorkerImpl)
-    model = _FakeTrainableModel()
-    restored_devices = []
-
-    worker.model = model
-    worker.optimizer = object()
-    worker.cpu_offload = False
-    worker.move_to_cuda = lambda model: model
-    worker.move_optimizer_to_device = lambda device: restored_devices.append(device)
-
-    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
-    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-
-    AutomodelPolicyWorkerImpl.prepare_for_training(worker)
-
-    assert model.train_called
-    assert restored_devices == ["cuda"]
-
-
-@pytest.mark.automodel
-@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-@pytest.mark.parametrize("keep_train_buffers", [False, True])
-def test_dtensor_v2_prepare_for_lp_inference_keep_train_buffers(
-    monkeypatch, keep_train_buffers
-):
-    """``keep_train_buffers`` suppresses the optimizer offload and nothing else.
-
-    ``True`` is not reachable from a dtensor run today -- the split train API
-    that leaves a step open (begin_train_step / train_microbatch /
-    finish_train_step) exists only on the Megatron worker -- but the branch is
-    here, so pin it: inverted, it would strand the optimizer on CPU for the rest
-    of the step.
-    """
-    worker = object.__new__(AutomodelPolicyWorkerImpl)
-    model = _FakeTrainableModel()
-    offloaded_devices = []
-
-    worker.model = model
-    worker.optimizer = object()
-    worker.cpu_offload = False
-    worker.offload_optimizer_for_logprob = True
-    worker.move_to_cuda = lambda model: model
-    worker.move_optimizer_to_device = lambda device: offloaded_devices.append(device)
-
-    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
-    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-    # The allocator wake-up is a real ``.cuda()`` call; keep this test CPU-only.
-    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: MagicMock())
-
-    AutomodelPolicyWorkerImpl.prepare_for_lp_inference(
-        worker, keep_train_buffers=keep_train_buffers
-    )
-
-    assert model.eval_called
-    assert offloaded_devices == ([] if keep_train_buffers else ["cpu"])
-
-
-@pytest.mark.automodel
-@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_update_moe_gate_bias_called_when_supported():
-    worker = object.__new__(AutomodelPolicyWorkerImpl)
-    worker.model = MagicMock()
-    worker.model.update_moe_gate_bias = MagicMock()
-
-    AutomodelPolicyWorkerImpl._update_moe_gate_bias_if_supported(worker)
-
-    worker.model.update_moe_gate_bias.assert_called_once_with()
-
-
-@pytest.mark.automodel
-@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_update_moe_gate_bias_noop_when_unsupported():
-    worker = object.__new__(AutomodelPolicyWorkerImpl)
-    # A real module without the hook: getattr(..., None) must short-circuit so
-    # models that do not expose update_moe_gate_bias are unaffected.
-    worker.model = nn.Linear(1, 1)
-
-    # Should be a no-op and must not raise.
-    AutomodelPolicyWorkerImpl._update_moe_gate_bias_if_supported(worker)
 
 
 def create_test_config(
@@ -157,6 +70,7 @@ def create_test_config(
     expert_parallel_size: int = 1,
     sequence_packing_enabled: bool = False,
     automodel_kwargs: AutomodelKwargs | None = None,
+    enable_loras: bool = False,
 ) -> PolicyConfig:
     config = {
         "model_name": model_name,
@@ -170,6 +84,7 @@ def create_test_config(
         "offload_optimizer_for_logprob": False,
         "generation": {
             "backend": "hf",
+            "lora_refit_mode": "merged",
             "temperature": 1.0,
             "top_p": 1.0,
             "top_k": None,
@@ -199,6 +114,18 @@ def create_test_config(
             "context_parallel_size": cp,
             "custom_parallel_plan": custom_parallel_plan,
             "expert_parallel_size": expert_parallel_size,
+            "lora_cfg": {
+                "enabled": enable_loras,
+                "target_modules": [],
+                "exclude_modules": [],
+                "match_all_linear": True,
+                "dim": 32,
+                "alpha": 32,
+                "dropout": 0.0,
+                "dropout_position": "post",
+                "lora_A_init": "xavier",
+                "use_triton": True,
+            },
         },
         "dynamic_batching": {
             "enabled": True,
@@ -234,6 +161,38 @@ def create_test_config(
     return config
 
 
+def update_lora_config(
+    config: PolicyConfig,
+    enabled: bool = True,
+    target_modules: list[str] = [],
+    exclude_modules: list[str] = [],
+    match_all_linear: bool = True,
+    dim: int = 32,
+    alpha: int = 32,
+    dropout: float = 0.0,
+    dropout_position: str = "post",
+    lora_A_init: str = "xavier",
+    use_triton: bool = True,
+):
+    if enabled:
+        config["automodel_cfg"]["checkpoint"]["model_save_format"] = "safetensors"
+
+    config["automodel_cfg"]["lora_cfg"].update(
+        {
+            "enabled": enabled,
+            "target_modules": target_modules,
+            "exclude_modules": exclude_modules,
+            "match_all_linear": match_all_linear,
+            "dim": dim,
+            "alpha": alpha,
+            "dropout": dropout,
+            "dropout_position": dropout_position,
+            "lora_A_init": lora_A_init,
+            "use_triton": use_triton,
+        }
+    )
+
+
 def create_test_batch(
     batch_size: int = 8,
     seq_len: int = 128,
@@ -264,7 +223,172 @@ def create_test_batch(
     return data
 
 
-@pytest.fixture(scope="module")
+def calculate_token_logprobs(model_name: str, data: BatchedDataDict):
+    data = data.to("cuda")
+    input_ids = data["input_ids"]
+
+    with torch.no_grad():
+        # run the log prob of regular hf model here
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name, device_map="cuda", torch_dtype=torch.float32
+        )
+        hf_model.eval()
+        outputs = hf_model(**data)
+
+    log_probs = torch.nn.functional.log_softmax(
+        outputs.logits.to(torch.float32), dim=-1
+    )
+    next_tokens = input_ids[:, 1:]
+    log_probs = log_probs[:, :-1]
+    token_logprobs = log_probs.gather(dim=-1, index=next_tokens.unsqueeze(-1)).squeeze(
+        -1
+    )
+    token_logprobs = torch.cat(
+        [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
+    ).cpu()
+
+    data = data.to("cpu")
+    return token_logprobs
+
+
+class _FakeTrainableModel:
+    def __init__(self):
+        self.train_called = False
+        self.eval_called = False
+
+    def train(self):
+        self.train_called = True
+
+    def eval(self):
+        self.eval_called = True
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_prepare_for_training_restores_optimizer(monkeypatch):
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    model = _FakeTrainableModel()
+    restored_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.cpu_offload = False
+    worker.move_to_cuda = lambda model: model
+    worker.move_optimizer_to_device = lambda device: restored_devices.append(device)
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    AutomodelPolicyWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
+    assert restored_devices == ["cuda"]
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize("keep_train_buffers", [False, True])
+def test_prepare_for_lp_inference_keep_train_buffers(monkeypatch, keep_train_buffers):
+    """``keep_train_buffers`` suppresses the optimizer offload and nothing else.
+
+    ``True`` is not reachable from an Automodel run today -- the split train API
+    that leaves a step open (begin_train_step / train_microbatch /
+    finish_train_step) exists only on the Megatron worker -- but the branch is
+    here, so pin it: inverted, it would strand the optimizer on CPU for the rest
+    of the step.
+    """
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    model = _FakeTrainableModel()
+    offloaded_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.cpu_offload = False
+    worker.offload_optimizer_for_logprob = True
+    worker.move_to_cuda = lambda model: model
+    worker.move_optimizer_to_device = lambda device: offloaded_devices.append(device)
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    # The allocator wake-up is a real ``.cuda()`` call; keep this test CPU-only.
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: MagicMock())
+
+    AutomodelPolicyWorkerImpl.prepare_for_lp_inference(
+        worker, keep_train_buffers=keep_train_buffers
+    )
+
+    assert model.eval_called
+    assert offloaded_devices == ([] if keep_train_buffers else ["cpu"])
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize("entry", ["offload_before_refit", "offload_after_refit"])
+def test_offload_releases_moe_dispatcher_state_before_empty_cache(monkeypatch, entry):
+    """MoE dispatch state must be released before the allocator cache is emptied.
+
+    Otherwise the recompute activations it keeps alive pin cached segments and
+    colocated generation wakes up with too little free memory.
+    """
+    manager = SimpleNamespace(
+        num_experts=8, token_probs=torch.rand(4, 8, requires_grad=True) * 1.0
+    )
+    dispatcher = MoEFlexTokenDispatcher.__new__(MoEFlexTokenDispatcher)
+    dispatcher._comm_manager = manager
+    experts = nn.Linear(2, 2)
+    experts.token_dispatcher = dispatcher
+
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    worker.model = nn.Sequential(experts)
+    worker.optimizer = None
+    worker.move_to_cpu = lambda model: model
+    token_probs_at_empty_cache = []
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    # The allocator wake-up is a real ``.cuda()`` call; keep this test CPU-only.
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a, **k: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: token_probs_at_empty_cache.append(manager.token_probs),
+    )
+
+    getattr(AutomodelPolicyWorkerImpl, entry)(worker)
+
+    assert token_probs_at_empty_cache == [None]
+    assert manager.num_experts == 8
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_update_moe_gate_bias_called_when_supported():
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    worker.model = MagicMock()
+    worker.model.update_moe_gate_bias = MagicMock()
+
+    AutomodelPolicyWorkerImpl._update_moe_gate_bias_if_supported(worker)
+
+    worker.model.update_moe_gate_bias.assert_called_once_with()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_update_moe_gate_bias_noop_when_unsupported():
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    # A real module without the hook: getattr(..., None) must short-circuit so
+    # models that do not expose update_moe_gate_bias are unaffected.
+    worker.model = nn.Linear(1, 1)
+
+    # Should be a no-op and must not raise.
+    AutomodelPolicyWorkerImpl._update_moe_gate_bias_if_supported(worker)
+
+
+@pytest.fixture
 def two_gpu_virtual_cluster():
     cluster_name = "test"
     print(f"Creating virtual cluster '{cluster_name}'...")
@@ -284,7 +408,7 @@ def two_gpu_virtual_cluster():
 @pytest.mark.automodel
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("save_optimizer", [True, False])
-def test_dtensor_v2_checkpoint_save_and_load(
+def test_checkpoint_save_and_load(
     two_gpu_virtual_cluster,
     tiny_llama_model_path,
     save_optimizer,
@@ -379,7 +503,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
 @pytest.mark.automodel
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("precision", ["bfloat16", "float16"])
-def test_dtensor_v2_mixed_precision_training_and_logprobs(
+def test_mixed_precision_training_and_logprobs(
     two_gpu_virtual_cluster,
     tiny_llama_model_path,
     precision,
@@ -620,6 +744,89 @@ class TestAutomodelParamsGenerator:
         assert results["e_score_correction_bias"].dtype == torch.float32
         assert results["ordinary_buffer"].dtype == torch.bfloat16
 
+    @staticmethod
+    def _lora_block(seed: int = 0) -> nn.Module:
+        from nemo_automodel.components._peft.lora import LinearLoRA
+
+        torch.manual_seed(seed)
+        block = nn.Module()
+        block.proj = LinearLoRA(nn.Linear(8, 6, bias=False), dim=2, alpha=4)
+        nn.init.normal_(block.proj.lora_B.weight)  # zero-initialized otherwise
+        return block
+
+    @staticmethod
+    def _expected_merge(proj) -> torch.Tensor:
+        w = proj.weight.detach().float()
+        delta = (
+            proj.lora_B.weight.detach().float() @ proj.lora_A.weight.detach().float()
+        )
+        return (w + proj.scale * delta).to(proj.weight.dtype)
+
+    def test_merges_lora_inside_activation_checkpoint_wrapper(self):
+        """Refit merges LoRA into the weights of activation-checkpointed blocks.
+
+        ``CheckpointWrapper`` strips ``_checkpoint_wrapped_module.`` from
+        ``state_dict()`` keys but not from ``named_modules()``, so a lookup keyed by
+        raw module names misses every LoRA module inside a block and the refit
+        streams the bare base weight.
+        """
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            checkpoint_wrapper,
+        )
+
+        block = self._lora_block()
+        model = nn.Module()
+        model.layers = nn.ModuleList([checkpoint_wrapper(block)])
+        expected = self._expected_merge(block.proj)
+
+        results = dict(automodel_params_generator(model, torch.float32))
+
+        assert set(results) == {"layers.0.proj.weight"}
+        torch.testing.assert_close(results["layers.0.proj.weight"], expected)
+        assert not torch.equal(
+            results["layers.0.proj.weight"], block.proj.weight.detach()
+        ), "refit tensor must not be the unmerged base weight"
+
+    def test_raises_when_lora_module_has_no_state_dict_weight(self):
+        """A LoRA module the merge cannot map to its weight would refit the base weight."""
+
+        class RenamingWrapper(nn.Module):
+            """Drops its ``inner.`` component from state_dict keys, like CheckpointWrapper."""
+
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+                self._register_state_dict_hook(self._strip_inner)
+
+            @staticmethod
+            def _strip_inner(module, state_dict, prefix, local_metadata):
+                inner = f"{prefix}inner."
+                for key in [k for k in state_dict if k.startswith(inner)]:
+                    state_dict[prefix + key[len(inner) :]] = state_dict.pop(key)
+
+        model = nn.Module()
+        model.block = RenamingWrapper(self._lora_block())
+
+        with pytest.raises(RuntimeError, match="block.inner.proj"):
+            list(automodel_params_generator(model, torch.float32))
+
+    def test_bf16_lora_merge_matches_offline_fp32_merge(self):
+        """The merged bf16 weight equals a single-rounded fp32 merge of the adapter.
+
+        Computing ``B @ A`` and the sum in bf16 rounds twice and can differ from the
+        offline merge (``W.float() + scale * B.float() @ A.float()``, cast once) by a
+        bf16 ulp; the refit must serve exactly the weights a merged checkpoint has.
+        """
+        block = self._lora_block(seed=1).to(torch.bfloat16)
+        model = nn.Module()
+        model.layers = nn.ModuleList([block])
+        expected = self._expected_merge(block.proj)
+
+        results = dict(automodel_params_generator(model, torch.bfloat16))
+
+        assert results["layers.0.proj.weight"].dtype == torch.bfloat16
+        assert torch.equal(results["layers.0.proj.weight"], expected)
+
     def test_contiguous_output(self):
         """Test that output tensors are contiguous."""
         # Arrange
@@ -714,6 +921,247 @@ class TestAutomodelParamsGenerator:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+class TestAutomodelLoraParamsGenerator:
+    class FactorizedModel(nn.Module):
+        def __init__(self, *, incomplete: bool = False):
+            super().__init__()
+            self.layer = nn.Module()
+            self.layer.base = nn.Linear(4, 4, bias=False)
+            self.layer.lora_A = nn.Linear(4, 2, bias=False)
+            if not incomplete:
+                self.layer.lora_B = nn.Linear(2, 4, bias=False)
+            self.layer.base.weight.requires_grad_(False)
+
+    def test_yields_only_complete_factorized_adapter(self):
+        model = self.FactorizedModel()
+
+        tensors = dict(automodel_lora_params_generator(model, torch.bfloat16))
+
+        assert set(tensors) == {"layer.lora_A.weight", "layer.lora_B.weight"}
+        assert all(tensor.dtype == torch.bfloat16 for tensor in tensors.values())
+        assert all(tensor.is_contiguous() for tensor in tensors.values())
+
+    def test_accepts_activation_checkpoint_wrapped_parameter_names(self):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            checkpoint_wrapper,
+        )
+
+        model = self.FactorizedModel()
+        model.layer = checkpoint_wrapper(model.layer)
+
+        tensors = dict(automodel_lora_params_generator(model, torch.bfloat16))
+
+        assert set(tensors) == {"layer.lora_A.weight", "layer.lora_B.weight"}
+
+    def test_adapts_grouped_internal_factors_to_hf_pairs(self):
+        from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import (
+            NemotronV3StateDictAdapter,
+        )
+
+        class GroupedFactorizedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([nn.Module()])
+                self.model.layers[0].mixer = nn.Module()
+                self.model.layers[0].mixer.experts = nn.Module()
+                experts = self.model.layers[0].mixer.experts
+                experts.lora_gate_and_up_A = nn.Parameter(torch.randn(2, 4, 2))
+                experts.lora_gate_and_up_B = nn.Parameter(torch.randn(2, 2, 6))
+                experts.lora_down_A = nn.Parameter(torch.randn(2, 6, 2))
+                experts.lora_down_B = nn.Parameter(torch.randn(2, 2, 4))
+                self.state_dict_adapter = NemotronV3StateDictAdapter(
+                    config=MagicMock(),
+                    moe_config=SimpleNamespace(
+                        n_routed_experts=2,
+                        moe_inter_dim=6,
+                        expert_activation="relu2",
+                    ),
+                    backend=MagicMock(),
+                )
+
+        model = GroupedFactorizedModel()
+
+        tensors = dict(automodel_lora_params_generator(model, torch.bfloat16))
+
+        assert set(tensors) == {
+            f"backbone.layers.0.mixer.experts.{expert_id}.{projection}.lora_{factor}.weight"
+            for expert_id in range(2)
+            for projection in ("up_proj", "down_proj")
+            for factor in ("A", "B")
+        }
+        experts = model.model.layers[0].mixer.experts
+        for expert_id in range(2):
+            prefix = f"backbone.layers.0.mixer.experts.{expert_id}"
+            expected = {
+                f"{prefix}.up_proj.lora_A.weight": experts.lora_gate_and_up_A[
+                    expert_id
+                ].T,
+                f"{prefix}.up_proj.lora_B.weight": experts.lora_gate_and_up_B[
+                    expert_id
+                ].T,
+                f"{prefix}.down_proj.lora_A.weight": experts.lora_down_A[expert_id].T,
+                f"{prefix}.down_proj.lora_B.weight": experts.lora_down_B[expert_id].T,
+            }
+            for name, expected_tensor in expected.items():
+                torch.testing.assert_close(
+                    tensors[name], expected_tensor.to(torch.bfloat16)
+                )
+
+            trainer_up_delta = (
+                experts.lora_gate_and_up_A[expert_id]
+                @ experts.lora_gate_and_up_B[expert_id]
+            )
+            # nn.Linear stores the transposed weight, so the PEFT/vLLM
+            # update B @ A must equal the transpose of Automodel's A @ B.
+            vllm_up_weight_delta = (
+                experts.lora_gate_and_up_B[expert_id].T
+                @ experts.lora_gate_and_up_A[expert_id].T
+            )
+            torch.testing.assert_close(
+                vllm_up_weight_delta,
+                trainer_up_delta.T,
+            )
+
+            trainer_down_delta = (
+                experts.lora_down_A[expert_id] @ experts.lora_down_B[expert_id]
+            )
+            vllm_down_weight_delta = (
+                experts.lora_down_B[expert_id].T @ experts.lora_down_A[expert_id].T
+            )
+            torch.testing.assert_close(
+                vllm_down_weight_delta,
+                trainer_down_delta.T,
+            )
+        assert all(tensor.dtype == torch.bfloat16 for tensor in tensors.values())
+        assert all(tensor.is_contiguous() for tensor in tensors.values())
+
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = model
+        worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
+        worker.lora_refit_mode = "native"
+        refit_info = AutomodelPolicyWorkerImpl.prepare_refit_info(worker)
+
+        assert refit_info == {
+            name: (tensor.shape, tensor.dtype) for name, tensor in tensors.items()
+        }
+
+    def test_rejects_incomplete_factor_pair(self):
+        model = self.FactorizedModel(incomplete=True)
+
+        with pytest.raises(RuntimeError, match="complete A/B pairs"):
+            list(automodel_lora_params_generator(model, torch.bfloat16))
+
+    def test_rejects_non_lora_trainable_parameter(self):
+        model = self.FactorizedModel()
+        model.layer.base.weight.requires_grad_(True)
+
+        with pytest.raises(RuntimeError, match="only LoRA A/B tensors"):
+            list(automodel_lora_params_generator(model, torch.bfloat16))
+
+    def test_rejects_dynamically_updated_router_buffer(self):
+        model = self.FactorizedModel()
+        model.router = nn.Module()
+        model.router.bias_update_factor = 1e-3
+        model.router.register_buffer(
+            "e_score_correction_bias", torch.zeros(4, dtype=torch.float32)
+        )
+
+        with pytest.raises(RuntimeError, match="dynamically updated MoE router"):
+            list(automodel_lora_params_generator(model, torch.bfloat16))
+
+    def test_prepare_refit_info_contains_only_factor_metadata(self):
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = self.FactorizedModel()
+        worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
+        worker.lora_refit_mode = "native"
+
+        refit_info = AutomodelPolicyWorkerImpl.prepare_refit_info(worker)
+
+        assert refit_info is not None
+        assert set(refit_info) == {
+            "layer.lora_A.weight",
+            "layer.lora_B.weight",
+        }
+        assert all(dtype == torch.bfloat16 for _, dtype in refit_info.values())
+
+    def test_ipc_producer_uses_worker_refit_generator(self, monkeypatch):
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = self.FactorizedModel()
+        worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
+        worker.lora_refit_mode = "native"
+        worker.cpu_offload = False
+        worker.zmq_socket = object()
+        worker.rank = 0
+        worker.maybe_init_zmq = lambda: None
+        sentinel = torch.ones(1)
+
+        def refit_generator():
+            yield "sentinel", sentinel
+
+        stream_impl = MagicMock()
+        worker._refit_params_generator = refit_generator
+        monkeypatch.setattr(
+            "nemo_rl.models.policy.utils.stream_weights_via_ipc_zmq_impl",
+            stream_impl,
+        )
+
+        worker.stream_weights_via_ipc_zmq(buffer_size_bytes=128)
+
+        assert list(stream_impl.call_args.kwargs["params_generator"]) == [
+            ("sentinel", sentinel)
+        ]
+
+    def test_collective_producer_uses_worker_refit_generator(self, monkeypatch):
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = self.FactorizedModel()
+        worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
+        worker.lora_refit_mode = "native"
+        worker.cpu_offload = False
+        worker.model_update_group = object()
+        sentinel = torch.ones(1)
+
+        def refit_generator():
+            yield "sentinel", sentinel
+
+        producer = MagicMock()
+        worker._refit_params_generator = refit_generator
+        monkeypatch.setattr(worker_mod, "packed_broadcast_producer", producer)
+
+        worker._broadcast_weights_for_collective()
+
+        assert list(producer.call_args.kwargs["iterator"]) == [("sentinel", sentinel)]
+
+    @pytest.mark.parametrize(
+        ("mode", "expected"), [("native", "lora"), ("merged", "full")]
+    )
+    def test_refit_params_generator_selects_by_mode(self, monkeypatch, mode, expected):
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = self.FactorizedModel()
+        worker.draft_model = None
+        worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
+        worker.lora_refit_mode = mode
+        monkeypatch.setattr(
+            worker_mod,
+            "automodel_lora_params_generator",
+            lambda *_: iter([("lora", torch.ones(1))]),
+        )
+        monkeypatch.setattr(
+            worker_mod,
+            "automodel_params_generator",
+            lambda *_, **__: iter([("full", torch.ones(1))]),
+        )
+
+        assert [name for name, _ in worker._refit_params_generator()] == [expected]
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 def test_prepare_refit_info_preserves_fp32_router_correction_bias():
     """Refit metadata must match the FP32 router-bias payload dtype."""
 
@@ -730,6 +1178,8 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = RouterModel()
     worker.dtype = torch.bfloat16
+    worker.draft_model = None
+    worker.lora_enabled = False
 
     refit_info = AutomodelPolicyWorkerImpl.prepare_refit_info(worker)
 
@@ -884,7 +1334,7 @@ def _init_v2_worker_mocked(
     ("model_type", "expected_async"),
     [("deepseek_v4", False), ("deepseek_v3", True)],
 )
-def test_dtensor_v2_scopes_synchronous_checkpointing_to_dsv4(
+def test_scopes_synchronous_checkpointing_to_dsv4(
     monkeypatch, model_type, expected_async
 ):
     worker, *_ = _init_v2_worker_mocked(
@@ -900,7 +1350,7 @@ def test_dtensor_v2_scopes_synchronous_checkpointing_to_dsv4(
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_resume_with_reference_model_defers_checkpoint_load(monkeypatch):
+def test_resume_with_reference_model_defers_checkpoint_load(monkeypatch):
     """On resume with a KL reference, the reference must be captured from base
     weights (checkpoint load deferred until after the capture)."""
     worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
@@ -928,7 +1378,7 @@ def test_dtensor_v2_resume_with_reference_model_defers_checkpoint_load(monkeypat
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_resume_without_reference_model_passes_paths_through(monkeypatch):
+def test_resume_without_reference_model_passes_paths_through(monkeypatch):
     worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
         monkeypatch,
         init_reference_model=False,
@@ -943,7 +1393,7 @@ def test_dtensor_v2_resume_without_reference_model_passes_paths_through(monkeypa
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_fresh_run_with_reference_model_does_not_defer(monkeypatch):
+def test_fresh_run_with_reference_model_does_not_defer(monkeypatch):
     worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
         monkeypatch,
         init_reference_model=True,
@@ -953,3 +1403,978 @@ def test_dtensor_v2_fresh_run_with_reference_model_does_not_defer(monkeypatch):
     assert setup_mock.call_args.kwargs["weights_path"] is None
     load_mock.assert_not_called()
     assert worker.reference_model_state_dict == {"ref": "state"}
+
+
+def _base_setup_impl(request, cluster):
+    """Implementation for base setup - can be used with any cluster."""
+    params = request.param if hasattr(request, "param") else None
+    assert params is not None, "params is not set"
+
+    mode = params["mode"]
+    model_fixture_name = params["model_fixture_name"]
+    specified_config = params["specified_config"]
+    enable_loras = params["enable_loras"]
+    lora_config = params["lora_config"]
+    model_name = request.getfixturevalue(model_fixture_name)
+
+    policy = None
+    data = None
+    loss_fn = None
+
+    try:
+        config = create_test_config(model_name, **specified_config)
+
+        if enable_loras:
+            update_lora_config(config, **lora_config)
+
+        tokenizer = get_tokenizer(config["tokenizer"])
+        print(f"Creating {mode} Policy with {specified_config}...")
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+        print("Creating test batch...")
+        data = create_test_batch(mode=mode)
+
+        if mode == "train":
+            # Create loss function
+            loss_fn: LossFunction = SimpleLossFn()
+            yield policy, data, loss_fn
+        elif mode == "logprob":
+            token_logprobs = calculate_token_logprobs(model_name, data)
+            yield policy, data, token_logprobs
+
+    finally:
+        print("Cleaning up resources for test")
+        if policy:
+            policy.shutdown()
+
+
+def _test_worker_training(policy, data, loss_fn):
+    def verify_loss_tensor(loss_tensor):
+        assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
+        assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
+        return loss_tensor
+
+    # Verify resources were created properly
+    assert policy is not None, "Training policy was not created properly"
+    assert data is not None, "Test data was not created properly"
+    assert loss_fn is not None, "Loss function was not created properly"
+
+    # Call prepare_for_training if available
+    print("\nPreparing for training...")
+    policy.prepare_for_training()
+
+    losses = []
+    for steps in range(2):
+        results = policy.train(data, loss_fn)
+
+        # Verify results
+        assert "loss" in results, "Training results should contain 'loss'"
+        loss_tensor = results["loss"]
+        verify_loss_tensor(loss_tensor)
+
+        # global_loss reports the mathematical objective, not the DP/CP factor
+        # applied only to compensate FSDP gradient averaging during backward.
+        # all_mb_metrics are divided by num_global_batches in the worker, so
+        # undo that scaling before comparing the two reporting paths.
+        num_global_batches = loss_tensor.numel()
+        scaled_metric_loss = sum(results["all_mb_metrics"]["loss"])
+        torch.testing.assert_close(
+            loss_tensor.sum(),
+            loss_tensor.new_tensor(scaled_metric_loss * num_global_batches),
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        losses.append(loss_tensor[-1].item())
+
+        print(f"Training loss: {results['loss']}")
+
+    policy.finish_training()
+
+    # Verify loss changed between iterations (model parameters were updated)
+    assert losses[0] > losses[-1], "Loss should decrease over training iterations"
+
+    # Verify the train function returns the performance metrics
+
+    if policy.flops_tracker is not None:
+        assert "total_flops" in results and isinstance(
+            results["total_flops"], (int, float)
+        ), "training backend should report total_flops"
+        assert results["total_flops"] > 0, "total_flops should be positive"
+        assert "num_ranks" in results and isinstance(results["num_ranks"], int), (
+            "training backend should report num_ranks"
+        )
+        assert results["num_ranks"] > 0, "num_ranks should be positive"
+
+        # we don't always require theoretical_tflops since the data about the GPU
+        # is not always available.
+        if "theoretical_tflops" in results:
+            assert isinstance(results["theoretical_tflops"], (int, float)), (
+                "training backend should report theoretical_tflops"
+            )
+            assert results["theoretical_tflops"] > 0, (
+                "theoretical_tflops should be positive"
+            )
+
+
+def _test_worker_logprob(policy, data, logprobs):
+    # Verify resources were created properly assert policy is not None, "Policy was not created properly"
+    assert data is not None, "Test data was not created properly"
+
+    # Generate logprobs
+    print("\nGenerating logprobs...")
+    policy.prepare_for_lp_inference()
+    policy_logprobs = policy.get_logprobs(data)["logprobs"]
+
+    print("## MAX DIFF ###", torch.max(torch.abs(policy_logprobs - logprobs)))
+    assert torch.allclose(policy_logprobs, logprobs), (
+        f"max diff {torch.max(torch.abs(policy_logprobs - logprobs))}"
+    )
+
+
+@pytest.mark.hf_gated
+class TestSingleGPUCluster:
+    """Tests that run on a single GPU cluster."""
+
+    @pytest.fixture(scope="class")
+    def single_gpu_cluster(self):
+        """Class-scoped single GPU virtual cluster fixture."""
+        cluster_name = "test_single_gpu"
+        print(f"Creating single GPU virtual cluster '{cluster_name}'...")
+        cluster = RayVirtualCluster(
+            name=cluster_name,
+            bundle_ct_per_node_list=[1],  # Single GPU bundle
+            use_gpus=True,
+            num_gpus_per_node=1,  # Using 1 GPU
+            max_colocated_worker_groups=1,  # Only one worker group
+        )
+        yield cluster
+        print("Shutting down single GPU virtual cluster...")
+        cluster.shutdown()
+
+    @pytest.mark.timeout(360)
+    @pytest.mark.automodel
+    def test_single_gpu_training(self, single_gpu_cluster, tiny_llama_model_path):
+        """Test Automodel training with a single GPU cluster (no parallelism)."""
+        config = create_test_config(
+            tiny_llama_model_path,
+            tp=1,
+            cp=1,
+            sp=False,
+            cpu_offload=False,
+            activation_checkpointing=False,
+        )
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        print("Creating Policy with single GPU cluster...")
+        policy = Policy(
+            cluster=single_gpu_cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        try:
+            # Verify we have one worker
+            assert len(policy.worker_group.workers) == 1, (
+                "Should have 1 worker for single GPU"
+            )
+
+            # Check worker is alive
+            worker_alive = ray.get(
+                [w.is_alive.remote() for w in policy.worker_group.workers]
+            )
+            assert all(worker_alive), f"Worker is not alive: {worker_alive}"
+
+            # Get GPU info to verify setup
+            gpu_infos = ray.get(
+                [w.get_gpu_info.remote() for w in policy.worker_group.workers]
+            )
+            assert len(gpu_infos) == 1, "Should have 1 GPU info"
+            assert gpu_infos[0]["world_size"] == 1, (
+                "World size should be 1 for single GPU"
+            )
+            assert gpu_infos[0]["rank"] == 0, "Rank should be 0 for single GPU"
+
+            # Create test batch
+            data = create_test_batch(mode="train")
+            loss_fn = SimpleLossFn()
+
+            # Test training
+            policy.prepare_for_training()
+
+            losses = []
+            for step in range(2):
+                results = policy.train(data, loss_fn)
+                assert "loss" in results, "Training results should contain 'loss'"
+                loss_tensor = results["loss"]
+                assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
+                assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
+                losses.append(loss_tensor[-1].item())
+                print(f"Step {step} - Training loss: {results['loss']}")
+
+            policy.finish_training()
+
+            # Verify loss changed (model was updated)
+            assert losses[0] > losses[-1], (
+                "Loss should decrease over training iterations"
+            )
+
+        finally:
+            policy.shutdown()
+
+    @pytest.mark.timeout(360)
+    @pytest.mark.automodel
+    def test_single_gpu_logprob(self, single_gpu_cluster, tiny_llama_model_path):
+        """Test Automodel logprob computation with a single GPU cluster (no parallelism)."""
+        config = create_test_config(
+            tiny_llama_model_path,
+            tp=1,
+            cp=1,
+            sp=False,
+            cpu_offload=False,
+            activation_checkpointing=False,
+        )
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        print("Creating Policy with single GPU cluster for logprob...")
+        policy = Policy(
+            cluster=single_gpu_cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        try:
+            # Verify we have one worker
+            assert len(policy.worker_group.workers) == 1, (
+                "Should have 1 worker for single GPU"
+            )
+
+            # Create test batch and compute reference logprobs
+            data = create_test_batch(mode="logprob")
+            expected_logprobs = calculate_token_logprobs(tiny_llama_model_path, data)
+
+            # Test logprob computation
+            policy.prepare_for_lp_inference()
+            policy_logprobs = policy.get_logprobs(data)["logprobs"]
+
+            max_diff = torch.max(torch.abs(policy_logprobs - expected_logprobs))
+            print(f"Max logprob diff: {max_diff}")
+            assert torch.allclose(policy_logprobs, expected_logprobs), (
+                f"Logprobs should match reference. Max diff: {max_diff}"
+            )
+
+        finally:
+            policy.shutdown()
+
+
+@pytest.mark.hf_gated
+class TestTwoGPUCluster:
+    """Tests that run on a two GPU cluster."""
+
+    @pytest.fixture(scope="class")
+    def two_gpu_cluster(self):
+        """Class-scoped two GPU virtual cluster fixture."""
+        cluster_name = "test_two_gpu"
+        print(f"Creating virtual cluster '{cluster_name}'...")
+        cluster = RayVirtualCluster(
+            name=cluster_name,
+            bundle_ct_per_node_list=[2],  # Use tp bundles, one per GPU
+            use_gpus=True,
+            num_gpus_per_node=2,  # Using tp GPUs
+            max_colocated_worker_groups=1,  # Only one worker group
+        )
+        yield cluster
+        print("Shutting down virtual cluster...")
+        cluster.shutdown()
+
+    @pytest.fixture
+    def policy_setup(self, request, two_gpu_cluster, tiny_llama_model_path):
+        """Setup and teardown for policy tests - creates a virtual cluster and policy."""
+        params = request.param if hasattr(request, "param") else {}
+        enable_loras = params.get("enable_loras", False)
+
+        config = create_test_config(tiny_llama_model_path, enable_loras=enable_loras)
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        print("Creating Policy...")
+        policy = Policy(cluster=two_gpu_cluster, config=config, tokenizer=tokenizer)
+
+        yield policy
+
+        print("Shutting down policy...")
+        policy.shutdown()
+
+    @pytest.fixture(
+        params=[
+            # model_fixture_name        tp cp  sp     cpu    act
+            ("tiny_llama_model_path", 1, 1, False, False, False),
+            ("tiny_llama_model_path", 1, 1, True, False, False),
+            ("tiny_llama_model_path", 1, 1, False, True, False),
+            ("tiny_llama_model_path", 1, 1, False, False, True),
+            ("tiny_llama_model_path", 1, 2, False, False, False),
+            ("tiny_qwen2_model_path", 1, 1, True, True, False),
+            ("tiny_qwen2_model_path", 1, 1, True, False, True),
+            ("tiny_qwen2_model_path", 1, 1, False, True, True),
+            ("tiny_qwen2_model_path", 1, 1, True, True, True),
+            ("tiny_qwen2_model_path", 1, 2, False, False, False),
+            ("tiny_qwen3_model_path", 1, 1, True, True, False),
+            ("tiny_qwen3_model_path", 1, 1, True, False, True),
+            ("tiny_qwen3_model_path", 1, 1, False, True, True),
+            ("tiny_qwen3_model_path", 1, 1, True, True, True),
+            ("tiny_qwen3_model_path", 1, 2, False, False, False),
+            (
+                "tiny_gemma3_model_path",
+                1,
+                1,
+                True,
+                True,
+                False,
+            ),  # gemma3 doesn't support spda
+            ("tiny_gemma3_model_path", 1, 1, True, False, True),
+            ("tiny_gemma3_model_path", 1, 1, False, True, True),
+            ("tiny_gemma3_model_path", 1, 1, True, True, True),
+            # CP doesn't support gemma3 due to spda input has attent_mask != None.
+            # Nemotron-H doesn't support SP https://github.com/NVIDIA-NeMo/RL/issues/881
+            # ("tiny_nemotron5_h_model_path", 1, 1, True, True, False),
+            # ("tiny_nemotron5_h_model_path", 1, 1, True, False, True),
+            # ("tiny_nemotron5_h_model_path", 1, 1, True, True, True),
+            # Disabled until https://github.com/NVIDIA-NeMo/RL/issues/4211 is fixed
+            # ("tiny_nemotron5_h_model_path", 1, 1, False, False, False),
+            # ("tiny_nemotron5_h_model_path", 1, 1, False, True, True),
+            # nemotron5_h doesn't support cp
+            # TP2, SP=True
+            ("tiny_llama_model_path", 2, 1, True, False, False),
+            ("tiny_qwen2_model_path", 2, 1, True, False, False),
+        ]
+    )
+    def training_setup(self, request, two_gpu_cluster):
+        """Setup and teardown specifically for training tests."""
+        request.param = {
+            "mode": "train",
+            "enable_loras": False,
+            "lora_config": None,
+            "model_fixture_name": request.param[0],
+            "specified_config": {
+                "tp": request.param[1],
+                "cp": request.param[2],
+                "sp": request.param[3],
+                "cpu_offload": request.param[4],
+                "activation_checkpointing": request.param[5],
+            },
+        }
+        yield from _base_setup_impl(request, two_gpu_cluster)
+
+    @pytest.fixture(
+        params=[
+            # TP=2, CP=1
+            ("tiny_qwen2_model_path", 2, 1, False, True, False),
+            ("tiny_qwen2_model_path", 2, 1, False, False, False),
+            ("tiny_llama_model_path", 2, 1, False, False, False),
+            ("tiny_llama_model_path", 2, 1, False, True, False),
+            ("tiny_llama_model_path", 2, 1, False, True, True),
+            ("tiny_qwen3_model_path", 2, 1, False, True, False),
+            ("tiny_qwen3_model_path", 2, 1, False, False, False),
+            ("tiny_gemma3_model_path", 2, 1, False, True, False),
+            ("tiny_gemma3_model_path", 2, 1, False, False, False),
+            # TP=1, CP=2 — skipped: CP=2 hits Automodel redistribute assertion with transformers v5 (hemil)
+            ("tiny_qwen2_model_path", 1, 2, False, True, False),
+            ("tiny_qwen2_model_path", 1, 2, False, False, False),
+            ("tiny_llama_model_path", 1, 2, False, False, False),
+            ("tiny_llama_model_path", 1, 2, False, True, False),
+            ("tiny_llama_model_path", 1, 2, False, True, True),
+            ("tiny_qwen3_model_path", 1, 2, False, True, False),
+            ("tiny_qwen3_model_path", 1, 2, False, False, False),
+        ]
+    )
+    def logprob_setup(self, request, two_gpu_cluster):
+        """Setup and teardown specifically for logprob tests."""
+        request.param = {
+            "mode": "logprob",
+            "enable_loras": False,
+            "lora_config": None,
+            "model_fixture_name": request.param[0],
+            "specified_config": {
+                "tp": request.param[1],
+                "cp": request.param[2],
+                "sp": request.param[3],
+                "cpu_offload": request.param[4],
+                "activation_checkpointing": request.param[5],
+            },
+        }
+        yield from _base_setup_impl(request, two_gpu_cluster)
+
+    @pytest.fixture(
+        params=[
+            # model_name,             target_modules, exclude_modules, match_all_linear, dim,  alpha, dropout, dropout_position, lora_A_init, use_triton
+            (
+                "tiny_llama_model_path",
+                [],
+                [],
+                True,
+                16,
+                32,
+                0.0,
+                "post",
+                "xavier",
+                True,
+            ),
+            ("tiny_qwen2_model_path", [], [], True, 32, 32, 0.0, "pre", "xavier", True),
+            (
+                "tiny_qwen2_model_path",
+                ["q_proj", "k_proj", "*gate_proj*", "*up_proj*", "*down_proj*"],
+                [],
+                False,
+                32,
+                16,
+                0.0,
+                "post",
+                "uniform",
+                True,
+            ),
+            (
+                "tiny_qwen2_model_path",
+                [],
+                ["q_proj", "k_proj"],
+                False,
+                32,
+                16,
+                0.0,
+                "post",
+                "uniform",
+                True,
+            ),
+        ]
+    )
+    def training_with_lora_setup(self, request, two_gpu_cluster):
+        """Setup and teardown specifically for training with lora tests."""
+        request.param = {
+            "mode": "train",
+            "enable_loras": True,
+            "model_fixture_name": request.param[0],
+            "specified_config": {},
+            "lora_config": {
+                "target_modules": request.param[1],
+                "exclude_modules": request.param[2],
+                "match_all_linear": request.param[3],
+                "dim": request.param[4],
+                "alpha": request.param[5],
+                "dropout": request.param[6],
+                "dropout_position": request.param[7],
+                "lora_A_init": request.param[8],
+                "use_triton": request.param[9],
+            },
+        }
+        yield from _base_setup_impl(request, two_gpu_cluster)
+
+    @pytest.fixture(
+        params=[
+            # model_name,             target_modules, exclude_modules, match_all_linear, dim,  alpha, dropout, dropout_position, lora_A_init, use_triton
+            (
+                "tiny_llama_model_path",
+                [],
+                [],
+                True,
+                16,
+                32,
+                0.0,
+                "post",
+                "xavier",
+                True,
+            ),
+            ("tiny_qwen2_model_path", [], [], True, 32, 32, 0.0, "pre", "xavier", True),
+            (
+                "tiny_qwen2_model_path",
+                ["q_proj", "k_proj", "*gate_proj*", "*up_proj*", "*down_proj*"],
+                [],
+                False,
+                32,
+                16,
+                0.0,
+                "post",
+                "uniform",
+                True,
+            ),
+            (
+                "tiny_qwen2_model_path",
+                [],
+                ["q_proj", "k_proj"],
+                False,
+                32,
+                16,
+                0.0,
+                "post",
+                "uniform",
+                True,
+            ),
+        ]
+    )
+    def logprob_with_lora_setup(self, request, two_gpu_cluster):
+        """Setup and teardown specifically for logprob with lora tests."""
+        request.param = {
+            "mode": "logprob",
+            "enable_loras": True,
+            "model_fixture_name": request.param[0],
+            "specified_config": {},
+            "lora_config": {
+                "target_modules": request.param[1],
+                "exclude_modules": request.param[2],
+                "match_all_linear": request.param[3],
+                "dim": request.param[4],
+                "alpha": request.param[5],
+                "dropout": request.param[6],
+                "dropout_position": request.param[7],
+                "lora_A_init": request.param[8],
+                "use_triton": request.param[9],
+            },
+        }
+        yield from _base_setup_impl(request, two_gpu_cluster)
+
+    @pytest.mark.timeout(360)
+    @pytest.mark.automodel
+    @pytest.mark.parametrize(
+        "policy_setup",
+        [{"enable_loras": False}, {"enable_loras": True}],
+        indirect=True,
+    )
+    def test_lm_policy_init(self, policy_setup, request):
+        policy = policy_setup
+
+        # Verify we have two workers, one per GPU
+        assert len(policy.worker_group.workers) == 2, (
+            "Should have 2 workers, one per GPU"
+        )
+
+        # Check workers are alive
+        worker_alive = ray.get(
+            [w.is_alive.remote() for w in policy.worker_group.workers]
+        )
+        assert all(worker_alive), f"Not all workers are alive: {worker_alive}"
+
+        # Get GPU info from both workers to verify GPU usage
+        print("\nGetting GPU information from workers...")
+        gpu_infos = ray.get(
+            [w.get_gpu_info.remote() for w in policy.worker_group.workers]
+        )
+        print("\nGPU Information:")
+        for i, info in enumerate(gpu_infos):
+            print(f"\nWorker {i} GPU Info:")
+            pprint.pprint(info)
+
+        # Check 1: Verify workers have different ranks
+        gpu_ranks = [info["rank"] for info in gpu_infos]
+        assert len(set(gpu_ranks)) == 2, f"Expected 2 different ranks, got {gpu_ranks}"
+        assert set(gpu_ranks) == {0, 1}, f"Expected ranks 0 and 1, got {gpu_ranks}"
+
+        # Check 2: Verify workers have different local_ranks
+        local_ranks = [info["local_rank"] for info in gpu_infos]
+        assert len(set(local_ranks)) == 2, (
+            f"Expected 2 different local_ranks, got {local_ranks}"
+        )
+        assert set(local_ranks) == {0, 1}, (
+            f"Expected local_ranks 0 and 1, got {local_ranks}"
+        )
+
+        # Check 3: Verify workers have different CUDA_VISIBLE_DEVICES
+        cuda_visible_devices = [
+            info["env_vars"].get("CUDA_VISIBLE_DEVICES") for info in gpu_infos
+        ]
+        assert len(set(cuda_visible_devices)) == 2, (
+            f"Expected different CUDA_VISIBLE_DEVICES, got {cuda_visible_devices}"
+        )
+
+        # Check 4: Verify all workers report correct world_size
+        for info in gpu_infos:
+            assert info["world_size"] == 2, (
+                f"Expected world_size=2, got {info['world_size']}"
+            )
+            assert info["env_vars"]["WORLD_SIZE"] == "2", (
+                f"Expected WORLD_SIZE=2, got {info['env_vars']['WORLD_SIZE']}"
+            )
+
+        # Check 5: Verify GPU memory is allocated on both GPUs
+        for info in gpu_infos:
+            assert info["memory_allocated_mb"] > 10, (
+                f"Not enough memory allocated on GPU for rank {info['rank']}: {info['memory_allocated_mb']:.2f} MB"
+            )
+
+        # Check 6: Verify model parameters are on CUDA devices for both workers
+        for info in gpu_infos:
+            param_sample = list(info["parameter_sample"].values())[0]
+            assert "cuda" in param_sample["device"], (
+                f"Parameter not on CUDA device: {param_sample['device']}"
+            )
+
+        # Check 8: Verify same model parameters are being tracked across workers
+        param_names = [list(info["parameter_sample"].keys())[0] for info in gpu_infos]
+        assert len(set(param_names)) == 1, (
+            f"Workers are not tracking the same parameter: {param_names}"
+        )
+
+        # Check 9: Both workers should see their device as cuda:0 (correct distributed behavior)
+        for info in gpu_infos:
+            param_device = list(info["parameter_sample"].values())[0]["device"]
+            assert param_device == "cuda:0", (
+                f"Expected parameter device to be cuda:0, got {param_device}"
+            )
+
+        # Check 10: With LoRA on, base weights are frozen, so the first trainable param
+        # is an adapter.
+        lora_on = request.node.callspec.params["policy_setup"]["enable_loras"]
+        assert (".lora_" in param_names[0]) == lora_on, param_names[0]
+
+    @pytest.mark.timeout(360)
+    @pytest.mark.automodel
+    def test_worker_training(self, training_setup):
+        policy, data, loss_fn = training_setup
+        _test_worker_training(policy, data, loss_fn)
+
+    @pytest.mark.timeout(360)
+    @pytest.mark.automodel
+    def test_worker_training_with_lora(self, training_with_lora_setup):
+        policy, data, loss_fn = training_with_lora_setup
+        _test_worker_training(policy, data, loss_fn)
+
+    @pytest.mark.timeout(360)
+    @pytest.mark.automodel
+    def test_worker_logprob_tp2_or_cp2_matches_unsharded(self, logprob_setup):
+        policy, data, logprobs = logprob_setup
+        _test_worker_logprob(policy, data, logprobs)
+
+    @pytest.mark.timeout(360)
+    @pytest.mark.automodel
+    def test_worker_logprob_with_lora(self, logprob_with_lora_setup):
+        policy, data, logprobs = logprob_with_lora_setup
+        _test_worker_logprob(policy, data, logprobs)
+
+    @pytest.mark.automodel
+    def test_tp_and_tied_model_with_custom_parallel_plan(
+        self, two_gpu_cluster, tiny_llama_tied_model_path
+    ):
+        """Test that Automodel with a tp > 1 and a tied model with a custom parallel plan works."""
+        from torch.distributed.tensor.parallel import ColwiseParallel
+        from torch.distributed.tensor.placement_types import Replicate
+
+        custom_parallel_plan = {
+            "lm_head": ColwiseParallel(output_layouts=Replicate()),
+            "model.embed_tokens": ColwiseParallel(output_layouts=Replicate()),
+        }
+        config = create_test_config(
+            model_name=tiny_llama_tied_model_path,
+            tp=2,
+            cp=1,
+            sp=False,
+            cpu_offload=False,
+            activation_checkpointing=False,
+            custom_parallel_plan=custom_parallel_plan,
+        )
+        tokenizer = get_tokenizer(config["tokenizer"])
+
+        policy = Policy(
+            tokenizer=tokenizer,
+            config=config,
+            init_optimizer=False,
+            init_reference_model=False,
+            cluster=two_gpu_cluster,
+        )
+
+        # Verify that the model is parallelized as expected
+        state_dict = ray.get(policy.worker_group.workers[0].return_state_dict.remote())
+        total_shape = state_dict["lm_head.weight"].shape
+        sharded_shape = state_dict["lm_head.weight"].to_local().shape
+        assert total_shape[0] == sharded_shape[0], (
+            "lm_head.weight should have the same number of rows"
+        )
+        assert total_shape[1] == sharded_shape[1] * 2, (
+            "lm_head.weight should be sharded across 2 GPUs"
+        )
+
+        # Clean up
+        policy.shutdown()
+
+    @pytest.mark.timeout(180)
+    @pytest.mark.parametrize("eval_mode", [False, True])
+    def test_packed_dummy_batches_do_not_affect_metrics(
+        self,
+        two_gpu_cluster: RayVirtualCluster,
+        tiny_llama_model_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        eval_mode: bool,
+    ) -> None:
+        """Uneven packed ranks must report only real samples across global batches."""
+        config = create_test_config(tiny_llama_model_path)
+        config["precision"] = "bfloat16"
+        config["dynamic_batching"]["enabled"] = False
+        config["make_sequence_length_divisible_by"] = 1
+        config["sequence_packing"] = {
+            "enabled": True,
+            "train_mb_tokens": 128,
+            "algorithm": "first_fit_decreasing",
+        }
+        tokenizer = get_tokenizer(config["tokenizer"])
+        policy = Policy(
+            cluster=two_gpu_cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+        try:
+            # Two global batches, each with two long and two short sequences.
+            # Pack each rank independently to exercise the worker's dummy path:
+            # rank 0 has two real microbatches and rank 1 has one plus a dummy.
+            data = create_test_batch(mode="train", batch_size=8, seq_len=128)
+            data["input_lengths"] = torch.tensor([96, 96, 16, 16] * 2)
+            packing_args = {
+                **policy.sequence_packing_args,
+                "max_tokens_per_microbatch": 128,
+            }
+            sharded_data = []
+            for indices in ([0, 1, 4, 5], [2, 3, 6, 7]):
+                rank_data = data.select_indices(indices)
+                packed_shards, _ = rank_data.shard_by_batch_size(
+                    shards=1, batch_size=2, sequence_packing_args=packing_args
+                )
+                sharded_data.extend(packed_shards)
+            for batch_idx in range(2):
+                counts = [
+                    shard.get_batch(
+                        batch_idx=batch_idx, batch_size=2
+                    ).get_microbatch_iterator_for_packable_sequences_len()[0]
+                    for shard in sharded_data
+                ]
+                assert counts == [2, 1]
+            monkeypatch.setattr(
+                policy, "_shard_for_train", lambda data, batch_size: sharded_data
+            )
+
+            policy.prepare_for_training()
+            results = policy.train(data, UnitSequenceLossFn(), eval_mode=eval_mode)
+
+            # Each global batch has mean sequence loss 1, irrespective of dummies.
+            torch.testing.assert_close(results["loss"], torch.ones(2))
+            metrics = results["all_mb_metrics"]
+            assert len(metrics["loss"]) == 6
+            assert sum(metrics["loss"]) == pytest.approx(1.0)
+            assert sum(metrics["num_valid_samples"]) == pytest.approx(4.0)
+        finally:
+            policy.shutdown()
+
+    @pytest.mark.timeout(180)
+    def test_loss_independent_of_microbatch_size_two_gpus(
+        self, two_gpu_cluster, tiny_llama_model_path
+    ):
+        """Tests that changing microbatch size while keeping global batch size constant does not affect loss values in Automodel."""
+        # Create test batch with global batch size of 8
+        global_batch_size = 8
+        seq_len = 128
+        vocab_size = 32000
+
+        # Create test input_ids and attention_mask
+        input_ids = torch.randint(0, vocab_size, (global_batch_size, seq_len))
+        attention_mask = torch.ones(global_batch_size, seq_len)
+        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+        # Create data dictionary
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+                "token_mask": torch.triu(
+                    torch.ones(global_batch_size, seq_len), diagonal=1
+                ),  # give different examples different numbers of valid tokens
+                "sample_mask": torch.ones((global_batch_size,)),
+                "labels": torch.randint(0, vocab_size, (global_batch_size, seq_len)),
+                "num_valid_tokens_in_batch": torch.tensor(
+                    [seq_len] * global_batch_size, dtype=torch.float32
+                ),
+                "advantages": torch.randn(global_batch_size, seq_len),
+                "prev_logprobs": torch.randn(global_batch_size, seq_len),
+                "reference_policy_logprobs": torch.randn(global_batch_size, seq_len),
+                "generation_logprobs": torch.randn(global_batch_size, seq_len),
+            }
+        )
+
+        # Test with mbs=1, 2 microbatches per GPU
+        config = create_test_config(tiny_llama_model_path)
+        tokenizer = get_tokenizer(config["tokenizer"])
+
+        print("Creating training Policy with mbs=1...")
+        policy_mbs1 = Policy(
+            cluster=two_gpu_cluster,
+            config=config,
+            init_reference_model=False,
+            tokenizer=tokenizer,
+        )
+
+        # Test NLLLossFn and ClippedPGLossFn with mbs=1
+        nll_loss_fn = NLLLossFn()
+        pg_loss_fn = ClippedPGLossFn(
+            ClippedPGLossConfig(reference_policy_kl_penalty=0.1)
+        )
+
+        policy_mbs1.prepare_for_training()
+        mbs1_nll_results = policy_mbs1.train(data, nll_loss_fn)
+        mbs1_nll_loss = mbs1_nll_results["loss"]
+
+        mbs1_pg_results = policy_mbs1.train(data, pg_loss_fn)
+        mbs1_pg_loss = mbs1_pg_results["loss"]
+
+        policy_mbs1.worker_group.shutdown()
+
+        # Test with mbs=2, 1 microbatch per GPU
+        config = create_test_config(tiny_llama_model_path)
+        config["train_micro_batch_size"] = 2
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        print("Creating training Policy with mbs=2...")
+        policy_mbs2 = Policy(
+            cluster=two_gpu_cluster,
+            config=config,
+            init_reference_model=False,
+            tokenizer=tokenizer,
+        )
+
+        # Test NLLLossFn and ClippedPGLossFn with mbs=2
+        policy_mbs2.prepare_for_training()
+        mbs2_nll_results = policy_mbs2.train(data, nll_loss_fn)
+        mbs2_nll_loss = mbs2_nll_results["loss"]
+
+        mbs2_pg_results = policy_mbs2.train(data, pg_loss_fn)
+        mbs2_pg_loss = mbs2_pg_results["loss"]
+
+        # Verify both loss functions are independent of microbatch size
+        torch.testing.assert_close(mbs1_nll_loss, mbs2_nll_loss, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(mbs1_pg_loss, mbs2_pg_loss, rtol=1e-5, atol=1e-5)
+
+        policy_mbs2.worker_group.shutdown()
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.automodel
+    def test_policy_flops_range_check(self, tiny_llama_model_path, two_gpu_cluster):
+        """Test that the returned FLOPS is within a reasonable range using the Automodel backend.
+
+        Performs 2 warmup iterations and checks FLOPS for the next 3 iterations.
+        """
+        batch_size = 8
+        seq_len = 128
+        vocab_size = 32000
+
+        config = create_test_config(tiny_llama_model_path)
+
+        # Update config for FLOPS testing with larger batch and sequence length
+        config["train_global_batch_size"] = batch_size
+        config["train_micro_batch_size"] = (
+            batch_size  # Use full batch size for single microbatch
+        )
+
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        policy = Policy(
+            cluster=two_gpu_cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        # Create test data
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        attention_mask = torch.ones(batch_size, seq_len)
+        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+                "labels": torch.randint(0, vocab_size, (batch_size, seq_len)),
+                "sample_mask": torch.ones(batch_size),
+            }
+        )
+
+        # Create loss function
+        loss_fn = SimpleLossFn()
+
+        try:
+            # Prepare for training
+            policy.prepare_for_training()
+
+            # Perform 2 warmup iterations
+            print("Performing warmup iterations...")
+            for warmup_step in range(2):
+                results = policy.train(data, loss_fn)
+
+            print("Checking FLOPS on 3 iterations...")
+            for train_step in range(3):
+                results = policy.train(data, loss_fn)
+
+            # Check if FLOPS tracking is available
+            if policy.flops_tracker is not None:
+                assert "total_flops" in results, (
+                    "Training results should contain 'total_flops'"
+                )
+                total_flops = results["total_flops"]
+
+                assert isinstance(total_flops, (int, float)), (
+                    "total_flops should be numeric"
+                )
+                assert total_flops > 0, "total_flops should be positive"
+
+                expected_tracker = FLOPTracker.from_config(
+                    config["model_name"],
+                    get_hf_config(
+                        config["model_name"],
+                        **(config.get("hf_config_overrides") or {}),
+                    ),
+                )
+                expected_tracker.track_batch(input_lengths.tolist())
+                expected_total_flops = expected_tracker.total_flops
+
+                assert total_flops == pytest.approx(expected_total_flops, rel=0.05), (
+                    f"Expected {expected_total_flops:.2e} FLOPS, got {total_flops:.2e}"
+                )
+
+                total_tflops = total_flops / 1e12
+                print(f"Total FLOPS: {total_flops:.2e} ({total_tflops:.4f} TFLOPS)")
+
+                if "theoretical_tflops" in results:
+                    theoretical_tflops = results["theoretical_tflops"]
+                    assert isinstance(theoretical_tflops, (int, float)), (
+                        "theoretical_tflops should be numeric"
+                    )
+                    assert theoretical_tflops > 0, (
+                        "theoretical_tflops should be positive"
+                    )
+
+                    utilization = total_tflops / theoretical_tflops
+                    print(f"Theoretical TFLOPS: {theoretical_tflops:.2f}")
+                    print(f"Model utilization: {utilization * 100:.2f}%")
+
+                    assert utilization <= 1.0, (
+                        f"Model utilization {utilization * 100:.2f}% should not exceed 100%"
+                    )
+            else:
+                print("FLOPS tracker not available, skipping FLOPS range check")
+                pytest.skip("FLOPS tracker not supported for this model configuration")
+
+        finally:
+            policy.shutdown()

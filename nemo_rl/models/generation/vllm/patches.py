@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.util import find_spec
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import torch
@@ -525,11 +527,25 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
 def _patch_vllm_radio_layerscale_loader(logger) -> None:
     """Load explicit RADIO LayerScale weights and initialize folded weights.
 
-    vLLM 0.25.1 uses ``ls1`` and ``ls2`` in ``RadioVisionEncoderLayer`` but
-    skips them in ``RadioModel.load_weights``. Explicit checkpoint values are
-    therefore ignored, while folded checkpoints leave the parameters at dummy
-    initialization. Patch the loader so explicit values are loaded and absent
-    values are initialized to RADIO's configured identity factor.
+    ``RadioVisionEncoderLayer`` scales each residual branch by ``ls1``/``ls2``
+    (``... + self.attn(...) * self.ls1``), but ``RadioModel.load_weights``
+    discards those entries for legacy ``radio_model.*`` checkpoints, and folded
+    checkpoints ship no LayerScale tensors at all. NeMo-RL forces
+    ``load_format=dummy`` because weights arrive by refit, so anything the
+    loader does not populate keeps its random initialization: the vision tower
+    then multiplies every residual branch by noise. The failure is silent --
+    unchanged step time, a collapsed reward, and a large
+    train/token_mult_prob_error.
+
+    Applied as two INDEPENDENT edits rather than one block replacement, each
+    anchored on text that is stable across loader variants. Both anchors are
+    verified against stock vLLM 0.25.1 and 0.29.0. Custom vLLM builds that
+    reshape the surrounding loader body (for example by gating the legacy
+    branch or adding a native-name mapping branch) still take the required
+    edit, where matching the whole body as one snippet would silently no-op.
+
+    Refit calls ``load_weights`` once per size-limited batch, so names loaded
+    by any earlier call are remembered on the module and never re-filled.
     """
     try:
         file_to_patch = _get_vllm_file("model_executor/models/radio.py")
@@ -537,64 +553,71 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
         logger.warning("Could not locate radio.py for the LayerScale loader patch.")
         return
 
-    old_snippet = """            elif sub.startswith("model.blocks."):
-                # Encoder blocks: HF 'model.blocks.{i}.' ->
-                # vLLM 'model.encoder.layers.{i}.'
-                parts = sub.split(".")
-                if len(parts) >= 4:
-                    layer_idx = parts[2]
-                    suffix = ".".join(parts[3:])
-                    # Skip layer-scale entries that vLLM doesn't use
+    # Edit 1 (optional): stop discarding explicit LayerScale weights from legacy
+    # radio_model.* checkpoints. Stock vLLM drops native-format
+    # layer_scale{1,2}.lambda1 names entirely; only custom builds with a native
+    # name mapping route them to ls{1,2}.
+    skip_old = """                    # Skip layer-scale entries that vLLM doesn't use
                     if suffix in {"ls1", "ls2"} or suffix.startswith(("ls1.", "ls2.")):
                         continue
-                    vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
+"""
+    skip_new = ""
 
-            if vllm_key and vllm_key in params_dict:
-                param = params_dict[vllm_key]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight)
-                loaded_params.add(vllm_key)
+    # Edit 2 (required): give every LayerScale parameter the checkpoint did not
+    # supply the configured identity factor instead of dummy-init noise.
+    # RadioConfig defaults initializer_factor=1.0, and getattr keeps this safe
+    # for configs that omit it. This is the edit that matters for the folded
+    # checkpoints we train on, which contain no ls1/ls2 tensors whatsoever.
+    old_snippet = """                loaded_params.add(vllm_key)
 
         return loaded_params
 """
-    new_snippet = """            elif sub.startswith("model.blocks."):
-                # Encoder blocks: HF 'model.blocks.{i}.' ->
-                # vLLM 'model.encoder.layers.{i}.'
-                parts = sub.split(".")
-                if len(parts) >= 4:
-                    layer_idx = parts[2]
-                    suffix = ".".join(parts[3:])
-                    vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
+    new_snippet = """                loaded_params.add(vllm_key)
 
-            if vllm_key and vllm_key in params_dict:
-                param = params_dict[vllm_key]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight)
-                loaded_params.add(vllm_key)
-
-        initializer_factor = self.config.initializer_factor
-        for name, param in params_dict.items():
-            if name.endswith((".ls1", ".ls2")) and name not in loaded_params:
-                param.data.fill_(initializer_factor)
-                loaded_params.add(name)
+        initializer_factor = getattr(self.config, "initializer_factor", 1.0)
+        # Refit calls load_weights once per batch. Remember every LayerScale name
+        # any batch has loaded, so a later batch does not reset it to the factor.
+        ever_loaded_ls = getattr(self, "_nemo_rl_loaded_layerscale", set())
+        ever_loaded_ls.update(n for n in loaded_params if n.endswith((".ls1", ".ls2")))
+        self._nemo_rl_loaded_layerscale = ever_loaded_ls
+        for ls_name, ls_param in params_dict.items():
+            if ls_name.endswith((".ls1", ".ls2")) and ls_name not in ever_loaded_ls:
+                ls_param.data.fill_(initializer_factor)
+                loaded_params.add(ls_name)
 
         return loaded_params
 """
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
-        if new_snippet in content:
+        if "ls_param.data.fill_(initializer_factor)" in content:
             logger.info("vLLM RADIO LayerScale loader patch already applied.")
             return
-        if old_snippet not in content:
+
+        updated = content
+        skip_removed = skip_old in updated
+        if skip_removed:
+            updated = updated.replace(skip_old, skip_new, 1)
+
+        if old_snippet not in updated:
+            # Without the fill loop the parameters stay at dummy init, so refuse
+            # to write a half-applied patch and make the reason loud.
             logger.warning(
-                "Could not apply vLLM RADIO LayerScale loader patch: expected "
-                "vLLM 0.25.1 source shape was not found in %s.",
+                "Could not apply vLLM RADIO LayerScale loader patch: the "
+                "load_weights tail anchor was not found in %s. LayerScale "
+                "parameters would keep their dummy initialization; expect a "
+                "degraded vision tower and inflated token_mult_prob_error.",
                 file_to_patch,
             )
             return
-        write_back(content.replace(old_snippet, new_snippet, 1))
+        updated = updated.replace(old_snippet, new_snippet, 1)
 
-    logger.info("Successfully patched vLLM RADIO LayerScale loading.")
+        write_back(updated)
+
+    logger.info(
+        "Successfully patched vLLM RADIO LayerScale loading "
+        "(explicit legacy-skip removed: %s).",
+        skip_removed,
+    )
 
 
 def _patch_vllm_radio_native_loader(logger) -> None:
@@ -1353,6 +1376,77 @@ def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
     finally:
         for module, alias in reversed(aliased):
             delattr(module, alias)
+
+
+def install_output_loop_yield(llm: Any, *, reader_budget_s: float) -> None:
+    """Make ``llm``'s output loops yield to other tasks on the event loop.
+
+    AsyncLLM runs two loops on the generation actor's event loop: the socket
+    reader (``AsyncMPClient``) that receives EngineCore outputs, and
+    ``output_handler`` (``AsyncLLM``) that does the per-token work. Under a
+    generation backlog each finds its next message already waiting, and awaiting
+    a done future does not yield, so either can hold the loop for minutes and
+    starve refit and other Ray calls to the actor.
+
+    ``output_handler`` now yields once per engine step, and the reader once it
+    has run for ``reader_budget_s`` without waiting. Yielding the reader on every
+    message instead starves it against ``output_handler`` and moves the backlog
+    into the socket. This bounds how long control calls wait behind generation;
+    it does not make the per-token work cheaper.
+
+    Args:
+        llm: The ``vllm.v1.engine.async_llm.AsyncLLM`` whose output loops to patch.
+        reader_budget_s: How long the socket reader may run without yielding.
+
+    Raises:
+        ValueError: If ``reader_budget_s`` is not positive.
+        RuntimeError: If the installed vLLM does not have the internals this patches.
+    """
+    if reader_budget_s <= 0:
+        raise ValueError(f"reader_budget_s must be positive, got {reader_budget_s}")
+    try:
+        from vllm.v1.engine.core_client import AsyncMPClient
+
+        original_get = AsyncMPClient.get_output_async
+        socket = llm.engine_core.resources.output_socket
+        original_recv = socket.recv_multipart
+    except (ImportError, AttributeError) as e:
+        raise RuntimeError(
+            "output-loop yielding is enabled (vllm_cfg.output_loop_yield_budget_ms) but "
+            "the installed vLLM does not have the AsyncMPClient output-loop internals it "
+            "patches; disable it or update install_output_loop_yield in "
+            "nemo_rl/models/generation/vllm/patches.py for this vLLM version"
+        ) from e
+
+    # output_handler: yield once per engine step. Patched on the class once per process.
+    if not getattr(AsyncMPClient, "_nrl_output_loop_yield", False):
+
+        async def get_output_async(self):
+            outputs = await original_get(self)
+            await asyncio.sleep(0)
+            return outputs
+
+        AsyncMPClient.get_output_async = get_output_async
+        AsyncMPClient._nrl_output_loop_yield = True
+
+    # Reader: yield after reader_budget_s of work; patch this socket instance only.
+    state = {"since": time.monotonic()}
+
+    async def recv_multipart(*args, **kwargs):
+        # A done future means a message was waiting; awaiting it does not yield.
+        future = original_recv(*args, **kwargs)
+        if not future.done():
+            # This receive waits, so the loop gets its turn; restart the budget.
+            frames = await future
+            state["since"] = time.monotonic()
+            return frames
+        frames = await future
+        if time.monotonic() - state["since"] >= reader_budget_s:
+            await asyncio.sleep(0)
+            state["since"] = time.monotonic()
+        return frames
+
+    socket.recv_multipart = recv_multipart
 
 
 def ensure_vllm_source_compat() -> None:

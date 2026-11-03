@@ -62,7 +62,6 @@ policy:
         tokenizer_cache: false
         tokenizer_cache_bytes: 52428800
         router_mode: kv
-        router_reset_states: true
         extra_cli_args: []
     vllm_cfg:
       async_engine: true

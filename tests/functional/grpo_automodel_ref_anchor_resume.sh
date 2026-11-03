@@ -1,5 +1,5 @@
 #!/bin/bash
-# Verifies that on the DTensor v2 (automodel) path the KL reference stays
+# Verifies that on the Automodel path the KL reference stays
 # anchored to the base (model_name) weights across a resume: the worker defers
 # the NeMo RL checkpoint load, captures the reference from the pristine base
 # weights, then loads the checkpoint. Without the deferred load the reference

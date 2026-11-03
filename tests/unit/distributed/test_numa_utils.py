@@ -214,7 +214,7 @@ class TestResolveVisibleGpuId:
         assert resolve_visible_gpu_id(3) == 3
 
     def test_isolated_single_device(self, monkeypatch):
-        # vLLM TP=1 / DTensor: CVD isolated to one GPU, local index is 0.
+        # vLLM TP=1 / Automodel: CVD isolated to one GPU, local index is 0.
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5")
         assert resolve_visible_gpu_id(0) == 5
 

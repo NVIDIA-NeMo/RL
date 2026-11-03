@@ -89,7 +89,6 @@ cluster:
 async_rl:
   sampler:
     warmup_lookahead_versions: 2
-  recompute_kv_cache_after_weight_updates: true
   max_inflight_prompts: ${mul:${ppo.num_prompts_per_step}, 3}
   max_buffered_rollouts: ${mul:${ppo.num_prompts_per_step}, 3}
 checkpointing:
