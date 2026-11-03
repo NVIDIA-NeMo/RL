@@ -92,6 +92,8 @@ def test_automodel_cp_layout_localizes_xtoken_windows_after_global_shift():
         "token_mask": torch.ones(1, 6),
         "sample_mask": torch.ones(1),
         "teacher_0_full_logits_ipc": teacher_ipc,
+        "teacher_0_input_ids": torch.arange(20, 24).unsqueeze(0),
+        "teacher_0_token_mask": torch.tensor([[1, 1, 0, 1]]),
         "alignment_0_student_chunk_id": torch.tensor([[10, 11, 12, 13, 14, 15]]),
         "alignment_0_teacher_chunk_id": torch.tensor([[20, 21, 22, 23]]),
         "alignment_0_pair_valid": torch.ones(1, 2, dtype=torch.bool),
@@ -130,6 +132,57 @@ def test_automodel_cp_layout_localizes_xtoken_windows_after_global_shift():
         local_logits, seq_dim=1, trim=True
     )
     rebuild_teacher.assert_called_once_with(teacher_ipc, cp_group=cp_group, device=0)
+    # CP rank 1 of 2 holds the second teacher window (2 of 4 positions); its ids
+    # and token mask match the teacher-logit window that the scoring code reads.
+    torch.testing.assert_close(
+        aligns[0].teacher_input_ids, data["teacher_0_input_ids"][:, 2:4]
+    )
+    torch.testing.assert_close(
+        aligns[0].teacher_token_mask, data["teacher_0_token_mask"][:, 2:4]
+    )
+
+
+def test_cp1_layout_keeps_the_teacher_logit_window():
+    """Without CP the teacher window is the first teacher-logit-width positions."""
+    teacher_logits = torch.randn(1, 3, 4)
+    data = {
+        "input_ids": torch.arange(4).unsqueeze(0),
+        "token_mask": torch.ones(1, 4),
+        "sample_mask": torch.ones(1),
+        "teacher_0_full_logits_ipc": [{"opaque": "handle"}],
+        "teacher_0_input_ids": torch.arange(20, 24).unsqueeze(0),
+        "teacher_0_token_mask": torch.tensor([[1, 1, 0, 1]]),
+        "alignment_0_student_chunk_id": torch.tensor([[10, 11, 12, 13]]),
+        "alignment_0_teacher_chunk_id": torch.tensor([[20, 21, 22, 23]]),
+        "alignment_0_pair_valid": torch.ones(1, 2, dtype=torch.bool),
+        "alignment_0_pair_is_correct": torch.ones(1, 2, dtype=torch.bool),
+    }
+
+    with (
+        patch("torch.cuda.current_device", return_value=0),
+        patch(
+            "nemo_rl.algorithms.x_token.loss_utils."
+            "rebuild_teacher_full_logits_from_ipc",
+            return_value=(teacher_logits, 0),
+        ),
+    ):
+        _, _, aligns, _, _ = prepare_xtoken_cross_tokenizer_loss_input(
+            torch.randn(1, 4, 2),
+            data,
+            projection_matrix_paths=["projection.pt"],
+            context_parallel_group=None,
+            cp_sharder=None,
+        )
+
+    # localize_alignment trims the teacher chunk ids to the teacher-logit width;
+    # the teacher ids and token mask use the same window.
+    assert aligns[0].teacher_chunk_id.shape[1] == 3
+    torch.testing.assert_close(
+        aligns[0].teacher_input_ids, data["teacher_0_input_ids"][:, :3]
+    )
+    torch.testing.assert_close(
+        aligns[0].teacher_token_mask, data["teacher_0_token_mask"][:, :3]
+    )
 
 
 def test_automodel_cp_layout_rejects_non_divisible_student_sequence():
