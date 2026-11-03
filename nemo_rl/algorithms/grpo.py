@@ -702,6 +702,10 @@ def setup(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     loss_config: ClippedPGLossConfig = master_config.loss_fn
+    if loss_config.score_centering:
+        raise ValueError(
+            "Score centering requires SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
+        )
     env_configs = master_config.env
     data_config = master_config.data
     grpo_config = master_config.grpo
