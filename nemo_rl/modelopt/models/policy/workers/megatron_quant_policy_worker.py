@@ -32,6 +32,7 @@ from megatron.core.utils import unwrap_model
 from modelopt.torch.quantization.nn import AnyQuantizer
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+from modelopt.torch.quantization.utils import apply_without_qdq
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.distributed.collectives import gather_jagged_object_lists
@@ -662,7 +663,15 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if w is None:
                     return None
                 try:
-                    return self._wq(w.float()).to(w.dtype)
+                    rows = getattr(
+                        self._task.megatron_module,
+                        "_modelopt_unquantized_output_rows",
+                        None,
+                    )
+                    folded = self._wq(w.float()).to(w.dtype, copy=rows is not None)
+                    if rows is not None:
+                        folded[rows] = apply_without_qdq(self._wq, w[rows]).to(w.dtype)
+                    return folded
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to apply weight quantizer for param "
