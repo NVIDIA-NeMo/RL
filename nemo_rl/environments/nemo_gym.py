@@ -3405,9 +3405,7 @@ def _spinup_shards_concurrently(
                     )
                 except Exception:
                     pass
-            # GetTimeoutError is our own ray.get running out of budget. An error
-            # raised inside the actor arrives as a RayTaskError, which also
-            # subclasses its cause's type.
+            # Our ray.get ran out of budget; actor-side errors arrive as RayTaskError.
             if isinstance(error, GetTimeoutError) and not isinstance(
                 error, RayTaskError
             ):
