@@ -42,7 +42,7 @@ from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.codec import pad_batch
 from nemo_rl.data_plane.column_io import fetch_columns
-from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
+from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, gdr_enabled
 from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
@@ -417,8 +417,7 @@ class TQWorkerMixin:
         # mooncake, so no GDR to order against a CUDA context.
         if (
             not isinstance(cfg, LocalDataPlaneConfig)
-            and cfg["backend"] == "mooncake_cpu"
-            and backend_config(cfg).use_gdr
+            and gdr_enabled(cfg)
             and not torch.cuda.is_initialized()
         ):
             raise RuntimeError(

@@ -281,6 +281,11 @@ def backend_config(cfg: DataPlaneConfig) -> Any:
     return _BACKEND_MODELS[backend].model_validate(nested)
 
 
+def gdr_enabled(cfg: DataPlaneConfig) -> bool:
+    """Return whether the selected TransferQueue backend requests GDR."""
+    return cfg["backend"] == "mooncake_cpu" and bool(backend_config(cfg).use_gdr)
+
+
 def storage_unit_placement(cfg: DataPlaneConfig) -> list[str] | Literal["all"] | None:
     """Where this config's storage units go, or None when they are off.
 

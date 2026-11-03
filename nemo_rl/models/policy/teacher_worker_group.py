@@ -33,7 +33,7 @@ from nemo_rl.algorithms.opd import TeacherResourceConfig
 from nemo_rl.data.multimodal_utils import teacher_multimodal_fields
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
 from nemo_rl.data_plane.column_io import round_up
-from nemo_rl.data_plane.interfaces import backend_config
+from nemo_rl.data_plane.interfaces import backend_config, gdr_enabled
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, TEACHER_LP_FIELDS
 from nemo_rl.distributed.batched_data_dict import (
@@ -322,11 +322,10 @@ class TeacherWorkerGroup:
         )
         # Only a GDR PUT reads straight from GPU, so only then can the teacher
         # skip copying what it writes (logprobs and any payload) to CPU.
-        if dp_cfg["backend"] == "mooncake_cpu":
-            mooncake_cfg = backend_config(dp_cfg)
-            self._keep_outputs_on_gpu = (
-                mooncake_cfg.use_gdr and mooncake_cfg.gdr_keep_teacher_payload_on_gpu
-            )
+        self._keep_outputs_on_gpu = (
+            gdr_enabled(dp_cfg)
+            and backend_config(dp_cfg).gdr_keep_teacher_payload_on_gpu
+        )
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         """Dispatch a TQ metadata batch; workers fetch and write teacher logprobs."""
