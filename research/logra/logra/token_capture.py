@@ -34,10 +34,9 @@ def align_image_placeholders(
 ) -> None:
     """Align Omni image embeddings with the exact carried conversation tokens.
 
-    Assistant text can retokenize differently. Native token-in HTTP preserves
-    the original tokens, but remaps media only with the optional TQ capture
-    service. This recipe uses HTTP capture and locates each image in that exact
-    token sequence, including earlier images shifted by previous turns.
+    Retained for existing callers of logra.osworld. Current generation uses
+    NeMo RL's native media remapping. This helper locates each image in the
+    carried token sequence, including images shifted by earlier turns.
     """
     placeholders = engine_prompt.get("mm_placeholders") or {}
     if not placeholders:
