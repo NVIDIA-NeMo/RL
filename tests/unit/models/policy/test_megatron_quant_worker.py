@@ -368,16 +368,23 @@ def test_modelopt_real_quant_cpu_and_gpu_exports_are_byte_identical(
         name: str,
         tensor: torch.Tensor,
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        yield from export_quantized_weight_tensors(
-            tensor, state, tensor.dtype, name
-        ).items()
+        prefix = name.removesuffix(".weight")
+        for relative_name, exported_tensor in export_quantized_weight_tensors(
+            tensor, state, tensor.dtype
+        ).items():
+            yield f"{prefix}.{relative_name}", exported_tensor
 
     weight = HFWeightTuple("model.layers.0.mlp.down_proj.weight", layer.weight)
     cpu_export = list(weight.iter_finalized(cpu=True, export_hook=export_hook))
     gpu_export = list(weight.iter_finalized(cpu=False, export_hook=export_hook))
 
     assert [name for name, _ in cpu_export] == [name for name, _ in gpu_export]
-    assert len(cpu_export) == (4 if quant_mode == "nvfp4" else 3)
+    expected = {"weight", "weight_scale", "weight_scale_2"}
+    if quant_mode == "nvfp4":
+        expected.add("input_scale")
+    assert {name for name, _ in cpu_export} == {
+        f"model.layers.0.mlp.down_proj.{suffix}" for suffix in expected
+    }
     for (_, cpu_tensor), (_, gpu_tensor) in zip(cpu_export, gpu_export, strict=True):
         assert cpu_tensor.device.type == "cpu"
         assert gpu_tensor.device.type == "cuda"
