@@ -39,6 +39,7 @@ def test_worker_extension_does_not_shadow_vllm_worker_attributes(extension_name)
     from nemo_rl.models.generation.vllm import vllm_backend
 
     extension = getattr(vllm_backend, extension_name)
+    assert hasattr(Worker, "synchronize_device")
     # Same predicate vLLM applies in WorkerBase.init_worker.
     conflicts = sorted(
         attr
@@ -49,3 +50,12 @@ def test_worker_extension_does_not_shadow_vllm_worker_attributes(extension_name)
         f"{extension_name} shadows vLLM Worker attribute(s) {conflicts}; vLLM "
         "refuses to load the extension when this happens. Rename them."
     )
+
+
+def test_sparse_refit_sync_uses_a_worker_extension_rpc_name():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    assert "synchronize_device" not in VllmInternalWorkerExtension.__dict__
+    assert "synchronize_sparse_refit_device" in VllmInternalWorkerExtension.__dict__

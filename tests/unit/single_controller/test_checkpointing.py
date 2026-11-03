@@ -2918,7 +2918,7 @@ class TestDataPlaneCheckpoint:
             batch_shortfall={},
             sampler_stamps_target_steps=True,
             reward_settings=CaptureRewardSettings.from_configs(
-                config.reward_penalties, None
+                config.reward_penalties, None, None
             ),
         )
         attempt = state["groups"][0]["siblings"][0]["attempts"][0]

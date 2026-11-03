@@ -1906,9 +1906,8 @@ class AsyncNemoGymRolloutImpl:
             completions[0].env_extras or {}
         )
         if receipt_mode:
-            # A receipt knows context lengths, not generation lengths. Exact
-            # output metrics are emitted after staged tensors are verified by
-            # the reassembler; delta_len includes input and is not a proxy.
+            # The finalizer reports all token metrics from the verified rows;
+            # receipts only supply the turn count here.
             if self._forest_training:
                 manifests = [
                     [
@@ -1929,15 +1928,7 @@ class AsyncNemoGymRolloutImpl:
                     )
                     for c in completions
                 ]
-            # .get with 0: _assemble_receipt ships raw ledger rows unvalidated
-            # when CallRecord validation fails (it only stamps
-            # capture_poisoned), so a malformed row must degrade a metric, not
-            # fail the group as a deterministic data failure.
             turn_count = [len(m) for m in manifests]
-            total_tokens = [
-                max((entry.get("cum_len", 0) for entry in m), default=0)
-                for m in manifests
-            ]
         else:
             turn_count = [
                 sum(1 for m in c.message_log if m["role"] == "user")
@@ -1967,12 +1958,19 @@ class AsyncNemoGymRolloutImpl:
                 )
                 for c in completions
             ]
-        # truncated metrics
-        truncated = [c.truncated for c in completions]
-
         # Aggregate metrics across all samples.
         n = len(completions)
-        truncation_rate = sum(truncated) / n
+        # Receipt completions carry a placeholder truncated=False; the finalizer
+        # reports capture termination rates from the rebuilt rows instead.
+        termination_metrics: dict[str, float] = {}
+        if not receipt_mode:
+            truncation_rate = sum(c.truncated for c in completions) / n
+            termination_metrics = {
+                "natural_termination_rate": sum(not c.truncated for c in completions)
+                / n,
+                "truncation_rate": truncation_rate,
+                f"{agent_name}/truncation_rate": truncation_rate,
+            }
         rollout_metrics: dict[str, Any] = {
             **(
                 calculate_single_metric(total_reward, n, "total_reward")
@@ -1984,11 +1982,12 @@ class AsyncNemoGymRolloutImpl:
             "turns_per_sample/p95": pct(turn_count, 95),
             "turns_per_sample/p99": pct(turn_count, 99),
             # token metrics
-            **calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
-            # truncated metrics
-            "natural_termination_rate": sum(not t for t in truncated) / n,
-            "truncation_rate": truncation_rate,
-            f"{agent_name}/truncation_rate": truncation_rate,
+            **(
+                calculate_single_metric(total_tokens, n, "total_tokens_per_sample")
+                if not receipt_mode
+                else {}
+            ),
+            **termination_metrics,
         }
 
         # Agent-level metrics. Receipts are lineage records, not agent
@@ -2017,6 +2016,7 @@ class AsyncNemoGymRolloutImpl:
                         "gen_tokens_per_sample",
                         "max_gen_tokens_per_turn",
                         "mean_gen_tokens_per_sample",
+                        "total_tokens_per_sample",
                     )
                 )
             }
@@ -2036,14 +2036,13 @@ class AsyncNemoGymRolloutImpl:
                 )
 
         # Emit authoritative live token metrics after full-result metrics so
-        # similarly named environment metadata cannot overwrite them. In receipt
-        # mode these come from the manifest-derived token counts above.
-        rollout_metrics.update(
-            calculate_single_metric(
-                total_tokens, n, f"{agent_name}/total_tokens_per_sample"
-            )
-        )
+        # similarly named environment metadata cannot overwrite them.
         if not receipt_mode:
+            rollout_metrics.update(
+                calculate_single_metric(
+                    total_tokens, n, f"{agent_name}/total_tokens_per_sample"
+                )
+            )
             rollout_metrics.update(
                 calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample")
             )
@@ -2715,11 +2714,13 @@ class RolloutManager:
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
         lineage_group_id: Optional[str] = None,
-    ) -> Optional["ReassemblyRequest"]:
+    ) -> Optional[tuple["ReassemblyRequest", dict[str, Any]]]:
         """Capture siblings with stable lineage and configured retry granularity.
 
-        Returns ``None`` when infrastructure retries are exhausted within the
-        configured drop budget. The caller then owns the backpressure permit and
+        Returns the metadata-only request and the group's rollout metrics, which
+        are empty unless the successful attempt dispatched every sibling. Returns
+        ``None`` when infrastructure retries are exhausted within the configured
+        drop budget. The caller then owns the backpressure permit and
         target-step shortfall.
         """
         assert self._tq_buffer is not None, (
@@ -2758,7 +2759,7 @@ class RolloutManager:
         last_infra_error: Optional[Exception] = None
         while infra_attempts < policy.max_infra_attempts:
             try:
-                request = await self._generate_for_finalization_attempt(
+                captured = await self._generate_for_finalization_attempt(
                     input_sample,
                     recovery_group_id=recovery_group_id,
                     inflight_registry=inflight_registry,
@@ -2784,7 +2785,7 @@ class RolloutManager:
                 continue
 
             self._consecutive_infra_drops = 0
-            return request
+            return captured
 
         assert last_infra_error is not None
         reason = type(last_infra_error).__name__
@@ -2822,7 +2823,7 @@ class RolloutManager:
         *,
         recovery_group_id: str,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
-    ) -> "ReassemblyRequest":
+    ) -> tuple["ReassemblyRequest", dict[str, Any]]:
         """Dispatch the current sibling cohort and leave one slot unready."""
         from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
@@ -2880,6 +2881,7 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
+        rollout_metrics: dict[str, Any] = {}
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -3013,7 +3015,7 @@ class RolloutManager:
                                 generation_indices=pending_indices,
                                 gym_instance_id=gym_instance_id,
                             )
-                    await self.run_rollout(
+                    record = await self.run_rollout(
                         attempt_input_sample,
                         rollout_ids=list(rollout_ids),
                         generation_indices=pending_indices,
@@ -3022,6 +3024,10 @@ class RolloutManager:
                         gym_instance_id=gym_instance_id,
                         dispatch_recorder=dispatch_recorder,
                     )
+                    # A retry of only the unsealed siblings would under-report
+                    # the group, so keep metrics only when every sibling ran.
+                    if len(pending_indices) == recovery_group.expected_generations:
+                        rollout_metrics = dict(record.rollout_metrics)
             finally:
                 if inflight_registry is not None:
                     inflight_registry.pop(group_id, None)
@@ -3062,7 +3068,7 @@ class RolloutManager:
                 ).resolved_agent_name,
             )
             assert_metadata_only(request)
-            return request
+            return request, rollout_metrics
         except UnresolvedCaptureAcknowledgement:
             # Neither retry nor abandon an attempt whose capture writes may still
             # be in flight. Surface the failure with its ledger ownership intact.
