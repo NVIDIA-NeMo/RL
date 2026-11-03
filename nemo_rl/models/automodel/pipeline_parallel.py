@@ -75,18 +75,6 @@ class ExecutionBatch:
     cp_sharder: Optional[ContextParallelSharder]
 
 
-def _forward_names_padding_mask(model: nn.Module) -> bool:
-    """Check whether forward explicitly accepts padding_mask.
-
-    Models with only **kwargs may forward it to layers that do not support it.
-    """
-    try:
-        parameters = inspect.signature(type(model).forward).parameters
-    except (TypeError, ValueError):
-        return False
-    return "padding_mask" in parameters
-
-
 def _check_batch_major_inputs(model: nn.Module, model_batch: dict[str, Any]) -> None:
     """Reject inputs that the schedule cannot split along batch dimension 0."""
     chunk_dims_hook = getattr(model, "get_pipeline_kwargs_chunk_dims", None)
@@ -144,7 +132,10 @@ def plan_execution_batches(
     else:
         padded = data
 
-    mark_padding_rows = _forward_names_padding_mask(model)
+    # Models with only **kwargs may pass padding_mask to layers that reject it.
+    mark_padding_rows = (
+        "padding_mask" in inspect.signature(type(model).forward).parameters
+    )
     execution_batches = []
     for call_idx in range(num_calls):
         start = call_idx * samples_per_call
@@ -216,7 +207,7 @@ PipelineCallMode = Literal["train", "eval", "logprobs"]
 
 @dataclass
 class PipelineCallContext:
-    """Per-call state for ``PipelineOutputAdapter``, passed via ``loss_kwargs``."""
+    """Per-call state for ``pipeline_loss_fn``, passed via ``loss_kwargs``."""
 
     execution_batch: ExecutionBatch
     mode: PipelineCallMode
@@ -244,45 +235,42 @@ def _free_logits_storage(logits: torch.Tensor) -> None:
     to_local_if_dtensor(logits).untyped_storage().resize_(0)
 
 
-class PipelineOutputAdapter:
+def pipeline_loss_fn(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    context: PipelineCallContext,
+) -> torch.Tensor:
     """Compute last-stage losses or logprobs using the shared post-processors.
 
     Results are keyed by microbatch index so repeated callbacks overwrite
-    rather than double-count results.
+    rather than double-count results. Returns the scaled loss for backward in
+    train mode.
     """
+    mb_index = context.microbatch_index(target)
+    result, metrics = post_process_logits(
+        logits,
+        context.post_processing_fn,
+        context.execution_batch.microbatches[mb_index],
+        cp_sharder=context.execution_batch.cp_sharder,
+        global_valid_seqs=context.global_valid_seqs,
+        global_valid_toks=context.global_valid_toks,
+        sampling_params=context.sampling_params,
+        sequence_dim=context.sequence_dim,
+    )
+    if context.mode == "logprobs":
+        context.results[mb_index] = result
+        _free_logits_storage(logits)
+        return result.new_zeros(())
 
-    def __call__(
-        self,
-        logits: torch.Tensor,
-        target: torch.Tensor,
-        *,
-        context: PipelineCallContext,
-    ) -> torch.Tensor:
-        """Record results and return the scaled loss for backward in train mode."""
-        mb_index = context.microbatch_index(target)
-        result, metrics = post_process_logits(
-            logits,
-            context.post_processing_fn,
-            context.execution_batch.microbatches[mb_index],
-            cp_sharder=context.execution_batch.cp_sharder,
-            global_valid_seqs=context.global_valid_seqs,
-            global_valid_toks=context.global_valid_toks,
-            sampling_params=context.sampling_params,
-            sequence_dim=context.sequence_dim,
-        )
-        if context.mode == "logprobs":
-            context.results[mb_index] = result
-            _free_logits_storage(logits)
-            return result.new_zeros(())
-
-        if mb_index >= context.execution_batch.num_real_microbatches:
-            # Padding must still participate in the schedule's backward pass.
-            result = result * 0
-        context.results[mb_index] = (result.detach(), metrics)
-        if context.mode == "eval":
-            _free_logits_storage(logits)
-            return result.detach()
-        return result * context.loss_scale
+    if mb_index >= context.execution_batch.num_real_microbatches:
+        # Padding must still participate in the schedule's backward pass.
+        result = result * 0
+    context.results[mb_index] = (result.detach(), metrics)
+    if context.mode == "eval":
+        _free_logits_storage(logits)
+        return result.detach()
+    return result * context.loss_scale
 
 
 def _run_schedule_call(
@@ -461,10 +449,6 @@ def broadcast_tensor_from_last_stage(
     """Broadcast the last stage's CUDA tensor with shape and dtype known on every rank."""
     if pipeline.info.has_last_stage:
         buffer = tensor.to(dtype).contiguous()
-        if tuple(buffer.shape) != shape:
-            raise RuntimeError(
-                f"Broadcast tensor has shape {tuple(buffer.shape)}, expected {shape}."
-            )
     else:
         buffer = torch.empty(shape, dtype=dtype, device="cuda")
     torch.distributed.broadcast(
@@ -495,9 +479,6 @@ def release_pipeline_runtime_state(pipeline: AutoPipeline) -> None:
     pipeline.update_seq_len(pipeline.pp_seq_len)
 
 
-LocalParamsFn = Callable[[], Iterator[tuple[str, torch.Tensor]]]
-
-
 @dataclass(frozen=True)
 class _ManifestEntry:
     """One tensor of the full-model stream."""
@@ -515,14 +496,21 @@ class PipelineWeightExporter:
     names and refit dtypes from the local parameter stream.
     """
 
-    def __init__(self, pipeline: AutoPipeline, *, local_params: LocalParamsFn):
+    def __init__(
+        self,
+        pipeline: AutoPipeline,
+        *,
+        local_params: Callable[[], Iterator[tuple[str, torch.Tensor]]],
+    ):
         """Initialize with a factory for this stage's refit parameter stream."""
         self._local_params = local_params
         self._pp_group = pipeline.pp_mesh.get_group()
         self._manifest: Optional[list[_ManifestEntry]] = None
 
-    def _build_manifest(self) -> list[_ManifestEntry]:
-        """List every stage's tensors, in PP rank order."""
+    def manifest(self) -> list[_ManifestEntry]:
+        """The full model's tensors in PP rank order; built once, collectively."""
+        if self._manifest is not None:
+            return self._manifest
         local_entries = [
             (name, tuple(tensor.shape), tensor.dtype)
             for name, tensor in self._local_params()
@@ -543,13 +531,8 @@ class PipelineWeightExporter:
                     )
                 producing_rank[name] = owner_pp_rank
                 manifest.append(_ManifestEntry(name, shape, dtype, owner_pp_rank))
+        self._manifest = manifest
         return manifest
-
-    def manifest(self) -> list[_ManifestEntry]:
-        """The full model's tensors in stream order; built once, collectively."""
-        if self._manifest is None:
-            self._manifest = self._build_manifest()
-        return self._manifest
 
     def refit_info(self) -> dict[str, tuple[torch.Size, torch.dtype]]:
         """Shape and dtype of every streamed tensor, as ``prepare_refit_info``."""

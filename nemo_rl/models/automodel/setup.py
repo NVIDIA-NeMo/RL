@@ -71,7 +71,7 @@ from nemo_rl.models.automodel.config import (
     RuntimeConfig,
 )
 from nemo_rl.models.automodel.pipeline_parallel import (
-    PipelineOutputAdapter,
+    pipeline_loss_fn,
     pipeline_optimizer_part_ids,
 )
 from nemo_rl.models.automodel.router_replay import (
@@ -1212,7 +1212,7 @@ def build_pipeline_config(
 ) -> PipelineConfig:
     """Build a 1F1B schedule with one stage per rank.
 
-    The loss adapter owns gradient scaling. Stage metadata uses the maximum
+    The loss function owns gradient scaling. Stage metadata uses the maximum
     sequence length and FSDP's output dtype for inter-stage activations.
     """
     pipeline_cfg = AutomodelPipelineConfig.model_validate(
@@ -1225,6 +1225,6 @@ def build_pipeline_config(
         pp_batch_size=micro_batch_size * pipeline_cfg.microbatches_per_step,
         dtype=fsdp2_config.mp_policy.output_dtype,
         scale_grads_in_schedule=False,
-        loss_fn=PipelineOutputAdapter(),
+        loss_fn=pipeline_loss_fn,
         pp_seq_len=config["max_total_sequence_length"],
     )

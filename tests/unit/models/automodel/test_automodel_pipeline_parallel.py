@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for Automodel pipeline-parallel batch planning and the loss adapter."""
+"""Unit tests for Automodel pipeline-parallel batch planning and the loss function."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ try:
     from nemo_rl.models.automodel.pipeline_parallel import (
         ExecutionBatch,
         PipelineCallContext,
-        PipelineOutputAdapter,
+        pipeline_loss_fn,
         plan_execution_batches,
     )
     from nemo_rl.models.automodel.train import (
@@ -147,12 +147,11 @@ def test_microbatch_index_maps_sample_ids(first_sample_id, micro_batch_size):
         assert context.microbatch_index(targets[mb_index]) == mb_index
 
 
-def test_adapter_train_returns_backward_scale_and_records_results():
+def test_loss_fn_train_returns_backward_scale_and_records_results():
     context = _context(_execution_batch(0, num_microbatches=2, num_real=1), "train")
-    adapter = PipelineOutputAdapter()
     logits = torch.randn(2, _SEQ_LEN, _VOCAB, requires_grad=True)
 
-    returned = adapter(logits, torch.tensor([0, 1]), context=context)
+    returned = pipeline_loss_fn(logits, torch.tensor([0, 1]), context=context)
     expected = logits.sum() / 48.0
     torch.testing.assert_close(returned, expected * 4.0)
     loss, metrics = context.results[0]
@@ -161,29 +160,29 @@ def test_adapter_train_returns_backward_scale_and_records_results():
     assert metrics["num_valid_samples"] == 2
 
     # A repeated call for the same microbatch overwrites instead of adding.
-    adapter(logits, torch.tensor([0, 1]), context=context)
+    pipeline_loss_fn(logits, torch.tensor([0, 1]), context=context)
     assert set(context.results) == {0}
 
     # Padding microbatches still return a graph for the schedule's backward,
     # but contribute nothing.
-    padding = adapter(logits, torch.tensor([2, 3]), context=context)
+    padding = pipeline_loss_fn(logits, torch.tensor([2, 3]), context=context)
     assert padding.requires_grad
     assert padding.item() == 0.0
     assert context.results[1][0].item() == 0.0
 
 
-def test_adapter_eval_frees_logits():
+def test_loss_fn_eval_frees_logits():
     context = _context(_execution_batch(0, num_microbatches=1, num_real=1), "eval")
     logits = torch.randn(2, _SEQ_LEN, _VOCAB)
     expected = logits.sum() / 48.0
 
-    returned = PipelineOutputAdapter()(logits, torch.tensor([0, 1]), context=context)
+    returned = pipeline_loss_fn(logits, torch.tensor([0, 1]), context=context)
     torch.testing.assert_close(returned, expected)
     torch.testing.assert_close(context.results[0][0], expected)
     assert logits.untyped_storage().size() == 0
 
 
-def test_adapter_logprobs_records_token_logprobs_and_frees_logits():
+def test_loss_fn_logprobs_records_token_logprobs_and_frees_logits():
     execution_batch = _execution_batch(4, num_microbatches=2, num_real=2)
     context = _context(execution_batch, "logprobs")
     logits = torch.randn(2, _SEQ_LEN, _VOCAB)
@@ -193,7 +192,7 @@ def test_adapter_logprobs_records_token_logprobs_and_frees_logits():
     )
     expected = torch.cat([torch.zeros(2, 1), expected.squeeze(-1)], dim=1)
 
-    PipelineOutputAdapter()(logits.clone(), torch.tensor([6, 7]), context=context)
+    pipeline_loss_fn(logits.clone(), torch.tensor([6, 7]), context=context)
     torch.testing.assert_close(context.results[1], expected)
 
 
@@ -226,7 +225,7 @@ def test_build_pipeline_config_sets_nemo_rl_runtime_fields():
     assert pipeline_config.dtype == torch.float32
     assert pipeline_config.scale_grads_in_schedule is False
     assert pipeline_config.pp_seq_len == 128
-    assert isinstance(pipeline_config.loss_fn, PipelineOutputAdapter)
+    assert pipeline_config.loss_fn is pipeline_loss_fn
 
 
 class _Forward(nn.Module):

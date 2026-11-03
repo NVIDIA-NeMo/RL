@@ -79,10 +79,10 @@ NeMo RL-owned fields are:
 | --- | --- | --- |
 | `pp_schedule` | `1F1B` | One stage per PP rank. |
 | `pp_microbatch_size`, `pp_batch_size` | `mbs`, `mbs * M` | One schedule call runs M microbatches. |
-| `scale_grads_in_schedule` | `False` | The loss adapter already applies the non-PP backward scale (Section 4). |
+| `scale_grads_in_schedule` | `False` | The loss function already applies the non-PP backward scale (Section 4). |
 | `pp_seq_len` | `max_total_sequence_length` | Stage shapes are precomputed, so the schedule uses static stage metadata instead of shape inference. |
 | `dtype` | FSDP `output_dtype` (fp32) | Activations between stages carry the mixed-precision output dtype, not the parameter dtype. |
-| `loss_fn` | `PipelineOutputAdapter()` | The RL loss runs on the last stage. |
+| `loss_fn` | `pipeline_loss_fn` | The RL loss runs on the last stage. |
 
 Under 1F1B each rank owns one stage, `AutoPipeline.parts[0]`. Setup treats that stage
 as the model, so `worker.model`, `worker.optimizer`, and `worker.scheduler` are the
@@ -142,14 +142,14 @@ inputs in place, so the stage shapes are set from the input length inside it: th
 shard for the generic round-robin layout, or the full length for models that shard in
 their own forward and describe their local activations through
 `get_pipeline_stage_metas`. The microbatches' canonical data stays unsharded, and the
-loss adapter maps each microbatch's targets and logprobs through the same sharder, which
+loss function maps each microbatch's targets and logprobs through the same sharder, which
 is valid because the layout depends only on the sequence position.
 
-### 4.2 Loss Adapter
+### 4.2 Loss Function
 
-`PipelineOutputAdapter` (`nemo_rl/models/automodel/pipeline_parallel.py`) is the
+`pipeline_loss_fn` (`nemo_rl/models/automodel/pipeline_parallel.py`) is the
 schedule's `loss_fn`. The schedule calls it on the last stage once per microbatch as
-`loss_fn(logits, sample_ids, context=PipelineCallContext)`. The adapter maps the IDs to
+`loss_fn(logits, sample_ids, context=PipelineCallContext)`. It maps the IDs to
 the microbatch they select and calls `post_process_logits`, the same temperature,
 masking, logprob, and loss path the non-PP worker uses. Results are written by
 microbatch index, so an extra call (for example during dynamic metadata inference)
@@ -162,7 +162,7 @@ overwrites instead of double-counting.
 | `logprobs` | zero | token logprobs; the logits storage is freed |
 
 Forward-only calls keep every microbatch's output in the stage's forward cache until
-the next call, so the adapter frees the logits storage after use and the runner calls
+the next call, so the loss function frees the logits storage after use and the runner calls
 `stage.clear_runtime_states()` after each forward-only call.
 
 ### 4.3 Numerics
