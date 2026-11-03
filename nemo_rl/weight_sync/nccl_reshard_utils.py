@@ -580,6 +580,26 @@ def is_blockwise_fp8_param_storage(fp8_cfg: Optional[dict[str, Any]]) -> bool:
     )
 
 
+def _speculative_config_carries_draft_weights(speculative_config: Any) -> bool:
+    """Whether a vLLM speculative_config enables a co-trained draft speculator.
+
+    A ``model`` without ``method`` counts: vLLM can infer the method from the
+    draft checkpoint. ``num_speculative_tokens == 0`` disables speculation.
+    """
+    # Lazy: the vllm package __init__ imports the generation workers.
+    from nemo_rl.models.generation.vllm.speculator_runtime import SPECULATOR_TYPES
+
+    if not isinstance(speculative_config, dict):
+        return False
+    num_tokens = speculative_config.get("num_speculative_tokens")
+    if num_tokens is not None and num_tokens <= 0:
+        return False
+    method = speculative_config.get("method")
+    if method is None:
+        return speculative_config.get("model") is not None
+    return method in SPECULATOR_TYPES
+
+
 def check_nccl_reshard_refit_support(master_config: Any) -> None:
     """Validate ``master_config`` against every precondition of nccl_reshard_refit.
 
@@ -647,6 +667,18 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "explicitly unsupported with refit_transport='nccl_reshard' "
             "(nccl_reshard_refit is its own refit path and does not use "
             "vLLM's reload_weights API)."
+        )
+
+    # nccl_reshard lacks coverage and finalization for draft.* weights.
+    # MTP weights use a separate finalization path.
+    speculative_config = vllm_kwargs.get("speculative_config")
+    if _speculative_config_carries_draft_weights(speculative_config):
+        assert isinstance(speculative_config, dict)
+        violations.append(
+            "policy.generation.vllm_kwargs.speculative_config.method must not be "
+            f"{speculative_config.get('method')!r} "
+            "(nccl_reshard_refit finalizes the target model only; co-trained "
+            "drafter weights would stay partially finalized after every refit)."
         )
 
     # ModelOpt real-quant rollout holds NVFP4-packed vLLM params and refits
@@ -811,9 +843,8 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                 )
 
     # Gen-backend restrictions. The reshard supports gen-side TP, DP, EP, and
-    # Megatron ETP. The vLLM backend shards experts by index across
-    # its TP ranks, so its EP is either 1 (TP-sharded experts) or equal to TP
-    # (EP-sharded). PP is not yet supported gen-side.
+    # Megatron ETP. vLLM experts can span TP and native DP ranks. PP is not yet
+    # supported gen-side.
     if backend == "vllm":
         gen_tp = vllm_cfg.get("tensor_parallel_size", 1)
         gen_ep = vllm_cfg.get("expert_parallel_size", 1)
@@ -827,10 +858,10 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                 "for a vLLM destination with nccl_reshard refit "
                 f"(got {train_etp})."
             )
-        if gen_ep != 1 and gen_ep != gen_tp:
+        if gen_ep > 1 and (gen_tp < 1 or gen_ep % gen_tp != 0):
             violations.append(
-                "policy.generation.vllm_cfg.expert_parallel_size must be 1 or "
-                f"equal to tensor_parallel_size (got ep={gen_ep}, tp={gen_tp})."
+                "policy.generation.vllm_cfg.expert_parallel_size must be a multiple "
+                f"of tensor_parallel_size (got ep={gen_ep}, tp={gen_tp})."
             )
         if gen_pp != 1:
             violations.append(
