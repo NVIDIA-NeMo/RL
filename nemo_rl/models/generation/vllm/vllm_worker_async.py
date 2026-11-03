@@ -78,7 +78,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_token_information_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
     format_prompt_for_vllm_generation,
-    off_policy_sampling_error,
+    check_sampling_param,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
     remap_multimodal_placeholders,
@@ -1187,6 +1187,15 @@ class VllmAsyncGenerationWorkerImpl(
         if engine_client is None:
             raise RuntimeError("The HTTP engine client is not initialized.")
         model_config = self.llm_async_engine_args.create_model_config()
+        # vLLM adds the generation config's EOS to every request's stop set
+        # regardless of the configured stops, so a turn can end on either.
+        model_stop_token_ids = set(self.cfg.get("stop_token_ids") or ())
+        generation_eos_token_ids = model_config.try_get_generation_config().get(
+            "eos_token_id"
+        )
+        if isinstance(generation_eos_token_ids, int):
+            generation_eos_token_ids = [generation_eos_token_ids]
+        model_stop_token_ids |= set(generation_eos_token_ids or ())
         base_model_paths = [
             BaseModelPath(
                 name=model_config.served_model_name, model_path=model_config.model
@@ -1429,6 +1438,10 @@ class VllmAsyncGenerationWorkerImpl(
                     model_prefix_token_ids=model_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
+                    # The template's own EOS must stay countable even when the
+                    # configured stops don't include it.
+                    eos_token_id=model_stop_token_ids
+                    | {self.renderer.tokenizer.eos_token_id},
                 )
                 final_prompt_token_ids = splice.token_ids
                 # Reject overflows before media validation can mask the length error.
@@ -1682,17 +1695,13 @@ class VllmAsyncGenerationWorkerImpl(
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
-            # The request sampling params need to exactly match those as are set in NeMo RL.
-            # If they do not match, the inference will be off policy and destroy training
-            # stability. grpo.validate() is the only caller that constructs a non-train
-            # GenerationSamplingParams, and the validation profile it stamps is accepted.
-            sampling_error = off_policy_sampling_error(
+            # Accept train and validation profiles; reject off-policy requests.
+            check_sampling_param(
                 temperature=request.temperature,
                 top_p=request.top_p,
                 top_k=request.top_k,
                 generation_config=generation_config,
             )
-            assert sampling_error is None, sampling_error
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
             request.top_k = -1
 
@@ -1928,6 +1937,10 @@ class VllmAsyncGenerationWorkerImpl(
         # e.g. last-run middleware.
         app = FastAPI()
 
+        @app.get("/health")
+        async def health() -> dict[str, str]:
+            return {"status": "ok"}
+
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.setup_api_server(app)
@@ -2050,9 +2063,6 @@ class VllmAsyncGenerationWorkerImpl(
     ) -> tuple[RolloutResult, Optional[Any]]:
         """Serve one rollout from this engine: its budget, sampling, generation and result.
 
-        Every path that serves a rollout from this engine calls this, so a rollout
-        step added here runs on all of them.
-
         Args:
             prompt: The vLLM prompt to generate from.
             prompt_token_ids: The learner's prompt tokens, which vLLM must have run.
@@ -2064,6 +2074,8 @@ class VllmAsyncGenerationWorkerImpl(
 
         Returns:
             The result, and vLLM's final RequestOutput (None when no new token fits).
+            The final output supplies finish and usage metadata to Dynamo
+            (``dynamo/native_engine.py``).
         """
         max_new_tokens = self._rollout_max_new_tokens(len(prompt_token_ids))
         if max_new_tokens == 0:

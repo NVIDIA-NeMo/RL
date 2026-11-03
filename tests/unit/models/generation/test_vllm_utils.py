@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import math
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -39,7 +40,7 @@ from nemo_rl.models.generation.vllm.utils import (
     encode_counter_key,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
-    off_policy_sampling_error,
+    check_sampling_param,
     pad_and_align_routed_expert_indices,
     remap_multimodal_placeholders,
 )
@@ -1531,17 +1532,21 @@ def test_remap_multimodal_placeholders_rebuilds_real_vllm_placeholder_range():
         (1.0, 1.0, 5, "Top k sampling parameter"),
     ],
 )
-def test_off_policy_sampling_error(temperature, top_p, top_k, error) -> None:
+def test_check_sampling_param(temperature, top_p, top_k, error) -> None:
     generation_config = {
         "temperature": 1.0,
         "top_p": 1.0,
         "val_temperature": 0.0,
         "val_top_p": 0.9,
     }
-    message = off_policy_sampling_error(
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        generation_config=generation_config,
-    )
-    assert (message is None) if error is None else (error in message)
+    with (
+        contextlib.nullcontext()
+        if error is None
+        else pytest.raises(ValueError, match=error)
+    ):
+        check_sampling_param(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            generation_config=generation_config,
+        )

@@ -981,6 +981,7 @@ def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
             model_name="test-model",
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )["initial_global_config_dict"]
 
     if expected is None:

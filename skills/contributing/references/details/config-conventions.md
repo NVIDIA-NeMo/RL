@@ -1,9 +1,3 @@
----
-name: config-conventions
-description: Configuration conventions for NeMo-RL. YAML is the single source of truth for defaults. Covers BaseModel/TypedDict usage, dataclass for internal classes, exemplar YAML updates, and forbidden default patterns.
-when_to_use: Adding or modifying config fields; reviewing config changes; 'where do I set defaults', 'BaseModel pattern', 'TypedDict pattern', 'dataclass', 'exemplar YAML', 'forbidden default patterns', during code review of config files.
----
-
 # Configuration Conventions
 
 ## Core Rule
@@ -93,7 +87,7 @@ When adding a new config key to a `BaseModel` or `TypedDict` subclass, document:
 - Valid values/types
 - Recommended default (if applicable)
 
-Reflect the default in the exemplar YAMLs under `examples/configs/*.yaml`. If the change affects an exemplar covered by `tests/unit/test_config_v2.py`, also update the matching `tests/unit/reference_configs/*.yaml` so the v1→v2 migration check stays green.
+Reflect the default in every base config YAML under `examples/configs/` (the ones without `defaults:`) that carries the key's block, and update every `tests/unit/reference_configs/*.yaml` whose resolved config gains the key, so the v1→v2 migration check in `tests/unit/test_config_v2.py` stays green. A base config may have no twin of its own: `ppo_math_1B.yaml` feeds `ppo_math_1B_megatron.yaml`.
 
 ## Recipe YAMLs Must Set `defaults`
 
@@ -176,12 +170,9 @@ if "milestones" in scheduler_cfg:
 
 ## Avoid `dict[str, Any]` for Known-Field Config
 
-If a config block has a known set of fields, model it as a `BaseModel` (or, pre-migration, a `TypedDict`) —
-do not type it as `dict[str, Any]` and read keys with `.get(k, default)`. A bare `dict[str, Any]` both loses
-type-safety and pushes per-key defaults to the call site (the Forbidden Pattern above).
+If a config block has a known set of fields, model it as a `BaseModel` (or, pre-migration, a `TypedDict`) — do not type it as `dict[str, Any]` and read keys with `.get(k, default)`. A bare `dict[str, Any]` both loses type-safety and pushes per-key defaults to the call site (the Forbidden Pattern above).
 
-If the block must also pass arbitrary keys through to another system, use `BaseModel(extra="allow")`: the known
-fields get types + centralized defaults, and unknown keys still come through (`model_extra`).
+If the block must also pass arbitrary keys through to another system, use `BaseModel(extra="allow")`: the known fields get types + centralized defaults, and unknown keys still come through (`model_extra`).
 
 **Don't:**
 ```python

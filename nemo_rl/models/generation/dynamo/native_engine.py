@@ -83,7 +83,7 @@ from nemo_rl.models.generation.vllm.request_pipeline import rollout_result_to_wi
 from nemo_rl.models.generation.vllm.utils import (
     chat_generation_tokens,
     chat_routed_experts,
-    off_policy_sampling_error,
+    check_sampling_param,
     remap_multimodal_placeholders,
 )
 
@@ -506,14 +506,15 @@ class NativeVllmEngine(LLMEngine):
         sampling: dict[str, Any] = request.get("sampling_options") or {}
         temperature = _as_f32(sampling.get("temperature"))
         top_p = _as_f32(sampling.get("top_p"))
-        sampling_error = off_policy_sampling_error(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=sampling.get("top_k"),
-            generation_config=self._gym_sampling_profile,
-        )
-        if sampling_error is not None:
-            raise InvalidArgument(sampling_error)
+        try:
+            check_sampling_param(
+                temperature=temperature,
+                top_p=top_p,
+                top_k=sampling.get("top_k"),
+                generation_config=self._gym_sampling_profile,
+            )
+        except ValueError as error:
+            raise InvalidArgument(str(error)) from error
         if (sampling.get("n") or 1) != 1:
             raise InvalidArgument(
                 "NeMo-Gym calls through Dynamo take n=1: engine_data carries one "

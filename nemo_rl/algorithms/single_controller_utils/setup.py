@@ -74,6 +74,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     forest_execution_row_multiple,
     is_ppo_run,
     logprob_passes_required,
+    resolve_ppo_chunk_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -190,6 +191,10 @@ class SingleControllerActorArgs:
     partition_includes_multimodal_fields: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
+    # Whether last_checkpoint_path is a rollout snapshot rather than a trainer
+    # checkpoint. Only a snapshot holds Gym state; a trainer checkpoint never
+    # pauses Gym, so its unfinished turn-level rollouts restart from their tasks.
+    restored_from_rollout_snapshot: bool = False
     # MooncakeStorageUnit actors; empty unless storage_unit_segment_size > 0.
     storage_units: tuple[Any, ...] = ()
     # None when async_rl.generation_fleet_health is disabled; the SingleController
@@ -205,6 +210,8 @@ class SingleControllerActorArgs:
     # the MSE loss it trains under.
     value_handle: Optional[TQValue] = None
     value_loss_fn: Optional[LossFunction] = None
+    ppo_group_multiple: int = 1
+    ppo_min_remaining_groups: int = 0
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -816,6 +823,9 @@ def _spinup_gym(
         enable_router_replay=enable_router_replay,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         policy_api_key=policy_api_key,
+        turn_checkpointing_enabled=(
+            master_config.rollout_recovery.turn_checkpointing_enabled
+        ),
         # Capture transport config includes the generation request's candidate count.
         token_capture=(
             {
@@ -1166,6 +1176,33 @@ def setup_single_controller(
         )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
+    if master_config.rollout_recovery.turn_checkpointing_enabled:
+        if generation_config["backend"] != "vllm":
+            raise NotImplementedError(
+                "rollout_recovery.target_level='turn' currently supports only "
+                "the vllm generation backend; "
+                f"got {generation_config['backend']!r}"
+            )
+        if not should_use_nemo_gym(master_config):
+            raise ValueError(
+                "rollout_recovery.target_level='turn' requires the NeMo-Gym "
+                "rollout path (env.should_use_nemo_gym=true)"
+            )
+        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is None:
+            raise ValueError(
+                "rollout_recovery.target_level='turn' requires "
+                "rollout_checkpointing.snapshot_attempt_interval_s"
+            )
+        if not master_config.token_capture.enabled:
+            raise ValueError(
+                "rollout_recovery.target_level='turn' requires "
+                "token_capture.enabled=true"
+            )
+        if rollout_checkpoint_cfg.restore_mode != "latest":
+            raise ValueError(
+                "rollout_recovery.target_level='turn' requires "
+                "rollout_checkpointing.restore_mode='latest'"
+            )
     if (
         master_config.checkpointing.get("save_data_plane")
         or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
@@ -1723,6 +1760,7 @@ def setup_single_controller(
     megatron_port_holders: list[Any] = []
     reserved_http_server_ports = None
     weight_synchronizer: Optional[WeightSynchronizer] = None
+    ppo_group_multiple, ppo_min_remaining_groups = (1, 0)
     if megatron_backend:
         generation_config["model_name"] = master_config.policy["model_name"]
 
@@ -1744,6 +1782,7 @@ def setup_single_controller(
             A tuple of (TQPolicy trainer, TQValue critic or None, per-phase wall
             times keyed as "trainer_time" and "value_time").
         """
+        nonlocal ppo_group_multiple, ppo_min_remaining_groups
         time_metrics: dict[str, float] = {}
         trainer, time_metrics["trainer_time"] = _build_trainer(
             train_cluster,
@@ -1776,6 +1815,11 @@ def setup_single_controller(
         )
         # Blocks on the critic's async Ray __init__, then parks it on CPU.
         value.finish_training()
+        ppo_group_multiple, ppo_min_remaining_groups = resolve_ppo_chunk_alignment(
+            master_config,
+            trainer.sharding_annotations.get_axis_size("data_parallel"),
+            value.sharding_annotations.get_axis_size("data_parallel"),
+        )
         trainer.prepare_for_training()
         return trainer, value, time_metrics
 
@@ -2215,6 +2259,11 @@ def setup_single_controller(
             create_rollout_reassembler_actors,
         )
 
+        # Set by the resolver only when the think-tag penalty is on.
+        thinking_tags = None
+        if master_config.reward_penalties.penalize_malformed_think_tag:
+            assert resolved_reward_penalty_config is not None
+            thinking_tags = resolved_reward_penalty_config["thinking_tags"]
         finalizer_actors = create_rollout_reassembler_actors(
             dp_config,
             RolloutReassemblerActorConfig(
@@ -2230,6 +2279,12 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
+                tokenizer_config=(
+                    policy_config["tokenizer"]
+                    if master_config.reward_penalties.penalize_malformed_think_tag
+                    else None
+                ),
+                thinking_tags=thinking_tags,
                 top_logprobs=master_config.policy["generation"]["top_logprobs"],
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
@@ -2324,6 +2379,7 @@ def setup_single_controller(
         partition_includes_multimodal_fields=processor is not None,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
+        restored_from_rollout_snapshot=resolved_snapshot is not None,
         finalizer_actors=finalizer_actors,
         storage_units=storage_units,
         advantage_actors=advantage_actors,
@@ -2334,5 +2390,7 @@ def setup_single_controller(
         # PPO extras
         value_handle=value,
         value_loss_fn=value_loss_fn,
+        ppo_group_multiple=ppo_group_multiple,
+        ppo_min_remaining_groups=ppo_min_remaining_groups,
     )
     return actor_args, setup_timing_metrics
