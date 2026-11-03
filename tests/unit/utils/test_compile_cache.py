@@ -11,42 +11,61 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from pathlib import Path
-
 import pytest
 
 from nemo_rl.utils import compile_cache
 
-SCRIPT = Path(__file__).parents[3] / "tools/external_gym_vllm/cache_sync.sh"
 
-
-def test_env_overrides(monkeypatch):
-    monkeypatch.setenv("NRL_VLLM_TRITON_CACHE_DIR", "/local/policy/triton")
-    monkeypatch.setenv("NRL_MEGATRON_TRITON_CACHE_DIR", "/local/megatron/triton")
-    assert compile_cache.env_overrides("VLLM") == {
-        "TRITON_CACHE_DIR": "/local/policy/triton"
-    }
-
-
-def test_seed_is_noop_unless_configured_and_rejects_partial_config(monkeypatch):
-    for var in compile_cache._SEED_VARS:
+@pytest.fixture
+def caches(tmp_path, monkeypatch):
+    for var in ("NRL_COMPILE_CACHE_VLLM_DIR", "NRL_COMPILE_CACHE_FORCE_FRESH"):
         monkeypatch.delenv(var, raising=False)
-    compile_cache.seed("policy")
-    monkeypatch.setenv("NRL_CACHE_SYNC", str(SCRIPT))
+    monkeypatch.setenv(compile_cache.SHARED_VAR, str(tmp_path / "shared"))
+    monkeypatch.setenv(compile_cache.LOCAL_VAR, str(tmp_path / "local"))
+    return tmp_path
+
+
+def test_off_unless_configured_and_rejects_half_config(monkeypatch):
+    monkeypatch.delenv(compile_cache.SHARED_VAR, raising=False)
+    monkeypatch.delenv(compile_cache.LOCAL_VAR, raising=False)
+    assert compile_cache.env_overrides("vllm") == {}
+    compile_cache.seed("vllm")  # no-op
+    monkeypatch.setenv(compile_cache.LOCAL_VAR, "/local")
     with pytest.raises(ValueError):
-        compile_cache.seed("policy")
+        compile_cache.seed("vllm")
 
 
-def test_seed_copies_once_per_node(tmp_path, monkeypatch):
-    (tmp_path / "persistent/policy").mkdir(parents=True)
-    (tmp_path / "persistent/policy/kernel").write_text("compiled")
-    monkeypatch.setenv("NRL_CACHE_SYNC", str(SCRIPT))
-    monkeypatch.setenv("NRL_COMPILE_CACHE_ROOT", str(tmp_path / "persistent"))
-    monkeypatch.setenv("NRL_LOCAL_COMPILE_CACHE", str(tmp_path / "local"))
+def test_env_overrides_default_under_the_local_dir(caches):
+    env = compile_cache.env_overrides("megatron")
+    assert env["TRITON_CACHE_DIR"] == f"{caches}/local/megatron/triton"
+    assert env["TORCHINDUCTOR_CACHE_DIR"] == f"{caches}/local/megatron/inductor"
+    assert compile_cache.vllm_engine_dir(3) == f"{caches}/local/vllm_engines/3"
 
-    compile_cache.seed("policy")
-    local = tmp_path / "local/policy/kernel"
+
+def test_missing_script_raises(caches, monkeypatch):
+    monkeypatch.setenv(compile_cache.SCRIPT_VAR, str(caches / "missing.sh"))
+    with pytest.raises(FileNotFoundError):
+        compile_cache.seed("megatron", background=True)
+
+
+def test_seed_copies_once_per_node_from_the_type_dir(caches, monkeypatch):
+    other = caches / "other_vllm"
+    (other / "vllm").mkdir(parents=True)
+    (other / "vllm/kernel").write_text("compiled")
+    monkeypatch.setenv("NRL_COMPILE_CACHE_VLLM_DIR", str(other))
+
+    compile_cache.seed("vllm")
+    local = caches / "local/vllm/vllm/kernel"
     assert local.read_text() == "compiled"
     local.write_text("changed here")
-    compile_cache.seed("policy")  # already seeded on this node: no copy
+    compile_cache.seed("vllm")  # already seeded on this node: no copy
     assert local.read_text() == "changed here"
+
+
+def test_engine_folder_is_filled_from_the_node_copy(caches):
+    (caches / "shared/vllm/vllm/torch_compile_cache").mkdir(parents=True)
+    (caches / "shared/vllm/vllm/torch_compile_cache/entry").write_text("compiled")
+    engine = compile_cache.vllm_engine_dir(0)
+
+    compile_cache._prepare_vllm_engine_on_this_node(engine)
+    assert (caches / "local/vllm_engines/0/torch_compile_cache/entry").exists()
