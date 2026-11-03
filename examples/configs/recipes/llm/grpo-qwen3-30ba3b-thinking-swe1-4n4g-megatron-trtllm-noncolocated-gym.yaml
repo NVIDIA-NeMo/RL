@@ -69,7 +69,8 @@ policy:
       cuda_graph_config:
         batch_sizes: [1, 2, 4, 8, 16, 32, 64]
     colocated:
-      enabled: false
+      # enabled is already false in the base; only the split differs.
+      # 2 nodes x 4 GPUs for generation, leaving 8 GPUs for training.
       resources:
         gpus_per_node: 4
         num_nodes: 2
