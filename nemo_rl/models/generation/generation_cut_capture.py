@@ -84,9 +84,8 @@ class _RequestCaptureState:
     call: Any
     prompt_token_ids: list[int]
     # Backend-owned opaque state that must survive until the terminal row is
-    # staged. vLLM uses this for its processed-media snapshot; prefix recovery
-    # is currently setup-guarded to text-only, but ordinary terminal capture
-    # still shares this lifecycle container.
+    # staged. vLLM uses this for its processed-media snapshot; the first
+    # generation-prefix row carries its tensor digests across recovery.
     media: Any | None = None
     resumed_generation_token_ids: list[int] = field(default_factory=list)
     effective_output_limit: int | None = None
@@ -192,6 +191,14 @@ class _CompletedCaptureState:
     terminal_finish_reason: Literal["stop", "length"] | None
     terminal_stop_reason: str | int | None
     completed_at_monotonic: float
+
+
+@dataclass(frozen=True)
+class _ResolvedGenerationCut:
+    """A verified restored prefix and the media its call carried."""
+
+    snapshot: Any
+    media: Any | None = None
 
 
 def _remaining_generation_limits_after_prefix(
@@ -303,6 +310,17 @@ class GenerationCutCaptureMixin:
     _restored_generation_prefix_tokens: int
     _generation_cut_counts: dict[str, int]
 
+    def _generation_cut_record_payload(
+        self, state: _RequestCaptureState
+    ) -> dict[str, Any] | None:
+        """Return the backend's extras for a call's first generation-prefix row.
+
+        Text-only hosts have none; the vLLM worker overrides this with media
+        metadata.
+        """
+        del state
+        return None
+
     def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
         with self._capture_registry_lock:
             state = self._capture_calls.pop(id(request), None)
@@ -360,16 +378,42 @@ class GenerationCutCaptureMixin:
             f"{type(self).__name__} cannot read generation progress for a cut"
         )
 
-    def _resolve_generation_cut(
-        self, admission: Any, prefix_token_ids: list[int]
-    ) -> Any:
-        """Fetch an admission's staged prefix chunks and rebuild the cumulative prefix."""
-        continuation = admission.generation_cut
+    def _fetch_generation_cut_chunks(self, continuation: Any) -> list[Any]:
+        """Fetch the staged chunks named by a ``GenerationCutContinuation``, in order."""
         # Gym requires at least one staging key per continuation.
         staging_keys = list(continuation.staging_keys)
-        snapshots = self._staging_source.fetch(staging_keys)
-        if len(snapshots) != len(staging_keys):
+        # The finalization read also returns each row's extras, which carry a
+        # media call's spans and tensor digests; plain ``fetch`` does not.
+        chunks = self._staging_source.fetch_for_finalization(staging_keys)
+        if len(chunks) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
+        if not chunks:
+            raise RuntimeError("generation-cut continuation has no staged chunks")
+        return chunks
+
+    def _resolve_generation_cut(
+        self,
+        admission: Any,
+        prefix_token_ids: list[int],
+        chunks: list[Any] | None = None,
+    ) -> Any:
+        """Rebuild the cumulative prefix from an admission's staged chunks.
+
+        ``chunks`` are the already-fetched chunks, so a restore that also reads
+        their media fetches once; they are fetched here when omitted.
+        """
+        continuation = admission.generation_cut
+        if chunks is None:
+            chunks = self._fetch_generation_cut_chunks(continuation)
+        snapshots = [chunk.snapshot for chunk in chunks]
+        # A media call's spans and tensor digests ride the first chunk's extras,
+        # and the advertised prefix digest covers them.
+        extras_by_chunk = [chunk.extras for chunk in chunks]
+        if any(extras is not None for extras in extras_by_chunk[1:]):
+            raise RuntimeError(
+                "only the first generation-cut chunk may carry call extras"
+            )
+        extras = extras_by_chunk[0]
         weight_versions = [snapshot.weight_version for snapshot in snapshots]
         if weight_versions != sorted(weight_versions):
             raise RuntimeError(
@@ -429,8 +473,8 @@ class GenerationCutCaptureMixin:
             token_ids_delta=token_ids_delta,
             token_mask_delta=token_mask_delta,
             generation_log_probs_delta=generation_logprobs_delta,
-            extras=None,
-            extras_digest=compute_extras_digest(None),
+            extras=extras,
+            extras_digest=compute_extras_digest(extras),
             chain_hash=compute_chain_hash(admission.parent_chain_hash, token_ids_delta),
             cumulative_hash=hash_token_ids(prefix_token_ids + token_ids_delta),
         )
@@ -459,23 +503,35 @@ class GenerationCutCaptureMixin:
         )
         return snapshot
 
+    def _restore_generation_cut_media(self, chunks: list[Any]) -> Any | None:
+        """Rebuild a restored call's media from its fetched prefix chunks.
+
+        Text-only hosts have none; the vLLM worker overrides this.
+        """
+        del chunks
+        return None
+
     def _resolve_usable_generation_cut(
         self, admission: Any, prefix_token_ids: list[int]
-    ) -> tuple[Any, Any | None]:
+    ) -> tuple[Any, _ResolvedGenerationCut | None]:
         """Resolve an admission's restored prefix, or drop it so the call regenerates.
 
         Gym has already consumed the restored cut when it sends this call, and
         generating the whole response from the turn boundary is always valid,
-        so a prefix that cannot be fetched or does not match its admission
-        costs time, not the rollout. Returns the admission to serve and the
-        verified prefix snapshot, or the admission without its cut and None.
+        so a prefix that cannot be fetched, whose media cannot be restored,
+        or that does not match its admission costs time, not the rollout.
+        Returns the admission to serve and the verified prefix with its media,
+        or the admission without its cut and None.
         """
         continuation = admission.generation_cut
         if continuation is None:
             return admission, None
         try:
+            # One fetch serves both the media and the prefix.
+            chunks = self._fetch_generation_cut_chunks(continuation)
+            media = self._restore_generation_cut_media(chunks)
             snapshot = GenerationCutCaptureMixin._resolve_generation_cut(
-                self, admission, prefix_token_ids
+                self, admission, prefix_token_ids, chunks
             )
             # Checked here, before the prefix is spliced into the prompt; Gym's
             # begin_call repeats it and would otherwise fail the call.
@@ -487,7 +543,7 @@ class GenerationCutCaptureMixin:
                     f"rebuilt prefix has {generated} generated tokens, "
                     f"admission expects {continuation.prefix_token_count}"
                 )
-            return admission, snapshot
+            return admission, _ResolvedGenerationCut(snapshot=snapshot, media=media)
         except Exception:  # noqa: BLE001 - any unusable prefix regenerates
             LOGGER.warning(
                 "cannot restore the generation prefix of model call %s; "
@@ -793,11 +849,13 @@ class GenerationCutCaptureMixin:
                 )
             staged_key = None
             try:
+                extras = self._generation_cut_record_payload(state)
                 cumulative_record = capture.build_prefix_record(
                     state.call,
                     prompt_token_ids=state.prompt_token_ids,
                     generated_token_ids=generated_token_ids,
                     generated_logprobs=generated_logprobs,
+                    extras=extras,
                 )
                 if chunk_token_ids:
                     chunk_record = (
