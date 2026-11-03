@@ -211,8 +211,8 @@ rollout, set `rollout_checkpointing.trace: true`. The controller then appends on
 JSON line per event to `rollout_trace.jsonl` in the log directory. Events are
 queued as they happen and a background thread writes them, so tracing never
 blocks the controller; a run that is killed loses only the last few
-milliseconds of events. Every line has the wall-clock time `t`, a `run` ID
-that is new for each process, and `event`.
+milliseconds of events. Every line has the
+wall-clock time `t`, a `run` ID that is new for each process, and `event`.
 
 | Event | Written by | Fields besides `t`, `run` and `event` |
 |---|---|---|
@@ -221,8 +221,9 @@ that is new for each process, and `event`.
 | `attempt_abandoned` | Recovery ledger | as above, plus `reason`: `dropped`, `failed`, `cancelled` (for example, by the run ending) or `restart`, and `whole_group` when prompt-group recovery threw the whole group away |
 | `attempt_resumed` | Recovery ledger, on restart | as above; `environment_attempt` is the environment's next attempt |
 | `group_sealed`, `group_discarded` | Recovery ledger | `group_id`, `prompt_id` |
-| `group_published` | Finalizer commit | `group_id`; with token capture, `tokens_by_version`: the tokens its trained calls generated, by the weight version each call began on |
+| `group_published` | Finalizer commit | `group_id`; with token capture, `tokens_by_version`: trained tokens summed by the version each call began on, and `calls`: `[model_call_id, version it began on, tokens it generated]` for the calls a refit paused, which are left out of the sums |
 | `step_trained` | Train pump | `step`, `trainer_version`, `trained_version` (the policy version the step updated), `group_ids` |
+| `refit_cut` | Weight sync, while generation is paused (token capture with vLLM) | `weight_version` being replaced, `calls`: `[model_call_id, tokens generated so far]` per running captured call |
 | `weights_synced` | Weight sync | `weight_version` |
 | `trainer_checkpoint_published` | Snapshotter | `step` |
 | `snapshot_published` | Snapshotter | `path`, `step`, `trainer_version`, `cut_time` (when the saved state was captured) |
@@ -245,8 +246,12 @@ token and training on it, comes from the same file:
 python -m nemo_rl.algorithms.rollout_checkpointing.trace <log_dir>/rollout_trace.jsonl
 ```
 
-Each call's tokens count under the version the call began on, so a call that
-runs across a refit counts as slightly older than it is.
+Each call's tokens count under the version it began on until a `refit_cut`, and
+under the version the following `weights_synced` installed from there on, so a
+call that runs across a refit is split exactly. vLLM reports each running call's
+token count from its output-processor request state, which has no public API; a
+backend that does not report it counts every token of a call under the version
+the call began on.
 
 ## Rules for New Code
 
