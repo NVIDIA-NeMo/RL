@@ -137,10 +137,13 @@ class _RequestCaptureState:
     engine_request_id: str | None = None
     # Full-sequence routes from the request's final output.
     terminal_routed_experts: torch.Tensor | None = None
-    # The engine's route pieces joined so far, and how many pieces they cover:
-    # a cut converts only the pieces vLLM appended since. Cut-path only.
-    engine_routes: torch.Tensor | None = None
+    # The engine's route pieces joined so far: a buffer that doubles when
+    # full, its filled rows, how many pieces they cover, and the last of them.
+    # A cut copies only the pieces vLLM appended since. Cut-path only.
+    engine_route_buffer: np.ndarray | None = None
+    engine_route_rows: int = 0
     engine_route_piece_count: int = 0
+    engine_route_last_piece: Any = None
     # Backend-owned opaque state that must survive until the terminal row is
     # staged. vLLM uses this for its processed-media snapshot; the first
     # generation-prefix row carries its tensor digests across recovery.
@@ -231,40 +234,71 @@ class _RequestCaptureState:
         )
 
     def absorb_engine_route_pieces(self, pieces: list[Any]) -> torch.Tensor:
-        """Join the engine's route pieces, converting only the new ones.
+        """Copy the engine's new route pieces into this call's route buffer.
 
         ``pieces`` is the request's whole route list as vLLM holds it. vLLM
-        only appends to it, so the pieces already joined are skipped and the
-        new ones are joined in one call. Returns the request's full-sequence
-        routes.
+        only appends to it and never replaces a piece, so the pieces already
+        joined are skipped and only the new ones are copied, into a buffer
+        that doubles when full: a cut costs the rows decoded since the last
+        one, not the request's history. Returns the request's full-sequence
+        routes as a view of the buffer; rows already returned are never
+        written again. The buffer follows the engine, not the cuts, so a
+        rolled-back cut does not rewind it.
 
         Raises:
-            ValueError: the list shrank, or a piece is not
-                ``[rows, layers, topk]`` with this request's model dimensions.
+            ValueError: the list shrank, a joined piece was replaced, or a new
+                piece is not integer ``[rows, layers, topk]`` with this
+                request's model dimensions.
         """
-        if len(pieces) < self.engine_route_piece_count:
+        covered = self.engine_route_piece_count
+        if len(pieces) < covered:
             raise ValueError(
-                "vLLM's route list shrank: "
-                f"{len(pieces)} pieces, {self.engine_route_piece_count} already joined"
+                f"vLLM's route list shrank: {len(pieces)} pieces, {covered} already joined"
             )
-        new = pieces[self.engine_route_piece_count :]
-        if new:
-            # One concatenate instead of one conversion per piece; it raises
-            # ValueError if the pieces' dimensions disagree.
-            joined = torch.from_numpy(np.concatenate([np.asarray(p) for p in new]))
-            if joined.dim() != 3 or joined.shape[1] < 1 or joined.shape[2] < 1:
-                raise ValueError("vLLM route pieces must be [rows, layers, topk]")
-            if self.engine_routes is not None:
-                if tuple(joined.shape[1:]) != tuple(self.engine_routes.shape[1:]):
-                    raise ValueError("vLLM route pieces changed model dimensions")
-                joined = torch.cat(
-                    (self.engine_routes, joined.to(self.engine_routes.dtype))
+        if covered and pieces[covered - 1] is not self.engine_route_last_piece:
+            raise ValueError("vLLM replaced a route piece that was already joined")
+        if len(pieces) > covered:
+            new = [np.asarray(piece) for piece in pieces[covered:]]
+            shape = tuple(new[0].shape[1:])
+            if (
+                len(shape) != 2
+                or min(shape) < 1
+                or any(
+                    piece.ndim != 3
+                    or tuple(piece.shape[1:]) != shape
+                    or piece.dtype.kind not in "iu"
+                    for piece in new
                 )
-            self.engine_routes = joined
+            ):
+                raise ValueError(
+                    "vLLM route pieces must be integer [rows, layers, topk]"
+                )
+            buffer = self.engine_route_buffer
+            if buffer is not None and tuple(buffer.shape[1:]) != shape:
+                raise ValueError("vLLM route pieces changed model dimensions")
+            added = np.concatenate(new, axis=0)
+            rows = self.engine_route_rows + len(added)
+            if buffer is None or rows > len(buffer):
+                # Doubling keeps the total copying linear in the request's length.
+                capacity = rows if buffer is None else max(rows, 2 * len(buffer))
+                grown = np.empty(
+                    (capacity, *shape),
+                    dtype=torch.empty((), dtype=self.routed_experts_dtype)
+                    .numpy()
+                    .dtype,
+                )
+                if buffer is not None:
+                    grown[: self.engine_route_rows] = buffer[: self.engine_route_rows]
+                buffer = grown
+            buffer[self.engine_route_rows : rows] = added
+            # Commit only after every check and copy has succeeded.
+            self.engine_route_buffer = buffer
+            self.engine_route_rows = rows
             self.engine_route_piece_count = len(pieces)
-        if self.engine_routes is None:
+            self.engine_route_last_piece = pieces[-1]
+        if self.engine_route_buffer is None:
             raise ValueError("vLLM has not routed any token of the request yet")
-        return self.engine_routes
+        return torch.from_numpy(self.engine_route_buffer[: self.engine_route_rows])
 
     def frozen_cut_routed_experts(
         self, engine_routed_experts: Any | None
