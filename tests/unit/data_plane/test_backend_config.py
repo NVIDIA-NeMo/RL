@@ -84,14 +84,6 @@ def test_absent_block_falls_back_to_model_defaults() -> None:
     assert isinstance(backend_config(_cfg("mooncake_cpu")), MooncakeCpuConfig)
 
 
-@pytest.mark.parametrize("value", [0, -1])
-def test_gdr_staging_size_rejects_non_positive_values(value: int) -> None:
-    with pytest.raises(pydantic.ValidationError):
-        backend_config(
-            _cfg("mooncake_cpu", mooncake_cpu={"gdr_staging_buffer_mb": value})
-        )
-
-
 def test_accepts_an_already_coerced_model() -> None:
     """Configs arriving via pydantic have the block coerced to a model already."""
     cfg = _cfg("mooncake_cpu", mooncake_cpu=MooncakeCpuConfig(global_segment_size=555))

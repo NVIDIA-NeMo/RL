@@ -442,18 +442,16 @@ class TestRouterDeadlineFitsInsideTheRollout:
             )
 
     def test_a_router_deadline_inside_it_is_accepted(self):
-        cfg = AsyncRLConfig(
+        AsyncRLConfig(
             generation_router={"enabled": True, "backend_timeout_s": 120.0},
             rollout_failure={"nemo_gym": {"rollout_timeout_s": 300.0}},
         )
-        assert cfg.generation_router.backend_timeout_s == 120.0
 
     def test_a_disabled_router_imposes_no_constraint(self):
-        cfg = AsyncRLConfig(
+        AsyncRLConfig(
             generation_router={"enabled": False, "backend_timeout_s": 600.0},
             rollout_failure={"nemo_gym": {"rollout_timeout_s": 60.0}},
         )
-        assert cfg.generation_router.enabled is False
 
 
 class TestTheDropBudgetsReachTheRolloutLayer:

@@ -33,7 +33,9 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
 )
+from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
+from nemo_rl.algorithms.opd import get_opd_full_config
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
@@ -48,7 +50,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
 )
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
 from nemo_rl.models.megatron.zero_train_gen_mismatch import (
-    validate_batch_invariant_mode,
+    validate_zero_train_gen_kl,
 )
 from nemo_rl.utils.config import (
     load_config_with_inheritance,
@@ -336,9 +338,11 @@ def _check_single_controller_config(config: DictConfig) -> None:
     config_dict = OmegaConf.to_container(config, resolve=True)
     if "async_rl" not in config_dict:
         pytest.skip("Not a SingleController config")
-    validate_single_controller_config(
-        SingleControllerMasterConfig.model_validate(config_dict)
-    )
+    # Validate the SingleController config
+    master_config = SingleControllerMasterConfig.model_validate(config_dict)
+    validate_single_controller_config(master_config)
+    # Validate the ClippedPGLossFn against the OPD full config
+    ClippedPGLossFn(master_config.loss_fn, opd_full=get_opd_full_config(master_config))
 
 
 def _check_nccl_reshard_refit_support(config: DictConfig) -> None:
@@ -349,14 +353,18 @@ def _check_nccl_reshard_refit_support(config: DictConfig) -> None:
     check_nccl_reshard_refit_support(SimpleNamespace(policy=config_dict["policy"]))
 
 
-def _check_batch_invariant_mode(config: DictConfig) -> None:
+def _check_zero_train_gen_kl(config: DictConfig) -> None:
     config_dict = OmegaConf.to_container(config, resolve=True)
     policy = config_dict.get("policy") or {}
-    if not (policy.get("megatron_cfg") or {}).get("batch_invariant_mode"):
-        pytest.skip("batch_invariant_mode is not enabled")
-    validate_batch_invariant_mode(policy).raise_if_invalid(
-        "batch_invariant_mode=True failed validation:"
-    )
+    megatron_cfg = policy.get("megatron_cfg") or {}
+    if not (
+        megatron_cfg.get("zero_train_gen_mismatch")
+        or megatron_cfg.get("batch_invariant_mode")
+    ):
+        pytest.skip(
+            "Neither zero_train_gen_mismatch nor batch_invariant_mode is enabled"
+        )
+    validate_zero_train_gen_kl(policy, check_environment=False)
 
 
 @pytest.mark.parametrize("config_file", full_config_files)
@@ -385,8 +393,8 @@ def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
             _check_single_controller_config(deepcopy(config))
         with subtests.test(check="nccl_reshard_refit_support"):
             _check_nccl_reshard_refit_support(deepcopy(config))
-        with subtests.test(check="batch_invariant_mode"):
-            _check_batch_invariant_mode(deepcopy(config))
+        with subtests.test(check="zero_train_gen_kl"):
+            _check_zero_train_gen_kl(deepcopy(config))
 
 
 @pytest.mark.parametrize(
