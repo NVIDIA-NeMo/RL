@@ -201,6 +201,56 @@ def reject_outdated_dynamo_router_reset_states(config: dict[str, Any]) -> None:
         )
 
 
+def reject_outdated_context_compaction(config: dict[str, Any]) -> None:
+    """Reject the old forest-training switch before schema validation."""
+    capture = config.get("token_capture")
+    if isinstance(capture, dict) and "context_compaction" in capture:
+        raise ValueError(
+            "token_capture.context_compaction was renamed to "
+            "token_capture.forest_training. Rename the key, keeping its value; "
+            "selection_policy=returned_history preserves the existing behavior."
+        )
+
+
+# Removed rollout_recovery key -> the key that replaced it.
+_RENAMED_ROLLOUT_RECOVERY_KEYS = {
+    "default_granularity": "target_level",
+    "task_granularity_overrides": "task_source_target_level_overrides",
+    "task_source_granularity_overrides": "task_source_target_level_overrides",
+    "agent_granularity_overrides": "agent_target_level_overrides",
+}
+
+
+def reject_outdated_rollout_recovery_granularity(config: dict[str, Any]) -> None:
+    """Fail when rollout_recovery still uses the *_granularity keys.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    rollout_recovery = config.get("rollout_recovery")
+    if not isinstance(rollout_recovery, dict):
+        return
+
+    removed = sorted(_RENAMED_ROLLOUT_RECOVERY_KEYS.keys() & rollout_recovery.keys())
+    if not removed:
+        return
+
+    renames = ", ".join(
+        f"rollout_recovery.{key} -> rollout_recovery.{_RENAMED_ROLLOUT_RECOVERY_KEYS[key]}"
+        for key in removed
+    )
+    message = (
+        f"rollout_recovery no longer accepts {removed!r}. Rename them ({renames}); "
+        f"the values ('sibling', 'prompt_group') are unchanged."
+    )
+    if "task_granularity_overrides" in removed:
+        message += (
+            " task_granularity_overrides was keyed by task name; its replacement is "
+            "keyed by extra_env_info.task_source."
+        )
+    raise ValueError(message)
+
+
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -218,3 +268,5 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_metric_name_format(config)
     reject_outdated_mcore_generation_keys(config)
     reject_outdated_dynamo_router_reset_states(config)
+    reject_outdated_context_compaction(config)
+    reject_outdated_rollout_recovery_granularity(config)

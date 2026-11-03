@@ -121,6 +121,24 @@ def test_pretrainable_tool_output_accepts_only_inline_images():
         )
 
 
+@pytest.mark.parametrize("source", ["https://example.com/result", "file:///tmp/result"])
+def test_text_tool_output_preserves_initial_images(monkeypatch, source):
+    from nemo_rl.environments import nemo_gym_multimodal
+
+    resolve_to_image = nemo_gym_multimodal.resolve_to_image
+
+    def reject_text_source(image_source):
+        assert image_source != source, "a text tool output must not be resolved"
+        return resolve_to_image(image_source)
+
+    monkeypatch.setattr(nemo_gym_multimodal, "resolve_to_image", reject_text_source)
+    output = [{"type": "function_call_output", "output": source}, _assistant([1])]
+    assert _extract_input_images_from_message(output[0]) == []
+    assert not _has_image_before_first_trainable_output(output)
+    per_turn = _index_per_turn_images(output, input_messages=[_user(_image((2, 2)))])
+    assert [[image.size for image in turn] for turn in per_turn] == [[(2, 2)]]
+
+
 def test_index_per_turn_images_bins_images():
     output = [
         _user(_image((2, 2))),

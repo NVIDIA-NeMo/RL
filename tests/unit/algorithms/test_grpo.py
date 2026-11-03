@@ -14,6 +14,7 @@
 
 import math
 import os
+import warnings
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -43,6 +44,7 @@ from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     RewardScalingConfig,
     _advantage_valid_mask,
+    _apply_async_sample_masks,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
@@ -774,6 +776,102 @@ class TestMaskSampleFilter:
         )
 
 
+class TestAsyncSampleMasks:
+    def test_overlapping_masks_attributed_once_and_legacy_count_kept(self):
+        # Row 0: kept. Row 1: zero loss multiplier and mask_sample.
+        # Row 2: truncated and mask_sample. Row 3: mask_sample only.
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.0, 0.5, 1.0]),
+                "truncated": [False, False, True, False],
+                "mask_sample": torch.tensor([False, True, True, True]),
+            }
+        )
+
+        metrics, num_mask_sample_filtered = _apply_async_sample_masks(
+            repeated_batch, overlong_filtering=True
+        )
+
+        assert torch.equal(
+            repeated_batch["loss_multiplier"],
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        )
+        assert metrics == {
+            "num_masked_seqs_by_loss_multiplier": 1,
+            "num_masked_seqs_by_overlong_filtering": 1,
+            "num_masked_seqs_by_rollout": 1,
+            "num_masked_seqs_total": 3,
+        }
+        # Legacy metric keeps its overlap-inclusive meaning.
+        assert num_mask_sample_filtered == 3
+
+    def test_overlong_filtering_disabled_keeps_truncated_rows(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5]),
+                "truncated": torch.tensor([True, True]),
+            }
+        )
+
+        metrics, num_mask_sample_filtered = _apply_async_sample_masks(
+            repeated_batch, overlong_filtering=False
+        )
+
+        assert torch.equal(repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5]))
+        assert metrics["num_masked_seqs_by_overlong_filtering"] == 0
+        assert metrics["num_masked_seqs_total"] == 0
+        assert num_mask_sample_filtered == 0
+
+    def test_legacy_count_only_counts_mask_sample(self):
+        # Non-Gym rollouts carry no mask_sample; truncation must not leak into
+        # the legacy num_mask_sample_filtered count.
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "truncated": torch.tensor([True, False]),
+            }
+        )
+
+        metrics, num_mask_sample_filtered = _apply_async_sample_masks(
+            repeated_batch, overlong_filtering=True
+        )
+
+        assert metrics["num_masked_seqs_by_overlong_filtering"] == 1
+        assert num_mask_sample_filtered == 0
+
+    def test_overlong_filtering_requires_truncated(self):
+        repeated_batch = BatchedDataDict({"loss_multiplier": torch.tensor([1.0])})
+
+        with pytest.raises(KeyError, match="truncated"):
+            _apply_async_sample_masks(repeated_batch, overlong_filtering=True)
+
+    def test_rejects_misaligned_mask(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "mask_sample": torch.tensor([True, False, True]),
+            }
+        )
+
+        with pytest.raises(ValueError, match="mask_sample has 3 rows; expected 2"):
+            _apply_async_sample_masks(repeated_batch, overlong_filtering=False)
+
+    def test_keeps_historical_timer_labels(self):
+        timer = Timer()
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0]),
+                "truncated": torch.tensor([False]),
+            }
+        )
+
+        _apply_async_sample_masks(repeated_batch, overlong_filtering=False, timer=timer)
+
+        timing = timer.get_timing_metrics("sum")
+        assert "overlong_filter" in timing
+        assert "mask_sample_filter" in timing
+
+
 class TestBaselineValidMask:
     def test_excludes_mask_sample_and_zero_loss_multiplier_rows(self):
         repeated_batch = BatchedDataDict(
@@ -1098,6 +1196,7 @@ def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
         "sampler_dispatch_index": None,
         # None unless adaptive-ppo-clip is on.
         "cur_adaptive_ppo_clip_k": None,
+        "next_nemo_gym_task_index": 0,
     }
     assert "total_valid_tokens" not in loaded_state
     assert not hasattr(save_state, "val:accuracy")
@@ -1108,6 +1207,7 @@ def test_grpo_save_state_checkpoint_round_trip():
     save_state.current_step = 4
     save_state.total_steps = 4
     save_state.total_valid_tokens = 128
+    save_state.next_nemo_gym_task_index = 123
     save_state.val_reward = 0.8
     setattr(save_state, "val:accuracy", 0.8)
 
@@ -1116,6 +1216,7 @@ def test_grpo_save_state_checkpoint_round_trip():
     assert restored_state.current_step == 4
     assert restored_state.total_steps == 4
     assert restored_state.total_valid_tokens == 128
+    assert restored_state.next_nemo_gym_task_index == 123
     assert restored_state.val_reward == 0.8
     assert not hasattr(restored_state, "val:accuracy")
 
@@ -2671,6 +2772,112 @@ def test_initial_refit_completes_before_async_collection_starts(
         )
 
     assert events[:3] == ["refit", "set_weight_version", "start_collection"]
+
+
+def test_async_grpo_logs_per_reason_sample_mask_metrics(
+    mock_grpo_components,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.grpo.overlong_filtering = True
+    master_config.env["should_log_nemo_gym_responses"] = True
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["truncated"] = torch.tensor([True])
+    mock_batch["mask_sample"] = torch.tensor([True])
+
+    with mock_async_grpo_infrastructure(
+        mock_batch,
+        {"mean_gen_tokens_per_sample": 2.0},
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    train_data = mock_grpo_components["policy"].train.call_args.args[0]
+    assert train_data["sample_mask"].tolist() == [0.0]
+
+    metrics = _logged_train_metrics_with_key(
+        mock_grpo_components["logger"],
+        "num_masked_seqs_by_overlong_filtering",
+    )
+    assert metrics["num_masked_seqs_by_loss_multiplier"] == 0
+    assert metrics["num_masked_seqs_by_overlong_filtering"] == 1
+    assert metrics["num_masked_seqs_by_rollout"] == 0
+    assert metrics["num_masked_seqs_by_logprob_error"] == 0
+    assert metrics["num_masked_seqs_total"] == 1
+    # Legacy metric is retained with its overlap-inclusive meaning: the row is
+    # attributed to overlong filtering but is still counted as mask_sample.
+    assert metrics["num_mask_sample_filtered"] == 1
+    assert "num_masked_seqs_by_empty_response_output" not in metrics
+
+
+def test_async_grpo_folds_logprob_error_masks_into_sample_mask_total(
+    mock_grpo_components,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.grpo.overlong_filtering = True
+    master_config.env["should_log_nemo_gym_responses"] = True
+
+    # The row survives every pre-training reason and is then masked for
+    # logprob error.
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["truncated"] = torch.tensor([False])
+    mock_batch["mask_sample"] = torch.tensor([False])
+    seq_logprob_error_result = {
+        **_mock_seq_logprob_error_result(),
+        "num_masked_seqs": 1,
+    }
+
+    with mock_async_grpo_infrastructure(
+        mock_batch,
+        {"mean_gen_tokens_per_sample": 2.0},
+        seq_logprob_error_result=seq_logprob_error_result,
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    metrics = _logged_train_metrics_with_key(
+        mock_grpo_components["logger"], "num_masked_seqs_total"
+    )
+    assert metrics["num_masked_seqs_by_overlong_filtering"] == 0
+    assert metrics["num_masked_seqs_by_rollout"] == 0
+    assert metrics["num_masked_seqs_by_logprob_error"] == 1
+    assert metrics["num_masked_seqs_total"] == 1
 
 
 def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> None:
@@ -4458,7 +4665,10 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
     assert master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"] == {}
 
 
-def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> None:
+@pytest.mark.parametrize("configured_gym_log_dir", [None, "logs/nemo_gym"])
+def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(
+    monkeypatch, configured_gym_log_dir
+) -> None:
     from nemo_rl.algorithms import grpo as grpo_mod
 
     repo_root = Path(__file__).resolve().parents[3]
@@ -4482,6 +4692,10 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         "num_nodes": 1,
     }
     config["env"]["should_use_nemo_gym"] = True
+    if configured_gym_log_dir is not None:
+        config["env"].setdefault("nemo_gym", {})["nemo_gym_log_dir"] = (
+            configured_gym_log_dir
+        )
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
     tokenizer.eos_token_id = 1
@@ -4536,7 +4750,9 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     synchronizer = MagicMock()
     nemo_gym_shard_set = MagicMock()
     build_nemo_gym_actors = MagicMock(return_value=nemo_gym_shard_set)
-    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: MagicMock())
+    dummy_logger = MagicMock()
+    dummy_logger.base_log_dir = "/tmp/grpo-test-results"
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: dummy_logger)
     monkeypatch.setattr(
         grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
     )
@@ -4567,7 +4783,9 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
 
     dataset = MagicMock()
     dataset.__len__.return_value = 2
-    result = setup(master_config, tokenizer, dataset, None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = setup(master_config, tokenizer, dataset, None)
 
     train_cluster, inference_cluster = cluster_instances
     assert train_cluster.kwargs["bundle_ct_per_node_list"] == [4]
@@ -4578,6 +4796,21 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     assert inference_cluster.kwargs["node_resource_constraints"] is None
     assert result[1].dp_openai_server_base_urls == ["http://dynamo-wrapper.example/v1"]
     assert result[2] is nemo_gym_shard_set
+    assert master_config.env["nemo_gym"]["nemo_gym_log_dir"] == (
+        "/tmp/grpo-test-results/nemo_gym"
+    )
+    log_dir_warnings = [
+        str(warning.message)
+        for warning in caught
+        if "nemo_gym_log_dir" in str(warning.message)
+    ]
+    if configured_gym_log_dir is None:
+        assert log_dir_warnings == []
+    else:
+        # A configured log dir is still replaced, but no longer silently.
+        assert len(log_dir_warnings) == 1
+        assert "'logs/nemo_gym'" in log_dir_warnings[0]
+        assert "'/tmp/grpo-test-results/nemo_gym'" in log_dir_warnings[0]
     dynamo_config = dynamo_init.call_args.kwargs["config"]
     assert dynamo_init.call_args.kwargs["cluster"] is inference_cluster
     assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
@@ -4589,6 +4822,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
         # Only the vLLM backend generates a bearer token for its HTTP server.
         policy_api_key=None,
     )
@@ -4842,6 +5076,8 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
     from nemo_rl.algorithms import grpo as grpo_mod
 
     class DummyLogger:
+        base_log_dir = "/tmp/grpo-test-results"
+
         def log_hyperparams(self, *_args, **_kwargs):
             pass
 
@@ -4995,6 +5231,8 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     from nemo_rl.algorithms import grpo as grpo_mod
 
     class DummyLogger:
+        base_log_dir = "/tmp/grpo-test-results"
+
         def log_hyperparams(self, *_args, **_kwargs):
             pass
 
@@ -5113,6 +5351,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
         # A TensorRT-LLM server checks no bearer token on its OpenAI routes.
         policy_api_key=None,
     )
@@ -5466,6 +5705,62 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
 
     checkpointer.begin_finalization.assert_called_once()
     checkpointer.shutdown.assert_called_once()
+
+
+def test_grpo_train_without_epoch_limit_cycles_until_max_num_steps(
+    mock_grpo_components, tmp_path
+):
+    """max_num_epochs=None keeps cycling the dataloader until max_num_steps."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.checkpoint_dir = tmp_path
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_epochs = None
+    master_config.grpo.max_num_steps = 3
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.checkpointing["enabled"] = False
+
+    single_batch_dataloader = MagicMock(spec=StatefulDataLoader)
+    single_batch_dataloader.__iter__ = lambda self: iter([mock_batch])
+    single_batch_dataloader.__len__ = MagicMock(return_value=1)
+    single_batch_dataloader.state_dict = MagicMock(return_value={})
+
+    with (
+        _patched_logprob_phase(policy),
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+        patch("nemo_rl.algorithms.grpo.refit_policy_generation", return_value={}),
+    ):
+        grpo_mod.grpo_train(
+            policy,
+            _mock_policy_generation(),
+            single_batch_dataloader,
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert policy.train.call_count == 3
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
@@ -7876,6 +8171,59 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         if masked_position:
             assert math.isfinite(result["max_seq_mult_prob_error"])
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+    @pytest.mark.parametrize("field", ["prev_logprobs", "generation_logprobs"])
+    @pytest.mark.parametrize("threshold", [None, 1.1])
+    def test_pooled_nonfinite_error_is_owner_local(
+        self, bad: float, field: str, threshold: float | None
+    ) -> None:
+        train_data = self._create_train_data(
+            4,
+            3,
+            torch.zeros(4, 3),
+            torch.zeros(4, 3),
+            sample_mask=torch.tensor([1.0, 1.0, 1.0, 0.0]),
+        )
+        train_data[field][0, 1] = bad
+        train_data[field][3] = torch.nan
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data,
+            torch.ones(4),
+            threshold,
+            row_owner=torch.tensor([7, 7, 12, -1]),
+        )
+        keep = float(threshold is None)
+        assert train_data["sample_mask"].tolist() == [keep, keep, 1.0, 0.0]
+        assert result["num_masked_seqs"] == (0 if threshold is None else 2)
+        if threshold is not None:
+            assert result["max_seq_mult_prob_error_after_mask"] == 1.0
+
+    @pytest.mark.parametrize("filtering_on", [False, True])
+    def test_pooled_filtering_uses_only_supported_token_counts(
+        self, filtering_on: bool
+    ) -> None:
+        train_data = self._create_train_data(
+            3,
+            4,
+            torch.zeros(3, 4),
+            torch.zeros(3, 4),
+            token_mask=torch.tensor([[0, 1, 1, 1], [0, 1, 0, 0], [0, 1, 1, 1]]),
+        )
+        train_data["generation_logprobs"][0, 1:] = -torch.inf
+        train_data["generation_logprobs"][1, 1] = -math.log(1.2)
+        original_token_mask = train_data["token_mask"].clone()
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data,
+            torch.ones(3),
+            1.1,
+            filtering_on=filtering_on,
+            row_owner=torch.tensor([0, 0, 1]),
+        )
+        # Unsupported tokens cannot dilute the remaining token's error to 0.3.
+        assert train_data["sample_mask"].tolist() == [0.0, 0.0, 1.0]
+        assert result["num_masked_seqs"] == 2
+        torch.testing.assert_close(train_data["token_mask"], original_token_mask)
+
     @pytest.mark.parametrize("threshold", [None, 2.0])
     def test_support_filtered_tokenless_rows_are_excluded(self, threshold):
         train_data = self._create_train_data(
@@ -7967,6 +8315,28 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert torch.allclose(train_data["sample_mask"], expected_mask), (
             "Should mask sequences 2 and 3"
         )
+
+    def test_masked_count_is_rows_for_fractional_sample_mask(self):
+        """Masked count is a row count, not the sum of fractional mask weights."""
+        batch_size, seq_length = 3, 10
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs[1:, 1:5] = 1.0
+        train_data = self._create_train_data(
+            batch_size,
+            seq_length,
+            prev_logprobs,
+            generation_logprobs,
+            sample_mask=torch.tensor([1.0, 0.5, 0.5]),
+        )
+
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, torch.tensor([1.0, 1.0, 0.0]), seq_logprob_error_threshold=1.2
+        )
+
+        assert result["num_masked_seqs"] == 2
+        assert result["masked_correct_pct"] == 0.5
+        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 0.0]))
 
     def test_no_sequences_masked_when_all_below_threshold(self):
         """Test that no sequences are masked when all are below threshold."""
@@ -8817,6 +9187,7 @@ def test_tq_rollout_and_trainer_masked_rewards(
     actor.policy_generation = None
     actor.tokenizer = components["tokenizer"]
     actor.task_to_env = components["task_to_env"]
+    actor.per_token_multimodal_fields = ()
     actor._dp_client = MagicMock()
     meta, carry, rollout_metrics, _ = actor.rollout_to_tq(
         batch, partition_id="train", group_size=4
@@ -8960,6 +9331,7 @@ def _tq_actor_rollout(
     actor.policy_generation = None
     actor.tokenizer = components["tokenizer"]
     actor.task_to_env = components["task_to_env"]
+    actor.per_token_multimodal_fields = ()
     actor._dp_client = MagicMock()
     meta, carry, rollout_metrics, _ = actor.rollout_to_tq(
         batch, partition_id="train", group_size=group_size

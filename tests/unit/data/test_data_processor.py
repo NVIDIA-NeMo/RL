@@ -96,6 +96,9 @@ def test_nemo_gym_data_processor_without_task_data_spec():
     assert result["idx"] == 3
     assert result["task_name"] == "nemo_gym"
     assert result["length"] == 0
+    # Placeholder token_ids must share the dtype of real tokenizer output so a
+    # mixed still-image/video Gym batch can be collated.
+    assert result["message_log"][0]["token_ids"].dtype == torch.long
 
 
 @pytest.mark.parametrize(
