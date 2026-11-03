@@ -135,8 +135,6 @@ class TrtllmGeneration(GenerationInterface):
         # under disaggregation a replica is several engines, and overloading
         # "dp" to mean engines is what makes the two concepts collide.
         self.dp_size = self.num_replicas
-        # The fleet the refit communicators were last built over.
-        self._refit_membership: Any = None
         self.num_engines = len(self._engine_tps)
 
         # GPUs held by the widest single engine; see
@@ -1005,7 +1003,7 @@ class TrtllmGeneration(GenerationInterface):
         return futures
 
     def set_refit_membership(self, membership: Any) -> None:
-        """Record the fleet the refit communicators were built over.
+        """Check the refit fleet covers every replica.
 
         TRT-LLM replicas cannot drop out of a refit today; a membership that
         excludes a shard is rejected rather than silently loading a subset.
@@ -1015,7 +1013,6 @@ class TrtllmGeneration(GenerationInterface):
                 f"TRT-LLM refit needs every replica: membership has "
                 f"{len(membership.shard_prefixes)} of {self.dp_size} shards"
             )
-        self._refit_membership = membership
 
     def rebuild_collective(
         self, membership: Any, ip: str, port: int

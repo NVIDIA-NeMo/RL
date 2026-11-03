@@ -17,7 +17,9 @@
 MoE branch (``_load_weights_impl_v2``). This loads the same received expert
 stacks into a real TRT-LLM model both ways and compares every expert parameter
 bit for bit, so a TRT-LLM bump that changes the loader fails here instead of
-silently loading different weights.
+silently loading different weights. It runs once per supported model type: their
+mappers differ, e.g. only Qwen3.5's ``preprocess_weights`` takes
+``allow_partial_loading``.
 """
 
 import json
@@ -32,7 +34,6 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
 ]
 
-_PREFIX = "model.language_model.layers.0.mlp.experts"
 _NUM_EXPERTS, _HIDDEN, _INTER = 16, 2048, 512
 _EP_SIZE = 2
 _LOCAL_EXPERTS = _NUM_EXPERTS // _EP_SIZE
@@ -102,7 +103,52 @@ def _write_tiny_qwen35_moe_vl_config(path):
     return path
 
 
-def _extension_on_tiny_model(tmp_path, ep_rank):
+def _write_tiny_qwen3_moe_config(path):
+    """One-layer Qwen3 MoE: its mapper keeps the base ``preprocess_weights``."""
+    config = {
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "model_type": "qwen3_moe",
+        "torch_dtype": "bfloat16",
+        "attention_bias": False,
+        "decoder_sparse_step": 1,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": _HIDDEN,
+        "intermediate_size": _INTER,
+        "max_position_embeddings": 4096,
+        "mlp_only_layers": [],
+        "moe_intermediate_size": _INTER,
+        "norm_topk_prob": True,
+        "num_attention_heads": 32,
+        "num_experts": _NUM_EXPERTS,
+        "num_experts_per_tok": 4,
+        "num_hidden_layers": 1,
+        "num_key_value_heads": 4,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1e6,
+        "tie_word_embeddings": False,
+        "vocab_size": 1024,
+    }
+    (path / "config.json").write_text(json.dumps(config))
+    return path
+
+
+# model type -> (config writer, mapper architecture, expert prefix on the wire)
+_MODELS = {
+    "qwen3_5_moe": (
+        _write_tiny_qwen35_moe_vl_config,
+        "Qwen3_5MoeForConditionalGeneration",
+        "model.language_model.layers.0.mlp.experts",
+    ),
+    "qwen3_moe": (
+        _write_tiny_qwen3_moe_config,
+        "Qwen3MoeForCausalLM",
+        "model.layers.0.mlp.experts",
+    ),
+}
+
+
+def _extension_on_tiny_model(tmp_path, model_type, ep_rank):
     """An NcclExtension over one EP rank of a real BF16 TRT-LLM model, on one GPU.
 
     The rank's model holds only its own expert slots. Attention DP and
@@ -120,7 +166,8 @@ def _extension_on_tiny_model(tmp_path, ep_rank):
 
     from nemo_rl.models.generation.trtllm.trtllm_backend import NcclExtension
 
-    pretrained = load_pretrained_config(str(_write_tiny_qwen35_moe_vl_config(tmp_path)))
+    write_config, architecture, _ = _MODELS[model_type]
+    pretrained = load_pretrained_config(str(write_config(tmp_path)))
     model_config = ModelConfig(
         pretrained_config=pretrained,
         mapping=Mapping(
@@ -133,8 +180,9 @@ def _extension_on_tiny_model(tmp_path, ep_rank):
         ),
     )
     model = AutoModelForCausalLM.from_config(model_config).to("cuda")
-    mapper = AutoCheckpointMapper.get("HF", "Qwen3_5MoeForConditionalGeneration")
-    # Bound to the VLM wrapper, as the engine leaves it before the first reload.
+    mapper = AutoCheckpointMapper.get("HF", architecture)
+    # For Qwen3.5, bound to the VLM wrapper, as the engine leaves it before the
+    # first reload.
     mapper.init_model_and_config(model, model_config)
     # ModelLoader.reload only reads these two attributes of the loader.
     model_loader = SimpleNamespace(
@@ -177,18 +225,20 @@ def _received_stacks(generator):
 @pytest.mark.parametrize(
     "ep_rank", range(_EP_SIZE), ids=lambda r: f"ep{_EP_SIZE}_rank{r}"
 )
+@pytest.mark.parametrize("model_type", sorted(_MODELS))
 def test_direct_expert_load_matches_model_loader_reload(
-    tmp_path, monkeypatch, ep_rank, split_by_projection
+    tmp_path, monkeypatch, model_type, ep_rank, split_by_projection
 ):
     monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", "ALLGATHER")
-    ext, model, mapper, reload = _extension_on_tiny_model(tmp_path, ep_rank)
+    ext, model, mapper, reload = _extension_on_tiny_model(tmp_path, model_type, ep_rank)
+    prefix = _MODELS[model_type][2]
     # The reshard delivers exactly this rank's experts, in slot order.
     expert_ids = list(range(ep_rank * _LOCAL_EXPERTS, (ep_rank + 1) * _LOCAL_EXPERTS))
     generator = torch.Generator(device="cuda").manual_seed(0)
 
     def converted_batches(stacks):
         batches = [
-            ext._convert_received_experts(_PREFIX, projection, expert_ids, stack)
+            ext._convert_received_experts(prefix, projection, expert_ids, stack)
             for projection, stack in stacks.items()
         ]
         if split_by_projection:
@@ -220,7 +270,7 @@ def test_direct_expert_load_matches_model_loader_reload(
     assert initial
     assert all(p.shape[0] == _LOCAL_EXPERTS for p in initial.values())
 
-    # Direct first, while the mapper is still bound to the wrapper.
+    # Direct first, while a Qwen3.5 mapper is still bound to the wrapper.
     load(weights, direct=True)
     direct = expert_params()
     load(other_weights, direct=False)
