@@ -153,9 +153,11 @@ automodel = [
   "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "apache-tvm-ffi==0.1.11",
   "nemo-automodel[moe]",
-  # Keep AutoModel's existing TileLang versions independent of Megatron's pin.
-  "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "tilelang==0.1.12; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  # Automodel's FLA kernels require this TileLang version on Hopper, and
+  # tile-kernels 1.0.0 (V4.1 Sinkhorn) cannot import with TileLang 0.1.12
+  # (deepseek-ai/TileKernels#24). Keep this scoped to the automodel fork;
+  # vLLM requires TileLang 0.1.12.
+  "tilelang==0.1.11; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
