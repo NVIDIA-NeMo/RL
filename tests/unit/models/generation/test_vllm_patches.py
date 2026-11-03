@@ -794,24 +794,129 @@ def test_compact_capturer_patch_composes_with_router_fallback_and_is_idempotent(
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("required", [False, True])
 @pytest.mark.parametrize(
     "old,new",
     [
         ("num_layers = model_config.get_total_num_hidden_layers()", "num_layers = 8"),
+        (
+            "num_layers, _, num_experts_per_tok = _get_routed_experts_shape",
+            "_, num_layers, num_experts_per_tok = _get_routed_experts_shape",
+        ),
+        (
+            "num_layers, num_experts, num_experts_per_tok = _get_routed_experts_shape",
+            "num_experts, num_layers, num_experts_per_tok = _get_routed_experts_shape",
+        ),
+        (
+            "                max_num_batched_tokens,",
+            "                max_num_batched_tokens + 1,",
+        ),
         ("                max_num_slots,", "                max_num_slots + 1,"),
+        (
+            "self.dp_rank = vllm_config.parallel_config.data_parallel_rank",
+            "self.dp_rank = 0",
+        ),
+        ("ctx = get_forward_context()", "ctx = get_forward_context_v2()"),
         ("if layer_id >= self.device_buffer.shape[1]:", "if layer_id > 5:"),
+        (
+            "self.device_buffer[:token_num_per_dp, layer_id, :]",
+            "self.device_buffer[:token_num_per_dp, layer_id + 1, :]",
+        ),
     ],
 )
 def test_compact_capturer_patch_refuses_unknown_source_without_writing(
-    compact_capturer_source, old, new
-):
-    content = compact_capturer_source.read_text().replace(old, new)
+    compact_capturer_source: Path,
+    caplog: pytest.LogCaptureFixture,
+    old: str,
+    new: str,
+    required: bool,
+) -> None:
+    original = compact_capturer_source.read_text()
+    assert original.count(old) == 1
+    content = original.replace(old, new, 1)
     compact_capturer_source.write_text(content)
-    with pytest.raises(RuntimeError, match="Could not apply compact routed-experts"):
+    if required:
+        with pytest.raises(
+            RuntimeError, match="Could not apply compact routed-experts"
+        ):
+            patches._patch_vllm_routed_experts_compact_layers(
+                logging.getLogger(__name__), required=True
+            )
+    else:
+        with caplog.at_level(logging.WARNING):
+            assert not patches._patch_vllm_routed_experts_compact_layers(
+                logging.getLogger(__name__)
+            )
+        assert "Could not apply compact routed-experts" in caplog.text
+    assert compact_capturer_source.read_text() == content
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("failure", ["duplicate_resolver", "invalid_syntax"])
+def test_compact_capturer_patch_validates_source_before_writing(
+    compact_capturer_source: Path, failure: str
+) -> None:
+    content = compact_capturer_source.read_text()
+    if failure == "duplicate_resolver":
+        resolver = next(
+            node
+            for node in ast.parse(content).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_get_routed_experts_shape"
+        )
+        content += "\n" + ast.get_source_segment(content, resolver) + "\n"
+        expected_cause = ValueError
+    else:
+        content += "\ndef invalid(:\n"
+        expected_cause = SyntaxError
+    compact_capturer_source.write_text(content)
+
+    with pytest.raises(
+        RuntimeError, match="Could not apply compact routed-experts"
+    ) as error:
         patches._patch_vllm_routed_experts_compact_layers(
             logging.getLogger(__name__), required=True
         )
+    assert isinstance(error.value.__cause__, expected_cause)
     assert compact_capturer_source.read_text() == content
+
+
+@pytest.mark.parametrize("version", ["0.30.1.dev0", "0.30.1rc0", "0.31.0"])
+@pytest.mark.parametrize("required", [False, True])
+def test_compact_capturer_patch_rejects_newer_vllm_before_opening_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    version: str,
+    required: bool,
+) -> None:
+    source = tmp_path / "routed_experts_capturer.py"
+    source.write_text("# Original capture source\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+    vllm_module = types.ModuleType("vllm")
+    vllm_module.__version__ = version
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    message = (
+        f"vLLM {version} detected; this patch was verified against "
+        "0.29.0 and 0.30.0 only"
+    )
+
+    if required:
+        with pytest.raises(RuntimeError) as error:
+            patches._patch_vllm_routed_experts_compact_layers(
+                logging.getLogger(__name__), required=True
+            )
+        assert message in str(error.value)
+        assert isinstance(error.value.__cause__, ValueError)
+    else:
+        with caplog.at_level(logging.WARNING):
+            assert not patches._patch_vllm_routed_experts_compact_layers(
+                logging.getLogger(__name__)
+            )
+        assert message in caplog.text
+
+    assert source.read_text() == "# Original capture source\n"
+    assert not source.with_suffix(".py.patch_lock").exists()
 
 
 @pytest.mark.vllm
@@ -1184,6 +1289,36 @@ def test_apply_vllm_patches_raises_when_nemotron_h_fp32_lm_head_patch_fails(
 
     with pytest.raises(RuntimeError, match="could not be applied"):
         patches._apply_vllm_patches("py", nemotron_h_fp32_lm_head=True)
+
+
+@pytest.mark.parametrize("require_capture", [False, True])
+@pytest.mark.parametrize("version", ["0.30.0", "0.30.1.dev0"])
+def test_apply_vllm_patches_rejects_incompatible_capture_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    require_capture: bool,
+    version: str,
+) -> None:
+    _install_fake_vllm_modules(monkeypatch)
+    monkeypatch.setattr(sys.modules["vllm"], "__version__", version, raising=False)
+    compact_patch = patches._patch_vllm_routed_experts_compact_layers
+    _stub_non_fp32_vllm_patches(monkeypatch, [])
+    monkeypatch.setattr(
+        patches, "_patch_vllm_routed_experts_compact_layers", compact_patch
+    )
+    source = tmp_path / "routed_experts_capturer.py"
+    source.write_text("# Unrecognized capture implementation\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    if require_capture:
+        with pytest.raises(
+            RuntimeError, match="Could not apply compact routed-experts"
+        ):
+            patches._apply_vllm_patches("py", require_moe_routed_experts_capture=True)
+    else:
+        patches._apply_vllm_patches("py", require_moe_routed_experts_capture=False)
+        assert not source.with_suffix(".py.patch_lock").exists()
+    assert source.read_text() == "# Unrecognized capture implementation\n"
 
 
 @pytest.mark.parametrize("require_capture", [False, True])

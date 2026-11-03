@@ -18,6 +18,8 @@ from contextlib import contextmanager
 from importlib.util import find_spec
 from typing import TYPE_CHECKING
 
+from packaging.version import Version as PkgVersion
+
 if TYPE_CHECKING:
     import torch
 
@@ -1312,6 +1314,14 @@ def _patch_vllm_routed_experts_compact_layers(
         file_to_patch = _get_vllm_file(
             "model_executor/layers/fused_moe/routed_experts_capturer.py"
         )
+        # Keep vLLM optional until its installed capture source is requested.
+        from vllm import __version__ as vllm_version
+
+        if PkgVersion(vllm_version) >= PkgVersion("0.30.1.dev0"):
+            raise ValueError(
+                f"vLLM {vllm_version} detected; this patch was verified against "
+                "0.29.0 and 0.30.0 only"
+            )
         with _locked_file_patch(file_to_patch) as (content, write_back):
             patched = _compact_routed_experts_capturer_source(content)
             compile(patched, file_to_patch, "exec")
