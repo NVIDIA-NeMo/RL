@@ -25,10 +25,15 @@ For an **already prepared** environment, the native registry can use system Pyth
 
 ```bash
 export NEMO_RL_PY_EXECUTABLES_SYSTEM=1
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 # uv selects this existing interpreter; it does not resolve the workspace again.
 uv run --no-project --python /path/to/prepared/python --no-sync run_cua.py \
   --config configs/cua_smoke.yaml osworld.setup_cache=/writable/setup_cache
 ```
+
+When starting Ray yourself, also set `RAY_ENABLE_UV_RUN_RUNTIME_ENV=0` before
+launching the driver, matching the repository's `ray.sub`. NeMo RL manages its
+worker environments; Ray's automatic uv hook must stay disabled.
 
 This mode requires the repository, AutoModel, Gym and `research/logra` to be
 importable in that interpreter on every node. It does not install dependencies.

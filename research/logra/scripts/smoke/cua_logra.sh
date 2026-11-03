@@ -25,6 +25,8 @@ fi
 : "${OSWORLD_ROOT:?Set the external model/data root}"
 : "${OSWORLD_CREDENTIAL_FILE:?Set the private sandbox credential file}"
 : "${CUA_OUTPUT_DIR:?Use a fresh output directory outside the source tree}"
+# Match ray.sub: NeMo RL manages its worker environments.
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 uv run --locked --project ../.. --extra automodel --extra nemo_gym python \
   run_cua.py --config configs/cua_smoke.yaml "$@"
 

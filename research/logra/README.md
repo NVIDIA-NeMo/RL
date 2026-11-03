@@ -34,7 +34,7 @@ in `research/logra`; NeMo RL and AutoModel core code are unchanged.
 
 Follow the repository's [Docker](../../docs/docker.md) and
 [cluster](../../docs/cluster.md) setup. This project targets NeMo RL main
-`26e2b802` and the AutoModel backend (`policy.automodel_cfg`).
+`4080612d` and the AutoModel backend (`policy.automodel_cfg`).
 
 ```bash
 # From the repository root.
