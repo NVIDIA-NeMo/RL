@@ -31,6 +31,8 @@ policy:
     enabled: true
     model_name: AngelSlim/Qwen3-1.7B_eagle3
     loss_weight: 1.0
+    # Single-pass draft training; the -ttt3 recipe covers multi-pass TTT.
+    ttt_steps: 1
   generation:
     vllm_kwargs:
       speculative_config:

@@ -77,7 +77,7 @@ policy:
 ```
 
 > [!NOTE]
-> This config enables online draft training on the Megatron backend; it does not support context parallelism yet. Set `policy.megatron_cfg.enabled=true`, `policy.automodel_cfg.enabled=false`, and `policy.megatron_cfg.context_parallel_size=1`. Sequence packing (`policy.sequence_packing.enabled=true`) is supported. For the Automodel backend, see the [Automodel speculative decoding guide](automodel-speculative-decoding.md).
+> This config enables online draft training on the Megatron backend; it does not support context parallelism yet. Set `policy.megatron_cfg.enabled=true`, `policy.automodel_cfg.enabled=false`, and `policy.megatron_cfg.context_parallel_size=1`. Sequence packing (`policy.sequence_packing.enabled=true`) is supported for single-pass training (`policy.draft.ttt_steps=1`); see [Multi-pass TTT](#multi-pass-ttt) for its requirements. For the Automodel backend, see the [Automodel speculative decoding guide](automodel-speculative-decoding.md).
 
 ## How It Works
 
@@ -166,12 +166,39 @@ $$
 
 where `lambda` is `policy.draft.loss_weight`.
 
+### Multi-pass TTT
+
+The single pass above only trains the first speculative position: at serving time the drafter's later tokens are conditioned on its own earlier outputs, which a single pass never sees. With `policy.draft.ttt_steps: K` (`K > 1`), the draft runs `K` sequential passes per step, one per speculative depth. Pass `d`:
+
+- takes the previous pass's pre-norm hidden state as input, without detaching it, so the pass-`d` loss also trains the earlier passes
+- uses the input embeddings shifted `d` positions left
+- attends causally to the pass-1 keys and values plus the same-anchor keys of passes `2..d`
+- shifts RoPE positions by `d - 1`, matching where vLLM places the `d`-th speculative token
+- is trained against the teacher distribution `d` positions ahead
+
+Pass `d`'s soft cross-entropy is weighted by `policy.draft.ttt_step_loss_decay ** (d - 1)` (uniform at the default `1.0`), and the sum is normalized by the same weighting of the per-pass valid-token counts, so `train/draft_loss` stays a per-token average; `train/draft_loss_pass_{d}` reports each pass. (The Automodel path instead sums the per-step averages.) Setting `ttt_steps` to `num_speculative_tokens` gives every served speculative position a training pass.
+
+```yaml
+policy:
+  draft:
+    enabled: true
+    ttt_steps: 3
+  megatron_cfg:
+    sequence_parallel: false
+  sequence_packing:
+    enabled: false
+```
+
+Multi-pass TTT additionally requires `policy.megatron_cfg.sequence_parallel=false`, `policy.sequence_packing.enabled=false`, flash-attn 2.7 or later 2.x, and the batched `train()` path (the single-controller split train step rejects `ttt_steps > 1`). `ttt_steps` defaults to `3` (shared with the Automodel path), so set `ttt_steps: 1` explicitly for the single-pass path described above, including any config that uses sequence packing.
+
 ## Important Knobs
 
 - `policy.draft.enabled`: attach and train the Eagle draft model
 - `policy.draft.speculator_type`: which speculator implementation to build. Currently pinned to `eagle3`, which is also the default, so configs that predate this key keep working unchanged; it exists as the extension point for future speculators (DFlash/DSpark)
 - `policy.draft.model_name`: checkpoint used to initialize the draft model
 - `policy.draft.loss_weight`: weight on the auxiliary draft loss
+- `policy.draft.ttt_steps`: number of TTT draft passes (default `3`); `1` is single-pass training, `> 1` enables [Multi-pass TTT](#multi-pass-ttt)
+- `policy.draft.ttt_step_loss_decay`: non-negative per-pass loss decay for `ttt_steps > 1`; pass `d` is weighted by `ttt_step_loss_decay ** (d - 1)` (default `1.0`, uniform)
 - `policy.generation.vllm_kwargs.speculative_config.model`: draft checkpoint used by the vLLM drafter
 - `policy.generation.vllm_kwargs.speculative_config.draft_tensor_parallel_size`: tensor parallelism used by the drafter inside vLLM
 - `policy.generation.vllm_kwargs.speculative_config.num_speculative_tokens`: number of speculative tokens proposed by vLLM
@@ -184,4 +211,4 @@ where `lambda` is `policy.draft.loss_weight`.
   `total_loss` is only emitted when the draft loss wrapper is active.
 - Resume checkpoints include the nested draft model state when `policy.draft.enabled=true`.
 - If speculative decoding is enabled without trainer-owned draft weights, vLLM must load real draft weights at startup. When the trainer owns the draft model, the first refit pushes both policy and draft parameters.
-- Online draft training supports `policy.sequence_packing.enabled=true`; it does not currently support `policy.megatron_cfg.context_parallel_size > 1`, and the packed path additionally requires `policy.megatron_cfg.pipeline_model_parallel_size = 1`.
+- Single-pass online draft training (`policy.draft.ttt_steps=1`) supports `policy.sequence_packing.enabled=true`; it does not currently support `policy.megatron_cfg.context_parallel_size > 1`, and the packed path additionally requires `policy.megatron_cfg.pipeline_model_parallel_size = 1`.
