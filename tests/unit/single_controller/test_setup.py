@@ -93,7 +93,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
-from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.utils.config import (
@@ -157,6 +157,7 @@ def _make_master_config(
     """
     generation_config: dict = {
         "backend": backend,
+        "top_logprobs": 0,
         "colocated": {"enabled": colocated, "resources": {}},
     }
     policy_config: dict = {
@@ -762,6 +763,84 @@ def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_cont
     )
 
 
+def test_generation_top_logprobs_requires_capture():
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.policy["generation"].update(
+        top_logprobs=4, temperature=1.0, top_p=1.0, top_k=None
+    )
+    with pytest.raises(ValueError, match="token_capture.enabled"):
+        validate_single_controller_config(mc)
+    mc.token_capture.enabled = True
+    validate_single_controller_config(mc)
+
+
+def test_token_capture_top_logprobs_rejects_megatron_generation():
+    mc = _make_master_config(
+        backend="megatron",
+        megatron_enabled=True,
+        loss_cfg=ClippedPGLossConfig(score_centering=True),
+    )
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = 4
+    with pytest.raises(ValueError, match="vllm generation backend"):
+        validate_single_controller_config(mc)
+
+
+def test_score_centering_requires_top_logprobs_and_unfiltered_sampling():
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+
+    with pytest.raises(ValueError, match="policy.generation.top_logprobs > 0"):
+        validate_single_controller_config(mc)
+
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = 4
+    mc.policy["generation"]["vllm_kwargs"] = {"max_logprobs": 4}
+    mc.policy["generation"]["top_p"] = 0.9
+    mc.policy["generation"]["temperature"] = 1.0
+    mc.policy["generation"]["top_k"] = None
+    with pytest.raises(ValueError, match="unfiltered sampling"):
+        validate_single_controller_config(mc)
+
+    mc.policy["generation"]["top_p"] = 1.0
+    validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize(
+    "temperature,mode,valid",
+    [
+        (1.0, None, True),
+        (1.0, "raw_logprobs", True),
+        (0.7, None, False),
+        (0.7, "raw_logprobs", False),
+        (0.7, "processed_logprobs", True),
+        (1.3, "processed_logprobs", True),
+        (0.0, "processed_logprobs", False),
+        (-1.0, "processed_logprobs", False),
+        (float("nan"), "processed_logprobs", False),
+        (float("inf"), "processed_logprobs", False),
+        (1.0, "raw_logits", False),
+        (1.0, "processed_logits", False),
+    ],
+)
+@pytest.mark.parametrize("source", ["vllm_cfg", "vllm_kwargs"])
+def test_score_centering_validates_sampler_distribution(
+    temperature, mode, valid, source
+):
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = 4
+    generation = mc.policy["generation"]
+    generation.update(
+        temperature=temperature, top_p=1.0, top_k=None, vllm_kwargs={"max_logprobs": 4}
+    )
+    generation.setdefault(source, {})["logprobs_mode"] = mode
+    if valid:
+        validate_single_controller_config(mc)
+    else:
+        with pytest.raises(ValueError, match="score_centering requires"):
+            validate_single_controller_config(mc)
+
+
 @pytest.mark.parametrize(
     ("reference_policy_kl_penalty", "expected_init_reference_model"),
     [(0.0, False), (0.01, True)],
@@ -847,7 +926,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
         "++data_plane.simple.num_storage_units=2",
         "++data_plane.claim_meta_poll_interval_s=0.5",
         "++token_capture.enabled=true",
-        "++rollout_recovery.default_granularity=prompt_group",
+        "++rollout_recovery.target_level=prompt_group",
         "++async_rl.sampler.name=in_order",
         "++async_rl.sampler.max_lookahead_versions=1",
         "++async_rl.min_groups_for_streaming_train=4",
@@ -871,8 +950,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     assert master_config.checkpointing["save_data_plane"] is True
     assert master_config.token_capture.enabled is True
     assert (
-        master_config.rollout_recovery.default_granularity
-        is RecoveryGranularity.PROMPT_GROUP
+        master_config.rollout_recovery.target_level is RecoveryTargetLevel.PROMPT_GROUP
     )
     assert master_config.async_rl.rollout_failure.native.generation_timeout_s is None
     assert master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s == 120
@@ -1005,15 +1083,12 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
-    def test_capture_rejects_malformed_thinking_reward_penalty(self, patched_factories):
+    def test_capture_allows_malformed_thinking_reward_penalty(self, patched_factories):
         mc = _make_master_config()
         mc.env["should_use_nemo_gym"] = True
         mc.token_capture.enabled = True
         mc.reward_penalties = RewardPenaltyConfig(penalize_malformed_think_tag=True)
-        with pytest.raises(
-            ValueError, match="does not support.*penalize_malformed_think_tag"
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_capture_allows_text_and_token_penalties_without_warning(
         self, patched_factories
@@ -1275,6 +1350,124 @@ class TestSetup:
         with pytest.raises(ValueError, match="supports training-claim ownership"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_periodic_checkpointing_does_not_enable_gym_participants(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+
+        with patch.object(
+            sc_setup_mod,
+            "build_nemo_gym_actors",
+            return_value=MagicMock(),
+        ) as mock_spinup:
+            sc_setup_mod._spinup_gym(
+                mc,
+                ["http://generation"],
+                MagicMock(name="tokenizer"),
+                policy_api_key=None,
+            )
+
+        assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
+
+    def test_turn_recovery_requires_periodic_snapshots(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.token_capture.enabled = True
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+
+        with pytest.raises(
+            ValueError,
+            match="target_level='turn' requires.*snapshot_attempt_interval_s",
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    @pytest.mark.parametrize(
+        ("overrides", "error", "match"),
+        [
+            (
+                {"backend": "sglang"},
+                NotImplementedError,
+                "target_level='turn' currently supports only the vllm",
+            ),
+            (
+                {"use_gym": False},
+                ValueError,
+                "target_level='turn' requires the NeMo-Gym",
+            ),
+            (
+                {"token_capture": False},
+                ValueError,
+                r"target_level='turn' requires token_capture\.enabled=true",
+            ),
+            (
+                {"restore_mode": "trainer_checkpoint"},
+                ValueError,
+                "target_level='turn' requires rollout_checkpointing.restore_mode",
+            ),
+        ],
+        ids=["non-vllm", "no-gym", "no-token-capture", "trainer-restore"],
+    )
+    def test_turn_recovery_rejects_each_missing_prerequisite(
+        self, overrides, error, match
+    ):
+        mc = _make_master_config(
+            env={"should_use_nemo_gym": overrides.pop("use_gym", True)},
+            backend=overrides.pop("backend", "vllm"),
+        )
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.token_capture.enabled = overrides.pop("token_capture", True)
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            restore_mode=overrides.pop("restore_mode", "latest"),
+        )
+
+        with pytest.raises(error, match=match):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    @pytest.mark.parametrize(
+        ("prepare_s", "control_s", "stall_s", "rejected"),
+        [
+            (300.0, 60.0, 600.0, False),  # defaults: 600 > 300 + 2 * 60
+            (600.0, 60.0, 600.0, True),  # a raised prepare timeout outlasts it
+            (300.0, 150.0, 600.0, True),  # equal is still a false stall
+            (600.0, 60.0, 900.0, False),
+        ],
+    )
+    def test_turn_recovery_stall_timeout_must_outlast_a_gym_park(
+        self, prepare_s, control_s, stall_s, rejected
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+        mc.token_capture.control_timeout_s = control_s
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_recovery.gym_prepare_timeout_s = prepare_s
+        mc.async_rl.stall_watchdog.stall_timeout_s = stall_s
+
+        if rejected:
+            with pytest.raises(
+                ValueError, match=r"stall_timeout_s \(.*\) must be > .*gym_prepare"
+            ):
+                validate_single_controller_config(mc)
+        else:
+            validate_single_controller_config(mc)
+
+    def test_stall_timeout_is_not_tied_to_gym_without_turn_recovery(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.SIBLING
+        mc.rollout_recovery.gym_prepare_timeout_s = 900.0
+
+        validate_single_controller_config(mc)
+
     def test_periodic_checkpointing_warns_without_per_step_trainer_anchors(
         self,
         tmp_path: Path,
@@ -1299,6 +1492,7 @@ class TestSetup:
             }
         )
         mc.token_capture.enabled = True
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -1313,7 +1507,7 @@ class TestSetup:
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
-            ),
+            ) as mock_spinup,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor."
@@ -1327,6 +1521,7 @@ class TestSetup:
             )
 
         assert actor_args.finalizer_actors == fake_finalizers
+        assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is True
 
     def test_nemo_gym_log_dir_is_set_before_gym_build(
         self, patched_factories, tmp_path
@@ -1833,16 +2028,16 @@ class TestSetup:
             mc = _make_master_config(colocated=False, backend="sglang")
         elif invalid_case == "prompt_group_recovery_without_capture":
             mc = _make_master_config()
-            mc.rollout_recovery.default_granularity = RecoveryGranularity.PROMPT_GROUP
+            mc.rollout_recovery.target_level = RecoveryTargetLevel.PROMPT_GROUP
         elif invalid_case == "recovery_override_without_capture":
             mc = _make_master_config()
-            mc.rollout_recovery.task_source_granularity_overrides = {
-                "genrm": RecoveryGranularity.PROMPT_GROUP
+            mc.rollout_recovery.task_source_target_level_overrides = {
+                "genrm": RecoveryTargetLevel.PROMPT_GROUP
             }
         elif invalid_case == "legacy_agent_recovery_override_without_capture":
             mc = _make_master_config()
-            mc.rollout_recovery.agent_granularity_overrides = {
-                "genrm_agent": RecoveryGranularity.PROMPT_GROUP
+            mc.rollout_recovery.agent_target_level_overrides = {
+                "genrm_agent": RecoveryTargetLevel.PROMPT_GROUP
             }
         else:  # pragma: no cover
             raise AssertionError(f"unknown test case {invalid_case}")
@@ -2511,6 +2706,7 @@ class TestSetup:
             tokenizer=tokenizer,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
             # The vLLM server's bearer token, handed to the Gym model server.
             policy_api_key=patched_factories["fake_gen"].http_server_api_key,
             token_capture=None,
@@ -2544,11 +2740,17 @@ class TestSetup:
             )
         patched_factories["_build_clusters"].assert_not_called()
 
+    @pytest.mark.parametrize("think_tag_penalty", [False, True])
     @pytest.mark.parametrize("with_processor", [True, False])
     @pytest.mark.parametrize("with_opd", [True, False])
     @pytest.mark.parametrize("shaping_enabled", [False, True])
     def test_token_capture_always_creates_finalizer_actor_pool(
-        self, patched_factories, with_processor, with_opd, shaping_enabled
+        self,
+        patched_factories,
+        with_processor,
+        with_opd,
+        shaping_enabled,
+        think_tag_penalty,
     ):
         # A VLM processor turns media capture on (Omni placeholder processor,
         # Megatron learner); text-only runs get capture_media=False.
@@ -2566,7 +2768,9 @@ class TestSetup:
             penalize_duplicated_reasoning=True,
             penalize_empty_final_answer=True,
             penalize_unwanted_tokens=True,
-            token_ids={"unwanted": [99]},
+            penalize_malformed_think_tag=think_tag_penalty,
+            # Explicit think IDs: the mock tokenizer is never asked to encode.
+            token_ids={"unwanted": [99], "think_open": 12, "think_close": 13},
         )
         mc.token_capture.enabled = True
         effort = (
@@ -2633,8 +2837,16 @@ class TestSetup:
         assert actor_config.staging_partition == mc.token_capture.staging_partition
         assert actor_config.pad_token_id == 9
         assert actor_config.capture_media is with_processor
-        assert actor_config.reward_penalty_config == mc.reward_penalties
         assert actor_config.effort_config == effort
+        # Only the malformed-think-tag penalty needs a finalizer-side tokenizer.
+        if think_tag_penalty:
+            assert actor_config.reward_penalty_config.penalize_malformed_think_tag
+            assert actor_config.tokenizer_config == mc.policy["tokenizer"]
+            assert actor_config.thinking_tags == ("<think>", "</think>")
+        else:
+            assert actor_config.reward_penalty_config == mc.reward_penalties
+            assert actor_config.tokenizer_config is None
+            assert actor_config.thinking_tags is None
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert actor_args.tq_buffer._per_token_multimodal_fields == ()
@@ -3343,8 +3555,8 @@ class TestAdaptiveLossRestore:
         checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
         checkpointer.load_training_info.return_value = vars(save_state)
         checkpointer.get_resume_paths.return_value = (None, None)
-        patched_factories["ClippedPGLossFn"].side_effect = (
-            lambda cfg, **kwargs: ClippedPGLossFn(cfg, **kwargs)
+        patched_factories["ClippedPGLossFn"].side_effect = lambda cfg, **kwargs: (
+            ClippedPGLossFn(cfg, **kwargs)
         )
         mc = _make_master_config(
             loss_cfg=ClippedPGLossConfig(
@@ -3433,6 +3645,7 @@ class TestNativeTQRecoverySetup:
         policy.load_data_plane_checkpoint.assert_not_called()
         dp_client.register_partition.assert_not_called()
         assert actor_args.last_checkpoint_path == str(checkpoint_path)
+        assert not actor_args.restored_from_rollout_snapshot
         assert actor_args.data_plane_checkpoint_metadata is None
         assert "tq_load_seconds" not in actor_args.rollout_checkpoint_load_metrics
 
@@ -3528,6 +3741,7 @@ class TestNativeTQRecoverySetup:
         patched_factories["fake_policy"].load_data_plane_checkpoint.assert_not_called()
         actor_args.dp_client.register_partition.assert_not_called()
         assert actor_args.last_checkpoint_path == str(snapshot_path)
+        assert actor_args.restored_from_rollout_snapshot
         assert actor_args.data_plane_checkpoint_metadata is None
         assert actor_args.save_state.current_epoch == 2
         assert actor_args.save_state.sampler_dispatch_index == 7
@@ -4240,7 +4454,10 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     finalizer_config = mock_finalizers.call_args.args[1]
     assert finalizer_config.capture_media is multimodal
     actor_args.gen_handle.setup_token_capture.assert_called_once_with(
-        ANY, mc.token_capture.staging_partition, capture_media=multimodal
+        ANY,
+        mc.token_capture.staging_partition,
+        capture_media=multimodal,
+        top_logprobs=0,
     )
     # What the workers pinned the media column to is what the finalizers get.
     assert (
@@ -4296,3 +4513,115 @@ def test_minf_image_preprocessing_emits_float32_pixels():
     assert tuple(imgs.shape) == (1, 4, 3 * 2 * 2)
     assert imgs_sizes.dtype == torch.int32
     assert imgs_sizes.tolist() == [[4, 4]]
+
+
+@pytest.mark.parametrize(
+    "backend_cfg",
+    [
+        {
+            "automodel_cfg": {
+                "enabled": True,
+                "tensor_parallel_size": 2,
+                "context_parallel_size": 1,
+            }
+        },
+        {
+            "automodel_cfg": {
+                "enabled": True,
+                "tensor_parallel_size": 1,
+                "context_parallel_size": 2,
+            }
+        },
+        {"megatron_cfg": {"enabled": True, "use_fused_linear_logprobs": True}},
+    ],
+)
+def test_score_centering_rejects_unsupported_trainer_logits(backend_cfg):
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = 4
+    mc.policy["generation"].update(
+        temperature=1.0, top_p=1.0, top_k=None, vllm_kwargs={"max_logprobs": 4}
+    )
+    validate_single_controller_config(mc)
+    for name, cfg in backend_cfg.items():
+        mc.policy[name] = {**(mc.policy.get(name) or {}), **cfg}
+    with pytest.raises(ValueError, match="loss_fn.score_centering"):
+        validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize("cap", [None, 2, 8, -1])
+@pytest.mark.parametrize("top_logprobs", [0, 4])
+def test_token_capture_top_logprobs_reaches_partitions_workers_and_finalizers(
+    patched_factories, top_logprobs, cap
+):
+    from nemo_rl.data_plane.schema import SAMPLER_TOPK_FIELDS
+
+    mc = _make_master_config(
+        backend="vllm",
+        loss_cfg=ClippedPGLossConfig(score_centering=top_logprobs > 0),
+    )
+    mc.policy["generation"].update(
+        {
+            "model_name": "test-model",
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": None,
+            "vllm_cfg": {"async_engine": True},
+            "vllm_kwargs": {} if cap is None else {"max_logprobs": cap},
+        }
+    )
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = top_logprobs
+    mc.env = {"should_use_nemo_gym": True, "nemo_gym": {}}
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(
+            sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+        ) as mock_gym,
+        patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[MagicMock(name="finalizer_0")],
+        ) as mock_finalizers,
+    ):
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+    expected_cap = (
+        (4 if cap is None or (cap != -1 and cap < 4) else cap) if top_logprobs else cap
+    )
+    assert mc.policy["generation"]["vllm_kwargs"].get("max_logprobs") == expected_cap
+    # Rollout and staging partitions carry the sampler columns only when on.
+    partitions = {
+        call.kwargs["partition_id"]: set(call.kwargs["fields"])
+        for call in actor_args.dp_client.register_partition.call_args_list
+    }
+    for partition_id in ("rollout_data", mc.token_capture.staging_partition):
+        assert (set(SAMPLER_TOPK_FIELDS) <= partitions[partition_id]) is (
+            top_logprobs > 0
+        )
+    generation, _ = patched_factories["_build_generation"].return_value
+    assert mock_gym.call_args.kwargs["token_capture"]["top_logprobs"] == top_logprobs
+    _, setup_kwargs = generation.setup_token_capture.call_args
+    assert setup_kwargs.get("top_logprobs", 0) == top_logprobs
+    assert mock_finalizers.call_args.args[1].top_logprobs == top_logprobs
+
+
+@pytest.mark.parametrize("count", [-1, 1.5, True])
+def test_score_centering_rejects_invalid_top_logprobs(count):
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.policy["generation"]["top_logprobs"] = count
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        validate_single_controller_config(mc)
+
+
+def test_generation_top_logprobs_requires_score_centering():
+    mc = _make_master_config()
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["top_logprobs"] = 4
+    with pytest.raises(ValueError, match="only read by loss_fn.score_centering"):
+        validate_single_controller_config(mc)

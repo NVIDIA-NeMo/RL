@@ -57,6 +57,9 @@ from nemo_rl.data.multimodal_utils import (  # noqa: E402
 from nemo_rl.data_plane.schema import (  # noqa: E402
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
+    SAMPLER_TOPK_FIELDS,
+    SAMPLER_TOPK_LOGPROBS_FIELD,
+    SAMPLER_TOPK_TOKEN_IDS_FIELD,
 )
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     MEDIA_STAGING_FIELDS,
@@ -65,6 +68,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSource,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
+from nemo_rl.experience.reward_penalties import RewardLogContext  # noqa: E402
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
 from nemo_rl.experience.route_assembly import RouteLayout  # noqa: E402
 from nemo_rl.experience.route_plan import decode_route_plan  # noqa: E402
@@ -249,6 +253,7 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         fallback_weight_version=9,
         prompt_idx=17,
         loss_multiplier=0.25,
+        reward_log_contexts=[RewardLogContext("agent", None)] * 2,
     )
     assert not finalized.dropped
     assert finalized.meta is not None
@@ -257,6 +262,9 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5
+    # Only the valid row counts toward truncation; it fills max_seq_len.
+    assert finalized.metrics["finalize/truncated_count"] == 1.0
+    assert finalized.metrics["finalize/truncated_count/agent"] == 1.0
     # Text-only rollouts never carry media.
     assert finalized.metrics["finalize/media_row_rate"] == 0.0
     assert finalized.metrics["finalize/terminal_selection_heuristic_count"] == 1.0
@@ -350,6 +358,155 @@ def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
         if key.startswith("finalize/terminal_selection_") and key.endswith("_count")
     ]
     assert sum(bucket_counts) == 1.0
+
+
+STAGING_PARTITION_TOPK = "rollout_staging_topk_fin_test"
+CANONICAL_PARTITION_TOPK = "rollout_data_topk_fin_test"
+TOPK = 3
+
+
+@pytest.fixture()
+def topk_partitions(tq_client):
+    tq_client.register_partition(
+        partition_id=STAGING_PARTITION_TOPK,
+        fields=list(STAGING_FIELDS) + list(SAMPLER_TOPK_FIELDS),
+        num_samples=64,
+        consumer_tasks=["finalize"],
+    )
+    tq_client.register_partition(
+        partition_id=CANONICAL_PARTITION_TOPK,
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+            "prompt_ids_for_adv",
+            "total_reward",
+            "mask_sample",
+            "truncated",
+            *SAMPLER_TOPK_FIELDS,
+        ],
+        num_samples=64,
+        consumer_tasks=["train"],
+    )
+    yield
+    tq_client.clear_samples(sample_ids=None, partition_id=STAGING_PARTITION_TOPK)
+    tq_client.clear_samples(sample_ids=None, partition_id=CANONICAL_PARTITION_TOPK)
+
+
+def _topk_finalizer(tq_client) -> RolloutReassembler:
+    return RolloutReassembler(
+        tq_client,
+        partition_id=CANONICAL_PARTITION_TOPK,
+        staging_partition=STAGING_PARTITION_TOPK,
+        pad_token_id=PAD,
+        max_seq_len=4096,
+        top_logprobs=TOPK,
+    )
+
+
+def _stage_fixture_with_topk(
+    tq_client, name: str, *, rollout_id: str, short_call: str | None = None
+):
+    """Stage a fixture plus a distinct top-k per call.
+
+    Returns (receipt_dict, expected LinearizedRow, expected row ids, expected
+    row log-probs); the expectation follows the row's link spans: zeros for
+    each span's carried tokens, then that call's fragment. ``short_call``
+    stages one row too few for that call.
+    """
+    records, receipt, row = build_fixture_artifacts(name, rollout_id=rollout_id)
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION_TOPK)
+    fragments = {}
+    for call_idx, record in enumerate(records):
+        generated = int(sum(record.token_mask_delta))
+        ids = torch.arange(generated * TOPK, dtype=torch.int32).reshape(generated, TOPK)
+        ids = ids + 100 * (call_idx + 1)
+        logprobs = -(torch.arange(generated * TOPK, dtype=torch.float32) + call_idx + 1)
+        logprobs = logprobs.reshape(generated, TOPK) / 10
+        if record.model_call_id == short_call:
+            ids, logprobs = ids[:-1], logprobs[:-1]
+        assert sink.stage(
+            record,
+            attachments={
+                "sampler_topk_token_ids": ids,
+                "sampler_topk_logprobs": logprobs,
+            },
+        ).ok
+        fragments[record.model_call_id] = (ids, logprobs)
+    expected_ids, expected_logprobs = [], []
+    for call_id, carry_len, _generation_len in row.link_spans:
+        ids, logprobs = fragments[call_id]
+        expected_ids += [torch.zeros((carry_len, TOPK), dtype=torch.int32), ids]
+        expected_logprobs += [torch.zeros((carry_len, TOPK)), logprobs]
+    return (
+        receipt.model_dump(),
+        row,
+        torch.cat(expected_ids),
+        torch.cat(expected_logprobs),
+    )
+
+
+def test_finalize_group_publishes_the_sampler_topk(tq_client, topk_partitions):
+    group_id = "topk_grp"
+    receipt, expected, expected_ids, expected_logprobs = _stage_fixture_with_topk(
+        tq_client, "worked_example", rollout_id=f"{group_id}_g0"
+    )
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+
+    finalized = _topk_finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],  # second rollout lost its receipt -> placeholder
+        [1.0, 0.0],
+        mask_sample=[True, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+    )
+
+    assert not finalized.dropped
+    assert set(SAMPLER_TOPK_FIELDS) <= set(finalized.meta.fields)
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=CANONICAL_PARTITION_TOPK,
+        select_fields=["token_mask", *SAMPLER_TOPK_FIELDS],
+    )
+    length = len(expected.token_ids)
+    ids = torch.as_tensor(rows[SAMPLER_TOPK_TOKEN_IDS_FIELD][0])
+    logprobs = torch.as_tensor(rows[SAMPLER_TOPK_LOGPROBS_FIELD][0])
+    assert ids.dtype == torch.int32
+    assert logprobs.dtype == torch.float32
+    assert torch.equal(ids[:length], expected_ids)
+    assert torch.equal(logprobs[:length], expected_logprobs)
+    # Token-aligned: zeros exactly on the carried (mask 0) positions.
+    generated = torch.as_tensor(rows["token_mask"][0]).flatten()[:length].bool()
+    assert not ids[:length][~generated].any()
+    assert ids[:length][generated].all()
+    placeholder = torch.as_tensor(rows[SAMPLER_TOPK_TOKEN_IDS_FIELD][1])
+    assert tuple(placeholder.shape) == (1, TOPK)
+    assert not placeholder.any()
+
+
+def test_finalize_rollout_rejects_a_topk_fragment_of_the_wrong_length(
+    tq_client, topk_partitions
+):
+    receipt, _, _, _ = _stage_fixture_with_topk(
+        tq_client, "worked_example", rollout_id="topk_short", short_call="c2"
+    )
+    row = _topk_finalizer(tq_client).finalize_rollout("topk_short", receipt, reward=1.0)
+    assert row.rejection_reason == "topk_length_mismatch:c2"
+
+
+def test_finalize_rollout_rejects_a_row_without_topk(tq_client, topk_partitions):
+    records, receipt, _ = build_fixture_artifacts("single_call", rollout_id="topk_none")
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION_TOPK)
+    for record in records:
+        assert sink.stage(record).ok
+    row = _topk_finalizer(tq_client).finalize_rollout(
+        "topk_none", receipt.model_dump(), reward=0.0
+    )
+    assert (row.rejection_reason or "").startswith("missing_staging_row")
 
 
 def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(
@@ -920,9 +1077,13 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
 
     class _InjectedSource:
         def fetch_for_finalization(
-            self, staging_keys, *, include_route_fragments=False
+            self,
+            staging_keys,
+            *,
+            include_route_fragments=False,
+            include_sampler_topk=False,
         ):
-            del staging_keys, include_route_fragments
+            del staging_keys, include_route_fragments, include_sampler_topk
             return fetched
 
     finalizer._source = _InjectedSource()
@@ -1028,9 +1189,13 @@ def test_direct_extras_corruption_rejects_before_publication(
 
     class _InjectedSource:
         def fetch_for_finalization(
-            self, staging_keys, *, include_route_fragments=False
+            self,
+            staging_keys,
+            *,
+            include_route_fragments=False,
+            include_sampler_topk=False,
         ):
-            del staging_keys, include_route_fragments
+            del staging_keys, include_route_fragments, include_sampler_topk
             return fetched
 
     finalizer._source = _InjectedSource()
@@ -1586,6 +1751,47 @@ def test_penalties_use_only_verified_selected_generations(
         assert row.logprobs == expected.logprobs
         assert row.token_mask == expected.token_mask
         assert row.penalty_counts["unwanted_token"] == int(expected_reward == 0.0)
+
+
+class _TagTokenizer:
+    """Decodes every generation to ``text``; records what it was asked to decode."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.decoded: list[list[int]] = []
+
+    def decode(self, token_ids, skip_special_tokens: bool) -> str:
+        assert skip_special_tokens is False
+        self.decoded.append(list(token_ids))
+        return self.text
+
+
+@pytest.mark.parametrize(
+    "decoded_text,expected_reward", [("plain answer", -2.0), ("<think>", 0.0)]
+)
+def test_malformed_think_tag_penalty_decodes_each_generation(
+    tq_client, partitions, decoded_text, expected_reward
+):
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+
+    receipt, expected = _stage_fixture(tq_client, "worked_example", rollout_id="r")
+    tokenizer = _TagTokenizer(decoded_text)
+    finalizer = _finalizer(
+        tq_client,
+        reward_penalty_config=RewardPenaltyConfig(penalize_malformed_think_tag=True),
+        tokenizer=tokenizer,
+        thinking_tags=("<think>", "</think>"),
+    )
+    row = finalizer.finalize_rollout("r", receipt, reward=-2.0)
+    assert row.valid, row.rejection_reason
+    assert row.reward == expected_reward
+    assert row.penalty_counts["malformed_think_tag"] == int(expected_reward == 0.0)
+    # Only generated spans are decoded, never the carried prompt tokens.
+    generated = {
+        token for token, mask in zip(expected.token_ids, expected.token_mask) if mask
+    }
+    assert tokenizer.decoded
+    assert all(set(ids) <= generated for ids in tokenizer.decoded)
 
 
 def test_penalized_rewards_reach_grpo_advantages_without_token_changes(

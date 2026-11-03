@@ -23,7 +23,6 @@ group. The second process records which generation indices are redispatched.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -31,6 +30,7 @@ from typing import Any
 from examples import run_grpo_single_controller
 from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from tests.functional._single_controller_hook_utils import append_event, find_group
 
 
 class _InstrumentedNemoGymRolloutImpl:
@@ -61,26 +61,6 @@ class _InstrumentedNemoGymRolloutImpl:
             raise AttributeError(name)
         return getattr(delegate, name)
 
-    def _append_event(self, event: str, **fields: Any) -> None:
-        self._events_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._events_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"event": event, **fields}, sort_keys=True) + "\n")
-
-    def _find_group(self, rollout_ids: list[str]) -> Any:
-        rollout_id_set = set(rollout_ids)
-        matches = [
-            group
-            for group in self._recovery_ledger.groups()
-            if rollout_id_set.intersection(group.gate_rollout_ids)
-        ]
-        if len(matches) != 1:
-            raise RuntimeError(
-                "sibling recovery hook could not uniquely resolve rollout IDs "
-                f"to one ledger group: ids={rollout_ids!r}, matches="
-                f"{[group.group_id for group in matches]!r}"
-            )
-        return matches[0]
-
     def _sibling_sealed_event(self) -> asyncio.Event:
         if self._selected_sibling_sealed is None:
             self._selected_sibling_sealed = asyncio.Event()
@@ -94,6 +74,8 @@ class _InstrumentedNemoGymRolloutImpl:
         generation_indices: list[int] | None = None,
         on_completion: RolloutCompletionCallback | None = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
+        gym_instance_id: str | None = None,
+        dispatch_recorder: Any = None,
     ) -> Any:
         if rollout_ids is None or generation_indices is None or on_completion is None:
             raise RuntimeError(
@@ -104,7 +86,7 @@ class _InstrumentedNemoGymRolloutImpl:
                 "sibling recovery hook requires sibling recovery granularity"
             )
 
-        group = self._find_group(rollout_ids)
+        group = find_group(self._recovery_ledger, rollout_ids, hook="sibling")
         indices = list(generation_indices)
         fields = {
             "group_id": group.group_id,
@@ -113,7 +95,7 @@ class _InstrumentedNemoGymRolloutImpl:
             "generation_indices": indices,
             "rollout_ids": list(rollout_ids),
         }
-        self._append_event("dispatch", **fields)
+        append_event(self._events_path, "dispatch", **fields)
 
         selected = False
         if (
@@ -141,11 +123,15 @@ class _InstrumentedNemoGymRolloutImpl:
                 if not sealed_in_selected_call:
                     await on_completion(generation_index, completion)
                     sealed_in_selected_call = True
-                    self._append_event("sibling_sealed", **completion_fields)
+                    append_event(
+                        self._events_path, "sibling_sealed", **completion_fields
+                    )
                     self._sibling_sealed_event().set()
                     return
 
-                self._append_event("blocked_before_ledger_seal", **completion_fields)
+                append_event(
+                    self._events_path, "blocked_before_ledger_seal", **completion_fields
+                )
                 print(
                     "sibling recovery functional hook: blocked group="
                     f"{group.group_id} generation_index={generation_index}",
@@ -170,8 +156,10 @@ class _InstrumentedNemoGymRolloutImpl:
             generation_indices=indices,
             on_completion=_instrumented_completion,
             recovery_granularity=recovery_granularity,
+            gym_instance_id=gym_instance_id,
+            dispatch_recorder=dispatch_recorder,
         )
-        self._append_event("capture_complete", **fields)
+        append_event(self._events_path, "capture_complete", **fields)
         return result
 
 

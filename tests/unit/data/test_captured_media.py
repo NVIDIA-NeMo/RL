@@ -774,6 +774,7 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
 
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker._capture_calls = {}
+    worker._capture_top_logprobs = 0
     worker.token_capture = RolloutTokenCapture(
         sink=TQTokenSink(
             dp,
@@ -1374,7 +1375,9 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     worker._http_engine_client = MagicMock()
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = SimpleNamespace(
-        served_model_name="test", model="test"
+        served_model_name="test",
+        model="test",
+        try_get_generation_config=lambda: {},
     )
     app = _FakeApp()
     worker._setup_vllm_openai_api_server(app)
