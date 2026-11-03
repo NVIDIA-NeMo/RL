@@ -221,7 +221,8 @@ that is new for each process, and `event`.
 | `attempt_abandoned` | Recovery ledger | as above, plus `reason`: `dropped`, `failed`, `cancelled` (for example, by the run ending) or `restart`, and `whole_group` when prompt-group recovery threw the whole group away |
 | `attempt_resumed` | Recovery ledger, on restart | as above; `environment_attempt` is the environment's next attempt |
 | `group_sealed`, `group_discarded` | Recovery ledger | `group_id`, `prompt_id` |
-| `step_trained` | Train pump | `step`, `trainer_version`, `group_ids` |
+| `group_published` | Finalizer commit | `group_id`; with token capture, `tokens_by_version`: the tokens its trained calls generated, by the weight version each call began on |
+| `step_trained` | Train pump | `step`, `trainer_version`, `trained_version` (the policy version the step updated), `group_ids` |
 | `weights_synced` | Weight sync | `weight_version` |
 | `trainer_checkpoint_published` | Snapshotter | `step` |
 | `snapshot_published` | Snapshotter | `path`, `step`, `trainer_version`, `cut_time` (when the saved state was captured) |
@@ -236,6 +237,16 @@ lost progress is how much later the groups running at the stop reached
 `group_sealed` than the same prompts in runs that never stopped. A model call
 redone after a turn-level resume is not visible here: that needs the time
 the environment parked each rollout, which it does not report yet.
+
+Batch age, the token-weighted number of policy updates between generating a
+token and training on it, comes from the same file:
+
+```bash
+python -m nemo_rl.algorithms.rollout_checkpointing.trace <log_dir>/rollout_trace.jsonl
+```
+
+Each call's tokens count under the version the call began on, so a call that
+runs across a refit counts as slightly older than it is.
 
 ## Rules for New Code
 

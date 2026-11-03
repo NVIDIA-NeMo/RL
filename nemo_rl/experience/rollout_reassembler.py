@@ -37,7 +37,7 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -132,6 +132,8 @@ class FinalizedRollout:
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
     # One length per owned call, even when adjacent generations have no input gap.
     generation_lengths: tuple[int, ...] = ()
+    # Tokens the owned calls generated, by the weight version each call began on.
+    tokens_by_version: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -204,6 +206,17 @@ class FinalizedGroup:
     # group (the caller does not read these when dropped is True).
     valid_row_count: int = 0
     total_row_count: int = 0
+    # Tokens the verified rollouts' trained calls generated, by the weight
+    # version each call began on; empty when dropped.
+    tokens_by_version: dict[int, int] = field(default_factory=dict)
+
+
+def _tokens_by_version(calls: Iterable[tuple[int, int]]) -> dict[int, int]:
+    """Sum ``(weight_version, tokens)`` pairs by version."""
+    totals: dict[int, int] = {}
+    for version, tokens in calls:
+        totals[version] = totals.get(version, 0) + tokens
+    return totals
 
 
 def _capture_token_metrics(
@@ -697,6 +710,11 @@ class RolloutReassembler:
             token_mask=token_mask,
             generation_lengths=tuple(
                 length
+                for call_id, _, length in row.link_spans
+                if call_id not in loss_excluded_call_ids
+            ),
+            tokens_by_version=_tokens_by_version(
+                (records_by_call[call_id].weight_version, length)
                 for call_id, _, length in row.link_spans
                 if call_id not in loss_excluded_call_ids
             ),
@@ -1371,6 +1389,9 @@ class RolloutReassembler:
             meta=meta,
             group_min_wv=group_min_wv,
             group_max_wv=group_max_wv,
+            tokens_by_version=_tokens_by_version(
+                pair for row in valid_rows for pair in row.tokens_by_version.items()
+            ),
             staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
             canonical_output_tokens=sum(
                 int(mask) for row in valid_rows for mask in row.token_mask

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -30,8 +31,11 @@ from nemo_rl.algorithms.rollout_checkpointing.manifest import (
 from nemo_rl.algorithms.rollout_checkpointing.trace import (
     ROLLOUT_TRACE_FILENAME,
     RolloutTrace,
+    batch_age_by_step,
 )
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_recovery import (
     RecoveryTargetLevel,
     RolloutRecoveryLedger,
@@ -51,6 +55,13 @@ from tests.unit.single_controller.test_checkpointing import (
     _actor_master_config,
     _make_actor_args,
     _run_train_pump,
+)
+from tests.unit.single_controller.test_finalizer_lifecycle import (
+    _controller as _finalizer_controller,
+)
+from tests.unit.single_controller.test_finalizer_lifecycle import (
+    _RemoteFinalize,
+    _request,
 )
 
 
@@ -230,6 +241,8 @@ def test_the_controller_traces_steps_weight_syncs_and_checkpoints(
     events = _events(path)
     steps = [event for event in events if event["event"] == "step_trained"]
     assert [event["step"] for event in steps] == [1, 2, 3, 4]
+    # The step updates the policy version it trained on.
+    assert [event["trained_version"] for event in steps] == [0, 1, 2, 3]
     assert all(isinstance(event["group_ids"], list) for event in steps)
     assert len([event for event in events if event["event"] == "weights_synced"]) >= 4
     assert [
@@ -346,3 +359,55 @@ def test_the_controller_class_with_its_disabled_trace_pickles() -> None:
 
     ray.cloudpickle.dumps(RolloutTrace(None))
     ray.cloudpickle.dumps(SingleControllerActor.__ray_metadata__.modified_class)
+
+
+def test_batch_age_weights_each_version_by_its_tokens() -> None:
+    events = [
+        {
+            "event": "group_published",
+            "group_id": "g1",
+            "tokens_by_version": {"3": 1200},
+        },
+        {"event": "group_published", "group_id": "g2", "tokens_by_version": {"4": 150}},
+        {
+            "event": "step_trained",
+            "step": 6,
+            "trainer_version": 7,
+            "trained_version": 6,
+            "group_ids": ["g1", "g2"],
+        },
+    ]
+
+    assert batch_age_by_step(events) == {6: (1200 * 3 + 150 * 2) / 1350}
+
+
+def test_a_published_group_traces_its_tokens_by_version(tmp_path: Path) -> None:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=4,
+        staging_keys=[],
+        tokens_by_version={3: 10, 4: 5},
+    )
+    actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+    ctrl = _finalizer_controller(actor)
+    ctrl._rollout_trace = RolloutTrace(tmp_path / ROLLOUT_TRACE_FILENAME)
+
+    assert asyncio.run(ctrl._finalize_with_actor(_request())) is result
+    ctrl._rollout_trace.close()
+
+    (published,) = [
+        event
+        for event in _events(tmp_path / ROLLOUT_TRACE_FILENAME)
+        if event["event"] == "group_published"
+    ]
+    assert published["group_id"] == "group"
+    assert published["tokens_by_version"] == {"3": 10, "4": 5}

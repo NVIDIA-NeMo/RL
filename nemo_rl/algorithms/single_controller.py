@@ -1353,6 +1353,11 @@ class SingleControllerActor:
                     # Canonical TQ rows plus replay metadata now own the completed
                     # group; keep only unfinished work in the lineage sidecar.
                     ledger.discard_group(cut, request.group_id)
+                    self._rollout_trace.emit(
+                        "group_published",
+                        group_id=request.group_id,
+                        tokens_by_version=finalized.tokens_by_version,
+                    )
                     self._rollout_manager.record_canonical_publication(
                         finalized.canonical_output_tokens
                     )
@@ -3033,6 +3038,8 @@ class SingleControllerActor:
                     "step_trained",
                     step=self._train_steps,
                     trainer_version=self._trainer_version,
+                    # The policy version the optimizer step updated.
+                    trained_version=version_during_step,
                     group_ids=sorted(step_finalizer_group_ids),
                 )
                 self._rollout_snapshots.end_optimizer_commit()

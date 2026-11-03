@@ -167,6 +167,8 @@ def test_twenty_turn_capture_to_replay_and_advantages(
         assert result.meta.size == (40 // chunk_size if compact else 2)
         assert result.valid_row_count == result.meta.size
         assert len(harness.worker_calls) == 40
+        # The 40 one-token calls, counted by the version each began on.
+        assert sum(result.tokens_by_version.values()) == 40
         assert plane.list_sample_ids("staged") == []
         ctrl = await ready_controller(monkeypatch, plane, result.meta)
         checked = []
