@@ -25,8 +25,9 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 class DenoisingSchedule(ABC):
     """Describe model inputs and harvested-token alignment for each reveal level.
 
-    Trajectories carry clean input_ids, target_ids, position_ids, token_mask,
-    and masked_indices as [N,S] tensors. The model owns noisy/clean
+    Trajectories carry clean response input_ids, target_ids, position_ids, token_mask,
+    and masked_indices as [N,S] tensors, plus clean_input_ids for the original
+    prompt and response. The model owns noisy/clean
     concatenation and block attention. original_positions maps [N,S] back to
     rollout coordinates; sample_indices maps [N] to original batch rows.
     Only token_mask positions contribute to the loss.

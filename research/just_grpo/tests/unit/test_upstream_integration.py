@@ -26,15 +26,14 @@ from just_grpo.generation.megatron_generation import (
 from test_sudoku_and_config import answer, load, load_reference_vllm
 
 
-def test_sudoku_round_trip_preserves_aligned_prompt_and_reward():
+def test_sudoku_round_trip_preserves_original_prompt_and_reward():
     config = load()
     tokenizer = SimpleNamespace(apply_chat_template=lambda *a, **kw: [7] * 19)
     dataset = SudokuResponseDataset(config, tokenizer)
     sample = dataset[0]
-    assert sample["length"] == 32
+    assert sample["length"] == 19
     ids = sample["message_log"][0]["token_ids"]
-    assert ids[:13].tolist() == [config.just_grpo.schedule.mask_token_id] * 13
-    assert ids[13:].tolist() == [7] * 19
+    assert ids.tolist() == [7] * 19
     example = sample["extra_env_info"]["example"]
     message = sample["message_log"] + [
         {"role": "assistant", "content": answer(example.solution)}

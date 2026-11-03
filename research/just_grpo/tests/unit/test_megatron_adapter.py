@@ -13,29 +13,31 @@
 # limitations under the License.
 """The upstream-worker adapter preserves trajectory coverage and gradients."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
-from test_fast_selection import confidence_batch, make_schedule
-
 from just_grpo.algorithms.block_just_grpo import (
     BlockJustGRPOSchedule,
     select_low_confidence_tokens,
 )
-from unittest.mock import Mock
+from test_fast_selection import confidence_batch, make_schedule
+
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 pytest.importorskip("megatron.bridge")
-from just_grpo.diffusion.megatron_diffusion_policy import (
-    MegatronDiffusionPolicyWorkerImpl,
-)
-
-from megatron.core import parallel_state
-from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from just_grpo.diffusion.diffusion_processors import (
-    DiffusionLossPostProcessor,
     DiffusionLogprobsPostProcessor,
+    DiffusionLossPostProcessor,
     prepare_diffusion_microbatch,
     selected_diffusion_logprobs,
 )
+from just_grpo.diffusion.megatron_diffusion_policy import (
+    MegatronDiffusionPolicyWorkerImpl,
+)
+from megatron.core import parallel_state
+
+from nemo_rl.models.megatron.data import ProcessedMicrobatch
 
 
 @pytest.fixture(autouse=True)
@@ -128,9 +130,12 @@ def test_selected_same_position_scores_and_gradients_match_dense(fraction):
         micro.input_ids[:, : clean.shape[1]],
         clean.masked_fill(trajectory["masked_indices"], 31),
     )
-    torch.testing.assert_close(micro.input_ids[:, clean.shape[1] :], clean)
     torch.testing.assert_close(
-        micro.position_ids[:, : clean.shape[1]], micro.position_ids[:, clean.shape[1] :]
+        micro.input_ids[:, clean.shape[1] :], trajectory["clean_input_ids"]
+    )
+    torch.testing.assert_close(
+        micro.position_ids[:, : clean.shape[1]],
+        trajectory["prompt_lengths"][:, None] + trajectory["position_ids"],
     )
     assert micro.data_dict is trajectory
     active = trajectory["token_mask"]
@@ -164,9 +169,10 @@ def test_standard_forward_and_diffusion_processors_match_core_loss(
 ):
     pytest.importorskip("megatron.bridge")
     from megatron.core import parallel_state
-    from nemo_rl.models.megatron.train import forward_with_post_processing_fn
+
     from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
     from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+    from nemo_rl.models.megatron.train import forward_with_post_processing_fn
 
     monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: None)
     monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_group", lambda: None)
@@ -258,9 +264,14 @@ def test_worker_accumulates_levels_before_one_optimizer_step(monkeypatch, fracti
     counts = {"tokens": 0.0, "sequences": 0.0}
 
     def accumulate(level):
-        # Mirror native streaming counts, including its AR first-column slice.
+        # Mirror the worker's same-position streaming normalization.
         counts["tokens"] += float(
-            (level["token_mask"][:, 1:] * level["sample_mask"][:, None]).sum()
+            (
+                MegatronDiffusionPolicyWorkerImpl._streaming_loss_token_mask(
+                    worker, level
+                )
+                * level["sample_mask"][:, None]
+            ).sum()
         )
         counts["sequences"] += float(level["sample_mask"].sum())
 
@@ -302,6 +313,7 @@ def test_training_failure_aborts_open_step(monkeypatch, failure):
     with pytest.raises(RuntimeError, match="training failed"):
         MegatronDiffusionPolicyWorkerImpl.train(worker, data=data, loss_fn=Mock())
     worker.abort_train_step.assert_called_once_with()
+    worker._clear_asymmetric_metadata.assert_called_once_with()
     if failure == "train_microbatch":
         worker.finish_train_step.assert_not_called()
 
@@ -311,6 +323,7 @@ def test_worker_scoring_uses_schedule_and_native_reference_context(
     monkeypatch, reference
 ):
     from contextlib import contextmanager
+
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -319,6 +332,7 @@ def test_worker_scoring_uses_schedule_and_native_reference_context(
     schedule = make_schedule(data)
     worker = object.__new__(MegatronDiffusionPolicyWorkerImpl)
     worker._schedule = Mock(return_value=schedule)
+    worker._clear_asymmetric_metadata = Mock()
     active = []
     calls = []
 
@@ -365,3 +379,81 @@ def test_worker_preserves_fixed_model_canvas_for_short_rollouts():
     assert schedule.base["input_ids"].shape == (data.size, 32)
     assert schedule.num_steps == 1
     assert not schedule.base["token_mask"][:, data["input_ids"].shape[1] :].any()
+
+
+def test_diffusion_streaming_normalization_includes_first_response_token():
+    data = BatchedDataDict(
+        token_mask=torch.tensor([[1.0, 0.0, 1.0], [1.0, 1.0, 0.0]]),
+        sample_mask=torch.tensor([1.0, 0.0]),
+    )
+    worker = object.__new__(MegatronDiffusionPolicyWorkerImpl)
+    mask = worker._streaming_loss_token_mask(data)
+    assert (mask * data["sample_mask"][:, None]).sum() == 2
+
+
+def test_microbatch_keeps_original_context_and_response_logical_positions():
+    data = BatchedDataDict(
+        input_ids=torch.tensor([[2, 3, 4, 5, 6, 7, 8, 9]]),
+        token_mask=torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1]]),
+        input_lengths=torch.tensor([8]),
+        sample_mask=torch.ones(1),
+    )
+    trajectory = next(make_schedule(data).iter_levels(data))
+    microbatch = prepare_diffusion_microbatch(processed(trajectory), mask_token_id=31)
+    width = trajectory["input_ids"].shape[1]
+    torch.testing.assert_close(microbatch.input_ids[:, width:], data["input_ids"])
+    assert microbatch.position_ids[0, :5].tolist() == [3, 4, 5, 6, 7]
+    assert trajectory["token_mask"][0, 0]
+
+
+def test_metadata_traverses_a_single_wrapped_model_and_is_shared_between_layers():
+    from megatron.bridge.diffusion.models.common.nemotron_labs_diffusion_attention import (
+        NemotronLabsDiffusionAttention,
+    )
+
+    layers = []
+    for _ in range(2):
+        layer = object.__new__(NemotronLabsDiffusionAttention)
+        torch.nn.Module.__init__(layer)
+        layer.block_size = 4
+        layer._asymmetric_ar_metadata = None
+        layers.append(layer)
+    worker = object.__new__(MegatronDiffusionPolicyWorkerImpl)
+    worker.model = torch.nn.Module()
+    worker.model.add_module("module", torch.nn.Sequential(*layers))
+    worker.mask_token_id = 31
+    trajectory = next(make_schedule(confidence_batch()).iter_levels())
+    prepared = worker._prepare_diffusion_microbatch(processed(trajectory))
+    metadata = layers[0]._asymmetric_ar_metadata
+    assert metadata is layers[1]._asymmetric_ar_metadata
+    torch.testing.assert_close(metadata.prompt_lengths, torch.tensor([4, 8]))
+    assert prepared.input_ids.shape[1] == metadata.noisy_length + metadata.clean_length
+    worker._clear_asymmetric_metadata()
+    assert all(layer._asymmetric_ar_metadata is None for layer in layers)
+
+
+def test_scoring_failure_clears_attention_metadata(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronDiffusionPolicyWorkerImpl)
+    worker._schedule = Mock(return_value=make_schedule(confidence_batch()))
+    worker._clear_asymmetric_metadata = Mock()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("scoring failed")
+
+    monkeypatch.setattr(MegatronPolicyWorkerImpl, "get_logprobs", fail)
+    with pytest.raises(RuntimeError, match="scoring failed"):
+        worker.get_logprobs(data=confidence_batch())
+    worker._clear_asymmetric_metadata.assert_called_once_with()
+
+
+def test_missing_diffusion_attention_fails_before_forward():
+    worker = object.__new__(MegatronDiffusionPolicyWorkerImpl)
+    worker.model = torch.nn.Linear(2, 2)
+    with pytest.raises(RuntimeError, match="requires Nemotron"):
+        worker._set_asymmetric_metadata(
+            next(make_schedule(confidence_batch()).iter_levels())
+        )

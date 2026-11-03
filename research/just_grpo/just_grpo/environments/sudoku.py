@@ -23,7 +23,6 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.data import Dataset
 
-from just_grpo.algorithms.block_just_grpo import align_prompt
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, TokenizerType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
@@ -102,7 +101,7 @@ def user_prompt(example: SudokuExample, *, style: str) -> str:
 
 
 class SudokuResponseDataset(Dataset):
-    """Convert 6x6 examples into block-aligned NeMo-RL rollout messages."""
+    """Convert 6x6 examples into NeMo-RL rollout messages."""
 
     def __init__(
         self, config: DictConfig, tokenizer: TokenizerType, *, validation: bool = False
@@ -134,13 +133,7 @@ class SudokuResponseDataset(Dataset):
         )
         if len(tokens) >= self.config.data.max_input_seq_length:
             raise ValueError("Sudoku prompt exceeds data.max_input_seq_length")
-        tokens = align_prompt(
-            tokens,
-            block_size=self.config.just_grpo.schedule.block_size,
-            mask_token_id=self.config.just_grpo.schedule.mask_token_id,
-        )
-        # One pretokenized message preserves exactly the reference chat template
-        # and block alignment. Upstream rollouts consume these token IDs directly.
+        # Preserve the exact chat template for generation and training.
         return dict(
             message_log=[
                 dict(

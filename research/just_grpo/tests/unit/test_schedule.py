@@ -19,12 +19,30 @@ import pytest
 import torch
 from just_grpo.algorithms.block_just_grpo import (
     BlockJustGRPOSchedule,
-    align_prompt,
 )
 from just_grpo.config import ScheduleConfig
 from torch import nn
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def asymmetric_mask(data, noisy_width, clean_width):
+    """Independent dense oracle: loop over response blocks and causal context."""
+    mask = torch.eye(noisy_width + clean_width, dtype=torch.bool)[None].repeat(
+        data.size, 1, 1
+    )
+    for row in range(data.size):
+        prompt = int(data["prompt_lengths"][row])
+        for start in range(0, int(data["noisy_valid_lengths"][row]), 4):
+            mask[row, start : start + 4, start : start + 4] = True
+            mask[row, start : start + 4, noisy_width : noisy_width + prompt + start] = (
+                True
+            )
+        length = int(data["clean_lengths"][row])
+        mask[
+            row, noisy_width : noisy_width + length, noisy_width : noisy_width + length
+        ] = torch.ones(length, length, dtype=torch.bool).tril()
+    return mask[:, None]
 
 
 class TinyDiffusion(nn.Module):
@@ -36,20 +54,18 @@ class TinyDiffusion(nn.Module):
 
     def forward(self, data):
         if "masked_indices" in data:
-            clean = data["input_ids"]
-            width = clean.shape[1]
-            noisy = torch.where(data["masked_indices"], 31, clean)
+            clean = data["clean_input_ids"]
+            width = data["input_ids"].shape[1]
+            noisy = torch.where(data["masked_indices"], 31, data["input_ids"])
             ids = torch.cat([noisy, clean], dim=1)
-            positions = data["position_ids"].repeat(1, 2)
-            # Native block_diff mask. Compare its output against serial canvases.
-            q = torch.arange(2 * width)[:, None]
-            k = torch.arange(2 * width)[None, :]
-            attention = (
-                ((q < width) & (k < width) & (q // 4 == k // 4))
-                | ((q < width) & (k >= width) & (q // 4 > (k - width) // 4))
-                | ((q >= width) & (k >= width) & (q >= k))
+            positions = torch.cat(
+                [
+                    data["position_ids"] + data["prompt_lengths"][:, None],
+                    torch.arange(clean.shape[1])[None].expand_as(clean),
+                ],
+                dim=1,
             )
-            attention = attention[None, None]
+            attention = asymmetric_mask(data, width, clean.shape[1])
         else:
             ids, positions, attention = (
                 data["input_ids"],
@@ -156,9 +172,9 @@ def test_each_token_harvested_once_and_tail_stays_masked(k):
     coverage = torch.zeros_like(data["input_ids"])
     for t in schedule.return_schedule(2):
         coverage += schedule.scatter_logprobs(t, torch.ones_like(t["input_ids"]))
-        assert t["masked_indices"][0, 10:12].all()
-        assert not t["masked_indices"][0, :4].any()
-        assert not t["masked_indices"][1, :8].any()
+        assert t["masked_indices"][0, 6:8].all()
+        assert t["masked_indices"][1, 3].all()
+        torch.testing.assert_close(t["clean_input_ids"], data["input_ids"])
     torch.testing.assert_close(coverage, data["token_mask"])
 
 
@@ -187,21 +203,31 @@ def test_empty_and_excluded_samples():
         assert not t["masked_indices"].any()
 
 
-@pytest.mark.parametrize("length", [1, 3, 4, 5, 8])
-def test_mask_prefix_aligns_prompt(length):
-    prompt = list(range(1, length + 1))
-    aligned = align_prompt(prompt, block_size=4, mask_token_id=31)
-    assert len(aligned) % 4 == 0
-    assert aligned[-length:] == prompt
-    assert aligned[:-length] == [31] * (-length % 4)
-
-
-def test_unaligned_prompt_is_rejected():
-    data = batch()
-    data["token_mask"][0, 3] = 1
-    with pytest.raises(ValueError, match="block-aligned"):
-        BlockJustGRPOSchedule(
-            data,
-            ScheduleConfig(mask_token_id=31, block_size=4, reveal_tokens_per_step=1),
-            pad_token_id=0,
-        )
+@pytest.mark.parametrize("prompt_length", [1, 3, 4, 5, 15, 16, 17])
+@pytest.mark.parametrize("reveal", [1, 2, 4])
+def test_variable_prompts_match_serial_without_prefix(prompt_length, reveal):
+    torch.manual_seed(3)
+    data = BatchedDataDict(
+        input_ids=torch.randint(1, 30, (2, prompt_length + 6)),
+        input_lengths=torch.tensor(
+            [prompt_length + 6, prompt_length + 5], dtype=torch.int32
+        ),
+        token_mask=torch.zeros(2, prompt_length + 6, dtype=torch.long),
+        sample_mask=torch.ones(2),
+    )
+    data["token_mask"][:, prompt_length:] = 1
+    data["token_mask"][1, -1] = 0
+    model = TinyDiffusion()
+    independent = copy.deepcopy(model)
+    schedule = BlockJustGRPOSchedule(
+        data,
+        ScheduleConfig(mask_token_id=31, block_size=4, reveal_tokens_per_step=reveal),
+        pad_token_id=0,
+    )
+    actual = sum(schedule.scatter_logprobs(t, model(t)) for t in schedule.iter_levels())
+    expected = serial(independent, data, 4, reveal)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+    actual.sum().backward()
+    expected.sum().backward()
+    for a, b in zip(model.parameters(), independent.parameters()):
+        torch.testing.assert_close(a.grad, b.grad, atol=1e-5, rtol=1e-4)

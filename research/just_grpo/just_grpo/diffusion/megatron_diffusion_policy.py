@@ -14,12 +14,13 @@
 """Native Megatron worker with a diffusion schedule and postprocessors."""
 
 import math
-from functools import partial
 from typing import Any
 
 import ray
 import torch
-from megatron.bridge.utils.instantiate_utils import register_allowed_target_prefix
+from megatron.bridge.diffusion.models.common.nemotron_labs_diffusion_attention import (
+    NemotronLabsDiffusionAttention,
+)
 from megatron.core import parallel_state
 from omegaconf import OmegaConf
 from transformers import AutoConfig
@@ -39,6 +40,7 @@ from just_grpo.generation.megatron_generation import generate_responses, pack_re
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.data.interfaces import TokenizerType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.megatron.train import model_forward
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
@@ -57,37 +59,69 @@ class MegatronDiffusionPolicyWorkerImpl(MegatronPolicyWorkerImpl):
         self.diffusion = JustGRPOConfig.model_validate(
             OmegaConf.to_container(self.research_config.just_grpo, resolve=True)
         )
-        # Register the trusted configuration class before Bridge reads the checkpoint.
         hf_config = AutoConfig.from_pretrained(
             config["model_name"], trust_remote_code=True
         )
         if hf_config.model_type != "nemotron_labs_diffusion":
             raise ValueError("JustGRPO requires Nemotron Labs Diffusion")
-        if (
-            2 * config["max_total_sequence_length"]
-            > hf_config.rope_parameters["original_max_position_embeddings"]
-        ):
-            raise ValueError(
-                "Doubled diffusion context exceeds the unscaled position window"
-            )
-        register_allowed_target_prefix(type(hf_config).__module__ + ".")
-        config["megatron_cfg"]["model_overrides"] = {
+        megatron_config = config["megatron_cfg"]
+        if not megatron_config["enabled"]:
+            raise ValueError("JustGRPO requires an enabled Megatron backend")
+        megatron_config["model_overrides"] = {
+            **(megatron_config.get("model_overrides") or {}),
             "seq_length": config["max_total_sequence_length"],
             "block_size": self.diffusion.schedule.block_size,
         }
+        self.mask_token_id = self.diffusion.schedule.mask_token_id
         super().__init__(
             config,
             tokenizer,
-            prepare_microbatch_fn=partial(
-                prepare_diffusion_microbatch,
-                mask_token_id=self.diffusion.schedule.mask_token_id,
-            ),
+            prepare_microbatch_fn=self._prepare_diffusion_microbatch,
             loss_postprocessor_factory=DiffusionLossPostProcessor,
             logprobs_postprocessor_factory=DiffusionLogprobsPostProcessor,
             **kwargs,
         )
         self.generation_index = 0
         self.generation_vocab_size = hf_config.vocab_size
+
+    def _streaming_loss_token_mask(self, data: BatchedDataDict[Any]) -> torch.Tensor:
+        """Diffusion predicts every selected position, including column zero."""
+        return data["token_mask"]
+
+    def _set_asymmetric_metadata(self, data: BatchedDataDict[Any]) -> None:
+        modules = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, NemotronLabsDiffusionAttention)
+        ]
+        if not modules:
+            raise RuntimeError(
+                "Diffusion policy requires Nemotron Labs Diffusion attention"
+            )
+        metadata = modules[0].build_asymmetric_ar_metadata(
+            noisy_length=data["input_ids"].shape[1],
+            clean_length=data["clean_input_ids"].shape[1],
+            noisy_response_offset=0,
+            prompt_lengths=data["prompt_lengths"],
+            response_lengths=data["response_lengths"],
+            noisy_valid_lengths=data["noisy_valid_lengths"],
+            clean_lengths=data["clean_lengths"],
+        )
+        for module in modules:
+            module.set_asymmetric_ar_metadata(metadata)
+
+    def _clear_asymmetric_metadata(self) -> None:
+        for module in self.model.modules():
+            if isinstance(module, NemotronLabsDiffusionAttention):
+                module.clear_asymmetric_ar_metadata()
+
+    def _prepare_diffusion_microbatch(
+        self, microbatch: ProcessedMicrobatch
+    ) -> ProcessedMicrobatch:
+        self._set_asymmetric_metadata(microbatch.data_dict)
+        return prepare_diffusion_microbatch(
+            microbatch, mask_token_id=self.mask_token_id
+        )
 
     def _schedule(
         self, data: BatchedDataDict[Any], *, selected: bool = True
@@ -127,12 +161,15 @@ class MegatronDiffusionPolicyWorkerImpl(MegatronPolicyWorkerImpl):
                 require_router_replay=require_router_replay,
             )["logprobs"]
 
-        scores = aggregate_diffusion_logprobs(
-            schedule.iter_levels(data),
-            score,
-            original_shape=data["input_ids"].shape,
-            device=data["input_ids"].device,
-        )
+        try:
+            scores = aggregate_diffusion_logprobs(
+                schedule.iter_levels(data),
+                score,
+                original_shape=data["input_ids"].shape,
+                device=data["input_ids"].device,
+            )
+        finally:
+            self._clear_asymmetric_metadata()
         return BatchedDataDict(logprobs=scores.cpu())
 
     def train(
@@ -157,6 +194,8 @@ class MegatronDiffusionPolicyWorkerImpl(MegatronPolicyWorkerImpl):
         except Exception:
             self.abort_train_step()
             raise
+        finally:
+            self._clear_asymmetric_metadata()
         # Per-view sample counts must not multiply the actual rollout count.
         result["all_mb_metrics"]["num_valid_samples"] = [
             float((data["sample_mask"] > 0).sum())
@@ -218,20 +257,24 @@ class MegatronDiffusionPolicyWorkerImpl(MegatronPolicyWorkerImpl):
             # additional IDs are not part of the tokenizer's distribution.
             return logits[..., : self.generation_vocab_size]
 
-        responses = generate_responses(
-            forward,
-            prompts,
-            batch_size=self.cfg["logprob_batch_size"],
-            device=torch.device("cuda", torch.cuda.current_device()),
-            sampling=sampling,
-            max_new_tokens=generation["max_new_tokens"],
-            max_sequence_length=self.cfg["max_total_sequence_length"],
-            mask_token_id=self.diffusion.schedule.mask_token_id,
-            stop_token_ids=stop,
-            seed=self.research_config.grpo.seed
-            + parallel_state.get_data_parallel_rank()
-            + self.generation_index * parallel_state.get_data_parallel_world_size(),
-        )
+        try:
+            responses = generate_responses(
+                forward,
+                prompts,
+                prepare_attention=self._set_asymmetric_metadata,
+                batch_size=self.cfg["logprob_batch_size"],
+                device=torch.device("cuda", torch.cuda.current_device()),
+                sampling=sampling,
+                max_new_tokens=generation["max_new_tokens"],
+                max_sequence_length=self.cfg["max_total_sequence_length"],
+                mask_token_id=self.diffusion.schedule.mask_token_id,
+                stop_token_ids=stop,
+                seed=self.research_config.grpo.seed
+                + parallel_state.get_data_parallel_rank()
+                + self.generation_index * parallel_state.get_data_parallel_world_size(),
+            )
+        finally:
+            self._clear_asymmetric_metadata()
         self.generation_index += 1
         return pack_responses(
             prompts,

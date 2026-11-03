@@ -15,16 +15,15 @@
 
 import pytest
 import torch
-from omegaconf import OmegaConf
-from test_schedule import TinyDiffusion, batch
-from test_sudoku_and_config import load, PROJECT
-
 from just_grpo.algorithms.block_just_grpo import (
     BlockJustGRPOSchedule,
     select_low_confidence_tokens,
 )
 from just_grpo.config import ScheduleConfig, validate_config
 from just_grpo.diffusion.denoising_schedule import aggregate_diffusion_logprobs
+from omegaconf import OmegaConf
+from test_schedule import TinyDiffusion, batch
+from test_sudoku_and_config import PROJECT, load
 
 
 def confidence_batch():
@@ -91,9 +90,12 @@ def test_selection_preserves_every_denoising_canvas_and_selected_logprob():
         assert torch.equal(original["masked_indices"], sparse["masked_indices"])
         assert torch.equal(original["input_ids"], sparse["input_ids"])
         active = sparse["token_mask"]
-        assert torch.equal(active, original["token_mask"] & selected)
+        assert torch.equal(
+            active,
+            original["token_mask"] & selected.gather(1, sparse["original_positions"]),
+        )
         torch.testing.assert_close(model(original)[active], model(sparse)[active])
-        coverage += active
+        coverage.scatter_add_(1, sparse["original_positions"], active.int())
     assert torch.equal(coverage, selected.int())
     sparse_logprobs = aggregate_diffusion_logprobs(
         fast.iter_levels(),
@@ -153,9 +155,9 @@ def test_per_block_selection_and_partial_views_preserve_scores_and_gradients():
     assert full.num_steps == 4 and compact.num_steps == 1
     view = compact.generate_single_trajectory(0)
     # Sample 0 blocks select offsets 3 and 1; sample 1 selects offset 0.
-    assert view["masked_indices"][0, 4:8].tolist() == [False, False, False, True]
-    assert view["masked_indices"][0, 8:12].tolist() == [False, True, True, True]
-    assert view["masked_indices"][1, 8:12].all()
+    assert view["masked_indices"][0, :4].tolist() == [False, False, False, True]
+    assert view["masked_indices"][0, 4:8].tolist() == [False, True, True, True]
+    assert view["masked_indices"][1, :4].all()
     torch.manual_seed(17)
     model = TinyDiffusion()
     dense_values = sum(model(t) * t["token_mask"] for t in full.return_schedule(2))
@@ -170,7 +172,10 @@ def test_per_block_selection_and_partial_views_preserve_scores_and_gradients():
     )
     for a, b in zip(dense_grad, compact_grad):
         torch.testing.assert_close(a, b)
-    assert torch.equal(view["token_mask"], selected)
+    assert torch.equal(
+        view["token_mask"],
+        selected.gather(1, view["original_positions"]) & compact.response_mask,
+    )
 
 
 @pytest.mark.parametrize("fraction", [1.0, 0.25])
@@ -188,9 +193,19 @@ def test_native_streaming_token_count_matches_selected_targets(fraction):
         selected_positions_per_block=1 if fraction < 1 else None,
     )
     count = sum(
-        (level["token_mask"][:, 1:] * level["sample_mask"][:, None]).sum()
+        (level["token_mask"] * level["sample_mask"][:, None]).sum()
         for level in schedule.iter_levels(data)
     )
     expected = (data["training_token_mask"] * data["sample_mask"][:, None]).sum()
     assert expected > 0
     torch.testing.assert_close(count, expected)
+
+
+def test_fast_selection_uses_response_relative_blocks():
+    data = confidence_batch().slice(0, 1)
+    data["token_mask"][:, 3] = 1
+    data["generation_logprobs"] = torch.tensor(
+        [[0.0, 0.0, 0.0, -1.0, -2.0, -3.0, -4.0, -8.0, -7.0, -6.0, 0.0, 0.0]]
+    )
+    selected = select_low_confidence_tokens(data, fraction=0.25, block_size=4)
+    assert selected.nonzero()[:, 1].tolist() == [6, 7]

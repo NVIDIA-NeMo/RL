@@ -33,7 +33,7 @@ from nemo_rl.models.megatron.train import LogprobsPostProcessor, LossPostProcess
 def prepare_diffusion_microbatch(
     microbatch: ProcessedMicrobatch, *, mask_token_id: int
 ) -> ProcessedMicrobatch:
-    """Prepare fixed-width [noisy | clean] inputs for the native block mask.
+    """Prepare [noisy response | clean context] inputs for asymmetric attention.
 
     The research config restricts this layout to unpacked PP=CP=1 training.
     Keep clean targets and loss metadata in data_dict, independent of inputs.
@@ -43,12 +43,17 @@ def prepare_diffusion_microbatch(
     data = microbatch.data_dict
     clean = data["input_ids"]
     noisy = clean.masked_fill(data["masked_indices"], mask_token_id)
-    inputs = torch.cat([noisy, clean], dim=1)
+    context = data["clean_input_ids"]
+    inputs = torch.cat([noisy, context], dim=1)
+    noisy_positions = data["prompt_lengths"][:, None] + data["position_ids"]
+    clean_positions = torch.arange(context.shape[1], device=context.device)[
+        None
+    ].expand_as(context)
     return replace(
         microbatch,
         input_ids=inputs,
         input_ids_cp_sharded=inputs,
-        position_ids=data["position_ids"].repeat(1, 2),
+        position_ids=torch.cat([noisy_positions, clean_positions], dim=1),
         attention_mask=None,
         original_seq_length=inputs.shape[1],
     )
@@ -59,7 +64,7 @@ def selected_diffusion_logprobs(
 ) -> torch.Tensor:
     """Extract selected same-position scores from temperature-scaled logits.
 
-    Ignore the clean half. Scores retain the clean sequence shape, with zeros
+    Ignore the clean context. Scores retain the noisy response shape, with zeros
     outside the selection, so training and reference scoring use one layout.
     """
     targets = data["target_ids"]

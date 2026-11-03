@@ -2,6 +2,62 @@
 
 The research driver supports Megatron training with reference vLLM or in-process Megatron generation. The earlier Transformers training adapter and its verification-only worker have been removed. Historical artifacts remain in their original run directories and Git history.
 
+## Asymmetric attention with Bridge PR #6771 (2026-11-03)
+
+The current implementation uses response-relative noisy blocks and unmodified
+clean prompts. Generation, old/reference scoring, and training install the same
+native asymmetric-attention metadata. Same-position streaming normalization
+includes response column zero. Earlier experiments below predate this change.
+
+The exact dependency revisions are Megatron Bridge
+`7bb664b85e36c741ac94025ecf658f2c31ebadac` and Megatron-Core
+`e0a4bfed7f1e233b857187ceff0104645858d7d1`. The local Bridge worktree is
+`/lustre/fsw/portfolios/coreai/users/snorouzi/Megatron-Bridge-pr-nld-20261103`.
+
+Job **21248569**, on two H100 GPUs with TP=1/DP=2, completed three updates each
+of Standard and Fast JustGRPO using the pretrained Nemotron-Labs-Diffusion-3B
+checkpoint, native HF-to-Megatron conversion, Megatron generation, reference
+scoring, and initial/final validation. Both runs passed the functional metric
+checker with finite nonzero gradients. The runs used 2 prompts x 4 generations,
+512 generated tokens, context limit 1536, block size 16, and one reveal per step.
+Fast selected 25% of positions per response block.
+
+| Run | Maximum generation/training KL | Final reference KL | Validation before / after |
+| --- | --- | --- | --- |
+| Standard | 0.000298 | 0.000709 | 0.200000 / 0.273810 |
+| Fast | 0.001022 | 0.002819 | 0.200000 / 0.273810 |
+
+The research GPU suite passed **170 tests**, including independent serial
+score/gradient oracles, unaligned prompts, generation/training parity, actual
+Bridge metadata installation, and cleanup after worker failures. The streaming-worker suite passed **85 tests**, the native
+checkpoint-cache cleanup tests passed **2 tests**, and the community checkpoint
+import tests passed **4 tests**. The offline remote-tokenizer regression passed
+with Transformers 5.15.0. Formatting/lint hooks and a scoped Pyrefly check of
+the block layout and schedule passed. The broader scoped Pyrefly run is not
+clean; it reports worker/config typing errors, so this is not a full typecheck
+pass.
+
+These are execution and score-alignment smokes, not convergence evidence.
+TP=2, CP>1, checkpoint resume, and a full rebuilt container are not verified.
+The provisioned GPU environment uses PyTorch 2.10.0+cu129 and Transformer
+Engine 2.14.0+71bbefbf; the dependency lock selects PyTorch 2.11.0 and TE 2.18.0. The first two runs used Transformers 5.12.1/NVRx 0.6.0. A second three-update
+Fast run passed with Python 3.13.14, Transformers 5.15.0, PEFT 0.20.0, and
+NVRx 0.7.0: maximum generation/training KL 0.001048, final reference KL
+0.003132, validation 0.200000 to 0.273810. The 170-test research suite also
+passed under those dependency versions. A further three-update Fast run with
+ModelOpt 0.48.0 also passed (maximum generation/training KL 0.001022, final
+reference KL 0.002819, identical validation endpoints). All six checkpoint
+import/cache tests passed with the updated Python dependencies. Dependency-pin
+guards passed four tests. The regenerated lock passes `uv lock --check` with
+uv 0.11.28 (the Dockerfile pin) and retains lock format revision 3. Static
+FlashInfer binary-wheel metadata avoids multi-GB downloads during resolution.
+
+Artifacts and exact commands:
+`/lustre/fsw/portfolios/coreai/users/snorouzi/runs/diffusion_rl/pr4258_mb_20261103/`
+(`train.sh`, `train-fast.sh`, `standard-final.log`, `fast.log`,
+`research-tests-final.log`, `train-fast-newdeps.sh`, `train-fast-aligned.sh`,
+`fast-aligned.log`, `provenance-aligned.log`).
+
 ## Normalization and recipe cleanup (2026-09-24)
 
 Training now uses native streaming token-mask counts, without a

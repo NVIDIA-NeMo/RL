@@ -19,16 +19,11 @@ from typing import Any
 import torch
 
 from just_grpo.config import ScheduleConfig
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
+from just_grpo.diffusion.block_layout import (
+    BlockDiffusionLayout,
+)
 from just_grpo.diffusion.denoising_schedule import DenoisingSchedule
-
-
-def align_prompt(
-    tokens: list[int], *, block_size: int, mask_token_id: int
-) -> list[int]:
-    """Left-pad with fixed MASK context; use these exact IDs for generation too."""
-    return [mask_token_id] * (-len(tokens) % block_size) + tokens
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 @torch.no_grad()
@@ -59,17 +54,21 @@ def select_low_confidence_tokens(
     if block_size is not None:
         if block_size < 1:
             raise ValueError("block_size must be positive")
-        width = valid.shape[1]
-        padding = -width % block_size
-        block_valid = torch.nn.functional.pad(valid, (0, padding)).reshape(
-            valid.shape[0], -1, block_size
-        )
-        scores = torch.nn.functional.pad(logprobs, (0, padding), value=float("inf"))
-        scores = scores.reshape_as(block_valid).masked_fill(~block_valid, float("inf"))
-        count = math.ceil(fraction * block_size)
-        order = scores.argsort(dim=-1, stable=True)[..., :count]
-        selected = torch.zeros_like(block_valid).scatter_(-1, order, True)
-        return (selected & block_valid).reshape(valid.shape[0], -1)[:, :width]
+        selected = torch.zeros_like(valid)
+        for row in range(valid.shape[0]):
+            positions = valid[row].nonzero().flatten()
+            if not positions.numel():
+                continue
+            start, end = int(positions[0]), int(positions[-1]) + 1
+            if end - start != positions.numel():
+                raise ValueError(
+                    "Block selection requires one contiguous response span"
+                )
+            for offset in range(start, end, block_size):
+                stop = min(offset + block_size, end)
+                order = logprobs[row, offset:stop].argsort(stable=True)
+                selected[row, offset + order[: math.ceil(fraction * block_size)]] = True
+        return selected
     counts = (valid.sum(dim=1) * fraction).ceil().long()
     order = logprobs.masked_fill(~valid, float("inf")).argsort(dim=1, stable=True)
     keep = torch.arange(valid.shape[1], device=valid.device)[None] < counts[:, None]
@@ -86,67 +85,21 @@ class BlockJustGRPOSchedule(DenoisingSchedule):
         padded_width: int | None = None,
         selected_positions_per_block: int | None = None,
     ) -> None:
-        ids = data["input_ids"]
-        valid = data["token_mask"].bool()
-        lengths = data["input_lengths"]
-        if (
-            ids.ndim != 2
-            or valid.shape != ids.shape
-            or lengths.shape != (ids.shape[0],)
-        ):
-            raise ValueError("Expected matching [N,S] IDs/masks and [N] lengths")
-        if ((lengths < 0) | (lengths > ids.shape[1])).any():
-            raise ValueError("Invalid input lengths")
-        valid = valid & (
-            torch.arange(ids.shape[1], device=ids.device)[None] < lengths[:, None]
+        layout = BlockDiffusionLayout(
+            data,
+            block_size=config.block_size,
+            pad_token_id=pad_token_id,
+            padded_width=padded_width,
         )
-        valid = valid & data["sample_mask"].bool()[:, None]
-        block = config.block_size
-        width = max(block, (ids.shape[1] + block - 1) // block * block)
-        if padded_width is not None:
-            if padded_width < width or padded_width % block:
-                raise ValueError("padded_width must fit the batch and align to a block")
-            width = padded_width
-        clean = torch.nn.functional.pad(
-            ids, (0, width - ids.shape[1]), value=pad_token_id
-        )
-        selected = data.get("training_token_mask")
-        if selected is None:
-            selected = valid
-        elif selected.shape != valid.shape or (selected.bool() & ~valid).any():
-            raise ValueError(
-                "training_token_mask must be a subset of valid response tokens"
-            )
-        score_mask = torch.nn.functional.pad(selected.bool(), (0, width - ids.shape[1]))
-        self.response_mask = torch.nn.functional.pad(valid, (0, width - ids.shape[1]))
-        canvas_mask = torch.zeros_like(clean, dtype=torch.bool)
-        for row, active in enumerate(valid):
-            positions = active.nonzero().flatten()
-            if not positions.numel():
-                continue
-            start, end = int(positions[0]), int(positions[-1]) + 1
-            if end - start != positions.numel():
-                raise ValueError(
-                    "Block JustGRPO currently requires one contiguous response span"
-                )
-            if start % block:
-                raise ValueError(
-                    "Prompt must be block-aligned before generation; use align_prompt"
-                )
-            canvas_mask[row, start : (end + block - 1) // block * block] = True
+        self.base = layout.base
+        self.response_mask = layout.response_mask
+        self.canvas_mask = layout.canvas_mask
+        self.original_width = layout.original_width
         self.config = config
-        self.original_width = ids.shape[1]
-        self.canvas_mask = canvas_mask
-        position_ids = torch.arange(width, device=ids.device)[None].expand_as(clean)
-        self.base = BatchedDataDict(
-            input_ids=clean,
-            target_ids=clean,
-            token_mask=score_mask,
-            position_ids=position_ids,
-            original_positions=position_ids.clamp_max(ids.shape[1] - 1),
-            sample_indices=torch.arange(ids.shape[0], device=ids.device),
-        )
-        self.selected_offsets = None
+        ids = data["input_ids"]
+        block = config.block_size
+        score_mask = self.base["token_mask"]
+        self.selected_offsets: torch.Tensor | None = None
         if selected_positions_per_block is not None:
             if config.reveal_tokens_per_step != 1:
                 raise ValueError("Compact partial views require one token per reveal")
@@ -188,8 +141,7 @@ class BlockJustGRPOSchedule(DenoisingSchedule):
         offsets = self.base["position_ids"] % self.config.block_size
         valid = self.base["token_mask"]
         result = BatchedDataDict(self.base)
-        # Tail tokens after EOS stay MASK at every reveal level. Prefix MASK
-        # tokens belong to fixed context and are never part of masked_indices.
+        # Tail tokens after EOS stay MASK at every reveal level.
         result["masked_indices"] = self.canvas_mask & (
             ~self.response_mask | (offsets >= prefix)
         )

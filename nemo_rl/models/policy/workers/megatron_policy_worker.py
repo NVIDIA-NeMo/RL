@@ -2139,6 +2139,10 @@ class MegatronPolicyWorkerImpl(
                 )
             raise
 
+    def _streaming_loss_token_mask(self, data: BatchedDataDict[Any]) -> torch.Tensor:
+        """Return predicted target positions for streaming loss normalization."""
+        return data["token_mask"][:, 1:]
+
     def _train_microbatch_body(
         self,
         state: dict[str, Any],
@@ -2161,10 +2165,10 @@ class MegatronPolicyWorkerImpl(
         sample_mask = data["sample_mask"]
         call_local_seqs = torch.sum(sample_mask).to(torch.float64)
         if "token_mask" in data:
-            token_mask = data["token_mask"]
-            call_local_toks = torch.sum(
-                token_mask[:, 1:] * sample_mask.unsqueeze(-1)
-            ).to(torch.float64)
+            token_mask = self._streaming_loss_token_mask(data)
+            call_local_toks = torch.sum(token_mask * sample_mask.unsqueeze(-1)).to(
+                torch.float64
+            )
         else:
             call_local_toks = call_local_seqs * data["input_ids"].shape[1]
 
@@ -2375,13 +2379,14 @@ class MegatronPolicyWorkerImpl(
         else:
             n_true = global_valid_seqs
         n_safe = n_true if n_true.item() > 0 else torch.tensor(1.0, device="cuda")
-        inv_n = float((1.0 / n_safe).item())
+        gradient_scale = n_safe.reciprocal()
+        inv_n = float(gradient_scale.item())
 
         # Rescale all locally-accumulated gradients by 1/N. The reduce
         # below sees the rescaled grads; for all_reduce the result is the
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
-        self.model.scale_gradients(inv_n)
+        self.model.scale_gradients(gradient_scale)
         if draft_step_state.active:
             draft_step_state.correct_main_grads(
                 self.model.parameters(),
