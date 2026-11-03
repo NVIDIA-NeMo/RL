@@ -147,10 +147,15 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "policy.megatron_cfg.tensor_model_parallel_size <= 2: at TP >= 3 "
             "Megatron-Core's TP reductions sum in a message-layout dependent order."
         )
-    if megatron_cfg.get("context_parallel_size") != 1:
+    # Generation always runs at CP=1. Megatron-Core's a2a CP gives each rank whole
+    # sequences of a subset of heads, which reproduces the CP=1 forward bitwise
+    # (NVIDIA/Megatron-LM#8935); the other CP types split attention by sequence.
+    cp_size = megatron_cfg.get("context_parallel_size") or 1
+    if cp_size > 1 and megatron_cfg.get("cp_comm_type") != "a2a":
         out.violations.append(
-            "batch_invariant_mode=True currently requires training context "
-            "parallel size 1."
+            "batch_invariant_mode=True with training context_parallel_size > 1 "
+            "requires policy.megatron_cfg.cp_comm_type='a2a' "
+            f"(got {megatron_cfg.get('cp_comm_type')!r})."
         )
     token_multiple = batch_invariant_token_multiple(
         megatron_cfg["tensor_model_parallel_size"]
@@ -234,7 +239,6 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             )
         matching_fields = (
             "tensor_model_parallel_size",
-            "context_parallel_size",
             "batch_invariant_mode",
             "batch_invariant_backend",
             "batch_invariant_collective",

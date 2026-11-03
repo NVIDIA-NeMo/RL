@@ -426,6 +426,9 @@ class MegatronConfig(TypedDict):
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
+    # Megatron-Core cp_comm_type; omit to keep the model provider's value. With
+    # batch_invariant_mode and context_parallel_size > 1 it must be "a2a".
+    cp_comm_type: NotRequired[Literal["p2p", "a2a", "all_gather", "a2a+p2p"]]
     # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
     radio_force_eval_mode: NotRequired[bool]

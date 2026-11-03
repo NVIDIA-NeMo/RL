@@ -40,6 +40,7 @@ CONFIGS_DIR = Path(__file__).resolve().parents[4] / "examples" / "configs"
 ZERO_KL_EXEMPLARS = [
     "recipes/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl.yaml",
     "recipes/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8.yaml",
+    "recipes/llm/grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-mxfp8-cp4.yaml",
     "recipes/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8-flashinfer.yaml",
     "recipes/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer.yaml",
 ]
@@ -235,7 +236,10 @@ def test_batch_invariant_reports_a_train_generation_tp_mismatch():
 @pytest.mark.parametrize(
     ("mutate", "expected"),
     [
-        (lambda c: c["megatron_cfg"].update(context_parallel_size=2), "context"),
+        (
+            lambda c: c["megatron_cfg"].update(context_parallel_size=2),
+            "cp_comm_type='a2a'",
+        ),
         (
             lambda c: c["megatron_cfg"].update(use_fused_linear_logprobs=True),
             "use_fused_linear_logprobs",
@@ -264,6 +268,21 @@ def test_batch_invariant_rejects_unsupported_settings(mutate, expected):
     mutate(config)
     result = zgm.validate_batch_invariant_mode(config)
     assert any(expected in v for v in result.violations), result.violations
+
+
+def test_batch_invariant_accepts_a2a_training_context_parallel():
+    # Generation stays at CP=1, so the CP sizes are not required to match.
+    config = _policy_config()
+    config["megatron_cfg"].update(context_parallel_size=2, cp_comm_type="a2a")
+    assert zgm.validate_batch_invariant_mode(config).violations == []
+
+
+@pytest.mark.parametrize("cp_comm_type", ["p2p", "all_gather", "a2a+p2p"])
+def test_batch_invariant_rejects_non_a2a_context_parallel(cp_comm_type):
+    config = _policy_config()
+    config["megatron_cfg"].update(context_parallel_size=2, cp_comm_type=cp_comm_type)
+    result = zgm.validate_batch_invariant_mode(config)
+    assert any("cp_comm_type='a2a'" in v for v in result.violations), result.violations
 
 
 def test_batch_invariant_accepts_sequence_packing():

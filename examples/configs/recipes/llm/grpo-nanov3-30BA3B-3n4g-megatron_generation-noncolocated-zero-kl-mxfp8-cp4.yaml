@@ -1,0 +1,19 @@
+# The zero-kl-mxfp8 recipe with context parallelism on the training side only:
+# training runs TP2 x CP4 with EP4 on two nodes, generation stays at CP=1 on the
+# third. All-to-all CP gives each rank whole sequences for a quarter of the heads,
+# so training still reproduces generation's log-probs bitwise.
+#
+# Needs Megatron-LM PR #8935 (batch-invariant a2a context parallelism).
+defaults: grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-mxfp8-cp4
+policy:
+  megatron_cfg:
+    context_parallel_size: 4
+    cp_comm_type: a2a
+logger:
+  log_dir: logs/grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-mxfp8-cp4
+  wandb:
+    name: grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-mxfp8-cp4
+cluster:
+  num_nodes: 3

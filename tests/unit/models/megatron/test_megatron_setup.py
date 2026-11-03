@@ -815,6 +815,26 @@ class TestApplyParallelismConfig:
 
         assert model_cfg.context_parallel_size == 4
 
+    def test_cp_comm_type_is_applied_only_when_set(self):
+        from nemo_rl.models.megatron.setup import _apply_parallelism_config
+
+        megatron_cfg = {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "num_layers_in_first_pipeline_stage": None,
+            "num_layers_in_last_pipeline_stage": None,
+            "sequence_parallel": False,
+            "context_parallel_size": 2,
+        }
+        model_cfg = MagicMock(cp_comm_type="p2p")
+        config = {"megatron_cfg": dict(megatron_cfg), "sequence_packing": {"enabled": True}}
+        _apply_parallelism_config(model_cfg, config)
+        assert model_cfg.cp_comm_type == "p2p"
+
+        config["megatron_cfg"]["cp_comm_type"] = "a2a"
+        _apply_parallelism_config(model_cfg, config)
+        assert model_cfg.cp_comm_type == "a2a"
+
 
 @pytest.mark.mcore
 class TestApplyMultimodalConfig:
