@@ -957,30 +957,42 @@ class MasterConfig(BaseModel, extra="allow"):
         return self
 
 
-def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
-    """Keep the initial Forest objective identical at startup and before fanout."""
+def validate_forest_objective(
+    algo_cfg: GRPOConfig | PPOConfig, loss: ClippedPGLossConfig
+) -> None:
+    """Keep the initial Forest objective identical at startup and before fanout.
+
+    GRPO uses one advantage per logical rollout; PPO runs GAE per physical row.
+    """
+    is_ppo = isinstance(algo_cfg, PPOConfig)
+    section = "ppo" if is_ppo else "grpo"
     unsupported = {
-        "grpo.adv_estimator.name": grpo.adv_estimator.name != "grpo",
+        f"{section}.adv_estimator.name": algo_cfg.adv_estimator.name
+        != ("gae" if is_ppo else "grpo"),
         "loss_fn.token_level_loss": not loss.token_level_loss,
         "loss_fn.sequence_level_importance_ratios": loss.sequence_level_importance_ratios,
         "loss_fn.truncated_importance_sampling_type": loss.truncated_importance_sampling_type
         == "seq-mask-tis",
         "loss_fn.use_kl_in_reward": loss.use_kl_in_reward,
         "loss_fn.positive_example_nll_weight": loss.positive_example_nll_weight != 0,
-        "grpo.use_dynamic_sampling": grpo.use_dynamic_sampling,
-        "grpo.reward_shaping.enabled": grpo.reward_shaping.enabled,
-        "grpo.reward_scaling.enabled": grpo.reward_scaling.enabled,
-        "grpo.calculate_advantages_on_gpu": bool(grpo.calculate_advantages_on_gpu),
-        "grpo.invalid_tool_call_advantage": grpo.invalid_tool_call_advantage
+        f"{section}.use_dynamic_sampling": algo_cfg.use_dynamic_sampling,
+        f"{section}.reward_shaping.enabled": algo_cfg.reward_shaping.enabled,
+        f"{section}.reward_scaling.enabled": algo_cfg.reward_scaling.enabled,
+        f"{section}.invalid_tool_call_advantage": algo_cfg.invalid_tool_call_advantage
         is not None,
-        "grpo.malformed_thinking_advantage": grpo.malformed_thinking_advantage
+        f"{section}.malformed_thinking_advantage": algo_cfg.malformed_thinking_advantage
         is not None,
     }
+    if not is_ppo:
+        # PPOConfig has no GPU advantage option.
+        unsupported["grpo.calculate_advantages_on_gpu"] = bool(
+            algo_cfg.calculate_advantages_on_gpu
+        )
     bad = [name for name, enabled in unsupported.items() if enabled]
     if bad:
         raise ValueError(
-            "Forest training (token_capture.forest_training) requires standard token-level GRPO; "
-            f"unsupported settings: {', '.join(bad)}"
+            "Forest training (token_capture.forest_training) requires token-level "
+            f"GRPO or PPO with GAE; unsupported settings: {', '.join(bad)}"
         )
 
 
@@ -1001,11 +1013,14 @@ def logprob_passes_required(
 
 
 def forest_execution_row_multiple(
-    policy: PolicyConfig, *, dp_size: int, logprobs_required: bool
+    policy: PolicyConfig | ValueConfig, *, dp_size: int, logprobs_required: bool
 ) -> int:
     """Common row divisibility for fixed or packed Megatron consumers.
 
     Policy and reference forwards share this trainer's mesh and logprob MBS.
+    A PPO critic is a second consumer on its own mesh; its value forward uses
+    ``logprob_batch_size`` when set, so callers pass ``logprobs_required`` from
+    that key's presence.
     Packed consumers form their own bins and only need complete DP shards.
     Non-interleaved PP admits any positive microbatch count; interleaved PP
     and dynamic batching require separate qualification.
@@ -1758,31 +1773,42 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "siblings have no durable receipts to recover"
         )
     if token_capture_config.forest_training:
-        if master_config.grpo is None:
-            raise ValueError("forest training requires GRPO")
+        forest_algo_cfg = algo_config(master_config)
         if not token_capture_config.enabled:
             raise ValueError(
                 "token_capture.forest_training requires token_capture.enabled=true"
             )
         if (
-            master_config.grpo.invalid_tool_call_advantage is not None
-            or master_config.grpo.malformed_thinking_advantage is not None
+            forest_algo_cfg.invalid_tool_call_advantage is not None
+            or forest_algo_cfg.malformed_thinking_advantage is not None
         ):
             raise ValueError(
                 "forest training does not support message-level advantage overrides"
             )
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
-        validate_forest_objective(master_config.grpo, master_config.loss_fn)
+        validate_forest_objective(forest_algo_cfg, master_config.loss_fn)
         if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
             raise ValueError(
                 "Forest does not support reward penalties or on-policy distillation"
             )
-        # Validate the fixed-batch policy shape before workers/generation start.
-        # Setup recomputes Q from the actual trainer DP mesh.
+        # Validate the fixed-batch policy and critic shapes before
+        # workers/generation start. Setup recomputes Q from the actual DP meshes.
         forest_execution_row_multiple(
             master_config.policy, dp_size=1, logprobs_required=True
         )
+        if is_ppo_run(master_config):
+            if forest_algo_cfg.value_training_mode != "whole_batch":  # type: ignore
+                # Forest pads the whole step to the critic's DP and microbatch
+                # sizes; split mode shards each chunk on its own.
+                raise ValueError(
+                    "forest training requires ppo.value_training_mode=whole_batch"
+                )
+            forest_execution_row_multiple(
+                master_config.value,  # type: ignore
+                dp_size=1,
+                logprobs_required="logprob_batch_size" in master_config.value,  # type: ignore
+            )
     if recovery_config.turn_checkpointing_enabled:
         # A turn snapshot holds rollout dispatch through Gym's prepare, commit and
         # drain, and the stall watchdog keeps counting meanwhile.

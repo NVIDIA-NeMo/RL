@@ -21,6 +21,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
+import math
 import os
 import time
 import warnings
@@ -50,6 +51,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_training_claims,
 )
 from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
     GRPOSaveState,
     RewardPenaltyConfig,
     _get_effort_config,
@@ -65,6 +67,7 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
 )
@@ -853,6 +856,30 @@ def _spinup_gym(
         ),
     )
     return shard_set, time.perf_counter() - t0
+
+
+def _forest_execution_row_multiple(
+    master_config: MasterConfig,
+    algo_cfg: GRPOConfig | PPOConfig,
+    trainer: TQPolicy,
+    value: Optional[TQValue],
+) -> int:
+    """Rows per Forest group must split evenly for the policy and any critic."""
+    multiple = forest_execution_row_multiple(
+        trainer.cfg,
+        dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
+        logprobs_required=any(logprob_passes_required(master_config, algo_cfg)),
+    )
+    if value is None:
+        return multiple
+    return math.lcm(
+        multiple,
+        forest_execution_row_multiple(
+            value.cfg,
+            dp_size=value.sharding_annotations.get_axis_size("data_parallel"),
+            logprobs_required="logprob_batch_size" in value.cfg,
+        ),
+    )
 
 
 def _generation_max_seq_len(generation_config) -> int:
@@ -2365,11 +2392,7 @@ def setup_single_controller(
         retry_policy=_build_retry_policy(master_config),
         forest_training=token_capture_cfg.forest_training,
         execution_row_multiple=(
-            forest_execution_row_multiple(
-                trainer.cfg,
-                dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
-                logprobs_required=any(logprob_passes_required(master_config, algo_cfg)),
-            )
+            _forest_execution_row_multiple(master_config, algo_cfg, trainer, value)
             if token_capture_cfg.forest_training
             else 1
         ),

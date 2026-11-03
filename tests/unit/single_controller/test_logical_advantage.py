@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise logical-owner GRPO through the actual SingleController stage."""
+"""Exercise logical-owner GRPO and PPO through the actual SingleController stage."""
 
 import asyncio
 import math
 from collections import defaultdict
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -25,11 +26,14 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GAEConfig,
+    GeneralizedAdvantageEstimator,
     GRPOAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
@@ -786,3 +790,132 @@ def test_unsupported_forest_estimator_or_objective_is_rejected(grpo, loss):
     with pytest.raises(ValueError, match="Forest"):
         asyncio.run(ctrl._advantage_stage(meta))
     assert not ctrl._dp_client.puts
+
+
+def _ppo_controller(meta, data, **gae):
+    """The GRPO harness above, switched to PPO with per-row GAE."""
+    ctrl = _controller(meta, data)
+    config = PPOConfig(
+        num_generations_per_prompt=ctrl._algo_cfg.num_generations_per_prompt,
+        adv_estimator=GAEConfig(gae_lambda=1.0, gae_gamma=1.0, **gae),
+    )
+    ctrl._algo_cfg = config
+    ctrl._is_ppo = True
+    ctrl._advantage_estimator = GeneralizedAdvantageEstimator(
+        config.adv_estimator, ClippedPGLossConfig()
+    )
+    ctrl._advantage_stage_config = AdvantageStageConfig(
+        advantage=ctrl._advantage_cfg,
+        algo=config,
+        is_ppo=True,
+        policy_logprobs_required=False,
+        reference_logprobs_required=False,
+        teacher_logprobs_required=False,
+        message_level_advantage_penalties_enabled=False,
+        opd_full_enabled=False,
+        shardable=False,
+        train_data_dump_dir=None,
+    )
+    ctrl._advantage_computer = AdvantageComputer(
+        ctrl._dp_client,
+        config=ctrl._advantage_stage_config,
+        advantage_estimator=ctrl._advantage_estimator,
+    )
+    return ctrl
+
+
+def _with_values(data: TensorDict, seed: int = 0) -> TensorDict:
+    generator = torch.Generator().manual_seed(seed)
+    data["values"] = torch.rand(data.batch_size[0], 3, generator=generator)
+    return data
+
+
+@pytest.mark.parametrize("reorder", [False, True])
+def test_forest_ppo_runs_gae_per_row_and_masks_whole_owner(reorder: bool) -> None:
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1), (3.0, 2)])], padding=True)
+    data = _with_values(data)
+    # A flagged segment filters every row of its owner (slot 2).
+    data["mask_sample"][3] = True
+    if reorder:
+        order = [5, 3, 0, 4, 2, 1]
+        meta, data = meta.subset(order), data[order]
+    inputs = data.clone()
+    ctrl = _ppo_controller(meta, data)
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    keep = torch.tensor([float(tag["logical_slot"] in (0, 1)) for tag in meta.tags])
+    torch.testing.assert_close(data["sample_mask"], keep)
+    expected, returns = ctrl._advantage_estimator.compute_advantage(
+        prompt_ids=None,
+        rewards=inputs["total_reward"].float(),
+        mask=inputs["token_mask"] * keep.unsqueeze(-1),
+        values=inputs["values"],
+    )
+    torch.testing.assert_close(data["advantages"], expected)
+    torch.testing.assert_close(data["returns"], returns)
+    # Segments of one owner keep their own values, so their advantages differ.
+    first = [i for i, tag in enumerate(meta.tags) if tag["logical_slot"] == 0]
+    assert not torch.equal(data["advantages"][first[0]], data["advantages"][first[1]])
+    padding = [i for i, tag in enumerate(meta.tags) if tag["is_execution_padding"]]
+    assert data["advantages"][padding].count_nonzero() == 0
+    # Owner-level reward metrics: two retained owners, padding never votes.
+    assert ctrl._step_log_dict["reward_partials"][0].weight == 2
+
+
+def test_forest_ppo_normalize_over_all_rows_excludes_execution_padding() -> None:
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
+    data = _with_values(data, seed=1)
+    data["mask_sample"][2] = True  # slot 1 trains nothing but still whitens.
+    # Live padding tokens and a huge reward would dominate any statistic.
+    data["token_mask"][-1] = torch.tensor([0.0, 1.0, 1.0])
+    inputs = data.clone()
+    results = {}
+    for normalize_over in ("kept_rows", "all_rows"):
+        data = inputs.clone()
+        ctrl = _ppo_controller(meta, data, normalize_over=normalize_over)
+        asyncio.run(ctrl._advantage_stage(meta))
+        results[normalize_over] = data["advantages"].clone()
+    keep = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    real = torch.tensor([1.0, 1.0, 1.0, 0.0]).unsqueeze(-1)
+    estimator = ctrl._advantage_estimator
+    expected, _ = estimator.compute_advantage(
+        prompt_ids=None,
+        rewards=inputs["total_reward"].float(),
+        mask=inputs["token_mask"] * real,
+        values=inputs["values"],
+    )
+    expected = expected * inputs["token_mask"] * keep.unsqueeze(-1)
+    torch.testing.assert_close(results["all_rows"], expected)
+    assert not torch.allclose(results["all_rows"], results["kept_rows"])
+    assert results["all_rows"][2:].count_nonzero() == 0
+
+
+def test_forest_objective_accepts_ppo_gae_only() -> None:
+    validate_forest_objective(PPOConfig(), ClippedPGLossConfig())
+    with pytest.raises(ValueError, match="ppo.adv_estimator.name"):
+        validate_forest_objective(
+            PPOConfig(adv_estimator={"name": "raw_reward"}), ClippedPGLossConfig()
+        )
+    with pytest.raises(ValueError, match="ppo.use_dynamic_sampling"):
+        validate_forest_objective(
+            PPOConfig(use_dynamic_sampling=True), ClippedPGLossConfig()
+        )
+
+
+@pytest.mark.parametrize("forest", [False, True])
+def test_critic_takes_every_forest_row_as_one_step(forest: bool) -> None:
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
+    if not forest:
+        tags = [{GROUP_ID_TAG: "a"} for _ in meta.sample_ids]
+        meta = KVBatchMeta(
+            "train", "train", meta.sample_ids, fields=list(data.keys()), tags=tags
+        )
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._value = MagicMock()
+    ctrl._value.train_from_meta.return_value = {}
+    ctrl._value_loss_fn = object()
+    asyncio.run(ctrl._value_train_epochs(meta, num_epochs=2))
+    calls = ctrl._value.train_from_meta.call_args_list
+    assert len(calls) == 2
+    assert {call.kwargs["gbs"] for call in calls} == {meta.size if forest else None}

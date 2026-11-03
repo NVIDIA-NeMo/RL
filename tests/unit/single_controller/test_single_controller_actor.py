@@ -3017,13 +3017,13 @@ class _NoOpValue:
     def prepare_for_training(self) -> None:
         self._record("prepare_for_training")
 
-    def begin_train_step(self, loss_fn) -> None:
+    def begin_train_step(self, loss_fn, **kwargs) -> None:
         self._record("begin_train_step")
 
     def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
         self._record("train_microbatches_from_meta")
 
-    def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
+    def train_from_meta(self, meta: KVBatchMeta, loss_fn, **kwargs) -> dict:
         self.trained_sample_ids.append(meta.sample_ids)
         self._record("train_from_meta")
         return {
@@ -3500,9 +3500,9 @@ class _StreamingPPOValue(_NoOpValue):
         assert not self.inference_prepared
         super().prepare_for_training()
 
-    def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
+    def train_from_meta(self, meta: KVBatchMeta, loss_fn, **kwargs) -> dict:
         self.trained_metas.append(meta)
-        return super().train_from_meta(meta, loss_fn)
+        return super().train_from_meta(meta, loss_fn, **kwargs)
 
 
 class _StreamingPPODataPlane(_NoOpDataPlane):
@@ -4402,7 +4402,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
             overlong_filtering=False,
             # The shard-decline log names the estimator, so an unshardable
             # stub has to carry one even though the assertions below ignore it.
-            adv_estimator=SimpleNamespace(name="gae"),
+            adv_estimator=SimpleNamespace(name="gae", normalize_over="kept_rows"),
         )
     )
     ctrl._algo_cfg = ctrl._master_config.ppo

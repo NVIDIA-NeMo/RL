@@ -1,6 +1,6 @@
 # Context compaction with framework-owned training rows
 
-This opt-in SingleController GRPO path lets a harness rewrite its semantic history while NeMo-RL owns the resulting training rows. It builds on the ordinary worker token/media capture path. It does not patch upstream vLLM.
+This opt-in SingleController GRPO and PPO path lets a harness rewrite its semantic history while NeMo-RL owns the resulting training rows. It builds on the ordinary worker token/media capture path. It does not patch upstream vLLM.
 
 The underlying mechanism is **forest training**: selected captured calls become
 training paths with one reward and advantage per logical rollout. Compaction is
@@ -101,7 +101,7 @@ Completed attempt receipts retain unselected records for cleanup. Before publica
 
 ## Configuration and supported scope
 
-Enable `token_capture.enabled: true` and `token_capture.forest_training: true` on the SingleController GRPO configuration. The former `token_capture.context_compaction` key is rejected with a migration message; rename it while keeping its value. For the included example, select Gym's `simple_agent_with_compaction` and configure its `context_history` policy/guards. RL sets Gym's internal `parent_resolution: source_history` with external `vllm_worker` staging and `rebuild_response: false`.
+Enable `token_capture.enabled: true` and `token_capture.forest_training: true` on a SingleController GRPO or PPO configuration. The former `token_capture.context_compaction` key is rejected with a migration message; rename it while keeping its value. For the included example, select Gym's `simple_agent_with_compaction` and configure its `context_history` policy/guards. RL sets Gym's internal `parent_resolution: source_history` with external `vllm_worker` staging and `rebuild_response: false`.
 
 `token_capture.selection_policy` controls training membership:
 
@@ -223,6 +223,14 @@ regardless of segment count, and execution padding is excluded. A group below th
 minimum is discarded and the controller seeks a replacement within its existing
 replacement budget. The default, `None`, disables this group-level filter.
 
+With PPO, the critic scores every physical row and GAE runs per row with that
+row's own values; every row of a logical rollout carries the rollout's reward.
+The logical rollout still decides validity as above. `ppo.adv_estimator.normalize_over`
+selects the whitening population: `kept_rows` (default) or `all_rows`, which also
+includes rows masked from the loss. Execution padding never counts. The critic
+trains on all of a step's rows as one optimizer step, and execution padding is
+sized for both the policy's and the critic's data-parallel and microbatch shapes.
+
 Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 
 Captured-rollout length metrics are emitted after tensor verification, with one
@@ -234,7 +242,7 @@ as generated output. Environment masking does not erase verified generations;
 unverifiable owners contribute zero. These are generation statistics before
 learner-side filtering, not counts of tokens ultimately used in the loss.
 
-The implementation supports concurrent capture through Responses and Chat, bounded resampling of definite responses, ordinary text/images supported by the foundation processor path, token-level GRPO, and direct route assembly. It retains existing forest-training guards on deferred route assembly, incompatible objectives, message-level advantage overrides and non-unit dataset loss multipliers. Buffered Responses SSE is supported through a non-streaming upstream call. Incremental engine streaming, provider-managed conversation state, assistant prefill, and engine prompt truncation are rejected. Ordinary capture keeps its existing path with the option disabled.
+The implementation supports concurrent capture through Responses and Chat, bounded resampling of definite responses, ordinary text/images supported by the foundation processor path, token-level GRPO, PPO with GAE, and direct route assembly. It retains existing forest-training guards on deferred route assembly, incompatible objectives, message-level advantage overrides and non-unit dataset loss multipliers. Buffered Responses SSE is supported through a non-streaming upstream call. Incremental engine streaming, provider-managed conversation state, assistant prefill, and engine prompt truncation are rejected. Ordinary capture keeps its existing path with the option disabled.
 
 Both repositories must use the paired capture schema v3 revision, including the `ReplaySummary` representation on this route. Earlier experimental v3 ledgers that persisted `ReplayContext.items` are rejected, as are prior v2 staged checkpoints; there is no automatic migration of those older capture formats. Source normalization and token/media digest versions are unchanged by the summary representation.
 

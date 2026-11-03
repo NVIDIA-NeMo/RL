@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import json
+import math
 import threading
 import warnings
 from pathlib import Path
@@ -33,6 +35,7 @@ from omegaconf import OmegaConf
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GAEConfig,
     OPDAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import (
@@ -79,6 +82,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     TokenCaptureConfig,
     _validate_opd_full_config,
     forest_execution_row_multiple,
+    logprob_passes_required,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -4314,6 +4318,78 @@ def test_setup_and_advantage_share_logprob_requirements(
 def test_forest_startup_accepts_partial_step_policy(forest_config, fraction):
     forest_config.async_rl.rollout_failure.min_step_batch_fraction = fraction
     validate_single_controller_config(forest_config)
+
+
+def _forest_ppo_config(mc, **adv_estimator):
+    # Only fields PPOConfig declares, so GRPO-only fields cannot mask a bug.
+    fields = {k: v for k, v in dict(mc.grpo).items() if k in PPOConfig.model_fields}
+    mc.ppo = PPOConfig.model_construct(
+        **(fields | {"adv_estimator": GAEConfig(**adv_estimator)})
+    )
+    mc.grpo = None
+    mc.value = copy.deepcopy(mc.policy)
+    mc.value_loss_fn = MseValueLossConfig()
+    return mc
+
+
+def test_forest_startup_accepts_ppo_with_gae(forest_config):
+    validate_single_controller_config(_forest_ppo_config(forest_config))
+
+
+def test_forest_startup_rejects_split_value_training(forest_config):
+    mc = _forest_ppo_config(forest_config)
+    mc.ppo.value_training_mode = "split"
+    with pytest.raises(ValueError, match="value_training_mode=whole_batch"):
+        validate_single_controller_config(mc)
+
+
+def test_forest_startup_rejects_unsupported_critic_shape(forest_config):
+    mc = _forest_ppo_config(forest_config)
+    mc.value["dynamic_batching"] = {"enabled": True}
+    with pytest.raises(ValueError, match="non-interleaved Megatron"):
+        validate_single_controller_config(mc)
+
+
+def test_forest_startup_rejects_ppo_without_gae(forest_config):
+    with pytest.raises(ValueError, match="ppo.adv_estimator.name"):
+        validate_single_controller_config(
+            _forest_ppo_config(forest_config, name="raw_reward")
+        )
+
+
+@pytest.mark.parametrize("value_packing", [False, True])
+def test_forest_row_multiple_includes_the_critic(forest_config, value_packing):
+    def consumer(cfg, dp_size):
+        return SimpleNamespace(
+            cfg=cfg,
+            sharding_annotations=SimpleNamespace(get_axis_size=lambda _: dp_size),
+        )
+
+    trainer = consumer(forest_config.policy, 2)
+    value_cfg = {
+        "megatron_cfg": {"enabled": True},
+        "dynamic_batching": {"enabled": False},
+        "sequence_packing": {"enabled": value_packing},
+        "train_micro_batch_size": 5,
+    }
+    args = (forest_config, forest_config.grpo, trainer)
+    policy_only = sc_setup_mod._forest_execution_row_multiple(*args, None)
+    assert policy_only == forest_execution_row_multiple(
+        forest_config.policy,
+        dp_size=2,
+        logprobs_required=any(
+            logprob_passes_required(forest_config, forest_config.grpo)
+        ),
+    )
+    critic = consumer(value_cfg, 3)
+    # Packed critics need whole DP shards; fixed ones DP x lcm(train, value MBS).
+    assert sc_setup_mod._forest_execution_row_multiple(*args, critic) == math.lcm(
+        policy_only, 3 if value_packing else 15
+    )
+    value_cfg["logprob_batch_size"] = 7
+    assert sc_setup_mod._forest_execution_row_multiple(*args, critic) == math.lcm(
+        policy_only, 3 if value_packing else 105
+    )
 
 
 def test_forest_startup_rejects_mismatched_configured_batch_size(forest_config):

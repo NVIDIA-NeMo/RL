@@ -89,6 +89,10 @@ class GAEConfig(BaseModel, extra="allow"):
     gae_lambda_policy: Optional[float] = None
     # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled.
     length_adaptive_alpha: float = 0.0
+    # Rows whose response tokens GAE runs and whitens over. "kept_rows": only
+    # rows that train. "all_rows": also rows excluded from the loss by
+    # sample_mask, which still never train; execution padding is excluded.
+    normalize_over: Literal["kept_rows", "all_rows"] = "kept_rows"
 
 
 class GRPOAdvantageEstimator:
