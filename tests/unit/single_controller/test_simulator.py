@@ -388,7 +388,7 @@ def test_cpu_trainer_train_step_counts_rows_and_returns_no_metrics() -> None:
     _, trainer, meta, _ = _trainer_with_group()
     trainer.prepare_for_training()
     trainer.begin_train_step(loss_fn=None)
-    trainer.train_microbatches_from_meta(meta, train_fields=["input_ids"])
+    trainer.train_microbatches_from_meta(meta, train_fields=("input_ids",))
     trainer.train_microbatches_from_meta(meta)
     assert trainer.step_rows == 2 * meta.size
     assert trainer.finish_train_step() == {}

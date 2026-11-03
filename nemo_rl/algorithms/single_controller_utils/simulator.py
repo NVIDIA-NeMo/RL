@@ -420,7 +420,7 @@ class CpuTrainer(TQDriverMixin):
     def prepare_for_training(self) -> None:
         """No-op: no parameters to bring to GPU."""
 
-    def prepare_for_lp_inference(self, *, keep_train_buffers: bool = False) -> None:
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         """No-op: the logprob stages below read the data plane only."""
         del keep_train_buffers
 
@@ -490,9 +490,11 @@ class CpuTrainer(TQDriverMixin):
 
     # ── train step: accept the batch, return no metrics ─────────────────────
 
-    def begin_train_step(self, loss_fn: Any) -> None:
-        """Open a step; the loss is not evaluated."""
-        del loss_fn
+    def begin_train_step(
+        self, loss_fn: Any, gbs: Optional[int] = None, mbs: Optional[int] = None
+    ) -> None:
+        """Open a step; the loss is not evaluated and the batch sizes are unused."""
+        del loss_fn, gbs, mbs
         if self._step_open:
             raise RuntimeError("CpuTrainer: a train step is already open")
         self._step_open = True
@@ -501,11 +503,15 @@ class CpuTrainer(TQDriverMixin):
     def train_microbatches_from_meta(
         self,
         meta: KVBatchMeta,
-        *,
-        train_fields: Optional[list[str]] = None,
+        timer: Any = None,
+        train_fields: tuple[str, ...] = (),
     ) -> None:
-        """Count the rows of a chunk; no forward or backward runs."""
-        del train_fields
+        """Count the rows of a chunk; no forward or backward runs.
+
+        Same signature as ``TQPolicy.train_microbatches_from_meta``; the timer
+        and the field list are accepted and ignored.
+        """
+        del timer, train_fields
         if not self._step_open:
             raise RuntimeError("CpuTrainer: train_microbatches_from_meta before begin")
         self._step_rows += meta.size
