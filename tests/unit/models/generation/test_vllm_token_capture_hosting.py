@@ -155,7 +155,7 @@ class _ByteTokenizer:
 class _NoCallsInVllm:
     """An HTTP engine client none of whose captured calls has reached vLLM."""
 
-    def read_generation_progress(self, calls, *, timeout_s):
+    def read_generation_progress(self, calls, *, timeout_s, route_calls=frozenset()):
         return _EngineProgressRead([None] * len(calls), 0.0, 0.0)
 
 
@@ -395,44 +395,6 @@ def test_prefix_capture_setup_requires_a_control_token(monkeypatch):
                 {},
                 "rollout_staging",
                 generation_prefix_cuts_enabled=True,
-            )
-        )
-
-
-@pytest.mark.parametrize("http_client", ["missing", "unsupported_vllm"])
-def test_prefix_capture_with_router_replay_fails_at_setup_without_route_state(
-    monkeypatch, http_client: str
-):
-    """A cut reads an active request's routes through the HTTP client."""
-    monkeypatch.setattr(
-        "nemo_rl.data_plane.build_data_plane_client",
-        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(name="dp_client"),
-    )
-    monkeypatch.setattr(
-        "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda *args, **kwargs: _MemorySink(),
-    )
-    worker = _fake_worker()
-    worker.llm = MagicMock(name="llm")
-    worker._return_routed_experts_enabled = lambda: True
-    if http_client == "missing":
-        match = "need the vLLM HTTP server"
-        worker._http_engine_client = None
-    else:
-        match = "verified on vLLM"
-        worker._http_engine_client = MagicMock(name="http_engine_client")
-        worker._http_engine_client.check_route_snapshot_support.side_effect = (
-            RuntimeError("router-replay prefix recovery ... verified on vLLM 0.29.0")
-        )
-
-    with pytest.raises(RuntimeError, match=match):
-        asyncio.run(
-            VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                worker,
-                {},
-                "rollout_staging",
-                generation_prefix_cuts_enabled=True,
-                generation_cut_control_token="secret",
             )
         )
 
@@ -2402,7 +2364,7 @@ def _route_pieces(routes: torch.Tensor) -> list[torch.Tensor]:
 
 
 class _EngineRoutes:
-    """vLLM's active per-call route pieces, as a generation cut reads them.
+    """vLLM's per-call route pieces, as a cut's progress read copies them.
 
     ``by_call`` holds each model call's routes so far; tests only ever extend
     them, as vLLM only appends.
@@ -2411,15 +2373,19 @@ class _EngineRoutes:
     def __init__(self) -> None:
         self.by_call: dict[str, torch.Tensor] = {}
         self.reads: list[str] = []
-        self.error: Exception | None = None
         self._pieces: dict[str, list[torch.Tensor]] = {}
 
-    def __call__(
-        self, model_call_id: str, *, timeout_s: float | None
-    ) -> list[torch.Tensor] | None:
+    def record_progress(self, states: list[Any], *, deadline: float | None) -> None:
+        """Stand in for the cut's progress read; tokens come from ``_observe``."""
+        del deadline
+        for state in states:
+            if state.capture_routed_experts and state.terminal_routed_experts is None:
+                pieces = self(state.call.model_call_id)
+                with state.lock:
+                    state.cut_engine_route_pieces = pieces
+
+    def __call__(self, model_call_id: str) -> list[torch.Tensor] | None:
         self.reads.append(model_call_id)
-        if self.error is not None:
-            raise self.error
         routes = self.by_call.get(model_call_id)
         if routes is None:
             return None
@@ -2457,10 +2423,10 @@ def _router_replay_call(
     ng_capture: dict[str, Any] = _ROUTER_REPLAY_CALL,
     prompt: tuple[int, ...] = (10, 11),
 ) -> tuple[VllmAsyncGenerationWorkerImpl, _FakeRequest, _EngineRoutes]:
-    """An active router-replay call whose cuts read ``_EngineRoutes``."""
+    """An active router-replay call whose cuts take routes from ``_EngineRoutes``."""
     worker = _router_replay_worker(sink, weight_version=7)
     engine_routes = _EngineRoutes()
-    worker._snapshot_engine_routed_experts = engine_routes
+    worker._record_generation_progress = engine_routes.record_progress
     request = _FakeRequest(ng_capture=dict(ng_capture), stream=False)
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, list(prompt))
     worker._capture_calls[id(request)].effective_output_limit = 128
@@ -2637,50 +2603,68 @@ def test_router_replay_survives_repeated_prefix_cuts_and_resume(caplog) -> None:
     assert logged == [("restored", kept_sha), ("completed", kept_sha)]
 
 
-def test_router_replay_cut_reads_routes_once_after_freezing_its_tokens() -> None:
+def test_router_replay_cut_drops_routes_past_its_frozen_tokens() -> None:
     sink = _MemorySink()
     worker, request, engine_routes = _router_replay_call(sink)
-    state = worker._capture_calls[id(request)]
     _observe(worker, request, [12, 13])
     # Decoding observes no routes; only a cut reads them.
     assert engine_routes.reads == []
-
-    def read_while_decoding(model_call_id, *, timeout_s):
-        # The token count is frozen and the state lock released, so decoding
-        # has moved on: vLLM routed two more tokens than the cut froze.
-        assert not state.lock.locked()
-        assert state.frozen_cut == ("checkpoint-1", 2)
-        return _route_pieces(_routes(1, 2, 3, 4, 5))
-
-    worker._snapshot_engine_routed_experts = read_while_decoding
+    # vLLM routed two more tokens than the call recorded.
+    engine_routes.by_call["c1"] = _routes(1, 2, 3, 4, 5)
 
     assert _cut(worker, "checkpoint-1").disposition == "durable_prefix"
+    assert engine_routes.reads == ["c1"]
     (_, record) = sink.generation_prefix_records[0]
     # Prompt rows, the first generated token's row, then the final placeholder.
     assert _staged_routes(record) == [1, 2, 3, -1]
 
 
-@pytest.mark.parametrize(
-    "engine_failure",
-    ["request_left_vllm", "engine_loop_timeout"],
-)
-def test_router_replay_cut_without_engine_routes_fails_only_that_call(
-    engine_failure: str,
-) -> None:
+def test_progress_read_copies_route_pieces_only_for_router_replay_calls(
+    monkeypatch,
+):
+    routed = _engine_request([20, 21], [-0.1, -0.2])
+    routed.routed_experts_chunks = _route_pieces(_routes(1, 2))
+    text = _engine_request([30], [-0.3], request_id="chatcmpl-2")
+    text.routed_experts_chunks = _route_pieces(_routes(5))
+    client = _progress_client(monkeypatch, _OutputProcessor(routed, text))
+    client._captured_requests.update({"chatcmpl-1": "c1", "chatcmpl-2": "c2"})
+
+    read = client.read_generation_progress(
+        [("c1", 0), ("c2", 0)],
+        timeout_s=None,
+        route_calls=frozenset({"c1"}),
+    )
+
+    [with_routes, without_routes] = read.progress
+    assert with_routes.routed_experts_chunks == routed.routed_experts_chunks
+    # vLLM keeps appending to its list; the copy does not grow with it.
+    assert with_routes.routed_experts_chunks is not routed.routed_experts_chunks
+    assert without_routes.routed_experts_chunks is None
+
+
+def test_router_replay_cut_takes_routes_from_its_progress_read(monkeypatch) -> None:
     sink = _MemorySink()
     worker, request, engine_routes = _router_replay_call(sink)
-    _observe(worker, request, [12])
-    if engine_failure == "engine_loop_timeout":
-        engine_routes.error = TimeoutError()
-    # Otherwise vLLM finished the request before the cut read its routes, and
-    # the HTTP layer had not yet observed the final output.
+    # The worker's own progress read, not the test double.
+    del worker._record_generation_progress
+    decoding = _engine_request([12, 13], [-0.1, -0.2])
+    # Prefill routed both prompt tokens, then decode routed the first sample;
+    # the last sampled token is not routed until the next step prefills it.
+    routes = _routes(1, 2, 3)
+    decoding.routed_experts_chunks = [routes[:2], routes[2:]]
+    worker._http_engine_client = _progress_client(
+        monkeypatch, _OutputProcessor(decoding)
+    )
+    worker._http_engine_client._captured_requests["chatcmpl-1"] = "c1"
 
-    assert _cut(worker, "checkpoint-1").disposition == "durable_failure"
-    assert engine_routes.reads == ["c1"]
-    assert sink.generation_prefix_records == []
-    state = worker._capture_calls[id(request)]
-    assert state.frozen_cut is None
-    assert state.staged_token_count == 0
+    assert _cut(worker, "checkpoint-1").disposition == "durable_prefix"
+    # Tokens and routes came from one read at the same output boundary.
+    assert engine_routes.reads == []
+    (_, record) = sink.generation_prefix_records[0]
+    assert record.token_ids_delta[-2:] == [12, 13]
+    assert _staged_routes(record) == [1, 2, 3, -1]
+    # The cut took the pieces, so a later cut cannot reuse them.
+    assert worker._capture_calls[id(request)].cut_engine_route_pieces is None
 
 
 def test_router_replay_bad_routes_fail_only_that_call_and_every_checkpoint_goes_on() -> (
@@ -2720,11 +2704,6 @@ def test_router_replay_bad_routes_fail_only_that_call_and_every_checkpoint_goes_
         return {ack.model_call_id: ack.disposition for ack in receipt.prefixes}
 
     assert cut("checkpoint-1") == {"c1": "durable_failure", "c2": "durable_prefix"}
-    # The bad call is not poisoned: the next checkpoint tries it again.
-    engine_routes.by_call["c1"] = _routes(1, 2)
-    _observe(worker, good_request, [12, 13])
-    engine_routes.by_call["c2"] = _routes(1, 2, 3)
-    assert cut("checkpoint-2") == {"c1": "durable_prefix", "c2": "durable_prefix"}
 
 
 def test_router_replay_route_buffer_copies_only_new_rows_as_it_grows() -> None:
@@ -2844,17 +2823,26 @@ def test_vllm_later_route_reads_that_do_not_fit_are_a_route_error(
     assert torch.equal(torch.from_numpy(state.engine_route_buffer[:3]), joined)
 
 
-def test_router_replay_short_engine_routes_fail_the_cut_instead_of_padding() -> None:
+@pytest.mark.parametrize("engine_routes_served", ["missing", "short"])
+def test_router_replay_cut_without_full_engine_routes_fails_and_retries(
+    engine_routes_served: str,
+) -> None:
     """Padding missing rows would put routes on the wrong tokens, and a later
     cut would stage rows that no longer line up, failing the restore digest."""
     sink = _MemorySink()
     worker, request, engine_routes = _router_replay_call(sink)
     _observe(worker, request, [12, 13])
-    # Two prompt rows and the first generated token's row are needed.
-    engine_routes.by_call["c1"] = _routes(1, 2)
+    # Two prompt rows and the first generated token's row are needed. Missing:
+    # vLLM finished the request before the cut read it, and the HTTP layer had
+    # not yet observed the final output.
+    if engine_routes_served == "short":
+        engine_routes.by_call["c1"] = _routes(1, 2)
 
     assert _cut(worker, "checkpoint-1").disposition == "durable_failure"
+    assert engine_routes.reads == ["c1"]
     assert sink.generation_prefix_records == []
+    state = worker._capture_calls[id(request)]
+    assert (state.frozen_cut, state.staged_token_count) == (None, 0)
 
     # Once vLLM's routes cover the frozen tokens, the call is cut again, and
     # each later cut's chunks rebuild exactly the digest it advertised.

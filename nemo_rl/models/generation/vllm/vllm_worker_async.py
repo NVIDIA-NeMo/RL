@@ -140,6 +140,9 @@ class _EngineGenerationProgress:
     logprobs: Any
     finish_reason: str | None
     stop_reason: str | int | None
+    # Router replay: the request's route pieces at the same boundary, when the
+    # read was asked for them.
+    routed_experts_chunks: list[Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -594,12 +597,6 @@ def install_http_server_api_key_check(app: FastAPI, api_key: str) -> None:
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 
 
-# The vLLM release whose private route state ``snapshot_routed_experts`` reads
-# (``OutputProcessor.external_req_ids`` / ``request_states`` and
-# ``RequestState.routed_experts_chunks``). Re-check those fields on a bump.
-_ROUTE_SNAPSHOT_VLLM_RELEASE = (0, 29, 0)
-
-
 class _AsyncLLMHTTPClient:
     """Keep HTTP generation on the loop that owns AsyncLLM request state.
 
@@ -780,7 +777,11 @@ class _AsyncLLMHTTPClient:
         self._progress_reads_enabled = True
 
     def read_generation_progress(
-        self, calls: list[tuple[str, int]], *, timeout_s: float | None
+        self,
+        calls: list[tuple[str, int]],
+        *,
+        timeout_s: float | None,
+        route_calls: frozenset[str] = frozenset(),
     ) -> _EngineProgressRead:
         """Copy each captured call's generated token IDs past ``start``, at one boundary.
 
@@ -789,6 +790,9 @@ class _AsyncLLMHTTPClient:
                 number of generated tokens the call has already recorded.
             timeout_s: How long to wait for vLLM to finish its current output
                 chunk; ``None`` waits indefinitely.
+            route_calls: Model call IDs whose router-replay route pieces are
+                copied too, from the same request state at the same boundary,
+                so a cut needs no route read of its own.
 
         Returns:
             Per call, its progress, or ``None`` when it has not reached vLLM
@@ -813,7 +817,12 @@ class _AsyncLLMHTTPClient:
             progress = [
                 None
                 if (request_id := engine_request_ids.get(model_call_id)) is None
-                else self._read_one_request(processor, request_id, start)
+                else self._read_one_request(
+                    processor,
+                    request_id,
+                    start,
+                    routes=model_call_id in route_calls,
+                )
                 for model_call_id, start in calls
             ]
         finally:
@@ -823,7 +832,7 @@ class _AsyncLLMHTTPClient:
         )
 
     def _read_one_request(
-        self, processor: Any, request_id: str, start: int
+        self, processor: Any, request_id: str, start: int, *, routes: bool = False
     ) -> _EngineGenerationProgress | None:
         if request_id in self._finished_requests:
             finished = self._finished_requests[request_id]
@@ -842,6 +851,8 @@ class _AsyncLLMHTTPClient:
         if request_state.detokenizer is None:
             return None
         logprobs_processor = request_state.logprobs_processor
+        # A shallow copy: vLLM appends route pieces but never rewrites one.
+        route_chunks = request_state.routed_experts_chunks if routes else None
         return _EngineGenerationProgress(
             token_ids=list(request_state.detokenizer.output_token_ids[start:]),
             logprobs=None
@@ -849,6 +860,7 @@ class _AsyncLLMHTTPClient:
             else logprobs_processor.logprobs,
             finish_reason=finish_reason,
             stop_reason=stop_reason,
+            routed_experts_chunks=None if route_chunks is None else list(route_chunks),
         )
 
     # These members only read engine status or immutable configuration. Running
@@ -901,112 +913,6 @@ class _AsyncLLMHTTPClient:
             return progress
 
         return await self._run_on_engine_loop(read)
-
-    def check_route_snapshot_support(self) -> None:
-        """Fail at setup if ``snapshot_routed_experts`` cannot read this vLLM.
-
-        It reads private vLLM state. A release that renamed it would make
-        every router-replay call uncuttable, so prefix recovery would quietly
-        fall back to turn level.
-
-        Raises:
-            RuntimeError: vLLM is not the release that state was verified on,
-                or its output processor lacks the fields read.
-        """
-        installed = importlib.metadata.version("vllm")
-        if Version(installed).release[:3] != _ROUTE_SNAPSHOT_VLLM_RELEASE:
-            expected = ".".join(map(str, _ROUTE_SNAPSHOT_VLLM_RELEASE))
-            raise RuntimeError(
-                "router-replay prefix recovery reads vLLM's private route state, "
-                f"verified on vLLM {expected}; vLLM {installed} is installed. "
-                "Re-check snapshot_routed_experts and _ROUTE_SNAPSHOT_VLLM_RELEASE."
-            )
-        output_processor = self._engine_client.output_processor
-        missing = [
-            name
-            for name in ("external_req_ids", "request_states")
-            if not hasattr(output_processor, name)
-        ]
-        if missing:
-            raise RuntimeError(
-                "router-replay prefix recovery needs vLLM's "
-                f"OutputProcessor.{', '.join(missing)}, which this vLLM lacks"
-            )
-
-    def snapshot_routed_experts(
-        self, model_call_id: str, *, timeout_s: float | None
-    ) -> list[Any] | None:
-        """Copy an active captured call's route chunks on the engine loop.
-
-        vLLM 0.29 keeps routed experts in ``OutputProcessor.RequestState``
-        while decoding, only ever appends to them, and publishes them in
-        ``CompletionOutput`` once the request finishes. A generation cut reads
-        them here, from its own thread, after freezing the call's tokens.
-
-        Returns:
-            The call's route chunks in order, or ``None`` when vLLM is not
-            serving the call.
-
-        Raises:
-            TimeoutError: the engine loop did not answer within ``timeout_s``.
-            ValueError: more than one vLLM request serves ``model_call_id``, or
-                its state has no route chunks.
-        """
-
-        async def snapshot() -> list[Any] | None:
-            return self._routed_expert_chunks_on_owner(model_call_id)
-
-        future = asyncio.run_coroutine_threadsafe(snapshot(), self._engine_loop)
-        try:
-            return future.result(timeout=timeout_s)
-        except TimeoutError:
-            future.cancel()
-            raise
-
-    def _captured_request_id(self, model_call_id: str) -> str | None:
-        """Find the vLLM request serving a captured call, through the trace's link.
-
-        Raises:
-            ValueError: more than one vLLM request serves ``model_call_id``.
-        """
-        # One C-level copy under the GIL; the HTTP thread may add entries.
-        request_ids = [
-            request_id
-            for request_id, call_id in list(self._captured_requests.items())
-            if call_id == model_call_id
-        ]
-        if len(request_ids) > 1:
-            raise ValueError(
-                "router-replay prefix capture requires exactly one active "
-                f"vLLM request for {model_call_id!r}; found {len(request_ids)}"
-            )
-        return request_ids[0] if request_ids else None
-
-    def _routed_expert_chunks_on_owner(self, model_call_id: str) -> list[Any] | None:
-        """List one captured call's route chunks while on the engine loop.
-
-        A shallow copy: vLLM appends new chunks but never rewrites one.
-        """
-        request_id = self._captured_request_id(model_call_id)
-        if request_id is None:
-            return None
-        output_processor = self._engine_client.output_processor
-        internal_ids = list(output_processor.external_req_ids.get(request_id, ()))
-        if not internal_ids:
-            return None
-        if len(internal_ids) != 1:
-            raise ValueError(
-                "router-replay prefix capture requires exactly one active "
-                f"vLLM request for {request_id!r}; found {len(internal_ids)}"
-            )
-        state = output_processor.request_states.get(internal_ids[0])
-        if state is None:
-            return None
-        # Checked per call, not at setup: only a live request has this field.
-        chunks = getattr(state, "routed_experts_chunks", None)
-        if chunks is None:
-            raise ValueError("vLLM's request state has no routed_experts_chunks")
-        return list(chunks)
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -1519,10 +1425,6 @@ class VllmAsyncGenerationWorkerImpl(
             dp_client, staging_partition=staging_partition, capture_media=capture_media
         )
         self._staging_source = source
-        if generation_prefix_cuts_enabled and self._return_routed_experts_enabled():
-            # A cut reads the active request's routes through the HTTP client,
-            # which the check above already required.
-            self._http_engine_client.check_route_snapshot_support()
         self._chain_prefix.install(source)
         install_capture(
             self,
@@ -1711,10 +1613,17 @@ class VllmAsyncGenerationWorkerImpl(
         vLLM has finished but whose consumer has not yet taken the output is
         read whole, with its finish reason. One vLLM does not hold (not yet
         submitted, or aborted) keeps what it has recorded.
+
+        Router-replay calls get their route pieces copied in the same read, so
+        each cut's routes come from the boundary its tokens do, and the cut
+        reads no routes of its own.
         """
         pending = []
+        route_calls = set()
         for state in states:
             with state.lock:
+                # Pieces an earlier cut's read copied are stale for this one.
+                state.cut_engine_route_pieces = None
                 pending.append(
                     (
                         state,
@@ -1722,12 +1631,19 @@ class VllmAsyncGenerationWorkerImpl(
                         state.observed_generation_token_count,
                     )
                 )
+                # A final output's routes already cover the whole call.
+                if (
+                    state.capture_routed_experts
+                    and state.terminal_routed_experts is None
+                ):
+                    route_calls.add(state.call.model_call_id)
         if not pending:
             return
         try:
             read = self._http_engine_client.read_generation_progress(
                 [(model_call_id, start) for _, model_call_id, start in pending],
                 timeout_s=None if deadline is None else deadline - time.monotonic(),
+                route_calls=frozenset(route_calls),
             )
         except TimeoutError:
             LOGGER.warning(
@@ -1764,15 +1680,7 @@ class VllmAsyncGenerationWorkerImpl(
                 _record_terminal_reason(
                     state, progress.finish_reason, progress.stop_reason
                 )
-
-    def _snapshot_engine_routed_experts(
-        self, model_call_id: str, *, timeout_s: float | None
-    ) -> list[Any] | None:
-        """Return an active call's route pieces from vLLM, in order."""
-        assert self._http_engine_client is not None  # setup_token_capture checks
-        return self._http_engine_client.snapshot_routed_experts(
-            model_call_id, timeout_s=timeout_s
-        )
+                state.cut_engine_route_pieces = progress.routed_experts_chunks
 
     def _restore_response_prefix(
         self, request: Any, request_output: Any, *, tokenizer: Any

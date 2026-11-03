@@ -157,8 +157,8 @@ class _RequestCaptureState:
 
     call: Any
     prompt_token_ids: list[int]
-    # Router replay: a cut reads the engine's routes once, after it freezes
-    # the token count; see ``frozen_cut_routed_experts``.
+    # Router replay: a cut takes the engine's routes from its progress read,
+    # with the tokens it freezes; see ``frozen_cut_routed_experts``.
     capture_routed_experts: bool = False
     routed_experts_dtype: torch.dtype = torch.int16
     restored_routed_experts: torch.Tensor | None = None
@@ -171,6 +171,9 @@ class _RequestCaptureState:
     engine_route_rows: int = 0
     engine_route_piece_count: int = 0
     engine_route_last_piece: Any = None
+    # The engine's route pieces the cut's progress read copied with this
+    # call's tokens, at the same output boundary. Cut-path only.
+    cut_engine_route_pieces: list[Any] | None = None
     # Backend-owned opaque state that must survive until the terminal row is
     # staged. vLLM uses this for its processed-media snapshot; the first
     # generation-prefix row carries its tensor digests across recovery.
@@ -323,8 +326,8 @@ class _RequestCaptureState:
         """Return the routes of the cut in progress: its chunk's, then the prefix's.
 
         ``engine_routed_experts`` are the request's full-sequence routes, read
-        from the engine after the freeze; ``None`` once the request has left
-        the engine. Rows decoding added after the freeze are dropped. vLLM only
+        from the engine with the frozen tokens; ``None`` when the request had
+        left the engine. Rows past the frozen tokens are dropped. vLLM only
         appends routes, so earlier rows never change and every cut stages rows
         that line up with what earlier cuts staged. The final output's routes
         are used when the request has finished.
@@ -554,17 +557,6 @@ class GenerationCutCaptureMixin:
     def _return_routed_experts_enabled(self) -> bool:
         """Whether calls carry router-replay routes; the host implements this."""
         raise NotImplementedError
-
-    def _snapshot_engine_routed_experts(
-        self, model_call_id: str, *, timeout_s: float | None
-    ) -> list[Any] | None:
-        """Return an active call's route pieces from the engine, in order.
-
-        ``None`` when the engine is not serving the call. Backends that serve
-        router replay override this.
-        """
-        del model_call_id, timeout_s
-        raise NotImplementedError("this backend cannot read routes for a cut")
 
     def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
         with self._capture_registry_lock:
@@ -1054,15 +1046,16 @@ class GenerationCutCaptureMixin:
         return self._failed_generation_cut_ack(prefix, reason=reason)
 
     def _frozen_cut_engine_routed_experts(
-        self, state: _RequestCaptureState, *, deadline: float | None
+        self, state: _RequestCaptureState
     ) -> Any | None:
-        """Read the engine's routes for a frozen cut that needs them.
+        """Join the engine's routes for a frozen cut that needs them.
 
-        Runs after the freeze, without ``state.lock``, so decoding continues.
+        The cut's progress read copied the call's route pieces with its
+        tokens, at the same output boundary; ``None`` when that read did not
+        find the call in the engine.
 
         Raises:
-            TimeoutError: the engine did not answer before ``deadline``.
-            ValueError: the engine cannot name the request's routes.
+            ValueError: the route pieces do not fit the call's routes.
         """
         with state.lock:
             needs_engine_routes = (
@@ -1071,14 +1064,9 @@ class GenerationCutCaptureMixin:
                 and state.frozen_cut[1] > 0
                 and state.terminal_routed_experts is None
             )
-            model_call_id = state.call.model_call_id
-        if not needs_engine_routes:
-            return None
-        timeout_s = None if deadline is None else max(deadline - time.monotonic(), 0.0)
-        pieces = self._snapshot_engine_routed_experts(
-            model_call_id, timeout_s=timeout_s
-        )
-        if pieces is None:
+            pieces = state.cut_engine_route_pieces
+            state.cut_engine_route_pieces = None
+        if not needs_engine_routes or pieces is None:
             return None
         # The cut owns the call's lifecycle lock, so only it touches the cache.
         return state.absorb_engine_route_pieces(pieces)
@@ -1088,8 +1076,6 @@ class GenerationCutCaptureMixin:
         prefix: Any,
         state: _RequestCaptureState,
         checkpoint_id: str,
-        *,
-        deadline: float | None = None,
     ) -> Any | None:
         """Cut one live call, or return ``None`` if abort won the race."""
         from nemo_gym._checkpoint.generation_cut import (
@@ -1201,15 +1187,13 @@ class GenerationCutCaptureMixin:
                     else "incomplete_utf8_boundary",
                 )
             try:
-                engine_routed_experts = self._frozen_cut_engine_routed_experts(
-                    state, deadline=deadline
-                )
+                engine_routed_experts = self._frozen_cut_engine_routed_experts(state)
                 with state.lock:
                     (
                         chunk_routed_experts,
                         cumulative_routed_experts,
                     ) = state.frozen_cut_routed_experts(engine_routed_experts)
-            except (TimeoutError, TypeError, ValueError) as error:
+            except (TypeError, ValueError) as error:
                 # Only this call regenerates; the rest of the inventory is cut,
                 # and the next checkpoint tries this call again.
                 with state.lock:
@@ -1378,7 +1362,7 @@ class GenerationCutCaptureMixin:
             try:
                 acknowledgement = (
                     self._checkpoint_active_generation_cut(
-                        prefix, state, inventory.checkpoint_id, deadline=deadline
+                        prefix, state, inventory.checkpoint_id
                     )
                     if state is not None
                     else None
