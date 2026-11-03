@@ -41,7 +41,6 @@ ZERO_KL_EXEMPLARS = [
     "recipes/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl.yaml",
     "recipes/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8.yaml",
     "recipes/llm/grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-mxfp8-cp4.yaml",
-    "recipes/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8-flashinfer.yaml",
     "recipes/llm/grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer-cp4.yaml",
 ]
 
