@@ -14,7 +14,7 @@ cd /opt/nemo-rl
 git submodule update --init --recursive
 ```
 
-On HSG, the `sft_v2_docs` rem project already has a checkout at `/home/rohitkumarj/code/RL/nemo-rl-sft_v2_docs` and uses `rl.nightly.sep30.2026.sqsh`. Its standard container mount maps the shared host data tree to `/data`. The project's `coreai_dlalgo_nemorl` account requires a four-GPU allocation; set `CUDA_VISIBLE_DEVICES=0,1` inside that allocation for this two-GPU recipe.
+On HSG, the `sft_v2_docs` rem project already has a checkout at `/home/rohitkumarj/code/RL/nemo-rl-sft_v2_docs` and uses `rl.nightly.nov3.2026.sqsh`. Its standard container mount maps the shared host data tree to `/data`. The project's `coreai_dlalgo_nemorl` account requires a four-GPU allocation; set `CUDA_VISIBLE_DEVICES=0,1` inside that allocation for this two-GPU recipe.
 
 ## 2. Prepare CLEVR for Energon
 
@@ -32,9 +32,40 @@ The output directory must be absent or empty before preparation. If the dataset 
 
 For a small data and training smoke test, prepare a separate directory with `--max-samples 16 --max-samples-per-shard 16 --num-workers 1 --download-workers 1`. Do not point the full recipe at that small dataset without also changing `data.train.virtual_epoch_length`.
 
-## 3. Run SFT v2
+## 3. Create a config
 
 The [Qwen CLEVR Energon recipe](../../examples/configs/recipes/vlm/vlm_sft-qwen2.5-vl-3b-instruct-clevr-1n2g-megatrontp1-energon.v1.yaml) inherits `examples/configs/sft_vlm_3B.yaml` and `examples/configs/sft.yaml`. It selects Qwen2.5-VL-3B-Instruct, two GPUs, Megatron tensor parallel size 1, the Energon `generic_conversation` cooker and `generic_sft` task encoder, and the prepared `train` split. The model and tokenizer are fetched through Hugging Face on first use; make sure the compute environment can reach or already has the model cache.
+
+The recipe is ready to run as written. To make your own config, copy it within the same directory so its relative `defaults` path still resolves:
+
+```bash
+cp examples/configs/recipes/vlm/vlm_sft-qwen2.5-vl-3b-instruct-clevr-1n2g-megatrontp1-energon.v1.yaml \
+  examples/configs/recipes/vlm/my-clevr-sft-v2.yaml
+```
+
+Edit `my-clevr-sft-v2.yaml` to point at your prepared data and choose the run length and outputs. These are the key fields in the recipe:
+
+```yaml
+sft:
+  max_num_steps: 1000
+  val_period: 0
+  val_at_start: false
+data:
+  backend: energon
+  train:
+    path: /data/nemorl-datasets/clevr
+    split: train
+    virtual_epoch_length: 4375
+  validation: null
+logger:
+  log_dir: logs/sft-qwen2.5-vl-3b-clevr-energon-v2
+checkpointing:
+  checkpoint_dir: results/sft_Qwen/Qwen2.5-VL-3B-Instruct_clevr_energon_v2
+```
+
+Keep the rest of the copied recipe, including its `data.energon`, `data_plane`, and policy settings. `virtual_epoch_length` is the number of batches in a virtual epoch; change it when changing dataset size or batch size. As in [SFT configuration](sft.md#example-configuration-file), you can edit YAML fields or pass `key=value` overrides on the command line.
+
+## 4. Run SFT v2
 
 ```bash
 uv run examples/run_sft_v2.py \
@@ -42,6 +73,8 @@ uv run examples/run_sft_v2.py \
 ```
 
 The recipe runs 1,000 steps with global batch size 16 and no validation. It enables Weights & Biases; log in first or add `logger.wandb_enabled=false`. By default, logs go to `logs/sft-qwen2.5-vl-3b-clevr-energon-v2` and checkpoints to `results/sft_Qwen/Qwen2.5-VL-3B-Instruct_clevr_energon_v2` relative to the checkout. Put `checkpointing.checkpoint_dir` on persistent storage for a cluster run.
+
+If you copied the config, replace the `--config` path in the command with `examples/configs/recipes/vlm/my-clevr-sft-v2.yaml`.
 
 To check the full loading and training path before a longer run, use the prepared dataset and run three steps:
 
@@ -55,7 +88,7 @@ uv run examples/run_sft_v2.py \
 
 For a 16-sample smoke dataset, also set `data.train.path=/path/to/smoke/clevr`, `data.train.virtual_epoch_length=6`, `policy.train_global_batch_size=2`, `data.energon.num_workers=0`, and `data.energon.shuffle_buffer_size=16`, as in the [functional smoke script](../../tests/functional/sft_v2_energon.sh).
 
-## 4. Adapt the data
+## 5. Adapt the data
 
 The recipe's `data.backend: energon` loads a prepared Energon directory, not a raw JSONL file or Hugging Face dataset ID. Each shard record produced by the preparation script has a `json` conversation and an image member. The conversation contains `messages` with a user turn referencing `media_index: 0`, an assistant turn holding the answer, and a `media` entry identifying the image member and its dimensions. The `generic_conversation` cooker and `generic_sft` task encoder turn those records into Qwen multimodal training samples; assistant content supplies the supervised loss.
 
