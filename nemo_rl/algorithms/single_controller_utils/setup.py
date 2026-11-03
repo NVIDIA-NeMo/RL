@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from functools import partial
@@ -2019,6 +2019,36 @@ def setup_single_controller(
             )
         build_tasks["trainer"] = _build_trainer_and_value
 
+    # The refit communicator needs only the trainer and generation, so it starts the moment both return, while Gym
+    # may still be finishing, and runs beside the actor pools created below. Its thread outlives the build executor.
+    # Non-colocated vLLM generation only; the other paths start it in the tail, as before.
+    tail_lane_secs: dict[str, float] = {}
+    communicator_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="refit-communicator"
+    )
+    communicator_future: Optional[Future] = None
+
+    def _init_communicator() -> Optional[WeightSynchronizer]:
+        """Refit communicator rendezvous; needs only the trainer and generation."""
+        if weight_synchronizer is not None:
+            return weight_synchronizer
+        t0 = time.perf_counter()
+        new_synchronizer = create_weight_synchronizer(
+            policy=trainer,
+            generation=generation,
+            generation_backend=generation_config["backend"],
+            colocated=colocated,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+            refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
+        )
+        generation.weight_synchronizer = new_synchronizer
+        new_synchronizer.init_communicator()
+        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
+        tail_lane_secs["refit communicator"] = time.perf_counter() - t0
+        return new_synchronizer
+
     # Submit build tasks and get results
     submitted: dict[str, Any] = {}
     nemo_gym_shards = None
@@ -2100,6 +2130,8 @@ def setup_single_controller(
             else:
                 generation, gen_load_time = submitted["generation"].result()
                 trainer, value, time_metrics = submitted["trainer"].result()
+            if not megatron_reserved_urls and not colocated:
+                communicator_future = communicator_executor.submit(_init_communicator)
             if megatron_reserved_urls:
                 # Gym initialization needs a live URL that will respond to health checks.
                 # Megatron generation can only respond to health checks once initialized.
@@ -2142,6 +2174,8 @@ def setup_single_controller(
                 nemo_gym_shards.shutdown()
         raise
     finally:
+        # A running communicator is joined at the tail; this only stops new work.
+        communicator_executor.shutdown(wait=False)
         for megatron_port_holder in megatron_port_holders:
             # The frontend ranks adopted (or will never adopt) the held sockets;
             # drop the holders.
@@ -2302,28 +2336,9 @@ def setup_single_controller(
         ),
     )
 
-    def _init_communicator() -> Optional[WeightSynchronizer]:
-        """Refit communicator rendezvous; needs only the trainer and generation."""
-        if weight_synchronizer is not None:
-            return weight_synchronizer
-        t0 = time.perf_counter()
-        new_synchronizer = create_weight_synchronizer(
-            policy=trainer,
-            generation=generation,
-            generation_backend=generation_config["backend"],
-            colocated=colocated,
-            train_cluster=train_cluster,
-            inference_cluster=inference_cluster,
-            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
-            refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
-        )
-        generation.weight_synchronizer = new_synchronizer
-        new_synchronizer.init_communicator()
-        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
-        return new_synchronizer
-
     def _create_finalizers() -> list[Any]:
         """Rollout reassembler pool; needs the token-capture result, not the communicator."""
+        lane_t0 = time.perf_counter()
         finalizer_actors: list[Any] = []
         if token_capture_cfg.enabled:
             from nemo_rl.experience.rollout_reassembler_actor import (
@@ -2369,10 +2384,13 @@ def setup_single_controller(
                 # registered its checkpoint participant.
                 ray.get([actor.__ray_ready__.remote() for actor in finalizer_actors])
 
+        if finalizer_actors:
+            tail_lane_secs["rollout reassemblers"] = time.perf_counter() - lane_t0
         return finalizer_actors
 
     def _create_advantage() -> list[Any]:
         """Advantage actor pool; needs the estimator and the data plane."""
+        lane_t0 = time.perf_counter()
         advantage_actors: list[Any] = []
         if master_config.async_rl.num_advantage_workers > 0:
             from nemo_rl.algorithms.advantage_actor import create_advantage_actors
@@ -2387,21 +2405,33 @@ def setup_single_controller(
                 num_workers=master_config.async_rl.num_advantage_workers,
             )
 
+        if advantage_actors:
+            tail_lane_secs["advantage actors"] = time.perf_counter() - lane_t0
         return advantage_actors
 
-    # Three independent startups, each tens of seconds at scale: the refit communicator rendezvous, the reassembler
-    # pool and the advantage pool. They share no state, so they run together and the setup waits for the slowest rather
-    # than the sum. All three finish before the rollout manager is built, so the pools still exist before the
-    # controller configures checkpoint participants and before any Mooncake restore.
+    # The reassembler and advantage pools take tens of seconds each at scale and share no state with each other or with
+    # the communicator, so they start together here and the setup waits for the slowest rather than the sum. All of
+    # them finish before the rollout manager is built, so the pools still exist before the controller configures
+    # checkpoint participants and before any Mooncake restore.
+    tail_started = time.perf_counter()
     with ThreadPoolExecutor(
-        max_workers=3, thread_name_prefix="setup-tail"
+        max_workers=2, thread_name_prefix="setup-tail"
     ) as tail_executor:
-        communicator_future = tail_executor.submit(_init_communicator)
         finalizer_future = tail_executor.submit(_create_finalizers)
         advantage_future = tail_executor.submit(_create_advantage)
+        if communicator_future is None:
+            # Not started with the builds: the Megatron-generation path, which synchronizes earlier.
+            communicator_future = tail_executor.submit(_init_communicator)
     weight_synchronizer = communicator_future.result()
     finalizer_actors = finalizer_future.result()
     advantage_actors = advantage_future.result()
+    if tail_lane_secs:
+        print(
+            "  ✓ Setup tail: "
+            + ", ".join(f"{name} {secs:.1f}s" for name, secs in tail_lane_secs.items())
+            + f" (concurrent; the tail waited {time.perf_counter() - tail_started:.1f}s)",
+            flush=True,
+        )
     if token_capture_cfg.forest_training:
         # Padding or borrowed inputs may appear in any step. Validate the loaded
         # model before admitting rollouts, even if the first batch needs neither.

@@ -2362,6 +2362,32 @@ class TestSetup:
         ):
             yield
 
+    def test_gym_vllm_starts_communicator_before_gym_finishes(self, patched_factories):
+        """The refit communicator needs only the trainer and generation, so it starts
+        when both return, not after Gym: Gym's build waits here for the communicator,
+        which a start after Gym could never satisfy."""
+        mc = self._gym_vllm_config()
+        communicator_started = threading.Event()
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = communicator_started.set
+
+        def _build_gym(*args: Any, **kwargs: Any) -> Any:
+            assert communicator_started.wait(timeout=30), (
+                "the communicator did not start while Gym was still building"
+            )
+            return MagicMock(name="nemo_gym_shards")
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "build_nemo_gym_actors", side_effect=_build_gym),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        weight_sync.init_communicator.assert_called_once_with()
+        assert actor_args.weight_synchronizer is weight_sync
+
     def test_gym_vllm_loads_dataset_while_trainer_builds(self, patched_factories):
         """The dataset load waits for the trainer build to start; in the old order
         (load first, then build) it would time out."""
