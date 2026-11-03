@@ -69,6 +69,7 @@ from nemo_rl.environments.nemo_gym import (
 from nemo_rl.environments.nemotron_utils import (
     verify_static_video_media_alignment,
 )
+from nemo_rl.experience.failures import GymRowFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -2169,7 +2170,20 @@ def resolve_reward_penalty_config(
                     token_ids["think_open"] = inferred_open
                 if inferred_close is not None:
                     token_ids["think_close"] = inferred_close
+        else:
+            raise ValueError(
+                "penalize_malformed_think_tag needs open and close thinking tags in "
+                f"env.nemo_gym.thinking_tags, got {tags!r}"
+            )
 
+    if resolved.get("penalize_malformed_think_tag") and (
+        ("think_open" in token_ids) != ("think_close" in token_ids)
+    ):
+        raise ValueError(
+            "reward_penalties.token_ids.think_open and think_close must both be set "
+            "or both omitted; omitted IDs are inferred from single-token "
+            "thinking_tags, otherwise only the decoded-text check runs"
+        )
     if token_ids:
         resolved["token_ids"] = token_ids
 
@@ -2313,8 +2327,9 @@ def apply_reward_penalties(
         )
         if (think_open_token_id is None) != (think_close_token_id is None):
             raise ValueError(
-                "reward_penalties.token_ids.think_open and "
-                "reward_penalties.token_ids.think_close must both be set"
+                "reward_penalties.token_ids.think_open and think_close must both be "
+                "set or both omitted; omitted IDs are inferred from single-token "
+                "thinking_tags, otherwise only the decoded-text check runs"
             )
         for result in results:
             has_violation = any(
@@ -2364,10 +2379,6 @@ def apply_reward_penalties(
                     )
                     or DEFAULT_THINKING_TAGS
                 )
-                if len(thinking_tags) < 2:
-                    raise ValueError(
-                        "reward_penalties.thinking_tags must contain open and close tags"
-                    )
                 think_open_text, think_close_text = thinking_tags[:2]
                 output_items = (
                     result["full_result"].get("response", {}).get("output", [])
@@ -2560,7 +2571,15 @@ async def _merge_nemo_gym_instance_streams(
                 instance_label = iterators[iterator]
                 try:
                     future = task.result()
-                    row_index, resolved_agent_ref, result, timing_metrics = await future
+                    item = await future
+                    if isinstance(item, GymRowFailure):
+                        # This path retries the whole batch, not one row, so a
+                        # failed row still ends its instance's stream.
+                        stream = streams_by_iterator[iterator]
+                        if isinstance(stream, ray.ObjectRefGenerator):
+                            ray.cancel(stream)
+                        raise item.error
+                    row_index, resolved_agent_ref, result, timing_metrics = item
                 except StopAsyncIteration:
                     active_iterators.remove(iterator)
                     continue
