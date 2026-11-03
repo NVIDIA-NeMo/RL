@@ -1652,12 +1652,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 raise ValueError(
                     f"{role}.megatron_cfg parallel sizes must be positive integers"
                 )
+            validated_parallel_sizes = cast(dict[str, int], parallel_sizes)
             model_parallel_size = (
-                parallel_sizes["tensor_model_parallel_size"]
-                * parallel_sizes["pipeline_model_parallel_size"]
-                * parallel_sizes["context_parallel_size"]
+                validated_parallel_sizes["tensor_model_parallel_size"]
+                * validated_parallel_sizes["pipeline_model_parallel_size"]
+                * validated_parallel_sizes["context_parallel_size"]
             )
-            expert_parallel_size = parallel_sizes["expert_model_parallel_size"]
+            expert_parallel_size = validated_parallel_sizes[
+                "expert_model_parallel_size"
+            ]
             if (
                 available_gpus % model_parallel_size
                 or available_gpus % expert_parallel_size
