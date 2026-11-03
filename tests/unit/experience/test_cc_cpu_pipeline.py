@@ -1,0 +1,476 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Composed CPU CC flow; generation, storage and learner execution are doubles.
+
+Uses scripted context rewrites, real HTTP capture/ledger, receipt processing,
+finalization, replay selection and controller advantages. No real tokenizer,
+image processor, vLLM, TransferQueue service or optimizer executes here.
+"""
+
+import asyncio
+import io
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+import torch
+from tensordict import TensorDict
+
+pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
+
+from nemo_gym.openai_utils import NeMoGymAsyncOpenAI
+from nemo_gym.token_id_capture.staging.records import RolloutManifest, StageResult
+
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
+from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+from nemo_rl.experience.rollout_reassembler import RolloutReassembler
+from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
+from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+from nemo_rl.models.generation.capture_context import decide_capture_input
+from tests.unit.experience.test_forest_dispatch import _env
+from tests.unit.experience.test_logical_owner_finalization import (
+    capture_segment,
+    finalize,
+    gym_harness,
+)
+from tests.unit.single_controller.test_forest_optimizer_batch import _setup
+
+pytestmark = pytest.mark.nemo_gym
+
+
+@pytest.fixture(params=[False])
+def pipeline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request: pytest.FixtureRequest
+) -> Iterator[tuple]:
+    plane = NoOpDataPlaneClient()
+    plane.register_partition("staged", [], 128, ["finalize"])
+    plane.register_partition("train", [], 128, ["train"])
+    source = TQTokenSource(plane, staging_partition="staged")
+    harness = gym_harness.make_capture_harness(
+        monkeypatch,
+        tmp_path,
+        sink=TQTokenSink(plane, staging_partition="staged"),
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
+        root_prompt=[10, 11],
+        reasoning=request.param,
+        decide_input=decide_capture_input,
+    )
+    finalizer = RolloutReassembler(
+        plane,
+        partition_id="train",
+        staging_partition="staged",
+        pad_token_id=0,
+        max_seq_len=1024,
+    )
+    yield harness, plane, finalizer
+    harness.client.close()
+    asyncio.run(harness.ledger.close())
+    plane.close()
+
+
+async def ready_controller(
+    monkeypatch: pytest.MonkeyPatch, plane: NoOpDataPlaneClient, meta: Any
+) -> Any:
+    data = plane.get_samples(meta.sample_ids, "train", meta.fields)
+    ctrl, _ = _setup(monkeypatch, batches=[(meta, data)], plane=plane)
+    buffer = TQReplayBuffer(
+        plane,
+        "train",
+        pad_value_dict={"token_ids": 0},
+        include_message_violation_fields=False,
+        staging_partition_id="staged",
+    )
+    buffer.set_data_plane_checkpoint_barrier(ctrl._data_plane_checkpoint_barrier)
+    group_id = meta.tags[0]["dispatch_group_id"]
+    buffer.reserve(weight_version=0, target_step=0, group_id=group_id)
+    async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+        await buffer.commit_finalized(
+            cut, group_id, meta, group_min_wv=0, group_max_wv=0, staging_keys=[]
+        )
+    ctrl._buffer = buffer
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
+    return ctrl
+
+
+@pytest.mark.parametrize(
+    "compact,pipeline,chunk_size",
+    [(False, False, 2), (True, True, 1), (True, True, 2), (True, True, 10)],
+    indirect=["pipeline"],
+    ids=["identity", "reasoning_k1", "reasoning_k2", "reasoning_k10"],
+)
+def test_twenty_turn_capture_to_replay_and_advantages(
+    pipeline: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    compact: bool,
+    chunk_size: int,
+) -> None:
+    harness, plane, finalizer = pipeline
+    env = _env(harness)
+    expected_tokens, receipts, selections, rewards = [], [], [], []
+
+    async def exercise() -> None:
+        for owner in range(2):
+            messages = list(gym_harness.HISTORY)
+            selected = []
+            accepted_ids = []
+            accepted_output = []
+            for turn in range(20):
+                if compact and turn and turn % chunk_size == 0:
+                    messages = [
+                        {"role": "user", "content": f"summary before turn {turn}"}
+                    ]
+                response = gym_harness.assert_clean(
+                    harness.post(f"group_g{owner}", messages)
+                )
+                accepted_ids.append(response["id"])
+                accepted_output.extend(response["output"])
+                selected.append(1000 + len(harness.worker_calls))
+                messages = (
+                    messages
+                    + response["output"]
+                    + [{"role": "user", "content": f"observation {turn}"}]
+                )
+            assert len(accepted_ids) == 20
+            manifest = RolloutManifest.model_validate(
+                await harness.ledger.manifest(f"group_g{owner}")
+            )
+            assert sum(
+                record.parent_call_id is None for record in manifest.records
+            ) == (20 // chunk_size if compact else 1)
+            processed = await env._postprocess_receipt_mode(
+                {"_ng_rollout_id": f"group_g{owner}"},
+                {
+                    "reward": float(owner),
+                    "response": {"id": response["id"], "output": accepted_output},
+                },
+            )
+            receipts.append(processed["receipt"])
+            assert processed["logical_selection"].response_ids == tuple(accepted_ids)
+            selections.append(processed["logical_selection"])
+            rewards.append(processed["full_result"]["reward"])
+            expected_tokens.append(selected)
+
+        result = finalizer.finalize_group(
+            "group",
+            ["group_g0", "group_g1"],
+            receipts,
+            rewards,
+            mask_sample=[False, False],
+            fallback_weight_version=7,
+            prompt_idx=99,
+            logical_selections=selections,
+            canonical_sample_ids=["group_g0", "group_g1"],
+        )
+        assert result.meta.size == (40 // chunk_size if compact else 2)
+        assert result.valid_row_count == result.meta.size
+        assert len(harness.worker_calls) == 40
+        assert plane.list_sample_ids("staged") == []
+        ctrl = await ready_controller(monkeypatch, plane, result.meta)
+        checked = []
+
+        def learner(meta: Any, *args: Any, **kwargs: Any) -> None:
+            data = plane.get_samples(
+                meta.sample_ids,
+                "train",
+                ["input_ids", "token_mask", "advantages", "generation_logprobs"],
+            )
+            for owner in range(2):
+                actual = []
+                for index, tag in enumerate(meta.tags):
+                    if tag["logical_slot"] != owner:
+                        continue
+                    mask = data["token_mask"][index].bool()
+                    actual.extend(data["input_ids"][index][mask].tolist())
+                    assert torch.all(data["generation_logprobs"][index][mask] == -0.25)
+                    assert torch.all(data["advantages"][index][mask] == owner - 0.5)
+                assert actual == expected_tokens[owner]
+                assert len(actual) == len(set(actual)) == 20
+            checked.append(meta.size)
+
+        ctrl._trainer.train_microbatches_from_meta.side_effect = learner
+        await asyncio.wait_for(ctrl._train_pump(), timeout=5)
+        assert checked == [result.meta.size]
+        ctrl._trainer.finish_train_step.assert_called_once()
+        assert ctrl._trainer_version == 1 and ctrl._consumed_samples == 1
+        assert ctrl._buffer.meta_list == [] and plane.list_sample_ids("train") == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("mask_all", [False, True])
+def test_mixed_cc_snapshot_restores_segmented_replay_and_owner_advantages(
+    pipeline: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mask_all: bool,
+) -> None:
+    harness, plane, finalizer = pipeline
+    healthy = [capture_segment(harness, "group_g0") for _ in range(3)]
+    failed = capture_segment(harness, "group_g1", child=True)
+    # Corrupt a committed child while retaining sound original prompt evidence.
+    key = failed["manifest"].records[-1].staging_key
+    plane._partitions["staged"].rows[key]["digest_bytes"][0] ^= 1
+    result = finalize(finalizer, [healthy, [failed]], execution_row_multiple=3)
+    meta = result.meta
+    assert meta.size == 6
+    if mask_all:
+        # Loss filtering does not remove the verified physical input layouts.
+        plane.put_samples(
+            sample_ids=meta.sample_ids,
+            partition_id="train",
+            fields=TensorDict(
+                {"mask_sample": torch.ones(meta.size, dtype=torch.bool)},
+                batch_size=[meta.size],
+            ),
+        )
+
+    async def exercise() -> None:
+        ctrl = await ready_controller(monkeypatch, plane, meta)
+        async with ctrl._data_plane_checkpoint_barrier.checkpoint():
+            state = ctrl._buffer.metadata_state_dict(saved_capacity=1)
+            serialized = io.BytesIO()
+            torch.save(state, serialized)
+            plane.save_checkpoint(
+                tmp_path / "snapshot",
+                metadata={"manifest_digest": state["manifest_digest"]},
+            )
+        serialized.seek(0)
+        state = torch.load(
+            serialized, weights_only=False
+        )  # Trusted test-created bytes.
+        restored_plane = NoOpDataPlaneClient()
+        native_metadata = restored_plane.load_checkpoint(tmp_path / "snapshot")
+        restored_meta = state["groups"][0]["meta"]
+        assert restored_meta.tags == meta.tags
+        assert restored_meta.sample_ids == meta.sample_ids
+        before = plane.get_samples(meta.sample_ids, "train", meta.fields)
+        after = restored_plane.get_samples(meta.sample_ids, "train", meta.fields)
+        for field in meta.fields:
+            for left, right in zip(
+                before[field].unbind(), after[field].unbind(), strict=True
+            ):
+                torch.testing.assert_close(left, right, rtol=0, atol=0)
+        restored_buffer = TQReplayBuffer(
+            restored_plane,
+            "train",
+            pad_value_dict={"token_ids": 0},
+            include_message_violation_fields=False,
+        )
+        # Two logical owners, six physical rows, and capacity for one group.
+        count = await restored_buffer.load_state_dict(
+            state,
+            max_groups=1,
+            expected_partition_id="train",
+            expected_group_size=2,
+            expected_manifest_digest=native_metadata["manifest_digest"],
+        )
+        assert count == restored_buffer.size() == 1
+        assert restored_buffer.meta_list == [restored_meta]
+        assert restored_buffer.target_step_list == ctrl._buffer.target_step_list
+        assert restored_buffer.start_weight_list == ctrl._buffer.start_weight_list
+        assert restored_buffer.end_weight_list == ctrl._buffer.end_weight_list
+        assert sorted(restored_plane.list_sample_ids("train")) == sorted(
+            meta.sample_ids
+        )
+        restored_ctrl = await ready_controller(
+            monkeypatch, restored_plane, restored_meta
+        )
+        await ctrl._advantage_stage(meta)
+        await restored_ctrl._advantage_stage(restored_meta)
+        for field in ("advantages", "sample_mask"):
+            original = plane.get_samples(meta.sample_ids, "train", [field])[field]
+            restored = restored_plane.get_samples(meta.sample_ids, "train", [field])[
+                field
+            ]
+            for left, right in zip(original.unbind(), restored.unbind(), strict=True):
+                torch.testing.assert_close(left, right, rtol=0, atol=0)
+                if mask_all:
+                    assert right.count_nonzero() == 0
+        restored_plane.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("logprobs", [False, True])
+def test_mixed_failed_owner_padding_replay_and_controller(
+    pipeline: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    logprobs: bool,
+) -> None:
+    harness, plane, finalizer = pipeline
+    healthy = [capture_segment(harness, "group_g0") for _ in range(3)]
+    failed = capture_segment(harness, "group_g1", child=True)
+    # Corrupt a committed child while retaining sound original prompt evidence.
+    key = failed["manifest"].records[-1].staging_key
+    plane._partitions["staged"].rows[key]["digest_bytes"][0] ^= 1
+    result = finalize(finalizer, [healthy, [failed]], execution_row_multiple=3)
+    meta = result.meta
+    assert meta.size == 6 and result.valid_row_count == 3
+    assert [tag["uses_borrowed_input"] for tag in meta.tags] == [False] * 3 + [True] * 3
+    assert [tag["is_execution_padding"] for tag in meta.tags] == [False] * 4 + [
+        True
+    ] * 2
+    assert plane.list_sample_ids("staged") == []
+
+    async def exercise() -> None:
+        ctrl = await ready_controller(monkeypatch, plane, meta)
+        ctrl._policy_logprobs_required = ctrl._reference_logprobs_required = logprobs
+        original_ids = list(meta.sample_ids)
+        check = ctrl._trainer.worker_group.run_all_workers_single_data
+        # Setup validates the loaded router before any rollouts are admitted.
+        # The train pump must reuse that validation, including borrowed rows.
+        check.side_effect = AssertionError("router validation was repeated")
+
+        def learner(batch: Any, *args: Any, **kwargs: Any) -> None:
+            assert batch.sample_ids == original_ids and batch.tags == meta.tags
+            data = plane.get_samples(
+                batch.sample_ids,
+                "train",
+                ["total_reward", "sample_mask", "token_mask", "advantages"],
+            )
+            assert data["total_reward"].tolist() == [1, 1, 1, 2, 0, 0]
+            assert data["sample_mask"].tolist() == [1, 1, 1, 0, 0, 0]
+            for index in range(6):
+                mask = data["token_mask"][index].bool()
+                if index < 3:
+                    # Only the healthy owner votes: reward and baseline are
+                    # both 1, regardless of its three physical segments.
+                    assert torch.all(data["advantages"][index][mask] == 0.0)
+                else:
+                    assert not mask.any()
+
+        ctrl._trainer.train_microbatches_from_meta.side_effect = learner
+        await asyncio.wait_for(ctrl._train_pump(), timeout=5)
+        ctrl._trainer.finish_train_step.assert_called_once()
+        assert plane.list_sample_ids("train") == []
+        assert ctrl._trainer_version == 1 and ctrl._consumed_samples == 1
+        check.assert_not_called()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure", ["engine", "cancel", "lost_ack", "late_write"])
+@pytest.mark.parametrize("prior_calls", [False, True])
+@pytest.mark.parametrize("healthy_sibling", [False, True])
+def test_failed_capture_masks_owner_and_preserves_unknown_writes(
+    pipeline: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    prior_calls: bool,
+    healthy_sibling: bool,
+) -> None:
+    harness, plane, finalizer = pipeline
+    env = _env(harness)
+    results = []
+    owners = ["attempt0", "attempt1"] if healthy_sibling else ["attempt0"]
+    if healthy_sibling:
+        healthy = capture_segment(harness, owners[0], child=True)
+        results.append(
+            {
+                "response": {"id": healthy["ids"][-1], "output": healthy["output"]},
+                "reward": 1.0,
+            }
+        )
+    failed_owner = owners[-1]
+    previous = (
+        capture_segment(harness, failed_owner, child=True) if prior_calls else None
+    )
+    stage = harness.sink.stage
+    deferred = []
+    with monkeypatch.context() as patch:
+        if failure in ("engine", "cancel"):
+
+            async def fail(client: Any, **body: Any) -> None:
+                if failure == "cancel":
+                    # Cancel a genuinely waiting coroutine, not a completed call.
+                    task = asyncio.create_task(asyncio.Event().wait())
+                    await asyncio.sleep(0)
+                    task.cancel()
+                    await task
+                raise RuntimeError("engine failed before staging")
+
+            patch.setattr(NeMoGymAsyncOpenAI, "create_chat_completion", fail)
+        else:
+
+            def unknown_write(record: Any) -> StageResult:
+                deferred.append(record.model_copy(deep=True))
+                if failure == "lost_ack":
+                    assert stage(record).ok
+                return StageResult(ok=False, error="staging acknowledgement lost")
+
+            patch.setattr(harness.sink, "stage", unknown_write)
+        response = harness.post(
+            failed_owner,
+            gym_harness.HISTORY
+            + (previous["output"] if previous else [])
+            + [{"role": "user", "content": "next"}],
+        )
+        assert response.status_code == 500
+    manifest = harness.manifest(failed_owner)
+    assert len(manifest.pending_call_ids) == 1
+    pending_key = f"{failed_owner}/{manifest.pending_call_ids[0]}"
+    results.append(
+        {"response": {"output": previous["output"] if previous else []}, "reward": 0.0}
+    )
+    processed = [
+        asyncio.run(env._postprocess_receipt_mode({"_ng_rollout_id": owner}, result))
+        for owner, result in zip(owners, results, strict=True)
+    ]
+    receipts = tuple(item["receipt"] for item in processed)
+    assert receipts[-1]["capture_poisoned"]
+    assert receipts[-1]["pending_call_ids"] == manifest.pending_call_ids
+    assert pending_key not in _receipt_staging_keys(receipts[-1])
+    assert not processed[-1]["logical_selection"].response_ids
+    request = ReassemblyRequest(
+        group_id="group",
+        rollout_ids=tuple(owners),
+        canonical_sample_ids=tuple(f"group_g{i}" for i in range(len(owners))),
+        receipts=receipts,
+        rewards=tuple(item["reward"] for item in results),
+        fallback_weight_version=7,
+        prompt_idx=99,
+        mask_sample=(False,) * len(owners),
+        logical_selections=tuple(item["logical_selection"] for item in processed),
+    )
+    assert request.capture_receipts == receipts
+    planned = request.cleanup_sample_ids
+    finalized = finalizer.finalize_group(
+        "group",
+        owners,
+        list(receipts),
+        list(request.rewards),
+        fallback_weight_version=7,
+        prompt_idx=99,
+        mask_sample=list(request.mask_sample),
+        canonical_sample_ids=list(request.canonical_sample_ids),
+        logical_selections=list(request.logical_selections),
+    )
+    if healthy_sibling:
+        assert finalized.valid_row_count == 1 and finalized.total_row_count == 2
+        assert tuple(finalized.meta.sample_ids) == planned
+        data = plane.get_samples(
+            finalized.meta.sample_ids, "train", finalized.meta.fields
+        )
+        assert data["sample_mask"].tolist() == [1, 0]
+        assert data["token_mask"][0].sum() == 2
+        assert data["token_mask"][1].sum() == 0
+        assert [tag["logical_rollout_id"] for tag in finalized.meta.tags] == [
+            "group_g0",
+            "group_g1",
+        ]
+    else:
+        assert finalized.dropped and finalized.meta is None
+        assert plane.list_sample_ids("train") == []
+    assert plane.list_sample_ids("staged") == (
+        [pending_key] if failure == "lost_ack" else []
+    )
+    if failure == "late_write":
+        assert stage(deferred[0]).ok
+        assert plane.list_sample_ids("staged") == [pending_key]
+    # A later fresh attempt remains usable; it cannot adopt the failed call.
+    following = capture_segment(harness, "fresh_attempt")
+    assert not following["manifest"].pending_call_ids
+    assert following["manifest"].records[0].parent_call_id is None

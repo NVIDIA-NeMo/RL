@@ -448,6 +448,6 @@ Listed in the order they run during a training step:
 - Config exemplar: [`examples/configs/xtoken_off_policy_distillation.yaml`](../../examples/configs/xtoken_off_policy_distillation.yaml)
 - Trainer module: `nemo_rl/algorithms/xtoken_off_policy_distillation.py`
 - KD data processor: `nemo_rl/data/processors.py::kd_data_processor`
-- Cross-tokenizer collator: `nemo_rl/data/xtoken/cross_tokenizer_collate.py::CrossTokenizerCollator`
+- Cross-tokenizer collator: `nemo_rl/data/cross_tokenizer/cross_tokenizer_collate.py::CrossTokenizerCollator`
 - Token alignment: `nemo_rl/algorithms/x_token/token_aligner.py::TokenAligner`
 - Loss implementation: `nemo_rl/algorithms/loss/loss_functions.py::CrossTokenizerDistillationLossFn`

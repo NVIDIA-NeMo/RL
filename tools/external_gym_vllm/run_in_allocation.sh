@@ -75,6 +75,18 @@ fi
 RAY_SUB="${RAY_SUB:-${SLURM_SUBMIT_DIR}/ray.sub}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
+# Image for the load-balancer steps. Each pool's LB is its own srun step on the
+# Ray head node, so with CONTAINER the head unpacks one extra copy of the training
+# image per pool. The LB needs only Python and aiohttp (see README.md).
+EXTERNAL_VLLM_LB_CONTAINER="${EXTERNAL_VLLM_LB_CONTAINER:-${CONTAINER}}"
+lb_python="${EXTERNAL_VLLM_LB_PYTHON}"
+if [[ "${EXTERNAL_VLLM_LB_CONTAINER}" != "${CONTAINER}" ]]; then
+  lb_python="${EXTERNAL_VLLM_LB_CONTAINER_PYTHON:-/usr/local/bin/python3}"
+  if [[ "${EXTERNAL_VLLM_LB_CONTAINER}" == [/.]* && ! -r "${EXTERNAL_VLLM_LB_CONTAINER}" ]]; then
+    echo "[FATAL] EXTERNAL_VLLM_LB_CONTAINER is not readable: ${EXTERNAL_VLLM_LB_CONTAINER}" >&2
+    exit 1
+  fi
+fi
 EXTERNAL_VLLM_SHARED_ROOT="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
 EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS="${EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS:-5}"
 EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS="${EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS:-10}"
@@ -759,7 +771,7 @@ launch_lb() {
     "${het_ray[@]}" \
     --no-container-mount-home \
     --container-name="external-vllm-lb-${pool,,}-${SLURM_JOB_ID}" \
-    --container-image="${CONTAINER}" \
+    --container-image="${EXTERNAL_VLLM_LB_CONTAINER}" \
     --container-mounts="${lb_mounts}" \
     --container-workdir="${SLURM_SUBMIT_DIR}" \
     --mpi=pmix \
@@ -772,7 +784,7 @@ launch_lb() {
     --cpus-per-task=2 \
     --output="${pool_log_dirs[${pool}]}/load_balancer.log" \
     --open-mode=append \
-    bash -lc "PYTHON='${EXTERNAL_VLLM_LB_PYTHON}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}'" &
+    bash -lc "PYTHON='${lb_python}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}'" &
   pid=$!
   if [[ -z "${slot}" ]]; then
     lb_step_pids+=("${pid}")

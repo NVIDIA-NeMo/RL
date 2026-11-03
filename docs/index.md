@@ -326,6 +326,7 @@ guides/cispo.md
 guides/prorlv2.md
 guides/swe-rl-qwen3.md
 guides/grpo.md
+guides/score-centering.md
 guides/length-penalty.md
 guides/ppo.md
 guides/grpo-deepscaler.md
@@ -339,6 +340,7 @@ guides/models/index.md
 model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md
+guides/context-compaction.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/automodel-speculative-decoding.md

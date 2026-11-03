@@ -2508,6 +2508,36 @@ def _validate_async_ppo_entry_config(
     _validate_async_ppo_config(master_config, generation)
 
 
+def test_legacy_ppo_entrypoint_rejects_split_value_training(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from examples import run_ppo
+
+    init_ray = MagicMock()
+    monkeypatch.setattr(run_ppo, "register_omegaconf_resolvers", MagicMock())
+    monkeypatch.setattr(
+        run_ppo,
+        "parse_args",
+        lambda: (SimpleNamespace(config="test.yaml"), []),
+    )
+    monkeypatch.setattr(run_ppo, "load_config", lambda _: {})
+    monkeypatch.setattr(run_ppo.OmegaConf, "to_container", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run_ppo, "check_outdated_config", MagicMock())
+    monkeypatch.setattr(
+        run_ppo,
+        "MasterConfig",
+        lambda **_: SimpleNamespace(
+            ppo=SimpleNamespace(async_ppo={}, value_training_mode="split")
+        ),
+    )
+    monkeypatch.setattr(run_ppo, "init_ray", init_ray)
+
+    with pytest.raises(ValueError, match="value_training_mode=split.*SingleController"):
+        run_ppo.main()
+
+    init_ray.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [

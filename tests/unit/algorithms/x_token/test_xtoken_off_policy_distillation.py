@@ -56,7 +56,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_non_student_seq_keys,
     xtoken_off_policy_distillation_train,
 )
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
@@ -970,6 +970,67 @@ def test_setup_rejects_same_vocab_teacher_with_mismatched_vocab():
             cfg,
             student_tokenizer=student_tok,
             teacher_tokenizers=teacher_toks,
+            train_dataset=MagicMock(),
+            val_dataset=None,
+        )
+    # The check fires before any cluster/policy construction.
+    assert mock_cluster.call_count == 0
+
+
+@pytest.mark.parametrize(
+    "student_cp,student_div,teacher_cp,teacher_div,same_vocab,match",
+    [
+        (
+            2,
+            1,
+            1,
+            8,
+            False,
+            r"^policy\.make_sequence_length_divisible_by \(1\) must be a multiple "
+            r"of policy\.automodel_cfg\.context_parallel_size \(2\)\.$",
+        ),
+        (
+            1,
+            8,
+            2,
+            1,
+            False,
+            r"^teachers\.0\.make_sequence_length_divisible_by \(1\) must be a "
+            r"multiple of its automodel_cfg\.context_parallel_size \(2\)\.$",
+        ),
+        # A same-vocab teacher forwards the student batch, so its own divisor
+        # does not apply.
+        (
+            1,
+            1,
+            2,
+            2,
+            True,
+            r"^teachers\.0 is a same-vocab teacher, which forwards the student "
+            r"batch: policy\.make_sequence_length_divisible_by \(1\) must be a "
+            r"multiple of its automodel_cfg\.context_parallel_size \(2\)\.$",
+        ),
+    ],
+)
+def test_setup_rejects_divisor_not_divisible_by_context_parallel_size(
+    student_cp, student_div, teacher_cp, teacher_div, same_vocab, match
+):
+    cfg = _make_master_config()
+    cfg.policy["automodel_cfg"]["context_parallel_size"] = student_cp
+    cfg.policy["make_sequence_length_divisible_by"] = student_div
+    teacher = cfg.teachers[0]
+    teacher.automodel_cfg["context_parallel_size"] = teacher_cp
+    teacher.make_sequence_length_divisible_by = teacher_div
+    if same_vocab:
+        teacher.aligner.projection_matrix_path = None
+    with (
+        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
+        pytest.raises(AssertionError, match=match),
+    ):
+        setup(
+            cfg,
+            student_tokenizer=_make_tokenizer(32),
+            teacher_tokenizers=[_make_tokenizer(32 if same_vocab else 24)],
             train_dataset=MagicMock(),
             val_dataset=None,
         )

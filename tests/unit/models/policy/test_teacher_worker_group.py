@@ -182,6 +182,79 @@ def test_teacher_worker_group_isolates_student_inference_settings(
     assert teacher_config.megatron_cfg_overrides == teacher_overrides
 
 
+def _build_teacher_cfg(monkeypatch, policy_config, megatron_cfg_overrides):
+    """Build a TeacherWorkerGroup with fake Ray builders; return the teacher cfg."""
+    import nemo_rl.distributed.worker_groups as worker_groups
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherConfig,
+        TeacherWorkerGroup,
+    )
+
+    class FakeWorkerBuilder:
+        def __init__(self, worker_path, cfg, **kwargs):
+            del worker_path, cfg, kwargs
+
+    class FakeWorkerGroup:
+        def __init__(self, cluster, worker_builder, **kwargs):
+            del cluster, worker_builder, kwargs
+
+    monkeypatch.setattr(worker_groups, "RayWorkerBuilder", FakeWorkerBuilder)
+    monkeypatch.setattr(worker_groups, "RayWorkerGroup", FakeWorkerGroup)
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    teacher_config = TeacherConfig(
+        alias="teacher",
+        model_name="/ckpt/teacher",
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        num_nodes=1,
+        gpus_per_node=1,
+        precision="bf16",
+        micro_batch_size=1,
+        megatron_cfg_overrides=megatron_cfg_overrides,
+    )
+    teacher = TeacherWorkerGroup(
+        teacher_config, cluster, policy_config, MagicMock(), teacher_index=0
+    )
+    return teacher.cfg
+
+
+def _student_policy_config_with_manual_gc():
+    return {
+        "model_name": "/ckpt/student",
+        "megatron_cfg": {
+            "enabled": True,
+            "manual_gc": True,
+            "manual_gc_interval": 10,
+        },
+        "automodel_cfg": {"enabled": False},
+        "sequence_packing": {"enabled": False},
+        "dynamic_batching": {"enabled": False},
+    }
+
+
+def test_teacher_worker_group_turns_off_the_student_manual_gc(monkeypatch):
+    """A teacher never trains, so it would never collect with GC disabled."""
+    policy_config = _student_policy_config_with_manual_gc()
+
+    cfg = _build_teacher_cfg(monkeypatch, policy_config, megatron_cfg_overrides={})
+
+    assert cfg["megatron_cfg"]["manual_gc"] is False
+    # The student's own config is untouched.
+    assert policy_config["megatron_cfg"]["manual_gc"] is True
+
+
+def test_teacher_worker_group_rejects_manual_gc_on_a_teacher(monkeypatch):
+    with pytest.raises(ValueError, match="manual_gc is not supported on teachers"):
+        _build_teacher_cfg(
+            monkeypatch,
+            _student_policy_config_with_manual_gc(),
+            megatron_cfg_overrides={"manual_gc": True},
+        )
+
+
 def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatch):
     """Left in, the teacher would load the student's weights and distill itself.
 

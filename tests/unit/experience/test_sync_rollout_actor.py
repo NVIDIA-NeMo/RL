@@ -36,6 +36,7 @@ def test_actor_stamps_distinct_groups_and_preserves_multimodal_tags(
     actor.policy_generation = MagicMock()
     actor.tokenizer = SimpleNamespace(pad_token_id=0)
     actor.task_to_env = {}
+    actor.per_token_multimodal_fields = ()
     actor._dp_client = MagicMock()
     actor.master_config = SimpleNamespace(
         policy={
