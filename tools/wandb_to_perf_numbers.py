@@ -69,7 +69,9 @@ def main():
     # The wandb row index (_step) also advances on non-training logs (e.g. ray
     # metrics), so index by the trainer's own step when it is logged.
     if "nemo_rl/step" in raw_history.columns:
-        raw_history = raw_history.dropna(subset=["nemo_rl/step"]).set_index("nemo_rl/step")
+        raw_history = raw_history.dropna(subset=["nemo_rl/step"]).set_index(
+            "nemo_rl/step"
+        )
     history = raw_history.loc[min_step:max_step, keys]
 
     # get average of the history
