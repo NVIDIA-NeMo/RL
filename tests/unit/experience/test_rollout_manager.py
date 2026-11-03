@@ -55,6 +55,7 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
@@ -1607,7 +1608,7 @@ def test_rollout_manager_task_counter_only_applies_to_gym(use_nemo_gym: bool) ->
     assert manager.get_next_nemo_gym_task_index() == (42 if use_nemo_gym else 0)
 
 
-def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling():
+def test_nemo_gym_build_inputs_preserves_materialized_task_and_stamps_sampling():
     impl = _nemo_gym_impl(True)
     impl._num_generations_per_prompt = 2
     impl._generation_config.update(temperature=0.7, top_p=0.9, max_new_tokens=64)
@@ -1628,20 +1629,43 @@ def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling()
 
     rows = impl._build_inputs(input_sample, task_index=7)
 
+    task_params = original["extra_env_info"]["task_input"]["responses_create_params"]
     assert input_sample == original
     assert len(rows) == 2
     for row in rows:
         assert row["task_id"] == original["extra_env_info"]["task_id"]
         assert row["task_input"]["task_data"] == {"state": ["meeting-1"]}
-        params = row["task_input"]["responses_create_params"]
-        assert params["temperature"] == 0.7
-        assert params["top_p"] == 0.9
-        assert params["max_output_tokens"] == 32
-        assert params["metadata"] == {"extra_body": '{"seed": 8}'}
+        # The task is left as the dataset wrote it; the values ride beside it.
+        assert row["task_input"]["responses_create_params"] == task_params
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY] == {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 64,
+        }
         assert "responses_create_params" not in row
     assert [row["_rowidx"] for row in rows] == [0, 1]
     rows[0]["task_input"]["task_data"]["state"].append("meeting-2")
     assert rows[1]["task_input"]["task_data"] == {"state": ["meeting-1"]}
+
+
+def test_nemo_gym_build_inputs_stamps_a_task_without_responses_create_params():
+    impl = _nemo_gym_impl(True)
+    input_sample = {
+        "extra_env_info": {
+            # A multi-turn Harbor task has no top-level responses_create_params.
+            "task_id": {"taskset": "harbor:train", "task_id": "7"},
+            "task_input": {"task_data": {"repo": "demo"}},
+        }
+    }
+
+    rows = impl._build_inputs(input_sample, task_index=3)
+
+    assert rows[0]["task_input"] == {"task_data": {"repo": "demo"}}
+    assert rows[0][NEMO_GYM_MODEL_SAMPLING_KEY] == {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_output_tokens": 100,
+    }
 
 
 @pytest.mark.parametrize(

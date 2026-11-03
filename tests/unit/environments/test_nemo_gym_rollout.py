@@ -568,16 +568,10 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case, accepte
     expected_reward = case["expected_reward"] if accepted else 0.0
     datum = _load_case_datum(case, accepted=accepted)
     extra_env_info = datum["extra_env_info"]
+    # NeMo-RL leaves the task unchanged: Gym's model server applies the policy's
+    # sampling to the trained agent's calls (see _assert_request_contract).
     expected_responses_create_params = deepcopy(
         extra_env_info["responses_create_params"]
-    )
-    expected_responses_create_params["temperature"] = _GENERATION_CONFIG["temperature"]
-    expected_responses_create_params["top_p"] = _GENERATION_CONFIG["top_p"]
-    row_max_output_tokens = expected_responses_create_params.get("max_output_tokens")
-    expected_responses_create_params["max_output_tokens"] = (
-        min(row_max_output_tokens, _GENERATION_CONFIG["max_new_tokens"])
-        if row_max_output_tokens is not None
-        else _GENERATION_CONFIG["max_new_tokens"]
     )
     assert case["expected_prompt_fragment"] in json.dumps(
         extra_env_info["responses_create_params"]

@@ -1233,6 +1233,7 @@ class NemoGym(EnvironmentInterface):
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
+        from nemo_gym.config import MODEL_CALL_SAMPLING_BLOCK
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import (
             HEAD_SERVER_KEY_NAME,
@@ -1333,6 +1334,38 @@ Depending on your data shape, you may want to change these values."""
             "host": self.node_ip,
             "port": self.head_server_port,
         }
+
+        # Gym applies each row's _ng_model_sampling to these servers' calls and
+        # refuses one without them: policy_model, servers that _copy it, and any
+        # the recipe lists. Resources servers keep their own sampling.
+        sampling_block = dict(
+            initial_global_config_dict.get(MODEL_CALL_SAMPLING_BLOCK) or {}
+        )
+        required = [_POLICY_SERVER_NAME] + [
+            name
+            for name, block in initial_global_config_dict.items()
+            if isinstance(block, Mapping) and block.get("_copy") == _POLICY_SERVER_NAME
+        ]
+        for name in sampling_block.get("required_model_servers") or []:
+            if name not in required:
+                required.append(name)
+        initial_global_config_dict[MODEL_CALL_SAMPLING_BLOCK] = {
+            **sampling_block,
+            "required_model_servers": required,
+        }
+        policy_model_server = (
+            (initial_global_config_dict.get(_POLICY_SERVER_NAME) or {})
+            .get("responses_api_models", {})
+            .get("vllm_model", {})
+        )
+        if policy_model_server.get("sampling_overrides"):
+            raise ValueError(
+                f"env.nemo_gym.{_POLICY_SERVER_NAME} sets sampling_overrides, but the "
+                "agent NeMo-RL trains samples with policy.generation: temperature and "
+                "top_p, val_temperature and val_top_p for validation, and "
+                "max_new_tokens. Remove sampling_overrides; to pin an untrained "
+                "agent such as a judge, give it a model server of its own."
+            )
 
         # Ledger-authoritative token capture: enable external staging in the
         # policy model server (via the policy_model global-config override

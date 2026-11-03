@@ -2336,14 +2336,14 @@ def test_nemo_gym_sanity(
     # Save original input before mutation for writing the actual test data file
     original_input = deepcopy(nemo_gym_sanity_test_data["input"])
 
-    # We need to match NeMo RL generation config params before sending to NeMo-Gym
+    # Rows carry NeMo RL's sampling values, which Gym applies to every policy call.
     generation_config = nemo_gym_vllm_generation.cfg
     examples = nemo_gym_sanity_test_data["input"]
     for idx, example in enumerate(examples):
-        example["responses_create_params"]["temperature"] = generation_config[
-            "temperature"
-        ]
-        example["responses_create_params"]["top_p"] = generation_config["top_p"]
+        example["_ng_model_sampling"] = {
+            "temperature": generation_config["temperature"],
+            "top_p": generation_config["top_p"],
+        }
         example["task_source"] = "example_multi_step_resources_server"
         example["_rowidx"] = idx
 
@@ -2686,3 +2686,168 @@ def test_spinup_forwards_job_identity_to_gym_servers(monkeypatch):
     # A launcher's value must win over the actor's.
     monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "nv.dl.campaign.stage=SFT")
     assert spin_up()["nv.dl.campaign.stage"] == "SFT"
+
+
+@pytest.mark.nemo_gym
+def test_sampling_names_match_gym():
+    """RL copies Gym's sampling names, because their readers cannot import
+    nemo_gym: the driver and vLLM-only actors set the row key, and the vLLM chat
+    route also serves workers built without nemo_gym (the ModelOpt workers).
+    They must not drift."""
+    from nemo_gym.config import MODEL_SAMPLING_KEY_NAME
+    from nemo_gym.core import MODEL_SAMPLING_HEADER, MODEL_SAMPLING_NULL
+
+    from nemo_rl.experience.interfaces import (
+        NEMO_GYM_MODEL_SAMPLING_HEADER,
+        NEMO_GYM_MODEL_SAMPLING_KEY,
+        NEMO_GYM_MODEL_SAMPLING_NULL,
+    )
+
+    assert (
+        NEMO_GYM_MODEL_SAMPLING_KEY,
+        NEMO_GYM_MODEL_SAMPLING_HEADER,
+        NEMO_GYM_MODEL_SAMPLING_NULL,
+    ) == (MODEL_SAMPLING_KEY_NAME, MODEL_SAMPLING_HEADER, MODEL_SAMPLING_NULL)
+
+
+@pytest.mark.nemo_gym
+def test_spinup_keeps_score_centering_on_the_required_policy_model(
+    monkeypatch, tmp_path
+):
+    """Score centering pins logprobs and top_logprobs on policy_model, which the run
+    also lists as required: Gym must still start that model server."""
+    from unittest.mock import MagicMock
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    import nemo_gym.server_utils as gym_server_utils
+    from omegaconf import OmegaConf
+    from responses_api_models.vllm_model.app import VLLMModel, VLLMModelConfig
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = []
+
+    class _FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config):
+            started.append(
+                OmegaConf.to_container(
+                    global_config_dict_parser_config.initial_global_config_dict,
+                    resolve=False,
+                )
+            )
+
+    monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
+    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    monkeypatch.setenv(nemo_gym_mod._TOKEN_CAPTURE_CONTROL_ENV, "unused")
+    cfg = {
+        "initial_global_config_dict": {},
+        "model_name": "policy",
+        "base_urls": ["http://127.0.0.1:1/v1"],
+        "token_capture": {
+            "enabled": True,
+            "generation_backend": "vllm",
+            "top_logprobs": 4,
+            "capture_dir": str(tmp_path),
+            "control_auth_token": "test-token",
+        },
+    }
+    NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+    config = started[-1]
+    pins = config["policy_model"]["responses_api_models"]["vllm_model"][
+        "sampling_overrides"
+    ]
+    assert pins and set(pins) <= {"logprobs", "top_logprobs"}
+    VLLMModel(
+        config=VLLMModelConfig(
+            host="127.0.0.1",
+            port=0,
+            name="policy_model",
+            entrypoint="app.py",
+            base_url="http://unused/v1",
+            api_key="gym",  # pragma: allowlist secret
+            model="policy",
+            return_token_id_information=False,
+            uses_reasoning_parser=False,
+            sampling_overrides=pins,
+        ),
+        server_client=MagicMock(
+            spec=gym_server_utils.ServerClient, global_config_dict=config
+        ),
+    )
+
+
+@pytest.mark.nemo_gym
+def test_spinup_has_gym_apply_policy_sampling_to_the_trained_agents_calls(
+    monkeypatch,
+):
+    """Gym puts each row's _ng_model_sampling on the trained agent's model calls,
+    refuses a policy_model call without them, and keeps a judge's own sampling;
+    a sampling_overrides pin on policy_model would contradict policy.generation."""
+    from unittest.mock import MagicMock
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    import nemo_gym.server_utils as gym_server_utils
+    from omegaconf import OmegaConf
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = []
+
+    class _FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config):
+            started.append(
+                OmegaConf.to_container(
+                    global_config_dict_parser_config.initial_global_config_dict,
+                    resolve=False,
+                )
+            )
+
+    monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
+    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+
+    def spin_up(initial_global_config_dict):
+        cfg = {
+            "initial_global_config_dict": initial_global_config_dict,
+            "model_name": "policy",
+            "base_urls": ["http://127.0.0.1:1/v1"],
+        }
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return started[-1]
+
+    assert spin_up({})["model_call_sampling"] == {
+        "required_model_servers": ["policy_model"]
+    }
+    with pytest.raises(ValueError, match="sampling_overrides"):
+        spin_up(
+            {
+                "policy_model": {
+                    "responses_api_models": {
+                        "vllm_model": {"sampling_overrides": {"temperature": 1.0}}
+                    }
+                }
+            }
+        )
+    # Servers that _copy policy_model serve the same trained policy, and the
+    # recipe's own list is kept, so Gym refuses a lost-value call on each one.
+    assert spin_up(
+        {
+            "policy_model_reasoning_off": {"_copy": "policy_model"},
+            "model_call_sampling": {"required_model_servers": ["judge_model"]},
+        }
+    )["model_call_sampling"] == {
+        "required_model_servers": [
+            "policy_model",
+            "policy_model_reasoning_off",
+            "judge_model",
+        ]
+    }
