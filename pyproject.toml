@@ -373,10 +373,10 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 # FlashMLA derives its version from the Git revision in setup.py. Keep this pin
 # synchronized with the static dependency metadata below.
 flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
-# Canonical weight export and GPT output-head checkpoint support for pinned Core.
+# Shared export, checkpoint and pipeline-calibration support for pinned Bridge/Core.
 # Includes grouped checkpoint sharding fixes; the ModelOpt worker hides all
 # AnyQuantizer containers when toggling DDP hooks.
-nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "fb3ccd0e65bcf983ad69a37c8ac8600604690f02" }
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "cc4b76d74625b42cca1967118628b25ed326a3d1" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.7.0" }
 flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
