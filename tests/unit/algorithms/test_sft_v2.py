@@ -839,18 +839,7 @@ def test_setup_keeps_policy_pretrained_checkpoint_when_checkpointing_is_null():
 
 
 def test_setup_charges_the_placement_wait_to_cluster_init() -> None:
-    """The placement groups are created before the policy, so the wait is measured.
-
-    ``RayVirtualCluster.__init__`` only stores fields; the bundles are scheduled on the
-    first ``get_placement_groups()``, which blocks on ``pg.ready()``. Drop that call and
-    ``RayWorkerGroup`` triggers it during the ``TQPolicy`` build instead, so a wait that
-    can dominate a large start is reported as ``policy_init`` and ``cluster_init`` reads
-    zero. Every other test here raises during validation, so this is the only one that
-    reaches the timing at all.
-
-    The stubs advance a fake clock themselves, which makes each phase an exact number
-    rather than something that has to be bounded loosely against a real one.
-    """
+    """The placement wait is charged to cluster_init, not policy_init (fake clock gives exact phases)."""
     from nemo_rl.algorithms import sft_v2
 
     calls: list[str] = []
@@ -896,7 +885,7 @@ def test_setup_charges_the_placement_wait_to_cluster_init() -> None:
         f"the placement wait must be taken before the policy build, got {calls}"
     )
     timing = actor_args.setup_timing
-    assert timing.extras["cluster_init_time_s"] == 7.0
+    assert timing.cluster_init_time_s == 7.0
     assert timing.policy_init_time_s == 3.0, (
         "policy_init must cover the policy build alone, not the placement wait"
     )

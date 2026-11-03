@@ -100,7 +100,7 @@ The controlling group is shown for each; a span is emitted whenever its group is
 | **GRPO / PPO** (async only) | `rl.grpo.generation` / `rl.ppo.generation` — `rollout` group, emitted by the collector actor, one span per rollout batch; the name follows the algorithm the collector was built for |
 | **PPO** | `rl.ppo.job`, `rl.ppo.step`, `rl.ppo.data_processing`, `rl.ppo.generation`, `rl.ppo.reward_calculation`, `rl.ppo.policy_and_reference_logprobs`, `rl.ppo.advantage_calculation`, `rl.ppo.policy_training`, `rl.ppo.value_training`, `rl.ppo.checkpointing`, `rl.ppo.evaluate` |
 | **SFT** | `rl.sft.job`, `rl.sft.step`, `rl.sft.data_processing`, `rl.sft.policy_training`, `rl.sft.checkpointing`, `rl.sft.evaluate` |
-| **SFT v2** | `rl.sft_v2.driver` wraps setup and training in the driver; `rl.sft_v2.job` and `rl.sft_v2.step` run in the controller (all unbucketed). `rl.sft_v2.setup_loaders` covers loader construction in the controller and `rl.sft_v2.build_loader` the matching work on each loader owner (both `setup`, both unbucketed) — see [the Energon worker pool](#the-energon-worker-pool). `rl.sft_v2.read_batch` and `rl.sft_v2.prepare_batch` run on loader owners (`data_processing`); `rl.sft_v2.policy_training` runs in the controller (`policy_update`). `rl.sft_v2.checkpointing` wraps the save's loop-blocking part in the controller (`checkpoint`), with `rl.sft_v2.loader_state_dict` the loader's share of it on each owner; with `async_save` off that is all of it, so it accounts for the gap between two `rl.sft_v2.step` spans. Under `sft.defer_async_checkpoint_finalize` the handoff moves to a later step boundary, so only `rl.checkpoint.finalize` says when that save became resumable, and the blocking wait for it is counted inside the next `rl.sft_v2.checkpointing`. Trace context crosses every Ray call whose callee opens a span; the lifecycle calls inherited from `lm_policy` do not carry it, and lose nothing by it. |
+| **SFT v2** | `rl.sft_v2.driver` wraps setup and training in the driver; `rl.sft_v2.job` and `rl.sft_v2.step` run in the controller (all unbucketed). `rl.sft_v2.setup_loaders` covers loader construction in the controller and `rl.sft_v2.build_loader` the matching work on each loader owner (both `setup`, both unbucketed) — see [the Energon worker pool](#the-energon-worker-pool). `rl.sft_v2.read_batch` and `rl.sft_v2.prepare_batch` run on loader owners (`data_processing`); `rl.sft_v2.policy_training` runs in the controller (`policy_update`). `rl.sft_v2.checkpointing` wraps the save's loop-blocking part in the controller (`checkpoint`), including the loader snapshot each owner takes inside it; with `async_save` off that is all of it, so it accounts for the gap between two `rl.sft_v2.step` spans. Under `sft.defer_async_checkpoint_finalize` the handoff moves to a later step boundary, so only `rl.checkpoint.finalize` says when that save became resumable, and the blocking wait for it is counted inside the next `rl.sft_v2.checkpointing`. Trace context crosses every Ray call whose callee opens a span; the lifecycle calls inherited from `lm_policy` do not carry it, and lose nothing by it. |
 | **DPO** | `rl.dpo.job`, `rl.dpo.step`, `rl.dpo.policy_training`, `rl.dpo.checkpointing`, `rl.dpo.evaluate` |
 | **RM** | `rl.rm.job`, `rl.rm.step`, `rl.rm.checkpointing`, `rl.rm.evaluate` |
 | **Distillation** | `rl.distillation.job`, `rl.distillation.step`, `rl.distillation.data_processing`, `rl.distillation.generation`, `rl.distillation.teacher_logprob_inference`, `rl.distillation.policy_training`, `rl.distillation.checkpointing`, `rl.distillation.evaluate` |
@@ -174,7 +174,7 @@ carries no `rl.iteration` of its own. That covers more than worker internals:
 | --- | --- |
 | `rl.policy.load_model` and the other worker-side leaves | the policy workers |
 | `rl.gym.run_rollouts` | the `NemoGym` actor |
-| `rl.sft_v2.build_loader`, `rl.sft_v2.read_batch`, `rl.sft_v2.prepare_batch`, `rl.sft_v2.loader_state_dict` | the Energon SFT worker |
+| `rl.sft_v2.build_loader`, `rl.sft_v2.read_batch`, `rl.sft_v2.prepare_batch` | the Energon SFT worker |
 | the async-GRPO collector's rollout spans | the collector actor |
 
 To scope those to a step, walk up to the driver-side ancestor that is stamped,
@@ -690,12 +690,10 @@ start on the first `next()`, inside step 1's `read_batch`.
 | `rl.sft_v2.read_batch` (each owner, per step) | the blocking dequeue. Near zero while the workers keep up; the span that grows when they stop, and the span that contains worker startup on step 1 |
 
 Read the wait off the spans, not a metric. There is one `read_batch` span per
-owner per step, so worker startup is visible at full resolution — 2.8 s on
-step 1 against 0.6 ms after, on one 30-step run. The teed gauges are sampled on
-the exporter's interval with last-value semantics, which at a 10 s interval and
-1.5 s steps is roughly one step in seven. `rl.sft_v2.loader.latency.max` is
-subject to that and covers prepare, register and publish as well as the
-dequeue.
+owner per step, so worker startup on step 1 shows up. The teed gauges keep only
+the last value per export interval, so they miss one-off stalls.
+`rl.sft_v2.loader.latency.max` also covers prepare, register and publish as
+well as the dequeue.
 
 Queue depth at dequeue time is not exported, so a pool that is keeping up and
 one that is barely keeping up both read as a near-zero wait.

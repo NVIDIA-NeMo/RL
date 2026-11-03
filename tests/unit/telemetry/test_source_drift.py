@@ -507,14 +507,7 @@ def test_every_context_accepting_method_is_dispatched_with_a_carrier():
 
 
 def test_every_carrier_sending_dispatch_targets_a_decorated_method():
-    """The receiving half, for every dispatch rather than the presharded ones.
-
-    ``trace_context_kwargs()`` puts ``_otel_carrier`` in the call. A method
-    that is not decorated has no parameter to take it, so the call raises
-    ``TypeError`` as soon as telemetry is on -- and the two guards above cannot
-    see it: one starts from the decorated methods, which no longer include it,
-    and the other from the ``*_presharded`` names, which never did.
-    """
+    """Every method dispatched with a trace carrier is decorated to accept it."""
     decorated = _context_accepting_methods()
     methods = _worker_methods()
     helpers = _forwarding_helpers()
@@ -541,11 +534,7 @@ def test_every_carrier_sending_dispatch_targets_a_decorated_method():
 
 
 def _worker_methods() -> set[str]:
-    """Every method defined on a class under ``nemo_rl/``.
-
-    Narrows the names a dispatch string is matched against, so an unrelated
-    literal that happens to reach a forwarding helper is not read as a method.
-    """
+    """Names of every method defined on a class under nemo_rl/."""
     names: set[str] = set()
     for source in _python_sources(_REPO / "nemo_rl"):
         for node in ast.walk(ast.parse(source.read_text())):
@@ -559,12 +548,7 @@ def _worker_methods() -> set[str]:
 
 
 def _forwarding_helpers() -> dict[str, tuple[str, int]]:
-    """Carrier-sending helpers that dispatch a method named by a parameter.
-
-    Keyed to that parameter's name and position, so a call site is read for the
-    method name alone and not for every other string it happens to pass --
-    ``_logprob_dispatch`` takes a ``timer_prefix`` beside its ``worker_method``.
-    """
+    """Carrier-sending helpers, keyed to the parameter that names the dispatched method."""
     helpers: dict[str, tuple[str, int]] = {}
     for source in _python_sources(_REPO / "nemo_rl"):
         for node in ast.walk(ast.parse(source.read_text())):

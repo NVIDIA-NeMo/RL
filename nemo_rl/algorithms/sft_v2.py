@@ -180,14 +180,7 @@ def _restore_save_state(
 
 
 def _energon_fanout_attributes(data_config: Mapping[str, Any]) -> dict[str, int]:
-    """How many Energon worker subprocesses a rank will fork, and their queue depth.
-
-    Per rank, because the span these land on has one ``rl.sft_v2.build_loader``
-    child per rank carrying ``rl.energon.world_size``.
-
-    ``num_workers=0`` loads in the policy process, so both read 0 rather than
-    going absent: there is genuinely no subprocess and no queue.
-    """
+    """Per-rank Energon worker count and queue depth; both 0 when num_workers=0."""
     energon = data_config["energon"]
     return {
         ENERGON_WORKERS_PER_RANK_ATTR: energon.num_workers,
@@ -491,13 +484,7 @@ class SFTSingleControllerActor:
         return {metric_name: float(metrics[key])}
 
     def _log_setup_timing(self, setup_timing: SetupTimingMetrics) -> None:
-        """Log the driver's setup phases, which only this actor's Logger can.
-
-        The prefix tees them to ``rl.setup.duration``, whose ``phase=total_setup``
-        is the one value that cannot double-count: the phases nest and the worker
-        builds run concurrently, so summing across phases multiplies startup
-        rather than measuring it.
-        """
+        """Log the setup phases; total_setup is the one that cannot double-count."""
         self._logger.log_metrics(
             setup_timing.to_metrics_dict(), step=0, prefix=SETUP_TIMING_PREFIX
         )
@@ -751,9 +738,9 @@ def setup_sft_v2(
     # Only total_setup compares across algorithms: elsewhere the placement wait
     # falls inside policy_init or into no phase, where here it is cluster_init.
     setup_timing = SetupTimingMetrics(
+        cluster_init_time_s=cluster_seconds,
         policy_init_time_s=policy_seconds,
         total_setup_time_s=time.monotonic() - setup_started,
-        extras={"cluster_init_time_s": cluster_seconds},
     )
     return SFTV2ActorArgs(
         trainer=trainer,

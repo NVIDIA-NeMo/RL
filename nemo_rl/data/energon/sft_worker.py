@@ -244,10 +244,7 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             raise RuntimeError("The SFT Energon loader is not configured on this rank.")
         if self._sft_active_envelope is not None:
             raise RuntimeError("Cannot checkpoint an uncommitted SFT batch.")
-        # Energon drains the worker subprocesses to snapshot their offsets, so
-        # this is loader cost inside the checkpoint, not part of the policy write.
-        with managed_span(RLSpanGroup.CHECKPOINT, "rl.sft_v2.loader_state_dict"):
-            return self._sft_loader.state_dict()
+        return self._sft_loader.state_dict()
 
     @accepts_trace_context
     def close_sft_dataloader(self) -> None:

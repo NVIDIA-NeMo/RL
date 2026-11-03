@@ -35,11 +35,7 @@ from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 
 def _loader_setup_controller(tracer, **energon: object) -> object:
-    """A controller with just enough state for ``_setup_loaders``, over 2 DP ranks.
-
-    ``data["energon"]`` is a model, not a mapping: ``MasterConfig`` validates it
-    on the driver, so the controller never sees the raw YAML.
-    """
+    """A controller with just enough state for _setup_loaders, over 2 DP ranks."""
     controller_cls = SFTSingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
     controller._tracer = tracer
@@ -132,14 +128,7 @@ def test_sft_v2_step_spans_follow_the_enabled_groups(
 
 
 def test_sft_v2_checkpointing_span_covers_the_whole_save(monkeypatch, tmp_path) -> None:
-    """The save blocks the loop with ``async_save`` off, so the span has to hold
-    all of it: a span around the policy write alone leaves the loader dump and
-    the finalization handoff outside, and ``rl.checkpoint.finalize`` parents to
-    whatever is open when ``begin_finalization`` runs.
-
-    The wait on a deferred save counts too: it is the previous checkpoint's,
-    but it blocks this step.
-    """
+    """The checkpointing span covers the whole blocking save, including a deferred-save wait."""
     exporter = InMemorySpanExporter()
     handle = setup_telemetry(
         NemoLensConfig(enabled=True, span_groups="per_step"),
@@ -208,13 +197,7 @@ def test_sft_v2_checkpointing_span_covers_the_whole_save(monkeypatch, tmp_path) 
 
 
 def test_sft_v2_controller_constructor_parents_setup_loaders_to_the_driver() -> None:
-    """``__init__`` builds the loaders, and Ray carries no context into one.
-
-    ``@accepts_trace_context`` only works on a method the driver calls through
-    ``.remote()``; a constructor has nowhere to put the kwarg, so the carrier
-    is an argument instead. Without it the whole setup subtree re-roots while
-    ``rl.sft_v2.driver`` is open on the driver and looks fine from the code.
-    """
+    """setup_loaders joins the driver's trace through the constructor's trace_carrier."""
     exporter = InMemorySpanExporter()
     handle = setup_telemetry(
         NemoLensConfig(enabled=True, span_groups="per_step"),
@@ -270,11 +253,7 @@ def test_sft_v2_controller_constructor_parents_setup_loaders_to_the_driver() -> 
 
 
 def test_sft_v2_setup_loaders_span_records_the_energon_worker_pool() -> None:
-    """The subprocesses emit nothing, so the span is the only place they appear.
-
-    Per rank, because the job-wide total is this times the loader rank count,
-    which every ``rl.sft_v2.build_loader`` child of this span already carries.
-    """
+    """The setup_loaders span carries the per-rank Energon worker count and queue depth."""
     exporter = InMemorySpanExporter()
     handle = setup_telemetry(
         NemoLensConfig(enabled=True, span_groups="per_step"),
@@ -297,11 +276,7 @@ def test_sft_v2_setup_loaders_span_records_the_energon_worker_pool() -> None:
 
 
 def test_sft_v2_in_process_loading_reports_no_worker_pool() -> None:
-    """``num_workers=0`` loads in the policy process, so the honest count is 0.
-
-    Reported rather than omitted: an absent attribute reads as telemetry that
-    failed, where 0 reads as the pool that is genuinely not there.
-    """
+    """num_workers=0 loads in-process, so the worker count and queue depth are both 0."""
     controller = _loader_setup_controller(None, num_workers=0)
 
     attributes = _energon_fanout_attributes(controller._master_config.data)
@@ -311,12 +286,7 @@ def test_sft_v2_in_process_loading_reports_no_worker_pool() -> None:
 
 
 def test_sft_v2_owner_calls_carry_the_caller_trace_context() -> None:
-    """Without this the loader's clear lands in its own root trace, once a step.
-
-    ``_owner_call`` names its method with a runtime string, so the carrier is
-    the only thing tying ``commit_sft_batch`` -- and the ``rl.data_plane.clear``
-    it opens on the worker -- back to the step that asked for it.
-    """
+    """_owner_call sends a trace carrier so commit_sft_batch joins the step's trace."""
     handle = setup_telemetry(
         NemoLensConfig(enabled=True, span_groups="per_step"),
         span_exporter=InMemorySpanExporter(),
@@ -340,11 +310,7 @@ def test_sft_v2_owner_calls_carry_the_caller_trace_context() -> None:
 
 
 def test_sft_v2_setup_timing_reaches_the_logger_under_the_teed_prefix() -> None:
-    """``setup_sft_v2`` measures on the driver, but the Logger lives in the actor.
-
-    The prefix is the whole mechanism: ``rl.setup.duration`` is teed off it, so
-    logging the same dict without it emits no metric at all.
-    """
+    """Setup timing is logged under SETUP_TIMING_PREFIX, which is what emits rl.setup.duration."""
     controller_cls = SFTSingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
     logger = MagicMock()
