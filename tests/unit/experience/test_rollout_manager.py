@@ -2335,7 +2335,7 @@ class TestGenerateForFinalizationFlow:
 
         mgr._impl.run_rollout = resend_row_1
 
-        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+        request, _ = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
 
         first_ids = buf.reserve_rollout_ids[0]
         assert request.rollout_ids[0] == first_ids[0]
@@ -2558,6 +2558,7 @@ class TestGenerateForFinalizationFlow:
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
+                **_kwargs,
             ):
                 indices = list(generation_indices)
                 self.generation_indices.append(indices)

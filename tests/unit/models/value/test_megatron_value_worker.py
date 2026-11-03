@@ -464,6 +464,7 @@ def test_finish_training_clears_transient_caches_when_configured(
     worker = object.__new__(MegatronValueWorkerImpl)
     worker.model = model
     worker.optimizer = None
+    worker._train_step_state = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": clear_caches}}
     worker.move_model = lambda m, device, **kwargs: (events.append("move_model") or m)
     monkeypatch.setattr(
