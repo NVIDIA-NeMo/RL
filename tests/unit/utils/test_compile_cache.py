@@ -45,7 +45,7 @@ def test_env_overrides_default_under_the_local_dir(caches):
 def test_missing_script_raises(caches, monkeypatch):
     monkeypatch.setenv(compile_cache.SCRIPT_VAR, str(caches / "missing.sh"))
     with pytest.raises(FileNotFoundError):
-        compile_cache.seed("megatron", background=True)
+        compile_cache.seed("megatron")
 
 
 def test_seed_copies_once_per_node_from_the_type_dir(caches, monkeypatch):
