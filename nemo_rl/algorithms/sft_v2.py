@@ -179,23 +179,6 @@ def _restore_save_state(
     return SFTV2SaveState(**defaults)
 
 
-def _energon_setting(energon: Any, name: str) -> int:
-    """One Energon loader setting, falling back to the model's own default.
-
-    ``data["energon"]`` reaches here either as the raw mapping from the YAML or
-    as an already-validated ``EnergonLoaderConfig``; ``build_energon_sft_loader``
-    accepts both, so this has to as well.
-    """
-    value = (
-        energon.get(name)
-        if isinstance(energon, Mapping)
-        else getattr(energon, name, None)
-    )
-    if isinstance(value, int) and not isinstance(value, bool):
-        return value
-    return EnergonLoaderConfig.model_fields[name].default
-
-
 def _energon_fanout_attributes(
     data_config: Mapping[str, Any], *, loader_ranks: int
 ) -> dict[str, int]:
@@ -211,14 +194,28 @@ def _energon_fanout_attributes(
     nothing else in that path does.
     """
     energon = data_config.get("energon")
-    workers = _energon_setting(energon, "num_workers")
+
+    def setting(name: str) -> int:
+        # ``data["energon"]`` arrives either as the raw mapping from the YAML
+        # or as an already-validated ``EnergonLoaderConfig``, since
+        # ``build_energon_sft_loader`` takes both.
+        value = (
+            energon.get(name)
+            if isinstance(energon, Mapping)
+            else getattr(energon, name, None)
+        )
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return EnergonLoaderConfig.model_fields[name].default
+
+    workers = setting("num_workers")
     return {
         ENERGON_WORKER_PROCESSES_ATTR: workers * loader_ranks,
         ENERGON_WORKERS_PER_RANK_ATTR: workers,
         # num_workers=0 loads in the policy process itself, so there is neither
         # a subprocess nor a queue in front of it. Both products are 0, which
         # is the honest reading rather than a missing value.
-        ENERGON_IN_FLIGHT_ATTR: workers * _energon_setting(energon, "prefetch_factor"),
+        ENERGON_IN_FLIGHT_ATTR: workers * setting("prefetch_factor"),
     }
 
 
