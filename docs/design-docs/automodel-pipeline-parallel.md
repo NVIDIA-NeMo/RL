@@ -64,7 +64,9 @@ Qwen3.5-MoE's MTP layer) are not placed on any stage; RL training does not use t
   clearing is not supported under PP. Leave it unset, or set it to `null` or `0`.
   The usual cache clearing at the end of `train()` still runs.
 
-SFT additionally requires `sft.val_micro_batch_size == policy.train_micro_batch_size`.
+PP supports SFT and GRPO. SFT additionally requires
+`sft.val_micro_batch_size == policy.train_micro_batch_size`. DPO rejects PP at setup
+because it runs microbatches of `2 * train_micro_batch_size`.
 Top-k logits, full logits, and reward scoring raise `NotImplementedError` in the worker.
 
 ## 2. Pipeline Stage
