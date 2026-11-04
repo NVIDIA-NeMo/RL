@@ -67,10 +67,7 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
-from nemo_rl.models.generation.vllm.multi_api import (
-    MultiAPIServerPool,
-    api_server_count,
-)
+from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -447,15 +444,18 @@ class VllmAsyncGenerationWorkerImpl(
             if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
             else []
         )
-        count = api_server_count(self.cfg)
-        if count is not None and count > 1:
+
+        # Initialize the vLLM engine
+        api_server_count = self.cfg["vllm_cfg"].get("http_api_server_count", 1)
+        if api_server_count > 1:
             if self._sparse_refit_receiver is not None:
                 raise ValueError(
                     "Multiple HTTP API servers do not support sparse refit"
                 )
             if self._reserved_socket is None:
                 self._reserve_port()
-            self._api_server_pool = MultiAPIServerPool(self, count)
+            # Multiple API servers require separate frontend and engine setup.
+            self._api_server_pool = MultiAPIServerPool(self, api_server_count)
             self.llm = self._api_server_pool.create_engine(
                 self.llm_async_engine_args, self.stat_loggers
             )
@@ -463,6 +463,7 @@ class VllmAsyncGenerationWorkerImpl(
             self.llm = AsyncLLM.from_engine_args(
                 self.llm_async_engine_args, stat_loggers=self.stat_loggers
             )
+
         # Keep vLLM's output loops from monopolizing this actor's event loop under a
         # generation backlog (see install_output_loop_yield).
         output_loop_yield_budget_ms = self.cfg["vllm_cfg"].get(
