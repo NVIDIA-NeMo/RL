@@ -1424,7 +1424,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
         grpo_cfg = cast(GRPOConfig, algo_cfg)
-        rollout_failure = async_config.rollout_failure
         # Capture cannot borrow future groups, so routine filtering would stall training.
         if master_config.token_capture.enabled:
             raise ValueError(
@@ -1433,66 +1432,23 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "a finished group from a later step, so every dropped group stalls its "
                 "step for a full fresh rollout. Disable one of the two."
             )
-        # A zero low-water mark disables spare-pool refills, including under shrink mode.
-        if rollout_failure.replacement_reserve_prompts < 1:
+        if grpo_cfg.dynamic_sampling_max_gen_batches < 1:
+            raise ValueError(
+                f"{algo_prefix}.dynamic_sampling_max_gen_batches must be >= 1 when "
+                f"{algo_prefix}.use_dynamic_sampling is set (got "
+                f"{grpo_cfg.dynamic_sampling_max_gen_batches}): a step needs at least "
+                "the batch it was admitted with."
+            )
+        # By name: neither the stamping nor the interruptible admission wait this
+        # needs is knowable for a `custom` class at setup. #4784 reopens it.
+        if async_config.sampler.name != "in_order":
             raise ValueError(
                 f"{algo_prefix}.use_dynamic_sampling requires "
-                "async_rl.rollout_failure.replacement_reserve_prompts >= 1, got "
-                f"{rollout_failure.replacement_reserve_prompts}: at 0 the spare pool "
-                "is never refilled, so every filtered group shrinks its step instead "
-                "of being resampled."
-            )
-        # Reserve headroom is checked only once per dataloader batch.
-        if rollout_failure.replacement_reserve_prompts < algo_cfg.num_prompts_per_step:
-            warnings.warn(
-                f"async_rl.rollout_failure.replacement_reserve_prompts="
-                f"{rollout_failure.replacement_reserve_prompts} is below "
-                f"{algo_prefix}.num_prompts_per_step="
-                f"{algo_cfg.num_prompts_per_step}, so the spare pool can empty "
-                "between refills: it is topped up only once it falls below the mark, "
-                "and that check runs once per dataloader batch. Filtering is routine, "
-                "so a group filtered after the pool empties shrinks its step instead "
-                "of being resampled, and enough of them fail the step against "
-                "async_rl.rollout_failure.min_step_batch_fraction. Set it to at least "
-                f"{algo_prefix}.num_prompts_per_step, which covers any drop rate "
-                "below 50%.",
-                stacklevel=2,
-            )
-        if grpo_cfg.dynamic_sampling_max_replacements_per_slot < 1:
-            raise ValueError(
-                f"{algo_prefix}.dynamic_sampling_max_replacements_per_slot must be >= 1 "
-                f"when {algo_prefix}.use_dynamic_sampling is set (got "
-                f"{grpo_cfg.dynamic_sampling_max_replacements_per_slot}): with no "
-                "replacement budget the first zero-variance group fails the run."
-            )
-        if async_config.sampler.name not in ("in_order", "custom"):
-            raise ValueError(
-                f"{algo_prefix}.use_dynamic_sampling requires a sampler that stamps a "
-                "target step (async_rl.sampler.name must be 'in_order', or a 'custom' "
-                f"sampler that stamps one), but got '{async_config.sampler.name}': "
-                "without a stamped step a filtered group cannot be credited short or "
-                "replaced, so every filtered group silently shrinks the batch."
-            )
-        # SC replaces individual slots instead of regenerating batches.
-        inert = [
-            f"{algo_prefix}.{name}={value!r}"
-            for name, value, default in (
-                (
-                    "dynamic_sampling_max_gen_batches",
-                    grpo_cfg.dynamic_sampling_max_gen_batches,
-                    10,
-                ),
-            )
-            if value != default
-        ]
-        if inert:
-            warnings.warn(
-                f"{', '.join(inert)} has no effect on the SingleController path: "
-                "dynamic sampling resamples per dropped slot, budgeted by "
-                f"{algo_prefix}.dynamic_sampling_max_replacements_per_slot, rather "
-                "than regenerating whole batches. See "
-                "docs/guides/single-controller.md#dynamic-sampling.",
-                stacklevel=2,
+                "async_rl.sampler.name='in_order', but got "
+                f"'{async_config.sampler.name}': a filtered group is charged to the "
+                "target step the sampler stamps, and the spare pool is refilled while "
+                "the pump waits to admit, neither of which the other samplers "
+                "support yet."
             )
         if algo_cfg.num_generations_per_prompt < 2:
             raise ValueError(

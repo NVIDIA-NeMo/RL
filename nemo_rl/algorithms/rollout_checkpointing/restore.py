@@ -792,7 +792,12 @@ class RolloutRestorer(_UsesRolloutParts):
         reserve_state = await asyncio.to_thread(
             load_checkpoint_object, reserve_path, weights_only=False
         )
-        self._rollout_runtime.replacement_reserve.extend(reserve_state)
+        if isinstance(reserve_state, dict):
+            self._rollout_runtime.replacement_reserve.extend(reserve_state.get("replacement", []))
+            self._rollout_runtime.filtered_reserve.extend(reserve_state.get("filtered", []))
+            reserve_state = list(self._rollout_runtime.replacement_reserve) + list(self._rollout_runtime.filtered_reserve)
+        else:
+            self._rollout_runtime.replacement_reserve.extend(reserve_state)
         print(
             f"📦 Restored {len(reserve_state)} pooled spare prompt(s) from checkpoint: "
             f"{reserve_path}",

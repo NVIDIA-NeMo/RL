@@ -1998,7 +1998,11 @@ class TestPeriodicRolloutCheckpoint:
             (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
         )
         assert manifest["rolled_back_train_group_count"] == int(claimed)
-        assert torch.load(snapshot / "replacement_reserve.pt", weights_only=True) == []
+        # Two pools since dynamic sampling got its own; both empty here.
+        assert torch.load(snapshot / "replacement_reserve.pt", weights_only=True) == {
+            "replacement": [],
+            "filtered": [],
+        }
         restored_state = torch.load(
             snapshot / REPLAY_BUFFER_METADATA_FILENAME, weights_only=False
         )
@@ -3603,6 +3607,9 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._consumed_samples = 0
     actor._total_valid_tokens = 0
     actor._rollout_runtime.replacement_reserve = []
+    actor._rollout_runtime.filtered_reserve = []
+    actor._rollout_runtime.finalizer_metrics_by_group = {}
+    actor._rollout_runtime.finalizer_rewards_by_group = {}
     actor._async_cfg = SimpleNamespace(
         sampler=SimpleNamespace(name="in_order"),
         max_buffered_rollouts=4,
@@ -4779,7 +4786,10 @@ class TestReplacementReservePersistence:
 
         reserve_path = tmp_path / "checkpoints" / "step_2" / "replacement_reserve.pt"
         assert reserve_path.exists()
-        assert torch.load(reserve_path, weights_only=False) == ["spare0", "spare1"]
+        assert torch.load(reserve_path, weights_only=False) == {
+            "replacement": ["spare0", "spare1"],
+            "filtered": [],
+        }
         # Saved, not consumed: the pool the run continues with is untouched.
         assert list(actor._rollout_runtime.replacement_reserve) == ["spare0", "spare1"]
 
@@ -4791,7 +4801,10 @@ class TestReplacementReservePersistence:
 
         step_dir = tmp_path / "checkpoints" / "step_2"
         assert step_dir.exists()
-        assert torch.load(step_dir / "replacement_reserve.pt", weights_only=False) == []
+        assert torch.load(step_dir / "replacement_reserve.pt", weights_only=False) == {
+            "replacement": [],
+            "filtered": [],
+        }
 
     def test_run_restores_the_pooled_spares(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"

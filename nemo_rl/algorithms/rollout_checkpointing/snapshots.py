@@ -359,7 +359,10 @@ class RolloutSnapshotter(_UsesRolloutParts):
         next_nemo_gym_task_index = self._rollout_manager.get_next_nemo_gym_task_index()
         # The spare pool and dataloader advance together under the same mutation
         # cut in recovery-enabled dispatch, so preserve them in this cut too.
-        replacement_reserve = list(self._rollout_runtime.replacement_reserve)
+        replacement_reserve = {
+            "replacement": list(self._rollout_runtime.replacement_reserve),
+            "filtered": list(self._rollout_runtime.filtered_reserve),
+        }
         replay_metadata: Optional[TQReplayMetadataState] = None
         recovery_payload: Optional[bytes] = None
         recovery_group_count: Optional[int] = None

@@ -2685,7 +2685,7 @@ class RolloutManager:
             every generation scored the same reward. It carries the same two caller
             obligations as ``SKIPPED`` -- the backpressure permit and the ledger
             transition -- but the rollout itself succeeded, so its replacement is paid
-            for out of ``grpo.dynamic_sampling_max_replacements_per_slot`` rather than
+            for out of ``grpo.dynamic_sampling_max_gen_batches`` rather than
             the rollout fault-tolerance budget.
 
         Raises:

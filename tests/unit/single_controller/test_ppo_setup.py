@@ -603,7 +603,7 @@ def _dynamic_sampling_config(
     on_dropped_prompt: str = "replace",
     sampler: str = "in_order",
     num_generations_per_prompt: int = _NUM_GENERATIONS_PER_PROMPT,
-    max_replacements_per_slot: int = 32,
+    max_gen_batches: int = 10,
     # A full batch, the size setup stops warning at: the pool is a low-water mark
     # checked once per dataloader batch, so anything smaller can empty in between.
     replacement_reserve_prompts: int = _NUM_PROMPTS_PER_STEP,
@@ -611,7 +611,7 @@ def _dynamic_sampling_config(
     """A GRPO SC config with dynamic sampling on and the knobs it validates."""
     mc = _make_master_config()
     mc.grpo.use_dynamic_sampling = True
-    mc.grpo.dynamic_sampling_max_replacements_per_slot = max_replacements_per_slot
+    mc.grpo.dynamic_sampling_max_gen_batches = max_gen_batches
     mc.grpo.num_generations_per_prompt = num_generations_per_prompt
     mc.policy["train_global_batch_size"] = (
         _NUM_PROMPTS_PER_STEP * num_generations_per_prompt
@@ -638,10 +638,14 @@ class TestDynamicSamplingValidation:
     def test_accepts_replace_with_a_stamping_sampler(self):
         validate_single_controller_config(_dynamic_sampling_config())
 
-    def test_accepts_a_custom_sampler(self):
-        # `custom` is permitted alongside `in_order`; stamping is the sampler's
-        # responsibility and cannot be checked here.
-        validate_single_controller_config(_dynamic_sampling_config(sampler="custom"))
+    def test_rejects_a_custom_sampler(self):
+        # Narrowed to in_order: a custom class cannot declare at setup that it stamps
+        # a target step or that its admission wait can be interrupted for a refill.
+        # #4784 reopens this through a capability protocol.
+        mc = _dynamic_sampling_config(sampler="custom")
+
+        with pytest.raises(ValueError, match="sampler.name='in_order'"):
+            validate_single_controller_config(mc)
 
     def test_accepts_shrink_because_filtering_replaces_regardless(self):
         # on_dropped_prompt governs rollout failures only. Training on a uniform group
@@ -660,64 +664,37 @@ class TestDynamicSamplingValidation:
         with pytest.raises(ValueError, match="token_capture.enabled"):
             validate_single_controller_config(mc)
 
-    def test_rejects_a_zero_replacement_budget(self):
-        mc = _dynamic_sampling_config(max_replacements_per_slot=0)
+    def test_rejects_a_zero_generation_batch_allowance(self):
+        mc = _dynamic_sampling_config(max_gen_batches=0)
 
         with pytest.raises(
-            ValueError, match="dynamic_sampling_max_replacements_per_slot must be >= 1"
+            ValueError, match="dynamic_sampling_max_gen_batches must be >= 1"
         ):
             validate_single_controller_config(mc)
 
-    def test_rejects_an_unfillable_spare_pool(self):
-        # RolloutFailureConfig only enforces this under on_dropped_prompt="replace",
-        # and filtering does not read that knob, so under "shrink" a pool of 0 would
-        # otherwise be accepted and every filtered group would shrink its step.
+    @pytest.mark.parametrize(
+        ("mode", "reserve"),
+        [
+            ("shrink", 0),
+            ("shrink", 1),
+            ("replace", 1),
+            ("replace", _NUM_PROMPTS_PER_STEP),
+        ],
+    )
+    def test_filter_pool_is_independent_of_failure_reserve(
+        self, mode: str, reserve: int
+    ) -> None:
         mc = _dynamic_sampling_config(
-            on_dropped_prompt="shrink", replacement_reserve_prompts=0
+            on_dropped_prompt=mode, replacement_reserve_prompts=reserve
         )
-
-        with pytest.raises(ValueError, match="replacement_reserve_prompts >= 1"):
-            validate_single_controller_config(mc)
-
-    def test_warns_when_the_spare_pool_is_smaller_than_one_batch(self):
-        # The key is a low-water mark checked once per dataloader batch, so below
-        # num_prompts_per_step the pool can empty mid-batch and groups filtered after
-        # that shrink their step. A warning, not a raise: the headroom a run needs
-        # scales with its drop rate, which setup cannot know.
-        mc = _dynamic_sampling_config(
-            replacement_reserve_prompts=_NUM_PROMPTS_PER_STEP - 1
-        )
-
-        with pytest.warns(UserWarning, match="can empty between refills"):
-            validate_single_controller_config(mc)
-
-    def test_does_not_warn_when_the_spare_pool_holds_a_full_batch(self):
-        mc = _dynamic_sampling_config(replacement_reserve_prompts=_NUM_PROMPTS_PER_STEP)
-
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
             validate_single_controller_config(mc)
 
-    def test_warns_that_the_v1_gen_batch_budget_is_inert_here(self):
-        # Reachable but unread on this path. Silently ignoring it would let a config
-        # that looks tuned for a high drop rate behave as if it were not.
-        mc = _dynamic_sampling_config()
-        mc.grpo.dynamic_sampling_max_gen_batches = 20
-
-        with pytest.warns(UserWarning, match="no effect on the SingleController"):
-            validate_single_controller_config(mc)
-
-    def test_does_not_warn_when_the_v1_knobs_are_left_at_their_defaults(self):
-        import warnings as _warnings
-
-        with _warnings.catch_warnings():
-            _warnings.simplefilter("error", UserWarning)
-            validate_single_controller_config(_dynamic_sampling_config())
-
     def test_rejects_a_sampler_that_stamps_no_target_step(self):
         mc = _dynamic_sampling_config(sampler="ready_first")
 
-        with pytest.raises(ValueError, match="stamps a target step"):
+        with pytest.raises(ValueError, match="sampler.name='in_order'"):
             validate_single_controller_config(mc)
 
     def test_rejects_a_single_generation_per_prompt(self):
