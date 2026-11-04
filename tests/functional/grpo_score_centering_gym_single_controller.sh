@@ -22,7 +22,14 @@ if [[ "$TOP_P" != 1.0 || "$TOP_K" != null ]]; then
     # then compares those replayed logprobs with vLLM's processed logprobs.
     REPLAY=true
     FORCE_ON_POLICY=false
-    REPLAY_CHECKS=('max(data["train/token_mult_prob_error"]) < 1.05')
+    REPLAY_CHECKS=(
+        'max(data["train/token_mult_prob_error"]) < 1.05'
+        # token_mult_prob_error averages over kept tokens only, so it cannot see
+        # drops. Replay drops a token only when its head misses part of the kept
+        # set (5+ ties at the top_k-th logit); logprobs recomputed with the
+        # filters drop every sampled token outside the trainer's own support.
+        'max(data["train/policy_support_excluded_tokens"]) < 10'
+    )
 fi
 
 cd "$PROJECT_ROOT"
