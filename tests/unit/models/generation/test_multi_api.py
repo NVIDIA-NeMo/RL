@@ -38,7 +38,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             hosts = []
 
             class Host:
-                def _initialize_http_state(self):
+                def _init_frontend_state(self):
                     self.http_server = None
                     self.setup_token_capture = AsyncMock()
                     self.set_rollout_weight_version = AsyncMock()
