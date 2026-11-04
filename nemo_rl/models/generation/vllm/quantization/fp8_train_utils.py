@@ -15,10 +15,16 @@
 
 import functools
 import importlib.util
+import logging
 import os
 import shutil
 
 import torch
+
+from nemo_rl.models.generation.vllm.patches import (
+    VLLM_MXFP8_TE_COMPAT_ENV_VAR,
+    patch_flashinfer_mxfp8_te_compat,
+)
 
 MXFP8_BLOCK_SIZE = 32
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
@@ -74,10 +80,11 @@ def canonicalize_mxfp8_refit_output(
             f"shape {tuple(shape)}, got {scales.numel()}."
         )
     scales = scales.reshape(scale_shape)
-    # An E8M0 byte of zero represents 2^-127. FlashInfer emits it for all-zero
-    # blocks, but TRTLLM does not accept it. Changing the scale to one preserves
-    # the represented zeros because every value in the block is zero.
-    scales = scales.masked_fill(scales == 0, 1)
+    # The compatibility mode retains nonzero FP8 values at scale byte zero.
+    # Preserve their exact scales across native and prequantized refit too.
+    # Keep the legacy zero-byte canonicalization when the flag is disabled.
+    if os.environ.get(VLLM_MXFP8_TE_COMPAT_ENV_VAR, "0") != "1":
+        scales = scales.masked_fill(scales == 0, 1)
     return values, scales
 
 
@@ -149,6 +156,8 @@ def mxfp8_e4m3_quantize_for_refit(
         and torch.cuda.get_device_capability(x.device) >= (10, 0)
         and _receiver_has_flashinfer()
     ):
+        # Install before importing the optional FlashInfer backend in trainers.
+        patch_flashinfer_mxfp8_te_compat(logging.getLogger(__name__))
         try:
             from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
         except ImportError as exc:

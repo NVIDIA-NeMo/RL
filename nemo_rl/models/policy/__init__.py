@@ -378,6 +378,9 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 
 
 class MegatronConfig(TypedDict):
+    # Dynamic E4M3 fake quantization of K/V per token/head before core attention.
+    # Optional boolean, default false; Q stays unquantized. Uses STE backward.
+    fp8_kv_per_token: NotRequired[bool]
     # Optional opt-in: transmit native MXFP8 values/scales to vLLM via NCCL
     # reshard. Absent/false keeps the BF16 dequantize/requantize roundtrip.
     native_mxfp8_refit: NotRequired[bool]

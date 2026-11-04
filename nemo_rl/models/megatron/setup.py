@@ -89,6 +89,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
+from nemo_rl.models.megatron.mxfp8_buffer_reset import install_mxfp8_buffer_reset
 from nemo_rl.models.megatron.quantization_recipe import (
     specialize_first_last_bf16_quant_recipe_for_current_pipeline_rank,
 )
@@ -157,8 +158,8 @@ def _patch_hf_config_double_instantiation():
 
 
 try:
-    from megatron.core.distributed import (
-        TorchFullyShardedDataParallel as torch_FSDP,  # noqa: F401 unused-import
+    from megatron.core.distributed import (  # noqa: F401 unused-import
+        TorchFullyShardedDataParallel as torch_FSDP,
     )
 
     HAVE_FSDP2 = True
@@ -329,6 +330,10 @@ from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
 from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
+)
+from nemo_rl.models.megatron.fp8_kv_quantization import (
+    fp8_kv_quantization_enabled,
+    install_fp8_kv_quantization,
 )
 from nemo_rl.models.megatron.hybridep import (
     configure_hybridep_packed_input_padding,
@@ -2425,6 +2430,8 @@ def setup_model_and_optimizer(
     additional_pre_wrap_hooks: Optional[list[Callable]] = None,
     load_weights: bool = True,
 ):
+    # Install before constructing DDP/optimizer instances, including checkpoint restore.
+    install_mxfp8_buffer_reset()
     state = GlobalState()
     _patch_bridge_signal_handler_for_worker_threads()
     state.cfg = megatron_cfg
@@ -2488,6 +2495,8 @@ def setup_model_and_optimizer(
     torch.distributed.barrier()
 
     pre_wrap_hook = []
+    if fp8_kv_quantization_enabled(policy_cfg["megatron_cfg"]):
+        pre_wrap_hook.append(install_fp8_kv_quantization)
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
     if not use_peft and policy_cfg["megatron_cfg"].get("peft", {}).get("restore_from"):
@@ -2906,6 +2915,8 @@ def setup_reference_model_state(
         ref_mixed_precision_wrapper = MoEFloat16Module
 
     ref_pre_wrap_hooks = []
+    if fp8_kv_quantization_enabled(config["megatron_cfg"]):
+        ref_pre_wrap_hooks.append(install_fp8_kv_quantization)
     use_peft = config["megatron_cfg"].get("peft", {}).get("enabled", False)
 
     if use_peft:

@@ -25,6 +25,8 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/models/megatron/fp8_kv_quantization.py",
+  "nemo_rl/models/megatron/mxfp8_buffer_reset.py",
   "nemo_rl/data/captured_media.py",
   "nemo_rl/experience/reward_penalties.py",
   # TODO: enable these once we have 100 correctness

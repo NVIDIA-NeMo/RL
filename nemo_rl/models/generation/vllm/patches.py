@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
+import logging
 import os
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.util import find_spec
@@ -26,6 +29,114 @@ if TYPE_CHECKING:
 # calls _apply_vllm_patches in serving containers that do not install NeMo RL.
 
 VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
+VLLM_MXFP8_TE_COMPAT_ENV_VAR = "NRL_VLLM_MXFP8_TE_COMPAT"
+
+
+def patch_flashinfer_mxfp8_te_compat(logger: logging.Logger) -> bool:
+    """Opt into TE's interpretation of E8M0 byte zero in MXFP8 quantization.
+
+    FlashInfer's inverse-scale helper returns zero for byte zero, discarding
+    nonzero inputs whose block scale is 2^-127. TE instead multiplies by 2^127.
+    Clone the helper without that special case and select it only in MXFP8's
+    CuTe kernels. MXFP4 and the unset/0 environment setting retain their code.
+
+    Call before importing FlashInfer. The installed source remains env-gated,
+    so subsequent processes can select either mode, including with a warm cache.
+    Unsupported source layouts fail before model initialization.
+    """
+    setting = os.environ.get(VLLM_MXFP8_TE_COMPAT_ENV_VAR, "0")
+    if setting not in ("0", "1"):
+        raise ValueError(f"{VLLM_MXFP8_TE_COMPAT_ENV_VAR} must be 0 or 1")
+    if setting == "0":
+        return False
+
+    helper_name = "ue8m0_to_inv_scale_te_compat"
+    for module_name in (
+        "flashinfer.quantization.quantization_cute_dsl_utils",
+        "flashinfer.quantization.kernels.mxfp8_quantize",
+    ):
+        loaded = sys.modules.get(module_name)
+        if loaded is None:
+            continue
+        if module_name.endswith("mxfp8_quantize"):
+            function = loaded.__dict__.get("ue8m0_to_inv_scale_fast")
+            ready = getattr(function, "__name__", None) == helper_name
+        else:
+            ready = helper_name in loaded.__dict__
+        if not ready:
+            raise RuntimeError(
+                f"{VLLM_MXFP8_TE_COMPAT_ENV_VAR}=1 must be installed before "
+                "FlashInfer is imported; restart the worker with the flag set."
+            )
+
+    spec = find_spec("flashinfer")
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError("TE-compatible MXFP8 quantization requires FlashInfer")
+    root = next(iter(spec.submodule_search_locations))
+    helper_path = os.path.join(root, "quantization", "quantization_cute_dsl_utils.py")
+    kernel_path = os.path.join(root, "quantization", "kernels", "mxfp8_quantize.py")
+    zero_instruction = "@p_zero mov.b32 $0, 0;"
+    with _locked_file_patch(helper_path) as (content, write_back):
+        tree = ast.parse(content)
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ue8m0_to_inv_scale_fast"
+        ]
+        if len(functions) != 1:
+            raise RuntimeError("Unsupported FlashInfer MXFP8 inverse-scale helper")
+        function_node = functions[0]
+        lines = content.splitlines(keepends=True)
+        start = min(
+            [function_node.lineno, *(d.lineno for d in function_node.decorator_list)]
+        )
+        original = "".join(lines[start - 1 : function_node.end_lineno])
+        if original.count(zero_instruction) != 1:
+            raise RuntimeError("Unsupported FlashInfer MXFP8 zero-scale instruction")
+        replacement = original.replace(
+            "def ue8m0_to_inv_scale_fast(", f"def {helper_name}(", 1
+        ).replace(
+            zero_instruction,
+            "// E8M0 byte zero is 2^-127; retain inverse scale 2^127.",
+            1,
+        )
+        replacement = replacement.replace(
+            "Returns 0 for ue8m0 == 0.",
+            "Preserves E8M0 byte zero as the valid scale 2^-127.",
+        )
+        if replacement not in content:
+            if f"def {helper_name}(" in content:
+                raise RuntimeError("Conflicting FlashInfer TE-compatible scale helper")
+            end = function_node.end_lineno
+            write_back(
+                "".join(lines[:end]) + "\n\n" + replacement + "".join(lines[end:])
+            )
+
+    selection = (
+        "\n# NeMo-RL: opt-in TE-compatible MXFP8 inverse scale; leave MXFP4 unchanged.\n"
+        "import os as _nrl_mxfp8_os\n\n"
+        f'if _nrl_mxfp8_os.environ.get("{VLLM_MXFP8_TE_COMPAT_ENV_VAR}") == "1":\n'
+        "    from ..quantization_cute_dsl_utils import (\n"
+        "        ue8m0_to_inv_scale_te_compat as ue8m0_to_inv_scale_fast,\n"
+        "    )\n"
+    )
+    with _locked_file_patch(kernel_path) as (content, write_back):
+        if selection not in content:
+            imports = [
+                node
+                for node in ast.parse(content).body
+                if isinstance(node, ast.ImportFrom)
+                and node.module == "quantization_cute_dsl_utils"
+                and any(a.name == "ue8m0_to_inv_scale_fast" for a in node.names)
+            ]
+            if len(imports) != 1 or "_nrl_mxfp8_os" in content:
+                raise RuntimeError("Unsupported FlashInfer MXFP8 kernel import layout")
+            lines = content.splitlines(keepends=True)
+            end = imports[0].end_lineno
+            write_back("".join(lines[:end]) + selection + "".join(lines[end:]))
+    logger.info("Enabled TE-compatible FlashInfer MXFP8 quantization (E8M0 byte 0)")
+    return True
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -1385,6 +1496,7 @@ def ensure_vllm_source_compat() -> None:
     first ``import vllm`` submodule that pulls in ``vllm.tool_parsers``.
     Worker processes get this via ``_apply_vllm_patches`` at init.
     """
+    patch_flashinfer_mxfp8_te_compat(logging.getLogger("vllm_patch"))
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
@@ -1402,6 +1514,9 @@ def _apply_vllm_patches(
     nemotron_h_fp32_lm_head: bool | None = None,
     require_moe_routed_experts_capture: bool = False,
 ) -> None:
+    patch_flashinfer_mxfp8_te_compat(logging.getLogger("vllm_patch"))
+    if VLLM_MXFP8_TE_COMPAT_ENV_VAR in os.environ:
+        extra_env_vars = [*(extra_env_vars or []), VLLM_MXFP8_TE_COMPAT_ENV_VAR]
     # Import lazily so importing the worker module does not import vLLM.
     import vllm.envs as envs
     from vllm.logger import init_logger

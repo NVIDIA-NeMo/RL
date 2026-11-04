@@ -43,6 +43,8 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.megatron.fp8_kv_quantization import fp8_kv_attention_env_vars
+from nemo_rl.models.megatron.mxfp8_buffer_reset import mxfp8_buffer_reset_env_vars
 from nemo_rl.models.policy import (
     BLOCK_DRAFT_ALGOS,
     PolicyConfig,
@@ -336,7 +338,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
-            env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
+            env_vars = fp8_kv_attention_env_vars(
+                mxfp8_buffer_reset_env_vars(config["megatron_cfg"].get("env_vars"))
+            )
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(

@@ -28,6 +28,10 @@ actual_test_nemo_gym_sanity.json
 .nrl_remote_state.json
 # Test biproducts
 tests/functional/*/
+!tests/functional/mxfp8_precision/
+tests/functional/mxfp8_precision/*
+!tests/functional/mxfp8_precision/*.py
+!tests/functional/mxfp8_precision/README.md
 tests/unit/unit_results.json
 tests/unit/unit_results/
 

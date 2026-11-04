@@ -30,6 +30,36 @@ The following workflow + quantization recipe combinations have been validated en
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The Nano3 `nano3_nvfp4_weightonly.yaml` recipe applies the same W4A16 weight-only format to the supported MLP/MoE weights while keeping Nano3-sensitive Mamba, attention, gate/router, shared-expert, norm, and selected layer paths in BF16 through the model-specific `real_quant_ignore` list in the example config.
 
+## Dynamic FP8 KV Cache
+
+For vLLM rollouts with FP8 precision (including MXFP8 weights), configure:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      precision: fp8
+      kv_cache_dtype: fp8_per_token_head
+    vllm_kwargs:
+      attention_backend: TRITON_ATTN
+```
+
+K and V scales are computed independently for each token and KV head when
+writing the cache, and stored alongside the FP8 cache. Static policy KV scales
+are not synchronized during weight refits. This requires a vLLM build supporting
+`fp8_per_token_head`. Explicitly incompatible attention backends raise an error;
+when no backend is specified, vLLM selects or rejects the backend. NeMo RL does
+not override the configured backend.
+
+DeepSeek's specialized MLA cache and ModelOpt `real_quant` rollout are not
+supported. Mamba state caches are unaffected. This configures rollout cache
+storage; it does not change policy training attention.
+
+For command-line overrides, use
+`policy.generation.vllm_cfg.kv_cache_dtype=fp8_per_token_head` and
+`++policy.generation.vllm_kwargs.attention_backend=TRITON_ATTN`.
+The default `kv_cache_dtype: auto` preserves the existing cache behavior.
+
 ## Simulated KV-Cache Quantization
 
 QARL can apply ModelOpt fake quantization to the attention K/V tensors in both
@@ -415,6 +445,132 @@ uv run --extra mcore --extra modelopt \
 - The `PYTHONPATH` prefix exposes Megatron-LM's `megatron.training` to the bridge script.
 - **`--tp 1` is required**: modelopt currently does not support TP>1 at export time. Training at TP>1 is fine; the bridge re-shards on load via `mp_overrides`.
 - **`--pp` can be >1** for large models that don't fit on one GPU. `--nproc_per_node` must equal `--pp` (since `--tp` is fixed at 1).
+
+## TE-compatible MXFP8 quantization in vLLM
+
+On Blackwell with the FlashInfer CuTe-DSL MXFP8 backend, opt into TE-compatible
+handling of the smallest E8M0 scale before launching NeMo RL:
+
+```bash
+export NRL_VLLM_MXFP8_TE_COMPAT=1
+```
+
+The default is `0` (the existing behavior). Only `0` and `1` are accepted. This
+mode fixes FlashInfer's inverse-scale special case for E8M0 byte `0`: it uses
+`2^127` instead of zero, retaining tiny nonzero BF16 inputs as TE does. It selects
+a separate helper in the MXFP8 kernels; MXFP4 keeps the original helper. NeMo RL
+also preserves the scale bytes during native/prequantized and ordinary refit,
+and forwards the flag to vLLM's Ray workers. No TE dependency is added to vLLM.
+
+Set the flag before starting workers; changing it in an existing process does
+not switch an imported/JITed kernel. Installation fails if FlashInfer was already
+imported in legacy mode or its source no longer matches the supported layout.
+The source patch is locked and idempotent and remains env-gated across processes.
+Tested with vLLM 0.29.0 / FlashInfer 0.6.18 on GB200. Other quantization backends
+and quantization fused inside other kernels are outside this switch's scope.
+
+The regression driver is
+`tests/functional/mxfp8_precision/run_te_quantizer_parity.py`. It independently
+quantizes identical BF16 inputs with TE and vLLM, compares raw FP8 codes and
+E8M0 bytes without dequantization, and compares their MXFP8 GEMM outputs. It also
+checks all 32,640 finite positive BF16 maxima with signed within-block patterns,
+linear/swizzled layouts, 3D expert inputs, both CuTe thread configurations, and
+an off/on/off sequence sharing a JIT cache. Source-patch gating and refit-scale
+preservation have unit coverage in `test_mxfp8_te_compat.py`.
+
+## Diagnostic MXFP8 shared-buffer clearing
+
+For Megatron MXFP8 parameter storage with
+`reuse_grad_buf_for_mxfp8_param_ag=true`, enable synchronized clearing with:
+
+```bash
+export NRL_MXFP8_RESET_SHARED_BUFFER=1
+```
+
+The policy driver forwards this environment variable to Megatron Ray workers.
+It can also be set explicitly with
+`++policy.megatron_cfg.env_vars.NRL_MXFP8_RESET_SHARED_BUFFER="'1'"`.
+An explicit worker environment setting takes precedence over the exported value.
+Unset or `0` preserves the existing implementation; values other than `0` and `1`
+are rejected when the worker initializes.
+
+The reset zeros the shared allocation before FP32 masters are cast into BF16
+staging, zeros each gathered BF16 slice after TE has converted it to MXFP8, and
+zeros the allocation at the existing start-of-step gradient reset. It does not
+clear between gradient-accumulation microbatches. After conversion it clears only
+the consumed transport slice: clearing a whole FP32 gradient bucket can erase a
+sibling bucket's still-live BF16 parameter payload. Live collectives and mixed
+parameter-storage buckets are rejected before a destructive reset.
+
+This diagnostic synchronizes CUDA before and after each clear, reducing
+communication/computation overlap. It requires the distributed optimizer and
+cannot execute inside CUDA graph capture. It does not modify optimizer masters,
+MXFP8 weight storage, quantizer scale selection, or the ordinary-refit source.
+Clearing storage cannot establish equivalence between the FP8 and BF16 parameter
+paths; compare the resulting weights, logits, and gradients separately.
+
+## Apply FP8 KV scales inside Megatron attention
+
+The experimental environment switch below is disabled by default:
+
+```bash
+export NRL_MEGATRON_FP8_KV_IN_ATTENTION=1
+```
+
+Unset or `0` preserves the existing behavior. With
+`policy.megatron_cfg.fp8_kv_per_token=true`, that behavior quantizes K/V and
+dequantizes them to BF16 before Transformer Engine attention. Setting the new
+switch to `1` enables training-side FP8 KV quantization even if the legacy
+configuration flag is false, replaces core attention, and disables the legacy
+BF16 dequantization hook. Q/K normalization and RoPE still happen before this
+replacement. Q is unchanged.
+
+The replacement keeps unscaled E4M3 K/V values and separate FP32 scales:
+
+```text
+scores  = FP32(Q @ K_e4m3.T) * (softmax_scale * k_scale)
+weights = BF16(softmax_FP32(scores) * v_scale)
+output  = BF16(FP32(weights @ V_e4m3))
+```
+
+The E4M3 values are represented exactly in the matmul operand dtype; their
+scales are never multiplied into K/V before attention. This matches vLLM's
+scale placement. Its globally normalized softmax and vLLM's tiled online
+softmax can still round differently, so this does not promise bitwise parity.
+Scales are detached, quantization uses straight-through gradients, and casts
+retain their usual autograd behavior.
+
+The policy driver forwards the exported switch to Megatron Ray workers.
+An explicit worker setting takes precedence:
+
+```bash
+++policy.megatron_cfg.env_vars.NRL_MEGATRON_FP8_KV_IN_ATTENTION="'1'"
+```
+
+Only `0` and `1` are valid values. The environment is read when the models are
+built; changing it does not reconfigure an already running model. The switch
+does not change vLLM: keep `policy.generation.vllm_cfg.kv_cache_dtype=fp8_per_token_head`
+for per-token-head rollout KV quantization.
+
+This backend supports SBHD and packed THD, MHA/GQA, causal/no-mask attention,
+packed padding, and mirrored context-parallel sharding. Context parallelism
+gathers K/V with autograd-aware collectives and reduces their gradients across
+the CP group, including ranks with no valid query tokens. It adds no model
+weights or state-dict keys.
+
+It uses chunked PyTorch attention and checkpointed query chunks to bound score
+storage, rather than TE's fused attention kernels. It may be substantially
+slower and use more memory, particularly for long sequences and CP collectives;
+production throughput and full-model logprob improvement have not been
+established. Dropout, sliding-window attention, attention bias/custom masks,
+softcapping, learned softmax, QK clipping/statistics, query/key layer scaling,
+TE-specific attention overrides, and CUDA graphs are rejected explicitly.
+
+The tests in `tests/unit/models/megatron/test_fp8_kv_attention.py` cover the
+default/opt-in switch, mutually exclusive paths, forward/backward arithmetic,
+packed padding, actual Megatron attention with recomputation, and four-rank CP.
+`test_fp8_kv_attention_parity.py` compares the new path, BF16-dequantized KV, and
+unquantized Megatron KV against real vLLM attention, including segmented decode.
 
 ## Limitations
 
