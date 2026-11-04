@@ -1207,9 +1207,7 @@ class SingleControllerActor:
 
         if isinstance(self._sampler, TransactionalAdmissionSampler):
             await self._wait_admissible_servicing_refills(refill_iterator)
-            async with self._data_plane_checkpoint_barrier.mutation(
-                "prompt_reservations"
-            ) as cut:
+            async with self._dispatch_reservation("prompt_reservations") as cut:
                 target_step = self._sampler.commit_admission(cut)
                 return _commit(cut, target_step)
 
@@ -1897,11 +1895,11 @@ class SingleControllerActor:
 
                         # Filtered groups spend only the dynamic-sampling budget.
                         filtered = outcome is RolloutOutcome.FILTERED
-                        async with self._dispatch_reservation(
-                            "prompt_reservations"
+                        async with self._replacement_mutation(
+                            filtered=filtered, target_step=target_step
                         ) as cut:
                             replacement = (
-                                await self._take_filtered_replacement(target_step)
+                                self._pop_filtered_replacement(target_step)
                                 if filtered
                                 else self._take_replacement(replacements)
                             )
@@ -2341,15 +2339,48 @@ class SingleControllerActor:
             the step is exempted from the batch-size floor.
         """
         self._charge_filtered_prompt(target_step)
+        await self._wait_for_filtered_reserve()
+        return self._pop_filtered_replacement(target_step)
+
+    async def _wait_for_filtered_reserve(self) -> None:
+        """Request prompts without holding a checkpoint mutation cut."""
         async with self._filtered_pool_cv:
             while not self._rollout_runtime.filtered_reserve and not self._dataloader_exhausted:
                 self._filtered_refill_wanted.set()
                 await self._filtered_pool_cv.wait()
-            if not self._rollout_runtime.filtered_reserve:
-                if target_step is not None:
-                    self._rollout_runtime.steps_allowed_short.add(target_step)
-                return None
+
+    def _pop_filtered_replacement(
+        self, target_step: Optional[int]
+    ) -> Optional[DatumSpec]:
+        """Consume an available spare, or finish a step after data exhaustion."""
+        if self._rollout_runtime.filtered_reserve:
             return self._rollout_runtime.filtered_reserve.popleft()
+        if not self._dataloader_exhausted:
+            raise RuntimeError("filtered replacement pool emptied before consumption")
+        if target_step is not None:
+            self._rollout_runtime.steps_allowed_short.add(target_step)
+        return None
+
+    @contextlib.asynccontextmanager
+    async def _replacement_mutation(
+        self, *, filtered: bool, target_step: Optional[int]
+    ) -> AsyncIterator[DataPlaneMutationCut]:
+        """Keep spare consumption and ledger transfer atomic without blocking saves."""
+        if filtered:
+            self._charge_filtered_prompt(target_step)
+        while True:
+            if filtered:
+                await self._wait_for_filtered_reserve()
+            async with self._dispatch_reservation("prompt_reservations") as cut:
+                # Another consumer may have taken the spare while this cut waited.
+                if (
+                    filtered
+                    and not self._rollout_runtime.filtered_reserve
+                    and not self._dataloader_exhausted
+                ):
+                    continue
+                yield cut
+                return
 
     def _serve_filtered_refill(self, iterator: Any) -> bool:
         """Pull one dataloader batch into the filtered pool, on the pump's own task.
