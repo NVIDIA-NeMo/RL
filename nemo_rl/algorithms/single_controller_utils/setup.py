@@ -2018,11 +2018,8 @@ def setup_single_controller(
     # Submit build tasks and get results
     submitted: dict[str, Any] = {}
     nemo_gym_shards = None
-    # The route-coverage scan reads every dataset source file, which takes tens of
-    # seconds on a large dataset. It needs only the datasets, so it runs here, on
-    # its own thread, while the builds proceed; only the comparison with the hosted
-    # routes waits for Gym. A separate executor keeps it from queueing behind the
-    # build tasks.
+    # The route-coverage scan needs only the datasets, so it runs on its own thread beside the builds;
+    # only the comparison with the hosted routes waits for Gym.
     scan_executor = ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="agent-name-scan"
     )
