@@ -27,7 +27,7 @@ policy:
   logprob_chunk_size: 2048
   max_total_sequence_length: 8192
   make_sequence_length_divisible_by: 8
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
@@ -67,6 +67,8 @@ policy:
       env_vars:
         NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
         NRL_REFIT_NUM_BUFFERS: "1"
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
 
 logger:
   wandb_enabled: true

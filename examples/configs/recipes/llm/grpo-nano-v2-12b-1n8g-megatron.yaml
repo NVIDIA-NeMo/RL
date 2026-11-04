@@ -12,7 +12,7 @@ policy:
     enabled: true
     bias_activation_fusion: false
     tensor_model_parallel_size: 8
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   make_sequence_length_divisible_by: 8
   generation:

@@ -29,10 +29,11 @@ Modeled after `tests/unit/models/policy/test_megatron_worker.py`.
 """
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
@@ -76,6 +77,7 @@ def test_get_values_suspends_activation_offload() -> None:
     model_config = SimpleNamespace(fine_grained_activation_offloading=True)
     model = SimpleNamespace(config=model_config, eval=lambda: None)
     worker = SimpleNamespace(
+        _train_step_state=None,
         cfg={"train_micro_batch_size": 1},
         model=model,
         _policy_like_cfg={},
@@ -141,7 +143,7 @@ def _create_value_test_config(
             "enabled": False,
             "reward_model_type": "regression",
         },
-        "dtensor_cfg": {"enabled": False},
+        "automodel_cfg": {"enabled": False},
         "dynamic_batching": {"enabled": False},
         "sequence_packing": {"enabled": False},
         "megatron_cfg": {
@@ -290,8 +292,136 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
     assert model.train_called
 
 
-def test_finish_training_evals_before_model_offload(monkeypatch):
-    """Mamba decode caches must refresh before CUDA parameter storage is released."""
+@pytest.mark.parametrize("optimizer_cpu_offload", [False, True])
+def test_finish_training_updates_eval_cache_before_parameter_offload(
+    optimizer_cpu_offload: bool,
+) -> None:
+    """Mamba's eval cache needs live parameters before CPU offload frees storage."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    events: list[str] = []
+
+    class _ModelWithEvalCache:
+        def __init__(self) -> None:
+            self.a_log: torch.Tensor | None = torch.tensor([0.0, 1.0])
+            self.decay: torch.Tensor | None = None
+
+        def eval(self) -> None:
+            assert self.a_log is not None, "eval read freed parameter storage"
+            self.decay = -torch.exp(self.a_log.float())
+            events.append("eval")
+
+    model = _ModelWithEvalCache()
+
+    def move_model(
+        moved_model: _ModelWithEvalCache,
+        device: str,
+        move_params: bool,
+        move_grads: bool,
+    ) -> _ModelWithEvalCache:
+        assert moved_model is model
+        assert (device, move_params, move_grads) == ("cpu", True, True)
+        # Model offload invalidates the original parameter storage. Accessing it
+        # during a later eval() reproduces the Mamba lifecycle failure.
+        moved_model.a_log = None
+        events.append("model_cpu")
+        return moved_model
+
+    def move_optimizer(device: str) -> None:
+        assert device == "cpu"
+        events.append("optimizer_cpu")
+
+    worker = SimpleNamespace(
+        _train_step_state=None,
+        model=model,
+        optimizer=object(),
+        optimizer_cpu_offload=optimizer_cpu_offload,
+        move_model=move_model,
+        move_optimizer=move_optimizer,
+        cfg={"megatron_cfg": {}},
+    )
+    with (
+        patch("nemo_rl.models.value.workers.megatron_value_worker.gc.collect"),
+        patch("torch.cuda.empty_cache"),
+    ):
+        MegatronValueWorkerImpl.finish_training(worker)
+
+    assert worker.model is model
+    torch.testing.assert_close(model.decay, -torch.exp(torch.tensor([0.0, 1.0])))
+    assert events == ["eval", "model_cpu"] + (
+        [] if optimizer_cpu_offload else ["optimizer_cpu"]
+    )
+
+
+def test_split_value_accepts_uneven_packed_dp_shard():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    state = SimpleNamespace(
+        loss_fn=object(),
+        mbs=1,
+        gbs=128,
+        counts=torch.zeros(3, device="cuda"),
+        metrics=[],
+        num_microbatches=0,
+        num_chunks=0,
+        failed=False,
+    )
+    worker = SimpleNamespace(
+        _assert_train_step_open=lambda: state,
+        _restore_train_hooks=lambda current_state: None,
+        _policy_like_cfg={"sequence_packing": {"enabled": True}},
+        mcore_state=SimpleNamespace(straggler_timer=None),
+        model=SimpleNamespace(no_sync=nullcontext),
+        defer_fp32_logits=False,
+        cfg={"megatron_cfg": {"empty_unused_memory_level": 0}},
+    )
+    data = BatchedDataDict(
+        {
+            "sample_mask": torch.ones(65, device="cuda"),
+            "token_mask": torch.ones((65, 2), device="cuda"),
+        }
+    )
+    rerun = SimpleNamespace(
+        should_run_forward_backward=MagicMock(side_effect=[True, False])
+    )
+    with (
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_microbatch_iterator",
+            return_value=(iter(()), 1, 1, None, 2),
+        ),
+        patch("nemo_rl.models.value.workers.megatron_value_worker.LossPostProcessor"),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_rerun_state_machine",
+            return_value=rerun,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.megatron_forward_backward",
+            return_value=[],
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.is_pipeline_last_stage",
+            return_value=False,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.broadcast_loss_metrics_from_last_stage",
+            return_value=[],
+        ),
+        patch("torch.cuda.nvtx.range_push"),
+        patch("torch.cuda.nvtx.range_pop"),
+    ):
+        MegatronValueWorkerImpl.train_microbatch(worker, data)
+
+    assert state.counts[2].item() == 65
+    assert state.num_chunks == 1
+    assert not state.failed
+
+
+def test_finish_training_preserves_model_move_contract(monkeypatch):
+    """Check that offloading preserves the model move-parameter contract."""
     from nemo_rl.models.value.workers.megatron_value_worker import (
         MegatronValueWorkerImpl,
     )
@@ -303,8 +433,10 @@ def test_finish_training_evals_before_model_offload(monkeypatch):
     events = []
     move_kwargs = []
     worker = object.__new__(MegatronValueWorkerImpl)
+    worker._train_step_state = None
     worker.model = _EvalModel()
     worker.optimizer = None
+    worker.cfg = {"megatron_cfg": {}}
     worker.move_model = lambda model, device, **kwargs: (
         events.append("move_model") or move_kwargs.append(kwargs) or model
     )
@@ -315,6 +447,36 @@ def test_finish_training_evals_before_model_offload(monkeypatch):
 
     assert events == ["eval", "move_model"]
     assert move_kwargs == [{"move_params": True, "move_grads": True}]
+
+
+@pytest.mark.parametrize("clear_caches", [True, False])
+def test_finish_training_clears_transient_caches_when_configured(
+    monkeypatch, clear_caches: bool
+) -> None:
+    """clear_memory_caches_before_refit releases the critic's RoPE/MoE caches too."""
+    from nemo_rl.models.value.workers import megatron_value_worker
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    events: list[str] = []
+    model = SimpleNamespace(eval=lambda: events.append("eval"))
+    worker = object.__new__(MegatronValueWorkerImpl)
+    worker.model = model
+    worker.optimizer = None
+    worker._train_step_state = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": clear_caches}}
+    worker.move_model = lambda m, device, **kwargs: (events.append("move_model") or m)
+    monkeypatch.setattr(
+        megatron_value_worker,
+        "clear_transient_megatron_caches",
+        lambda m: events.append("clear") if m is model else None,
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronValueWorkerImpl.finish_training(worker)
+
+    assert events == ["eval", "move_model"] + (["clear"] if clear_caches else [])
 
 
 @pytest.fixture
@@ -356,7 +518,7 @@ def value_setup(request, tiny_qwen2_model_path):
         _apply_config_updates(config, config_updates)
         tokenizer = get_tokenizer(config["tokenizer"])
 
-        value = Value(cluster=cluster, config=config, tokenizer=tokenizer)
+        value = Value(cluster=cluster, config=config, tokenizer=tokenizer, seed=42)
 
         # Build a tiny test batch.
         torch.manual_seed(42)
@@ -570,7 +732,7 @@ def test_value_worker_parallelism_equivalence(
         # Reference worker: feature OFF.
         ref_config = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
         tokenizer = get_tokenizer(ref_config["tokenizer"])
-        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer)
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer, seed=42)
         values_ref = ref.get_values(data)["values"].detach().cpu()
 
         # Save weights, then reload into a feature-ON worker (same weights).
@@ -586,6 +748,7 @@ def test_value_worker_parallelism_equivalence(
             cluster=cluster,
             config=feat_config,
             tokenizer=tokenizer,
+            seed=42,
             weights_path=Path(weights_path),
             name_prefix="lm_value_feat",
         )
@@ -646,7 +809,7 @@ def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_pa
         )
         _apply_config_updates(ref_config, {"sequence_packing": True})
         tokenizer = get_tokenizer(ref_config["tokenizer"])
-        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer)
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer, seed=42)
         values_ref = ref.get_values(data)["values"].detach().cpu()
 
         # Save weights, then reload into the CP=2 worker (same weights).
@@ -667,6 +830,7 @@ def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_pa
             cluster=cluster,
             config=feat_config,
             tokenizer=tokenizer,
+            seed=42,
             weights_path=Path(weights_path),
             name_prefix="lm_value_feat",
         )
@@ -929,6 +1093,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         cluster=cluster,
         config=config,
         tokenizer=tokenizer,
+        seed=42,
         weights_path=resume_weights_path,
         optimizer_path=resume_optimizer_path,
         name_prefix="lm_value_resumed",

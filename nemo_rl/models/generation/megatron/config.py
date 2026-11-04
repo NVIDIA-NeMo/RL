@@ -14,6 +14,8 @@
 
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
+from pydantic import BaseModel, ConfigDict
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy import Fp8Config, PolicyConfig
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
@@ -31,6 +33,30 @@ def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
     return configured_bytes
 
 
+class MediaPromptSpecOverrides(BaseModel):
+    """Partial MCore `MediaPromptSpec`. Omitted fields keep the wrapper's defaults."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_token: Optional[str] = None
+    prefix: Optional[str] = None
+    suffix: Optional[str] = None
+    input_marker: Optional[str] = None
+    content_part_separator: Optional[str] = None
+    expansion_mode: Optional[Literal["single", "temporal_patch"]] = None
+    include_frame_timestamps_for_nemotron_vl: Optional[bool] = None
+
+
+class MultimodalPromptConfigOverrides(BaseModel):
+    """Partial MCore `MultimodalPromptConfig`. Omitted fields keep the wrapper's defaults."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image_spec: Optional[MediaPromptSpecOverrides] = None
+    video_spec: Optional[MediaPromptSpecOverrides] = None
+    content_part_order: Optional[Literal["preserve", "media_first"]] = None
+
+
 class MCoreGenerationSpecificArgs(TypedDict):
     """Megatron fields related only to inference.
 
@@ -45,6 +71,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     buffer_size_gb: int
     block_size_tokens: int
     max_tokens: int
+    # Optional cap on concurrent requests; MCore derives it from the KV pool when unset.
+    max_requests: NotRequired[int]
     max_model_len: int
 
     # None disables CUDA-graph bucket construction; -1 selects automatic
@@ -92,14 +120,11 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # Soft per-rank staging limit for native MCore refit. None uses the same
     # dynamic packed-buffer target as NeMo-RL's existing collective refit.
     refit_execution_batch_bytes: int | None
-    # Move training gradients and optimizer state to CPU around a non-colocated
-    # refit when extra GPU headroom is needed for transfer staging. The
-    # recommended default is False.
-    offload_policy_before_refit: bool
     num_speculative_tokens: int
 
-    mamba_inference_ssm_states_dtype: NotRequired[str]
-    mamba_inference_conv_states_dtype: NotRequired[str]
+    # Hybrid (Mamba) inference state dtypes; None keeps the model dtype.
+    mamba_inference_ssm_states_dtype: NotRequired[str | None]
+    mamba_inference_conv_states_dtype: NotRequired[str | None]
     # GPU budget for cached Mamba states; null disables it (MCore default).
     prefix_caching_mamba_gb: NotRequired[float | None]
 
@@ -119,6 +144,16 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # `video_num_frames` is required for video.
     vision_model_type: NotRequired[str]
     image_dynamic_resolution: NotRequired[bool]
+    # Image token budget; overrides the HF processor's `max_model_len`.
+    image_dynamic_resolution_model_length: NotRequired[int]
+    # MCore default: 'ceil'. HF processors use 'round_plus_half'.
+    image_dynamic_resolution_rounding_mode: NotRequired[
+        Literal["ceil", "round_plus_half"]
+    ]
+    # MCore default: 'pil'. Torch-based HF processors use 'torch_bicubic_antialias'.
+    image_dynamic_resolution_resize_mode: NotRequired[
+        Literal["pil", "torch_bicubic_antialias"]
+    ]
     video_num_frames: NotRequired[int]  # Frames sampled per video.
     video_temporal_patch_size: NotRequired[int]  # Frames per temporal patch.
     video_target_num_patches: NotRequired[int]  # Overrides the image max-patch budget.
@@ -131,11 +166,14 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # attributes gate which modalities are preprocessed. Not media preprocessing
     # itself, and used on the direct generate path as well as the HTTP endpoint.
     megatron_inference_wrapper: NotRequired[str]
+    # Partial MultimodalPromptConfig overrides applied on top of the wrapper's
+    # default image/video prompt contracts.
+    multimodal_prompt_config: NotRequired[MultimodalPromptConfigOverrides]
 
     # KV cache lifecycle across suspend/resume:
-    # - "persist": cache stays allocated; CUDA graphs remain valid (default)
+    # - "persist": cache stays allocated; CUDA graphs remain valid
     # - "offload": cache is moved off-GPU between iterations
-    # - "recompute": cache is dropped and rebuilt on resume
+    # - "recompute": cache is dropped and rebuilt on resume (default)
     kv_cache_management_mode: Literal["persist", "offload", "recompute"]
 
     logging_step_interval: NotRequired[int]
@@ -147,6 +185,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
     fp8_cfg: NotRequired[Fp8Config]
+    # Megatron Bridge provider fields without a first-class NeMo-RL setting.
+    model_overrides: NotRequired[dict[str, Any]]
 
 
 class MCoreGenerationConfig(GenerationConfig):

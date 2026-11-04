@@ -59,14 +59,6 @@ def _make_row(prompt: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_effort_levels_config_defaults():
-    cfg = EffortLevelsConfig()
-    assert cfg.low_weight == 0.0
-    assert cfg.low_penalty == 1.0
-    assert cfg.low_ub == 64000
-    assert cfg.low_string == ""
-
-
 # ---------------------------------------------------------------------------
 # No-op paths
 # ---------------------------------------------------------------------------
@@ -373,32 +365,48 @@ def test_run_rollouts_shapes_completion_reward_and_emits_low_metrics():
     assert "median_length_high" not in metrics
 
 
-def test_streamed_completion_is_shaped_before_recovery_callback() -> None:
-    """Recovery ownership must never seal the environment's raw reward."""
+@pytest.mark.parametrize(
+    "usage", [None, {"output_tokens": 1000}, {"completion_tokens": 99000}]
+)
+def test_streamed_capture_seals_raw_reward_and_original_reward_checks(usage) -> None:
+    """Capture defers shaping until verified terminal length is available."""
     observed_rewards: list[float] = []
+    observed_checks = []
 
     async def record_completion(_rowidx: int, completion: Completion) -> None:
         observed_rewards.append(completion.reward)
+        observed_checks.append(completion.env_extras["ng_reward_checks"])
 
     result = {
         "input_message_log": [{"role": "user", "token_ids": [1, 2]}],
         "message_log": [],
         "full_result": {
             "reward": 1.0,
-            "response": {"usage": {"output_tokens": 100}},
+            "response": {
+                "usage": usage,
+                "output": [
+                    {"type": "reasoning", "summary": [{"text": "same"}]},
+                    {"content": "same"},
+                    {"content": " "},
+                ],
+            },
         },
-        "receipt": {"rollout_id": "rollout-0", "manifest": []},
+        "receipt": {"capture_key": "rollout-0", "manifest": []},
         "rollout_id": "rollout-0",
     }
 
-    _run_gym_rollouts(
+    _, _, metrics = _run_gym_rollouts(
         _LOW_EFFORT_CONFIG,
         "<budget> be concise",
         [result],
         on_completion=record_completion,
     )
 
-    assert observed_rewards == pytest.approx([1.9])
+    assert not any(key in metrics for key in _SHAPING_METRIC_KEYS)
+    assert observed_rewards == [1.0]
+    assert observed_checks[0].low_effort is True
+    assert observed_checks[0].duplicated_reasoning is True
+    assert observed_checks[0].empty_final_answer is True
 
 
 def test_run_rollouts_leaves_high_effort_prompt_reward_untouched():

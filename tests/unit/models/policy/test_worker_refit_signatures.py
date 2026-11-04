@@ -20,12 +20,12 @@ type-check time -- it fails at the Ray boundary, at refit, as
 ``TypeError: got an unexpected keyword argument``, several frames from the cause.
 
 That is not hypothetical. ``refit_timeout_s`` was added to ``Policy`` and to the Megatron
-worker; both DTensor workers were missed, which broke every non-colocated DTensor refit
+worker; both Automodel workers were missed, which broke every non-colocated Automodel refit
 until a GPU test caught it. Nothing in between could: there is no shared declaration to
 diverge from, since ``broadcast_weights_for_collective`` is defined independently on each
 worker.
 
-Read from the AST rather than by importing, deliberately: ``dtensor_policy_worker_v2``
+Read from the AST rather than by importing, deliberately: ``automodel_policy_worker``
 imports ``nemo_automodel``, which lives in a per-worker venv and is absent from the base
 one, so an import-based check would skip on precisely the worker that regressed.
 """
@@ -43,7 +43,7 @@ FANOUT_METHODS = [
     (
         "broadcast_weights_for_collective",
         [
-            "workers/dtensor_policy_worker_v2.py",
+            "workers/automodel_policy_worker.py",
             "workers/megatron_policy_worker.py",
             "interfaces.py",
         ],

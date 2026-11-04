@@ -7,7 +7,7 @@ checkpointing:
   checkpoint_dir: results/ppo_dapo_megatron
 
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
@@ -21,8 +21,8 @@ policy:
 # Value Model with Megatron-Core Backend (for GAE in PPO)
 value:
   reward_model_cfg:
-    enabled: false  # only used for DTensor V2 value worker
-  dtensor_cfg:
+    enabled: false  # only used for the Automodel value worker
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true

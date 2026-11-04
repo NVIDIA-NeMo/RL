@@ -34,8 +34,9 @@ import torch
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_columns
+from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, GROUP_ID_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import (
@@ -226,7 +227,6 @@ def _make_driver_carry(rewards: list[float], stds: list[float]) -> BatchedDataDi
             "loss_multiplier": torch.ones(n),
             "truncated": torch.zeros(n, dtype=torch.bool),
             "length": torch.tensor([8] * n, dtype=torch.long),
-            "prompt_ids_for_adv": torch.zeros(n, 4, dtype=torch.long),
         }
     )
 
@@ -257,6 +257,63 @@ def _stamp_filter_tags(
         for std, is_trivial_prompt in zip(stds, is_trivial_prompt_distribution)
     ]
     return meta
+
+
+def test_group_tags_survive_dynamic_sampling_cache_and_overflow():
+    """Distinct UUIDs remain distinct after survivor concatenation and slicing."""
+    from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
+    from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+
+    client = NoOpDataPlaneClient()
+    pending_meta = pending_carry = None
+    pending_rewards = []
+    for iteration, (groups, rewards, trivial) in enumerate(
+        [
+            (
+                ["discard", "discard", "first", "first"],
+                [0.0, 0.0, 0.0, 2.0],
+                [True, True, False, False],
+            ),
+            (
+                ["second", "second", "overflow", "overflow"],
+                [10.0, 14.0, 0.0, 2.0],
+                [False] * 4,
+            ),
+        ],
+        start=1,
+    ):
+        meta = _seed_meta(client, f"batch-{iteration}-", 4)
+        meta.stamp_tags(
+            {GROUP_ID_TAG: groups, "is_trivial_prompt_distribution": trivial}
+        )
+        pending_meta, pending_carry, pending_rewards, complete, _, _ = (
+            _apply_dynamic_sampling(
+                meta=meta,
+                driver_carry=_make_driver_carry(rewards, [1.0] * 4),
+                pending_meta=pending_meta,
+                pending_carry=pending_carry,
+                pending_unfiltered_rewards=pending_rewards,
+                train_prompts_size=4,
+                num_gen_batches=iteration,
+                max_gen_batches=2,
+                policy=_fake_policy(client),
+            )
+        )
+        assert complete == (iteration == 2)
+    assert row_group_ids(pending_meta) == ["first", "first", "second", "second"]
+    assert pending_meta.sample_ids == [
+        "batch-1-2_g0",
+        "batch-1-3_g0",
+        "batch-2-0_g0",
+        "batch-2-1_g0",
+    ]
+    baseline, _, _ = calculate_baseline_and_std_per_prompt(
+        group_index_column(row_group_ids(pending_meta)),
+        pending_carry["total_reward"],
+        torch.ones(4),
+        leave_one_out_baseline=False,
+    )
+    torch.testing.assert_close(baseline, torch.tensor([1.0, 1.0, 12.0, 12.0]))
 
 
 def test_apply_dynamic_sampling_filters_zero_std():

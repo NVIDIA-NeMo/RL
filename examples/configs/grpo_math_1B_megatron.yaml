@@ -54,7 +54,7 @@ policy:
   max_total_sequence_length: 512
   precision: "bfloat16"
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
@@ -81,12 +81,16 @@ policy:
   # this is useful for sequence parallel training
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
 
-  optimizer: null # remove default FSDP optimizer
+  optimizer: null # remove default Automodel optimizer
 
   megatron_cfg:
     enabled: true
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
     cuda_graph_impl: "none"
@@ -133,6 +137,9 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
 

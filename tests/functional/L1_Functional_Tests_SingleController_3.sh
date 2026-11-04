@@ -38,13 +38,21 @@ run_test() {
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
 # Same recovery flow with Mooncake CPU storage; skips without an RDMA device.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh
+# Same flows with storage units: SimpleStorageUnits pinned by placement, and
+# Mooncake CPU storage units as the only memory owners (skips without RDMA).
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh simple_placed
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh mooncake_units
 # Deterministic process restart with an admitted group held before canonical TQ
 # commit, followed by exact-once redispatch at its stable group ID.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_unfinished_recovery.sh
 
 # Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
 # custodying token lineage and the finalizer publishing training rows.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+# Score centering through capture, canonical TQ columns, trainer gather and loss.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_gym_single_controller.sh
+# BrowseComp hides old tool results; valid rows must prove a context boundary.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_context_compaction.sh
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and
 # redispatch only its unfinished peer after restoring the step checkpoint.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
@@ -55,6 +63,9 @@ run_test fast env SC_SIBLING_RECOVERY_GENERATION_BACKEND=megatron uv run --no-sy
 # Periodic native-TQ snapshot while a streamed step owns only part of its
 # rollout batch, followed by SIGKILL and rollback to the durable trainer anchor.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
+# Two-process Gym turn-level recovery against a stateful Workplace Assistant
+# server: a restored episode resumes on its Gym instance as its next attempt.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_turn_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

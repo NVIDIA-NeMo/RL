@@ -8,7 +8,7 @@ policy:
   tokenizer:
     name: meta-llama/Llama-3.2-1B
   make_sequence_length_divisible_by: 1
-  dtensor_cfg:
+  automodel_cfg:
     dp_replicate_size: 2
 data:
   add_generation_prompt: true

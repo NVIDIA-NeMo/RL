@@ -1,5 +1,5 @@
-# SingleController + Megatron variant of grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.yaml.
-defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.yaml
+# SingleController + Megatron variant of grpo-qwen2.5-math-1.5b-instruct-1n8g-automodel.v3.yaml.
+defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n8g-automodel.v3.yaml
 
 logger:
   log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync
@@ -35,7 +35,7 @@ async_rl:
   max_buffered_rollouts: 32
 
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true

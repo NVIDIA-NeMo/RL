@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections import Counter
+from urllib.parse import quote
 
 import pytest
 from PIL import Image
@@ -21,6 +22,7 @@ import nemo_rl.environments.nemo_gym_multimodal as nemo_gym_multimodal
 from nemo_rl.data.multimodal_utils import (
     image_to_data_url,
     resolve_to_image,
+    video_path_to_data_url,
 )
 from nemo_rl.environments.nemo_gym_multimodal import (
     normalize_media_in_examples,
@@ -59,6 +61,17 @@ def test_resolve_to_image_accepts_file_scheme(tmp_path):
     path = _write_png(tmp_path, "img.png", (5, 6))
     assert resolve_to_image(f"file://{path}").size == (5, 6)
     assert resolve_to_image(path).size == (5, 6)
+
+
+def test_file_scheme_media_paths_are_percent_decoded(tmp_path):
+    image_path = _write_png(tmp_path, "my image.png", (5, 6))
+    assert resolve_to_image(f"file://{quote(image_path)}").size == (5, 6)
+
+    video_path = tmp_path / "my video.mp4"
+    video_path.write_bytes(b"video")
+    assert video_path_to_data_url(f"file://{quote(str(video_path))}").startswith(
+        "data:video/mp4;base64,"
+    )
 
 
 def test_normalize_media_encodes_local_image_paths_and_file_urls(tmp_path):

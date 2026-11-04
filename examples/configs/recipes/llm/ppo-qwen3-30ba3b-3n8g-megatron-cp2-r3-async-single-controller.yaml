@@ -1,0 +1,72 @@
+defaults: ../../ppo_math_1B_megatron_single_controller.yaml
+ppo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 1
+  ppo_epochs: 1
+  critic_ppo_epochs: 1
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: results/ppo-qwen3-30ba3b-3n8g-megatron-cp2-r3-async-single-controller
+policy:
+  model_name: Qwen/Qwen3-30B-A3B
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 16
+  router_replay:
+    enabled: true
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 2
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    moe_permute_fusion: true
+    moe_token_dispatcher_type: alltoall
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+  generation:
+    max_new_tokens: 2048
+    colocated:
+      resources:
+        gpus_per_node: 8
+    vllm_cfg:
+      precision: bfloat16
+      tensor_parallel_size: 4
+      expert_parallel_size: 4
+      gpu_memory_utilization: 0.8
+      max_model_len: 4096
+      enable_prefix_caching: false
+    vllm_kwargs:
+      enable_chunked_prefill: false
+      moe_backend: triton
+value:
+  train_micro_batch_size: 1
+  make_sequence_length_divisible_by: 16
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 2
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    moe_permute_fusion: true
+    moe_token_dispatcher_type: alltoall
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+  sequence_packing:
+    enabled: true
+data_plane:
+  observability:
+    enabled: true
+    verify_tensor_hash: false
+async_rl:
+  max_buffered_rollouts: ${mul:${ppo.num_prompts_per_step}, 2}
+logger:
+  log_dir: logs/ppo-qwen3-30ba3b-3n8g-megatron-cp2-r3-async-single-controller
+  wandb:
+    name: ppo-qwen3-30ba3b-3n8g-megatron-cp2-r3-async-single-controller
+cluster:
+  num_nodes: 3
+  gpus_per_node: 8

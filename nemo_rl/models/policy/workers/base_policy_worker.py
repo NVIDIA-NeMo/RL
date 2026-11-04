@@ -18,7 +18,6 @@ import torch
 import zmq
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -35,7 +34,7 @@ class AbstractPolicyWorker:
 
     def sync_params_before_refit(self) -> None:
         """Materialize optimizer updates before refit when the backend requires it."""
-        # DTensor policy parameters already contain the latest optimizer update.
+        # Automodel policy parameters already contain the latest optimizer update.
         # Megatron overrides this whenever the distributed optimizer overlaps the
         # parameter all-gather (MXFP8 shared-buffer and plain BF16 alike).
         pass
@@ -165,8 +164,6 @@ class AbstractPolicyWorker:
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
-        *,
-        refit_payload_mode: Optional[RefitPayloadMode] = None,
     ) -> dict[str, Any]:
         """Prepare parameter metadata for NCCL reshard refit."""
         # This is a placeholder implementation.
@@ -350,8 +347,11 @@ class AbstractPolicyWorker:
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         with self.use_reference_model():
+            # Rollout routes (R3) belong to the policy, never to the reference model.
             reference_logprobs = self.get_logprobs(
-                data=data, micro_batch_size=micro_batch_size
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
@@ -361,6 +361,16 @@ class AbstractPolicyWorker:
     def finalize_async_save(self) -> None:
         """Block until any in-flight async checkpoint write completes. No-op by default."""
         pass
+
+    def poll_async_save(self) -> bool:
+        """Finalize a completed async checkpoint write without waiting; True when none is pending.
+
+        Not implemented by default: answering True for a backend that writes in the
+        background would let the caller publish a checkpoint whose write hasn't landed.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support polling async checkpoint saves."
+        )
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation

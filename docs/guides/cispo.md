@@ -16,7 +16,7 @@ bash tests/test_suites/llm/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-
 
 The corresponding config is [examples/configs/recipes/llm/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo.yaml](../../examples/configs/recipes/llm/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo.yaml). It uses `Qwen/Qwen3-30B-A3B`, Megatron policy training, async GRPO with `max_trajectory_age_steps: 1`, and a separate non-colocated vLLM generation node.
 
-**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for gated models.
+**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `hf auth login` as well for gated models.
 
 ## The CISPO Objective
 
@@ -57,6 +57,18 @@ loss_fn:
 
 > [!NOTE]
 > When `use_importance_sampling_correction: true`, the shared GRPO loss path additionally multiplies the CISPO token loss by the actor-vs-generation correction `exp(prev_logprobs - generation_logprobs)`. This correction is separate from CISPO's clipped `pi_theta / pi_old` weight.
+
+For single-update training, override these fields in the `loss_fn` example above to reuse the training forward's logprobs. In this mode the CISPO ratio `pi_theta / pi_old` is always 1, so the loss does not read `ratio_clip_min` / `ratio_clip_max`: the TIS clamp on the detached current/rollout ratio `exp(curr_logprobs - generation_logprobs)` is the only bound on the weight. The gradient is the same as GRPO with `force_on_policy_ratio: true` and the same TIS settings; only the reported loss value differs.
+
+```yaml
+  force_on_policy_ratio: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio_min: 0.0
+  truncated_importance_sampling_ratio: 6.0
+```
+
+Both the GRPO trainer and SingleController skip the previous-policy forward in this mode unless `grpo.seq_logprob_error_threshold` is set (the GRPO trainer also skips it when `loss_fn.seq_logprob_error_in_loss: true`). This mode needs one optimizer update per rollout batch (`policy.train_global_batch_size == grpo.num_prompts_per_step * grpo.num_generations_per_prompt`). A reference-policy forward is still required when reference KL is enabled.
 
 ## References
 

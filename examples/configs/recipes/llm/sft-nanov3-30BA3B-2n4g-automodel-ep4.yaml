@@ -1,0 +1,14 @@
+defaults: ./sft-nanov3-30BA3B-2n8g-automodel-ep8.yaml
+logger:
+  wandb:
+    name: sft-nanov3-30BA3B-2n4g-automodel-ep4
+  tensorboard:
+    log_dir: tb_logs-sft-nanov3-30BA3B-2n4g-automodel-ep4
+  mlflow:
+    run_name: sft-nanov3-30BA3B-2n4g-automodel-ep4
+policy:
+  automodel_cfg:
+    expert_parallel_size: 4
+cluster:
+  gpus_per_node: 4
+

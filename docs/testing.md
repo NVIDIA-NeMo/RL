@@ -40,7 +40,7 @@ Usage:
 uv run --group test pytest --testmon tests/unit
 
 # You can also combine with markers/paths
-uv run --group test pytest --hf-gated --testmon tests/unit/models/policy/test_dtensor_worker.py
+uv run --group test pytest --hf-gated --testmon tests/unit/models/policy/test_automodel_worker.py
 ```
 
 What to expect:
@@ -229,7 +229,7 @@ Vanilla flow:
 # Copy bisect utilities outside of VCS to ensure a stable runner
 rsync -ahP --delete tools/ tools.bisect/
 
-TEST_CASE=tests/test_suites/llm/sft-llama3.2-1b-1n8g-fsdp2tp1.v3.sh
+TEST_CASE=tests/test_suites/llm/sft-llama3.2-1b-1n8g-automodel.v3.sh
 
 HF_HOME=... \
 HF_DATASETS_CACHE=... \

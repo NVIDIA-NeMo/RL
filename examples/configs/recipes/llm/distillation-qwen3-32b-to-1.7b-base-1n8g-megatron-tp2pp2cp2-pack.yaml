@@ -12,7 +12,7 @@ checkpointing:
 policy:
   train_global_batch_size: 32
   generation_batch_size: 32
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   dynamic_batching:
     enabled: false
@@ -24,7 +24,7 @@ policy:
     enabled: true
 teacher:
   model_name: Qwen/Qwen3-32B
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   dynamic_batching:
     enabled: false

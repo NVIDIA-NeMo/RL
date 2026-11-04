@@ -30,8 +30,10 @@ import ray
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.opd import TeacherResourceConfig
+from nemo_rl.data.multimodal_utils import teacher_multimodal_fields
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
 from nemo_rl.data_plane.column_io import round_up
+from nemo_rl.data_plane.interfaces import backend_config, gdr_enabled
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, TEACHER_LP_FIELDS
 from nemo_rl.distributed.batched_data_dict import (
@@ -69,7 +71,9 @@ def create_teacher_configs_from_opd_config(
     """Build per-teacher configs from on_policy_distillation config.
 
     Handles deduplication (multiple aliases sharing one checkpoint produce
-    one TeacherConfig) and per-teacher overrides on top of defaults.
+    one TeacherConfig) and per-teacher overrides on top of defaults. The merge
+    is shallow: a per-alias ``megatron_cfg_overrides`` replaces the default
+    dictionary; unknown top-level keys are merged individually.
     """
     teacher_model_by_agent_name: dict[str, str] = dict(
         opd_cfg.get("teacher_model_by_agent_name", {})
@@ -158,25 +162,42 @@ class TeacherWorkerGroup:
         cfg["megatron_cfg"]["expert_model_parallel_size"] = (
             teacher_cfg.expert_model_parallel_size
         )
+        # The student's manual_gc is for its training steps; a teacher never trains.
+        cfg["megatron_cfg"]["manual_gc"] = False
 
         # Apply any additional megatron config overrides from teacher config.
         for key, value in teacher_cfg.megatron_cfg_overrides.items():
             cfg["megatron_cfg"][key] = value
+        if cfg["megatron_cfg"]["manual_gc"]:
+            raise ValueError(
+                f"Teacher '{self.alias}': manual_gc is not supported on teachers. "
+                "They never run a training step, so GC would be disabled with "
+                "nothing ever collecting."
+            )
+
+        # Teacher architecture comes from its checkpoint, not the student's
+        # cloned config. Only explicit teacher overrides reach the provider,
+        # except that scoring disables unused MTP layers unless requested.
+        allowlist = set(teacher_cfg.megatron_cfg_overrides)
+        if "mtp_num_layers" not in allowlist:
+            cfg["megatron_cfg"]["mtp_num_layers"] = 0
+            allowlist.add("mtp_num_layers")
+        cfg["megatron_cfg"]["_provider_override_allowlist"] = sorted(allowlist)
 
         # Teachers run Megatron inference-only. Don't let the student's other
         # backend or parameter-adding features leak onto the frozen teacher.
-        if cfg.get("dtensor_cfg", {}).get("enabled", False):
+        if cfg.get("automodel_cfg", {}).get("enabled", False):
             raise ValueError(
                 f"Teacher '{self.alias}': only the Megatron backend is supported "
-                "for teachers, but the policy config has dtensor_cfg.enabled=True."
+                "for teachers, but the policy config has automodel_cfg.enabled=True."
             )
-        if "dtensor_cfg" in cfg:
-            cfg["dtensor_cfg"]["enabled"] = False
+        if "automodel_cfg" in cfg:
+            cfg["automodel_cfg"]["enabled"] = False
         if "peft" in cfg["megatron_cfg"]:
             cfg["megatron_cfg"]["peft"]["enabled"] = False
         cfg.pop("draft", None)
         # Router replay keeps the student's rollout and training logprobs
-        # consistent. A frozen teacher has no training pass, and its text-only
+        # consistent. A frozen teacher has no training pass, and its
         # TQ fetch does not carry routed_experts, so replay must stay off.
         if "router_replay" in cfg:
             cfg["router_replay"]["enabled"] = False
@@ -262,6 +283,8 @@ class TeacherWorkerGroup:
         self._opd_full_teacher_index_field: Optional[str] = (
             opd_full_cfg["teacher_index_field"] if opd_full_cfg else None
         )
+        # Decided in setup_data_plane, once the data-plane transport is known.
+        self._keep_outputs_on_gpu = False
 
         # Set up sequence packing / dynamic batching (mirrors lm_policy.py)
         self.use_sequence_packing = cfg["sequence_packing"]["enabled"]
@@ -297,6 +320,12 @@ class TeacherWorkerGroup:
                 "setup_data_plane", cfg=dp_cfg
             )
         )
+        # Only a GDR PUT reads straight from GPU, so only then can the teacher
+        # skip copying what it writes (logprobs and any payload) to CPU.
+        self._keep_outputs_on_gpu = (
+            gdr_enabled(dp_cfg)
+            and backend_config(dp_cfg).gdr_keep_teacher_payload_on_gpu
+        )
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         """Dispatch a TQ metadata batch; workers fetch and write teacher logprobs."""
@@ -318,7 +347,7 @@ class TeacherWorkerGroup:
         teacher_meta = replace(
             meta,
             task_name=f"teacher_lp:{self.alias}",
-            fields=list(TEACHER_LP_FIELDS),
+            fields=[*TEACHER_LP_FIELDS, *teacher_multimodal_fields(meta)],
             extra_info={
                 **dict(meta.extra_info or {}),
                 GLOBAL_FORWARD_PAD_SEQLEN: round_up(
@@ -363,6 +392,7 @@ class TeacherWorkerGroup:
                 "micro_batch_size": self._micro_batch_size,
                 "opd_full_payload": self._opd_full_payload,
                 "opd_full_payload_dtype": self._opd_full_payload_dtype,
+                "keep_outputs_on_gpu": self._keep_outputs_on_gpu,
                 "opd_full_payload_field": self._opd_full_payload_field,
                 "opd_full_teacher_index": self.teacher_index,
                 "opd_full_teacher_index_field": self._opd_full_teacher_index_field,

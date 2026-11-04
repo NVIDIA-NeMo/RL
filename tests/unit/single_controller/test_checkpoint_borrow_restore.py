@@ -228,7 +228,7 @@ def _controller(
     controller._master_config = SimpleNamespace(
         grpo=controller._algo_cfg,
         checkpointing={"load_replay_buffer": True},
-        token_capture=SimpleNamespace(enabled=False),
+        token_capture=SimpleNamespace(enabled=False, forest_training=False),
     )
     controller._dataloader = loader
     controller._rollout_permitted = asyncio.Event()
@@ -248,6 +248,8 @@ def _controller(
     controller._batch_replacements = {}
     controller._batch_promotions = {}
     controller._finalizer_actors = []
+    controller._finalizer_metrics_by_group = {}
+    controller._finalizer_rewards_by_group = {}
     controller._replacement_reserve = deque(replacement_reserve or [])
     controller._rollout_slot_waiters = 0
     controller._rollout_permitted_waiters = 0

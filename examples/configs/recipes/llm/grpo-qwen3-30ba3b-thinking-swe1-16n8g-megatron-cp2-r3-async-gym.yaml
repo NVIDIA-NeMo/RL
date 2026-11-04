@@ -33,6 +33,13 @@ env:
           model_server:
             type: responses_api_models
             name: policy_model
+    single_step_tool_use_with_argument_comparison_swe_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: single_step_tool_use_with_argument_comparison_swe
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym
   wandb:

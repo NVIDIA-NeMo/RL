@@ -37,7 +37,7 @@ from nemo_rl.utils.flops_formulas import (
 def get_hf_config(model_name: str, **overrides: Any) -> PretrainedConfig:
     """Get the effective Hugging Face config for a model.
 
-    Both the DTensor and MCore paths use the same config, which allows backend-agnostic
+    Both the Automodel and MCore paths use the same config, which allows backend-agnostic
     theoretical FLOPs computation. Policy overrides must be included so the tracker describes
     the model that is actually trained.
     """

@@ -15,7 +15,7 @@
 
 The driver runs in the project environment, which is synced without a
 training-backend extra, so it cannot import ``megatron_policy_worker``
-(``megatron.bridge``) or ``dtensor_policy_worker_v2`` (``nemo_automodel``).
+(``megatron.bridge``) or ``automodel_policy_worker`` (``nemo_automodel``).
 Doing so raises ``ModuleNotFoundError`` at the first refit.
 
 These checks parse the sources instead of importing them, so they also fail in
@@ -38,9 +38,7 @@ REFIT_DRIVER_MODULES = (
 
 BACKEND_ONLY_ROOTS = frozenset({"megatron", "nemo_automodel", "transformer_engine"})
 
-POLICY_WORKER_MODULES = frozenset(
-    {"megatron_policy_worker", "dtensor_policy_worker_v2"}
-)
+POLICY_WORKER_MODULES = frozenset({"megatron_policy_worker", "automodel_policy_worker"})
 
 
 def test_refit_environment_is_configured_before_first_process_group() -> None:
