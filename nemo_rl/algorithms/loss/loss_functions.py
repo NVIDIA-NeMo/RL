@@ -651,11 +651,6 @@ class ClippedPGLossFn(LossFunction):
             self.metric_normalizations["score_centering_head_mass"] = (
                 MetricNormalizer.TOKENS
             )
-        if self.objective_reduction.requires_explicit_denominator:
-            # Missing entries use the worker's objective denominator. Keep
-            # token diagnostics explicitly token-normalized.
-            self.metric_normalizations.pop("loss")
-            self.metric_normalizations.pop(KL_PENALTY_KEY)
         if self.opd_full is not None:
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
@@ -675,6 +670,11 @@ class ClippedPGLossFn(LossFunction):
                         "opd_full_decomposition_error": MetricNormalizer.NONE,
                     }
                 )
+        if self.objective_reduction.requires_explicit_denominator:
+            # Missing entries use the worker's objective denominator. Keep
+            # token diagnostics explicitly token-normalized.
+            self.metric_normalizations.pop("loss")
+            self.metric_normalizations.pop(KL_PENALTY_KEY)
 
     def has_adaptive_loss_state(self) -> bool:
         """Whether this loss carries controller state across training steps."""
@@ -794,6 +794,7 @@ class ClippedPGLossFn(LossFunction):
                 opd_full_divergence=opd_full_divergence,
                 opd_full_entropy=opd_full_entropy,
                 opd_full_cross_entropy=opd_full_cross_entropy,
+                global_objective_denominator=global_objective_denominator,
             )
         assert next_token_logprobs is not None, (
             "ClippedPGLossFn requires next_token_logprobs"
@@ -1138,17 +1139,15 @@ class ClippedPGLossFn(LossFunction):
                 adaptive_ppo_clip_advantages=advantages,
                 adaptive_ppo_clip_outer_bound=self.truncated_importance_sampling_adaptive_outer_bound,
             )
-            correction = advantages * centering
-            if self.loss_type == LossType.TOKEN_LEVEL:
-                actor_loss = actor_loss + masked_mean(
-                    correction, mask, global_normalization_factor=global_valid_toks
-                )
-            else:
-                actor_loss = actor_loss + masked_mean(
-                    masked_mean(correction, token_mask, dim=-1),
-                    sample_mask,
-                    global_normalization_factor=global_valid_seqs,
-                )
+            # Reduce the correction exactly like the actor objective it corrects.
+            actor_loss = actor_loss + self.objective_reduction.reduce(
+                advantages * centering,
+                token_mask=token_mask,
+                sample_mask=sample_mask,
+                mask=mask,
+                denominator=objective_denominator,
+                per_response_weights=per_response_weights,
+            )
             score_centering_metrics["score_centering_head_mass"] = masked_mean(
                 head_mass, mask, global_normalization_factor=global_valid_toks
             )
@@ -1249,6 +1248,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_divergence: Optional[Tensor],
         opd_full_entropy: Optional[Tensor],
         opd_full_cross_entropy: Optional[Tensor],
+        global_objective_denominator: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Full-vocabulary MOPD objective: the exact reverse KL is the whole loss.
 
@@ -1267,6 +1267,8 @@ class ClippedPGLossFn(LossFunction):
             opd_full_divergence: Per-token reverse KL ``[B, S - 1]``.
             opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
             opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+            global_objective_denominator: Streaming split-API divisor forwarded
+                from ``__call__``; see its docstring.
 
         Returns:
             Tuple of the scalar loss and its metric dict.
@@ -1282,24 +1284,22 @@ class ClippedPGLossFn(LossFunction):
         sample_mask = data["sample_mask"]
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        def reduce_like_loss(per_token_values: Tensor) -> torch.Tensor:
-            """Reduce a per-token tensor the way the gradient is normalized.
+        objective_denominator = self.objective_reduction.loss_divisor(
+            global_valid_toks=global_valid_toks,
+            global_valid_seqs=global_valid_seqs,
+            global_objective_denominator=global_objective_denominator,
+        )
+        per_response_weights = self.objective_reduction.per_response_weights(data)
 
-            SEQUENCE_LEVEL averages within each sequence first, so every sequence
-            contributes equally regardless of length; a flat masked_mean against
-            ``global_valid_seqs`` would instead divide a token sum by a sequence
-            count and scale the loss by the mean sequence length.
-            """
-            if self.loss_type == LossType.TOKEN_LEVEL:
-                return masked_mean(
-                    per_token_values,
-                    mask,
-                    global_normalization_factor=global_valid_toks,
-                )
-            return masked_mean(
-                masked_mean(per_token_values, token_mask, dim=-1),
-                sample_mask,
-                global_normalization_factor=global_valid_seqs,
+        def reduce_like_loss(per_token_values: Tensor) -> torch.Tensor:
+            """Reduce a per-token tensor exactly like the policy-gradient objective."""
+            return self.objective_reduction.reduce(
+                per_token_values,
+                token_mask=token_mask,
+                sample_mask=sample_mask,
+                mask=mask,
+                denominator=objective_denominator,
+                per_response_weights=per_response_weights,
             )
 
         actor_loss = reduce_like_loss(opd_full_divergence)
