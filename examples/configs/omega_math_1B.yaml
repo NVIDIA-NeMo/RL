@@ -1,0 +1,20 @@
+# Omega: GRPO-like algorithm with softmax-over-group weights (see nemo_rl/algorithms/loss/omega_loss.py)
+defaults: grpo_math_1B.yaml
+
+grpo:
+  loss_function: omega
+  omega_loss:
+    h: inverse_length   # h(x,y) = 1/|y|; add new choices to H_FUNCTIONS
+  # Omega needs advantages = r - mean(r)
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0   # no KL term in Omega
+policy:
+  # Groups of k responses must stay contiguous inside a microbatch
+  train_micro_batch_size: ${grpo.num_generations_per_prompt}
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false

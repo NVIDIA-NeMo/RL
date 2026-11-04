@@ -19,7 +19,7 @@ import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import Any, Callable, Literal, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -47,6 +47,11 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.omega_loss import (
+    OmegaLossConfig,
+    OmegaLossFn,
+    validate_omega_setup,
+)
 from nemo_rl.algorithms.metric_utils import (
     GRAD_NORM_KEY,
     LOSS_KEY,
@@ -329,6 +334,9 @@ _REWARD_PENALTY_FLAGS = (
 
 
 class GRPOConfig(BaseModel, extra="allow"):
+    # Policy loss: "clipped_pg" (GRPO/PPO family) or "omega" (private softmax-weighted loss).
+    loss_function: Literal["clipped_pg", "omega"] = "clipped_pg"
+    omega_loss: OmegaLossConfig = OmegaLossConfig()
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
     max_num_epochs: int = 1
@@ -853,11 +861,19 @@ def setup(
             "policy.generation.top_p=1.0)."
         )
 
-    loss_fn = ClippedPGLossFn(
-        loss_config,
-        use_fused_linear_logprobs=use_fused_linear_logprobs,
-        seq_logprob_error_threshold=grpo_config.seq_logprob_error_threshold,
-    )
+    if grpo_config.loss_function == "omega":
+        validate_omega_setup(master_config)
+        loss_fn = OmegaLossFn(
+            grpo_config.omega_loss,
+            num_generations_per_prompt=grpo_config.num_generations_per_prompt,
+            use_fused_linear_logprobs=use_fused_linear_logprobs,
+        )
+    else:
+        loss_fn = ClippedPGLossFn(
+            loss_config,
+            use_fused_linear_logprobs=use_fused_linear_logprobs,
+            seq_logprob_error_threshold=grpo_config.seq_logprob_error_threshold,
+        )
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
