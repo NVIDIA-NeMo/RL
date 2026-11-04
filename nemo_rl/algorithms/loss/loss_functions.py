@@ -468,6 +468,8 @@ class ClippedPGLossFn(LossFunction):
         self._compiled_actor_objective = None
         self.objective_reduction = make_objective_reduction(self.normalization)
         self.loss_type = self.objective_reduction.loss_type
+        # Authoritative check for every construction path (legacy trainers, tests);
+        # validate_single_controller_config repeats it to fail before cluster start.
         self.objective_reduction.validate_loss_options(
             sequence_level_importance_ratios=cfg.sequence_level_importance_ratios,
             opd_full=self.opd_full is not None,
