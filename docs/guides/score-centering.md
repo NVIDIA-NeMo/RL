@@ -41,13 +41,20 @@ coefficients depend on the importance-sampling mode:
 | Untruncated token-level IS | `p(v)` | `1` |
 | Token-level TIS with bounds `[lo, hi]` | `clamp(p(v), lo*q(v), hi*q(v))` | `clamp(1, lo*rho, hi*rho)` |
 | Token-level ICEPOP with bounds `[lo, hi]` | `p(v)` if `p(v)/q(v)` is in bounds, otherwise `0` | `1` if `1/rho` is in bounds, otherwise `0` |
+| Token-level adaptive-ppo-clip with bounds `lo`, `hi + k`, and outer bound `o` | `p(v)` if `p(v)/q(v)` is kept for the sign of `A`, otherwise `0` | `1` if `1/rho` is kept for the sign of `A`, otherwise `0` |
+
+adaptive-ppo-clip keeps a ratio `r` when `r <= o` and, for `A < 0`, `r >= lo`
+or, for `A > 0`, `r <= hi + k`; a zero advantage is held to `o` only. These are
+the bounds its filter applies to the sampled token at the same step, with the
+controller's current offset `k`.
 
 Only `log p(v)` carries gradients through this correction. The captured head
 retains its original probability mass; it is not renormalized to one. The loss
 applies the existing token/sample masks and normalization to `A * C`.
-Masked logprobs are neutralized before exponentiation. An ICEPOP rejection of
-the sampled token does not mask the head/tail correction. Under untruncated
-IS, the head and tail coefficients cancel and the correction is zero.
+Masked logprobs are neutralized before exponentiation. An ICEPOP or
+adaptive-ppo-clip rejection of the sampled token does not mask the head/tail
+correction. Under untruncated IS, the head and tail coefficients cancel and the
+correction is zero.
 
 This implementation adds a correction to the existing clipped objective; it
 does not replace it with centered REINFORCE or exactly center every possible
@@ -120,6 +127,13 @@ For untruncated IS, set `use_importance_sampling_correction: true` and leave
 the truncation type and both bounds `null`. For ICEPOP, use the TIS example
 with `truncated_importance_sampling_type: icepop`; out-of-bounds weights become
 zero instead of being clamped. Both the head and modeled tail use this rule.
+For adaptive-ppo-clip, use the TIS example with
+`truncated_importance_sampling_type: adaptive-ppo-clip` and
+`force_on_policy_ratio: true`, which that mode requires; the
+`truncated_importance_sampling_adaptive_*` settings work as described in the
+[GRPO guide](grpo.md#adaptive-ppo-clip). The head and modeled tail are filtered
+by the sign of each position's advantage, with the upper bound the controller
+set for the step.
 `seq-mask-tis` and sequence-level IS remain unsupported with score centering.
 
 ## Data Flow
@@ -207,16 +221,19 @@ uv run --no-sync bash tests/functional/grpo_score_centering_gym_single_controlle
 The test adapts the existing SingleController Gym token-capture smoke. It
 requires two GPUs, the Gym dependencies, model/data access, and `HF_TOKEN` for
 the Workplace Assistant data preparation. It runs three training steps each
-with IS off, untruncated IS, TIS, and ICEPOP, using Qwen3-0.6B, Megatron, and
-async vLLM. TIS and ICEPOP enable internal packing with `fuse_loss=true`; the
-other two modes use unpacked preparation.
+with IS off, untruncated IS, TIS, ICEPOP, and adaptive-ppo-clip, using
+Qwen3-0.6B, Megatron, and async vLLM. TIS, ICEPOP, and adaptive-ppo-clip enable
+internal packing with `fuse_loss=true`; the other two modes use unpacked
+preparation.
 It is registered in the full `L1_Functional_Tests_SingleController_3.sh` suite.
 
 The checks require three loss/head-mass records, finite loss and gradient
 norms, positive valid-token counts, head mass in `(0, 1.0001]`, finalizer
 activity, and zero invalid-row and poisoned-rollout metrics. The
 `train/score_centering_head_mass` metric proves the score-centering loss path
-executed. This smoke does not establish convergence, large-K performance, or
+executed. The adaptive-ppo-clip run also requires three
+`train/cur_adaptive_ppo_clip_k` records, one per step, from its controller.
+This smoke does not establish convergence, large-K performance, or
 TP/CP correctness. Separate packed TP/CP unit tests compare values and gradients
 against an unpacked, full-vocabulary reference.
 

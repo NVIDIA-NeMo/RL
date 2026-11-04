@@ -2209,17 +2209,17 @@ class SingleControllerActor:
     ) -> Optional[dict[str, Any]]:
         """The ``extra_env_info`` the replay buffer's enricher sees for a finalized group.
 
-        Teachers route on the Gym-resolved agent alone. The SWE privileged critic
+        Routing metadata comes from the finalized request. The SWE privileged critic
         needs the prompt's own env info (its golden patch), which the
         metadata-only request does not carry, so the prompt is looked up.
         """
-        env_info = (
-            {"agent_ref": {"name": request.resolved_agent_name}}
-            if request.resolved_agent_name is not None
-            else None
-        )
+        env_info: dict[str, Any] = {}
+        if request.attribution_key is not None:
+            env_info["attribution_key"] = request.attribution_key
+        if request.resolved_agent_name is not None:
+            env_info["agent_ref"] = {"name": request.resolved_agent_name}
         if self._privilege_store is None:
-            return env_info
+            return env_info or None
         prompt = await self._load_recovery_prompt(
             group_id=request.group_id, sample_id=str(request.prompt_idx)
         )
@@ -2230,7 +2230,7 @@ class SingleControllerActor:
                 f"{request.prompt_idx} holds prompt idx={prompt.get('idx')!r} "
                 f"(group={request.group_id!r})"
             )
-        return {**dict(prompt.get("extra_env_info") or {}), **(env_info or {})}
+        return {**dict(prompt.get("extra_env_info") or {}), **env_info}
 
     async def _finalize_with_actor(
         self, request: "ReassemblyRequest", rollout_metrics: dict[str, Any]
