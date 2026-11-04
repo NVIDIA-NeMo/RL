@@ -40,10 +40,41 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt
+from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt, model_validator
 from tensordict import TensorDict
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
+
+
+class SsdOffloadConfig(BaseModel, extra="allow"):
+    """TQ SimpleStorage SSD offload: large field values live on node-local SSD.
+
+    Each storage unit writes under ``path`` on its own node, so no shared
+    filesystem is needed. Values whose encoded size is ``>= threshold_bytes``
+    go to SSD; smaller ones stay in host memory. The data is temporary:
+    ``tq.close()`` removes it, and a run that dies without closing leaves its
+    ``<path>/transfer_queue_ssd_offload/<run_id>`` directory behind.
+
+    A data-plane checkpoint saved with ``enabled=true`` must be resumed with
+    ``enabled=true`` (TQ raises at load otherwise); ``path`` and
+    ``threshold_bytes`` may change between save and resume.
+    """
+
+    enabled: bool = False
+    path: str | None = None  # absolute; required when enabled
+    threshold_bytes: PositiveInt = 1048576  # 1 MiB
+
+    @model_validator(mode="after")
+    def _require_absolute_path_when_enabled(self) -> "SsdOffloadConfig":
+        # Storage actors resolve a relative path against their own cwd, which
+        # differs per node/process, so it would not be one node-local dir.
+        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+            raise ValueError(
+                "data_plane.simple.ssd_offload.enabled=true requires "
+                "data_plane.simple.ssd_offload.path to be an absolute "
+                f"node-local SSD directory, got {self.path!r}."
+            )
+        return self
 
 
 class SimpleStorageConfig(BaseModel, extra="allow"):
@@ -63,6 +94,37 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
     # names (train, inference, teacher:<name>). None keeps TQ's own SPREAD
     # placement over every Ray node.
     storage_unit_placement: list[str] | Literal["all"] | None = None
+    ssd_offload: SsdOffloadConfig = Field(default_factory=SsdOffloadConfig)
+
+
+class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
+    """Mooncake SSD offload: segment owners spill DRAM to node-local SSD.
+
+    Once memory use across all segments passes ``offload_threshold`` (a share
+    of their total), Mooncake moves objects to the SSD of the process owning
+    them, under its own subdirectory of ``path`` (node-local, absolute).
+    Offload runs in every segment owner: the storage units when they are on,
+    otherwise every client with a segment (see
+    ``nemo_rl.data_plane.adapters.mooncake_ssd_offload``).
+    Size ``path`` for about (segment owners on the node) x (peak data
+    offloaded at once): owners delete the files of cleared keys every 30 s.
+    Operation, cleanup and the full-disk data-loss risk are described under
+    "Mooncake SSD offload" in nemo_rl/data_plane/README.md.
+    """
+
+    enabled: bool = False
+    path: str | None = None  # absolute; required when enabled
+    offload_threshold: Annotated[float, Field(gt=0, le=1)] = 0.5
+
+    @model_validator(mode="after")
+    def _require_absolute_path_when_enabled(self) -> "MooncakeSsdOffloadConfig":
+        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+            raise ValueError(
+                "data_plane.mooncake_cpu.ssd_offload.enabled=true requires "
+                "data_plane.mooncake_cpu.ssd_offload.path to be an absolute "
+                f"node-local SSD directory, got {self.path!r}."
+            )
+        return self
 
 
 class MooncakeCpuConfig(BaseModel, extra="allow"):
@@ -89,6 +151,17 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     HBM capacity of that buffer per active GDR client. CPU-only clients keep
     using the registered host-buffer path.
 
+    ``gdr_keep_teacher_payload_on_gpu`` only matters for MOPD with
+    ``use_gdr: true``. When true, each teacher keeps what it writes to the data
+    plane on the GPU until the PUT: its logprobs and, with full-vocabulary MOPD,
+    its hidden-state or logits payload. The GDR PUT then copies them GPU to GPU
+    into its staging buffer instead of GPU -> CPU -> GPU. The cost is teacher
+    GPU memory: each teacher holds its share of one prompt group's outputs until
+    the PUT, which for a full-vocabulary payload is tokens x hidden (or
+    vocabulary) size x payload dtype bytes, and briefly about twice that while
+    it is joined and packed. Set it to false to copy them to CPU first, which
+    was the behavior before this option. It is ignored without ``use_gdr``.
+
     Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
     That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
     transfer's peer rail to the local one by name; on a rail-isolated RoCE
@@ -107,6 +180,7 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     staging_buffer_size: int = 536870912  # 512 MiB per pool slot
     use_gdr: bool = False
     gdr_staging_buffer_mb: PositiveInt = 1024
+    gdr_keep_teacher_payload_on_gpu: bool = True
     # >0: only CPU MooncakeStorageUnit actors own Mooncake memory (this many
     # bytes each); every other process is a client and off the save path.
     storage_unit_segment_size: NonNegativeInt = 0
@@ -115,6 +189,20 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     # Clusters whose nodes host units: "all" or a list of names (train,
     # inference, teacher:<name>).
     storage_unit_placement: list[str] | Literal["all"] = "all"
+    ssd_offload: MooncakeSsdOffloadConfig = Field(
+        default_factory=MooncakeSsdOffloadConfig
+    )
+
+    def owned_segment_size(self, segment_size: int | None) -> int:
+        """Bytes of Mooncake memory a process owns.
+
+        ``segment_size`` is what the process asked for (a storage unit's size,
+        or 0 for a client that owns nothing); ``None`` takes the controller's
+        default, which is 0 for every client once storage units are on.
+        """
+        if segment_size is not None:
+            return segment_size
+        return 0 if self.storage_unit_segment_size else self.global_segment_size
 
 
 class DataPlaneConfig(TypedDict):
@@ -191,6 +279,11 @@ def backend_config(cfg: DataPlaneConfig) -> Any:
     if isinstance(nested, BaseModel):
         nested = nested.model_dump(exclude_unset=True)
     return _BACKEND_MODELS[backend].model_validate(nested)
+
+
+def gdr_enabled(cfg: DataPlaneConfig) -> bool:
+    """Return whether the selected TransferQueue backend requests GDR."""
+    return cfg["backend"] == "mooncake_cpu" and bool(backend_config(cfg).use_gdr)
 
 
 def storage_unit_placement(cfg: DataPlaneConfig) -> list[str] | Literal["all"] | None:
@@ -585,6 +678,11 @@ class DataPlaneClient(ABC):
         fallback): bulk schemas are wide and silent over-fetch is the
         most expensive shape the wire can take. Callers must name what
         they read.
+
+        Every requested field must exist on every requested row, or the
+        backend raises. Callers reading rows that carry different fields
+        (e.g. image and text samples) split the request by row set, as
+        :func:`nemo_rl.data_plane.column_io.fetch_columns` does for media.
 
         Args:
             sample_ids: Uids to fetch.

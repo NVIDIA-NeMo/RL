@@ -31,9 +31,9 @@ Since Ray programs can spawn multiple workers and actors, using the Ray Distribu
 From the SLURM login node, query the nodes used by the interactive `ray.sub` job as follows:
 
 ```sh
-teryk@slurm-login:~$ squeue --me
+user@slurm-login:~$ squeue --me
              JOBID PARTITION        NAME     USER ST       TIME  NODES NODELIST(REASON)
-           2504248     batch ray-cluster   terryk  R      15:01      4 node-12,node-[22,30],node-49
+           2504248     batch ray-cluster   user    R      15:01      4 node-12,node-[22,30],node-49
 ```
 
 The first node is always the head node, so we need to port forward the dashboard port to the login node:

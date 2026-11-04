@@ -18,6 +18,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -31,7 +32,9 @@ from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
+    ROLLOUT_MATCHED_MEDIA_KEY,
     PackedTensor,
+    attach_image_model_inputs_to_message,
     image_to_data_url,
     video_path_to_data_url,
 )
@@ -39,10 +42,15 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.nemo_gym import (
+    ExternalServiceReadinessConfig,
     NemoGym,
     NemoGymConfig,
+    _count_structured_response_tokens,
+    _wait_for_external_services,
     build_reward_component_columns,
+    extract_external_service_readiness,
     extract_reward_components,
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
@@ -64,6 +72,7 @@ from nemo_rl.environments.nemotron_utils import (
 )
 from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
+    _reattach_static_multimodal_payloads_to_result,
     attach_static_multimodal_payload,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -77,6 +86,39 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+class _WhitespaceTokenizer:
+    def __init__(self):
+        self.encoded = []
+
+    def encode(self, text, add_special_tokens=False):
+        assert add_special_tokens is False
+        self.encoded.append(text)
+        return text.split()
+
+
+def test_count_structured_response_tokens_strips_text():
+    tokenizer = _WhitespaceTokenizer()
+    assert _count_structured_response_tokens(
+        tokenizer, reasoning_text="  think carefully  ", answer_text="  final answer\n"
+    ) == (2, 2)
+    assert tokenizer.encoded == ["think carefully", "final answer"]
+
+
+def test_count_structured_response_tokens_allows_one_empty_component():
+    assert _count_structured_response_tokens(
+        _WhitespaceTokenizer(), reasoning_text="", answer_text="answer only"
+    ) == (0, 2)
+
+
+def test_count_structured_response_tokens_rejects_missing_text():
+    assert (
+        _count_structured_response_tokens(
+            _WhitespaceTokenizer(), reasoning_text="", answer_text=""
+        )
+        is None
+    )
 
 
 def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
@@ -93,8 +135,10 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
         ]
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
-                del head_server_config
+            def run_examples(
+                self, examples, head_server_config, route_failures_to_sidecar=False
+            ):
+                del head_server_config, route_failures_to_sidecar
                 for row in examples:
                     row["agent_ref"] = {"name": "resolved_agent"}
 
@@ -108,6 +152,7 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
+            _forest_training = False
             _tokenizer = object()
             # run_rollouts is a thin span-opening wrapper that delegates the
             # streaming to _stream_rollouts, so the mock has to supply the real
@@ -157,6 +202,115 @@ def test_multimodal_content_types_cover_responses_media_aliases():
     } <= MULTIMODAL_CONTENT_TYPES
 
 
+def _external_health_response(
+    *, status: str, healthy_backends: int, total_backends: int
+) -> MagicMock:
+    response = MagicMock()
+    response.status = 200
+    response.read.return_value = json.dumps(
+        {
+            "status": status,
+            "healthy_backends": healthy_backends,
+            "total_backends": total_backends,
+        }
+    ).encode()
+    response.__enter__.return_value = response
+    return response
+
+
+def test_external_service_readiness_waits_for_every_expected_backend():
+    config = ExternalServiceReadinessConfig(
+        services=[
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        timeout_seconds=10,
+        poll_interval_seconds=1,
+        request_timeout_seconds=2,
+    )
+
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
+            side_effect=[
+                _external_health_response(
+                    status="ok", healthy_backends=1, total_backends=2
+                ),
+                _external_health_response(
+                    status="ok", healthy_backends=2, total_backends=2
+                ),
+            ],
+        ) as urlopen,
+        patch("nemo_rl.environments.nemo_gym.sleep") as sleep,
+    ):
+        _wait_for_external_services(config)
+
+    assert urlopen.call_count == 2
+    sleep.assert_called_once_with(1)
+
+
+def test_external_service_readiness_times_out_with_last_observation():
+    config = ExternalServiceReadinessConfig(
+        services=[
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        timeout_seconds=1,
+        poll_interval_seconds=1,
+        request_timeout_seconds=1,
+    )
+
+    now = 0.0
+
+    def advance(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    # Probes return instantly and only sleep advances the clock, so the last
+    # sleep ends exactly at the deadline, as it does in a real run.
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
+            side_effect=[OSError("connection refused")],
+        ),
+        patch("nemo_rl.environments.nemo_gym.monotonic", side_effect=lambda: now),
+        patch("nemo_rl.environments.nemo_gym.sleep", side_effect=advance),
+    ):
+        with pytest.raises(TimeoutError, match="GENRM: request failed"):
+            _wait_for_external_services(config)
+
+
+def test_external_service_readiness_is_not_forwarded_to_gym():
+    nemo_gym_dict = {
+        "external_service_readiness": {
+            "services": [
+                {
+                    "name": "GENRM",
+                    "url": "http://10.0.0.1:9213/health",
+                    "expected_backends": 2,
+                }
+            ],
+            "timeout_seconds": 10,
+            "poll_interval_seconds": 1,
+            "request_timeout_seconds": 2,
+        },
+        "skip_venv_if_present": True,
+    }
+
+    readiness = extract_external_service_readiness(nemo_gym_dict)
+
+    assert readiness is not None
+    assert readiness.services[0].name == "GENRM"
+    assert "external_service_readiness" not in nemo_gym_dict
+    assert nemo_gym_dict == {"skip_venv_if_present": True}
+
+
 def test_extract_static_video_message_resolves_local_file(tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"test")
@@ -187,7 +341,8 @@ def test_extract_static_video_message_resolves_local_file(tmp_path):
     assert messages[0]["content"][1]["type"] == "video"
 
 
-def test_extract_static_video_message_accepts_cached_frames(tmp_path):
+@pytest.mark.parametrize("with_timing", [False, True])
+def test_extract_static_video_message_accepts_cached_frames(tmp_path, with_timing):
     frame_paths = []
     for index in range(2):
         frame_path = tmp_path / f"frame_{index:04d}.png"
@@ -215,6 +370,13 @@ def test_extract_static_video_message_accepts_cached_frames(tmp_path):
         }
     }
 
+    if with_timing:
+        for part, index in zip(
+            example["responses_create_params"]["input"][0]["content"], [0, 24]
+        ):
+            part.update(_video_frame_index=index, _video_fps=23.976)
+    expected_indices = [0, 24] if with_timing else [0, 1]
+    expected_fps = 23.976 if with_timing else 1.0
     messages, resolved_path = _extract_static_video_messages(example)
 
     assert resolved_path is None
@@ -227,14 +389,18 @@ def test_extract_static_video_message_accepts_cached_frames(tmp_path):
         isinstance(part["image"], Image.Image) for part in messages[0]["content"][:2]
     )
     assert all(part["_is_video_frame"] for part in messages[0]["content"][:2])
-    assert [part["_video_frame_index"] for part in messages[0]["content"][:2]] == [0, 1]
-    assert [part["_video_fps"] for part in messages[0]["content"][:2]] == [1.0, 1.0]
+    assert [
+        part["_video_frame_index"] for part in messages[0]["content"][:2]
+    ] == expected_indices
+    assert [part["_video_fps"] for part in messages[0]["content"][:2]] == [
+        expected_fps
+    ] * 2
 
     _, frames, frame_indices, fps = _flatten_nemotron_video_frame_messages(messages)
 
     assert len(frames) == 2
-    assert frame_indices == [0, 1]
-    assert fps == 1.0
+    assert frame_indices == expected_indices
+    assert fps == expected_fps
 
 
 def test_extract_static_video_message_ignores_still_image_only_row():
@@ -492,6 +658,55 @@ def test_reattach_static_multimodal_payload_to_rollout_user_message():
     assert target[1]["pixel_values"] is payload
 
 
+def test_reattach_keeps_rollout_matched_media_when_token_counts_already_match():
+    """Exact-count processor media is authoritative even without budget repair."""
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class _TextTokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_processor = _ImageProcessor()
+        tokenizer = _TextTokenizer()
+        model_input_names = ["input_ids", "pixel_values", "num_tokens"]
+
+        def __call__(self, *, text, images, return_tensors):
+            assert text == "<image>"
+            assert len(images) == 1
+            assert return_tensors == "pt"
+            return {
+                "input_ids": torch.tensor([[1]]),
+                "pixel_values": torch.tensor([[7.0]]),
+                "num_tokens": torch.tensor([256]),
+            }
+
+    target_user = {"role": "user", "content": "question"}
+    attach_image_model_inputs_to_message(
+        target_user,
+        images=[Image.new("RGB", (2, 2))],
+        processor=_Processor(),
+        expected_num_tokens_per_image=[256],
+    )
+    rollout_media = target_user["pixel_values"]
+    assert target_user[ROLLOUT_MATCHED_MEDIA_KEY] is True
+
+    result = {
+        "input_message_log": [target_user],
+        "message_log": [target_user],
+    }
+    static_media = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    _reattach_static_multimodal_payloads_to_result(
+        result,
+        [{"role": "user", "content": "question", "pixel_values": static_media}],
+    )
+
+    assert target_user["pixel_values"] is rollout_media
+    assert ROLLOUT_MATCHED_MEDIA_KEY not in target_user
+
+
 def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"video")
@@ -617,7 +832,9 @@ def test_video_datum_requires_explicit_video_data_config(tmp_path):
 
 def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_path):
     data_path = tmp_path / "video-gym.jsonl"
-    data_path.write_text(json.dumps({"row": 1}) + "\n", encoding="utf-8")
+    video_part = {"type": "input_video", "video_url": "clip.mp4"}
+    row = {"responses_create_params": {"input": [{"content": [video_part]}]}}
+    data_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
     expected_media_config = {
         "num_frames": 32,
         "video_sampling_style": "nemotron_vl",
@@ -659,7 +876,7 @@ def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_pa
     )
     processor = SimpleNamespace(
         apply_chat_template=lambda *args: None,
-        tokenizer=object(),
+        tokenizer=SimpleNamespace(bos_token_id=None),
     )
 
     train_dataset, _ = setup_response_data(
@@ -950,7 +1167,10 @@ def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
     )
 
 
-def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_path):
+@pytest.mark.parametrize("with_timing", [False, True])
+def test_nemotron_cached_video_uses_native_lossless_manifest(
+    monkeypatch, tmp_path, with_timing
+):
     frame_paths = []
     for index in range(4):
         frame_path = tmp_path / f"frame_{index:04d}.png"
@@ -988,10 +1208,15 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
             },
         }
     }
+    if with_timing:
+        for part, index in zip(
+            example["responses_create_params"]["input"][0]["content"], [0, 6, 12, 18]
+        ):
+            part.update(_video_frame_index=index, _video_fps=23.976)
     manifest_calls = []
 
-    def fake_manifest_builder(paths):
-        manifest_calls.append(paths)
+    def fake_manifest_builder(paths, *, frame_indices, frame_fps):
+        manifest_calls.append((paths, frame_indices, frame_fps))
         return "data:video/x-nemo-rl-cached-frames;base64,dGVzdA=="
 
     monkeypatch.setattr(
@@ -1031,7 +1256,13 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
     )
 
     assert datum is not None
-    assert manifest_calls == [[str(path) for path in frame_paths]]
+    assert manifest_calls == [
+        (
+            [str(path) for path in frame_paths],
+            [0, 6, 12, 18] if with_timing else [None] * 4,
+            [23.976] * 4 if with_timing else [None] * 4,
+        )
+    ]
     outbound = datum["extra_env_info"]["responses_create_params"]
     assert outbound["input"][0]["content"] == [
         {
@@ -1142,7 +1373,7 @@ def test_nemo_gym_stub_module():
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
     master_config = MasterConfig.model_construct(
-        policy={"generation": generation_config}
+        policy={"generation": generation_config}, data={}
     )
     setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 
@@ -1179,6 +1410,13 @@ example_multi_step_simple_agent:
       model_server:
         type: responses_api_models
         name: openai_model
+example_multi_step_environment_server:
+  environment_servers:
+    legacy_agent:
+      entrypoint: app.py
+      agent_server:
+        type: responses_api_agents
+        name: example_multi_step_simple_agent
 openai_model:
   responses_api_models:
     vllm_model:
@@ -1194,6 +1432,8 @@ openai_model:
         model_name=nemo_gym_vllm_generation.cfg["model_name"],
         base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
         initial_global_config_dict=safe_load(yaml_str),
+        checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+        turn_checkpointing_enabled=False,
     )
     env = NemoGym.options(
         runtime_env={
@@ -1312,10 +1552,34 @@ def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
         asyncio.run(stream.__anext__())
 
 
-def test_nemo_gym_postprocess_uses_batch_decode():
+@pytest.mark.parametrize(
+    ("token_fields", "expected_count"),
+    [
+        pytest.param({}, None, id="missing"),
+        pytest.param(
+            {
+                "reasoning_text": "think carefully",
+                "answer_text": "final answer",
+            },
+            2,
+            id="genrm",
+        ),
+        pytest.param({"reasoning_text": None}, None, id="aegis-without-reasoning"),
+        pytest.param(
+            {"reasoning_text": "safety reasoning"},
+            None,
+            id="aegis-with-reasoning",
+        ),
+    ],
+)
+def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     class _Tokenizer:
         def __init__(self):
             self.batch_decode_calls = []
+
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return text.split()
 
         def batch_decode(self, batch):
             self.batch_decode_calls.append([list(token_ids) for token_ids in batch])
@@ -1326,11 +1590,15 @@ def test_nemo_gym_postprocess_uses_batch_decode():
         "response": {
             "output": [
                 {
+                    "type": "reasoning",
+                    "summary": [{"text": "think carefully"}],
                     "prompt_token_ids": [1, 2],
                     "generation_token_ids": [3],
                     "generation_log_probs": [-0.1],
                 },
                 {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "final answer"}],
                     "prompt_token_ids": [1, 2, 3, 4, 5],
                     "generation_token_ids": [6, 7],
                     "generation_log_probs": [-0.2, -0.3],
@@ -1339,6 +1607,7 @@ def test_nemo_gym_postprocess_uses_batch_decode():
         },
         "responses_create_params": {"input": []},
     }
+    nemo_gym_result.update(token_fields)
 
     class _MockSelf:
         cfg = {}
@@ -1357,6 +1626,14 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert result["message_log"][1]["token_ids"].tolist() == [3]
     assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
     assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
+    assert result["reasoning_token_count"] == expected_count
+    assert result["response_token_count"] == expected_count
+    assert result["token_extraction_valid"] is (expected_count is not None)
+    for key, value in token_fields.items():
+        if expected_count is None:
+            assert result["full_result"][key] == value
+        else:
+            assert key not in result["full_result"]
     assert nemo_gym_result["response"]["output"][0]["prompt_str"] == "1 2"
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
@@ -1535,6 +1812,115 @@ def test_nemo_gym_dedup_omits_actor_initial_tensor_and_preserves_later_media():
     assert on_users[1]["pixel_values"].as_tensor().item() == 2
 
 
+def test_nemo_gym_dedup_keeps_initial_media_with_pre_response_tool_image(
+    monkeypatch,
+):
+    """Rollout-budget repair must cover initial and tool images together."""
+    initial_url = image_to_data_url(Image.new("RGB", (512, 512), color=(1, 0, 0)))
+    tool_url = image_to_data_url(Image.new("RGB", (1024, 1024), color=(2, 0, 0)))
+    initial_input = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "inspect"},
+                {"type": "input_image", "image_url": initial_url},
+            ],
+        }
+    ]
+
+    image_start_id, image_id, image_end_id = 10, 11, 12
+    image_run = [image_start_id, *([image_id] * 256), image_end_id]
+    nemo_gym_result = {
+        "response": {
+            "agent_input": deepcopy(initial_input),
+            "seed_obs": deepcopy(initial_input),
+            "output": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": tool_url},
+                    ],
+                },
+                {
+                    "prompt_token_ids": [*image_run, *image_run],
+                    "generation_token_ids": [20],
+                    "generation_log_probs": [-0.1],
+                },
+            ],
+        },
+        "responses_create_params": {"input": deepcopy(initial_input)},
+        "reward": 1.0,
+    }
+
+    class _Tokenizer:
+        model_input_names = ["input_ids"]
+        unk_token_id = -1
+
+        def convert_tokens_to_ids(self, tokens):
+            ids = {
+                "<image>": image_id,
+                "<img>": image_start_id,
+                "</img>": image_end_id,
+            }
+            return [ids[token] for token in tokens]
+
+        def batch_decode(self, batch):
+            return ["decoded"] * len(batch)
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class NemotronH_Super_Omni_Reasoning_V3Processor:
+        image_token = "<image>"
+        image_start_token = "<img>"
+        image_end_token = "</img>"
+        image_processor = _ImageProcessor()
+        tokenizer = _Tokenizer()
+        model_input_names = ["input_ids", "pixel_values"]
+
+    def attach_repaired_images(message, *, images, expected_num_tokens_per_image, **_):
+        assert expected_num_tokens_per_image == [256, 256]
+        message["pixel_values"] = PackedTensor(
+            torch.tensor([[image.width] for image in images], dtype=torch.float32),
+            dim_to_pack=0,
+        )
+        message[ROLLOUT_MATCHED_MEDIA_KEY] = True
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym.attach_image_model_inputs_to_message",
+        attach_repaired_images,
+    )
+
+    class _MockSelf:
+        cfg = {}
+        _processor = NemotronH_Super_Omni_Reasoning_V3Processor()
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(),
+            {},
+            nemo_gym_result,
+            _Tokenizer(),
+            include_initial_multimodal_data=False,
+        )
+    )
+    assert result.get("_initial_multimodal_data_omitted") is False
+    original_media = PackedTensor(torch.tensor([[99.0]]), dim_to_pack=0)
+    _reattach_original_multimodal_payloads(
+        [result],
+        [[{"role": "user", "content": "", "pixel_values": original_media}]],
+    )
+
+    user_message = next(
+        message for message in result["message_log"] if message["role"] == "user"
+    )
+    assert user_message["pixel_values"].as_tensor().flatten().tolist() == [
+        512.0,
+        1024.0,
+    ]
+    assert user_message[ROLLOUT_MATCHED_MEDIA_KEY] is True
+
+
 @pytest.mark.parametrize(
     ("seed_mode", "expected_pixel_values"),
     [
@@ -1683,8 +2069,10 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         postprocess_calls = []
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
-                del head_server_config
+            def run_examples(
+                self, examples, head_server_config, route_failures_to_sidecar=False
+            ):
+                del head_server_config, route_failures_to_sidecar
                 content = examples[0]["responses_create_params"]["input"][0]["content"]
                 assert content[0]["video_url"].startswith("data:video/mp4;base64,")
                 assert content[1]["image_url"].startswith("data:image/png;base64,")
@@ -1703,6 +2091,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             # streaming to _stream_rollouts, so the mock has to supply the real
             # one for the generator below to produce anything.
             _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
+            _forest_training = False
 
             def _require_spinup(self):
                 pass
@@ -1734,10 +2123,20 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         ):
             streamed_results.append(result)
 
-        assert postprocess_calls == [(nemo_gym_row, nemo_gym_result, tokenizer, True)]
+        assert postprocess_calls == [
+            (
+                nemo_gym_row,
+                nemo_gym_result,
+                tokenizer,
+                True,
+            )
+        ]
         assert streamed_results[0][0] == 7
         assert streamed_results[0][1] == nemo_gym_row["agent_ref"]
-        assert streamed_results[0][2] == {"message_log": []}
+        assert streamed_results[0][2] == {
+            "message_log": [],
+            "attribution_key": "legacy_test_agent",
+        }
 
     asyncio.run(_run())
 
@@ -1780,7 +2179,10 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
                 return [" ".join(map(str, token_ids)) for token_ids in batches]
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples(
+                self, examples, head_server_config, route_failures_to_sidecar=False
+            ):
+                del route_failures_to_sidecar
                 assert head_server_config.backend == "megatron"
                 dispatched_row = examples[0]
                 dispatched_part = dispatched_row["responses_create_params"]["input"][0][
@@ -1822,6 +2224,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             _tokenizer = _Tokenizer()
             _processor = None
             _token_capture_enabled = False
+            _forest_training = False
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
@@ -1967,6 +2370,9 @@ def test_nemo_gym_sanity(
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
         d.pop("full_result", None)
+        d.pop("reasoning_token_count", None)
+        d.pop("response_token_count", None)
+        d.pop("token_extraction_valid", None)
 
         # We remove these fields and message from comparison since we cannot guarantee exact generation reproducibility
         d["message_log"] = d["message_log"][:2]
@@ -2074,3 +2480,207 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
             f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
             f"got {null_resp.status_code}: {null_resp.text}"
         )
+
+
+@pytest.mark.nemo_gym
+def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch):
+    """The Gym head server serves the merged global config unredacted and the
+    server commands inline it, so the key must reach Gym's servers as an
+    environment interpolation resolved in each server process, never as a
+    value in the config; without a key the placeholder is sent."""
+    import os
+    from unittest.mock import MagicMock
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    import nemo_gym.server_utils as gym_server_utils
+    from omegaconf import OmegaConf
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = []
+
+    class _FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config):
+            # Unresolved, as Gym serializes it: reading the DictConfig directly
+            # would resolve the interpolation from this process's environment.
+            started.append(
+                OmegaConf.to_container(
+                    global_config_dict_parser_config.initial_global_config_dict,
+                    resolve=False,
+                )
+            )
+
+    monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
+    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    monkeypatch.delenv("NEMO_RL_POLICY_API_KEY", raising=False)
+
+    def spin_up(policy_api_key):
+        cfg = {
+            "initial_global_config_dict": {},
+            "model_name": "policy",
+            "base_urls": ["http://127.0.0.1:1/v1"],
+        }
+        if policy_api_key is not None:
+            cfg["policy_api_key"] = policy_api_key
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return started[-1]
+
+    with_key = spin_up("per-job-key")
+    assert with_key["policy_api_key"] == "${oc.env:NEMO_RL_POLICY_API_KEY}"
+    assert os.environ["NEMO_RL_POLICY_API_KEY"] == "per-job-key"
+
+    monkeypatch.delenv("NEMO_RL_POLICY_API_KEY", raising=False)
+    without_key = spin_up(None)
+    assert without_key["policy_api_key"] == "dummy_key"
+    assert "NEMO_RL_POLICY_API_KEY" not in os.environ
+
+
+def _fake_gym_run_helper(monkeypatch, gym_mod, gym_cli, gym_rollout_collection):
+    """Capture the global config `_spinup` hands to Gym, without starting one."""
+    from unittest.mock import MagicMock
+
+    import nemo_gym.server_utils as gym_server_utils
+    from omegaconf import OmegaConf
+
+    started = []
+
+    class _FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config):
+            started.append(
+                OmegaConf.to_container(
+                    global_config_dict_parser_config.initial_global_config_dict,
+                    resolve=False,
+                )
+            )
+
+    monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    # _spinup resolves the rollout client up front, which would otherwise reach
+    # the head server the fake RunHelper never started.
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
+    monkeypatch.setattr(gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    return started
+
+
+@pytest.mark.nemo_gym
+def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkeypatch):
+    """The telemetry block is added only when this actor exports, merged with the user's."""
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = _fake_gym_run_helper(
+        monkeypatch, nemo_gym_mod, gym_cli, gym_rollout_collection
+    )
+    # Read straight from the env, so the run id and the traces/metrics switches
+    # reach Gym's servers even with traces off -- not read back off an SDK
+    # provider that a traces-off run never installs.
+    monkeypatch.setenv("NEMO_RL_OTEL_RUN_ID", "a-run")
+    monkeypatch.setenv("NEMO_RL_OTEL_EXPORTER", "console")
+    monkeypatch.setenv("NEMO_RL_OTEL_TRACES_ENABLED", "0")
+    monkeypatch.setenv("NEMO_RL_OTEL_METRICS_ENABLED", "1")
+    # Published to os.environ directly; seed it so monkeypatch restores it.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+
+    def spin_up(handle, gym_config=None):
+        monkeypatch.setattr(nemo_gym_mod, "get_telemetry_handle", lambda: handle)
+        # The user's block arrives inside the Gym config dict, so go through the builder.
+        cfg = nemo_gym_mod._build_gym_actor_config(
+            dict(gym_config or {}),
+            base_urls=["http://127.0.0.1:1/v1"],
+            model_name="policy",
+            enable_router_replay=False,
+            use_fastokens=False,
+            checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+            turn_checkpointing_enabled=False,
+        )
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return started[-1]
+
+    # Telemetry off, and up but not exporting: the block must not appear at all.
+    assert "telemetry" not in spin_up(None)
+    assert "telemetry" not in spin_up(SimpleNamespace(is_exporting=False))
+
+    exporting = SimpleNamespace(is_exporting=True)
+    # Traces off, yet run id and the switches still ride along.
+    assert spin_up(exporting)["telemetry"] == {
+        "enabled": True,
+        "run_id": "a-run",
+        "exporter": "console",
+        "traces_enabled": False,
+        "metrics_enabled": True,
+    }
+
+    # A user block is merged into ours, not swapped in.
+    configured = spin_up(exporting, {"telemetry": {"span_groups": "default,sandbox"}})
+    assert configured["telemetry"]["span_groups"] == "default,sandbox"
+    assert configured["telemetry"]["enabled"] is True
+    assert configured["telemetry"]["run_id"] == "a-run"
+    # An explicit false opts the Gym side out without turning off RL's own.
+    opted_out = spin_up(exporting, {"telemetry": {"enabled": False}})
+    assert opted_out["telemetry"]["enabled"] is False
+
+
+@pytest.mark.nemo_gym
+def test_spinup_forwards_job_identity_to_gym_servers(monkeypatch):
+    """Job-level resource attributes reach Gym's servers; per-process ones do not."""
+    import os
+    from types import SimpleNamespace as NS
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    from nemo.lens import derive_nv_dl_run_uuid
+    from nemo.lens.resources.attributes import parse_otel_resource_attributes
+    from nemo.lens.semconv import NV_DL_RUN_UUID
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = _fake_gym_run_helper(
+        monkeypatch, nemo_gym_mod, gym_cli, gym_rollout_collection
+    )
+    monkeypatch.setattr(
+        nemo_gym_mod, "get_telemetry_handle", lambda: NS(is_exporting=True)
+    )
+    monkeypatch.setenv("NEMO_RL_OTEL_RUN_ID", "a-run")
+
+    def spin_up():
+        cfg = nemo_gym_mod._build_gym_actor_config(
+            {},
+            base_urls=["http://127.0.0.1:1/v1"],
+            model_name="policy",
+            enable_router_replay=False,
+            use_fastokens=False,
+            checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+            turn_checkpointing_enabled=False,
+        )
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return parse_otel_resource_attributes(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
+
+    # Nothing pre-seeded: the job identity a server cannot know is forwarded.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+    published = spin_up()
+    assert published["nv.dl.campaign.stage"] == "RL"
+    assert published[NV_DL_RUN_UUID] == derive_nv_dl_run_uuid(run_id="a-run")
+    # Everything a server determines for itself stays behind.
+    for per_process in (
+        "service.name",
+        "service.instance.id",
+        "nv.dl.rank",
+        "process.pid",
+        "nemo.run.id",
+    ):
+        assert per_process not in published, per_process
+    # Gym gets our run id rather than minting its own.
+    assert started[-1]["telemetry"]["run_id"] == "a-run"
+
+    # A launcher's value must win over the actor's.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "nv.dl.campaign.stage=SFT")
+    assert spin_up()["nv.dl.campaign.stage"] == "SFT"

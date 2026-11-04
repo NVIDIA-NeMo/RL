@@ -43,6 +43,8 @@ policy:
   max_total_sequence_length: 8192
   precision: bfloat16
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
   automodel_cfg:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""
@@ -109,7 +111,13 @@ policy:
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: false
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     cuda_graph_impl: none
     cuda_graph_modules: []
     cuda_graph_warmup_steps: 3
@@ -140,6 +148,9 @@ policy:
     moe_token_dispatcher_type: alltoall
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     freeze_audio_encoder: true
@@ -219,6 +230,7 @@ logger:
   swanlab_enabled: false
   monitor_gpus: true
   num_val_samples_to_print: 0
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb:
     project: vlm-mpo
     name: vlm-mpo

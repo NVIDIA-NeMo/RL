@@ -1,0 +1,27 @@
+# Deferred router replay: the policy worker reads route fragments from
+# staging, and with CP=2 the replica-group leader broadcasts them to its peers.
+# Megatron generation does not support token capture with router replay yet,
+# so this variant generates with vLLM.
+defaults: ./grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-noncolocated-async-gym-single-controller-token_capture-r3-defer
+
+policy:
+  # vLLM rejects a turn whose prompt exceeds max_model_len, which poisons the
+  # rollout; bound each turn so the agent's 6 turns fit the context.
+  max_total_sequence_length: 8192
+  router_replay:
+    enabled: true
+  generation:
+    backend: vllm
+    refit_transport: null
+    max_new_tokens: 1024
+
+token_capture:
+  defer_routed_experts_to_policy: true
+
+logger:
+  log_dir: logs/grpo-nanov3-30BA3B-2n8g-noncolocated-async-gym-single-controller-token_capture-r3-defer
+  wandb:
+    name: grpo-nanov3-30BA3B-2n8g-noncolocated-async-gym-single-controller-token_capture-r3-defer

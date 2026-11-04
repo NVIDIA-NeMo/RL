@@ -28,7 +28,6 @@ from nemo_rl.algorithms.loss.utils import (
     map_teacher_logits_to_draft_vocab,
     reconstruct_opd_full_teacher_logits,
 )
-from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.algorithms.x_token.loss_utils import (
     prepare_xtoken_cross_tokenizer_loss_input,
 )
@@ -42,6 +41,7 @@ from nemo_rl.distributed.model_utils import (
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
+    get_policy_logprobs_at_sampler_topk,
 )
 from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
@@ -49,6 +49,21 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
         ContextParallelSharder,
     )
+
+
+def _validate_score_centering_data(data: BatchedDataDict[Any]) -> None:
+    """Reject missing sampler inputs before computing trainer logprobs."""
+    missing = [
+        key
+        for key in ("sampler_topk_token_ids", "sampler_topk_logprobs")
+        if key not in data
+    ]
+    if missing:
+        raise ValueError(
+            f"Score centering requires {', '.join(missing)}: use SingleController "
+            "with NeMo Gym + vLLM, token_capture.enabled=true and "
+            "policy.generation.top_logprobs > 0."
+        )
 
 
 def _prepare_opd_full_loss_input(
@@ -99,7 +114,7 @@ def _prepare_opd_full_loss_input(
     if vocab_parallel_group is None:
         raise NotImplementedError(
             "opd_full currently requires the Megatron vocabulary-parallel path; "
-            "the DTensor-only logit path is not supported."
+            "the Automodel-only logit path is not supported."
         )
 
     payload_field = opd_full_payload_field(full_cfg)
@@ -233,7 +248,8 @@ def prepare_loss_input(
             projects each row's teacher payload into teacher logits with them.
 
     Notes:
-        vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
+        Parallel groups are supplied by Megatron and Automodel workers.
+        Automodel uses a singleton vocabulary group for chunked local logprobs.
         sampling_params is only used for LossInputType.LOGPROB, and currently only supported for ClippedPGLossFn.
         d2t is only used for LossInputType.DRAFT.
         teacher_output_layer_weight_by_index is only used for LossInputType.OPD_FULL.
@@ -241,6 +257,8 @@ def prepare_loss_input(
     Returns:
         tuple(loss_input, maybe_updated_data)
     """
+    if getattr(loss_fn, "score_centering", False):
+        _validate_score_centering_data(data)
     if loss_fn.input_type == LossInputType.LOGIT:
         loss_input = {"logits": logits}
 
@@ -268,19 +286,8 @@ def prepare_loss_input(
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
         if need_top_k_or_top_p_filtering(sampling_params):
-            # mask out negative infinity logprobs
-            # prev_logprobs is already masked out in the previous step
-            mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-            logprobs, curr_finite_mask = mask_out_neg_inf_logprobs(
-                logprobs, mask[:, 1:], "curr_logprobs"
-            )
-            # Propagate the neg-inf mask so the loss reduction skips these positions.
-            # Without this change, the IS weight exp(prev-gen) becomes exp(-gen).
-            data["token_mask"] = data["token_mask"].clone()
-            data["token_mask"][:, 1:] = data["token_mask"][:, 1:] * curr_finite_mask
-
-            # compute unfiltered logprobs for the reference-KL penalty;
-            # -inf positions were dropped from token_mask above, so the KL skips them.
+            # Preserve support information until the actor loss builds its mask.
+            # compute unfiltered logprobs for reference policy KL penalty
             if (
                 hasattr(loss_fn, "reference_policy_kl_penalty")
                 and loss_fn.reference_policy_kl_penalty != 0
@@ -298,6 +305,21 @@ def prepare_loss_input(
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
+        if need_top_k_or_top_p_filtering(sampling_params):
+            loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
+        if getattr(loss_fn, "score_centering", False):
+            # Log-probs at the sampler's captured top-k ids, for score centering.
+            loss_input["policy_logprobs_at_sampler_topk"] = (
+                get_policy_logprobs_at_sampler_topk(
+                    sampler_topk_token_ids=data["sampler_topk_token_ids"],
+                    next_token_logits=logits,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    chunk_size=chunk_size,
+                    cp_sharder=cp_sharder,
+                )
+            )
 
     elif loss_fn.input_type == LossInputType.OPD_FULL:
         loss_input = _prepare_opd_full_loss_input(
@@ -495,9 +517,13 @@ def prepare_packed_loss_input(
         "vocab_parallel_rank must be provided with vocab_parallel_group."
     )
 
+    if getattr(loss_fn, "score_centering", False):
+        _validate_score_centering_data(data)
     input_ids = data["input_ids"]
     unpacked_seqlen = input_ids.shape[1]
     input_is_prepacked = "cu_seqlens" in data
+    if getattr(loss_fn, "score_centering", False) and input_is_prepacked:
+        raise ValueError("Score centering does not support externally prepacked inputs")
     cp_size = (
         1
         if context_parallel_group is None
@@ -549,15 +575,8 @@ def prepare_packed_loss_input(
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:
     # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
-    # Note that `-inf` positions are dropped from `token_mask`, so terms like KL skip them.
     if need_top_k_or_top_p_filtering(sampling_params):
-        mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-        logprobs, curr_finite_mask = mask_out_neg_inf_logprobs(
-            logprobs, mask[:, 1:], "curr_logprobs"
-        )
-        data["token_mask"] = data["token_mask"].clone()
-        data["token_mask"][:, 1:] = data["token_mask"][:, 1:] * curr_finite_mask
-
+        # Preserve support information until the actor loss builds its mask.
         if (
             hasattr(loss_fn, "reference_policy_kl_penalty")
             and loss_fn.reference_policy_kl_penalty != 0
@@ -580,4 +599,29 @@ def prepare_packed_loss_input(
                 )
             )
 
-    return {"next_token_logprobs": logprobs}, data
+    loss_input = {"next_token_logprobs": logprobs}
+    if need_top_k_or_top_p_filtering(sampling_params):
+        loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
+    if getattr(loss_fn, "score_centering", False):
+        packed_sampler_ids = _pack_input_ids(
+            data["sampler_topk_token_ids"],
+            cu_seqlens_q,
+            cu_seqlens_q_padded,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            roll_shift=-1,
+        )
+        loss_input["policy_logprobs_at_sampler_topk"] = (
+            get_policy_logprobs_at_sampler_topk(
+                sampler_topk_token_ids=data["sampler_topk_token_ids"],
+                next_token_logits=logits,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                chunk_size=chunk_size,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_q_padded=cu_seqlens_q_padded,
+                packed_sampler_topk_token_ids=packed_sampler_ids,
+            )
+        )
+    return loss_input, data

@@ -15,12 +15,14 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import io
 import json
 import os
 import traceback
 import urllib.parse
 from collections.abc import Callable
+from functools import partial, update_wrapper
 from typing import Any, Iterator, Literal, Mapping, Protocol, cast
 
 import torch
@@ -34,6 +36,7 @@ from megatron.energon import (
     get_train_dataset,
     get_val_dataset,
 )
+from megatron.energon.epathlib import epath as energon_epath
 
 from nemo_rl.data.energon.config import EnergonLoaderConfig, EnergonSourceConfig
 from nemo_rl.data.energon.multimodal.registry import (
@@ -50,6 +53,12 @@ from nemo_rl.data.packing import get_packer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 _V2_STATE_FORMAT_VERSION = 2
+
+
+def _set_nvdataset_cache_dir(path: str) -> None:
+    """Update both forms of Energon's process-local DSS cache setting."""
+    os.environ["NVDATASET_CACHE_DIR"] = path
+    energon_epath.NVDATASET_CACHE_DIR = energon_epath.EPath(path)
 
 
 def compact_sample_error_handler(
@@ -225,8 +234,6 @@ def _loader_config(value: Any) -> EnergonLoaderConfig:
         )
     if not config.cookers:
         raise ValueError("At least one Energon cooker must be configured.")
-    if any(cooker.options for cooker in config.cookers):
-        raise ValueError("The generic conversation cooker has no options.")
     fallback_cookers = [
         index
         for index, cooker in enumerate(config.cookers)
@@ -246,15 +253,22 @@ def _loader_config(value: Any) -> EnergonLoaderConfig:
     ]
     if any(current in filters[:index] for index, current in enumerate(filters)):
         raise ValueError("Energon cooker has_subflavors filters must be unique.")
-    TASK_ENCODER_REGISTRY.resolve_for_model_family(
-        config.task_encoder.name,
+    TASK_ENCODER_REGISTRY.resolve_configured_for_model_family(
+        config.task_encoder,
         model_family=config.model_family,
     )
     for cooker in config.cookers:
-        COOKER_REGISTRY.resolve_for_model_family(
-            cooker.name,
+        cooker_fn = COOKER_REGISTRY.resolve_configured_for_model_family(
+            cooker,
             model_family=config.model_family,
         )
+        try:
+            inspect.signature(cooker_fn).bind_partial(None, **cooker.options)
+        except TypeError as error:
+            label = cooker.name or f"{cooker.python_file}:{cooker.object_name}"
+            raise ValueError(
+                f"Invalid options for Energon cooker {label!r}: {error}"
+            ) from error
     return config
 
 
@@ -311,8 +325,8 @@ def _loader_identity(
         # what a change to this payload's shape needs.
         "state_format_version": _V2_STATE_FORMAT_VERSION,
         "registries": selected_registry_identity(
-            task_encoder=loader_config.task_encoder.name,
-            cookers=[cooker.name for cooker in loader_config.cookers],
+            task_encoder=loader_config.task_encoder,
+            cookers=loader_config.cookers,
         ),
         "topology": topology,
     }
@@ -351,37 +365,45 @@ def _task_encoder(
     loader_config: EnergonLoaderConfig,
     adapter: Any,
     include_source_ids: bool,
-    packing_algorithm: str | None,
-    max_sequences_per_bin: int | None,
     max_sequence_length: int,
     sequence_length_pad_multiple: int,
     tokenizer: Any,
     only_unmask_final: bool,
 ) -> BaseSFTTaskEncoder:
-    cooker_functions = [
-        Cooker(
-            cast(
-                Callable[[CrudeSample], CanonicalSFTSample],
-                COOKER_REGISTRY.resolve(cooker.name),
+    cooker_functions = []
+    for cooker_config in loader_config.cookers:
+        cooker_function = cast(
+            Callable[[CrudeSample], CanonicalSFTSample],
+            COOKER_REGISTRY.resolve_configured(
+                cooker_config,
             ),
-            has_subflavors=cooker.has_subflavors,
         )
-        for cooker in loader_config.cookers
-    ]
+        if cooker_config.options:
+            cooker_function = update_wrapper(
+                partial(cooker_function, **cooker_config.options), cooker_function
+            )
+        cooker_functions.append(
+            Cooker(
+                cooker_function,
+                has_subflavors=cooker_config.has_subflavors,
+            )
+        )
     encoder_type = cast(
-        Any, TASK_ENCODER_REGISTRY.resolve(loader_config.task_encoder.name)
+        Any,
+        TASK_ENCODER_REGISTRY.resolve_configured(
+            loader_config.task_encoder,
+        ),
     )
-    encoder_options: dict[str, Any] = dict(loader_config.task_encoder.options)
-    packer = (
-        get_packer(
-            packing_algorithm,
+    encoder_options = loader_config.task_encoder.options
+    packing = loader_config.task_encoder.packing
+    packer = None
+    if packing is not None:
+        packer = get_packer(
+            packing.name,
             max_sequence_length,
-            max_sequences_per_bin=max_sequences_per_bin,
+            max_sequences_per_bin=packing.options.max_sequences_per_bin,
+            balanced_knapsack_delta=packing.options.balanced_knapsack_delta,
         )
-        if loader_config.packing_buffer_size is not None
-        and packing_algorithm is not None
-        else None
-    )
     return cast(
         BaseSFTTaskEncoder,
         encoder_type(
@@ -404,13 +426,11 @@ def build_energon_sft_loader(
     processor: Any,
     batch_size: int,
     max_sequence_length: int,
+    sequence_length_pad_multiple: int,
     split_role: Literal["train", "validation"],
     logical_rank: int,
     logical_world_size: int,
     placement_fingerprint: str,
-    packing_algorithm: str | None,
-    max_sequences_per_bin: int | None,
-    sequence_length_pad_multiple: int,
     only_unmask_final: bool,
 ) -> EnergonSFTDataLoader:
     """Build one loader for an explicit logical data shard and split."""
@@ -425,8 +445,9 @@ def build_energon_sft_loader(
 
     resolved_source = _source_config(source, name=split_role)
     loader_config = _loader_config(data_config["energon"])
-    if loader_config.packing_buffer_size is not None and packing_algorithm is None:
-        raise ValueError("Energon packing requires a packing algorithm.")
+    if loader_config.nvdataset_cache_dir is not None:
+        _set_nvdataset_cache_dir(loader_config.nvdataset_cache_dir)
+    packing = loader_config.task_encoder.packing
     adapter = build_processor_adapter(
         processor_adapter=loader_config.processor_adapter,
         processor=processor,
@@ -439,8 +460,6 @@ def build_energon_sft_loader(
         loader_config=loader_config,
         adapter=adapter,
         include_source_ids=True,
-        packing_algorithm=packing_algorithm,
-        max_sequences_per_bin=max_sequences_per_bin,
         max_sequence_length=max_sequence_length,
         sequence_length_pad_multiple=sequence_length_pad_multiple,
         tokenizer=processor.tokenizer,
@@ -466,7 +485,7 @@ def build_energon_sft_loader(
             worker_config=worker_config,
             batch_size=batch_size,
             batch_drop_last=True,
-            packing_buffer_size=loader_config.packing_buffer_size,
+            packing_buffer_size=None if packing is None else packing.buffer_size,
             shuffle_buffer_size=(loader_config.shuffle_buffer_size),
             shuffle_over_epochs_multiplier=1,
             max_samples_per_sequence=loader_config.max_samples_per_sequence,
@@ -480,16 +499,26 @@ def build_energon_sft_loader(
             worker_config=worker_config,
             batch_size=batch_size,
             batch_drop_last=False,
-            packing_buffer_size=loader_config.packing_buffer_size,
+            packing_buffer_size=None if packing is None else packing.buffer_size,
             limit=resolved_source.limit,
             task_encoder=task_encoder,
         )
 
+    cache_pool_kwargs: dict[str, Any] = {"method": "raw"}
+    if loader_config.cache_pool_num_workers is not None:
+        cache_pool_kwargs["num_workers"] = loader_config.cache_pool_num_workers
+    if loader_config.cache_pool_max_gbytes is not None:
+        cache_pool_kwargs["max_cache_size_gbytes"] = loader_config.cache_pool_max_gbytes
     cache_pool = (
-        FileStoreCachePool(method="raw")
+        FileStoreCachePool(**cache_pool_kwargs)
         if any(cooker.need_cache for cooker in task_encoder.cookers)
         else None
     )
+    loader_kwargs: dict[str, Any] = {}
+    if loader_config.gc_collect_every_n_steps is not None:
+        loader_kwargs["gc_collect_every_n_steps"] = (
+            loader_config.gc_collect_every_n_steps
+        )
     loader = get_savable_loader(
         dataset,
         cache_pool=cache_pool,
@@ -497,6 +526,7 @@ def build_energon_sft_loader(
         prefetch_factor=loader_config.prefetch_factor,
         watchdog_timeout_seconds=loader_config.watchdog_timeout_seconds,
         fail_on_timeout=True,
+        **loader_kwargs,
     )
     return EnergonSFTDataLoader(
         loader,
@@ -513,8 +543,10 @@ def build_energon_sft_loader(
                 logical_rank=logical_rank,
                 logical_world_size=logical_world_size,
             ),
-            packing_algorithm=packing_algorithm,
-            max_sequences_per_bin=max_sequences_per_bin,
+            packing_algorithm=None if packing is None else packing.name,
+            max_sequences_per_bin=(
+                None if packing is None else packing.options.max_sequences_per_bin
+            ),
             sequence_length_pad_multiple=sequence_length_pad_multiple,
             only_unmask_final=only_unmask_final,
         ),

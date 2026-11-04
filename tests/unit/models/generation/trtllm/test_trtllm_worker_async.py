@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.trtllm.config import resolve_role_overrides
 from nemo_rl.models.generation.trtllm.trtllm_worker_async import (
     TrtllmAsyncGenerationWorkerImpl,
 )
@@ -78,6 +79,7 @@ def test_configure_worker_reserves_gpus_for_internal_trtllm_actors(monkeypatch):
     assert env_vars["PATH"].endswith(":/usr/bin")
     assert init_kwargs == {
         "bundle_indices": [2, 3],
+        "bundle_pg_idx": 0,
         "fraction_of_gpus": 2,
     }
     assert actor_options == {}
@@ -227,8 +229,11 @@ async def test_async_lifecycle_resets_cache_before_sleep_and_resumes_selected_ta
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("result", [[True], [], [False]])
-async def test_async_collective_refit_propagates_worker_result(result):
+@pytest.mark.parametrize(
+    "result",
+    [[True], [], [False], [True, False], [True, True]],
+)
+async def test_async_collective_refit_propagates_every_worker_result(result):
     worker = _worker()
     worker.llm.collective_rpc.return_value = result
 
@@ -237,7 +242,7 @@ async def test_async_collective_refit_propagates_worker_result(result):
         recompute_kv=True,
     )
 
-    assert succeeded is (result != [False])
+    assert succeeded is (bool(result) and all(result))
     worker.llm.collective_rpc.assert_awaited_once_with(
         "update_weights_from_collective",
         kwargs={"drain": False, "recompute_kv": True},
@@ -245,8 +250,186 @@ async def test_async_collective_refit_propagates_worker_result(result):
 
 
 @pytest.mark.asyncio
-async def test_async_ipc_refit_returns_false_on_worker_exception():
+async def test_async_refit_surfaces_worker_exception():
     worker = _worker()
-    worker.llm.collective_rpc.side_effect = RuntimeError("refit failed")
+    worker.llm.collective_rpc.side_effect = RuntimeError("worker is poisoned")
+
+    with pytest.raises(RuntimeError, match="worker is poisoned"):
+        await worker.update_weights_via_ipc_zmq_async()
+    with pytest.raises(RuntimeError, match="worker is poisoned"):
+        await worker.update_weights_from_collective_async(
+            drain=True, recompute_kv=False
+        )
+
+
+class _RecordedConfig:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+@pytest.fixture
+def recorded_async_llm(monkeypatch):
+    """Stub tensorrt_llm so the worker's constructor can run without a GPU.
+
+    Returns the ``AsyncLLM`` mock; its call kwargs are what the engine would
+    have been built with. The llm_args config classes just record their kwargs.
+    """
+    import importlib
+    import sys
+    import types
+
+    # ray.util re-exports the placement_group *function* under the module's
+    # name, so attribute access would patch the wrong object.
+    placement_group_module = importlib.import_module("ray.util.placement_group")
+
+    from nemo_rl.models.generation.trtllm import trtllm_worker_async
+
+    async_llm = MagicMock(name="AsyncLLM")
+    trt = types.ModuleType("tensorrt_llm")
+    trt.AsyncLLM = async_llm
+    trt.SamplingParams = object
+    llm_args = types.ModuleType("tensorrt_llm.llmapi.llm_args")
+    for name in (
+        "CacheTransceiverConfig",
+        "CudaGraphConfig",
+        "KvCacheConfig",
+        "SchedulerConfig",
+        "SleepConfig",
+    ):
+        setattr(llm_args, name, type(name, (_RecordedConfig,), {}))
+    llm_args.CapacitySchedulerPolicy = SimpleNamespace(MAX_UTILIZATION="max")
+    llm_args.ExecutorMemoryType = SimpleNamespace(KV_CACHE="kv")
+    for mod in (trt, types.ModuleType("tensorrt_llm.llmapi"), llm_args):
+        monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    monkeypatch.setattr(
+        placement_group_module,
+        "get_current_placement_group",
+        lambda: MagicMock(bundle_specs=[]),
+    )
+    monkeypatch.setattr(
+        trtllm_worker_async, "get_nsight_config_if_pattern_matches", lambda _: {}
+    )
+    return async_llm
+
+
+def _engine_kwargs(async_llm, cfg) -> dict:
+    TrtllmAsyncGenerationWorkerImpl(cfg, bundle_indices=[0], bundle_pg_idx=0)
+    return async_llm.call_args.kwargs
+
+
+def _disagg_worker_config(trtllm_kwargs=None, *, prefill_trtllm_kwargs=None):
+    # The shape the driver ships: the layout under generation.disaggregation,
+    # the role blocks resolved (configure_generation_config), and this engine's
+    # role stamped into trtllm_cfg._engine_roles.
+    cfg = _config()
+    cfg["colocated"] = {"enabled": False}
+    cfg["disaggregation"] = {"enabled": True}
+    if trtllm_kwargs is not None:
+        cfg["trtllm_kwargs"] = trtllm_kwargs
+    if prefill_trtllm_kwargs is not None:
+        cfg["trtllm_cfg"]["prefill_engine"] = {"trtllm_kwargs": prefill_trtllm_kwargs}
+    cfg = resolve_role_overrides(cfg)
+    cfg["trtllm_cfg"]["_engine_roles"] = {"0:0": {"role": "prefill", "ordinal": 0}}
+    return cfg
+
+
+def test_a_disaggregated_engine_gets_the_default_cache_transceiver(
+    recorded_async_llm,
+):
+    # Without a transceiver config TRT-LLM builds no transceiver at all, and
+    # every context leg comes back without disaggregated_params.
+    kwargs = _engine_kwargs(recorded_async_llm, _disagg_worker_config())
+
+    assert kwargs["cache_transceiver_config"].kwargs == {"backend": "DEFAULT"}
+
+
+def test_an_explicit_cache_transceiver_config_is_not_overridden(recorded_async_llm):
+    cfg = _disagg_worker_config({"cache_transceiver_config": {"backend": "NIXL"}})
+
+    kwargs = _engine_kwargs(recorded_async_llm, cfg)
+
+    assert kwargs["cache_transceiver_config"] == {"backend": "NIXL"}
+
+
+def test_a_role_kv_cache_config_adds_to_the_shared_one(recorded_async_llm):
+    # A role naming only its pool size must keep the shared reuse settings:
+    # replacing the whole block would bring back TRT-LLM's default
+    # enable_partial_reuse=True, which the disagg recipe turns off.
+    cfg = _disagg_worker_config(
+        {
+            "kv_cache_config": {
+                "enable_block_reuse": True,
+                "enable_partial_reuse": False,
+            },
+            "cache_transceiver_config": {"backend": "NIXL"},
+        },
+        prefill_trtllm_kwargs={
+            "kv_cache_config": {"max_tokens": 4096},
+            "cache_transceiver_config": {"kv_transfer_timeout_ms": 600000},
+        },
+    )
+
+    kwargs = _engine_kwargs(recorded_async_llm, cfg)
+
+    assert kwargs["kv_cache_config"].kwargs == {
+        "enable_block_reuse": True,
+        "enable_partial_reuse": False,
+        "max_tokens": 4096,
+    }
+    assert kwargs["cache_transceiver_config"] == {
+        "backend": "NIXL",
+        "kv_transfer_timeout_ms": 600000,
+    }
+
+
+def test_a_role_kv_cache_config_keeps_the_role_memory_fraction(recorded_async_llm):
+    # A role's own kv_cache_config must not displace its gpu_memory_utilization.
+    cfg = _config()
+    cfg["colocated"] = {"enabled": False}
+    cfg["disaggregation"] = {"enabled": True}
+    cfg["trtllm_cfg"]["gpu_memory_utilization"] = 0.7
+    cfg["trtllm_cfg"]["prefill_engine"] = {
+        "gpu_memory_utilization": 0.4,
+        "trtllm_kwargs": {"kv_cache_config": {"max_tokens": 4096}},
+    }
+    cfg = resolve_role_overrides(cfg)
+    cfg["trtllm_cfg"]["_engine_roles"] = {"0:0": {"role": "prefill", "ordinal": 0}}
+
+    kwargs = _engine_kwargs(recorded_async_llm, cfg)
+
+    assert kwargs["kv_cache_config"].kwargs == {
+        "max_tokens": 4096,
+        "free_gpu_memory_fraction": 0.4,
+    }
+
+
+def test_a_disaggregated_engine_reads_its_role_block(recorded_async_llm):
+    cfg = _disagg_worker_config()
+    cfg["trtllm_cfg"]["prefill_engine"]["max_batch_size"] = 2
+
+    kwargs = _engine_kwargs(recorded_async_llm, cfg)
+
+    assert kwargs["max_batch_size"] == 2
+
+
+@pytest.mark.parametrize("disaggregation", [None, {"enabled": False}])
+def test_an_aggregated_engine_gets_no_cache_transceiver(
+    recorded_async_llm, disaggregation
+):
+    cfg = _config()
+    cfg["colocated"] = {"enabled": False}
+    if disaggregation is not None:
+        cfg["disaggregation"] = disaggregation
+
+    kwargs = _engine_kwargs(recorded_async_llm, cfg)
+
+    assert "cache_transceiver_config" not in kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [[], [True, False]])
+async def test_async_ipc_refit_checks_every_worker_result(result):
+    worker = _worker()
+    worker.llm.collective_rpc.return_value = result
 
     assert await worker.update_weights_via_ipc_zmq_async() is False

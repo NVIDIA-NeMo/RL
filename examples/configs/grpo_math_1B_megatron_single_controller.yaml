@@ -27,7 +27,7 @@ async_rl:
     # How far generation may run ahead of the trainer.
     max_lookahead_versions: 1
   # Recompute generation KV caches after each weight update.
-  recompute_kv_cache_after_weight_updates: false
+  recompute_kv_cache_after_weight_updates: true
   # Min ready groups the streaming trainer waits for before dispatching a batch.
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   # Cap on in-flight generate_and_push calls in the rollout pump.
@@ -38,6 +38,14 @@ async_rl:
   diagnostics: false
   # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
   log_full_train_data: false
+  # Writer used by log_full_train_data. json writes JSONL files; set target to a
+  # dotted import path of a DebugWriter defined outside this repo to store the dump
+  # elsewhere (extra keys are passed to its constructor).
+  debug_writer:
+    target: json
+  # With policy.megatron_cfg.checkpoint.async_save: finalize async checkpoints at a
+  # later step boundary so the disk write overlaps training (non-colocated generation).
+  defer_async_checkpoint_finalize: false
   # CPU actors that run the advantage stage. 0 keeps it in the controller
   # process, which both holds a whole cohort's advantage inputs in the
   # controller's heap and blocks its event loop while the stage runs.
@@ -189,7 +197,6 @@ policy:
   generation:
     # HTTP ports inherit the shared [3000, 4999) band from grpo_math_1B.yaml.
     mcore_generation_config:
-      unified_memory_level: 0
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512
       prefix_caching_mamba_gb: null
@@ -221,22 +228,44 @@ data_plane:
 # single-controller recovery options require it.
 token_capture:
   enabled: false
+  # Optional multi-path reconstruction; keeps one reward/advantage per rollout.
+  forest_training: false
+  # returned_history (default) or all_captured, including discarded attempts.
+  selection_policy: returned_history
   staging_partition: rollout_staging
 
-# Retry and restore policy for unfinished token-capture groups. "sibling" reuses
-# already sealed generations; "prompt_group" regenerates every sibling when any
-# sibling fails in-process or was unfinished at a checkpoint.
+
+# Target recovery boundary for unfinished token-capture groups. "turn" enables
+# coordinated Gym participant snapshots; "sibling" preserves sealed siblings;
+# "prompt_group" regenerates every sibling in an unfinished group.
+# "turn" also requires env.should_use_nemo_gym, the vllm generation backend,
+# token_capture.enabled: true, rollout_checkpointing.snapshot_attempt_interval_s,
+# rollout_checkpointing.restore_mode: latest, both override maps left empty,
+# only legacy_agent Gym environment servers, and
+# async_rl.stall_watchdog.stall_timeout_s above
+# gym_prepare_timeout_s + 2 * token_capture.control_timeout_s.
 rollout_recovery:
-  default_granularity: sibling
-  # Per-Gym-task-source override, keyed on extra_env_info.task_source.
-  #   task_source_granularity_overrides:
+  target_level: sibling
+  # Per-Gym-task-source coarsening override, keyed on extra_env_info.task_source.
+  # Until Gym advertises group-scoring capability, configure GenRM explicitly:
+  #   task_source_target_level_overrides:
   #     genrm_compare_resources_server: prompt_group
-  task_source_granularity_overrides: {}
+  task_source_target_level_overrides: {}
   # Agent-specific override for rows already carrying extra_env_info.agent_ref.
   # A matching agent entry wins over a matching task-source entry and also
   # provides compatibility for legacy datasets without task_source.
-  #   agent_granularity_overrides: {genrm_agent: prompt_group}
-  agent_granularity_overrides: {}
+  #   agent_target_level_overrides: {genrm_agent: prompt_group}
+  agent_target_level_overrides: {}
+  # Seconds every Gym deployment gets to park its in-flight steps before a
+  # "turn" checkpoint gives up on this attempt. Raise it for long agent or
+  # environment steps; token_capture.control_timeout_s still bounds each
+  # other Gym control call.
+  gym_prepare_timeout_s: 300.0
+  # With "turn", setup fails if a Gym server's checkpoint mode is restart_only
+  # (the default for agents and resources servers). Such a server's in-flight
+  # rollouts start over after a crash.
+  # Set true to accept that with a warning; only valid with target_level: turn.
+  allow_restart_only_gym_servers: false
 
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.

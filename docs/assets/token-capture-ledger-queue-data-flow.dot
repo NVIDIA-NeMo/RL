@@ -32,7 +32,7 @@ digraph token_capture_flow {
     group="left",
     color="#7c3aed",
     fillcolor="#ede9fe",
-    label="vLLM — prompt preparation\nNeMoRLOpenAIServingMixin.preprocess_chat()\n_resolve_admission_prefix() → TQTokenSource.fetch_prefix_token_ids()\nreplace_prefix_tokens() → exact prompt_token_ids"
+    label="vLLM — prompt preparation\nNeMoRLOpenAIServingMixin.preprocess_chat()\n_resolve_admission_prefix() → TQTokenSource.fetch_prefix_chains()\nreplace_prefix_tokens() → exact prompt_token_ids"
   ];
   megatron_prepare [
     group="right",

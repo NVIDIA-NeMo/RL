@@ -45,33 +45,33 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 
 cd $PROJECT_ROOT
 
-# Dtensor 2 step baseline
+# Automodel 2 step baseline
 train_cmd logger.log_dir=$LOG_DIR/baseline sft.max_num_steps=2 policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[baseline 2step] " | tee ${RUN_LOG}.2step_baseline
 uv run tests/json_dump_tb_logs.py $LOG_DIR/baseline --output_path $EXP_DIR/baseline.json
-# Dtensor 1+1 step
-train_cmd logger.log_dir=$LOG_DIR/dtensor sft.max_num_steps=2 checkpointing.checkpoint_must_save_by=0:0:0:1 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/dtensor policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[dtensor 1step] " | tee ${RUN_LOG}.dtensor_1step
-uv run tests/json_dump_tb_logs.py $LOG_DIR/dtensor --output_path $EXP_DIR/dtensor_1step.json
-train_cmd logger.log_dir=$LOG_DIR/dtensor sft.max_num_steps=2 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/dtensor policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[dtensor 2step] " | tee ${RUN_LOG}.dtensor_2step
-uv run tests/json_dump_tb_logs.py $LOG_DIR/dtensor --output_path $EXP_DIR/dtensor_2step.json
+# Automodel 1+1 step
+train_cmd logger.log_dir=$LOG_DIR/automodel sft.max_num_steps=2 checkpointing.checkpoint_must_save_by=0:0:0:1 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/automodel policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[automodel 1step] " | tee ${RUN_LOG}.automodel_1step
+uv run tests/json_dump_tb_logs.py $LOG_DIR/automodel --output_path $EXP_DIR/automodel_1step.json
+train_cmd logger.log_dir=$LOG_DIR/automodel sft.max_num_steps=2 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/automodel policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[automodel 2step] " | tee ${RUN_LOG}.automodel_2step
+uv run tests/json_dump_tb_logs.py $LOG_DIR/automodel --output_path $EXP_DIR/automodel_2step.json
 # Mcore 2+2 step
 train_cmd logger.log_dir=$LOG_DIR/mcore sft.max_num_steps=2 checkpointing.checkpoint_must_save_by=0:0:0:1 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore policy.automodel_cfg.enabled=false policy.megatron_cfg.enabled=true $@ 2>&1 | prefix_output "[mcore 1step] " | tee ${RUN_LOG}.mcore_1step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/mcore --output_path $EXP_DIR/mcore_1step.json
 train_cmd logger.log_dir=$LOG_DIR/mcore sft.max_num_steps=2 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore policy.automodel_cfg.enabled=false policy.megatron_cfg.enabled=true $@ 2>&1 | prefix_output "[mcore 2step] " | tee ${RUN_LOG}.mcore_2step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/mcore --output_path $EXP_DIR/mcore_2step.json
 
-uv run python - <<EOF $EXP_DIR/baseline.json $EXP_DIR/dtensor_1step.json $EXP_DIR/dtensor_2step.json $EXP_DIR/mcore_1step.json $EXP_DIR/mcore_2step.json
+uv run python - <<EOF $EXP_DIR/baseline.json $EXP_DIR/automodel_1step.json $EXP_DIR/automodel_2step.json $EXP_DIR/mcore_1step.json $EXP_DIR/mcore_2step.json
 import sys
 import json
 import numpy as np
 
-baseline_json, dtensor_1step_json, dtensor_2step_json, mcore_1step_json, mcore_2step_json = sys.argv[1:6]
+baseline_json, automodel_1step_json, automodel_2step_json, mcore_1step_json, mcore_2step_json = sys.argv[1:6]
 
 with open(baseline_json) as f:
     base = json.load(f)
-with open(dtensor_1step_json) as f:
-    dtensor_1 = json.load(f)
-with open(dtensor_2step_json) as f:
-    dtensor_2 = json.load(f)
+with open(automodel_1step_json) as f:
+    automodel_1 = json.load(f)
+with open(automodel_2step_json) as f:
+    automodel_2 = json.load(f)
 with open(mcore_1step_json) as f:
     mcore_1 = json.load(f)
 with open(mcore_2step_json) as f:
@@ -85,22 +85,22 @@ def assert_all_close(i, name, close_args={}, **kwargs):
         print(f"{test_name}[{repr(name)}][{repr(i)}] ({val}) == baseline[{repr(name)}][{repr(i)}] ({baseline})")
     print(f"✓ {name} {i} is equal")
 
-assert_all_close(1, "train/lr", baseline=base, dtensor_1=dtensor_1, dtensor_2=dtensor_2, mcore_1=mcore_1, mcore_2=mcore_2)
-assert_all_close(2, "train/lr", baseline=base, dtensor_2=dtensor_2, mcore_2=mcore_2)
-assert_all_close(1, "train/global_valid_seqs", baseline=base, dtensor_1=dtensor_1, dtensor_2=dtensor_2, mcore_1=mcore_1, mcore_2=mcore_2)
-assert_all_close(2, "train/global_valid_seqs", baseline=base, dtensor_2=dtensor_2, mcore_2=mcore_2)
-assert_all_close(1, "train/global_valid_toks", baseline=base, dtensor_1=dtensor_1, dtensor_2=dtensor_2, mcore_1=mcore_1, mcore_2=mcore_2)
-assert_all_close(2, "train/global_valid_toks", baseline=base, dtensor_2=dtensor_2, mcore_2=mcore_2)
-assert_all_close(1, "train/num_unmasked_tokens", baseline=base, dtensor_1=dtensor_1, dtensor_2=dtensor_2, mcore_1=mcore_1, mcore_2=mcore_2)
-assert_all_close(2, "train/num_unmasked_tokens", baseline=base, dtensor_2=dtensor_2, mcore_2=mcore_2)
-assert_all_close(1, "train/num_valid_samples", baseline=base, dtensor_1=dtensor_1, dtensor_2=dtensor_2, mcore_1=mcore_1, mcore_2=mcore_2)
-assert_all_close(2, "train/num_valid_samples", baseline=base, dtensor_2=dtensor_2, mcore_2=mcore_2)
+assert_all_close(1, "train/lr", baseline=base, automodel_1=automodel_1, automodel_2=automodel_2, mcore_1=mcore_1, mcore_2=mcore_2)
+assert_all_close(2, "train/lr", baseline=base, automodel_2=automodel_2, mcore_2=mcore_2)
+assert_all_close(1, "train/global_valid_seqs", baseline=base, automodel_1=automodel_1, automodel_2=automodel_2, mcore_1=mcore_1, mcore_2=mcore_2)
+assert_all_close(2, "train/global_valid_seqs", baseline=base, automodel_2=automodel_2, mcore_2=mcore_2)
+assert_all_close(1, "train/global_valid_toks", baseline=base, automodel_1=automodel_1, automodel_2=automodel_2, mcore_1=mcore_1, mcore_2=mcore_2)
+assert_all_close(2, "train/global_valid_toks", baseline=base, automodel_2=automodel_2, mcore_2=mcore_2)
+assert_all_close(1, "train/num_unmasked_tokens", baseline=base, automodel_1=automodel_1, automodel_2=automodel_2, mcore_1=mcore_1, mcore_2=mcore_2)
+assert_all_close(2, "train/num_unmasked_tokens", baseline=base, automodel_2=automodel_2, mcore_2=mcore_2)
+assert_all_close(1, "train/num_valid_samples", baseline=base, automodel_1=automodel_1, automodel_2=automodel_2, mcore_1=mcore_1, mcore_2=mcore_2)
+assert_all_close(2, "train/num_valid_samples", baseline=base, automodel_2=automodel_2, mcore_2=mcore_2)
 
-assert_all_close(1, "train/grad_norm", close_args={"rtol": 0.05}, baseline=base, dtensor_1=dtensor_1, dtensor_2=dtensor_2, mcore_1=mcore_1, mcore_2=mcore_2)
-assert_all_close(2, "train/grad_norm", close_args={"rtol": 0.05}, baseline=base, dtensor_2=dtensor_2, mcore_2=mcore_2)
+assert_all_close(1, "train/grad_norm", close_args={"rtol": 0.05}, baseline=base, automodel_1=automodel_1, automodel_2=automodel_2, mcore_1=mcore_1, mcore_2=mcore_2)
+assert_all_close(2, "train/grad_norm", close_args={"rtol": 0.05}, baseline=base, automodel_2=automodel_2, mcore_2=mcore_2)
 
-assert_all_close(1, "train/loss", close_args={"rtol": 0.05}, baseline=base, dtensor_1=dtensor_1, dtensor_2=dtensor_2, mcore_1=mcore_1, mcore_2=mcore_2)
-assert_all_close(2, "train/loss", close_args={"rtol": 0.05}, baseline=base, dtensor_2=dtensor_2, mcore_2=mcore_2)
+assert_all_close(1, "train/loss", close_args={"rtol": 0.05}, baseline=base, automodel_1=automodel_1, automodel_2=automodel_2, mcore_1=mcore_1, mcore_2=mcore_2)
+assert_all_close(2, "train/loss", close_args={"rtol": 0.05}, baseline=base, automodel_2=automodel_2, mcore_2=mcore_2)
 EOF
 
 # Mcore 1+1 resume with override_opt_param_scheduler: Bridge rewrites the

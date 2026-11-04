@@ -25,6 +25,9 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 8192
+  # Cap the two refit staging buffers at 2 GiB each so the 8 GiB grouped-expert
+  # export still has enough contiguous GPU headroom.
+  refit_buffer_size_gb: 4
   automodel_cfg:
     enabled: false
   sequence_packing:
@@ -60,6 +63,12 @@ policy:
       expert_parallel_size: 64
       enable_expert_parallel: true
       max_model_len: 8192
+    vllm_kwargs:
+      # vLLM can skip DP collectives on zero-token async steps (DP=4), which
+      # deadlocks generation in a Gloo DP sync until the 30-minute timeout.
+      # Disable async scheduling to avoid the hang.
+      # Tracking: https://github.com/vllm-project/vllm/issues/43547
+      async_scheduling: false
 data:
   max_input_seq_length: 2048
   train:

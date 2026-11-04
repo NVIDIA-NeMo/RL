@@ -13,6 +13,9 @@ sft:
   val_at_end: false
   seed: 42
   only_unmask_final: false
+  # SFT v2 + policy.megatron_cfg.checkpoint.async_save only: finalize async checkpoints
+  # at a later step boundary so the disk write overlaps training (see SFTConfig).
+  defer_async_checkpoint_finalize: false
 
 checkpointing:
   enabled: true
@@ -42,6 +45,8 @@ policy:
   precision: "bfloat16"
 
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   automodel_cfg:
     enabled: true
@@ -55,9 +60,10 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
-    # HSDP replicate dimension size for Automodel DTensor v2.
+    # HSDP replicate dimension size for Automodel.
     # Typically set to the number of nodes; set to 1 to disable HSDP.
     dp_replicate_size: 1
     custom_parallel_plan: null
@@ -107,7 +113,7 @@ policy:
       weight_decay: 0.1
       betas: [0.9, 0.98]
       eps: 1e-5
-      # when using Dtensor, we need to set foreach
+      # when using Automodel, we need to set foreach
       # and fused to False
       foreach: False
       fused: False
@@ -123,7 +129,13 @@ policy:
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     env_vars: {}
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
     cuda_graph_impl: "none"
     cuda_graph_modules: []
@@ -177,6 +189,9 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
 
@@ -304,6 +319,7 @@ data:
 
 logger:
   log_dir: "logs"  # Base directory for all logs
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
   mlflow_enabled: false

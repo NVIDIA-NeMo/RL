@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Automodel DTensor checkpoint-engine weight transfer."""
+"""Tests for the Automodel checkpoint-engine weight transfer."""
 
 import pytest
 import torch
@@ -30,10 +30,11 @@ except ImportError:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_automodel_checkpoint_engine_weight_iterator():
+def test_checkpoint_engine_weight_iterator():
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = nn.Linear(2, 1)
     worker.dtype = torch.float32
+    worker.draft_model = None
 
     weights = list(AutomodelPolicyWorkerImpl._checkpoint_engine_weight_iterator(worker))
 
@@ -45,7 +46,7 @@ def test_automodel_checkpoint_engine_weight_iterator():
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_automodel_checkpoint_engine_rejects_kv_scales():
+def test_checkpoint_engine_rejects_kv_scales():
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = nn.Linear(2, 1)
     worker.dtype = torch.float32
@@ -58,7 +59,7 @@ def test_automodel_checkpoint_engine_rejects_kv_scales():
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_automodel_checkpoint_engine_cpu_offload_hooks():
+def test_checkpoint_engine_cpu_offload_hooks():
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = "cpu_model"
     worker.cpu_offload = True

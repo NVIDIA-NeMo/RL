@@ -32,6 +32,7 @@ uv run ray stop --force || true # don't attach to a stale cluster
 uv run ray start --head --disable-usage-stats \
     --resources='{"nvlink_domain_ci_synthetic": 1, "topo_rank": 1}'
 
+# Qwen2.5-0.5B derives max_requests=3412 from the 10 GB KV pool; pin 4.
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
     --config $PROJECT_ROOT/examples/configs/grpo_math_1B_megatron.yaml \
@@ -44,6 +45,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.generation.backend=megatron \
     policy.generation.refit_transport=mcore \
     policy.generation.mcore_generation_config.refit_backend=nccl \
+    policy.generation.mcore_generation_config.num_cuda_graphs=4 \
     cluster.gpus_per_node=2 \
     cluster.segment_size=1 \
     grpo.max_num_steps=2 \

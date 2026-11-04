@@ -14,7 +14,7 @@ uv run examples/run_ppo.py --config <PATH TO YAML CONFIG> {overrides}
 
 If not specified, `config` will default to [examples/configs/ppo_math_1B.yaml](../../examples/configs/ppo_math_1B.yaml).
 
-**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for gated models.
+**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `hf auth login` as well for gated models.
 
 In this guide, we'll walk through how we handle:
 
@@ -102,7 +102,7 @@ value:
       data_parallel_sharding_strategy: "optim_grads_params"
 ```
 
-For a DTensor PPO recipe, see [ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml](../../examples/configs/recipes/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml).
+For an Automodel PPO recipe, see [ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-dynbatch.yaml](../../examples/configs/recipes/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-dynbatch.yaml).
 
 ## Generalized Advantage Estimation (GAE)
 
@@ -276,7 +276,7 @@ ppo:
     max_trajectory_age_steps: 1
     warmup_generation_lead_steps: null
     in_flight_weight_updates: false
-    recompute_kv_cache_after_weight_updates: false
+    recompute_kv_cache_after_weight_updates: true  # Default; false avoids repeated prefill but retains old KV.
     drop_incomplete_targets_on_restore: false
 
   adv_estimator:
@@ -318,6 +318,7 @@ value_loss_fn:
 **PPO-specific parameters:**
 - **`ppo.ppo_epochs`**: Number of actor training updates per rollout batch
 - **`ppo.critic_ppo_epochs`**: Number of critic training updates per rollout batch. It can differ from `ppo_epochs`; the exemplar defaults it to `${ppo.ppo_epochs}`.
+- **`ppo.value_training_mode`**: SingleController critic execution: `whole_batch` (default) trains each epoch on the assembled batch; `split` replays its chunks and performs one optimizer update per epoch. Split mode does not currently overlap critic training with policy work.
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
 - **`ppo.warm_start_value_checkpoint`**: Checkpoint step directory whose `value/` seeds the critic on a fresh run. See [Warm-Starting the Critic](#warm-starting-the-critic)
 - **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.
@@ -355,7 +356,7 @@ PPO logs all the same metrics as GRPO (see [GRPO Metrics](grpo.md#metrics)). It 
 
 ## Evaluate the Trained Model
 
-Upon completion of the training process, you can refer to our [evaluation guide](eval.md) to assess model capabilities.
+Upon completion of the training process, see the [evaluation overview](../about/evaluation.md) to assess model capabilities.
 
 ## References
 

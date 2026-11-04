@@ -26,6 +26,7 @@ import ray
 import torch
 
 import nemo_rl.experience.rollout_reassembler_actor as actor_module
+from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -47,7 +48,7 @@ def _request() -> ReassemblyRequest:
         canonical_sample_ids=("group_g0",),
         receipts=(
             {
-                "rollout_id": "group_g0",
+                "capture_key": "group_g0",
                 "manifest": [
                     {
                         "call_id": "call",
@@ -108,6 +109,8 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         prompt_idx=17,
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
+        logical_selections=None,
+        execution_row_multiple=1,
         reward_checks=None,
         reward_log_contexts=None,
     )
@@ -144,12 +147,19 @@ def test_actor_forwards_capture_media_to_the_reassembler(
         router_replay_enabled=False,
         defer_routed_experts_to_policy=False,
         max_seq_len=4096,
+        top_logprobs=0,
         capture_media=capture_media,
+        media_columns=(
+            MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=16)
+            if capture_media
+            else None
+        ),
     )
     actor = object.__new__(actor_cls)
     actor.__init__({"enabled": True, "impl": "transfer_queue"}, config)
     finalizer = actor._finalizer
     assert finalizer._capture_media is capture_media
+    assert finalizer._media_columns is config.media_columns
     assert finalizer._source._capture_media is capture_media
     assert finalizer._staging._capture_media is capture_media
 
@@ -185,6 +195,10 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        "logical_selections",
+        "execution_row_multiple",
+        "resolved_agent_name",
+        "attribution_key",
         "reward_checks",
         "reward_log_contexts",
     }
@@ -200,6 +214,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "drop_reason",
         "valid_row_count",
         "total_row_count",
+        "token_metrics",
     }
 
 
@@ -251,6 +266,8 @@ def test_factory_selects_gym_environment_and_waits_for_dependencies(
         defer_routed_experts_to_policy=False,
         max_seq_len=4096,
         capture_media=False,
+        media_columns=None,
+        top_logprobs=0,
     )
     dp_config = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
     actors = [MagicMock(), MagicMock()]
