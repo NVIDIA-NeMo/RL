@@ -54,7 +54,19 @@ class MetricNormalizer(enum.Enum):
 
 @dataclass(frozen=True)
 class ObjectiveReduction:
-    """Own the objective formula and its independently accumulated denominator."""
+    """Own the objective formula and its independently accumulated denominator.
+
+    Attributes:
+        loss_type: Legacy export for ``LossFunction.loss_type`` readers
+            (``process_global_batch``, the GSPO/CISPO asserts). New code
+            branches on ``token_normalized`` or calls ``reduce``; a reduction
+            can be ``TOKEN_LEVEL`` here and still not be token normalized.
+        metric_normalizer: Denominator advertised for the ``loss`` and KL metrics.
+        requires_explicit_denominator: True when the split worker must pass its
+            finish-time count explicitly (``global_valid_*`` are not it).
+        token_normalized: True when token-summed auxiliary losses (MTP, router
+            aux losses) can share this reduction's denominator.
+    """
 
     loss_type: ClassVar[LossType]
     metric_normalizer: ClassVar[MetricNormalizer]
