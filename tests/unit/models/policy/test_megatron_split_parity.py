@@ -107,7 +107,11 @@ def _run_split(
     data plane: presharded begin/finish fan-out + replica-leader dedup +
     the shared ``_aggregate_train_results``; the microbatch dispatch uses
     the backend ``train_microbatch`` with driver-sharded tensors instead
-    of ``train_microbatches_from_meta`` (which requires a TQ partition)."""
+    of ``train_microbatches_from_meta`` (which requires a TQ partition).
+
+    Each step is dispatched as two half-batch ``train_microbatch`` calls so the
+    worker accumulates objective sums and denominator counts across chunks;
+    ``begin_train_step`` still receives the full ``gbs``."""
     wg = policy.worker_group
     policy.prepare_for_training()
     results = []
@@ -123,24 +127,25 @@ def _run_split(
                 mbs=mbs,
             )
         )
-        sharded = policy._shard_for_train(data, gbs)
-        wg.get_all_worker_results(
-            wg.run_all_workers_sharded_data(
-                "train_microbatch",
-                data=sharded,
-                in_sharded_axes=["data_parallel"],
-                replicate_on_axes=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
+        for half in data.shard_by_batch_size(2):
+            sharded = policy._shard_for_train(half, gbs // 2)
+            wg.get_all_worker_results(
+                wg.run_all_workers_sharded_data(
+                    "train_microbatch",
+                    data=sharded,
+                    in_sharded_axes=["data_parallel"],
+                    replicate_on_axes=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    output_is_replicated=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                )
             )
-        )
         finish_results = ray.get(
             wg.run_all_workers_single_data("finish_train_step_presharded")
         )
@@ -163,18 +168,21 @@ def _reduce_metric(key: str, values: list) -> float:
 
 @pytest.mark.hf_gated
 @pytest.mark.timeout(600)
+@pytest.mark.parametrize("normalization", ["global_token_mean", "sequence_mean"])
 @pytest.mark.parametrize("tp", [1, 2], ids=["2gpu_dp2", "2gpu_tp2"])
-def test_split_train_matches_sync_train(tp, tiny_llama_model_path):
+def test_split_train_matches_sync_train(tp, normalization, tiny_llama_model_path):
     """Grad-norm / loss-curve / metric A/B of split vs sync train()."""
     loss_fn = ClippedPGLossFn(
-        ClippedPGLossConfig(use_importance_sampling_correction=True)
+        ClippedPGLossConfig(
+            use_importance_sampling_correction=True, normalization=normalization
+        )
     )
 
     # Two fresh policies from the same checkpoint → identical initial
     # weights and optimizer state; the sync one runs (and is torn down)
     # first so each path sees identical GPU memory conditions.
     policy, cluster, config = _make_policy(
-        tiny_llama_model_path, tp, f"parity-sync-tp{tp}"
+        tiny_llama_model_path, tp, f"parity-sync-tp{tp}-{normalization}"
     )
     gbs = config["train_global_batch_size"]
     mbs = config["train_micro_batch_size"]
@@ -185,7 +193,9 @@ def test_split_train_matches_sync_train(tp, tiny_llama_model_path):
         policy.shutdown()
         cluster.shutdown()
 
-    policy, cluster, _ = _make_policy(tiny_llama_model_path, tp, f"parity-split-tp{tp}")
+    policy, cluster, _ = _make_policy(
+        tiny_llama_model_path, tp, f"parity-split-tp{tp}-{normalization}"
+    )
     try:
         split_results = _run_split(policy, data, loss_fn, gbs=gbs, mbs=mbs)
     finally:
