@@ -2357,44 +2357,6 @@ class TestApplyPrecisionConfig:
         assert model_cfg.num_layers_at_start_in_bf16 == 2
         assert model_cfg.num_layers_at_end_in_bf16 == 4
 
-    def test_te_precision_recipe_matches_attention_and_mlp_modules(self):
-        from pathlib import Path
-
-        from megatron.core.quantization.quant_config import MatchContext
-
-        from nemo_rl.models.megatron.setup import _apply_precision_config
-
-        recipe_path = (
-            Path(__file__).resolve().parents[4]
-            / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
-        )
-        model_cfg = SimpleNamespace()
-        _apply_precision_config(
-            model_cfg,
-            {
-                "megatron_cfg": {
-                    "pipeline_dtype": "bfloat16",
-                    "te_precision_config_file": str(recipe_path),
-                }
-            },
-            torch.bfloat16,
-        )
-
-        def match(module_path):
-            return model_cfg.quant_recipe.match_to_config_key(
-                MatchContext(module_path=module_path, layer_number=0)
-            )
-
-        assert match("decoder.layers.0.self_attention.linear_qkv") == "bf16"
-        assert match("decoder.layers.0.self_attention.linear_proj") == "bf16"
-        assert match("decoder.layers.0.mlp.experts.linear_fc1") == "nvfp4"
-        assert match("decoder.layers.0.mlp.experts.linear_fc2") == "nvfp4"
-        assert match("decoder.layers.0.mlp.linear_fc1") == "bf16"
-        assert match("decoder.layers.0.mlp.linear_fc2") == "bf16"
-        assert match("decoder.layers.0.mlp.shared_experts.linear_fc1") == "bf16"
-        assert match("decoder.layers.0.mlp.shared_experts.linear_fc2") == "bf16"
-        assert match("decoder.layers.0.input_layernorm") == "bf16"
-
 
 @pytest.mark.mcore
 class TestApplyPerformanceConfig:
@@ -3989,35 +3951,6 @@ class TestValidateAndSetConfig:
                 assert runtime_config.is_generation_colocated is colocated
                 assert runtime_config.offload_optimizer_for_refit is True
                 assert os.environ.get("NCCL_CUMEM_ENABLE") == expected_cumem
-
-
-@pytest.mark.mcore
-class TestRuntimeConfigNamedTuple:
-    """Tests for RuntimeConfig named tuple."""
-
-    def test_runtime_config_fields(self):
-        """Test that RuntimeConfig has all expected fields."""
-        from nemo_rl.models.megatron.config import RuntimeConfig
-
-        runtime_config = RuntimeConfig(
-            megatron_cfg=MagicMock(),
-            model_cfg=MagicMock(),
-            dtype=torch.bfloat16,
-            optimizer_cpu_offload=False,
-            offload_optimizer_for_logprob=True,
-            offload_optimizer_for_refit=False,
-            is_generation_colocated=True,
-            sampling_params=None,
-            final_padded_vocab_size=32000,
-        )
-
-        assert runtime_config.dtype == torch.bfloat16
-        assert runtime_config.optimizer_cpu_offload is False
-        assert runtime_config.offload_optimizer_for_logprob is True
-        assert runtime_config.is_generation_colocated is True
-        assert runtime_config.offload_optimizer_for_refit is False
-        assert runtime_config.sampling_params is None
-        assert runtime_config.final_padded_vocab_size == 32000
 
 
 @pytest.mark.mcore

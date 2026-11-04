@@ -37,6 +37,7 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import RewardPenaltyConfig
     from nemo_rl.experience.rollouts import EffortLevelsConfig
+    from nemo_rl.models.policy import TokenizerConfig
 
 
 @dataclass(frozen=True)
@@ -62,8 +63,10 @@ class ReassemblyRequest:
     execution_row_multiple: int = 1
     reward_checks: tuple[RewardChecks | None, ...] | None = None
     reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
-    # Resolved by Gym and persisted with the sealed receipts for teacher routing.
+    # Real agent identity for flat rows, retained for existing checkpoint readers.
     resolved_agent_name: Optional[str] = None
+    # Taskset or flat-agent attribution, persisted with sealed receipts.
+    attribution_key: Optional[str] = None
 
     @property
     def capture_receipts(self) -> tuple[Optional[dict[str, Any]], ...]:
@@ -139,6 +142,10 @@ class RolloutReassemblerActorConfig:
     top_logprobs: int
     reward_penalty_config: RewardPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
+    # Policy tokenizer and resolved think tags, set only when
+    # penalize_malformed_think_tag needs to decode generations.
+    tokenizer_config: TokenizerConfig | None = None
+    thinking_tags: tuple[str, ...] | None = None
 
 
 @ray.remote(
@@ -156,6 +163,13 @@ class RolloutReassemblerActor:  # pragma: no cover
         config: RolloutReassemblerActorConfig,
     ) -> None:
         dp_client = build_data_plane_client(dp_config, bootstrap=False)
+        tokenizer = None
+        if config.tokenizer_config is not None:
+            # Deferred: loading a tokenizer pulls in transformers, which only
+            # the malformed-think-tag penalty needs here.
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            tokenizer = get_tokenizer(config.tokenizer_config)
         self._finalizer = RolloutReassembler(
             dp_client,
             partition_id=config.partition_id,
@@ -168,6 +182,8 @@ class RolloutReassemblerActor:  # pragma: no cover
             media_columns=config.media_columns,
             reward_penalty_config=config.reward_penalty_config,
             effort_config=config.effort_config,
+            tokenizer=tokenizer,
+            thinking_tags=config.thinking_tags,
             top_logprobs=config.top_logprobs,
         )
 
