@@ -655,7 +655,9 @@ class NativeVllmEngine(LLMEngine):
                 chunk["engine_data"] = await self._stage_gym_call(request, final_output)
             else:
                 engine_data = {"prompt_token_ids": list(final_output.prompt_token_ids)}
-                for field, value in self._gym_message(final_output).items():
+                for field, value in self._gym_message(
+                    final_output, encode_for_wire=True
+                ).items():
                     engine_data[_GYM_ENGINE_DATA_KEYS[field]] = value
                 chunk["engine_data"] = engine_data
                 log_probs, top_logprobs = extract_from_completion_output(
@@ -759,7 +761,9 @@ class NativeVllmEngine(LLMEngine):
                 "output tokens."
             )
 
-    def _gym_message(self, final_output: Any) -> dict[str, Any]:
+    def _gym_message(
+        self, final_output: Any, *, encode_for_wire: bool
+    ) -> dict[str, Any]:
         """The token fields the native endpoint puts on the call's message."""
         completion = final_output.outputs[0]
         message: dict[str, Any] = {"generation_token_ids": list(completion.token_ids)}
@@ -774,6 +778,7 @@ class NativeVllmEngine(LLMEngine):
                 device=torch.device("cpu"),
                 logger=LOGGER,
                 routed_experts_dtype=self._host.routed_experts_dtype,
+                encode_for_wire=encode_for_wire,
             )
         return message
 
@@ -791,7 +796,7 @@ class NativeVllmEngine(LLMEngine):
                 {
                     "index": 0,
                     "finish_reason": final_output.outputs[0].finish_reason,
-                    "message": self._gym_message(final_output),
+                    "message": self._gym_message(final_output, encode_for_wire=False),
                 }
             ]
         }

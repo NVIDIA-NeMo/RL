@@ -47,7 +47,9 @@ from nemo_rl.data.captured_media import CapturedMedia  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
 from nemo_rl.models.generation.dynamo import native_engine  # noqa: E402
 from nemo_rl.models.generation.vllm.utils import R3_MISSING_ROUTE_SENTINEL  # noqa: E402
-from nemo_rl.utils.routed_experts_codec import decode_routed_experts  # noqa: E402
+from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
+    routed_experts_tensor_metadata,
+)
 from tests.unit.models.generation.test_dynamo_native_engine import (  # noqa: E402
     EOS,
     IMAGE_PLACEHOLDER,
@@ -75,6 +77,7 @@ class _Capture:
     def __init__(self) -> None:
         self.begun: list[tuple] = []
         self.staged: list[dict] = []
+        self.attachments: list[dict | None] = []
         self.failed: list[str] = []
 
     def begin_call(self, admission, *, prefix_token_ids, stream):
@@ -83,6 +86,7 @@ class _Capture:
 
     def complete_call_from_response(self, call, payload, attachments=None):
         self.staged.append(payload)
+        self.attachments.append(attachments)
         return SimpleNamespace(model_dump=lambda: dict(COORDS))
 
     def fail_call(self, call, *, reason) -> None:
@@ -93,6 +97,7 @@ def _capturing_host(llm, **cfg):
     host = _host(llm, **cfg)
     host.token_capture = _Capture()
     host._capture_calls = {}
+    host._capture_top_logprobs = 0
     host._chain_prefix = ChainPrefixCache()
     return host
 
@@ -164,10 +169,12 @@ def test_a_captured_token_in_call_is_staged_from_the_engine() -> None:
     assert message["generation_log_probs"] == [-0.5, -0.5]
     # As the native endpoint stages them: the full sequence's routes (none for
     # the last token) from the boundary row, the prefix's last token, on.
-    staged_routes = decode_routed_experts(message["routed_experts"], torch.int16)
+    (attachments,) = host.token_capture.attachments
+    staged_routes = attachments["routed_experts"]
     expected = torch.full((5, 2, 2), R3_MISSING_ROUTE_SENTINEL, dtype=torch.int16)
     expected[:4] = torch.from_numpy(routes[3:7])
     assert torch.equal(staged_routes, expected)
+    assert message["routed_experts"] == routed_experts_tensor_metadata(staged_routes)
     # Only the commit coordinates go back through the frontend.
     assert chunk["engine_data"] == {NG_COMMIT_COORDS_FIELD: COORDS}
     assert "log_probs" not in chunk
