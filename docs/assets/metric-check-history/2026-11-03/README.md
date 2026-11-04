@@ -4,6 +4,7 @@ Four endpoint checks reject runs whose curves remain consistent with the accepte
 historical variation. The proposed bounds add empirical headroom; they do not
 establish a 95% or 99% future pass rate. The DAPO probability-error failure remains
 unexplained, so its median gate stays unchanged.
+The investigation is tracked in [issue #5071](https://github.com/NVIDIA-NeMo/RL/issues/5071).
 
 ## Replay results
 
