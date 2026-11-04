@@ -160,6 +160,76 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(
     assert data["sample_mask"].tolist() == [1.0, 1.0, 1.0, 0.0]
 
 
+@pytest.mark.parametrize("chunks", [[4], [1, 1, 1, 1], [2, 2], [1, 3]])
+@pytest.mark.parametrize("kl_penalty", [0.0, 0.1])
+@pytest.mark.parametrize("metrics_level", ["full", "minimal"])
+def test_split_api_survivor_division_matches_upstream_mask(
+    chunks, kl_penalty, metrics_level
+):
+    """SingleController's N=1 chunk sums divided by survivors match pre-masking."""
+    data, values = _batch()
+    cfg = ClippedPGLossConfig(
+        force_on_policy_ratio=True,
+        token_level_loss=True,
+        reference_policy_kl_penalty=kl_penalty,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type="seq-mask-tis",
+        truncated_importance_sampling_ratio_min=0.8,
+        truncated_importance_sampling_ratio=1.2,
+        metrics_level=metrics_level,
+    )
+    expected_data = data.select_indices(list(range(4)))
+    expected_data["sample_mask"] = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    expected_lp = values.clone().requires_grad_()
+    expected_loss, expected_metrics = ClippedPGLossFn(cfg)(
+        next_token_logprobs=expected_lp,
+        data=expected_data,
+        global_valid_seqs=torch.tensor(2.0),
+        global_valid_toks=torch.tensor(4.0),
+    )
+    expected_loss.backward()
+
+    loss_fn = ClippedPGLossFn(
+        cfg.model_copy(update={"seq_logprob_error_in_loss": True}),
+        seq_logprob_error_threshold=2.0,
+    )
+    actual_lp = values.clone().requires_grad_()
+    metrics = []
+    start = 0
+    for size in chunks:
+        end = start + size
+        loss, chunk_metrics = loss_fn(
+            next_token_logprobs=actual_lp[start:end],
+            data=data.slice(start, end),
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+        )
+        loss.backward()
+        metrics.append(chunk_metrics)
+        start = end
+
+    kept_toks = sum(m["seq_logprob_error_valid_tokens"] for m in metrics)
+    kept_seqs = sum(m["seq_logprob_error_valid_seqs"] for m in metrics)
+    torch.testing.assert_close(actual_lp.grad / kept_toks, expected_lp.grad)
+    rescaled = [
+        rescale_loss_metrics(
+            m,
+            loss_fn.metric_normalizations,
+            token_factor=1 / kept_toks,
+            sequence_factor=1 / kept_seqs,
+        )
+        for m in metrics
+    ]
+    for key in (
+        "loss",
+        "is_oob_ratio",
+        "token_mult_prob_error",
+        "kl_penalty",
+        "num_valid_samples",
+    ):
+        assert sum(m[key] for m in rescaled) == pytest.approx(expected_metrics[key])
+
+
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
 def test_rejected_nonfinite_logprobs_do_not_poison_loss(bad_value):
     data, values = _batch()

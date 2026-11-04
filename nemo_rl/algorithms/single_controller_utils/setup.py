@@ -2291,6 +2291,7 @@ def setup_single_controller(
     loss_fn = ClippedPGLossFn(
         master_config.loss_fn,
         opd_full=opd_module.get_opd_full_config(master_config),
+        seq_logprob_error_threshold=algo_cfg.seq_logprob_error_threshold,
     )
     _restore_adaptive_loss_state(loss_fn, save_state)
     value_loss_fn: Optional[LossFunction] = (

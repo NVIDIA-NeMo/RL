@@ -2327,9 +2327,32 @@ class MegatronPolicyWorkerImpl(
         # from the same policy config on every DP rank, and Megatron runs
         # the same microbatch count on all of them.
         draft_step_state: DraftStepState = state["draft_step_state"]
-        policy_counts = torch.stack(
-            [state["local_valid_seqs"], state["local_valid_toks"]]
-        ).to(torch.float64)
+        loss_fn = state["loss_fn"]
+        in_loss_filter = (
+            isinstance(loss_fn, ClippedPGLossFn)
+            and loss_fn.requires_survivor_normalization
+        )
+        if in_loss_filter:
+            # Chunks backpropagated unnormalized survivor sums, so divide by the
+            # survivor counts. Metrics are already on every PP stage; reduce DP only.
+            policy_counts = torch.tensor(
+                [
+                    sum(
+                        m["seq_logprob_error_valid_seqs"]
+                        for m in state["all_mb_metrics"]
+                    ),
+                    sum(
+                        m["seq_logprob_error_valid_tokens"]
+                        for m in state["all_mb_metrics"]
+                    ),
+                ],
+                dtype=torch.float64,
+                device=state["local_valid_toks"].device,
+            )
+        else:
+            policy_counts = torch.stack(
+                [state["local_valid_seqs"], state["local_valid_toks"]]
+            ).to(torch.float64)
         to_reduce = torch.cat(
             [
                 policy_counts,
@@ -2342,6 +2365,12 @@ class MegatronPolicyWorkerImpl(
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
         draft_step_state.set_global_counts(to_reduce[2:])
+        if in_loss_filter and global_valid_toks.item() == 0:
+            raise RuntimeError(
+                "No valid response tokens remain after in-loss sequence-logprob "
+                "filtering; refusing an empty optimizer update. Check "
+                "grpo.seq_logprob_error_threshold."
+            )
 
         if state["loss_type"] == LossType.TOKEN_LEVEL:
             n_true = global_valid_toks
