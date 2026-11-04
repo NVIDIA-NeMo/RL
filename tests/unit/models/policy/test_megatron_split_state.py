@@ -323,14 +323,16 @@ class TestBegin:
             ("sequence_mean", "none", 0.1, None, True),
             ("sequence_mean", "none", 0.0, 0.1, False),
             ("global_token_mean", "aux_loss", 0.1, 0.1, True),
+            ("sequence_mean", ["aux_loss", "seq_aux_loss"], [0.0, 0.1], None, False),
+            ("sequence_mean", ["aux_loss", "seq_aux_loss"], [0.0, 0.0], None, True),
         ],
     )
     def test_streaming_router_auxiliary_validation(
         self,
         mock_module_symbols,
         normalization: str,
-        balancing: str,
-        aux: float,
+        balancing: str | list[str],
+        aux: float | list[float],
         z_loss: float | None,
         allowed: bool,
     ) -> None:

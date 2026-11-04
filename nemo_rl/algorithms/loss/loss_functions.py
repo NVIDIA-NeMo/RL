@@ -381,7 +381,7 @@ class ClippedPGLossFn(LossFunction):
                 "loss_fn.token_level_loss is deprecated; use "
                 f"loss_fn.normalization={self.normalization!r} and remove "
                 "token_level_loss (or set it to null).",
-                DeprecationWarning,
+                FutureWarning,
                 stacklevel=2,
             )
         self.seq_logprob_error_in_loss = cfg.seq_logprob_error_in_loss
@@ -769,6 +769,11 @@ class ClippedPGLossFn(LossFunction):
                 the ``opd_full`` branch.
             opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
             opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+            global_objective_denominator: Streaming split-API divisor passed by
+                ``StreamingObjectiveLoss`` for reductions with
+                ``requires_explicit_denominator``; None on synchronous paths,
+                where ``loss_divisor`` falls back to ``global_valid_toks`` or
+                ``global_valid_seqs``.
 
         Returns:
             Tuple of the scalar loss and its metric dict.

@@ -204,17 +204,12 @@ def _validate_streaming_router_auxiliaries(model_config: Any) -> None:
             return any(nonzero(item) for item in value)
         return value is not None and float(value) != 0
 
-    # A converted provider can retain a nonzero coefficient while NeMo-RL
-    # overrides its balancing mode to "none". Mirror MCore's
-    # TopKRouter.get_aux_loss_coeff/is_aux_loss_enabled: only coefficients
-    # selected by the configured mode can attach an auxiliary gradient.
+    # Mirrors Megatron-LM TopKRouter.get_aux_loss_coeff / is_aux_loss_enabled
+    # (modes gated by the configured balancing type, coefficient > 0) and
+    # apply_z_loss (fires whenever moe_z_loss_coeff is not None), at the pinned
+    # commit 3e95097b. Re-check on a Megatron-LM bump.
     routing_type = getattr(model_config, "moe_router_load_balancing_type", None)
     aux_coeff: Any = getattr(model_config, "moe_aux_loss_coeff", 0.0)
-    if routing_type is None and nonzero(aux_coeff):
-        raise ValueError(
-            "Streaming non-token objective normalization cannot determine whether "
-            "moe_aux_loss_coeff is active without a routing mode"
-        )
     if isinstance(routing_type, (list, tuple)):
         if not isinstance(aux_coeff, (list, tuple)) or len(routing_type) != len(
             aux_coeff
