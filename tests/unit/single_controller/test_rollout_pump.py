@@ -565,6 +565,39 @@ def _pump_controller(
     return ctrl
 
 
+@pytest.mark.parametrize("refill_first", [False, True])
+def test_refill_and_normal_reads_share_epoch_transitions(refill_first: bool) -> None:
+    ctrl = _pump_controller(_ScriptedRolloutManager([]), [_batch("prompt")])
+    ctrl._algo_cfg.max_num_epochs = 2
+    iterator = ctrl._iter_prompt_batches()
+    assert next(iterator)["message_log"][0][0]["content"] == "prompt"
+    if refill_first:
+        assert ctrl._serve_filtered_refill(iterator)
+    else:
+        assert next(iterator)["message_log"][0][0]["content"] == "prompt"
+    assert ctrl._current_epoch == 1
+    assert not ctrl._dataloader_exhausted
+    assert not ctrl._serve_filtered_refill(iterator)
+    assert ctrl._current_epoch == 2
+    assert ctrl._dataloader_exhausted
+
+
+def test_filtered_group_can_draw_from_the_next_epoch() -> None:
+    manager = _ScriptedRolloutManager(
+        [RolloutOutcome.FILTERED, RolloutOutcome.COMMITTED]
+    )
+    ctrl = _pump_controller(
+        manager, [_batch("prompt")], dynamic_sampling_max_replacements=2
+    )
+    ctrl._algo_cfg.max_num_epochs = 2
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=5))
+    assert manager.prompts_seen == ["prompt", "prompt"]
+    assert ctrl._current_epoch == 2
+    assert ctrl._rollout_runtime.batch_shortfall == {}
+    assert ctrl._rollout_runtime.steps_allowed_short == set()
+    assert ctrl._filtered_prompts_by_step == {0: 1}
+
+
 class TestDynamicSamplingReplacement:
     """A filtered group draws on its own pool and its own budget."""
 
@@ -740,14 +773,15 @@ class TestDynamicSamplingReplacement:
 
         assert exc_info.value.subgroup(RuntimeError) is not None
 
-    def test_the_last_step_closes_short_when_the_data_runs_out(self):
+    @pytest.mark.parametrize("max_batches", [1, 10])
+    def test_the_last_step_closes_short_when_the_data_runs_out(self, max_batches):
         # The dataloader running out is the end of the run, not a mis-tuned filter, so
         # the step closes on what arrived instead of raising against the floor.
         manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED])
         ctrl = _pump_controller(
             manager,
             [_batch("step0")],
-            dynamic_sampling_max_replacements=10,
+            dynamic_sampling_max_replacements=max_batches,
         )
 
         asyncio.run(ctrl._rollout_pump())
@@ -757,6 +791,8 @@ class TestDynamicSamplingReplacement:
         assert 0 in ctrl._rollout_runtime.steps_allowed_short, (
             "a step short because the data ran out must not fail the floor"
         )
+
+        assert ctrl._filtered_prompts_by_step == {}
 
 
 class TestReplaceDroppedPrompt:

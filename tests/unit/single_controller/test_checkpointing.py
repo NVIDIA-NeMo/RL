@@ -2634,7 +2634,7 @@ class TestPeriodicRolloutCheckpoint:
             )
 
     @pytest.mark.parametrize("checkpoint_kind", ["snapshot", "full"])
-    def test_snapshot_persists_and_restores_pending_finalizer_metrics(
+    def test_snapshot_persists_and_restores_pending_step_state(
         self, tmp_path: Path, checkpoint_kind: str
     ):
         """Only canonical groups' pending statistics are saved; restore keeps them."""
@@ -2645,6 +2645,8 @@ class TestPeriodicRolloutCheckpoint:
         from nemo_rl.experience.rollout_recovery import parse_rollout_recovery_state
 
         actor = self._actor(tmp_path)
+        actor._rollout_runtime.steps_allowed_short = {0}
+        actor._rollout_runtime.batch_shortfall = {0: 1}
         claimed_meta = KVBatchMeta(
             partition_id=_PARTITION_ID,
             task_name=None,
@@ -2697,11 +2699,15 @@ class TestPeriodicRolloutCheckpoint:
         state = torch.load(
             snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
         )
+        assert state["steps_allowed_short"] == [0]
+        assert state["batch_shortfall"] == {0: 1}
         assert state["finalizer_metrics_by_group"] == {"claimed-group": pending}
         assert parse_rollout_recovery_state(state).finalizer_rewards_by_group == {
             "claimed-group": observations
         }
 
+        actor._rollout_runtime.steps_allowed_short = set()
+        actor._rollout_runtime.batch_shortfall = {}
         actor._rollout_runtime.finalizer_metrics_by_group = {}
         actor._rollout_runtime.finalizer_rewards_by_group = {}
         actor._buffer.training_claims = []
@@ -2720,6 +2726,8 @@ class TestPeriodicRolloutCheckpoint:
         assert actor._rollout_runtime.finalizer_rewards_by_group == {
             "claimed-group": observations
         }
+        assert actor._rollout_runtime.steps_allowed_short == {0}
+        assert actor._rollout_runtime.batch_shortfall == {0: 1}
 
     def test_snapshot_reindexes_rows_owned_by_active_streamed_step(
         self, tmp_path: Path
@@ -3048,6 +3056,7 @@ class TestDataPlaneCheckpoint:
         state = build_rollout_recovery_state(
             ledger,
             batch_shortfall={},
+            steps_allowed_short=set(),
             sampler_stamps_target_steps=True,
             reward_settings=CaptureRewardSettings.from_configs(
                 config.reward_penalties, None, None
@@ -3705,6 +3714,28 @@ class TestPPOWarmupCheckpoint:
         assert written is is_policy_training_step
         # The critic trains from step 0, so its optimizer is always written.
         assert actor._value.save_kwargs["optimizer_path"] is not None
+
+    @pytest.mark.parametrize("consumed_samples", [0, 16])
+    def test_grpo_skipped_step_checkpoint_preserves_only_initialized_optimizer(
+        self, actor, consumed_samples
+    ):
+        actor._is_ppo = False
+        actor._consumed_samples = consumed_samples
+        actor._train_steps = 2
+
+        asyncio.run(
+            actor._save_checkpoint(
+                {"skipped_step": 1},
+                is_policy_training_step=True,
+                is_final_checkpoint=True,
+            )
+        )
+
+        assert actor._trainer.save_kwargs["weights_path"] is not None
+        assert (actor._trainer.save_kwargs["optimizer_path"] is not None) == (
+            consumed_samples > 0
+        )
+        assert actor._save_state.consumed_samples == consumed_samples
 
     def test_warmup_step_skips_the_top_k_metric(self, actor):
         """No policy metrics exist yet, so the checkpoint just is not a candidate."""

@@ -424,6 +424,7 @@ class RolloutRestorer(_UsesRolloutParts):
                     )
 
                 self._rollout_runtime.batch_shortfall = parsed_state.batch_shortfall
+                self._rollout_runtime.steps_allowed_short = parsed_state.steps_allowed_short
                 canonical_state = self._buffer.metadata_state_dict(
                     saved_capacity=self._async_cfg.max_buffered_rollouts
                 )

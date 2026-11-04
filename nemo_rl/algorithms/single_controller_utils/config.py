@@ -1424,6 +1424,17 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
         grpo_cfg = cast(GRPOConfig, algo_cfg)
+        if grpo_cfg.adv_estimator.name != "grpo":
+            raise ValueError(
+                "grpo.use_dynamic_sampling requires grpo.adv_estimator.name='grpo': "
+                "constant rewards do not imply zero advantage for other estimators."
+            )
+        for key in ("invalid_tool_call_advantage", "malformed_thinking_advantage"):
+            if getattr(grpo_cfg, key) not in (None, 0):
+                raise ValueError(
+                    f"grpo.use_dynamic_sampling requires grpo.{key} to be 0 or null: "
+                    "nonzero message-level overrides can train constant-reward groups."
+                )
         # Capture cannot borrow future groups, so routine filtering would stall training.
         if master_config.token_capture.enabled:
             raise ValueError(

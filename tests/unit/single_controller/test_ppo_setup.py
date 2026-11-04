@@ -635,6 +635,37 @@ def _dynamic_sampling_config(
 class TestDynamicSamplingValidation:
     """Dynamic sampling needs a substitute for every filtered group, or steps shrink."""
 
+    @pytest.mark.parametrize("estimator", ["reinforce_plus_plus", "opd"])
+    def test_rejects_estimators_with_nonzero_constant_reward_advantages(
+        self, estimator
+    ):
+        mc = _dynamic_sampling_config()
+        mc.grpo.adv_estimator.name = estimator
+        with pytest.raises(ValueError, match="requires grpo.adv_estimator.name='grpo'"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        "key", ["invalid_tool_call_advantage", "malformed_thinking_advantage"]
+    )
+    @pytest.mark.parametrize("value", [-1.0, 1.0])
+    def test_rejects_nonzero_message_advantage_overrides(self, key, value):
+        mc = _dynamic_sampling_config()
+        setattr(mc.grpo, key, value)
+        with pytest.raises(ValueError, match=f"grpo.{key} to be 0 or null"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("value", [0.0, None])
+    def test_accepts_zero_or_absent_message_advantage_overrides(self, value):
+        mc = _dynamic_sampling_config()
+        mc.env["should_use_nemo_gym"] = True
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.grpo.invalid_tool_call_advantage = value
+        mc.grpo.malformed_thinking_advantage = value
+        validate_single_controller_config(mc)
+
     def test_accepts_replace_with_a_stamping_sampler(self):
         validate_single_controller_config(_dynamic_sampling_config())
 
