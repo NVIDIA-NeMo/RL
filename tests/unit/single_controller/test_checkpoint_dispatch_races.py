@@ -1949,6 +1949,163 @@ def test_checkpoint_waits_for_replacement_pop_and_reownership() -> None:
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_checkpoint_completes_while_filtered_replacement_waits(exhausted: bool) -> None:
+    """An empty-pool consumer must not prevent the snapshot needed before refill."""
+
+    async def exercise() -> None:
+        controller = _reserve_controller()
+        controller._filtered_prompt_budget = 20
+        manager = controller._rollout_manager
+        barrier = controller._data_plane_checkpoint_barrier
+        async with barrier.mutation() as cut:
+            old_id = manager.reserve_prompt_group(
+                cut, _reserve_prompt(20), target_step=7
+            )
+        replaced = asyncio.Event()
+        checkpoint_entered = asyncio.Event()
+        release_checkpoint = asyncio.Event()
+
+        async def replace() -> None:
+            async with controller._replacement_mutation(
+                filtered=True, target_step=7
+            ) as cut:
+                spare = controller._pop_filtered_replacement(7)
+                manager.discard_prompt_group(cut, old_id)
+                if spare is not None:
+                    manager.reserve_prompt_group(cut, spare, target_step=7)
+            replaced.set()
+
+        async def checkpoint() -> None:
+            async with barrier.checkpoint():
+                assert not controller._filtered_reserve
+                assert [g.prompt_id for g in manager.recovery_ledger.groups()] == ["20"]
+                checkpoint_entered.set()
+                await release_checkpoint.wait()
+
+        consumer = asyncio.create_task(replace())
+        await controller._filtered_refill_wanted.wait()
+        saver = asyncio.create_task(checkpoint())
+        await checkpoint_entered.wait()
+        batches = [] if exhausted else [BatchedDataDict({"idx": [21]})]
+        refiller = asyncio.create_task(
+            controller._await_servicing_refills(replaced.wait(), iter(batches))
+        )
+        await asyncio.sleep(0)
+        assert not replaced.is_set()
+        release_checkpoint.set()
+        await asyncio.gather(consumer, saver, refiller)
+        assert [g.prompt_id for g in manager.recovery_ledger.groups()] == (
+            [] if exhausted else ["21"]
+        )
+        assert controller._filtered_prompts_by_step == {7: 1}
+        assert (7 in controller._steps_allowed_short) == exhausted
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=5))
+
+
+def test_filtered_replacement_rechecks_pool_after_waiting_for_checkpoint() -> None:
+    """Two consumers racing for one spare retry without spending another budget unit."""
+
+    async def exercise() -> None:
+        controller = _reserve_controller()
+        controller._filtered_prompt_budget = 20
+        manager = controller._rollout_manager
+        barrier = controller._data_plane_checkpoint_barrier
+        async with barrier.mutation() as cut:
+            old_ids = [
+                manager.reserve_prompt_group(cut, _reserve_prompt(i), target_step=7)
+                for i in (20, 30)
+            ]
+        controller._filtered_reserve.append(_reserve_prompt(21))
+        checkpoint_entered = asyncio.Event()
+        release_checkpoint = asyncio.Event()
+
+        async def checkpoint() -> None:
+            async with barrier.checkpoint():
+                checkpoint_entered.set()
+                await release_checkpoint.wait()
+
+        async def replace(old_id: str) -> None:
+            async with controller._replacement_mutation(
+                filtered=True, target_step=7
+            ) as cut:
+                spare = controller._pop_filtered_replacement(7)
+                assert spare is not None
+                manager.discard_prompt_group(cut, old_id)
+                manager.reserve_prompt_group(cut, spare, target_step=7)
+
+        saver = asyncio.create_task(checkpoint())
+        await checkpoint_entered.wait()
+        consumers = [asyncio.create_task(replace(old_id)) for old_id in old_ids]
+        while barrier._waiting_mutations < 2:
+            await asyncio.sleep(0)
+        release_checkpoint.set()
+        await saver
+        await controller._filtered_refill_wanted.wait()
+        # A second checkpoint can enter while the losing consumer waits for refill.
+        async with barrier.checkpoint():
+            owners = {g.prompt_id for g in manager.recovery_ledger.groups()}
+            assert "21" in owners
+            assert len(owners & {"20", "30"}) == 1
+        async with barrier.mutation():
+            controller._serve_filtered_refill(iter([BatchedDataDict({"idx": [22]})]))
+        await controller._wake_filtered_waiters()
+        await asyncio.gather(*consumers)
+        assert sorted(g.prompt_id for g in manager.recovery_ledger.groups()) == [
+            "21",
+            "22",
+        ]
+        assert controller._filtered_prompts_by_step == {7: 2}
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=5))
+
+
+def test_checkpoint_waits_for_filtered_pop_and_reownership() -> None:
+    """A popped filter spare and its new ledger owner belong to the same cut."""
+
+    async def exercise() -> None:
+        controller = _reserve_controller()
+        controller._filtered_prompt_budget = 20
+        manager = controller._rollout_manager
+        barrier = controller._data_plane_checkpoint_barrier
+        async with barrier.mutation() as cut:
+            old_id = manager.reserve_prompt_group(
+                cut, _reserve_prompt(20), target_step=7
+            )
+        controller._filtered_reserve.append(_reserve_prompt(21))
+        popped = asyncio.Event()
+        release_replacement = asyncio.Event()
+        checkpoint_entered = asyncio.Event()
+
+        async def replace() -> None:
+            async with controller._replacement_mutation(
+                filtered=True, target_step=7
+            ) as cut:
+                spare = controller._pop_filtered_replacement(7)
+                assert spare is not None
+                popped.set()
+                await release_replacement.wait()
+                manager.discard_prompt_group(cut, old_id)
+                manager.reserve_prompt_group(cut, spare, target_step=7)
+
+        async def checkpoint() -> None:
+            async with barrier.checkpoint():
+                checkpoint_entered.set()
+                assert not controller._filtered_reserve
+                assert [g.prompt_id for g in manager.recovery_ledger.groups()] == ["21"]
+
+        consumer = asyncio.create_task(replace())
+        await popped.wait()
+        saver = asyncio.create_task(checkpoint())
+        await asyncio.sleep(0)
+        assert not checkpoint_entered.is_set()
+        release_replacement.set()
+        await asyncio.gather(consumer, saver)
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=5))
+
+
 def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
     """After pool removal, RESERVED ledger records own the whole batch."""
 
