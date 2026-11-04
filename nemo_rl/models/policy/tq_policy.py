@@ -294,6 +294,9 @@ class TQPolicy(TQDriverMixin, Policy):
             # reset_step_window: this call is the once-per-step reader, and
             # a max only scopes to a step by being reset by its reader.
             snapshots.append(client.snapshot(reset_step_window=True))
+        own = getattr(self, "dp_client", None)
+        if own is not client and is_metrics_client(own):
+            snapshots.append(own.snapshot(reset_step_window=True))
         # Submitted before the worker fan-out blocks, so the round trips overlap.
         extra_refs = [
             source.get_data_plane_snapshot.remote()
