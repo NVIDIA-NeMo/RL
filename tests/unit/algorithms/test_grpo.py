@@ -116,7 +116,10 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
-from nemo_rl.models.generation.interfaces import should_use_async_rollouts
+from nemo_rl.models.generation.interfaces import (
+    SamplerReplayConfig,
+    should_use_async_rollouts,
+)
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
@@ -8060,7 +8063,9 @@ class TestValidateFunction:
     def test_setup_rejects_sampler_support_replay(self, mock_grpo_components):
         """Replay reads the captured sampler head, which only SingleController stages."""
         master_config = mock_grpo_components["master_config"]
-        master_config.policy["generation"]["sampler_replay"] = {"enabled": True}
+        master_config.policy["generation"]["sampler_replay"] = SamplerReplayConfig(
+            enabled=True
+        )
 
         with pytest.raises(ValueError, match="sampler_replay.*legacy GRPO"):
             setup(master_config, MagicMock(), MagicMock(), None)

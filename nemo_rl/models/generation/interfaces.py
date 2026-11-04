@@ -238,13 +238,14 @@ class CheckpointEngineConfig(TypedDict):
     engine_kwargs: dict[str, dict[str, Any]]
 
 
-class SamplerReplayConfig(TypedDict):
+class SamplerReplayConfig(BaseModel, extra="allow"):
+    """Sampler replay, with or without loss_fn.score_centering."""
+
     # Renormalize the trainer's top-k/top-p log-probs over the support the sampler
     # actually drew from (its captured top-K head) instead of recomputing the
-    # filters, with or without loss_fn.score_centering. Requires top_logprobs >=
-    # top_k and token capture. False: the trainer recomputes top_k/top_p on its
-    # own logits.
-    enabled: bool
+    # filters. Requires top_logprobs >= top_k and token capture. False: the
+    # trainer recomputes top_k/top_p on its own logits.
+    enabled: bool = False
 
 
 class GenerationConfig(TypedDict):
@@ -296,9 +297,12 @@ class GenerationConfig(TypedDict):
 
 
 def sampler_replay_enabled(config: GenerationConfig) -> bool:
-    """Whether ``policy.generation.sampler_replay.enabled`` is set; absent means off."""
+    """Whether ``policy.generation.sampler_replay.enabled`` is set; absent means off.
+
+    The block is a dict until MasterConfig validates it into a SamplerReplayConfig.
+    """
     replay = config.get("sampler_replay")
-    return replay is not None and replay["enabled"]
+    return replay is not None and SamplerReplayConfig.model_validate(replay).enabled
 
 
 def should_use_async_rollouts(

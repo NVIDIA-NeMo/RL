@@ -45,6 +45,8 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
+    SamplerReplayConfig,
+    sampler_replay_enabled,
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -1712,9 +1714,45 @@ def test_configure_generation_config_requires_top_k_for_top_p_replay(
     config["vllm_cfg"]["logprobs_mode"] = "processed_logprobs"
     configure_generation_config(deepcopy(config), tokenizer)
 
-    config["sampler_replay"] = {"enabled": True}
+    # Replay itself needs vLLM (see the test below).
+    config.update(backend="vllm", sampler_replay=SamplerReplayConfig(enabled=True))
     with pytest.raises(ValueError, match="top_p < 1 requires .*top_k"):
         configure_generation_config(deepcopy(config), tokenizer)
+
+
+@pytest.mark.parametrize("backend", ["sglang", "megatron", "trtllm", "dynamo"])
+def test_configure_generation_config_sampler_replay_requires_vllm(
+    backend: str,
+) -> None:
+    """Only vLLM captures the sampler head; say so before asking for top_k/top_logprobs."""
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+    config = deepcopy(basic_vllm_test_config)
+    config.update(
+        backend=backend,
+        sampler_replay=SamplerReplayConfig(enabled=True),
+        top_k=None,
+        top_p=0.9,
+        top_logprobs=0,
+    )
+    with pytest.raises(ValueError, match="requires the vllm generation backend"):
+        configure_generation_config(deepcopy(config), tokenizer)
+
+
+@pytest.mark.parametrize(
+    "sampler_replay,enabled",
+    [
+        (None, False),
+        ({"enabled": True}, True),
+        (SamplerReplayConfig(enabled=True), True),
+        (SamplerReplayConfig(), False),
+    ],
+)
+def test_sampler_replay_enabled_reads_a_dict_or_a_validated_model(
+    sampler_replay, enabled
+) -> None:
+    """The block is a dict until MasterConfig validates it; absent means off."""
+    config = {} if sampler_replay is None else {"sampler_replay": sampler_replay}
+    assert sampler_replay_enabled(config) is enabled
 
 
 @pytest.mark.parametrize(
@@ -1731,7 +1769,7 @@ def test_configure_generation_config_checks_sampler_support_replay(
     tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
     config = deepcopy(basic_vllm_test_config)
     config["vllm_cfg"]["logprobs_mode"] = "processed_logprobs"
-    config.update(sampler_replay={"enabled": True}, **overrides)
+    config.update(sampler_replay=SamplerReplayConfig(enabled=True), **overrides)
     with pytest.raises(ValueError, match=match):
         configure_generation_config(deepcopy(config), tokenizer)
     config.update(top_k=20, top_p=0.9, top_logprobs=20)

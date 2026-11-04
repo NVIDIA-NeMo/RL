@@ -95,6 +95,7 @@ from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.nemo_gym import validate_dataset_agent_coverage
 from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
 from nemo_rl.experience.rollouts import EffortLevelsConfig
+from nemo_rl.models.generation.interfaces import SamplerReplayConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.utils.config import (
     load_config,
@@ -716,7 +717,7 @@ def test_score_centering_with_filtered_sampling_requires_head_covering_top_k():
         temperature=1.0,
         top_p=0.9,
         top_k=20,
-        sampler_replay={"enabled": True},
+        sampler_replay=SamplerReplayConfig(enabled=True),
     )
     generation.setdefault("vllm_cfg", {})["logprobs_mode"] = "processed_logprobs"
     for top_logprobs in (4, 19):
@@ -756,7 +757,7 @@ def test_sampler_support_replay_without_score_centering():
         temperature=1.0,
         top_p=0.9,
         top_k=20,
-        sampler_replay={"enabled": True},
+        sampler_replay=SamplerReplayConfig(enabled=True),
     )
     generation.setdefault("vllm_cfg", {})["logprobs_mode"] = "processed_logprobs"
     with pytest.raises(ValueError, match="top_logprobs >= policy.generation.top_k"):

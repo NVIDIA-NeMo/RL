@@ -164,6 +164,13 @@ def configure_generation_config(
         )
 
     if not is_eval and sampler_replay_enabled(config):
+        # Only vLLM returns the processed top-K log-probs replay reads; say so
+        # before asking for top_k/top_logprobs, which other backends reject anyway.
+        if config["backend"] != "vllm":
+            raise ValueError(
+                "policy.generation.sampler_replay.enabled requires the vllm "
+                f"generation backend (got backend={config['backend']!r})"
+            )
         # Replaying the sampler's support needs top_k to bound it.
         check_top_p_has_top_k(config["top_k"], config["top_p"])
         if not need_top_k_or_top_p_filtering(

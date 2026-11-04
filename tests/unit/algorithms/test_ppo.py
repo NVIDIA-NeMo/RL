@@ -34,6 +34,7 @@ from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.models.generation.interfaces import SamplerReplayConfig
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import LoggerConfig
 
@@ -1789,7 +1790,7 @@ def test_ppo_rejects_sampler_support_replay_before_cluster_creation(
     cluster_cls = MagicMock()
     monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
     config = _make_noncolocated_setup_config()
-    config.policy["generation"]["sampler_replay"] = {"enabled": True}
+    config.policy["generation"]["sampler_replay"] = SamplerReplayConfig(enabled=True)
 
     with pytest.raises(ValueError, match="sampler_replay.*legacy PPO trainer"):
         ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
