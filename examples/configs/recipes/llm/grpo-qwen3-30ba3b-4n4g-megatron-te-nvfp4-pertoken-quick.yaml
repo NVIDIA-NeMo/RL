@@ -7,16 +7,10 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick
 policy:
   train_global_batch_size: 16
-  train_micro_batch_size: 1
   logprob_batch_size: 1
-  logprob_chunk_size: null
   router_replay:
     enabled: true
   generation:
-    vllm_kwargs:
-      # Keep automatic scheduler sizing for this quick NVFP4 recipe.
-      max_num_seqs: null
-      max_num_batched_tokens: null
     nvfp4_pertoken_rollout:
       enabled: true
     vllm_cfg:
@@ -24,7 +18,6 @@ policy:
         FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH: '1'
         TRTLLM_DISABLE_FP4_QUANT_FAST_MATH: '1'
   megatron_cfg:
-    defer_fp32_logits: false
     moe_router_dtype: fp32
     optimizer:
       use_precision_aware_optimizer: false
