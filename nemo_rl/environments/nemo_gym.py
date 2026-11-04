@@ -3855,9 +3855,25 @@ def spinup_nemo_gym_actor(
     ).sole_handle()
 
 
+def collect_dataset_agent_names(datasets: Mapping[str, Any]) -> dict[str, set[str]]:
+    """Map each split to the route names its rows reference; needs no shard.
+
+    A split this scan cannot resolve, such as one with taskset rows, whose
+    routes only the running Gym stack knows, is left for the coverage check.
+    """
+    agent_names: dict[str, set[str]] = {}
+    for split, dataset in datasets.items():
+        try:
+            agent_names[split] = _iter_dataset_agent_names(dataset)
+        except ValueError:
+            continue
+    return agent_names
+
+
 def validate_dataset_agent_coverage(
     shard_set: NemoGymShardSet,
     datasets: Mapping[str, Any],
+    agent_names: Optional[Mapping[str, set[str]]] = None,
 ) -> None:
     """Fail at setup if any row names a route no shard hosts.
 
@@ -3878,6 +3894,8 @@ def validate_dataset_agent_coverage(
             built at setup; an unsharded set is asked for its entries here.
         datasets: Split name to dataset, for the error message. ``None`` values
             and datasets without gym rows are skipped.
+        agent_names: ``collect_dataset_agent_names`` of these datasets, if
+            already scanned. Splits it lacks are scanned here.
 
     Raises:
         ShardSetupError: A split references routes no shard hosts.
@@ -3895,15 +3913,18 @@ def validate_dataset_agent_coverage(
             )
         )
     for split, dataset in datasets.items():
-        try:
-            referenced = _iter_dataset_agent_names(
-                dataset,
-                shard_set.environment_server_routes,
-            )
-        except ValueError as error:
-            raise ShardSetupError(
-                f"The {split} dataset failed NeMo-Gym validation: {error}"
-            ) from error
+        if agent_names is not None and split in agent_names:
+            referenced = agent_names[split]
+        else:
+            try:
+                referenced = _iter_dataset_agent_names(
+                    dataset,
+                    shard_set.environment_server_routes,
+                )
+            except ValueError as error:
+                raise ShardSetupError(
+                    f"The {split} dataset failed NeMo-Gym validation: {error}"
+                ) from error
         unhosted = sorted(referenced - hosted)
         if unhosted:
             raise ShardSetupError(

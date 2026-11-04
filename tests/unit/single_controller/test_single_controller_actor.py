@@ -235,6 +235,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         restored_from_rollout_snapshot=False,
         ppo_group_multiple=1,
         ppo_min_remaining_groups=0,
+        trainer_warmup_ran=False,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -2412,6 +2413,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._optimizer_commit_started = asyncio.Event()
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
+    ctrl._trainer_warmup_task = None
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
     ctrl._ppo_epochs = 1
