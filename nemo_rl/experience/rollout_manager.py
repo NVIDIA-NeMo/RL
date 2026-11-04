@@ -30,8 +30,6 @@ import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
-from nemo_rl.algorithms.utils import rewards_carry_no_signal
-from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
@@ -42,12 +40,20 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
+from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     get_nemo_gym_task_input,
+)
+from nemo_rl.experience.dynamic_sampling import (
+    StepRewardStats,
+    drain_step_reward_metrics,
+    participating_rewards,
+    record_group_rewards,
+    rewards_carry_no_signal,
 )
 from nemo_rl.experience.failures import (
     FailureClass,
@@ -277,75 +283,6 @@ class RolloutRetryPolicy:
     def backoff_for(self, attempt: int) -> float:
         """Return the delay before infra attempt ``attempt`` + 1 (1-based attempts)."""
         return min(self.backoff_base_s * 2 ** (attempt - 1), self.max_backoff_s)
-
-
-def participating_rewards(
-    record: PromptGroupRecord,
-    *,
-    masked_reward_policy: Optional[str],
-    overlong_filtering: bool,
-) -> list[float]:
-    """The rewards that vote in this group's baseline and std.
-
-    Mirrors v1's ``_dynamic_sampling_valid_mask``, which is the mask the group
-    statistics are actually computed under. Filtering on the full reward list instead
-    would keep groups whose voters are uniform, and drop groups whose only spread
-    comes from rows that never vote.
-
-    A zero dataset weight is excluded under either policy: ``processors.py`` cuts a
-    prompt that did not fit the sequence limit down to a few tokens and gives it
-    ``loss_multiplier == 0`` before any rollout, so its rewards are placeholders
-    rather than measurements. That is group-level here, so such a group has no voters
-    at all and is trivial by construction.
-
-    Under ``exclude`` the environment's ``mask_sample`` rows drop out, and with
-    ``overlong_filtering`` so do truncated ones -- the rows the loss drops later in
-    the step. Under ``include`` both still vote: their rewards are measurements of
-    the policy even though they carry no loss.
-    """
-    if record.loss_multiplier == 0:
-        return []
-    # None is PPO: no group-relative baseline exists to mask rows out of.
-    if masked_reward_policy != "exclude":
-        return [completion.reward for completion in record.completions]
-    return [
-        completion.reward
-        for completion in record.completions
-        if not _mask_sample_flagged(completion.env_extras)
-        and not (overlong_filtering and completion.truncated)
-    ]
-
-
-def _mask_sample_flagged(extra: Optional[dict[str, Any]]) -> bool:
-    """Whether the environment asked for this row to be masked from the loss.
-
-    Both reads are consulted for the reason ``rollouts._mask_sample_flags`` gives:
-    Gym serializes ``mask_sample: false`` on every response, so an environment that
-    flags only the nested ``instance_config`` one carries a false first-class field
-    beside the true nested one.
-    """
-    extra = extra or {}
-    if extra.get(MASK_SAMPLE):
-        return True
-    return bool((extra.get("instance_config") or {}).get(MASK_SAMPLE, False))
-
-
-@dataclass
-class StepRewardStats:
-    """Reward totals for the groups generated for one training step.
-
-    Counts every group that finished generating, whether dynamic sampling kept or
-    dropped it. The kept groups all have reward spread, so their mean alone says
-    little about how well the policy is doing.
-    """
-
-    groups: int = 0
-    zero_variance_groups: int = 0
-    reward_sum: float = 0.0
-    samples: int = 0
-    # First attempts only: the prompts originally scheduled, not their replacements.
-    first_attempt_reward_sum: float = 0.0
-    first_attempt_samples: int = 0
 
 
 @dataclass
@@ -2583,59 +2520,18 @@ class RolloutManager:
         replacement_index: int,
         zero_variance: bool,
     ) -> None:
-        """Add one finished group's rewards to the tally of the step it was made for.
-
-        Args:
-            target_step: Step the group was stamped for. ``None`` (sampler does not
-                stamp steps) means there is nothing to report against, so skip.
-            rewards: Every row's reward, voting or not. ``unfiltered_reward`` is the
-                pre-filter progress signal, so it averages the whole group.
-            replacement_index: 0 for the originally scheduled prompt, N for its N-th
-                replacement.
-            zero_variance: Whether the group's *voting* rewards carry no signal.
-                Passed in rather than recomputed here, so the count cannot disagree
-                with the decision the filter actually made on the same group.
-        """
-        if target_step is None or not rewards:
-            return
-        tally = self._step_rewards.setdefault(target_step, StepRewardStats())
-        total = float(sum(rewards))
-        tally.groups += 1
-        tally.zero_variance_groups += int(zero_variance)
-        tally.reward_sum += total
-        tally.samples += len(rewards)
-        if replacement_index == 0:
-            tally.first_attempt_reward_sum += total
-            tally.first_attempt_samples += len(rewards)
+        """Record a finished group's rewards for its original target step."""
+        record_group_rewards(
+            self._step_rewards,
+            target_step,
+            rewards,
+            replacement_index=replacement_index,
+            zero_variance=zero_variance,
+        )
 
     def drain_step_reward_metrics(self, step: int) -> dict[str, float]:
-        """Return the reward metrics for ``step`` and forget that step and older ones.
-
-        Groups count toward the step they were generated for, even if a later step
-        borrowed them (``promote_ready_group``). With lookahead above zero that can
-        differ from the step that trained on them.
-
-        Returns:
-            ``unfiltered_reward`` (mean over every generated group, kept or dropped),
-            ``first_attempt_reward`` (same, but first attempts only),
-            ``generated_prompt_groups``, ``zero_variance_prompt_groups`` and
-            ``zero_variance_fraction``. Empty if nothing was generated for the step.
-        """
-        tally = self._step_rewards.get(step)
-        self._step_rewards = {s: t for s, t in self._step_rewards.items() if s > step}
-        if tally is None or not tally.groups:
-            return {}
-        metrics = {
-            "unfiltered_reward": tally.reward_sum / tally.samples,
-            "generated_prompt_groups": float(tally.groups),
-            "zero_variance_prompt_groups": float(tally.zero_variance_groups),
-            "zero_variance_fraction": tally.zero_variance_groups / tally.groups,
-        }
-        if tally.first_attempt_samples:
-            metrics["first_attempt_reward"] = (
-                tally.first_attempt_reward_sum / tally.first_attempt_samples
-            )
-        return metrics
+        """Report this step's rewards and retire this and older step tallies."""
+        return drain_step_reward_metrics(self._step_rewards, step)
 
     async def generate_and_push(
         self,

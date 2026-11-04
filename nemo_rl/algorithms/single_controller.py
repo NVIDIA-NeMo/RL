@@ -150,7 +150,6 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     reduce_advantage_pump_metrics,
 )
-from nemo_rl.algorithms.utils import rewards_carry_no_signal
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import (
@@ -179,6 +178,7 @@ from nemo_rl.environments.checkpointing.interfaces import (
     EnvironmentCheckpoint,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.experience.dynamic_sampling import rewards_carry_no_signal
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import (

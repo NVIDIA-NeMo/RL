@@ -19,7 +19,8 @@ from types import SimpleNamespace
 import pytest
 
 from nemo_rl.data_plane.schema import MASK_SAMPLE
-from nemo_rl.experience.rollout_manager import RolloutManager, rewards_carry_no_signal
+from nemo_rl.experience.dynamic_sampling import rewards_carry_no_signal
+from nemo_rl.experience.rollout_manager import RolloutManager
 
 
 def _manager(
