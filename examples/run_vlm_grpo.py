@@ -165,8 +165,6 @@ def main() -> None:
             raise NotImplementedError(
                 "use_dynamic_sampling is not supported with async GRPO"
             )
-        if config.grpo.reward_scaling.enabled:
-            raise NotImplementedError("reward_scaling is not supported with async GRPO")
         if config.grpo.reward_shaping.enabled:
             raise NotImplementedError("reward_shaping is not supported with async GRPO")
         if config.data["use_multiple_dataloader"]:
