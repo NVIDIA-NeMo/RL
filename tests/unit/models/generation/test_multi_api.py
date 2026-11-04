@@ -32,43 +32,6 @@ spec.loader.exec_module(module)
 
 
 class MultiAPITest(unittest.IsolatedAsyncioTestCase):
-    def test_count_validation(self):
-        self.assertIsNone(module.api_server_count({"vllm_cfg": {}}))
-        self.assertIsNone(
-            module.api_server_count({"vllm_cfg": {"http_api_server_count": None}})
-        )
-        self.assertEqual(
-            module.api_server_count({"vllm_cfg": {"http_api_server_count": 1}}), 1
-        )
-        for count in [0, -1, True, 1.5, "8"]:
-            with self.subTest(count=count), self.assertRaises(ValueError):
-                module.api_server_count({"vllm_cfg": {"http_api_server_count": count}})
-        with self.assertRaises(ValueError):
-            module.api_server_count({"vllm_cfg": {"http_api_server_count": 8}})
-        self.assertEqual(
-            module.api_server_count(
-                {
-                    "vllm_cfg": {
-                        "http_api_server_count": 8,
-                        "expose_http_server": True,
-                        "async_engine": True,
-                    }
-                }
-            ),
-            8,
-        )
-
-        with self.assertRaises(ValueError):
-            module.api_server_count(
-                {
-                    "vllm_cfg": {
-                        "http_api_server_count": 8,
-                        "expose_http_server": True,
-                        "async_engine": False,
-                    }
-                }
-            )
-
     async def test_spawned_host_preserves_frontend_settings(self):
         # Exercise child initialization without constructing a GPU worker.
         for dtype in ["int16", "int32"]:

@@ -86,6 +86,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.rollout_result import RolloutResult
 from nemo_rl.models.generation.score_centering import validate_score_centering_request
 from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
     CapturedChatLogprobsMixin,
@@ -97,11 +98,7 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
-from nemo_rl.models.generation.rollout_result import RolloutResult
-from nemo_rl.models.generation.vllm.multi_api import (
-    MultiAPIServerPool,
-    api_server_count,
-)
+from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.request_pipeline import (
     rollout_output,
     rollout_result,
@@ -554,11 +551,13 @@ class VllmAsyncGenerationWorkerImpl(
                     stacklevel=1,
                 )
             llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
+
         self.stat_loggers = (
             [PrometheusStatLogger]
             if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
             else []
         )
+
         if dynamo_enabled(self.cfg):
             from nemo_rl.models.generation.dynamo.vllm_adapter import (
                 SnapshotStatLogger,
@@ -575,6 +574,7 @@ class VllmAsyncGenerationWorkerImpl(
                 ),
             )
             self.stat_loggers.append(SnapshotStatLogger)
+
         # AsyncEngineArgs leaves kv_events_config dicts unconverted.
         if isinstance(llm_kwargs.get("kv_events_config"), dict):
             from vllm.config import KVEventsConfig
@@ -584,15 +584,18 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-        count = api_server_count(self.cfg)
-        if count is not None and count > 1:
+
+        # Initialize the vLLM engine
+        api_server_count = self.cfg["vllm_cfg"].get("http_api_server_count", 1)
+        if api_server_count > 1:
             if self._sparse_refit_receiver is not None:
                 raise ValueError(
                     "Multiple HTTP API servers do not support sparse refit"
                 )
             if self._reserved_socket is None:
                 self._reserve_port()
-            self._api_server_pool = MultiAPIServerPool(self, count)
+            # Multiple API servers require separate frontend and engine setup.
+            self._api_server_pool = MultiAPIServerPool(self, api_server_count)
             self.llm = self._api_server_pool.create_engine(
                 self.llm_async_engine_args, self.stat_loggers
             )
@@ -600,6 +603,7 @@ class VllmAsyncGenerationWorkerImpl(
             self.llm = AsyncLLM.from_engine_args(
                 self.llm_async_engine_args, stat_loggers=self.stat_loggers
             )
+
         # Keep vLLM's output loops from monopolizing this actor's event loop under a
         # generation backlog (see install_output_loop_yield).
         output_loop_yield_budget_ms = self.cfg["vllm_cfg"].get(

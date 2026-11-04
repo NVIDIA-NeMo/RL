@@ -29,23 +29,6 @@ if TYPE_CHECKING:
     from nemo_rl.models.generation.vllm.config import VllmConfig
 
 
-def api_server_count(config: VllmConfig) -> int | None:
-    """Validate and return the optional HTTP frontend process count."""
-    count = config["vllm_cfg"].get("http_api_server_count")
-    if count is None:
-        return None
-    if type(count) is not int or count < 1:
-        raise ValueError("http_api_server_count must be a positive integer")
-    if count > 1 and not (
-        config["vllm_cfg"].get("async_engine")
-        and config["vllm_cfg"].get("expose_http_server")
-    ):
-        raise ValueError(
-            "Multiple API servers require async_engine=true and expose_http_server=true"
-        )
-    return count
-
-
 def receive_reply(connection: Connection, timeout: float = 600) -> Any:
     if not connection.poll(timeout):
         raise TimeoutError("Timed out waiting for an HTTP API process")

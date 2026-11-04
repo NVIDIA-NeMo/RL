@@ -261,9 +261,32 @@ def test_async_actor_settings_reject_ignored_options(
 
 
 @pytest.mark.parametrize(
+    "settings",
+    [
+        {},
+        {"async_engine": False, "expose_http_server": True},
+        {"async_engine": True, "expose_http_server": False},
+    ],
+)
+def test_async_actor_settings_require_async_http_for_multiple_frontends(
+    settings: dict,
+) -> None:
+    with pytest.raises(ValueError, match="Multiple API servers require"):
+        validate_vllm_async_actor_settings(
+            cast(VllmConfig, {"vllm_cfg": {"http_api_server_count": 8, **settings}})
+        )
+
+
+@pytest.mark.parametrize(
     "vllm_cfg",
     [
         {},
+        {"http_api_server_count": 1},
+        {
+            "http_api_server_count": 8,
+            "async_engine": True,
+            "expose_http_server": True,
+        },
         {"flat_logprobs": False, "output_loop_yield_budget_ms": None},
         {
             "flat_logprobs": True,
