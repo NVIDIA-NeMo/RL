@@ -349,6 +349,8 @@ class RolloutSnapshotter(_UsesRolloutParts):
         cut: DataPlaneMutationCut,
         checkpoint_path: PathLike,
         kind: CheckpointKind,
+        *,
+        additional_expected_staging_keys: Optional[set[str]] = None,
     ) -> CapturedRolloutState:
         """Capture restart-facing controller state and save TQ under the barrier.
 
@@ -417,6 +419,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     staging_partition=self._master_config.token_capture.staging_partition,
                     replay_metadata=replay_metadata,
                     clear_unreferenced=False,
+                    additional_expected_staging_keys=additional_expected_staging_keys,
                 )
             tq_save_started = time.monotonic()
             await self._save_data_plane_checkpoint(
@@ -617,6 +620,12 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 not force
                 and self._last_snapshot_mutation_version
                 == self._data_plane_checkpoint_barrier.mutation_version
+                # Decoding grows a live call's recoverable prefix without
+                # mutating the data plane, so keep cutting while one is active.
+                and not (
+                    self._master_config.rollout_recovery.generation_prefix_cuts_enabled
+                    and self._rollout_recovery_ledger.has_dispatched_generation_prefix()
+                )
             ):
                 return RolloutCheckpointSaveResult(
                     saved=False,
@@ -670,10 +679,21 @@ class RolloutSnapshotter(_UsesRolloutParts):
                                 reason="trainer_state_changed",
                             )
                         snapshot_epoch = self._read_progress().current_epoch
+                        environment_staging_keys: frozenset[str] = frozenset()
                         if environment_snapshot is not None:
-                            await environment_snapshot.check_against_cut(cut)
+                            # The environment's saved state can reference rows
+                            # RL's ledger does not own, such as a generation
+                            # prefix; the TQ capture must hold those too.
+                            environment_staging_keys = (
+                                await environment_snapshot.check_against_cut(cut)
+                            )
                         snapshot_cut = await self.capture(
-                            cut, tmp_path, "rollout_snapshot"
+                            cut,
+                            tmp_path,
+                            "rollout_snapshot",
+                            additional_expected_staging_keys=set(
+                                environment_staging_keys
+                            ),
                         )
                     barrier_released = time.monotonic()
                 # Dispatch reopens and the environment resumes when that block
@@ -738,11 +758,13 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 "controller_sidecar_bytes": float(controller_sidecar_bytes),
             }
             restarted_rollouts = 0
+            environment_metrics: dict[str, float] = {}
             if environment_snapshot is not None:
                 restarted_rollouts = environment_snapshot.restarted_rollouts
-                checkpoint_metrics.update(
-                    environment_snapshot.metrics(environment_paused_seconds)
+                environment_metrics = environment_snapshot.metrics(
+                    environment_paused_seconds
                 )
+                checkpoint_metrics.update(environment_metrics)
                 _warn_if_environment_paused_past_interval(
                     environment_paused_seconds,
                     self._master_config.rollout_checkpointing.snapshot_attempt_interval_s,
@@ -768,7 +790,13 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 f"restarted_rollouts={restarted_rollouts}, "
                 f"total_save_seconds={checkpoint_metrics['total_save_seconds']:.2f}, "
                 "exclusive_hold_seconds="
-                f"{checkpoint_metrics['exclusive_hold_seconds']:.2f})",
+                f"{checkpoint_metrics['exclusive_hold_seconds']:.2f}"
+                # The environment's own figures, e.g. a prefix cut's fence hold.
+                + "".join(
+                    f", {name}={value:.2f}"
+                    for name, value in environment_metrics.items()
+                )
+                + ")",
                 flush=True,
             )
             return RolloutCheckpointSaveResult(saved=True, reason="completed")

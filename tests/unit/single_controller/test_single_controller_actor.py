@@ -2302,6 +2302,7 @@ def _train_pump_controller(*, sampler) -> object:
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
+        rollout_recovery=SimpleNamespace(generation_prefix_cuts_enabled=False),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -2796,6 +2797,39 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
         assert "vllm/spec_acceptance_rate" not in train_metrics
     else:
         assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
+
+
+def test_train_pump_logs_generation_prefix_restores_with_prefix_cuts(
+    monkeypatch,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+    events: list[str] = []
+    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    ctrl._trainer = _StepMetricRecordingTrainer(events)
+    ctrl._gen = _StepMetricRecordingGeneration(events, dies_in=None)
+    ctrl._gen.get_generation_prefix_counts = lambda: {
+        "restored_calls": 3,
+        "restored_prefix_tokens": 120,
+        "failed_cuts_control_deadline": 2,
+    }
+    ctrl._master_config.rollout_recovery.generation_prefix_cuts_enabled = True
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["generation_prefix/restored_calls"] == 3.0
+    assert train_metrics["generation_prefix/restored_prefix_tokens"] == 120.0
+    assert train_metrics["generation_prefix/failed_cuts_control_deadline"] == 2.0
 
 
 @pytest.mark.parametrize(

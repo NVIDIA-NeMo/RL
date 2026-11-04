@@ -682,6 +682,9 @@ class GenerationInterface(ABC):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
     ) -> "Optional[MediaColumnSpec]":
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -697,6 +700,12 @@ class GenerationInterface(ABC):
             capture_media: Whether the staging partition carries media columns and
                 the workers must stage the media the engine consumed beside each
                 call's tokens.
+            generation_prefix_cuts_enabled: Allow checkpoint-time cuts of active
+                model calls for prefix recovery.
+            generation_cut_control_token: Bearer token used by Gym's checkpoint
+                coordinator to authorize generation-cut requests.
+            generation_cut_control_timeout_s: Bound on one generation-cut
+                request; calls not cut by then are acknowledged as failures.
 
         Returns:
             With ``capture_media``, the pixel dtype and patch size the workers
@@ -790,6 +799,37 @@ class GenerationInterface(ABC):
         """
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
+
+    def begin_token_capture_snapshot_fence(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Fence terminal token writes while a coordinated TQ snapshot is taken."""
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
+
+    def end_token_capture_snapshot_fence(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Release terminal token writes after the coordinated TQ snapshot."""
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
+
+    def get_generation_prefix_counts(self) -> dict[str, int]:
+        """Sum over workers of generation-prefix restore and cut counts.
+
+        Returns:
+            Counts since the workers started: ``restored_calls`` and their
+            ``restored_prefix_tokens``, and the cut counts named by
+            ``GenerationCutCaptureMixin.get_generation_prefix_counts``.
+        """
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
 
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.

@@ -169,8 +169,9 @@ class _FakeEnvironmentSnapshot:
     def __init__(self) -> None:
         self.checked_cuts: list[Any] = []
 
-    async def check_against_cut(self, cut: Any) -> None:
+    async def check_against_cut(self, cut: Any) -> frozenset[str]:
         self.checked_cuts.append(cut)
+        return frozenset()
 
     def metrics(self, paused_seconds: float) -> dict[str, float]:
         return {"environment_paused_seconds": paused_seconds}
@@ -3024,6 +3025,77 @@ class TestPeriodicRolloutCheckpoint:
         assert forced == [True]
         assert not actor._rollout_snapshots._wakeup.is_set()
         assert bool(deadline_warnings) is (expected == "warns")
+
+    @pytest.mark.parametrize(
+        ("prefix_cuts_enabled", "restore_level", "expect_save"),
+        [
+            (True, RecoveryTargetLevel.PREFIX, True),
+            (False, RecoveryTargetLevel.PREFIX, False),
+            (True, RecoveryTargetLevel.TURN, False),
+        ],
+    )
+    def test_unchanged_data_plane_still_cuts_a_decoding_prefix(
+        self,
+        tmp_path: Path,
+        prefix_cuts_enabled: bool,
+        restore_level: RecoveryTargetLevel,
+        expect_save: bool,
+    ) -> None:
+        """Decoding grows a recoverable prefix without mutating the data plane."""
+
+        class _SaveStarted(Exception):
+            pass
+
+        actor = self._actor(tmp_path)
+        snapshots = actor._rollout_snapshots
+        # Only the cadence check reads the target; the rest of this actor is
+        # built for sibling recovery.
+        actor._master_config.rollout_recovery.target_level = (
+            RecoveryTargetLevel.PREFIX
+            if prefix_cuts_enabled
+            else RecoveryTargetLevel.SIBLING
+        )
+        ledger = actor._rollout_recovery_ledger
+
+        async def dispatch() -> None:
+            async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=2,
+                    target_step=0,
+                    start_weight_version=0,
+                    restore_level=restore_level,
+                    admitted=True,
+                )
+                ledger.mark_group_dispatched(
+                    cut, "g7", environment_instance_id="tools/replica-0"
+                )
+
+        asyncio.run(dispatch())
+        snapshots._last_snapshot_mutation_version = (
+            actor._data_plane_checkpoint_barrier.mutation_version
+        )
+        result = None
+        try:
+            with patch.object(
+                actor._checkpointer, "finalize_pending", side_effect=_SaveStarted
+            ):
+                try:
+                    result = asyncio.run(snapshots.save_snapshot())
+                except _SaveStarted:
+                    pass
+        finally:
+            actor._checkpointer.shutdown()
+
+        if expect_save:
+            assert result is None
+        else:
+            assert result is not None
+            assert result.reason == "no_data_plane_mutations"
 
     def test_periodic_pump_reports_each_consecutive_failure(
         self,

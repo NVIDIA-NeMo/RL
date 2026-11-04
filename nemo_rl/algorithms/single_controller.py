@@ -514,13 +514,14 @@ class SingleControllerActor:
         # it costs five minutes, not quietly at hour three of a run.
         self._env_handles = actor_args.env_handles
         # Rollout state the environment backend holds between turns. Only
-        # turn-level recovery keeps any; otherwise this is a no-op.
+        # turn- and prefix-level recovery keep any; otherwise this is a no-op.
         self._environment_checkpoint: EnvironmentCheckpoint = (
             build_environment_checkpoint(
                 master_config,
                 env_handles=self._env_handles,
                 rollout_manager=self._rollout_manager,
                 dp_client=self._dp_client,
+                generation=self._gen,
             )
         )
         # These two keep the getattr for a genuinely different reason: None is a
@@ -3004,6 +3005,22 @@ class SingleControllerActor:
                     )
                 except RayActorError as error:
                     log.warning("Skipping generation step metrics: %s", error)
+                if self._master_config.rollout_recovery.generation_prefix_cuts_enabled:
+                    try:
+                        prefix_counts = await asyncio.to_thread(
+                            self._gen.get_generation_prefix_counts
+                        )
+                    except RayActorError as error:
+                        log.warning("Skipping generation-prefix metrics: %s", error)
+                    else:
+                        # Totals since the generation workers started, so a
+                        # restore or a failed cut shows up as a step in the curve.
+                        step_metrics.update(
+                            {
+                                f"generation_prefix/{name}": float(count)
+                                for name, count in prefix_counts.items()
+                            }
+                        )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(
