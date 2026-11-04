@@ -1341,6 +1341,7 @@ class MegatronPolicyWorkerImpl(
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
         eval_mode: bool,
+        mtp_detached: bool,
     ) -> tuple[list[dict[str, Any]], torch.Tensor, torch.Tensor]:
         """Normalize one complete optimizer batch after in-loss filtering.
 
@@ -1351,6 +1352,9 @@ class MegatronPolicyWorkerImpl(
         All microbatches have now finished, so sum survivor counts over DP, broadcast them to
         every PP stage, and correct gradients before the optimizer clips them.
         CP/TP replicas must not be counted as additional samples.
+
+        With ``mtp_detached``, detached MTP heads keep their pre-filter token
+        denominator: their loss mask is built before filtering.
         """
         metrics = losses_reduced
         counts = _local_survivor_counts(metrics, global_valid_toks.device)
@@ -1386,6 +1390,8 @@ class MegatronPolicyWorkerImpl(
             # gradient buffers (including distributed-optimizer gradient shards).
             torch.cuda.synchronize()
             self.model.scale_gradients(token_factor)
+            if mtp_detached:
+                self._scale_mtp_param_grads(1.0 / token_factor)
         metrics = [
             rescale_loss_metrics(
                 m,
@@ -1607,6 +1613,10 @@ class MegatronPolicyWorkerImpl(
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
                         eval_mode=eval_mode,
+                        mtp_detached=self.mtp_enabled
+                        and bool(
+                            getattr(self._get_model_config(), "mtp_detach_heads", False)
+                        ),
                     )
 
                 # Update parameters.
@@ -2348,8 +2358,15 @@ class MegatronPolicyWorkerImpl(
         if in_loss_filter:
             # Chunks backpropagated unnormalized survivor sums, so divide by the
             # survivor counts. Metrics are already on every PP stage; reduce DP only.
-            policy_counts = _local_survivor_counts(
-                state["all_mb_metrics"], state["local_valid_toks"].device
+            # MTP's loss mask is built before filtering, so it keeps the
+            # pre-filter token count as its denominator.
+            policy_counts = torch.cat(
+                [
+                    _local_survivor_counts(
+                        state["all_mb_metrics"], state["local_valid_toks"].device
+                    ),
+                    state["local_valid_toks"].to(torch.float64).reshape(1),
+                ]
             )
         else:
             policy_counts = torch.stack(
@@ -2366,7 +2383,8 @@ class MegatronPolicyWorkerImpl(
         )
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
-        draft_step_state.set_global_counts(to_reduce[2:])
+        mtp_valid_toks = to_reduce[2] if in_loss_filter else global_valid_toks
+        draft_step_state.set_global_counts(to_reduce[policy_counts.numel() :])
         if in_loss_filter:
             _raise_if_no_survivors(global_valid_toks)
 
@@ -2389,11 +2407,12 @@ class MegatronPolicyWorkerImpl(
             )
         # The uniform rescale gives MTP the main loss's denominator. Correct
         # detached, MTP-tagged parameters back to the valid-token denominator
-        # used by the synchronous path. For token-level loss the factor is 1.
+        # used by the synchronous path. For token-level loss without in-loss
+        # filtering the factor is 1.
         # This runs before gradient reduction; scaling and reduction are linear.
         if state["mtp_enabled"] and state["mtp_detach_heads"]:
             self._scale_mtp_param_grads(
-                float((n_safe / global_valid_toks.clamp(min=1)).item())
+                float((n_safe / mtp_valid_toks.clamp(min=1)).item())
             )
         # No more forward/backward calls remain in this step. Clear the
         # callable before optimizer/scheduler/checkpoint state can serialize it.
