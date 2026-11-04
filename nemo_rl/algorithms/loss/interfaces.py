@@ -41,7 +41,9 @@ class MetricNormalizer(enum.Enum):
     Losses advertise the mapping via a ``metric_normalizations:
     dict[str, MetricNormalizer]`` instance attribute, built in ``__init__``
     from the same flags that pick the denominators, so it lives next to the
-    metric definitions instead of in a consumer-side table. Metrics absent
+    metric definitions instead of in a consumer-side table. Objective terms
+    (``loss``, KL) advertise ``LOSS_DIVISOR`` so they are logged with the
+    gradient's own denominator, whatever the reduction. Metrics absent
     from the mapping fall back to the gradient normalization (the
     objective denominator) in split-API trainers. Survivor rescaling
     requires every returned metric to be listed.
@@ -50,6 +52,9 @@ class MetricNormalizer(enum.Enum):
     TOKENS = "tokens"  # divided by global_valid_toks
     SEQUENCES = "sequences"  # divided by global_valid_seqs
     NONE = "none"  # not normalized: raw counts, local means, min/max
+    # Divide by the objective reduction's loss_divisor(), i.e. exactly the
+    # divisor the gradient used.
+    LOSS_DIVISOR = "loss_divisor"
 
 
 @dataclass(frozen=True)
@@ -61,7 +66,6 @@ class ObjectiveReduction:
             (``process_global_batch``, the GSPO/CISPO asserts). New code
             branches on ``token_normalized`` or calls ``reduce``; a reduction
             can be ``TOKEN_LEVEL`` here and still not be token normalized.
-        metric_normalizer: Denominator advertised for the ``loss`` and KL metrics.
         requires_explicit_denominator: True when the split worker must pass its
             finish-time count explicitly (``global_valid_*`` are not it).
         token_normalized: True when token-summed auxiliary losses (MTP, router
@@ -69,7 +73,6 @@ class ObjectiveReduction:
     """
 
     loss_type: ClassVar[LossType]
-    metric_normalizer: ClassVar[MetricNormalizer]
     requires_explicit_denominator: ClassVar[bool] = False
     token_normalized: ClassVar[bool] = False
 
@@ -160,7 +163,6 @@ class GlobalTokenMeanReduction(ObjectiveReduction):
     """Sum valid token losses and divide by total valid token mass."""
 
     loss_type: ClassVar[LossType] = LossType.TOKEN_LEVEL
-    metric_normalizer: ClassVar[MetricNormalizer] = MetricNormalizer.TOKENS
     token_normalized: ClassVar[bool] = True
 
     def denominator_contribution(
@@ -205,7 +207,6 @@ class SequenceMeanReduction(ObjectiveReduction):
     """Average tokens within each response, then average weighted responses."""
 
     loss_type: ClassVar[LossType] = LossType.SEQUENCE_LEVEL
-    metric_normalizer: ClassVar[MetricNormalizer] = MetricNormalizer.SEQUENCES
 
     def denominator_contribution(
         self,

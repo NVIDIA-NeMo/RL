@@ -580,11 +580,10 @@ class ClippedPGLossFn(LossFunction):
         # that pick the denominators — so split-API trainers can undo the
         # placeholder global_valid_*=1 normalization without maintaining a
         # consumer-side table. Keep in sync with __call__'s return dict.
-        grad_normalizer = self.objective_reduction.metric_normalizer
         self.metric_normalizations: dict[str, MetricNormalizer] = {
-            # Normalized like the gradient (loss_type-dependent).
-            "loss": grad_normalizer,
-            KL_PENALTY_KEY: grad_normalizer,
+            # Normalized like the gradient (by the objective reduction).
+            "loss": MetricNormalizer.LOSS_DIVISOR,
+            KL_PENALTY_KEY: MetricNormalizer.LOSS_DIVISOR,
             # Token-normalized diagnostics, independent of loss_type.
             "probs_ratio": MetricNormalizer.TOKENS,
             "probs_ratio_clamped": MetricNormalizer.TOKENS,
@@ -655,8 +654,8 @@ class ClippedPGLossFn(LossFunction):
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
             self.metric_normalizations = {
-                "loss": grad_normalizer,
-                KL_PENALTY_KEY: grad_normalizer,
+                "loss": MetricNormalizer.LOSS_DIVISOR,
+                KL_PENALTY_KEY: MetricNormalizer.LOSS_DIVISOR,
                 "num_valid_samples": MetricNormalizer.NONE,
                 "opd_full_reverse_kl": MetricNormalizer.TOKENS,
                 "opd_full_reverse_kl_min": MetricNormalizer.NONE,
@@ -670,11 +669,6 @@ class ClippedPGLossFn(LossFunction):
                         "opd_full_decomposition_error": MetricNormalizer.NONE,
                     }
                 )
-        if self.objective_reduction.requires_explicit_denominator:
-            # Missing entries use the worker's objective denominator. Keep
-            # token diagnostics explicitly token-normalized.
-            self.metric_normalizations.pop("loss")
-            self.metric_normalizations.pop(KL_PENALTY_KEY)
 
     def has_adaptive_loss_state(self) -> bool:
         """Whether this loss carries controller state across training steps."""
