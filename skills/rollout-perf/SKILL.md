@@ -183,7 +183,10 @@ uv run --no-project python skills/rollout-perf/rollout_perf_report.py \
 The report:
 - pairs steps and gives the per-step generation-time ratio, with its range
   and tail;
-- compares step, validation and setup time;
+- compares step, validation and setup time, warning when step coverage differs;
+- uses exposed (non-overlapped) generation time when both arms are async;
+- reports timing percentiles of per-step medians across runs, not pooled run
+  tails; retain per-run/request distributions for tail-regression gates;
 - flags workload drift in generated tokens;
 - prints the logprob gates per run;
 - warns when an arm has fewer than 3 runs.

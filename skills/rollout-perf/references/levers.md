@@ -77,8 +77,11 @@ medium-sized token chunks, so graph coverage for prefill matters too.
 
 **Evidence.**
 
-H100 nightly A/Bs, eager → graphs. Every listed arm passed its `check_metrics`
-gates with `token_mult_prob_error` and `gen_kl_error` unchanged.
+H100 nightly A/Bs, eager → graphs (grade C). The PR reports unchanged
+logprob metrics for these comparisons, with one explicit exception to gate
+passing: the Nano V3.5 DAPO test failed its pre-existing step-20
+`token_mult_prob_error` gate in both arms. PR #4459 addresses that gate; the
+speedup alone does not establish that the test passes.
 
 | Test | Generation per step | Wall time |
 | :-- | :-- | :-- |
@@ -189,7 +192,7 @@ GRPO with many generations per prompt also shares the prompt prefix.
 | vLLM | `vllm_cfg.enable_prefix_caching` (null means on for SM ≥ 8.0); hybrid models: `vllm_kwargs.{mamba_cache_mode, mamba_ssm_cache_dtype}` | The prefix cache is reset at every `finish_generation`, so reuse lasts within a step only |
 | SGLang | Radix cache, always on: `sglang_cfg.disable_radix_cache` is declared but not forwarded | The cache is flushed at startup and on KV invalidation |
 | TRT-LLM | `trtllm_kwargs.kv_cache_config.{enable_block_reuse, tokens_per_block, host_cache_size}` | The prefix cache is reset after generation when not colocated; colocated sleep drops the KV |
-| Megatron | `mcore_generation_config.{enable_prefix_caching (default false), prefix_caching_coordinator_policy (default longest_prefix), prefix_caching_routing_alpha, prefix_caching_eviction_policy, prefix_cache_ttl_seconds, prefix_caching_mamba_gb}` | The coordinator routes requests to the replica with the longest cached prefix |
+| Megatron | `mcore_generation_config.{enable_prefix_caching (base recipe true), prefix_caching_coordinator_policy (default longest_prefix), prefix_caching_routing_alpha, prefix_caching_eviction_policy, prefix_cache_ttl_seconds, prefix_caching_mamba_gb}` | The coordinator routes requests to the replica with the longest cached prefix |
 | Dynamo | `vllm_kwargs.enable_prefix_caching`; `dynamo_cfg.frontend_args.router_mode: kv` for KV-aware routing | One frontend URL; the router decides the replica |
 
 **Routing.**
@@ -215,8 +218,8 @@ GRPO with many generations per prompt also shares the prompt prefix.
 - **Hybrid (Mamba) state reuse is version-gated, and a correctness option
   first.**
   - TRT-LLM rc21 crashed with block reuse on a hybrid model (`Invalid
-    recurrent state block index`); rc24 worked. NeMo-RL main pins
-    `tensorrt-llm==1.3.0rc21`.
+    recurrent state block index`); rc24 worked. The current pin is
+    `tensorrt-llm==1.3.0rc28`; revalidate hybrid reuse on that version.
   - An SGLang Mamba radix strategy resolved to a buffer mode under overlap
     scheduling, and reward fell from about 0.29 to 0.13 while requests looked
     faster.

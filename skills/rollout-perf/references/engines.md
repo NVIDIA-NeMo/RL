@@ -139,10 +139,9 @@ engine-bound from feeder-bound directly; use GPU telemetry
   For MNNVL claims, require the MNNVL fabric lines on every replica.
 - **Metrics.** None: `get_logger_metrics()` returns `{}` (a TODO). Use GPU
   telemetry and request timing.
-- **Version.** NeMo-RL pins `tensorrt-llm==1.3.0rc21`. Results from rc24
-  (block reuse on hybrid models, `prefill_cuda_graph_backend: breakable`) may
-  not apply to rc21; check that the pinned version accepts the key and
-  survives.
+- **Version.** The current `pyproject.toml` pins `tensorrt-llm==1.3.0rc28`. The
+  benchmark observations below used rc21/rc24; revalidate them on the pinned
+  version rather than assuming an old failure or improvement still applies.
 - **Landmines.**
   - rc21 block reuse on hybrid Mamba models crashed (`Invalid recurrent state
     block index 2147483647`).
@@ -162,15 +161,15 @@ engine-bound from feeder-bound directly; use GPU telemetry
 - **Config path.** Keys are read into MCore's `InferenceConfig`:
   - Graphs:
     - `cuda_graph_impl: local`, `inference_cuda_graph_scope: block`,
-      `num_cuda_graphs: 4`;
+      `num_cuda_graphs: -1` (autotune);
     - `cuda_graph_max_tokens: 512`,
       `cuda_graph_sizing_distribution: hybrid`;
     - `use_cuda_graphs_for_non_decode_steps: true`.
   - Memory and scheduling:
     - `buffer_size_gb: 10`, `block_size_tokens: 256`;
     - `max_tokens: 16384`, `enable_chunked_prefill: true`;
-    - `kv_cache_management_mode: persist`, `async_sched_mode: async`.
-  - Prefix caching: `enable_prefix_caching: false`, with
+    - `kv_cache_management_mode: recompute`, `async_sched_mode: async`.
+  - Prefix caching: `enable_prefix_caching: true`, with
     `prefix_caching_coordinator_policy: longest_prefix`.
 
   Any `megatron_cfg` key can be overridden for the inference model.

@@ -244,16 +244,17 @@ def scan_log(path: Path) -> dict[str, dict[str, str]]:
     anchored: set[str] = set()
     with path.open(errors="replace") as handle:
         for line in handle:
-            anchored.update(
-                engine
-                for engine, anchors in ENGINE_ANCHORS.items()
-                if any(anchor in line for anchor in anchors)
-            )
             for name, pattern in CONFIG_PATTERNS.items():
                 if name not in config and (match := re.search(pattern, line)):
                     config[name] = match.group(1)
             if "Overrides:" in line or "MasterConfig(" in line:
                 continue
+            line_engines = {
+                engine
+                for engine, anchors in ENGINE_ANCHORS.items()
+                if any(anchor in line for anchor in anchors)
+            }
+            anchored.update(line_engines)
             if "Capturing CUDA graphs" in line:
                 captured = True
             if match := VLLM_STATS.search(line):
@@ -267,6 +268,10 @@ def scan_log(path: Path) -> dict[str, dict[str, str]]:
                     )
                 )
             for engine, patterns in ENGINE_PATTERNS.items():
+                # Config dumps share field names across engines; another engine's
+                # dump must not supply this engine's effective settings.
+                if line_engines and engine not in line_engines:
+                    continue
                 seen = found.setdefault(engine, {})
                 for name, pattern in patterns.items():
                     if (name in seen and name not in LAST_VALUE) or not (
@@ -319,7 +324,9 @@ def diagnose(
         gen_vals = [gen[s] for s in steps]
         gen_med = med(gen_vals)
         quartiles = (
-            statistics.quantiles(gen_vals, n=4) if len(gen_vals) >= 2 else [gen_med] * 3
+            statistics.quantiles(gen_vals, n=4, method="inclusive")
+            if len(gen_vals) >= 2
+            else [gen_med] * 3
         )
         iqr = (quartiles[2] - quartiles[0]) / gen_med if gen_med > 0 else math.nan
         print(f"total step time, median: {med(step[s] for s in steps):.1f} s")
@@ -506,30 +513,59 @@ def compare(base: list[dict], treat: list[dict]) -> None:
         )
     elif len(base) < 3:
         print("  note: fewer than 3 control runs; grade B evidence at best.")
-    gb, gt = arm_series(base, GEN), arm_series(treat, GEN)
+    generation_key = GEN
+    generation_label = "generation"
+    if all(
+        not series(run, GEN) and series(run, PHASES["exposed generation (async)"])
+        for run in base + treat
+    ):
+        generation_key = PHASES["exposed generation (async)"]
+        generation_label = "exposed generation (non-overlapped)"
+    print(
+        "timing distributions use per-step medians across runs, not pooled run tails."
+    )
+    for key in (
+        generation_key,
+        STEP,
+        VAL,
+        SETUP,
+        PHASES["refit"],
+        MEAN_GEN,
+        TMPE,
+        GEN_KL,
+    ):
+        coverage = [set(series(run, key)) for run in base + treat]
+        if any(steps != coverage[0] for steps in coverage[1:]):
+            print(
+                f"warning: unequal step coverage for {key}; "
+                f"base {[len(s) for s in coverage[: len(base)]]}, "
+                f"treat {[len(s) for s in coverage[len(base) :]]}. "
+                "Only common steps are compared; verify run completeness before claiming a speedup."
+            )
+    gb, gt = arm_series(base, generation_key), arm_series(treat, generation_key)
     paired = sorted(s for s in set(gb) & set(gt) if gb[s] > 0)
     if not paired:
         print("warning: no steps with generation timing are shared by both arms.")
     if paired:
         ratios = [gt[s] / gb[s] for s in paired]
         print(
-            f"paired steps: {len(paired)}; generation ratio treat/base median "
+            f"paired steps: {len(paired)}; {generation_label} ratio treat/base median "
             f"{med(ratios):.3f} (min {min(ratios):.3f}, max {max(ratios):.3f})"
         )
         for name, arm in (("base", gb), ("treat", gt)):
             values = [arm[s] for s in paired]
             p90 = (
-                statistics.quantiles(values, n=10)[-1]
+                statistics.quantiles(values, n=10, method="inclusive")[-1]
                 if len(values) >= 2
                 else values[0]
             )
             print(
-                f"  [{name}] generation per step p50 {med(values):.1f} s, "
+                f"  [{name}] {generation_label} per step p50 {med(values):.1f} s, "
                 f"p90 {p90:.1f} s, max {max(values):.1f} s"
             )
     rows: list[tuple[str, str, Callable[[list[float]], float]]] = [
-        ("generation per step, median (s)", GEN, med),
-        ("generation, sum over paired steps (s)", GEN, sum),
+        (f"{generation_label} per step, median (s)", generation_key, med),
+        (f"{generation_label}, sum over paired steps (s)", generation_key, sum),
         ("total step time, sum over paired steps (s)", STEP, sum),
         ("refit, sum over paired steps (s)", PHASES["refit"], sum),
         ("validation, sum (s)", VAL, sum),
