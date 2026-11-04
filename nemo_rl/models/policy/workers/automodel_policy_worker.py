@@ -218,14 +218,15 @@ def automodel_lora_params_generator(
 
 
 def _module_params_generator(
-    model: nn.Module, target_dtype: torch.dtype
+    model: nn.Module, target_dtype: Optional[torch.dtype]
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
 
     Args:
         model: The model whose parameters to generate.
-        target_dtype: The default dtype for refit tensors. Source-FP32
-            ``e_score_correction_bias`` tensors retain FP32.
+        target_dtype: The default dtype for refit tensors. None preserves each
+            source dtype for checkpoint export. Source-FP32 router correction
+            biases retain FP32.
 
     Yields:
         Tuples of (fully_qualified_name, tensor) where tensors are converted to
@@ -252,7 +253,11 @@ def _module_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            refit_dtype = _refit_tensor_dtype(adapted_fqn, adapted_tensor, target_dtype)
+            refit_dtype = (
+                adapted_tensor.dtype
+                if target_dtype is None
+                else _refit_tensor_dtype(adapted_fqn, adapted_tensor, target_dtype)
+            )
             yield (
                 adapted_fqn,
                 adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
@@ -1695,6 +1700,37 @@ class AutomodelPolicyWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
         return model
+
+    @torch.no_grad()
+    def export_hf_checkpoint(
+        self,
+        path: str,
+        allowed_names: list[str],
+        config_dir: str,
+        dtypes: dict[str, str],
+    ) -> dict[str, Any]:
+        """Export serving weights in their checkpoint dtypes on rank zero."""
+        # The serializer is needed only by external checkpoint-based generation.
+        from nemo_rl.models.policy.checkpoint_export import (
+            SHARD_BYTES,
+            export_hf_checkpoint,
+        )
+
+        offloaded = self.cpu_offload
+        if offloaded:
+            self.model = self.move_to_cuda(self.model)
+        try:
+            return export_hf_checkpoint(
+                _module_params_generator(self.model, None),
+                path,
+                allowed_names,
+                config_dir,
+                SHARD_BYTES,
+                dtypes,
+            )
+        finally:
+            if offloaded:
+                self.model = self.move_to_cpu(self.model)
 
     def save_checkpoint(
         self,

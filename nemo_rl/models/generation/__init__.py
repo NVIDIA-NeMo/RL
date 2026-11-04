@@ -110,6 +110,13 @@ def resolve_generation_class(
         from nemo_rl.models.generation.dynamo import DynamoGeneration
 
         return DynamoGeneration
+    if backend == "coreweave":
+        # cwtrain is optional and is imported only for this backend.
+        from nemo_rl.models.generation.coreweave.coreweave_generation import (
+            CoreWeaveGeneration,
+        )
+
+        return CoreWeaveGeneration
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 

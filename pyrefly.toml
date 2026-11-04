@@ -25,6 +25,9 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/models/generation/coreweave/*.py",
+  "nemo_rl/models/policy/checkpoint_export.py",
+  "nemo_rl/weight_sync/coreweave_weight_synchronizer.py",
   "nemo_rl/environments/call_selection.py",
   "nemo_rl/algorithms/single_controller_utils/logical_advantage.py",
   "nemo_rl/data/captured_media.py",

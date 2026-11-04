@@ -1,0 +1,27 @@
+defaults: ../../grpo_math_1B.yaml
+policy:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  generation:
+    backend: coreweave
+    colocated:
+      enabled: false
+    coreweave_cfg:
+      base_url: ${oc.env:CWTRAIN_ROLLOUT_BASE_URL,null}
+      model: ${oc.env:CWTRAIN_ROLLOUT_MODEL,null}
+      deployment_id: ${oc.env:CWTRAIN_HOTLOAD_DEPLOYMENT_ID,null}
+      run_id: ${oc.env:CWTRAIN_HOTLOAD_RUN_ID,null}
+      state_dir: ${oc.env:CWTRAIN_HOTLOAD_STATE_DIR,null}
+      max_model_len: ${policy.max_total_sequence_length}
+      api_key_file: ${oc.env:CWTRAIN_ROLLOUT_API_KEY_FILE,null}
+      concurrency: 32
+      timeout: 600.0
+      max_attempts: 3
+      full_every: 1
+      upload_workers: 8
+      wait: true
+      verify: true
+      prompt_cache_policy: reset_all
+      require_logprobs: true
+      importance_sampling: true
+cluster:
+  gpus_per_node: 8
