@@ -1436,6 +1436,10 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     request = SimpleNamespace(
         top_k=-1,
         min_p=None,
+        repetition_penalty=None,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        logit_bias=None,
         top_p=1.0,
         temperature=1.0,
         ng_capture=admission.model_dump(),

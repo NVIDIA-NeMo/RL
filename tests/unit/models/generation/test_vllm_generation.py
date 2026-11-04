@@ -1155,6 +1155,9 @@ def _fake_chat_request():
         top_k=-1,
         min_p=None,
         repetition_penalty=None,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        logit_bias=None,
         top_p=1.0,
         temperature=1.0,
         max_tokens=1,
@@ -1197,9 +1200,18 @@ def test_chat_request_pins_top_k_and_disables_min_p(
 
 
 @pytest.mark.parametrize(
-    "field,value", [("top_k", 50), ("min_p", 0.1), ("repetition_penalty", 1.05)]
+    "field,value",
+    [
+        ("top_k", 50),
+        ("min_p", 0.1),
+        ("repetition_penalty", 1.05),
+        # Logits modifiers the trainer does not replay.
+        ("presence_penalty", 0.5),
+        ("frequency_penalty", 0.5),
+        ("logit_bias", {"1": 5.0}),
+    ],
 )
-def test_chat_request_rejects_mismatched_top_k_and_min_p(
+def test_chat_request_rejects_unreplayed_sampling_params(
     monkeypatch: pytest.MonkeyPatch, field: str, value: float
 ) -> None:
     worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)

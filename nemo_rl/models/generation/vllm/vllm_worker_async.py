@@ -1675,8 +1675,9 @@ class VllmAsyncGenerationWorkerImpl(
             # generation_config.json (e.g. Qwen2.5-Instruct's repetition_penalty=1.05).
             # Pin top_k to what the trainer replays (as in
             # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params) and
-            # disable min_p and the repetition penalty, which the trainer does not
-            # replay.
+            # disable min_p and the repetition penalty. vLLM applies these and the
+            # presence/frequency penalties and logit bias before sampling; the
+            # trainer replays none of them, so a request may not set them.
             top_k = generation_config["top_k" if is_train_sampling else "val_top_k"]
             top_k = top_k if top_k is not None else -1
             assert request.top_k in (None, top_k), (
@@ -1690,6 +1691,15 @@ class VllmAsyncGenerationWorkerImpl(
                 f"request repetition_penalty={request.repetition_penalty} is not "
                 "supported; leave it unset"
             )
+            assert request.presence_penalty in (None, 0.0), (
+                f"request presence_penalty={request.presence_penalty} is not "
+                "supported; leave it unset"
+            )
+            assert request.frequency_penalty in (None, 0.0), (
+                f"request frequency_penalty={request.frequency_penalty} is not "
+                "supported; leave it unset"
+            )
+            assert not request.logit_bias, "request logit_bias is not supported"
             request.top_k = top_k
             request.min_p = 0.0
             request.repetition_penalty = 1.0
