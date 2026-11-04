@@ -80,13 +80,37 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
-from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
+from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    INPUT_IDS,
+    INPUT_LENGTHS,
+    SAMPLER_TOPK_FIELDS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 
 if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
     # back through the controller.
     from nemo_rl.algorithms.ppo import PPOConfig
+
+
+def _train_fields_for_step(
+    *,
+    policy_logprobs_required: bool,
+    reference_logprobs_required: bool,
+    sampler_head_required: bool,
+) -> tuple[str, ...]:
+    """Return only the data-plane columns produced for this train step."""
+    fields = tuple(
+        field
+        for field in DP_TRAIN_FIELDS
+        if (policy_logprobs_required or field != "prev_logprobs")
+        and (reference_logprobs_required or field != "reference_policy_logprobs")
+    )
+    if sampler_head_required:
+        fields += SAMPLER_TOPK_FIELDS
+    return fields
 
 
 @dataclass(frozen=True)
@@ -204,6 +228,16 @@ class AdvantageStageConfig:
                 ]
             )
         return list(dict.fromkeys(fields))
+
+    def train_fields(self, master_config: Any) -> tuple[str, ...]:
+        """Return the data-plane columns a train step reads."""
+        return _train_fields_for_step(
+            policy_logprobs_required=self.policy_logprobs_required,
+            reference_logprobs_required=self.reference_logprobs_required,
+            # Score centering and sampler replay both read the captured head.
+            sampler_head_required=master_config.loss_fn.score_centering
+            or sampler_replay_enabled(master_config.policy["generation"]),
+        )
 
 
 @dataclass(frozen=True)
