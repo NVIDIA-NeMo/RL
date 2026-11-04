@@ -389,7 +389,11 @@ class VllmAsyncGenerationWorkerImpl(
         # The task serving this engine through Dynamo, when it is registered.
         self._dynamo_endpoint_task: Optional[asyncio.Task] = None
 
-        self._initialize_http_state()
+        # Initialize HTTP server, token capture, and API server pool state.
+        self._init_frontend_state()
+
+        if bundle_indices is not None and config["vllm_cfg"].get("expose_http_server"):
+            self._reserve_port()
 
         super().__init__(
             config,
@@ -406,13 +410,10 @@ class VllmAsyncGenerationWorkerImpl(
         self._deferred_bundle_indices = bundle_indices
         self._deferred_seed = seed
 
-        if self.cfg["vllm_cfg"].get("expose_http_server"):
-            self._reserve_port()
-
         self.llm = None
         self.vllm_device_ids = None
 
-    def _initialize_http_state(self) -> None:
+    def _init_frontend_state(self) -> None:
         """Initialize frontend state without constructing a GPU worker."""
         # Defaults for HTTP server state; populated after the actor loop starts.
         self.server_thread = None
@@ -588,8 +589,6 @@ class VllmAsyncGenerationWorkerImpl(
         # Initialize the vLLM engine
         api_server_count = self.cfg["vllm_cfg"].get("http_api_server_count", 1)
         if api_server_count > 1:
-            if self._reserved_socket is None:
-                self._reserve_port()
             # Multiple API servers require separate frontend and engine setup.
             self._api_server_pool = MultiAPIServerPool(self, api_server_count)
             self.llm = self._api_server_pool.create_engine(
