@@ -159,6 +159,10 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.engine_timeline import (
+    calibrate_cluster_clocks,
+    timeline_collection_enabled,
+)
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
     current_trace_carrier,
@@ -3438,6 +3442,7 @@ def _grpo_train_impl(
     processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run GRPO training algorithm."""
+    _record_clock_calibration(master_config)
     timer = Timer(context={"worker": "driver"})
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
@@ -4704,6 +4709,20 @@ def _grpo_train_impl(
     checkpointer.shutdown()
 
 
+def _record_clock_calibration(master_config: MasterConfig) -> None:
+    """Write each Ray host's wall-clock offset from the driver to ``clock_calibration.jsonl``.
+
+    Only under NRL_COLLECT_TIMELINE_FIELDS. The generation servers stamp their per-request
+    timeline fields with their own host's clock; the offsets let a consumer map those stamps onto
+    one clock (see ``nemo_rl.telemetry.llm_span_breakdown_hook``).
+    """
+    if not timeline_collection_enabled():
+        return
+    log_dir = os.path.abspath(str(master_config.logger.log_dir))
+    os.makedirs(log_dir, exist_ok=True)
+    calibrate_cluster_clocks(os.path.join(log_dir, "clock_calibration.jsonl"))
+
+
 @umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.grpo.job")
 def grpo_train(
     policy: ColocatablePolicyInterface,
@@ -5175,6 +5194,7 @@ def async_grpo_train(
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
+    _record_clock_calibration(master_config)
     timer = Timer(context={"worker": "driver"})
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None

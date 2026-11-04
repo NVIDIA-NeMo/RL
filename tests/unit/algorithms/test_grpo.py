@@ -9456,3 +9456,34 @@ def test_trainers_never_let_over_length_prompts_vote(
     counterfactual = all_rows[response] / all_rows[response].var(correction=0).sqrt()
     assert counterfactual.abs().max().item() == pytest.approx(2.236, abs=1e-3)
     assert not torch.allclose(counterfactual[:2], advantages[0][response[0]])
+
+
+class TestRecordClockCalibration:
+    """The clock offsets the generation servers' per-request timeline fields are mapped with."""
+
+    @staticmethod
+    def _master_config(log_dir):
+        return SimpleNamespace(logger=SimpleNamespace(log_dir=str(log_dir)))
+
+    def test_does_nothing_without_the_opt_in(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("NRL_COLLECT_TIMELINE_FIELDS", raising=False)
+        monkeypatch.setattr(
+            grpo_mod,
+            "calibrate_cluster_clocks",
+            lambda path: pytest.fail("clocks were calibrated without the opt-in"),
+        )
+
+        grpo_mod._record_clock_calibration(self._master_config(tmp_path))
+
+        assert list(tmp_path.iterdir()) == []
+
+    def test_calibrates_the_clocks_into_the_log_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NRL_COLLECT_TIMELINE_FIELDS", "1")
+        calibrated = []
+        monkeypatch.setattr(
+            grpo_mod, "calibrate_cluster_clocks", lambda path: calibrated.append(path)
+        )
+
+        grpo_mod._record_clock_calibration(self._master_config(tmp_path / "logs"))
+
+        assert calibrated == [str(tmp_path / "logs" / "clock_calibration.jsonl")]
