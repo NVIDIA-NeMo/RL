@@ -587,15 +587,23 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires the Megatron backend"
         )
+    # Detached MTP heads keep their own pre-filter denominator; attached heads
+    # would mix it into shared gradients that are rescaled by survivors.
+    if policy["megatron_cfg"].get("mtp_num_layers") and not policy["megatron_cfg"].get(
+        "mtp_detach_heads", False
+    ):
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss supports MTP only with "
+            "policy.megatron_cfg.mtp_detach_heads=true"
+        )
     draft = coerce_draft_config(policy.get("draft"))
     if (
-        policy["megatron_cfg"].get("mtp_num_layers")
-        or (draft is not None and draft.enabled)
+        (draft is not None and draft.enabled)
         or loss.positive_example_nll_weight != 0
         or opd_module.is_opd_enabled(master_config)
     ):
         raise ValueError(
-            "loss_fn.seq_logprob_error_in_loss does not support MTP, draft, "
+            "loss_fn.seq_logprob_error_in_loss does not support draft, "
             "positive-example NLL, or distillation losses"
         )
 

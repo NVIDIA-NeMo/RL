@@ -8824,6 +8824,21 @@ def test_validate_single_forward_config(mock_grpo_components, draft) -> None:
         _validate_seq_logprob_error_in_loss(config)
 
 
+def test_validate_single_forward_accepts_detached_mtp(mock_grpo_components) -> None:
+    config = mock_grpo_components["master_config"]
+    config.loss_fn.seq_logprob_error_in_loss = True
+    config.grpo.seq_logprob_error_threshold = 2.0
+    config.loss_fn.force_on_policy_ratio = True
+    config.loss_fn.token_level_loss = True
+    config.policy["megatron_cfg"] = {
+        "enabled": True,
+        "mtp_num_layers": 2,
+        "mtp_detach_heads": True,
+    }
+    config.policy["draft"] = {"enabled": False}
+    _validate_seq_logprob_error_in_loss(config)
+
+
 @pytest.mark.parametrize(
     "override, message",
     [
@@ -8833,7 +8848,10 @@ def test_validate_single_forward_config(mock_grpo_components, draft) -> None:
         ({"loss_fn": {"use_kl_in_reward": True}}, "advantage estimator"),
         ({"loss_fn": {"positive_example_nll_weight": 0.1}}, "NLL"),
         ({"policy": {"megatron_cfg": {"enabled": False}}}, "Megatron backend"),
-        ({"policy": {"megatron_cfg": {"enabled": True, "mtp_num_layers": 1}}}, "MTP"),
+        (
+            {"policy": {"megatron_cfg": {"enabled": True, "mtp_num_layers": 1}}},
+            "mtp_detach_heads=true",
+        ),
         ({"policy": {"draft": {"enabled": True}}}, "draft"),
         ({"policy": {"draft": Eagle3DraftConfig(enabled=True)}}, "draft"),
     ],

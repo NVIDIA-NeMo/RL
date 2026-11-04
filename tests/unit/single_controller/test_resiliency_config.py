@@ -113,6 +113,21 @@ def test_single_forward_threshold_rejected_for_forest_training() -> None:
         validate_single_controller_config(cfg)
 
 
+@pytest.mark.parametrize("detach_heads", [True, False])
+def test_single_forward_threshold_supports_only_detached_mtp(
+    detach_heads: bool,
+) -> None:
+    cfg = _single_forward_config()
+    cfg.policy["megatron_cfg"].update(
+        {"mtp_num_layers": 2, "mtp_detach_heads": detach_heads}
+    )
+    if detach_heads:
+        validate_single_controller_config(cfg)
+    else:
+        with pytest.raises(ValueError, match="mtp_detach_heads=true"):
+            validate_single_controller_config(cfg)
+
+
 def test_single_forward_threshold_requires_a_threshold() -> None:
     cfg = _single_forward_config()
     cfg.grpo.seq_logprob_error_threshold = None

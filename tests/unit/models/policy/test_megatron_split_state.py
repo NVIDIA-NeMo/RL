@@ -1298,6 +1298,35 @@ class TestFinishInLossSeqFilter:
         assert {m["global_valid_toks"] for m in metrics} == {600.0}
         assert {m["global_valid_seqs"] for m in metrics} == {4.0}
 
+    def test_detached_mtp_keeps_pre_filter_token_denominator(self, mock_module_symbols):
+        """MTP's loss mask is built before filtering, so it divides by all tokens."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
+        w.model.config.mtp_detach_heads = True
+        mtp_param, other_param = TestFinish._mtp_params()
+        w.model.parameters = MagicMock(return_value=[mtp_param, other_param])
+        mock_module_symbols["mfb"].return_value = [
+            {
+                "loss": 3.0,
+                "seq_logprob_error_valid_seqs": 2.0,
+                "seq_logprob_error_valid_tokens": 300.0,
+                "num_masked_seqs_by_logprob_error": 6.0,
+            }
+        ]
+        w.begin_train_step(loss_fn=_in_loss_seq_filter_loss_fn())
+        w.train_microbatch(_fake_batch())  # 2048 tokens before filtering
+        w.finish_train_step()
+
+        reduced = mock_module_symbols["all_reduce"].call_args_list[0].args[0]
+        assert reduced.tolist() == [2.0, 300.0, 2048.0]
+        assert w.model.scale_gradients.call_args.args[0] == pytest.approx(1 / 300)
+        # Main loss gets 1/300; MTP additionally gets 300/2048, for net 1/2048.
+        torch.testing.assert_close(mtp_param.main_grad, torch.full((4,), 300 / 2048))
+        torch.testing.assert_close(other_param.main_grad, torch.ones(4))
+
     def test_empty_survivor_step_raises_before_any_update(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
