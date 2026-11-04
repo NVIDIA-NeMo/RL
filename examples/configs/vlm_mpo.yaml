@@ -141,7 +141,6 @@ policy:
     flash_attention_version: 2
     bias_activation_fusion: true
     defer_fp32_logits: false
-    # Write the chunked logprob grad into the packed logits' storage; see MegatronConfig.
     reuse_logits_storage: false
     moe_per_layer_logging: false
     moe_enable_deepep: false

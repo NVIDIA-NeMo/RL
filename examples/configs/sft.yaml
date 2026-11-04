@@ -181,7 +181,6 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
-    # Write the chunked logprob grad into the packed logits' storage; see MegatronConfig.
     reuse_logits_storage: false
     fp32_lm_head: false # Emit fp32 logits from Megatron's LM head.
     moe_per_layer_logging: False
