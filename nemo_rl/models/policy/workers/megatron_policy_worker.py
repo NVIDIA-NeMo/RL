@@ -65,7 +65,10 @@ from nemo_rl.algorithms.loss.interfaces import (
     get_objective_reduction,
 )
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
-from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
+from nemo_rl.algorithms.loss.utils import (
+    metric_normalizer_scales,
+    rescale_loss_metrics,
+)
 from nemo_rl.algorithms.loss.wrapper import StreamingObjectiveLoss
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
@@ -1451,6 +1454,8 @@ class MegatronPolicyWorkerImpl(
                 loss_fn.metric_normalizations,
                 token_factor=token_factor,
                 sequence_factor=sequence_factor,
+                # The gradient was rescaled by token_factor above.
+                loss_divisor_factor=token_factor,
             )
             for m in metrics
         ]
@@ -2613,8 +2618,12 @@ class MegatronPolicyWorkerImpl(
             if global_valid_seqs.item() > 0
             else torch.tensor(1.0, device="cuda")
         )
-        inv_toks = float((1.0 / n_toks_safe).item())
-        inv_seqs = float((1.0 / n_seqs_safe).item())
+        scales = metric_normalizer_scales(
+            state["objective_reduction"],
+            global_valid_toks=n_toks_safe,
+            global_valid_seqs=n_seqs_safe,
+            global_objective_denominator=n_safe,
+        )
 
         from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 
@@ -2629,12 +2638,10 @@ class MegatronPolicyWorkerImpl(
             kind = metric_normalizations.get(name)
             if kind is MetricNormalizer.NONE:
                 return value
-            if kind is MetricNormalizer.TOKENS:
-                scale = inv_toks
-            elif kind is MetricNormalizer.SEQUENCES:
-                scale = inv_seqs
-            else:  # not advertised → same as gradient normalization
+            if kind is None:  # not advertised → same as gradient normalization
                 scale = inv_n
+            else:
+                scale = scales[kind]
             return (
                 value.detach() * scale
                 if isinstance(value, torch.Tensor)
