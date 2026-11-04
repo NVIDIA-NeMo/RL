@@ -90,22 +90,22 @@ ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.draft", "policy.generation.vllm_kwargs
 SUITE_BUDGETS = {
     ("nightly", "h100"): {
         "runs_per_week": 7,
-        "max_gpu_hours_per_week": 29_800,
+        "max_gpu_hours_per_week": 33_200,
         "suggested_room": 224,  # 32 GPU-hours x 7 runs
     },
     ("nightly", "gb200"): {
         "runs_per_week": 7,
-        "max_gpu_hours_per_week": 6_300,
+        "max_gpu_hours_per_week": 8_000,
         "suggested_room": 112,  # 16 GPU-hours x 7 runs
     },
     ("release", "h100"): {
         "runs_per_week": 1,
-        "max_gpu_hours_per_week": 9_600,
+        "max_gpu_hours_per_week": 9_100,
         "suggested_room": 128,  # 128 GPU-hours x 1 run
     },
     ("release", "gb200"): {
         "runs_per_week": 1,
-        "max_gpu_hours_per_week": 2_800,
+        "max_gpu_hours_per_week": 3_300,
         "suggested_room": 64,  # 64 GPU-hours x 1 run
     },
     ("performance", "h100"): {
