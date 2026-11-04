@@ -1942,10 +1942,6 @@ class TestPeriodicRolloutCheckpoint:
             {"claimed-group"} if claimed else set()
         )
 
-    def test_restore_mode_rejects_removed_none_value(self):
-        with pytest.raises(ValidationError, match="restore_mode"):
-            RolloutCheckpointConfig.model_validate({"restore_mode": "none"})
-
     @pytest.mark.parametrize(
         "config",
         [

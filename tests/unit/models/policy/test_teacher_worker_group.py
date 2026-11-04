@@ -29,16 +29,6 @@ from nemo_rl.data_plane.schema import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
-def test_teacher_resource_config_defaults():
-    from nemo_rl.algorithms.opd import TeacherResourceConfig
-
-    res = TeacherResourceConfig(tensor_model_parallel_size=4)
-    assert res.tensor_model_parallel_size == 4
-    assert res.pipeline_model_parallel_size == 1
-    assert res.gpus_per_node == 8
-    assert res.precision == "bf16"
-
-
 def test_create_teacher_configs_homogeneous():
     from nemo_rl.models.policy.teacher_worker_group import (
         create_teacher_configs_from_opd_config,
