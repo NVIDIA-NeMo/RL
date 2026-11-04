@@ -25,6 +25,8 @@ import nemo_rl.experience.rollouts as rollouts
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
 
+pytestmark = pytest.mark.mcore
+
 
 class Tokenizer:
     pad_token_id = 0
@@ -37,24 +39,34 @@ class Tokenizer:
         return SimpleNamespace(input_ids=torch.empty((1, 0), dtype=torch.long))
 
 
-@pytest.mark.parametrize("reason,expected", [("length", True), ("stop", False)])
-def test_truncation_reaches_rollout_metrics(reason, expected):
-    tokenizer = Tokenizer()
-    worker = SimpleNamespace(tokenizer=tokenizer)
-    # Equal-length outputs can either exhaust the response budget or stop at it.
-    result = SimpleNamespace(
-        prompt_tokens=[10, 11],
-        generated_tokens=[20, 21, 22, 23],
-        generated_log_probs=[-1.0] * 4,
-        finish_reason=reason,
-    )
+class MegatronGeneration:
+    """Generation backend that packs one engine reply with the real Megatron parser."""
 
-    class Generation:
-        def generate(self, data, **kwargs):
-            return MegatronGenerationMixin._parse_result_to_batched_data_dict(
-                worker, data, [result]
-            )
+    cfg = {"backend": "megatron"}
 
+    def __init__(self, reason):
+        # Equal-length outputs can either exhaust the response budget or stop at it.
+        self._result = SimpleNamespace(
+            prompt_tokens=[10, 11],
+            generated_tokens=[20, 21, 22, 23],
+            generated_log_probs=[-1.0] * 4,
+            finish_reason=reason,
+        )
+
+    def _parse(self, data):
+        worker = SimpleNamespace(tokenizer=Tokenizer())
+        return MegatronGenerationMixin._parse_result_to_batched_data_dict(
+            worker, data, [self._result]
+        )
+
+    def generate(self, data, **kwargs):
+        return self._parse(data)
+
+    async def generate_async(self, data, **kwargs):
+        yield 0, self._parse(data)
+
+
+def _rollout(rollout_fn, reason):
     batch = BatchedDataDict(
         {
             "message_log": [
@@ -78,11 +90,32 @@ def test_truncation_reaches_rollout_metrics(reason, expected):
         metadata=[None],
     )
     with patch.object(rollouts, "calculate_rewards", return_value=feedback):
-        output, metrics = rollouts.run_multi_turn_rollout(
-            Generation(), batch, tokenizer, {}, max_seq_len=16, max_rollout_turns=1
+        return rollout_fn(
+            MegatronGeneration(reason),
+            batch,
+            Tokenizer(),
+            {},
+            max_seq_len=16,
+            max_rollout_turns=1,
         )
+
+
+ROLLOUTS = [rollouts.run_multi_turn_rollout, rollouts.run_async_multi_turn_rollout]
+
+
+@pytest.mark.parametrize("rollout_fn", ROLLOUTS, ids=["sync", "async"])
+@pytest.mark.parametrize("reason,expected", [("length", True), ("stop", False)])
+def test_truncation_reaches_rollout_metrics(rollout_fn, reason, expected):
+    output, metrics = _rollout(rollout_fn, reason)
     assert output["truncated"].tolist() == [expected]
     assert metrics["truncation_rate"] == float(expected)
+
+
+@pytest.mark.parametrize("reason", [None, "unknown", "error"])
+def test_async_rollout_fails_on_missing_or_unknown_reason(reason):
+    """The native async rollout fails the batch rather than returning the prompt alone."""
+    with pytest.raises(RuntimeError, match="finish_reason"):
+        _rollout(rollouts.run_async_multi_turn_rollout, reason)
 
 
 @pytest.mark.parametrize("reason", [None, "unknown", "error"])
