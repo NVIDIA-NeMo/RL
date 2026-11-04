@@ -2019,9 +2019,8 @@ def setup_single_controller(
             )
         build_tasks["trainer"] = _build_trainer_and_value
 
-    # The refit communicator needs only the trainer and generation, so it starts the moment both return, while Gym
-    # may still be finishing, and runs beside the actor pools created below. Its thread outlives the build executor.
-    # Non-colocated vLLM generation only; the other paths start it in the tail, as before.
+    # The communicator needs only the trainer and generation: start it when both return, beside Gym's last stretch.
+    # Non-colocated vLLM generation only; the other paths start it in the tail.
     tail_lane_secs: dict[str, float] = {}
     communicator_executor = ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="refit-communicator"
@@ -2409,10 +2408,8 @@ def setup_single_controller(
             tail_lane_secs["advantage actors"] = time.perf_counter() - lane_t0
         return advantage_actors
 
-    # The reassembler and advantage pools take tens of seconds each at scale and share no state with each other or with
-    # the communicator, so they start together here and the setup waits for the slowest rather than the sum. All of
-    # them finish before the rollout manager is built, so the pools still exist before the controller configures
-    # checkpoint participants and before any Mooncake restore.
+    # The pools and the communicator share no state, so they run together: the setup waits for the slowest, not the sum.
+    # All finish before the rollout manager is built, so the pools exist before any checkpoint participant or restore.
     tail_started = time.perf_counter()
     with ThreadPoolExecutor(
         max_workers=2, thread_name_prefix="setup-tail"
