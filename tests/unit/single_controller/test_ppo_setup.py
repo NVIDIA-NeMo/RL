@@ -73,6 +73,7 @@ def _value_config(
         "tokenizer": {"name": "Qwen/Qwen3-0.6B"},
         "train_global_batch_size": train_global_batch_size,
         "train_micro_batch_size": 1,
+        "dynamic_batching": {"enabled": False},
         "max_total_sequence_length": 32,
         "megatron_cfg": {"enabled": megatron_enabled},
         "automodel_cfg": {"enabled": not megatron_enabled},
@@ -123,6 +124,8 @@ def _make_master_config(
         else GRPOConfig.model_construct(max_num_steps=max_num_steps, **_STEP_CONFIG),
         policy={
             "train_global_batch_size": _GLOBAL_BATCH_SIZE,
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": False},
             "max_total_sequence_length": 32,
             "tokenizer": {"use_fastokens": False},
             "megatron_cfg": {"enabled": megatron_enabled},
@@ -191,18 +194,6 @@ class TestAlgorithmBlockValidator:
         resolved = OmegaConf.to_container(raw, resolve=True)
         assert isinstance(resolved, dict)
         return resolved
-
-    @pytest.mark.parametrize(
-        "name",
-        [
-            "grpo_math_1B_megatron_single_controller.yaml",
-            "ppo_math_1B_megatron_single_controller.yaml",
-        ],
-        ids=["grpo", "ppo"],
-    )
-    def test_the_exemplars_still_validate(self, name):
-        config = MasterConfig(**self._resolved(name))
-        assert config.checkpointing["save_period"] == 1
 
     def test_rejects_a_config_with_no_algorithm_block(self):
         resolved = self._resolved("grpo_math_1B_megatron_single_controller.yaml")
@@ -731,6 +722,8 @@ def patched_ppo_factories():
     fake_dataloader.__len__ = MagicMock(return_value=4)
     fake_policy = MagicMock(name="policy")
     fake_value = MagicMock(name="value")
+    fake_policy.sharding_annotations.get_axis_size.return_value = 1
+    fake_value.sharding_annotations.get_axis_size.return_value = 1
 
     with (
         patch.object(

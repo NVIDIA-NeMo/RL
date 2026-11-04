@@ -74,6 +74,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     forest_execution_row_multiple,
     is_ppo_run,
     logprob_passes_required,
+    resolve_ppo_chunk_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -210,6 +211,8 @@ class SingleControllerActorArgs:
     # the MSE loss it trains under.
     value_handle: Optional[TQValue] = None
     value_loss_fn: Optional[LossFunction] = None
+    ppo_group_multiple: int = 1
+    ppo_min_remaining_groups: int = 0
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -1781,6 +1784,7 @@ def setup_single_controller(
     megatron_port_holders: list[Any] = []
     reserved_http_server_ports = None
     weight_synchronizer: Optional[WeightSynchronizer] = None
+    ppo_group_multiple, ppo_min_remaining_groups = (1, 0)
     if megatron_backend:
         generation_config["model_name"] = master_config.policy["model_name"]
 
@@ -1802,6 +1806,7 @@ def setup_single_controller(
             A tuple of (TQPolicy trainer, TQValue critic or None, per-phase wall
             times keyed as "trainer_time" and "value_time").
         """
+        nonlocal ppo_group_multiple, ppo_min_remaining_groups
         time_metrics: dict[str, float] = {}
         trainer, time_metrics["trainer_time"] = _build_trainer(
             train_cluster,
@@ -1834,6 +1839,11 @@ def setup_single_controller(
         )
         # Blocks on the critic's async Ray __init__, then parks it on CPU.
         value.finish_training()
+        ppo_group_multiple, ppo_min_remaining_groups = resolve_ppo_chunk_alignment(
+            master_config,
+            trainer.sharding_annotations.get_axis_size("data_parallel"),
+            value.sharding_annotations.get_axis_size("data_parallel"),
+        )
         trainer.prepare_for_training()
         return trainer, value, time_metrics
 
@@ -2273,6 +2283,11 @@ def setup_single_controller(
             create_rollout_reassembler_actors,
         )
 
+        # Set by the resolver only when the think-tag penalty is on.
+        thinking_tags = None
+        if master_config.reward_penalties.penalize_malformed_think_tag:
+            assert resolved_reward_penalty_config is not None
+            thinking_tags = resolved_reward_penalty_config["thinking_tags"]
         finalizer_actors = create_rollout_reassembler_actors(
             dp_config,
             RolloutReassemblerActorConfig(
@@ -2288,6 +2303,12 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
+                tokenizer_config=(
+                    policy_config["tokenizer"]
+                    if master_config.reward_penalties.penalize_malformed_think_tag
+                    else None
+                ),
+                thinking_tags=thinking_tags,
                 top_logprobs=master_config.policy["generation"]["top_logprobs"],
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
@@ -2393,5 +2414,7 @@ def setup_single_controller(
         # PPO extras
         value_handle=value,
         value_loss_fn=value_loss_fn,
+        ppo_group_multiple=ppo_group_multiple,
+        ppo_min_remaining_groups=ppo_min_remaining_groups,
     )
     return actor_args, setup_timing_metrics

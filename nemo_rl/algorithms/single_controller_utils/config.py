@@ -63,6 +63,10 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.call_selection import resolve_selection_policy
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym_task import (
+    get_nemo_gym_attribution_key,
+    is_nemo_gym_task,
+)
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RecoveryTargetLevel,
@@ -713,10 +717,10 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
 class TaskSourceRecoveryGranularity:
     """Resolved retry and restore policy for a prompt-group reservation.
 
-    ``task_source`` is copied from the raw Gym row when present. ``restore_level``
-    is the configured restart target. Until Gym advertises group-scoring
-    capabilities, ``granularity`` is derived from that target and explicit
-    task-source or agent overrides.
+    ``task_source`` is the materialized taskset or the flat Gym row's task source.
+    Materialized rows select a taskset override or the global default; flat rows
+    select an agent override, a task-source override, or the global default.
+    ``restore_level`` records that target; ``granularity`` derives its retry unit.
     """
 
     task_source: Optional[str]
@@ -733,17 +737,17 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     ``turn`` requests Gym participant recovery, ``sibling`` preserves completed
     generations and restarts unfinished siblings, and ``prompt_group`` restarts
     every sibling in an unfinished group. Overrides may only make a particular
-    task source or agent coarser than the global target.
+    taskset, task source, or agent coarser than the global target.
     """
 
     target_level: RecoveryTargetLevel = RecoveryTargetLevel.SIBLING
-    # Keyed by ``extra_env_info.task_source``, which is available before Gym
-    # resolves the concrete agent used to execute the row.
+    # Keyed by ``extra_env_info.task_id.taskset`` for materialized tasks or
+    # ``extra_env_info.task_source`` for flat rows, before Gym resolves an agent.
     task_source_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
     # Keyed by ``extra_env_info.agent_ref.name`` when the input row already has
-    # a concrete Gym route. A matching agent override wins over task_source.
+    # a concrete Gym route. For flat rows, this wins over task_source.
     agent_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
@@ -807,11 +811,23 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     def resolve_for_prompt(
         self, prompt: Mapping[str, Any]
     ) -> TaskSourceRecoveryGranularity:
-        """Resolve using matching agent, matching task source, then default."""
+        """Resolve by taskset for materialized tasks, or agent then source for flat rows."""
         extra_env_info = prompt.get("extra_env_info")
         task_source: Optional[str] = None
         agent_name: Optional[str] = None
         if isinstance(extra_env_info, Mapping):
+            if is_nemo_gym_task(extra_env_info):
+                task_source = get_nemo_gym_attribution_key(extra_env_info)
+                if task_source is None:
+                    raise ValueError(
+                        "materialized Gym prompt must have a non-empty task_id.taskset"
+                    )
+                return TaskSourceRecoveryGranularity(
+                    task_source=task_source,
+                    restore_level=self.task_source_target_level_overrides.get(
+                        task_source, self.target_level
+                    ),
+                )
             raw_task_source = extra_env_info.get("task_source")
             if raw_task_source is not None and not isinstance(raw_task_source, str):
                 raise TypeError("prompt task_source must be a string or None")
@@ -1465,10 +1481,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "PPO on the SingleController path requires "
             "async_rl.rollout_failure.max_skipped_prompts=0 and "
             "max_consecutive_dropped_prompts=0, but they sum to "
-            f"{drop_budget}. A drop shortens the step, and the critic shards that "
-            "step against the configured value.train_global_batch_size rather than "
-            "its actual size, so the first short step fails a divisibility assert "
-            "inside the value workers (#2625)."
+            f"{drop_budget}. A drop shortens the step, but the critic split API "
+            "requires each epoch to contain exactly value.train_global_batch_size "
+            "samples, whether replayed as chunks or one full batch. "
+            "Shortened PPO steps are not supported yet."
         )
 
     if (
@@ -1508,6 +1524,52 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             f"({value_global_batch_size}) so that each critic epoch consumes one "
             "complete RL batch."
         )
+
+
+def resolve_ppo_chunk_alignment(
+    master_config: MasterConfig, policy_dp: int, value_dp: int
+) -> tuple[int, int]:
+    """Validate PPO batch alignment and return sampler group and tail multiples."""
+    if not is_ppo_run(master_config):
+        return 1, 0
+    value_config = master_config.value
+    if value_config is None:
+        raise ValueError("PPO requires a value model configuration")
+
+    def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
+        if config["dynamic_batching"]["enabled"] or (
+            config.get("sequence_packing") and config["sequence_packing"]["enabled"]
+        ):
+            return dp_size
+        train_micro_batch_size = config["train_micro_batch_size"]
+        logprob_batch_size = config.get("logprob_batch_size") or train_micro_batch_size
+        return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
+
+    sample_alignment = math.lcm(
+        sample_multiple(master_config.policy, policy_dp),
+        sample_multiple(value_config, value_dp),
+    )
+    ppo_config = master_config.ppo
+    assert ppo_config is not None
+    group_multiple = sample_alignment // math.gcd(
+        sample_alignment, ppo_config.num_generations_per_prompt
+    )
+    if ppo_config.num_prompts_per_step % group_multiple:
+        raise ValueError(
+            "PPO num_prompts_per_step must be divisible by the policy/value "
+            f"group multiple ({group_multiple}) to avoid an incomplete final chunk"
+        )
+    min_groups = master_config.async_rl.min_groups_for_streaming_train
+    if min_groups < group_multiple:
+        raise ValueError(
+            "PPO min_groups_for_streaming_train must be at least the "
+            f"policy/value group multiple ({group_multiple}) so each chunk "
+            "contains complete microbatches on every DP rank"
+        )
+    min_remaining_groups = (
+        (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
+    )
+    return group_multiple, min_remaining_groups
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
@@ -1776,13 +1838,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "token_capture.num_reassembler_workers exceeds "
             "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
             stacklevel=2,
-        )
-    if (
-        token_capture_config.enabled
-        and master_config.reward_penalties.penalize_malformed_think_tag
-    ):
-        raise ValueError(
-            "token_capture.enabled does not support reward_penalties.penalize_malformed_think_tag"
         )
     if (
         token_capture_config.enabled
