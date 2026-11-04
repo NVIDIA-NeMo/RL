@@ -609,11 +609,25 @@ exists to fence off. Gating it on `rollout` instead would put that volume in
 dataset size. The group has to describe the volume, not the phase, even though
 these spans sit inside the rollout.
 
-Completing the trace on the server side is a change in the Gym repository, not
-this one — its app has to call `nemo.lens.contrib.fastapi.instrument_fastapi`.
-Until it does, the header arrives and is ignored, and Gym's internal spans (if
-any) stay in their own traces. Everything up to and including the client-side
-HTTP span still nests correctly.
+Gym's servers export their own spans whenever NeMo-RL is exporting; you don't
+need to set anything. To pass options to Gym's `telemetry:` block, set
+`env.nemo_gym.telemetry`, for example `{span_groups: "default,sandbox"}`.
+
+- `enabled: false` turns off Gym's servers only. A `NEMO_LENS_ENABLED=1`
+  already in the environment still turns them on.
+- `span_groups` in this block controls Gym's servers and
+  `NEMO_RL_OTEL_SPAN_GROUPS` controls NeMo-RL's processes. A
+  `NEMO_GYM_OTEL_SPAN_GROUPS` or `NEMO_LENS_SPAN_GROUPS` in the environment
+  overrides the block.
+- `job` and `rollout` exist in both libraries, so naming either turns it on
+  for both.
+- Gym servers are named `nemo-rl/<server name>`; `service_name` in this block
+  has no effect.
+- If your recipe sets `skip_venv_if_present`, rebuild or re-prefetch Gym's
+  venvs after turning telemetry on. An older venv has no `nemo-lens`, so its
+  server sends nothing.
+- Known issue: all Gym servers share one `service.instance.id` until
+  [Gym#5100](https://github.com/NVIDIA-NeMo/Gym/pull/5100) merges.
 
 Two failure modes degrade quietly rather than breaking a rollout. Without
 `nemo-lens[aiohttp]` installed the constructor logs a warning once and Gym's
