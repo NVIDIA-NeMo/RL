@@ -29,9 +29,11 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.interfaces import group_token_mean_weights
 from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
 from nemo_rl.algorithms.opd import OnPolicyDistillationFullConfig
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.data_plane.schema import GROUP_TOKEN_MEAN_WEIGHT
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 # Two prompt groups with unequal response lengths and unequal group masses:
@@ -43,7 +45,9 @@ VOCAB = 7
 TOP_K = 2
 KL_COEF = 0.1
 
-NORMALIZATIONS = ("global_token_mean", "sequence_mean")
+NORMALIZATIONS = ("global_token_mean", "sequence_mean", "group_token_mean")
+# Formulas that existed before the reducer refactor.
+LEGACY_NORMALIZATIONS = ("global_token_mean", "sequence_mean")
 TERMS = ("none", "kl", "score_centering", "opd_full", "opd_full_kl")
 # Dropped (0) and fractionally weighted rows must leave both the sums and the
 # denominators exactly as the oracle weights them.
@@ -52,6 +56,17 @@ SAMPLE_MASKS = {
     "longest_dropped": (0.0, 1.0, 1.0, 1.0),
     "fractional": (1.0, 0.0, 0.5, 0.25),
 }
+# Combinations the loss rejects at construction.
+UNSUPPORTED = {
+    ("group_token_mean", "opd_full"),
+    ("group_token_mean", "opd_full_kl"),
+}
+CASES = [
+    (normalization, term)
+    for normalization in NORMALIZATIONS
+    for term in TERMS
+    if (normalization, term) not in UNSUPPORTED
+]
 
 
 def _batch(
@@ -82,6 +97,13 @@ def _batch(
         ),
         sampler_topk_token_ids=sampler_topk_ids,
         sampler_topk_logprobs=sampler_topk_logprobs,
+    )
+    data[GROUP_TOKEN_MEAN_WEIGHT] = group_token_mean_weights(
+        [f"s{row}" for row in range(batch_size)],
+        token_mask,
+        data["sample_mask"],
+        group_indices=torch.tensor(GROUP_INDICES),
+        expected_group_size=2,
     )
     topk_policy = policy_logprobs.gather(-1, sampler_topk_ids)[:, 1:]
     outputs = {
@@ -151,6 +173,17 @@ def _oracle(normalization: str, values: torch.Tensor, data: BatchedDataDict):
     if normalization == "sequence_mean":
         per_response = [r / n * s for r, n, s in zip(rows, lengths, sample_mask)]
         return sum(per_response) / sample_mask.sum()
+    if normalization == "group_token_mean":
+        # Each prompt group's token mean, then the mean over groups with tokens.
+        group_tokens: dict[int, torch.Tensor] = {}
+        for group, n, s in zip(GROUP_INDICES, lengths, sample_mask):
+            group_tokens[group] = group_tokens.get(group, 0.0) + n * s
+        nonempty_groups = sum(1 for total in group_tokens.values() if total > 0)
+        weighted = [
+            r * s / group_tokens[group]
+            for r, s, group in zip(rows, sample_mask, GROUP_INDICES)
+        ]
+        return sum(weighted) / nonempty_groups
     raise AssertionError(f"no oracle for {normalization}")
 
 
@@ -172,6 +205,10 @@ def _run_loss(normalization: str, term: str, data, outputs, **call_kwargs):
     cfg, extra = _loss_config(normalization, term)
     loss_fn = ClippedPGLossFn(cfg, **extra)
     mask = data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+    if loss_fn.objective_reduction.requires_explicit_denominator:
+        # What the split worker would all-reduce for this (single-chunk) batch.
+        _, _, denominator = loss_fn.objective_reduction.local_counts(data)
+        call_kwargs.setdefault("global_objective_denominator", denominator)
     kwargs = {
         "data": data,
         "next_token_logprobs": outputs["next_token_logprobs"],
@@ -207,8 +244,7 @@ def _assert_same_value_and_grads(actual, expected, outputs) -> None:
 
 
 @pytest.mark.parametrize("sample_mask", SAMPLE_MASKS)
-@pytest.mark.parametrize("term", TERMS)
-@pytest.mark.parametrize("normalization", NORMALIZATIONS)
+@pytest.mark.parametrize("normalization,term", CASES)
 def test_every_loss_term_follows_the_configured_reduction(
     normalization: str, term: str, sample_mask: str
 ) -> None:
@@ -220,7 +256,7 @@ def test_every_loss_term_follows_the_configured_reduction(
 
 @pytest.mark.parametrize("sample_mask", SAMPLE_MASKS)
 @pytest.mark.parametrize("term", TERMS)
-@pytest.mark.parametrize("normalization", NORMALIZATIONS)
+@pytest.mark.parametrize("normalization", LEGACY_NORMALIZATIONS)
 def test_reducers_preserve_the_pre_refactor_formula(
     normalization: str, term: str, sample_mask: str
 ) -> None:
@@ -240,4 +276,13 @@ def test_batch_distinguishes_the_reductions() -> None:
     data, outputs = _batch()
     values = _per_token_terms("none", data, outputs)
     results = [_oracle(mode, values, data) for mode in NORMALIZATIONS]
-    assert not torch.allclose(results[0], results[1])
+    for i, first in enumerate(results):
+        for second in results[i + 1 :]:
+            assert not torch.allclose(first, second)
+
+
+@pytest.mark.parametrize("normalization,term", sorted(UNSUPPORTED))
+def test_unsupported_combinations_are_rejected(normalization: str, term: str) -> None:
+    cfg, extra = _loss_config(normalization, term)
+    with pytest.raises(ValueError, match="does not support"):
+        ClippedPGLossFn(cfg, **extra)

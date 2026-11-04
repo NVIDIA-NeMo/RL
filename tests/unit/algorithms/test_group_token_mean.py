@@ -130,14 +130,17 @@ def test_group_loss_gradient_and_partition_invariance(empty: bool) -> None:
     )
 
     # Split siblings across chunks; the complete-group weights must stay fixed.
-    losses, token_errors = [], []
+    losses, token_errors, chunk_groups = [], [], []
     for indices in ([6, 2], [0], [5, 4, 1], [3]):
         chunk = BatchedDataDict({key: value[indices] for key, value in data.items()})
         loss, chunk_metrics = _call(loss_fn, chunk, current[indices], raw=True)
         losses.append(loss)
         token_errors.append(chunk_metrics["token_mult_prob_error"])
+        # Mirror the worker, which accumulates the denominator per chunk.
+        chunk_groups.append(loss_fn.objective_reduction.local_counts(chunk)[2])
     _, tokens, groups = loss_fn.objective_reduction.local_counts(data)
     assert groups.item() == pytest.approx(0 if empty else 2)
+    torch.testing.assert_close(torch.stack(chunk_groups).sum(), groups)
     streamed = torch.stack(losses).sum() / groups.clamp_min(1)
     torch.testing.assert_close(streamed, actual)
     torch.testing.assert_close(torch.autograd.grad(streamed, current)[0], expected_grad)
@@ -298,4 +301,36 @@ def test_group_token_mean_validate_setup_rejects_unsupported_paths(overrides) ->
         reduction.validate_setup(**{**supported, **overrides})
     make_objective_reduction("global_token_mean").validate_setup(
         **{**supported, **overrides}
+    )
+
+
+@pytest.mark.parametrize(
+    "override,match",
+    [
+        (
+            {"sequence_level_importance_ratios": True},
+            "sequence_level_importance_ratios",
+        ),
+        ({"opd_full": True}, "OPD-full or NLL"),
+        ({"positive_example_nll_weight": 0.1}, "OPD-full or NLL"),
+        ({"seq_logprob_error_in_loss": True}, "masks finalized before training"),
+    ],
+)
+def test_group_token_mean_validate_loss_options_rejects_each_option(
+    override: dict[str, Any], match: str
+) -> None:
+    supported = dict(
+        sequence_level_importance_ratios=False,
+        opd_full=False,
+        positive_example_nll_weight=0.0,
+        seq_logprob_error_in_loss=False,
+    )
+    make_objective_reduction("group_token_mean").validate_loss_options(**supported)
+    with pytest.raises(ValueError, match=match):
+        make_objective_reduction("group_token_mean").validate_loss_options(
+            **{**supported, **override}
+        )
+    # The base reductions place no such restriction.
+    make_objective_reduction("global_token_mean").validate_loss_options(
+        **{**supported, **override}
     )
