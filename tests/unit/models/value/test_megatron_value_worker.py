@@ -55,9 +55,7 @@ pytestmark = pytest.mark.mcore
 
 def test_value_media_mask_only_for_explicit_model_forward() -> None:
     """Qwen2.5-style forwards must not receive the rollout media mask."""
-    from nemo_rl.models.value.workers.megatron_value_worker import (
-        _model_media_placeholder_token_id,
-    )
+    from nemo_rl.models.megatron.common import model_media_placeholder_token_id
 
     class _WithMask(torch.nn.Module):
         image_token_index = 42
@@ -72,20 +70,18 @@ def test_value_media_mask_only_for_explicit_model_forward() -> None:
         def forward(self, input_ids):
             return input_ids
 
-    assert _model_media_placeholder_token_id(_WithMask()) == 42
-    assert _model_media_placeholder_token_id(_WithoutMask()) is None
+    assert model_media_placeholder_token_id(_WithMask()) == 42
+    assert model_media_placeholder_token_id(_WithoutMask()) is None
 
 
 def test_value_model_cp_slicing_capability_is_detected() -> None:
-    from nemo_rl.models.value.workers.megatron_value_worker import (
-        _model_slices_context_parallel_inputs,
-    )
+    from nemo_rl.models.megatron.common import model_slices_context_parallel_inputs
 
     class _SlicesContextParallelInputs:
         model_slices_context_parallel_inputs = True
 
-    assert _model_slices_context_parallel_inputs(_SlicesContextParallelInputs())
-    assert not _model_slices_context_parallel_inputs(object())
+    assert model_slices_context_parallel_inputs(_SlicesContextParallelInputs())
+    assert not model_slices_context_parallel_inputs(object())
 
 
 def test_value_head_hook_replaces_nested_vlm_language_head() -> None:
@@ -180,6 +176,8 @@ def test_get_values_suspends_activation_offload() -> None:
         model=model,
         _policy_like_cfg={},
         mcore_state=SimpleNamespace(straggler_timer=None),
+        defer_fp32_logits=False,
+        media_placeholder_token_id=None,
         model_slices_context_parallel_inputs=False,
     )
     observed_states: list[tuple[bool, bool]] = []

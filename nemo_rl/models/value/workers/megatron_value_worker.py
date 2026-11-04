@@ -57,8 +57,6 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType, MetricNor
 from nemo_rl.data.multimodal_utils import (
     PACKED_MULTIMODAL_FIELDS,
     attach_media_token_validity_mask,
-    chunks_accept_media_token_validity_mask,
-    media_placeholder_token_id_from_chunks,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -69,6 +67,8 @@ from nemo_rl.models.megatron.common import (
     clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
+    model_media_placeholder_token_id,
+    model_slices_context_parallel_inputs,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -143,29 +143,6 @@ def _report_multimodal_input_once(worker: Any, data: BatchedDataDict[Any]) -> No
         flush=True,
     )
     worker._reported_multimodal_input = True
-
-
-def _model_media_placeholder_token_id(model: Any) -> Optional[int]:
-    """Return the media token only when the model explicitly accepts its mask."""
-    from megatron.core.utils import unwrap_model
-
-    unwrapped = unwrap_model(model)
-    chunks = list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-    if not chunks_accept_media_token_validity_mask(chunks):
-        return None
-    return media_placeholder_token_id_from_chunks(chunks)
-
-
-def _model_slices_context_parallel_inputs(model: Any) -> bool:
-    """Whether the model consumes full THD input and slices CP after embedding."""
-    from megatron.core.utils import unwrap_model
-
-    unwrapped = unwrap_model(model)
-    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-    return any(
-        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
-        for chunk in chunks
-    )
 
 
 def _value_head_parent(chunk: MegatronModule) -> tuple[Any, str]:
@@ -584,9 +561,9 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             self.model,
             self.optimizer,
         )
-        self.media_placeholder_token_id = _model_media_placeholder_token_id(self.model)
+        self.media_placeholder_token_id = model_media_placeholder_token_id(self.model)
         self.model_slices_context_parallel_inputs = (
-            _model_slices_context_parallel_inputs(self.model)
+            model_slices_context_parallel_inputs(self.model)
         )
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
@@ -624,9 +601,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         """
         if self._train_step_state is not None:
             raise RuntimeError("finish or abort the open value train step before train")
-        attach_media_token_validity_mask(
-            data, getattr(self, "media_placeholder_token_id", None)
-        )
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
         _report_multimodal_input_once(self, data)
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
@@ -1096,9 +1071,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                 "finish or abort the value train step before inference/offload"
             )
 
-        attach_media_token_validity_mask(
-            data, getattr(self, "media_placeholder_token_id", None)
-        )
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
         _report_multimodal_input_once(self, data)
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -1144,7 +1117,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
-                defer_fp32_logits=getattr(self, "defer_fp32_logits", False),
+                defer_fp32_logits=self.defer_fp32_logits,
                 straggler_timer=self.mcore_state.straggler_timer,
                 media_token_validity_mask=processed_mb.media_token_validity_mask,
                 model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
