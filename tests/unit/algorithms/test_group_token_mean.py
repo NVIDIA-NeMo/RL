@@ -18,6 +18,7 @@ from nemo_rl.algorithms.loss.interfaces import (
     group_token_mean_weights,
     make_objective_reduction,
 )
+from nemo_rl.algorithms.loss.utils import metric_normalizer_scales
 from nemo_rl.algorithms.loss.wrapper import StreamingObjectiveLoss
 from nemo_rl.data_plane.schema import GROUP_TOKEN_MEAN_WEIGHT
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -294,14 +295,33 @@ def test_group_token_mean_rejects_malformed_row_weights() -> None:
         )
 
 
-def test_group_token_mean_defers_loss_metrics_to_the_group_denominator() -> None:
-    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(normalization="group_token_mean"))
-    assert "loss" not in loss_fn.metric_normalizations
-    assert "kl_penalty" not in loss_fn.metric_normalizations
-    assert (
-        loss_fn.metric_normalizations["token_mult_prob_error"]
-        is MetricNormalizer.TOKENS
-    )
+def test_group_token_mean_logs_loss_metrics_by_the_group_count() -> None:
+    loss_fn = _loss_fn()
+    norms = loss_fn.metric_normalizations
+    assert norms["loss"] is MetricNormalizer.LOSS_DIVISOR
+    assert norms["kl_penalty"] is MetricNormalizer.LOSS_DIVISOR
+    assert norms["token_mult_prob_error"] is MetricNormalizer.TOKENS
+
+    data, current = _batch()
+    _, synchronous = _call(loss_fn, data, current)
+    raw = {"loss": 0.0, "kl_penalty": 0.0}
+    for indices in ([6, 2], [0], [5, 4, 1], [3]):
+        chunk = BatchedDataDict({key: value[indices] for key, value in data.items()})
+        _, chunk_metrics = _call(loss_fn, chunk, current[indices], raw=True)
+        for key in raw:
+            raw[key] += chunk_metrics[key]
+    sequences, tokens, groups = loss_fn.objective_reduction.local_counts(data)
+    assert groups.item() == pytest.approx(2)
+    scale = metric_normalizer_scales(
+        loss_fn.objective_reduction,
+        global_valid_toks=tokens,
+        global_valid_seqs=sequences,
+        global_objective_denominator=groups,
+    )[MetricNormalizer.LOSS_DIVISOR]
+    assert scale == pytest.approx(1 / groups.item())
+    assert synchronous["kl_penalty"] != 0
+    for key, value in raw.items():
+        assert value * scale == pytest.approx(synchronous[key], rel=1e-5)
 
 
 @pytest.mark.parametrize(
