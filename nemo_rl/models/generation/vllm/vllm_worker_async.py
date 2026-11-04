@@ -92,8 +92,6 @@ from nemo_rl.telemetry.setup import shutdown_telemetry
 LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    import socket
-
     from nemo_gym.token_id_capture.staging.capture import ActiveCall
 
 
@@ -287,9 +285,9 @@ class VllmAsyncGenerationWorkerImpl(
         """
         # Deferred-loading state. Always initialized so every instance has a
         # consistent set of attributes regardless of init path.
-        self._reserved_socket: socket.socket | None = None
-        self._reserved_port: int | None = None
-        self._reserved_node_ip: str | None = None
+        self._reserved_socket = None
+        self._reserved_port = None
+        self._reserved_node_ip = None
         self._deferred_bundle_indices = None
         self._deferred_seed = None
 
@@ -319,11 +317,11 @@ class VllmAsyncGenerationWorkerImpl(
     def _initialize_http_state(self) -> None:
         """Initialize frontend state without constructing a GPU worker."""
         # Defaults for HTTP server state; populated after the actor loop starts.
-        self.server_thread: threading.Thread | None = None
-        self.base_url: str | None = None
-        self.http_server: uvicorn.Server | None = None
-        self._engine_loop: asyncio.AbstractEventLoop | None = None
-        self._http_engine_client: _AsyncLLMHTTPClient | None = None
+        self.server_thread = None
+        self.base_url = None
+        self.http_server = None
+        self._engine_loop = None
+        self._http_engine_client = None
 
         # Ledger-authoritative token capture (dormant until the
         # setup_token_capture fan-out runs). The weight
@@ -352,7 +350,7 @@ class VllmAsyncGenerationWorkerImpl(
         # captured call's delta; 0 leaves captured calls as they are.
         self._capture_top_logprobs = 0
 
-        self._api_server_pool: MultiAPIServerPool | None = None
+        self._api_server_pool = None
 
     async def start_gpu_profiling(self) -> None:
         """Start GPU profiling on the inner TP workers.
