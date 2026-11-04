@@ -35,7 +35,7 @@ Both lines that start a command must end in `&`: `ray.sub` runs `SETUP_COMMAND` 
 
 ## What it covers
 
-Covered: vLLM generation engines (also those spanning several nodes), the Megatron trainer, and the external vLLM pools (`POOL_CACHE_DIR`, see `tools/external_gym_vllm/README.md`).
+Covered: vLLM generation engines (also those spanning several nodes), the Megatron trainer, and the external vLLM pools (`POOL_CACHE_DIR`, see `tools/external_gym_vllm/README.md`). The Megatron cache can also keep Triton autotune results and torch.compile's shape profiles; see [Opt-In Startup Optimizations](single-controller.md#opt-in-startup-optimizations).
 
 Not covered: the DTensor/Automodel trainer, SGLang, and kernels compiled in the last minute of a job (write-back only takes files that have not changed for `NRL_COMPILE_CACHE_MIN_AGE_MIN` minutes, default 1).
 
@@ -43,7 +43,7 @@ The cache only helps a job that compiles the same thing: same model, parallelism
 
 ## How it behaves
 
-- Files on the shared folder are never replaced or deleted, only added. A file appears there whole or not at all (written under a temporary name, then renamed).
+- Files on the shared folder are never deleted, and only torch.compile's shape profiles are replaced: a node that rewrote one publishes its newer copy. A file appears there whole or not at all (written under a temporary name, then renamed).
 - Nodes take turns writing back (a lock folder next to each type's cache). A node that finds it busy tries again at the next pass; the last pass waits up to 2 minutes, then logs how many files it could not publish.
 - A failed copy or write-back (for example a filesystem error) only logs a warning: the job compiles what is missing. A missing script, `rsync` or `flock`, or only one of the two variables set, stops the job at start.
 - The cache only grows. A job that compiles something again (a cold run, a node without the copy) adds a second copy under new file names, and old entries stay. Reset it when it gets large.
