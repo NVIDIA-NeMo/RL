@@ -62,6 +62,7 @@ from nemo_rl.data_plane.interfaces import (
     KVBatchMeta,
     backend_config,
     data_plane_supports_checkpointing,
+    gdr_enabled,
     storage_unit_placement,
 )
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
@@ -1229,11 +1230,7 @@ class TQDataPlaneClient(DataPlaneClient):
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
-        # GDR is a mooncake_cpu-only transport knob, so key it off the backend
-        # directly rather than off any incidental per-backend flag.
-        self._gdr_requested = self._backend == "mooncake_cpu" and bool(
-            backend_config(cfg).use_gdr
-        )
+        self._gdr_requested = gdr_enabled(cfg)
         self._gdr_put_confirmed = False
 
         if bootstrap:
