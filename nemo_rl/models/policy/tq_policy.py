@@ -274,7 +274,9 @@ class TQPolicy(TQDriverMixin, Policy):
         """Drop this step's bulk from TQ. Mirror of :meth:`prepare_step`."""
         self.discard_samples(meta.sample_ids, meta.partition_id)
 
-    def collect_data_plane_snapshots(self) -> list[dict[str, Any]]:
+    def collect_data_plane_snapshots(
+        self, driver_client: Any = None
+    ) -> list[dict[str, Any]]:
         """This driver's data-plane counters plus every worker rank's.
 
         The driver sees roughly a sixth of a step's traffic — the rollout
@@ -287,7 +289,7 @@ class TQPolicy(TQDriverMixin, Policy):
         to take training down. Measured at ~2.4 ms and ~1 kB per process.
         """
         snapshots: list[dict[str, Any]] = []
-        client = getattr(self, "dp_client", None)
+        client = driver_client or getattr(self, "dp_client", None)
         if is_metrics_client(client):
             # reset_step_window: this call is the once-per-step reader, and
             # a max only scopes to a step by being reset by its reader.
@@ -322,7 +324,7 @@ class TQPolicy(TQDriverMixin, Policy):
         self._extra_snapshot_sources.append(actor)
 
     def get_data_plane_step_metrics(
-        self, step_time_s: float
+        self, step_time_s: float, driver_client: Any = None
     ) -> "tuple[dict[str, float], str] | None":
         """This step's data-plane cost and the scope it covers, or ``None``.
 
@@ -340,10 +342,11 @@ class TQPolicy(TQDriverMixin, Policy):
         falls back after N cluster steps differences against last step rather
         than reporting N steps' accumulated history as one.
         """
-        if not is_metrics_client(self.dp_client):
+        driver_client = driver_client or self.dp_client
+        if not is_metrics_client(driver_client):
             return None  # observability disabled -> plain adapter
         collect_started = time.perf_counter()
-        snapshots = self.collect_data_plane_snapshots()
+        snapshots = self.collect_data_plane_snapshots(driver_client)
         # The fan-out is part of what observability costs, and the larger
         # part: omitting it reported a twentieth of the real bill. Charged on
         # the fallback path too, where it is the cost of an attempt that
@@ -353,7 +356,7 @@ class TQPolicy(TQDriverMixin, Policy):
         # and closing the step window is what reading it means, so the client
         # is handed that snapshot rather than taking a second one -- a second
         # reset would zero every ``step/by_op/*/max_ms``.
-        driver = self.dp_client.get_step_metrics(step_time_s, snapshots[0], collect_ms)
+        driver = driver_client.get_step_metrics(step_time_s, snapshots[0], collect_ms)
         if len(snapshots) == 1:
             # The fan-out could not reach the workers, or there are none.
             return driver, "driver"
