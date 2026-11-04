@@ -875,8 +875,8 @@ def _generation_max_seq_len(generation_config) -> int:
 
 # On the overlapped path the trainer build waits up to this long for the dataset. Within it, the trainer is built once
 # for the clamped step count; past it, the trainer starts with the unclamped count and is rebuilt if the clamp changes
-# train_iters. A rebuild costs a full second trainer build (~280 s at 6K scale), while a fast load costs the trainer
-# only its own duration, so the wait is cheap insurance; a slow load loses at most this much.
+# train_iters. A rebuild costs a full second trainer build, while a fast load costs the trainer only its own duration,
+# so the wait is cheap insurance; a slow load loses at most this much.
 _TRAINER_BUILD_DATASET_WAIT_S = 20.0
 
 
@@ -1709,10 +1709,8 @@ def setup_single_controller(
     # len(dataloader), and the clamp only binds when a run asks for more steps than
     # its data holds. So on that path the trainer is built with the unclamped value,
     # the dataset loads while all three build, and the trainer is rebuilt if the
-    # clamp changed train_iters. The trainer first waits up to
-    # _TRAINER_BUILD_DATASET_WAIT_S for the dataset, so a load that is fast (it is
-    # seconds when the rows are read lazily) builds the trainer once for the
-    # clamped count. Every other path, and every resume, keeps the original order.
+    # clamp changed train_iters (unless the load beats _TRAINER_BUILD_DATASET_WAIT_S).
+    # Every other path, and every resume, keeps the original order.
     overlap_dataset_load = (
         use_nemo_gym
         and generation_config["backend"] == "vllm"
@@ -2029,9 +2027,7 @@ def setup_single_controller(
     nemo_gym_shards = None
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
-            # Held back when the clamp can change a Megatron train_iters: the trainer
-            # is submitted below, once the dataset has had its chance to arrive (see
-            # _TRAINER_BUILD_DATASET_WAIT_S). Other trainers do not depend on it.
+            # A Megatron trainer waits for the dataset; see _TRAINER_BUILD_DATASET_WAIT_S.
             defer_trainer = (
                 overlap_dataset_load
                 and "trainer" in build_tasks
@@ -2073,13 +2069,13 @@ def setup_single_controller(
                                 f"{algo_cfg.max_num_steps}",
                                 flush=True,
                             )
-                        submitted["trainer"] = executor.submit(_build_trainer_and_value)
+                        submitted["trainer"] = executor.submit(build_tasks["trainer"])
                     dataset, _val_dataset, env_handles, dataloader = (
                         load_future.result()
                     )
                 print(
                     f"  ✓ Dataset and dataloader ready in {time.perf_counter() - t0:.1f}s "
-                    "(overlapped with generation, NeMo-Gym and trainer spin-up)",
+                    "(overlapped with generation and NeMo-Gym spin-up)",
                     flush=True,
                 )
                 final_train_iters = _megatron_train_iters(master_config)
@@ -2099,7 +2095,7 @@ def setup_single_controller(
                         stale_value.shutdown()
                     stale_trainer.shutdown()
                     _maybe_inject_megatron_train_iters(master_config)
-                    submitted["trainer"] = executor.submit(_build_trainer_and_value)
+                    submitted["trainer"] = executor.submit(build_tasks["trainer"])
             if "generation_trainer" in submitted:
                 generation, trainer, value, time_metrics = submitted[
                     "generation_trainer"

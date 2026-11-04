@@ -2363,10 +2363,11 @@ class TestSetup:
         patched_factories["_build_trainer"].side_effect = _build_trainer
         patched_factories["setup_response_data"].side_effect = _setup_response_data
 
-        # No wait: the trainer starts before the dataset, as it does for a slow load.
+        # Longer than the load's 30 s wait below: a trainer with no Megatron
+        # train_iters must not wait for the dataset at all.
         with (
             self._gym_patches(),
-            patch.object(sc_setup_mod, "_TRAINER_BUILD_DATASET_WAIT_S", 0.0),
+            patch.object(sc_setup_mod, "_TRAINER_BUILD_DATASET_WAIT_S", 60.0),
         ):
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -2502,6 +2503,28 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+        fake_gym_shards.shutdown.assert_called_once()
+
+    def test_gym_vllm_dataset_load_failure_before_trainer_starts_shuts_down_gym(
+        self, patched_factories
+    ):
+        """The load fails while the Megatron trainer waits for it: the trainer is
+        never built, and Gym is still shut down."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+        patched_factories["setup_response_data"].side_effect = RuntimeError(
+            "bad data path"
+        )
+
+        with (
+            self._gym_patches(fake_gym_shards),
+            pytest.raises(RuntimeError, match="bad data path"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_trainer"].assert_not_called()
         fake_gym_shards.shutdown.assert_called_once()
 
     def test_gym_vllm_resume_builds_trainer_once_with_clamped_train_iters(
