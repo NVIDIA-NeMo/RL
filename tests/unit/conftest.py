@@ -354,7 +354,7 @@ def tracker(request, session_data, ray_gpu_monitor):
     qualified_name = f"{module_name}::{test_name}"
 
     # Initialize an empty dict for this test if it doesn't exist
-    if qualified_name not in session_data:
+    if qualified_name not in session_data["metrics"]:
         session_data["metrics"][qualified_name] = {}
 
     class Tracker:
