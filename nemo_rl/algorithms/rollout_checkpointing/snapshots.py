@@ -288,6 +288,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
             "single_controller_epoch": current_epoch,
             "partition_id": self._partition_id,
             "sampler_name": self._async_cfg.sampler.name,
+            "loss_normalization": self._master_config.loss_fn.resolved_normalization,
             "mode": "authoritative" if replay_metadata is not None else "shadow",
             "forest_training": self._master_config.token_capture.forest_training,
             "forest_execution_row_multiple": (
