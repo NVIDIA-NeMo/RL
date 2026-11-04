@@ -30,6 +30,7 @@ from nemo_rl.models.generation.interfaces import (
     get_num_routed_experts,
 )
 from nemo_rl.models.generation.vllm.lora_utils import LoraRefitMode
+from nemo_rl.models.generation.vllm.multi_api import api_server_count
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
     MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
@@ -120,6 +121,9 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Positive frontend process count sharing one engine and socket; 1 or None
+    # keeps a single frontend. Multiple processes require async HTTP serving.
+    http_api_server_count: NotRequired[int | None]
     # Require `Authorization: Bearer <key>` on the exposed server's OpenAI routes
     # (/v1/* and /tokenize). VllmGeneration generates one random key per job, hands
     # it to the workers, and exposes it as `http_server_api_key` for the NeMo-Gym
@@ -299,6 +303,7 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    api_server_count(config)
     if vllm_cfg.get("flat_logprobs") and not (
         vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
     ):

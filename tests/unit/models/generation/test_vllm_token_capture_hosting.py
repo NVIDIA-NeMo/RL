@@ -78,6 +78,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _chain_prefix=ChainPrefixCache(),
         _staging_source=None,
         _capture_top_logprobs=0,
+        _api_server_pool=None,
     )
     worker.install_token_capture = lambda capture: setattr(
         worker, "token_capture", capture
