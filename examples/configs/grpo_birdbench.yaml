@@ -155,7 +155,7 @@ policy:
     fuse_loss: true  # fused loss path for packed sequences, as in a working 4-node run
 
   make_sequence_length_divisible_by: 32
-  max_grad_norm: 0.1 # 1.0
+  max_grad_norm: 1.0
 
   optimizer: null
   scheduler:
@@ -228,7 +228,7 @@ policy:
 
     optimizer:
       optimizer: "adam"
-      lr: 1.0e-6
+      lr: 2.0e-6
       min_lr: 1.0e-7
       weight_decay: 0.0
       bf16: true
