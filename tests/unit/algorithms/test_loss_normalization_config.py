@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from pathlib import Path
 
 import pytest
@@ -39,9 +40,11 @@ def test_normalization_selectors_and_roundtrip() -> None:
         assert reloaded.resolved_normalization == expected
         assert reloaded.model_dump() == saved
         if config.token_level_loss is None:
-            loss = ClippedPGLossFn(config)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                loss = ClippedPGLossFn(config)
         else:
-            with pytest.warns(DeprecationWarning, match="normalization"):
+            with pytest.warns(FutureWarning, match="normalization"):
                 loss = ClippedPGLossFn(config)
         assert loss.normalization == expected
 

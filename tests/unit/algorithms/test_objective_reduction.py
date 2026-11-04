@@ -1,11 +1,22 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import ClassVar
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
-from nemo_rl.algorithms.loss.interfaces import LossType, make_objective_reduction
+from nemo_rl.algorithms.loss.interfaces import (
+    GlobalTokenMeanReduction,
+    LossType,
+    SequenceMeanReduction,
+    get_objective_reduction,
+    make_objective_reduction,
+)
 from nemo_rl.algorithms.loss.wrapper import StreamingObjectiveLoss
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -86,3 +97,78 @@ def test_streaming_preserves_legacy_objective(mode: str) -> None:
         torch.autograd.grad(streamed, current, retain_graph=True)[0],
         torch.autograd.grad(full, current)[0],
     )
+
+
+@dataclass(frozen=True)
+class _ExplicitDenominatorReduction(GlobalTokenMeanReduction):
+    requires_explicit_denominator: ClassVar[bool] = True
+
+    def loss_divisor(
+        self, *, global_valid_toks, global_valid_seqs, global_objective_denominator
+    ):
+        assert global_objective_denominator is not None
+        return global_objective_denominator
+
+
+def test_streaming_objective_loss_forwards_denominator_and_proxies_attributes() -> None:
+    data = BatchedDataDict(
+        token_mask=torch.tensor([[0, 1, 1], [0, 1, 0]], dtype=torch.float32),
+        sample_mask=torch.tensor([1.0, 1.0]),
+        advantages=torch.tensor([[0.0, 2.0, -1.0], [0.0, 3.0, 1.0]]),
+        prev_logprobs=torch.full((2, 3), -2.0),
+        generation_logprobs=torch.full((2, 3), -2.0),
+    )
+    current = torch.full((2, 2), -3.0, requires_grad=True)
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            normalization="global_token_mean",
+            disable_ppo_ratio=True,
+            reference_policy_kl_penalty=0,
+        )
+    )
+    loss_fn.objective_reduction = _ExplicitDenominatorReduction()
+    streaming = StreamingObjectiveLoss(loss_fn)
+
+    assert streaming.loss_type is loss_fn.loss_type
+    assert streaming.metric_normalizations is loss_fn.metric_normalizations
+    assert not hasattr(streaming, "definitely_missing_attribute")
+
+    placeholder = torch.tensor(7.0)
+    loss, _ = streaming(
+        data=data,
+        next_token_logprobs=current,
+        global_valid_toks=placeholder,
+        global_valid_seqs=torch.tensor(99.0),
+    )
+    token_sum = -(data["advantages"][:, 1:] * current * data["token_mask"][:, 1:]).sum()
+    torch.testing.assert_close(loss, token_sum / placeholder)
+
+
+def test_get_objective_reduction_prefers_reducer_then_legacy_loss_type() -> None:
+    explicit = ClippedPGLossFn(ClippedPGLossConfig(normalization="sequence_mean"))
+    assert get_objective_reduction(explicit) is explicit.objective_reduction
+    assert isinstance(
+        get_objective_reduction(SimpleNamespace(loss_type=LossType.SEQUENCE_LEVEL)),
+        SequenceMeanReduction,
+    )
+    assert isinstance(
+        get_objective_reduction(SimpleNamespace(loss_type=LossType.TOKEN_LEVEL)),
+        GlobalTokenMeanReduction,
+    )
+    assert isinstance(get_objective_reduction(object()), GlobalTokenMeanReduction)
+    assert isinstance(
+        get_objective_reduction(MagicMock(loss_type=LossType.SEQUENCE_LEVEL)),
+        SequenceMeanReduction,
+    )
+
+
+@pytest.mark.parametrize("mode", ["global_token_mean", "sequence_mean"])
+def test_local_counts_without_token_mask_counts_every_position(mode: str) -> None:
+    data = {
+        "sample_mask": torch.tensor([1.0, 0.0, 1.0]),
+        "input_ids": torch.zeros(3, 7, dtype=torch.long),
+    }
+    sequences, tokens, denominator = make_objective_reduction(mode).local_counts(data)
+    assert sequences.item() == 2.0
+    assert tokens.item() == 14.0
+    assert denominator.item() == (14.0 if mode == "global_token_mean" else 2.0)
