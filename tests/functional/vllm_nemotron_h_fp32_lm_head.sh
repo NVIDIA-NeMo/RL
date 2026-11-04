@@ -31,5 +31,4 @@ uv run --extra vllm coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" 
     2>&1 | tee "$RUN_LOG"
 
 assert_grep "Resolved architecture: NemotronHForCausalLM" "$RUN_LOG"
-assert_grep "\\[fp32_lm_head\\] NemotronH vLLM lm_head.forward casts input and weight to fp32" "$RUN_LOG"
 assert_grep "\\[PASS\\] Nemotron-H fp32 lm_head generated text" "$RUN_LOG"

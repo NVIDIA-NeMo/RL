@@ -195,22 +195,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             megatron_enabled=megatron_enabled,
             automodel_enabled=automodel_enabled,
         )
-        hf_config = None
-        hf_config_overrides = config.get("hf_config_overrides") or {}
-        generation_config = config.get("generation")
-        if generation_config is not None and generation_config["backend"] == "vllm":
-            vllm_cfg = generation_config.get("vllm_cfg")
-            if vllm_cfg is not None and vllm_cfg.get("fp32_lm_head"):
-                hf_config = get_hf_config(
-                    config["model_name"],
-                    **hf_config_overrides,
-                )
-                validate_fp32_lm_head_config(
-                    config,
-                    megatron_enabled=megatron_enabled,
-                    automodel_enabled=automodel_enabled,
-                    model_config=hf_config,
-                )
         if reserved_http_server_ports is not None and not megatron_enabled:
             raise ValueError(
                 "reserved_http_server_ports is only supported by the Megatron "
@@ -510,11 +494,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # initialize FLOPs tracker
         try:
-            if hf_config is None:
-                hf_config = get_hf_config(
-                    config["model_name"],
-                    **hf_config_overrides,
-                )
+            hf_config = get_hf_config(
+                config["model_name"],
+                **(config.get("hf_config_overrides") or {}),
+            )
             self.flops_tracker = FLOPTracker.from_config(
                 config["model_name"],
                 hf_config,
