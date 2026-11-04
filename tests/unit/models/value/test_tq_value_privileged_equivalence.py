@@ -168,7 +168,11 @@ def test_privileged_values_and_loss_match_explicit_prefix_concatenation(
     value = None
     try:
         value = TQValue(
-            cluster=cluster, config=config, tokenizer=tokenizer, dp_cfg=_dp_cfg()
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            seed=42,
+            dp_cfg=_dp_cfg(),
         )
         dp_client = value.dp_client
         dp_client.register_partition(
