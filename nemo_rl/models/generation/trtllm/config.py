@@ -94,6 +94,12 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
     in_flight_weight_updates: NotRequired[bool]
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
     default_chat_template_kwargs: NotRequired[dict[str, Any]]
+    # Jinja template that overrides the tokenizer's own, mirroring vLLM's
+    # http_server_serving_chat_kwargs.chat_template. A recipe that pins a custom
+    # template (the SWE blends keep <think> on every assistant turn, which the
+    # stock Qwen3 template strips) renders identically on both backends only if
+    # TRT-LLM honours it too.
+    chat_template: NotRequired[str]
     # TRT-LLM's registered parser names:
     #   "qwen3"       -> Qwen3ToolParser      (JSON format: {"name":..., "arguments":{...}})
     #   "qwen3_coder" -> Qwen3CoderToolParser  (XML format: <function=...>)
