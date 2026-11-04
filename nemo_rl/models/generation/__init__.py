@@ -237,10 +237,7 @@ def configure_generation_config(
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
 
     elif config["backend"] == "trtllm":
-        # Same contract as vLLM above: training starts on dummy weights because the
-        # initial refit overwrites them; evaluation has no refit and must load.
-        # precision="fp8" is always dummy (see quantization.fp8.configure_fp8_llm_kwargs).
-        # Set before resolve_role_overrides so the prefill/decode engines inherit it.
+        # Resolve loading before the role engines copy the shared config.
         trtllm_cfg = cast(TrtllmConfig, config)["trtllm_cfg"]
         trtllm_cfg.setdefault(
             "load_format",

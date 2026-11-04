@@ -774,9 +774,7 @@ def setup(
     _validate_seq_logprob_error_in_loss(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
 
-    # Validation-only sampling is honored on the NeMo-Gym rollout path for the
-    # backends whose HTTP server accepts a second sampling profile; everywhere
-    # else validation must sample exactly like training.
+    # Validation sampling overrides require a Gym server that accepts the profile.
     val_sampling_overridden = (
         generation_config["val_temperature"] != generation_config["temperature"]
         or generation_config["val_top_p"] != generation_config["top_p"]
@@ -4924,14 +4922,13 @@ def validate(
         )
 
         total_rewards = []
-        total_lengths = []
+        # Sum of per-batch mean length x rollouts, so a partial batch weighs less.
+        total_length_tokens = 0.0
         all_message_logs = []  # Collect all message logs
 
         max_val_samples = master_config.grpo.max_val_samples
         val_batch_size = master_config.grpo.val_batch_size
-        # Round up so a partial last batch is still scored (251 prompts in
-        # batches of 126 -> 126 + 125), and trim the last batch so no more than
-        # max_val_samples prompts are scored when the dataset is larger.
+        # Include the partial final batch, then trim it to the prompt cap.
         max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
@@ -5024,8 +5021,11 @@ def validate(
                     ),
                 )
 
-            total_rewards.extend(val_batch["total_reward"].tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+            batch_rewards = val_batch["total_reward"].tolist()
+            total_rewards.extend(batch_rewards)
+            total_length_tokens += gen_metrics["mean_gen_tokens_per_sample"] * len(
+                batch_rewards
+            )
 
             # Collect message logs for later display
             to_env = [
@@ -5060,9 +5060,7 @@ def validate(
         else:
             accuracy = 0.0
 
-        avg_length = (
-            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
-        )
+        avg_length = total_length_tokens / num_samples if num_samples > 0 else 0.0
 
         val_metrics = {
             "accuracy": accuracy,

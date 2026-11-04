@@ -300,7 +300,7 @@ def validate_sync(
 
     timer = Timer()
     total_rewards: list[float] = []
-    total_lengths: list[float] = []
+    total_length_tokens = 0.0  # per-batch mean length x rollouts
     all_message_logs: list[list[dict[str, str]]] = []
     additional_metrics: dict[str, Any] = {}
     capture_extras = should_use_nemo_gym(master_config)
@@ -309,8 +309,7 @@ def validate_sync(
         print(f"▶ Starting validation at step {step}...", flush=True)
         max_val_samples = master_config.grpo.max_val_samples
         val_batch_size = master_config.grpo.val_batch_size
-        # Round up so a partial last batch is still scored, and trim the last
-        # batch so no more than max_val_samples prompts are scored.
+        # Include the partial final batch, then trim it to the prompt cap.
         max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
@@ -332,8 +331,11 @@ def validate_sync(
             )
             roles = driver_carry["turn_roles"]
             contents = driver_carry["turn_contents"]
-            total_rewards.extend(driver_carry["total_reward"].tolist())
-            total_lengths.append(rollout_metrics["mean_gen_tokens_per_sample"])
+            batch_rewards = driver_carry["total_reward"].tolist()
+            total_rewards.extend(batch_rewards)
+            total_length_tokens += rollout_metrics["mean_gen_tokens_per_sample"] * len(
+                batch_rewards
+            )
             all_message_logs.extend(
                 [{"role": r, "content": c} for r, c in zip(roles[i], contents[i])]
                 for i in range(n_prompts)
@@ -347,7 +349,7 @@ def validate_sync(
             if total_rewards
             else 0.0
         )
-        avg_length = sum(total_lengths) / len(total_lengths) if total_lengths else 0.0
+        avg_length = total_length_tokens / len(total_rewards) if total_rewards else 0.0
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,

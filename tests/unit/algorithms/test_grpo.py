@@ -8057,7 +8057,8 @@ class TestValidateFunction:
 
         def run_rollout(_policy, batch, *_args, **_kwargs):
             scored_waves.append(batch["idx"].tolist())
-            return batch, {"mean_gen_tokens_per_sample": 1.0}
+            # Each wave reports a different mean length.
+            return batch, {"mean_gen_tokens_per_sample": 10.0 * len(scored_waves)}
 
         with (
             patch(
@@ -8071,7 +8072,7 @@ class TestValidateFunction:
             ),
             patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
         ):
-            validate(
+            val_metrics, _ = validate(
                 MagicMock(),
                 mock_dataloader,
                 MagicMock(),
@@ -8081,6 +8082,82 @@ class TestValidateFunction:
             )
 
         assert scored_waves == expected_waves
+        # avg_length weighs each wave's mean by its rollout count.
+        expected_avg_length = sum(
+            10.0 * (i + 1) * len(wave) for i, wave in enumerate(expected_waves)
+        ) / sum(len(wave) for wave in expected_waves)
+        assert val_metrics["avg_length"] == pytest.approx(expected_avg_length)
+
+    @pytest.mark.parametrize(
+        ("max_val_samples", "expected_sizes"),
+        [
+            # A partial final wave is scored.
+            (5, [2, 2, 1]),
+            # A cap past the dataset size scores the whole dataset.
+            (10, [2, 2, 2]),
+        ],
+    )
+    def test_validate_sync_scores_exactly_max_val_samples(
+        self, mock_grpo_components, max_val_samples, expected_sizes
+    ):
+        from nemo_rl.algorithms.grpo_sync import validate_sync
+
+        def make_batch(indices):
+            return BatchedDataDict[DatumSpec]({"idx": torch.tensor(indices)})
+
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(
+            return_value=iter(
+                [make_batch([0, 1]), make_batch([2, 3]), make_batch([4, 5])]
+            )
+        )
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.max_val_samples = max_val_samples
+        mock_config.grpo.val_batch_size = 2
+        mock_config.grpo.val_period = 1
+
+        policy = MagicMock()
+        rollout_actor = MagicMock()
+
+        def rollout(batch, **_kwargs):
+            n = int(batch.size)
+            carry = {
+                "total_reward": torch.zeros(n),
+                "turn_roles": [["user"]] * n,
+                "turn_contents": [["q"]] * n,
+            }
+            # Each wave reports a different mean length.
+            metrics = {
+                "mean_gen_tokens_per_sample": 10.0
+                * policy.prepare_val_partition.call_count
+            }
+            return MagicMock(), carry, metrics, None
+
+        rollout_actor.rollout_to_tq.remote.side_effect = rollout
+
+        with (
+            patch("nemo_rl.algorithms.grpo_sync.ray.get", side_effect=lambda x: x),
+            patch(
+                "nemo_rl.algorithms.grpo_sync.should_use_nemo_gym", return_value=False
+            ),
+            patch("nemo_rl.algorithms.grpo_sync.print_message_log_samples"),
+        ):
+            val_metrics, _ = validate_sync(
+                rollout_actor=rollout_actor,
+                policy=policy,
+                val_dataloader=mock_dataloader,
+                val_task_to_env={"math": MagicMock(spec=EnvironmentInterface)},
+                step=0,
+                master_config=mock_config,
+            )
+
+        scored_sizes = [c.args[0] for c in policy.prepare_val_partition.call_args_list]
+        assert scored_sizes == expected_sizes
+        # avg_length weighs each wave's mean by its rollout count.
+        expected_avg_length = sum(
+            10.0 * (i + 1) * n for i, n in enumerate(expected_sizes)
+        ) / sum(expected_sizes)
+        assert val_metrics["avg_length"] == pytest.approx(expected_avg_length)
 
     def test_validation_uses_val_sampling_params_on_gym_path(
         self, mock_grpo_components

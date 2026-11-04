@@ -469,6 +469,7 @@ def test_the_chat_route_renders_gym_tools_in_normalized_order(monkeypatch):
         model_name="m",
         max_seq_len=16,
         sampling_config={"temperature": 1.0, "top_p": 1.0, "top_k": None},
+        val_sampling_config={"temperature": 1.0, "top_p": 1.0, "top_k": None},
         tool_parser="qwen3",
     )
 
@@ -496,7 +497,7 @@ _VAL = {"temperature": 0.6, "top_p": 0.95, "top_k": None}
         ({"temperature": 0.6, "top_p": 0.95}, _VAL, _VAL),
         # Unpinned params take the train profile.
         ({}, _VAL, _TRAIN),
-        ({"temperature": 0.6, "top_p": 0.95}, None, None),
+        ({"temperature": 0.6, "top_p": 0.95}, _TRAIN, None),
         ({"temperature": 0.6, "top_p": 1.0}, _VAL, None),
     ],
 )

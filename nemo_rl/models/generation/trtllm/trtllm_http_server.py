@@ -389,7 +389,7 @@ def create_app(
     *,
     max_seq_len: int,
     sampling_config: dict[str, Any],
-    val_sampling_config: dict[str, Any] | None = None,
+    val_sampling_config: dict[str, Any],
     stop_token_ids: list[int] | None = None,
     default_chat_template_kwargs: dict[str, Any] | None = None,
     tool_parser: str | None = None,
@@ -405,9 +405,7 @@ def create_app(
         max_seq_len: Context window of the engine being fronted.
         sampling_config: Train sampling profile, keyed
             ``temperature``/``top_p``/``top_k``.
-        val_sampling_config: Validation sampling profile, same keys. ``None``
-            (the default) accepts train sampling only, which is what a backend
-            without separate validation sampling wants.
+        val_sampling_config: Validation sampling profile, same keys.
         stop_token_ids: Extra stop tokens to trim from generations.
         default_chat_template_kwargs: Server-side chat template defaults.
         tool_parser: Registered TRT-LLM tool parser name, or None to infer.
@@ -483,9 +481,7 @@ def create_app(
         # train profile, or the validation profile grpo.validate() stamps.
         if _request_matches_profile(body, sampling_config):
             active_sampling_config = sampling_config
-        elif val_sampling_config is not None and _request_matches_profile(
-            body, val_sampling_config
-        ):
+        elif _request_matches_profile(body, val_sampling_config):
             active_sampling_config = val_sampling_config
         else:
             raise AssertionError(
@@ -604,9 +600,7 @@ def create_app(
         from tensorrt_llm import SamplingParams as TrtSamplingParams
         from tensorrt_llm.executor.utils import RequestError
 
-        # Serve whichever profile the request pinned (train or validation),
-        # built through the shared helper so this path and the direct
-        # generate() path keep sampling from the same distribution.
+        # Build sampling parameters from the selected train or validation profile.
         sampling = _build_sampling_params(
             TrtSamplingParams,
             sampling_config=active_sampling_config,
@@ -966,7 +960,7 @@ def start_server(
     *,
     max_seq_len: int,
     sampling_config: dict[str, Any],
-    val_sampling_config: dict[str, Any] | None = None,
+    val_sampling_config: dict[str, Any],
     stop_token_ids: list[int] | None = None,
     host: str = "0.0.0.0",
     port: int = 0,
@@ -983,8 +977,7 @@ def start_server(
         model_name: Model identifier echoed back on responses.
         max_seq_len: Context window of the engine being fronted.
         sampling_config: Train sampling profile.
-        val_sampling_config: Validation sampling profile, or None to accept
-            train sampling only.
+        val_sampling_config: Validation sampling profile.
         stop_token_ids: Extra stop tokens to trim from generations.
         host: Bind address.
         port: Bind port; 0 picks a free one.
