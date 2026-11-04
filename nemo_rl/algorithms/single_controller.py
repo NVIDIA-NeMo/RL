@@ -476,6 +476,7 @@ class SingleControllerActor:
                     save_state=actor_args.save_state,
                     partition_id=self._partition_id,
                     sampler_name=master_config.async_rl.sampler.name,
+                    loss_normalization=master_config.loss_fn.resolved_normalization,
                     opd_full_teacher_checkpoints=(
                         opd_module.opd_full_teacher_checkpoints_by_index(master_config)
                     ),
