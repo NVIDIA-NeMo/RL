@@ -33,7 +33,8 @@ assert_patch_target() {
 show_ccache_status() {
     local phase=$1
 
-    # ccache is not part of the release image; it is only present for CI builds.
+    # ccache is installed only for the image's TRT-LLM build layer and is not part of the
+    # release image, so skip the stats when it is absent.
     command -v ccache >/dev/null || return 0
 
     echo "[TRTLLM_CCACHE] status ${phase}:"
