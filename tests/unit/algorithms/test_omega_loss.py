@@ -72,7 +72,7 @@ def _reference(logp, token_mask, rewards):
 
 def test_matches_reference_loss_and_grad():
     logp, data, _, rewards = _make()
-    fn = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K)
+    fn = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K, gen_kl_type="k3")
     loss, metrics = fn(logp, data, global_valid_seqs=torch.tensor(float(B * K)))
     ref = _reference(logp, data["token_mask"], rewards)
     torch.testing.assert_close(loss, ref)
@@ -86,14 +86,14 @@ def test_matches_reference_loss_and_grad():
 def test_uniform_reward_group_gives_zero_loss():
     logp, data, _, _ = _make()
     data["advantages"] = torch.zeros_like(data["advantages"])
-    fn = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K)
+    fn = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K, gen_kl_type="k3")
     loss, _ = fn(logp, data, global_valid_seqs=torch.tensor(float(B * K)))
     assert loss.item() == 0.0
 
 
 def test_invalid_rows_get_no_weight_or_grad():
     logp, data, _, _ = _make(invalid_rows=(1, 5))
-    fn = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K)
+    fn = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K, gen_kl_type="k3")
     loss, _ = fn(logp, data, global_valid_seqs=torch.tensor(float(B * K - 2)))
     assert torch.isfinite(loss)
     g = torch.autograd.grad(loss, logp)[0]
@@ -102,20 +102,22 @@ def test_invalid_rows_get_no_weight_or_grad():
 
 def test_split_groups_rejected():
     logp, data, _, _ = _make()
-    fn = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=5)
+    fn = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=5, gen_kl_type="k3")
     with pytest.raises(AssertionError):
         fn(logp, data, global_valid_seqs=torch.tensor(float(B * K)))
 
 
 def test_unknown_h_rejected():
     with pytest.raises(ValueError):
-        OmegaLossFn(OmegaLossConfig(h="nope"), num_generations_per_prompt=K)
+        OmegaLossFn(
+            OmegaLossConfig(h="nope"), num_generations_per_prompt=K, gen_kl_type="k3"
+        )
 
 
 def test_empty_response_is_dropped_not_dominant():
     logp, data, _, _ = _make()
     data["token_mask"][2] = 0  # row 2 generated nothing: |y| = 0
-    fn = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K)
+    fn = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K, gen_kl_type="k3")
     loss, metrics = fn(logp, data, global_valid_seqs=torch.tensor(float(B * K - 1)))
     assert torch.isfinite(loss)
     assert metrics["num_empty_responses"] == 1
@@ -136,7 +138,7 @@ def _per_sequence_grad(logp, data, prompt_ids, n_valid, rows_separately=False):
         data=data,
     )
     data = BatchedDataDict({**data, "omega_coef": coef})
-    fn = OmegaPerSequenceLossFn()
+    fn = OmegaPerSequenceLossFn(gen_kl_type="k3")
     gvs = torch.tensor(float(n_valid))
     if not rows_separately:
         loss, _ = fn(logp, data, gvs)
@@ -157,7 +159,9 @@ def _prompt_ids():
 
 def test_per_sequence_gradient_matches_exact_group_form():
     logp, data, _, _ = _make()
-    exact = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K)
+    exact = OmegaLossFn(
+        OmegaLossConfig(), num_generations_per_prompt=K, gen_kl_type="k3"
+    )
     loss, _ = exact(logp, data, torch.tensor(float(B * K)))
     g_exact = torch.autograd.grad(loss, logp)[0]
     g, metrics = _per_sequence_grad(logp, data, _prompt_ids(), B * K)
@@ -191,7 +195,9 @@ def test_per_sequence_invalid_and_empty_rows():
     assert metrics["num_empty_responses"] == 1
     # Matches the exact form on the same masked data.
     data_e = BatchedDataDict({**data, "sample_mask": data["sample_mask"].clone()})
-    exact = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K)
+    exact = OmegaLossFn(
+        OmegaLossConfig(), num_generations_per_prompt=K, gen_kl_type="k3"
+    )
     loss, _ = exact(logp, data_e, torch.tensor(float(B * K - 2)))
     torch.testing.assert_close(
         g, torch.autograd.grad(loss, logp)[0], rtol=1e-4, atol=1e-6
@@ -257,24 +263,41 @@ def _clipped_pg_mult_prob_error(data, global_valid_toks):
     )
 
 
-def test_both_forms_report_token_mult_prob_error_like_grpo():
-    """grpo_train reads metrics["token_mult_prob_error"] after every step."""
+def _clipped_pg_gen_kl(data, global_valid_toks):
+    """Reference: ClippedPGLossFn's gen_kl_error with kl_type k3, no clamping."""
+    mask = data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+    gen = torch.where(mask.bool(), data["generation_logprobs"][:, 1:], 0.0)
+    prev = torch.where(mask.bool(), data["prev_logprobs"][:, 1:], 0.0)
+    logr = prev - gen
+    kl = torch.exp(logr) - logr - 1  # k3
+    return ((kl * mask).sum() / (global_valid_toks + 1e-8)).item()
+
+
+def test_both_forms_report_generation_mismatch_metrics_like_grpo():
+    """grpo_train reads metrics["token_mult_prob_error"] and metrics["gen_kl_error"]."""
     logp, data, _, _ = _make(invalid_rows=(3,))
     gvt = (data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)).sum()
     ref = _clipped_pg_mult_prob_error(data, gvt).item()
-    assert ref > 1.0  # the injected drift is visible
+    ref_kl = _clipped_pg_gen_kl(data, gvt)
+    assert ref > 1.0 and ref_kl > 0  # the injected drift is visible
 
-    group = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K)
+    group = OmegaLossFn(
+        OmegaLossConfig(), num_generations_per_prompt=K, gen_kl_type="k3"
+    )
     _, m = group(logp, data, torch.tensor(float(B * K - 1)), gvt)
     assert abs(m["token_mult_prob_error"] - ref) < 1e-5
+    assert abs(m["gen_kl_error"] - ref_kl) < 1e-6
 
     data["omega_coef"] = torch.zeros(B * K)
-    _, m = OmegaPerSequenceLossFn()(logp, data, torch.tensor(float(B * K - 1)), gvt)
+    _, m = OmegaPerSequenceLossFn(gen_kl_type="k3")(
+        logp, data, torch.tensor(float(B * K - 1)), gvt
+    )
     assert abs(m["token_mult_prob_error"] - ref) < 1e-5
+    assert abs(m["gen_kl_error"] - ref_kl) < 1e-6
 
     # Packed, non-fused path: one row per call, metrics summed by the wrapper.
     total = sum(
-        OmegaPerSequenceLossFn()(
+        OmegaPerSequenceLossFn(gen_kl_type="k3")(
             logp[i : i + 1],
             BatchedDataDict({k: v[i : i + 1] for k, v in data.items()}),
             torch.tensor(float(B * K - 1)),

@@ -46,7 +46,7 @@ from nemo_rl.algorithms.loss.interfaces import (
     LossType,
     MetricNormalizer,
 )
-from nemo_rl.algorithms.utils import masked_mean
+from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 # h(x, y): per-sequence exponent applied to the sequence probability.
@@ -67,17 +67,23 @@ H_FUNCTIONS: dict[str, HFunction] = {
 }
 
 
-def _token_mult_prob_error(
+def _generation_mismatch_metrics(
     data: BatchedDataDict[Any],
     sample_mask: torch.Tensor,
     global_valid_toks: torch.Tensor | None,
-) -> float:
+    kl_type: str,
+) -> dict[str, float]:
     """vLLM-vs-training logprob mismatch, computed exactly as ClippedPGLossFn does.
 
-    mean over valid response tokens of exp(|generation_logprobs - prev_logprobs|).
-    The GRPO loop reads ``metrics["token_mult_prob_error"]`` after every step
-    (and plots samples above 1.05), so every policy loss must report it; it
-    also keeps this diagnostic comparable between GRPO and Omega runs.
+    - token_mult_prob_error: mean over valid response tokens of
+      exp(|generation_logprobs - prev_logprobs|)
+    - gen_kl_error: KL(P_gen || P_train) per token (``calculate_kl`` with the
+      configured ``loss_fn.reference_policy_kl_type``, no clamping), averaged.
+
+    grpo_train reads both after every step (``metrics["token_mult_prob_error"]``
+    for the high-error plot, ``metrics["gen_kl_error"]`` in the step summary),
+    so every policy loss must report them; they also keep this diagnostic
+    comparable between GRPO and Omega runs.
     """
     token_mask = data["token_mask"][:, 1:].to(torch.float32)
     mask = token_mask * sample_mask.to(torch.float32).unsqueeze(-1)
@@ -86,11 +92,23 @@ def _token_mult_prob_error(
     gen = torch.where(mask.bool(), gen, 0.0)
     prev = torch.where(mask.bool(), prev, 0.0)
     lp_error = torch.abs(gen - prev)
-    return masked_mean(
+    mult_prob_error = masked_mean(
         torch.exp(lp_error * mask),
         mask,
         global_normalization_factor=global_valid_toks,
     ).item()
+    gen_kl_error = masked_mean(
+        calculate_kl(
+            logprobs=gen,
+            logprobs_reference=prev,
+            kl_type=kl_type,
+            input_clamp_value=None,
+            output_clamp_value=None,
+        ),
+        mask,
+        global_normalization_factor=global_valid_toks,
+    ).item()
+    return {"token_mult_prob_error": mult_prob_error, "gen_kl_error": gen_kl_error}
 
 
 class OmegaLossConfig(BaseModel, extra="allow"):
@@ -114,6 +132,8 @@ class OmegaLossFn(LossFunction):
         self,
         cfg: OmegaLossConfig,
         num_generations_per_prompt: int,
+        *,
+        gen_kl_type: str,
         use_fused_linear_logprobs: bool = False,
     ):
         if cfg.h not in H_FUNCTIONS:
@@ -124,6 +144,8 @@ class OmegaLossFn(LossFunction):
             raise ValueError("Omega loss needs num_generations_per_prompt >= 2")
         self.h_fn = H_FUNCTIONS[cfg.h]
         self.k = num_generations_per_prompt
+        # KL estimator for the gen_kl_error diagnostic (loss_fn.reference_policy_kl_type).
+        self.gen_kl_type = gen_kl_type
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
         self.metric_normalizations = {
             "loss": MetricNormalizer.SEQUENCES,
@@ -132,6 +154,7 @@ class OmegaLossFn(LossFunction):
             "h_mean": MetricNormalizer.SEQUENCES,
             "num_empty_responses": MetricNormalizer.NONE,
             "token_mult_prob_error": MetricNormalizer.TOKENS,
+            "gen_kl_error": MetricNormalizer.TOKENS,
         }
 
     def __call__(
@@ -205,8 +228,8 @@ class OmegaLossFn(LossFunction):
                 "h_mean": masked_mean(
                     h, sample_mask, global_normalization_factor=global_valid_seqs
                 ).item(),
-                "token_mult_prob_error": _token_mult_prob_error(
-                    data, data["sample_mask"], global_valid_toks
+                **_generation_mismatch_metrics(
+                    data, data["sample_mask"], global_valid_toks, self.gen_kl_type
                 ),
             }
         return loss, metrics
@@ -308,12 +331,15 @@ class OmegaPerSequenceLossFn(LossFunction):
     loss_type = LossType.SEQUENCE_LEVEL
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, use_fused_linear_logprobs: bool = False):
+    def __init__(self, *, gen_kl_type: str, use_fused_linear_logprobs: bool = False):
+        # KL estimator for the gen_kl_error diagnostic (loss_fn.reference_policy_kl_type).
+        self.gen_kl_type = gen_kl_type
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
         self.metric_normalizations = {
             "loss": MetricNormalizer.SEQUENCES,
             "seq_logprob_mean": MetricNormalizer.SEQUENCES,
             "token_mult_prob_error": MetricNormalizer.TOKENS,
+            "gen_kl_error": MetricNormalizer.TOKENS,
         }
 
     def __call__(
@@ -341,8 +367,8 @@ class OmegaPerSequenceLossFn(LossFunction):
                 sample_mask,
                 global_normalization_factor=global_valid_seqs,
             ).item(),
-            "token_mult_prob_error": _token_mult_prob_error(
-                data, sample_mask, global_valid_toks
+            **_generation_mismatch_metrics(
+                data, sample_mask, global_valid_toks, self.gen_kl_type
             ),
         }
         return loss, metrics

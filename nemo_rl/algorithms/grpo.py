@@ -868,12 +868,14 @@ def setup(
         validate_omega_setup(master_config)
         if grpo_config.omega_loss.form == "per_sequence":
             loss_fn = OmegaPerSequenceLossFn(
-                use_fused_linear_logprobs=use_fused_linear_logprobs
+                gen_kl_type=loss_config.reference_policy_kl_type,
+                use_fused_linear_logprobs=use_fused_linear_logprobs,
             )
         else:
             loss_fn = OmegaLossFn(
                 grpo_config.omega_loss,
                 num_generations_per_prompt=grpo_config.num_generations_per_prompt,
+                gen_kl_type=loss_config.reference_policy_kl_type,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
             )
     else:
