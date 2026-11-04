@@ -2898,13 +2898,14 @@ class TestDataPlaneCheckpoint:
             _async_cfg=SimpleNamespace(sampler=SimpleNamespace(name="in_order")),
             _teacher_coordinator=None,
             _master_config=SimpleNamespace(
+                token_capture=SimpleNamespace(forest_training=False),
                 data_plane={
                     "packed_multimodal_fields": [
                         "z_features",
                         "a_features",
                         "z_features",
                     ],
-                }
+                },
             ),
         )
         asyncio.run(
