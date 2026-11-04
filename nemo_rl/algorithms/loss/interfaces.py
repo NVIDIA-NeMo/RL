@@ -132,6 +132,26 @@ class ObjectiveReduction:
         denominator: torch.Tensor,
         per_response_weights: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Reduce per-token values to this call's scalar share of the objective.
+
+        Every loss term that is normalized like the gradient (actor, KL,
+        score-centering correction, OPD-full divergence) goes through this
+        method, so all of them share one formula and one denominator.
+
+        Args:
+            values: Per-token values ``[B, S - 1]``.
+            token_mask: Response-token mask ``[B, S - 1]``, before sample masking.
+            sample_mask: Per-response loss weights ``[B]``.
+            mask: ``token_mask * sample_mask[:, None]``.
+            denominator: Scalar from ``loss_divisor``: the global count on
+                synchronous paths, or the split worker's placeholder when the
+                finish-time count is applied later.
+            per_response_weights: ``per_response_weights(data)`` output, or None.
+
+        Returns:
+            A scalar tensor; summing it over microbatches and data-parallel
+            ranks yields the global objective.
+        """
         raise NotImplementedError
 
 
