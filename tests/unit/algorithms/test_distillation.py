@@ -1256,6 +1256,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         "num_gpu_nodes": 1,
         "invalid_tool_call_patterns": ["bad_call"],
         "thinking_tags": ["<think>"],
+        "truncate_noncontiguous_episodes": True,
         "config_paths": ["gym.yaml"],
     }
 
