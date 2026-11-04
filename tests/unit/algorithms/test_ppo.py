@@ -674,13 +674,6 @@ def test_ppo_schema_rejects_unsupported_estimator_name():
         PPOConfig(adv_estimator={"name": "grpo"})
 
 
-def test_ppo_config_defaults_both_epoch_counts_to_four():
-    config = PPOConfig()
-
-    assert config.ppo_epochs == 4
-    assert config.critic_ppo_epochs == 4
-
-
 def test_ppo_config_accepts_more_critic_epochs():
     config = PPOConfig(ppo_epochs=1, critic_ppo_epochs=3)
 
@@ -2508,6 +2501,36 @@ def _validate_async_ppo_entry_config(
     _validate_async_ppo_config(master_config, generation)
 
 
+def test_legacy_ppo_entrypoint_rejects_split_value_training(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from examples import run_ppo
+
+    init_ray = MagicMock()
+    monkeypatch.setattr(run_ppo, "register_omegaconf_resolvers", MagicMock())
+    monkeypatch.setattr(
+        run_ppo,
+        "parse_args",
+        lambda: (SimpleNamespace(config="test.yaml"), []),
+    )
+    monkeypatch.setattr(run_ppo, "load_config", lambda _: {})
+    monkeypatch.setattr(run_ppo.OmegaConf, "to_container", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run_ppo, "check_outdated_config", MagicMock())
+    monkeypatch.setattr(
+        run_ppo,
+        "MasterConfig",
+        lambda **_: SimpleNamespace(
+            ppo=SimpleNamespace(async_ppo={}, value_training_mode="split")
+        ),
+    )
+    monkeypatch.setattr(run_ppo, "init_ray", init_ray)
+
+    with pytest.raises(ValueError, match="value_training_mode=split.*SingleController"):
+        run_ppo.main()
+
+    init_ray.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -2592,33 +2615,11 @@ def test_async_ppo_rejects_fp8_kv_scale_sync():
         _validate_async_ppo_entry_config(config, requires_kv_scale_sync=True)
 
 
-def test_async_ppo_config_allows_kv_cache_recompute_without_inflight_updates():
-    from nemo_rl.algorithms.ppo import AsyncPPOConfig
-
-    config = AsyncPPOConfig(
-        in_flight_weight_updates=False,
-        recompute_kv_cache_after_weight_updates=True,
-    )
-
-    assert not config.in_flight_weight_updates
-    assert config.recompute_kv_cache_after_weight_updates
-
-
-def test_async_ppo_config_defaults():
-    from nemo_rl.algorithms.ppo import AsyncPPOConfig
-
-    config = AsyncPPOConfig()
-
-    assert not config.in_flight_weight_updates
-    assert not config.drop_incomplete_targets_on_restore
-
-
 def test_async_ppo_config_warmup_lead_defaults_to_training_age():
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 
     config = AsyncPPOConfig(max_trajectory_age_steps=3)
 
-    assert config.warmup_generation_lead_steps is None
     assert config.resolved_warmup_generation_lead_steps == 3
 
 

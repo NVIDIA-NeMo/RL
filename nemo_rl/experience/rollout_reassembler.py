@@ -55,7 +55,6 @@ from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
-    ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
     SAMPLER_TOPK_LOGPROBS_FIELD,
     SAMPLER_TOPK_TOKEN_IDS_FIELD,
@@ -204,6 +203,9 @@ class FinalizedGroup:
     # group (the caller does not read these when dropped is True).
     valid_row_count: int = 0
     total_row_count: int = 0
+    # Token metrics counted from the verified rows. The controller merges them
+    # with the Gym rollout metrics into the group's ROLLOUT_METRICS sidecar.
+    token_metrics: dict[str, Any] = field(default_factory=dict)
 
 
 def _capture_token_metrics(
@@ -379,9 +381,14 @@ class RolloutReassembler:
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
         media_columns: Optional[MediaColumnSpec] = None,
+        tokenizer: Any = None,
+        thinking_tags: Sequence[str] | None = None,
         top_logprobs: int = 0,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
+        # Decodes generations for the malformed-think-tag string check.
+        self._tokenizer = tokenizer
+        self._thinking_tags = thinking_tags
         self._effort_config = effort_config
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -543,6 +550,8 @@ class RolloutReassembler:
                     effort_config=self._effort_config,
                     token_ids=row.token_ids,
                     link_spans=reward_spans,
+                    decode=self._decode if self._tokenizer is not None else None,
+                    thinking_tags=self._thinking_tags,
                 )
             except ValueError as error:
                 return rejected(f"reward_processing:{error}", staging_keys)
@@ -716,6 +725,9 @@ class RolloutReassembler:
             sampler_topk_token_ids=sampler_topk_token_ids,
             sampler_topk_logprobs=sampler_topk_logprobs,
         )
+
+    def _decode(self, token_ids: Sequence[int]) -> str:
+        return self._tokenizer.decode(list(token_ids), skip_special_tokens=False)
 
     def _resolve_media(
         self,
@@ -1043,12 +1055,13 @@ class RolloutReassembler:
                 count
             )
 
+        # (row index, logical slot, row): one entry per rollout.
         if logical is None:
-            reward_rows = list(enumerate(rows))
+            reward_rows = [(index, index, row) for index, row in enumerate(rows)]
         else:
             reward_rows = [
-                (tag["logical_slot"], row)
-                for tag, row in zip(logical.tags, rows, strict=True)
+                (index, tag["logical_slot"], row)
+                for index, (tag, row) in enumerate(zip(logical.tags, rows, strict=True))
                 if tag["segment_index"] == 0
             ]
         reward_observations = [
@@ -1058,12 +1071,24 @@ class RolloutReassembler:
                 row.reward,
                 log_contexts[slot],
             )
-            for slot, row in reward_rows
+            for _, slot, row in reward_rows
             if row.valid
         ]
+        # Truncated rollouts among the reward observations, pooled into
+        # termination rates like the penalty counts; receipt-side rates only
+        # saw a placeholder truncated=False.
+        truncated_flags = self._truncated_flags(rows, logical)
+        metrics["finalize/truncated_count"] = 0.0
+        for index, slot, row in reward_rows:
+            if row.valid:
+                truncated = float(truncated_flags[index])
+                metrics["finalize/truncated_count"] += truncated
+                context = log_contexts[slot]
+                if context is not None:
+                    key = f"finalize/truncated_count/{context.agent_name}"
+                    metrics[key] = metrics.get(key, 0.0) + truncated
 
-        # Reuse the ordinary replay metric channel; finalizer timing counters stay
-        # scalar-only. Compute before _publish_rows appends execution padding.
+        # Compute before _publish_rows appends execution padding.
         token_metrics = _capture_token_metrics(
             rows,
             [tag["logical_slot"] for tag in logical.tags]
@@ -1087,9 +1112,20 @@ class RolloutReassembler:
             canonical_sample_ids=canonical_sample_ids,
             loss_multiplier=loss_multiplier,
         )
-        if finalized.meta is not None:
-            finalized.meta.extra_info[ROLLOUT_METRICS] = [token_metrics]
+        finalized.token_metrics = token_metrics
         return finalized
+
+    def _truncated_flags(
+        self, rows: Sequence[FinalizedRollout], logical: Optional[_LogicalRows]
+    ) -> list[bool]:
+        """Per-row truncation, shared by the TRUNCATED column and termination rates.
+
+        Forest rows carry their rollout's Gym-reported truncation; ordinary rows
+        count as truncated when they fill ``max_seq_len``.
+        """
+        if logical is not None:
+            return list(logical.truncated)
+        return [len(row.token_ids) == self._max_seq_len for row in rows]
 
     def _publish_rows(
         self,
@@ -1247,10 +1283,7 @@ class RolloutReassembler:
             "total_reward": rewards_t,
             MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
             TRUNCATED: torch.tensor(
-                logical.truncated
-                if logical is not None
-                else [seq_len == self._max_seq_len for seq_len in seq_lens],
-                dtype=torch.bool,
+                self._truncated_flags(rows, logical), dtype=torch.bool
             ),
         }
         if sampler_topk_token_ids is not None:

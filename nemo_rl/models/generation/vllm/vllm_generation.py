@@ -91,6 +91,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def resolve_refit_rank_prefixes(
+    membership: RefitMembership,
+    total_workers: int,
+    dp_size: int,
+    vllm_dp_size: int,
+) -> dict[int, int]:
+    """Use instance prefixes for native DP, preserving compacted shard prefixes otherwise."""
+    if vllm_dp_size == 1:
+        return membership.shard_prefixes
+    if (
+        sorted(membership.shard_prefixes) != list(range(dp_size))
+        or membership.world_size - membership.train_world_size != total_workers
+    ):
+        raise RuntimeError("Partial-shard rebuild is not supported with vLLM DP")
+    prefixes = resolve_vllm_rank_prefixes(total_workers, dp_size, vllm_dp_size)
+    return {shard_idx: prefixes[shard_idx] for shard_idx in membership.shard_prefixes}
+
+
 def http_server_api_key_and_worker_config(
     config: VllmConfig,
 ) -> tuple[Optional[str], VllmConfig]:
@@ -997,10 +1015,15 @@ class VllmGeneration(GenerationInterface):
         Only leaders are called: each one ``collective_rpc``s into its own TP/PP workers,
         so one Ray call per shard reaches every rank in it.
         """
-        if self.vllm_dp_size > 1:
-            raise RuntimeError("Partial-shard rebuild is not supported with vLLM DP")
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
+
+        rank_prefixes = resolve_refit_rank_prefixes(
+            membership,
+            len(self.worker_group.workers),
+            self.dp_size,
+            self.vllm_dp_size,
+        )
 
         method_name = (
             "init_collective_async"
@@ -1009,7 +1032,7 @@ class VllmGeneration(GenerationInterface):
         )
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
-        for shard_idx, rank_prefix in membership.shard_prefixes.items():
+        for shard_idx, rank_prefix in rank_prefixes.items():
             leader_idx = shard_idx * membership.workers_per_shard
             if leader_idx >= len(workers):
                 raise RuntimeError(
@@ -1562,9 +1585,9 @@ class VllmGeneration(GenerationInterface):
             else "init_nccl_reshard_comm_group"
         )
 
-        total_workers = len(self.worker_group.workers)
-        workers_per_group = total_workers // self.dp_size
-        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+        rank_prefix_list = resolve_vllm_rank_prefixes(
+            len(self.worker_group.workers), self.dp_size, self.vllm_dp_size
+        )
 
         futures = self.worker_group.run_all_workers_multiple_data(
             method_name,
@@ -1617,6 +1640,13 @@ class VllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
+        rank_prefixes = resolve_refit_rank_prefixes(
+            membership,
+            len(self.worker_group.workers),
+            self.dp_size,
+            self.vllm_dp_size,
+        )
+
         method_name = (
             "init_nccl_reshard_comm_group_async"
             if self.cfg["vllm_cfg"]["async_engine"]
@@ -1624,7 +1654,7 @@ class VllmGeneration(GenerationInterface):
         )
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
-        for shard_idx, rank_prefix in membership.shard_prefixes.items():
+        for shard_idx, rank_prefix in rank_prefixes.items():
             leader = workers[shard_idx * membership.workers_per_shard]
             futures.append(
                 getattr(leader, method_name).remote(
