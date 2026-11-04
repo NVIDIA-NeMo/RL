@@ -6702,6 +6702,15 @@ def async_grpo_train(
                 )
             )
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
+            mean_gen_length = metrics.get("mean_gen_tokens_per_sample")
+            print(
+                "  • Mean Generation Length: "
+                + (
+                    f"{mean_gen_length:.4f}"
+                    if mean_gen_length is not None
+                    else "not reported"
+                )
+            )
             print(f"  • Buffer Size: {buffer_size_current}")
             print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")
 
