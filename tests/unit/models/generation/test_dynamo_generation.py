@@ -124,7 +124,7 @@ def _patch_runtime(
         def shutdown(self):
             events.append("shutdown")
 
-    monkeypatch.setattr(generation_module, "ManagedDynamoRuntime", FakeRuntime)
+    monkeypatch.setattr(generation_module, "LegacyManagedDynamoRuntime", FakeRuntime)
 
 
 def _data() -> BatchedDataDict:

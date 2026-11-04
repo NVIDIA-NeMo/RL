@@ -13,9 +13,11 @@
 # limitations under the License.
 import sys
 import types
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from nemo_rl.models.generation.megatron import dynamo_worker_mixin
 from nemo_rl.models.generation.megatron.dynamo_worker_mixin import (
@@ -103,6 +105,326 @@ def test_dynamo_worker_builds_the_handoff_engine(engine_modules, role):
         role=role, require_handoff_claim=True
     )
     plain.assert_not_called()
+
+
+def test_engine_state_reset_clears_the_event_reporter_and_endpoint():
+    worker = _bare_worker(role="prefill")
+    worker._dynamo_event_reporter = MagicMock()
+    worker._dynamo_endpoint_future = MagicMock()
+    worker._dynamo_endpoint_metadata = {"event_port": 1}
+
+    worker._init_inference_engine_state()
+
+    assert worker._dynamo_event_reporter is None
+    assert worker._dynamo_endpoint_future is None
+    assert worker._dynamo_endpoint_metadata is None
+    assert worker.dynamic_inference_engine is None
+
+
+# ---------------------------------------------------------------------------
+# Rank zero hosts Megatron-LM's Dynamo adapter in-process
+# ---------------------------------------------------------------------------
+
+
+class _LoopThread:
+    """A running asyncio loop on a thread, standing in for the worker's inference loop."""
+
+    def __init__(self) -> None:
+        import asyncio
+        import threading
+
+        self.loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self._thread.join(timeout=5)
+        self.loop.close()
+
+
+@pytest.fixture
+def dynamo_endpoint_env(monkeypatch):
+    """Fake ai-dynamo and Megatron-LM Dynamo modules, plus a bare rank-zero worker.
+
+    Yields a namespace with the worker, the fakes' call records, and a knob that
+    makes the fake ``Worker.run`` return (``finish``) or raise (``fail``).
+    """
+    import asyncio
+    import sys
+    import types
+
+    records = SimpleNamespace(
+        configs=[],
+        engines=[],
+        workers=[],
+        fetched=[],
+        run_started=None,
+        reporters=[],
+    )
+    control = SimpleNamespace(finish=None, fail=None)
+
+    class Config:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            records.configs.append(self)
+
+    class MegatronLLMEngine:
+        def __init__(self, config, registration_model=None):
+            self.config = config
+            self.registration_model = registration_model
+            records.engines.append(self)
+
+        @staticmethod
+        def worker_config(config, registration_model=None):
+            return ("worker-config", config.role, registration_model)
+
+    class Worker:
+        def __init__(self, engine, config):
+            self.engine = engine
+            self.config = config
+            records.workers.append(self)
+
+        async def run(self):
+            records.run_started = asyncio.get_running_loop()
+            while control.finish is None and control.fail is None:
+                await asyncio.sleep(0.01)
+            if control.fail is not None:
+                raise control.fail
+            return None
+
+    async def fetch_model(model, ignore_weights=False):
+        records.fetched.append((model, ignore_weights))
+        return f"/snapshots/{model.replace('/', '--')}"
+
+    class EngineEventReporter:
+        def __init__(self, engine, parent_address):
+            self.parent_address = parent_address
+            self.events = []
+            self.started_on = None
+            records.reporters.append(self)
+
+        def start(self):
+            self.started_on = asyncio.get_running_loop()
+
+        def observe(self, kind, payload):
+            self.events.append((kind, payload))
+
+    class InferenceEngineEndpoint:
+        def __init__(self, address):
+            self.address = address
+
+        @classmethod
+        def from_engine(cls, address, engine, logical_data_parallel_size):
+            assert logical_data_parallel_size == 1
+            return cls(address)
+
+        def to_dict(self):
+            return {"coordinator_address": self.address}
+
+    def module(name, **attrs):
+        mod = types.ModuleType(name)
+        mod.__dict__.update(attrs)
+        monkeypatch.setitem(sys.modules, name, mod)
+        return mod
+
+    module("dynamo")
+    module("dynamo.common")
+    module("dynamo.common.backend", Worker=Worker)
+    module("dynamo.common.model_fetch", fetch_model=fetch_model)
+    module("megatron.inference.integrations")
+    module("megatron.inference.integrations.dynamo")
+    module("megatron.inference.integrations.dynamo.args", Config=Config)
+    module(
+        "megatron.inference.integrations.dynamo.llm_engine",
+        MegatronLLMEngine=MegatronLLMEngine,
+    )
+    module(
+        "megatron.inference.integrations.dynamo.telemetry",
+        EngineEventReporter=EngineEventReporter,
+    )
+    module(
+        "megatron.core.inference.engine_endpoint",
+        InferenceEngineEndpoint=InferenceEngineEndpoint,
+    )
+    ports = iter(range(4000, 4100))
+
+    def free_port(low, high, *, max_retries=None, excluded_ports=()):
+        while True:
+            port = next(ports)
+            if port not in excluded_ports:
+                return port
+
+    worker_module = "nemo_rl.models.generation.megatron.dynamo_worker_mixin"
+    monkeypatch.setattr(f"{worker_module}._get_node_ip_local", lambda: "10.0.0.5")
+    monkeypatch.setattr(f"{worker_module}._get_free_port_local", free_port)
+    monkeypatch.delenv("DYN_SYSTEM_PORT", raising=False)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    loop_thread = _LoopThread()
+    # A rank-zero worker whose engine the first refit already built.
+    worker = object.__new__(_Worker)
+    worker.rank = 0
+    worker.cfg = {"generation": {"_dynamo_role": "prefill"}}
+    worker._inference_engine_initialized = True
+    worker._dynamo_endpoint_future = None
+    worker._dynamo_endpoint_metadata = None
+    worker._dynamo_event_reporter = None
+    worker.coordinator_addr = "tcp://10.0.0.5:6000"
+    worker.dynamic_inference_engine = MagicMock()
+    worker._inference_loop = loop_thread.loop
+    yield SimpleNamespace(worker=worker, records=records, control=control)
+    worker.stop_dynamo_endpoint()
+    loop_thread.close()
+
+
+def _start(env, role="prefill", **overrides):
+    env.worker.cfg["generation"]["_dynamo_role"] = role
+    kwargs = dict(
+        namespace="ns",
+        manager_env={"ETCD_ENDPOINTS": "http://etcd:2379", "DYN_NAMESPACE": "ns"},
+        model_name="Qwen/Qwen3-0.6B",
+        served_model_name="Qwen/Qwen3-0.6B",
+        endpoint_types=["completions"],
+        engine_start_timeout_s=600.0,
+        excluded_ports=[4000],
+    )
+    kwargs.update(overrides)
+    return env.worker.start_dynamo_endpoint(**kwargs)
+
+
+def _wait_until(predicate, timeout=5.0):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.01)
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_start_dynamo_endpoint_hosts_the_adapter_on_the_inference_loop(
+    dynamo_endpoint_env, role
+):
+    env = dynamo_endpoint_env
+    metadata = _start(env, role=role)
+
+    # Ports skip what earlier engines on the node took; the event address is
+    # what every rank's reporter connects to.
+    assert metadata["node_ip"] == "10.0.0.5"
+    assert metadata["event_port"] == 4001 and metadata["system_port"] == 4002
+    assert metadata["parent_event_address"] == "tcp://10.0.0.5:4001"
+    import os
+
+    assert os.environ["DYN_SYSTEM_PORT"] == "4002"
+    assert os.environ["ETCD_ENDPOINTS"] == "http://etcd:2379"
+
+    # The adapter is Megatron-LM's own, in external mode: it starts no engine.
+    _wait_until(lambda: env.records.run_started is not None)
+    (config,) = env.records.configs
+    assert config.engine_launch_mode == "external"
+    assert config.role == role
+    assert config.component == ("prefill" if role == "prefill" else "backend")
+    assert config.endpoint == "generate" and config.endpoint_types == "completions"
+    assert (config.parent_event_host, config.parent_event_port) == ("10.0.0.5", 4001)
+    assert config.coordinator_host == "10.0.0.5"
+    assert config.engine_start_timeout == 600.0
+    assert config.namespace == "ns" and config.discovery_backend == "etcd"
+    if role == "decode":
+        assert config.handoff_owner == metadata["handoff_owner"]
+        assert len(config.handoff_owner) == 32
+    else:
+        assert config.handoff_owner is None and metadata["handoff_owner"] is None
+    # It runs on the inference loop, the loop the engine itself will use.
+    assert env.records.run_started is env.worker._inference_loop
+    assert not env.worker._dynamo_endpoint_future.done()
+
+    # A repeat start hands back the same endpoint and launches no second adapter.
+    assert _start(env, role=role, excluded_ports=[]) == metadata
+    assert len(env.records.configs) == 1
+
+
+@pytest.mark.parametrize(
+    ("model_name", "fetched", "registered"),
+    [
+        # A hub id registers as a metadata-only snapshot, never a second copy.
+        pytest.param(
+            "Qwen/Qwen3-0.6B",
+            [("Qwen/Qwen3-0.6B", True)],
+            "/snapshots/Qwen--Qwen3-0.6B",
+            id="hub_id",
+        ),
+        pytest.param("{tmp_path}", [], "{tmp_path}", id="local_path"),
+    ],
+)
+def test_dynamo_endpoint_registers_the_model_with_the_adapter(
+    dynamo_endpoint_env, tmp_path, model_name, fetched, registered
+):
+    env = dynamo_endpoint_env
+    local = str(tmp_path.resolve())
+    _start(env, model_name=model_name.format(tmp_path=local))
+    _wait_until(lambda: env.records.workers)
+
+    assert env.records.fetched == fetched
+    (engine,) = env.records.engines
+    assert engine.registration_model == registered.format(tmp_path=local)
+    (dynamo_worker,) = env.records.workers
+    assert dynamo_worker.engine is engine
+    assert dynamo_worker.config == (
+        "worker-config",
+        "prefill",
+        engine.registration_model,
+    )
+
+
+def test_stop_dynamo_endpoint_cancels_the_adapter_task(dynamo_endpoint_env):
+    env = dynamo_endpoint_env
+    _start(env)
+    future = env.worker._dynamo_endpoint_future
+    _wait_until(lambda: env.records.run_started is not None)
+
+    env.worker.stop_dynamo_endpoint()
+
+    _wait_until(future.done)
+    assert future.cancelled()
+    # Stopping forgets the task, so a rebuilt worker can start a new one.
+    assert env.worker._dynamo_endpoint_future is None
+    assert env.worker._dynamo_endpoint_metadata is None
+    _start(env, excluded_ports=[])
+    assert len(env.records.configs) == 2
+    assert not env.worker._dynamo_endpoint_future.done()
+
+
+def test_dynamo_endpoint_and_events_need_a_built_engine(dynamo_endpoint_env):
+    env = dynamo_endpoint_env
+    env.worker._inference_engine_initialized = False
+    match = "needs the inference engine"
+    with pytest.raises(RuntimeError, match=match):
+        _start(env)
+    with pytest.raises(RuntimeError, match=match):
+        env.worker.attach_dynamo_events(parent_event_address="tcp://10.0.0.5:4001")
+    assert env.records.configs == [] and env.records.reporters == []
+
+
+def test_attach_dynamo_events_reports_ready_to_the_adapter_once(dynamo_endpoint_env):
+    """Once the engine runs, rank zero tells the adapter where its coordinator is."""
+    env = dynamo_endpoint_env
+    metadata = _start(env)
+    address = metadata["parent_event_address"]
+
+    assert env.worker.attach_dynamo_events(parent_event_address=address) is True
+
+    (reporter,) = env.records.reporters
+    assert reporter.parent_address == address
+    # Started on the inference loop, where the engine fires its callbacks.
+    assert reporter.started_on is env.worker._inference_loop
+    assert reporter.events == [
+        ("ready", {"coordinator_address": "tcp://10.0.0.5:6000"})
+    ]
+    env.worker.dynamic_inference_engine.set_progress_callback.assert_called_once()
+    # A second attach (a later refit, or the controller's copy) changes nothing.
+    env.worker.attach_dynamo_events(parent_event_address=address)
+    assert len(env.records.reporters) == 1 and len(reporter.events) == 1
 
 
 def test_dynamo_worker_requires_the_megatron_dynamo_integration(monkeypatch):

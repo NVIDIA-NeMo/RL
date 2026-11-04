@@ -217,6 +217,12 @@ mcore = [
   # dependency megatron-core[dev,mlm] and its [tool.uv.sources] path mapping, so Megatron-LM
   # pyproject changes propagate on bump without any mirror here.
   "megatron-bridge[te,ssm]",
+  # Megatron prefill/decode engines behind Dynamo (policy.generation.backend=dynamo,
+  # dynamo_cfg.engine=megatron): rank zero of each engine hosts Megatron-LM's Dynamo
+  # adapter through Dynamo's engine-agnostic backend SDK. Base package only: its
+  # [vllm] extra pins Dynamo's own vLLM, which these engines never run.
+  "ai-dynamo==1.5.1",
+  "ai-dynamo-runtime==1.5.1",
   # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
   "torch==2.13.0",
   "torchvision==0.28.0",
@@ -469,6 +475,10 @@ override-dependencies = [
   # ships aarch64 wheels, so this is a choice, not a wheel-availability limit.
   "instanttensor>=0.1.9; platform_machine == 'x86_64'",
   "llguidance>=1.7.0,<1.8.0",
+  # ai-dynamo requires these for its planner and simulators only (aisimulate brings
+  # jax, flax and tfp-nightly). The backend SDK the Megatron engines use imports neither.
+  "aisimulate; sys_platform == 'never'",
+  "kubernetes; sys_platform == 'never'",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",

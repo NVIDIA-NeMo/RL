@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MegatronDynamoGeneration: the prefill/decode engines and their refit side."""
+"""MegatronDynamoGeneration: the prefill/decode engines behind the frontend and their refit side."""
 
 import asyncio
 import copy
 import pickle
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import ray
@@ -169,23 +170,36 @@ class _FakeEngine:
         self.log = env.log
         self.name = kwargs["name_prefix"].removeprefix("dynamo_")
         self.short = _SHORT.get(self.name, self.name)
+        self.env = env
         self.alive = True
         self.fail_shutdown = False
         self.unclean_shutdown = False
+        self.fail_calls = False
         self.shutdown_calls = 0
+        # (rank, parent_event_address) per attach_dynamo_events call.
+        self.attached: list[tuple[int, str]] = []
+        self.metadata = None
+        self.endpoint_kwargs = None
         # Refit fakes: rank zero's calls land in the log. ``faults`` maps a
         # worker method to an exception, or "hang".
         self.faults: dict[str, object] = {}
         (width,) = kwargs["cluster"].kwargs["bundle_ct_per_node_list"]
         workers = [_FakeWorker(self.short, rank) for rank in range(width)]
         self.worker_group = SimpleNamespace(
-            workers=workers, get_dp_leader_worker_idx=lambda shard: 0
+            workers=workers,
+            get_dp_leader_worker_idx=lambda shard: 0,
+            py_executable="/venvs/mcore/bin/python",
         )
         self.log.append(f"engine {self.name} up")
 
     def call(self, rank: int, method: str, kwargs: dict) -> _Ref:
         if method == "is_alive":
             return _Ref(self.alive)
+        if method in ("start_dynamo_endpoint", "attach_dynamo_events"):
+            try:
+                return _Ref(getattr(self, f"_{method}")(rank, **kwargs))
+            except Exception as error:
+                return _Ref(error=error)
         if rank == 0:
             self.log.append(self._entry(method, kwargs))
         fault = self.faults.get(method)
@@ -216,12 +230,72 @@ class _FakeEngine:
     def role(self) -> str:
         return self.kwargs["config"]["generation"]["_dynamo_role"]
 
+    def _start_dynamo_endpoint(self, rank, **kwargs):
+        """Rank zero's endpoint start: node-local ports, an owner for decode."""
+        assert rank == 0
+        if self.metadata is not None:
+            return self.metadata
+        index = len(self.env.endpoints)
+        if self.env.fail_endpoint_at == index:
+            raise RuntimeError(f"endpoint {self.name} failed to start")
+        self.endpoint_kwargs = kwargs
+        node_ip = self.kwargs["cluster"].placement_group.bundle_nodes[0]
+        self.event_port = 7000 + 2 * index
+        self.system_port = self.event_port + 1
+        self.owner = f"owner-{self.name}" if self.role == "decode" else None
+        self.env.endpoints.append(self)
+        self.log.append(f"endpoint {self.name} {self.role}")
+        self.metadata = {
+            "node_ip": node_ip,
+            "event_port": self.event_port,
+            "system_port": self.system_port,
+            "parent_event_address": f"tcp://{node_ip}:{self.event_port}",
+            "handoff_owner": self.owner,
+        }
+        return self.metadata
+
+    def _attach_dynamo_events(self, rank, *, parent_event_address):
+        self.attached.append((rank, parent_event_address))
+        if rank == 0:
+            self.log.append(f"attach {self.name}")
+        return True
+
+    def stop_dynamo_endpoint(self):
+        if self.fail_calls:
+            raise RuntimeError(f"engine {self.name} is gone")
+        self.log.append(f"stop-endpoint {self.name}")
+
     def shutdown(self):
         self.shutdown_calls += 1
         if self.fail_shutdown:
             raise RuntimeError(f"engine {self.name} shutdown failed")
         self.log.append(f"engine {self.name} down")
         return not self.unclean_shutdown
+
+
+class _FakeRuntime:
+    """Stand-in for ``ManagedDynamoRuntime``: etcd, NATS and the frontend."""
+
+    def __init__(self, env: "_Env", *, dynamo_cfg, model_name, frontend_python):
+        self.dynamo_cfg = dynamo_cfg
+        self.model_name = model_name
+        self.frontend_python = frontend_python
+        self.log = env.log
+        self.waits: list[Any] = []
+        self.namespace = "ns"
+        self.engine_env = {"ETCD_ENDPOINTS": "http://etcd:2379"}
+        self.frontend_url = "http://10.0.0.1:3000/v1"
+        env.runtimes.append(self)
+
+    def start(self):
+        self.log.append("runtime up")
+
+    def wait_for_engines(self, expected_components, check_engines):
+        check_engines()
+        self.waits.append(dict(expected_components))
+
+    def shutdown(self):
+        self.log.append("runtime down")
 
 
 class _NodeIpTask:
@@ -243,7 +317,11 @@ class _Env:
         self.clusters: list[_FakeCluster] = []
         self.engines: list[_FakeEngine] = []
         self.engines_by_short: dict[str, _FakeEngine] = {}
+        # Engines whose rank zero started its Dynamo endpoint, in start order.
+        self.endpoints: list[_FakeEngine] = []
+        self.runtimes: list[_FakeRuntime] = []
         self.fail_engine_at = None
+        self.fail_endpoint_at = None
         self.ray = _FakeRay()
 
         def make_cluster(**kwargs):
@@ -270,6 +348,11 @@ class _Env:
         monkeypatch.setattr(generation_module, "RayVirtualCluster", make_cluster)
         monkeypatch.setattr(generation_module, "cluster_node_ip", _NodeIpTask())
         monkeypatch.setattr(generation_module, "ray", self.ray)
+        monkeypatch.setattr(
+            generation_module,
+            "ManagedDynamoRuntime",
+            lambda **kwargs: _FakeRuntime(self, **kwargs),
+        )
 
     def generation(
         self,
@@ -306,6 +389,11 @@ class _Env:
 
     def engine(self, short: str) -> _FakeEngine:
         return self.engines_by_short[short]
+
+    @property
+    def runtime(self) -> _FakeRuntime:
+        (runtime,) = self.runtimes
+        return runtime
 
     def refit_timeouts(self) -> list:
         """Timeouts of the gets the refit path made (liveness probes excluded)."""
@@ -360,10 +448,17 @@ def test_builds_one_cluster_and_engine_per_role(env):
     assert generation.inference_world_size == 6
     assert generation.get_inference_world_size() == 6
     assert generation.num_engines == 3
+    assert generation.expected_components() == {"prefill": 1, "backend": 2}
+    # Engines first, then the runtime from their environment, as for vLLM. No
+    # endpoint yet: the engines have no weights until the first refit.
     expected_log = []
     for name in _IDS:
         expected_log += [f"cluster {name} up", f"placement {name}", f"engine {name} up"]
-    assert env.log == expected_log
+    assert env.log == expected_log + ["runtime up"] and env.endpoints == []
+    assert env.runtime.frontend_python == "/venvs/mcore/bin/python"
+    assert env.runtime.model_name == "Qwen/Qwen3-0.6B"
+    assert generation._dynamo_namespace == "ns"
+    assert generation.dp_openai_server_base_urls == ["http://10.0.0.1:3000/v1"]
 
     cluster = env.clusters[0]
     assert cluster.kwargs == {
@@ -609,6 +704,12 @@ def test_start_failure_tears_down_what_exists(env):
         "cluster decode-0 down",
         "cluster decode-1 down",
     }
+    assert [line for line in env.log if line.startswith("stop-endpoint")] == [
+        "stop-endpoint prefill-0",
+        "stop-endpoint decode-0",
+    ]
+    # No service was started for engines that never came up.
+    assert env.runtimes == []
 
 
 def test_engine_split_across_nodes_is_rejected(env):
@@ -638,13 +739,11 @@ def test_rejects_colocation_and_a_cluster_that_does_not_fit_the_replica(env):
     generation_config["disaggregation"]["num_prefill_engines"] = 2
     with pytest.raises(ValueError, match="not a multiple of one replica"):
         env.generation(generation_config, world_size=4)
-    assert env.log == []
+    assert env.log == [] and env.runtimes == []
 
 
 _ENGINES_DOWN = [
-    "engine prefill-0 down",
-    "engine decode-0 down",
-    "engine decode-1 down",
+    line for name in _IDS for line in (f"stop-endpoint {name}", f"engine {name} down")
 ]
 _CLUSTERS_DOWN = [
     "cluster prefill-0 down",
@@ -657,32 +756,188 @@ _CLUSTERS_DOWN = [
     ("faults", "expected_log", "errors"),
     [
         pytest.param({}, _ENGINES_DOWN + _CLUSTERS_DOWN, [], id="clean"),
-        # A failed or unclean engine stop is logged; the teardown continues.
+        # A failed endpoint stop, engine stop or unclean stop is logged; the
+        # teardown continues.
         pytest.param(
-            {"d0": {"fail_shutdown": True}, "d1": {"unclean_shutdown": True}},
-            ["engine prefill-0 down", "engine decode-1 down"] + _CLUSTERS_DOWN,
-            ["Could not stop a Megatron engine", "did not shut down cleanly"],
+            {
+                "p0": {"fail_calls": True},
+                "d0": {"fail_shutdown": True},
+                "d1": {"unclean_shutdown": True},
+            },
+            [
+                "engine prefill-0 down",
+                "stop-endpoint decode-0",
+                "stop-endpoint decode-1",
+                "engine decode-1 down",
+            ]
+            + _CLUSTERS_DOWN,
+            [
+                "Could not stop a Megatron engine's Dynamo endpoint",
+                "Could not stop a Megatron engine",
+                "did not shut down cleanly",
+            ],
             id="continues_past_failures",
         ),
     ],
 )
-def test_shutdown_stops_every_engine_then_its_cluster(
+def test_shutdown_stops_every_endpoint_and_engine_then_its_cluster_then_the_runtime(
     env, caplog, faults, expected_log, errors
 ):
     generation = env.started()
+    _start_endpoints(generation)
     for short, flags in faults.items():
         vars(env.engine(short)).update(flags)
+    env.log.clear()
 
     with caplog.at_level("ERROR"):
         assert generation.shutdown() is True
 
-    assert env.log == expected_log
+    # Engines (endpoint, then policy), their clusters, then the services.
+    assert env.log == expected_log + ["runtime down"]
     for error in errors:
         assert error in caplog.text
     assert generation.engine_records == [] and generation.num_engines == 0
+    assert generation.expected_components() == {}
     env.log.clear()
     assert generation.shutdown() is True
     assert env.log == []
+
+
+# ---------------------------------------------------------------------------
+# Serving through the frontend: endpoints and the readiness wait
+# ---------------------------------------------------------------------------
+
+
+def _start_endpoints(generation) -> None:
+    generation.start_endpoints(
+        namespace="ns",
+        engine_env={"ETCD_ENDPOINTS": "http://etcd:2379"},
+        model_name="Qwen/Qwen3-0.6B",
+        timeout_s=_CONTROL_TIMEOUT_S,
+    )
+
+
+def test_start_endpoints_starts_rank_zero_then_attaches_every_rank(env):
+    generation = env.started()
+
+    _start_endpoints(generation)
+
+    # Engine by engine: rank zero's endpoint, then every rank's events.
+    assert env.log == [
+        line
+        for name, role in zip(_IDS, _ROLES)
+        for line in (f"endpoint {name} {role}", f"attach {name}")
+    ]
+    for engine in env.engines:
+        address = engine.metadata["parent_event_address"]
+        assert engine.attached == [(0, address), (1, address)]
+    assert [e.owner for e in env.endpoints] == [
+        None,
+        "owner-decode-0",
+        "owner-decode-1",
+    ]
+    # The second engine on 10.0.0.1 avoids the first one's ports; the engine on
+    # 10.0.0.2 starts fresh.
+    first = env.endpoints[0]
+    assert [e.endpoint_kwargs["excluded_ports"] for e in env.endpoints] == [
+        [],
+        [first.event_port, first.system_port],
+        [],
+    ]
+    assert first.endpoint_kwargs == {
+        "namespace": "ns",
+        "manager_env": {"ETCD_ENDPOINTS": "http://etcd:2379"},
+        "model_name": "Qwen/Qwen3-0.6B",
+        "served_model_name": "Qwen/Qwen3-0.6B",
+        "endpoint_types": ["completions"],
+        "engine_start_timeout_s": 600,
+        "excluded_ports": [],
+    }
+    # Later refits do not start them again.
+    env.log.clear()
+    _start_endpoints(generation)
+    assert env.log == []
+
+
+def test_start_endpoints_names_the_engine_that_failed(env):
+    env.fail_endpoint_at = 1
+    generation = env.started()
+    with pytest.raises(RuntimeError, match="failed to start") as raised:
+        _start_endpoints(generation)
+    assert "decode-0" in str(raised.value.__notes__)
+    # The next attempt resumes where the workers left off.
+    env.fail_endpoint_at = None
+    _start_endpoints(generation)
+    assert [e.name for e in env.endpoints] == _IDS
+
+
+def test_check_alive_names_the_dead_engines(env):
+    generation = env.started()
+    generation.check_alive()
+    env.engine("d0").alive = False
+    with pytest.raises(RuntimeError, match="died: decode-0"):
+        generation.check_alive()
+
+
+def test_first_resume_starts_the_endpoints_and_awaits_the_frontend(env):
+    generation = env.started()
+
+    generation.suspend_for_refit()
+    generation.prepare_for_generation(tags=["weights"])
+    generation.prepare_for_generation(tags=["kv_cache"])
+    assert env.runtime.waits == [] and env.endpoints == []
+    env.log.clear()
+    generation.resume_after_refit()
+    # The first resume is the engines' startup: the refit built them, so their
+    # endpoints start now, and the frontend must list both components.
+    assert env.log == [f"{name}.resume" for name in _NAMES] + [
+        line
+        for name, role in zip(_IDS, _ROLES)
+        for line in (f"endpoint {name} {role}", f"attach {name}")
+    ]
+    assert env.runtime.waits == [{"prefill": 1, "backend": 2}]
+    env.log.clear()
+    generation.resume_after_refit()
+    assert env.log == [f"{name}.resume" for name in _NAMES]
+    assert env.runtime.waits == [{"prefill": 1, "backend": 2}], "awaited once"
+
+
+def test_pickled_copy_awaits_the_frontend_over_http(env, monkeypatch):
+    generation = env.started()
+    clone = pickle.loads(pickle.dumps(generation))
+    assert clone._dynamo_runtime is None
+    assert clone.dp_openai_server_base_urls == ["http://10.0.0.1:3000/v1"]
+    with pytest.raises(RuntimeError, match="copy .* owns no engines"):
+        clone.engine_python()
+    # The copy owns nothing: shutdown stops no engine and no service.
+    assert clone.shutdown() is True
+    assert env.log == []
+
+    waits: list[dict[str, Any]] = []
+
+    def fake_wait(**kwargs):
+        kwargs.pop("check_alive")()  # the wait probes the engines each poll
+        waits.append(kwargs)
+
+    monkeypatch.setattr(generation_module, "wait_for_engine_registrations", fake_wait)
+    clone = pickle.loads(pickle.dumps(generation))
+    clone.resume_after_refit()
+    # The copy starts the endpoints itself, through the workers' handles.
+    assert [e.name for e in env.endpoints] == _IDS
+    assert waits == [
+        {
+            "frontend_url": "http://10.0.0.1:3000/v1",
+            "namespace": "ns",
+            "expected_components": {"prefill": 1, "backend": 2},
+            "model_name": "Qwen/Qwen3-0.6B",
+            "timeout_s": 600.0,
+        }
+    ]
+    # A dead engine fails the readiness wait instead of running out the timeout.
+    clone._dynamo_fleet_ready = False
+    env.engine("d0").alive = False
+    with pytest.raises(RuntimeError, match="Megatron engines died: decode-0"):
+        clone.resume_after_refit()
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +985,7 @@ def test_pickled_copy_drives_the_engines_but_owns_none(env):
     assert env.log == []
     # The copy still drives the engines through the handles it kept.
     clone = pickle.loads(pickle.dumps(generation))
+    clone._dynamo_fleet_ready = True  # the readiness wait is covered below
     clone.suspend_for_refit()
     clone.resume_after_refit()
     assert env.log == [f"{name}.suspend" for name in _NAMES] + [
@@ -808,7 +1064,7 @@ def test_refit_sequence_runs_every_phase_on_every_engine(env):
     ]
     log.clear()
     generation.resume_after_refit()
-    assert log == [f"{name}.resume" for name in _NAMES]
+    assert log[: len(_NAMES)] == [f"{name}.resume" for name in _NAMES]
     # Every wait on an engine is bounded by the control timeout.
     assert all(t <= _CONTROL_TIMEOUT_S for t in env.refit_timeouts())
 
@@ -922,6 +1178,7 @@ def test_rollouts_are_not_served_yet(env):
     )
     with pytest.raises(NotImplementedError, match="do not serve rollouts yet"):
         generation.generate(data)
+    assert generation.get_inference_world_size() == 6
 
     async def collect():
         return [item async for item in generation.generate_async(data)]

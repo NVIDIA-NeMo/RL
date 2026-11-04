@@ -750,6 +750,14 @@ class MegatronGeneration(GenerationInterface):
             self._policy.worker_group.run_all_workers_single_data("resume_after_refit")
         )
 
+    def stop_dynamo_endpoint(self) -> None:
+        """Cancel rank zero's Dynamo endpoint task (an engine served through Dynamo)."""
+        ray.get(
+            self._policy.worker_group.run_single_worker_single_data(
+                method_name="stop_dynamo_endpoint", worker_idx=0
+            )
+        )
+
     def prepare_refit_info(
         self, state_dict_info: Optional[dict[str, Any]]
     ) -> Optional[list[str]]:
