@@ -1252,6 +1252,27 @@ class TestFinish:
         # unadvertised → inv_n of the loss_type (TOKEN_LEVEL → 1/2048)
         assert m["other_metric"] == pytest.approx(1.0)
 
+    @pytest.mark.parametrize(
+        "loss_type_name,expected", [("TOKEN_LEVEL", 1.0), ("SEQUENCE_LEVEL", 256.0)]
+    )
+    def test_loss_divisor_metric_uses_the_reduction_divisor(
+        self, mock_module_symbols, loss_type_name, expected
+    ):
+        """LOSS_DIVISOR → 1/objective_reduction.loss_divisor(): global valid
+        tokens for global_token_mean, global valid sequences for sequence_mean."""
+        from nemo_rl.algorithms.loss.interfaces import LossType, MetricNormalizer
+
+        w = _make_worker(LossType[loss_type_name])
+        w._test_loss_fn.metric_normalizations = {
+            "loss": MetricNormalizer.LOSS_DIVISOR,
+        }
+        mock_module_symbols["mfb"].return_value = [{"loss": 2048.0}]
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())  # 8 seqs / 2048 valid toks
+        w.finish_train_step()
+        m = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"][0]
+        assert m["loss"] == pytest.approx(expected)
+
     def test_raw_count_metrics_not_rescaled_by_inv_n(self, mock_module_symbols):
         """Raw-count metrics (num_valid_samples, num_unmasked_tokens) are
         absolute counts the loss advertises as NONE; finish must leave them
