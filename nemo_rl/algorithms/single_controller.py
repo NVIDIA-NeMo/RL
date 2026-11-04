@@ -629,6 +629,8 @@ class SingleControllerActor:
         self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
         self._generation_router = getattr(actor_args, "generation_router", None)
         self._finalizer_actors = list(actor_args.finalizer_actors)
+        for actor in (*self._finalizer_actors, *self._advantage_actors):
+            self._trainer.add_data_plane_snapshot_source(actor)
         self._storage_units = tuple(actor_args.storage_units)
         self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
         for actor in self._finalizer_actors:
