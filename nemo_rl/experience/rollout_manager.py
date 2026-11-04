@@ -1253,6 +1253,7 @@ class AsyncNemoGymRolloutImpl:
         on_completion: Optional[RolloutCompletionCallback] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
         admission_closed_rows: Optional[set[int]] = None,
+        recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> Optional[dict[str, Any]]:
         """Dispatch ``pending`` rows and fill their slots in ``results`` as they land.
 
@@ -1272,13 +1273,15 @@ class AsyncNemoGymRolloutImpl:
             admission_closed_rows: Rows Gym refused because a checkpoint had
                 admission closed and that wait for their re-send; required with
                 ``dispatch_recorder``.
+            recovery_granularity: Whether a failed row is re-sent on its own or
+                its whole prompt group is replaced.
 
         Returns:
             The environment's timing metrics, or None if the stream ended without them.
 
         Raises:
             A row's transport-shaped failure only once the stream has ended, and a
-            data failure at once.
+            data failure, or any row failure under prompt-group recovery, at once.
         """
         if dispatch_recorder is not None and admission_closed_rows is None:
             raise ValueError(
@@ -1390,9 +1393,19 @@ class AsyncNemoGymRolloutImpl:
                                 }
                             ),
                         )
-                    if classify_rollout_failure(item.error) is not FailureClass.INFRA:
-                        # The prompt fails as a whole; its other rows cannot save it.
+                    if (
+                        classify_rollout_failure(item.error) is not FailureClass.INFRA
+                        or recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+                    ):
+                        # The prompt fails as a whole, or its whole cohort is
+                        # replaced; its other rows cannot save it.
                         raise item.error
+                    if dispatch_recorder is not None:
+                        # Released before the next row is read. A checkpoint
+                        # draining right now waits on every dispatched attempt Gym
+                        # did not export, while the siblings that would end this
+                        # stream stay parked until it resumes.
+                        await dispatch_recorder.replace_dropped([rowidx])
                     # Raised once the stream ends. The other rows keep running in
                     # Gym either way; ending the stream now would only re-send them
                     # while they still run.
@@ -1633,6 +1646,7 @@ class AsyncNemoGymRolloutImpl:
                             on_completion=on_completion,
                             dispatch_recorder=dispatch_recorder,
                             admission_closed_rows=admission_closed_rows,
+                            recovery_granularity=recovery_granularity,
                         )
                     except Exception as error:
                         last_error = error
