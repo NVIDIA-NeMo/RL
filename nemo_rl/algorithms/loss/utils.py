@@ -27,22 +27,28 @@ def rescale_loss_metrics(
     *,
     token_factor: float,
     sequence_factor: float,
+    gradient_factor: float,
 ) -> dict[str, Any]:
     """Change global loss denominators while preserving raw counts and extrema.
 
-    Metrics absent from ``normalizers`` are returned unchanged. Unlike
-    split-API normalization of raw sums, this only adjusts denominators
-    explicitly advertised by the loss.
+    Metrics absent from ``normalizers`` use ``gradient_factor``, matching the
+    split-API fallback to the ``loss_type`` denominator. Keys containing
+    ``_min`` or ``_max`` are extrema and are returned unchanged.
     """
     factors = {
         MetricNormalizer.TOKENS: token_factor,
         MetricNormalizer.SEQUENCES: sequence_factor,
         MetricNormalizer.NONE: 1.0,
     }
-    return {
-        key: value * factors[normalizers[key]] if key in normalizers else value
-        for key, value in metrics.items()
-    }
+    rescaled = {}
+    for key, value in metrics.items():
+        if key in normalizers:
+            rescaled[key] = value * factors[normalizers[key]]
+        elif "_min" in key or "_max" in key:
+            rescaled[key] = value
+        else:
+            rescaled[key] = value * gradient_factor
+    return rescaled
 
 
 def map_teacher_logits_to_draft_vocab(

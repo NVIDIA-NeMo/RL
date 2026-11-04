@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
 from nemo_rl.algorithms.loss.wrapper import SequencePackingLossWrapper
 from nemo_rl.algorithms.utils import compute_seq_logprob_errors
@@ -144,6 +145,7 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(
             loss_fn.metric_normalizations,
             token_factor=6 / kept_toks,
             sequence_factor=3 / kept_seqs,
+            gradient_factor=6 / kept_toks,
         )
         for m in metrics
     ]
@@ -217,6 +219,7 @@ def test_split_api_survivor_division_matches_upstream_mask(
             loss_fn.metric_normalizations,
             token_factor=1 / kept_toks,
             sequence_factor=1 / kept_seqs,
+            gradient_factor=1 / kept_toks,
         )
         for m in metrics
     ]
@@ -228,6 +231,28 @@ def test_split_api_survivor_division_matches_upstream_mask(
         "num_valid_samples",
     ):
         assert sum(m[key] for m in rescaled) == pytest.approx(expected_metrics[key])
+
+
+def test_rescale_loss_metrics_uses_gradient_factor_for_unadvertised_metrics():
+    """Unadvertised metrics follow the gradient denominator; extrema stay put."""
+    rescaled = rescale_loss_metrics(
+        {"tok": 2.0, "seq": 2.0, "raw": 2.0, "other": 2.0, "other_max": 2.0},
+        {
+            "tok": MetricNormalizer.TOKENS,
+            "seq": MetricNormalizer.SEQUENCES,
+            "raw": MetricNormalizer.NONE,
+        },
+        token_factor=3.0,
+        sequence_factor=5.0,
+        gradient_factor=7.0,
+    )
+    assert rescaled == {
+        "tok": 6.0,
+        "seq": 10.0,
+        "raw": 2.0,
+        "other": 14.0,
+        "other_max": 2.0,
+    }
 
 
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])

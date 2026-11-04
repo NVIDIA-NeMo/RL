@@ -1371,6 +1371,8 @@ class MegatronPolicyWorkerImpl(
                 loss_fn.metric_normalizations,
                 token_factor=token_factor,
                 sequence_factor=sequence_factor,
+                # In-loss filtering requires token-level loss.
+                gradient_factor=token_factor,
             )
             for m in metrics
         ]
