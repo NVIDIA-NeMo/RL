@@ -1798,6 +1798,22 @@ def test_ppo_rejects_sampler_support_replay_before_cluster_creation(
     cluster_cls.assert_not_called()
 
 
+def test_ppo_forced_ratio_requires_one_policy_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.loss_fn = config.loss_fn.model_copy(update={"force_on_policy_ratio": True})
+    config.ppo = config.ppo.model_copy(update={"ppo_epochs": 4})
+
+    with pytest.raises(AssertionError, match="requires ppo.ppo_epochs=1"):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
 def test_ppo_rejects_adaptive_ppo_clip_before_cluster_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

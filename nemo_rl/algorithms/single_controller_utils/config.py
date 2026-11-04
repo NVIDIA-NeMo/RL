@@ -1425,6 +1425,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
+    # A forced ratio equals the true one only on the first optimizer step taken
+    # on a batch; later epochs would train without any trust region.
+    if master_config.loss_fn.force_on_policy_ratio and algo_cfg.ppo_epochs != 1:
+        raise ValueError(
+            "loss_fn.force_on_policy_ratio=true requires ppo.ppo_epochs=1, got "
+            f"ppo.ppo_epochs={algo_cfg.ppo_epochs}. Set "
+            "loss_fn.force_on_policy_ratio=false to run multiple policy epochs."
+        )
+
     policy_megatron_cfg = master_config.policy.get("megatron_cfg")
     if async_config.min_groups_for_streaming_train < algo_cfg.num_prompts_per_step:
         # Policy chunks accumulate into one optimizer update; critic epochs
@@ -1752,19 +1761,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
             )
-        # GRPO takes one optimizer step per RL step and recomputes prev_logprobs
-        # with the weights it trains, so its PPO ratio is 1 regardless of how
-        # many versions a batch mixes; TIS corrects generation staleness.
-        if (
-            master_config.loss_fn.force_on_policy_ratio
-            and not master_config.loss_fn.use_cispo
-            and is_ppo_run(master_config)
-        ):
-            raise ValueError(
-                "the ready_first sampler requires "
-                "loss_fn.force_on_policy_ratio=false for PPO unless "
-                "loss_fn.use_cispo=true"
-            )
+        # TIS corrects generation staleness; a forced ratio stays exact with one
+        # optimizer step per batch (enforced for PPO in _validate_algo_settings).
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no
     # validation loop yet (see _save_checkpoint), so a "val:" metric would
