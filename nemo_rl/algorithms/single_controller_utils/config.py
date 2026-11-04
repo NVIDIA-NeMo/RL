@@ -63,6 +63,10 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.call_selection import resolve_selection_policy
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym_task import (
+    get_nemo_gym_attribution_key,
+    is_nemo_gym_task,
+)
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RecoveryTargetLevel,
@@ -713,10 +717,10 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
 class TaskSourceRecoveryGranularity:
     """Resolved retry and restore policy for a prompt-group reservation.
 
-    ``task_source`` is copied from the raw Gym row when present. ``restore_level``
-    is the configured restart target. Until Gym advertises group-scoring
-    capabilities, ``granularity`` is derived from that target and explicit
-    task-source or agent overrides.
+    ``task_source`` is the materialized taskset or the flat Gym row's task source.
+    Materialized rows select a taskset override or the global default; flat rows
+    select an agent override, a task-source override, or the global default.
+    ``restore_level`` records that target; ``granularity`` derives its retry unit.
     """
 
     task_source: Optional[str]
@@ -733,17 +737,17 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     ``turn`` requests Gym participant recovery, ``sibling`` preserves completed
     generations and restarts unfinished siblings, and ``prompt_group`` restarts
     every sibling in an unfinished group. Overrides may only make a particular
-    task source or agent coarser than the global target.
+    taskset, task source, or agent coarser than the global target.
     """
 
     target_level: RecoveryTargetLevel = RecoveryTargetLevel.SIBLING
-    # Keyed by ``extra_env_info.task_source``, which is available before Gym
-    # resolves the concrete agent used to execute the row.
+    # Keyed by ``extra_env_info.task_id.taskset`` for materialized tasks or
+    # ``extra_env_info.task_source`` for flat rows, before Gym resolves an agent.
     task_source_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
     # Keyed by ``extra_env_info.agent_ref.name`` when the input row already has
-    # a concrete Gym route. A matching agent override wins over task_source.
+    # a concrete Gym route. For flat rows, this wins over task_source.
     agent_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
@@ -807,11 +811,23 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     def resolve_for_prompt(
         self, prompt: Mapping[str, Any]
     ) -> TaskSourceRecoveryGranularity:
-        """Resolve using matching agent, matching task source, then default."""
+        """Resolve by taskset for materialized tasks, or agent then source for flat rows."""
         extra_env_info = prompt.get("extra_env_info")
         task_source: Optional[str] = None
         agent_name: Optional[str] = None
         if isinstance(extra_env_info, Mapping):
+            if is_nemo_gym_task(extra_env_info):
+                task_source = get_nemo_gym_attribution_key(extra_env_info)
+                if task_source is None:
+                    raise ValueError(
+                        "materialized Gym prompt must have a non-empty task_id.taskset"
+                    )
+                return TaskSourceRecoveryGranularity(
+                    task_source=task_source,
+                    restore_level=self.task_source_target_level_overrides.get(
+                        task_source, self.target_level
+                    ),
+                )
             raw_task_source = extra_env_info.get("task_source")
             if raw_task_source is not None and not isinstance(raw_task_source, str):
                 raise TypeError("prompt task_source must be a string or None")
