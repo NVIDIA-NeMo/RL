@@ -590,7 +590,10 @@ def test_dispatch_cursor_alone_assigns_the_next_batch_to_step_8() -> None:
     assert asyncio.run(exercise()) == 8
 
 
-def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
+@pytest.mark.parametrize("skipped_step", [False, True])
+def test_checkpoint_after_fetch_before_admit_owns_the_prompt(
+    tmp_path, skipped_step: bool
+) -> None:
     """A checkpoint cut inside admit retains the fetched batch for recovery."""
 
     async def exercise() -> None:
@@ -620,6 +623,7 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
             max_num_epochs=1,
             data_plane_checkpoint=True,
         )
+        config.checkpointing["metric_name"] = "train:loss"
         actor_args = _make_actor_args(
             save_state=save_state,
             dataloader=dataloader,
@@ -636,11 +640,20 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
         assert controller._sampler.dispatch_index == 6
 
         try:
-            await controller._save_checkpoint(
-                {"loss": 1.0},
-                is_policy_training_step=True,
-                is_final_checkpoint=False,
-            )
+            if skipped_step:
+                with pytest.warns(UserWarning, match="a skipped data-exhausted step"):
+                    await controller._save_checkpoint(
+                        {"skipped_step": 1},
+                        is_policy_training_step=True,
+                        is_final_checkpoint=False,
+                    )
+                assert not hasattr(save_state, "train:loss")
+            else:
+                await controller._save_checkpoint(
+                    {"loss": 1.0},
+                    is_policy_training_step=True,
+                    is_final_checkpoint=False,
+                )
         finally:
             sampler.release_admission.set()
             await _wait_for_event_or_pump(rollout_manager.started, pump)

@@ -771,8 +771,8 @@ class SingleControllerActor:
         self._filtered_pool_cv: asyncio.Condition = asyncio.Condition()
         # Set once the dataloader has nothing left, so waiters stop waiting.
         self._dataloader_exhausted: bool = False
-        # Steps that may close short because the data ran out, not because the fleet
-        # or the filter misbehaved. _target_groups_for_step skips the floor for these.
+        # Data-exhausted steps are collected to completion, then trained or skipped
+        # according to min_step_batch_fraction.
         self._rollout_runtime.steps_allowed_short: set[int] = set()
 
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
@@ -2459,14 +2459,7 @@ class SingleControllerActor:
         )
 
     def _allow_short_drained_step(self, target_step: Optional[int]) -> None:
-        """Exempt a step assembled from the drained pool from the batch-size floor.
-
-        The pool is counted in prompts, not in groups that will survive the filter, so
-        a full batch of spares can still come up short once some of them score
-        uniformly -- and at this point the dataloader is empty, so nothing can replace
-        them. That is the data running out, which ends a run cleanly, not the fleet or
-        the filter failing, which is what the floor is there to catch.
-        """
+        """Mark a drained-pool step for the final train-or-skip floor check."""
         if target_step is None or not self._dynamic_sampling_enabled:
             return
         self._rollout_runtime.steps_allowed_short.add(target_step)
@@ -2534,9 +2527,9 @@ class SingleControllerActor:
         matches batches to steps exactly cannot substitute another step's groups for
         them. Without this the pump waits on a group no one is generating.
 
-        The step trains on fewer samples than configured, which is the point: a smaller
-        step beats a stalled run. The count is logged as ``dropped_prompt_groups`` so
-        the batch size a step actually used is recoverable afterwards.
+        A data-exhausted step returns its remaining target even below the floor,
+        allowing the train pump to drain its groups and abort accumulated gradients.
+        The final floor check then decides whether to train or skip that step.
 
         How much smaller is bounded by ``min_step_batch_fraction``, and that bound has
         to live here because neither drop budget provides it. Both budgets are
@@ -2545,7 +2538,8 @@ class SingleControllerActor:
         succeed can shrink it without ever tripping them.
 
         Raises:
-            RuntimeError: The step fell below ``min_step_batch_fraction`` of
+            RuntimeError: A step without data exhaustion fell below
+                ``min_step_batch_fraction`` of
                 ``num_prompts_per_step``. Training a fraction of a batch is a silent
                 change to the gradient estimate, so it is refused rather than absorbed.
         """
@@ -2558,8 +2552,8 @@ class SingleControllerActor:
         # the empty step.
         floor = math.ceil(num_prompts_per_step * fraction)
         if step in self._rollout_runtime.steps_allowed_short:
-            # The data ran out mid-step, so the floor describes a batch this run
-            # cannot assemble. Close on what arrived rather than fail.
+            # Collect the remaining groups before deciding whether to skip. Streaming
+            # gradients must be aborted if the final count falls below the floor.
             return target
         if target < floor:
             # Explain spare-pool exhaustion when dynamic sampling shortens a step.
@@ -3216,7 +3210,28 @@ class SingleControllerActor:
                     groups_dispatched,
                 )
 
-                if self._is_ppo:
+                skipped_step = (
+                    version_during_step in self._rollout_runtime.steps_allowed_short
+                    and groups_dispatched
+                    < math.ceil(
+                        self._algo_cfg.num_prompts_per_step
+                        * self._async_cfg.rollout_failure.min_step_batch_fraction
+                    )
+                )
+                if skipped_step:
+                    if step_open:
+                        await asyncio.to_thread(self._trainer.abort_train_step)
+                        step_open = False
+                    self._begin_optimizer_commit()
+                    log.info(
+                        "train_pump: skipping data-exhausted step %d: %d/%d groups, "
+                        "min_step_batch_fraction=%s; no optimizer update",
+                        version_during_step,
+                        groups_dispatched,
+                        self._algo_cfg.num_prompts_per_step,
+                        self._async_cfg.rollout_failure.min_step_batch_fraction,
+                    )
+                elif self._is_ppo:
                     if not step_has_valid_training_tokens:
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
@@ -3338,7 +3353,7 @@ class SingleControllerActor:
                     )
 
                 # Aggregate step metrics
-                step_metrics = {}
+                step_metrics: dict[str, Any] = {"skipped_step": int(skipped_step)}
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                     _update_adaptive_loss_state(self._loss_fn, step_metrics)
@@ -3471,12 +3486,10 @@ class SingleControllerActor:
                     for step, promoted in self._batch_promotions.items()
                     if step > version_during_step
                 }
-                # What the step actually trained on, which is num_prompts_per_step only
-                # when nothing was dropped. Counted from the dispatch tally rather than
-                # derived from the shortfall so the figure does not depend on the
-                # bookkeeping staying exact; this lands in the checkpoint.
-                self._consumed_samples += groups_dispatched
-                self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
+                # Skipped chunks consumed storage but did not contribute training samples.
+                if not skipped_step:
+                    self._consumed_samples += groups_dispatched
+                    self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
 
                 is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
@@ -3513,7 +3526,8 @@ class SingleControllerActor:
                 # Critic warmup doesn't need a refit and the version still advances.
                 # But a colocated engine that was stood down still needs to be woken up via reshard.
                 if not early_refit_done and (
-                    is_policy_training_step or self._gen.blocks_training()
+                    (is_policy_training_step and not skipped_step)
+                    or self._gen.blocks_training()
                 ):
                     if defer_refit_for_save:
                         # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
@@ -3629,7 +3643,11 @@ class SingleControllerActor:
 
             # min sample version refers to the version each consumed sample was
             # generated with; lag = training version - oldest sample version.
-            lag = version_during_step - min_sample_version  # type: ignore
+            lag = (
+                version_during_step - min_sample_version
+                if min_sample_version is not None
+                else 0
+            )
             step_metrics["weight_version_lag"] = lag
             # TODO: vllm metrics logger,
             #   histogram log, pretty-print "Training Results" block,
