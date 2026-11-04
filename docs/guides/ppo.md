@@ -40,18 +40,11 @@ The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enab
 
 ### Multimodal PPO
 
-The Single-Controller path supports multimodal PPO with vLLM generation and
-Megatron policy/value workers. The critic must use the same VLM architecture
-and tokenizer as the policy (for example,
-`value.model_name: ${policy.model_name}`) so both workers consume the same
-packed media representation.
+Multimodal PPO requires `examples/run_grpo_single_controller.py`; the legacy `examples/run_ppo.py` entrypoint does not support it.
 
-The validated configuration uses a Qwen2.5-VL-style wrapper with TP=2,
-PP=1, CP=1, and sequence packing disabled. Wrappers that self-pack inputs or
-slice context-parallel inputs, such as Qwen3-VL, are not yet supported by this
-value-worker path. See the
-[Qwen2.5-VL-3B Geometry3K recipe](../../examples/configs/recipes/vlm/vlm_ppo-qwen2.5-vl-3b-geometry3k-1n8g-megatron-single-controller.v1.yaml)
-for a complete configuration.
+The Single-Controller path supports multimodal PPO with vLLM generation and Megatron policy/value workers. The critic must use the same VLM architecture and tokenizer as the policy (for example, `value.model_name: ${policy.model_name}`) so both workers consume the same packed media representation.
+
+The validated configuration uses a Qwen2.5-VL-style wrapper with TP=2, PP=1, CP=1, and sequence packing disabled. Wrappers that self-pack inputs or slice context-parallel inputs, such as Qwen3-VL, are not yet supported by this value-worker path. See the [Qwen2.5-VL-3B Geometry3K recipe](../../examples/configs/recipes/vlm/vlm_ppo-qwen2.5-vl-3b-geometry3k-1n8g-megatron-single-controller.v1.yaml) for a complete configuration.
 
 ![CLEVR-CoGenT 100-step and MMPR-Tiny 300-step PPO versus GRPO fixed-set accuracy](../assets/vlm-ppo-vs-grpo-fixed-accuracy.png)
 

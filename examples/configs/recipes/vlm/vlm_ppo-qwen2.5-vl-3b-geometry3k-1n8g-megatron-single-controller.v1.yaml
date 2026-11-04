@@ -37,6 +37,7 @@ policy:
       resources:
         gpus_per_node: 2
     vllm_cfg:
+      skip_tokenizer_init: false
       tensor_parallel_size: 2
       gpu_memory_utilization: 0.8
       max_model_len: 3072

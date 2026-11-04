@@ -280,6 +280,23 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="the `ppo` block is absent"):
             validate_single_controller_config(mc)
 
+    def test_rejects_vlm_policy_with_a_different_critic_model(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        mc.policy["model_name"] = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+        with pytest.raises(ValueError, match="policy and critic to use the same VLM"):
+            validate_single_controller_config(mc)
+
+    def test_accepts_vlm_policy_with_the_same_vlm_critic(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        mc.policy["model_name"] = "Qwen/Qwen2.5-VL-3B-Instruct"
+        assert mc.value is not None
+        mc.value["model_name"] = mc.policy["model_name"]
+
+        validate_single_controller_config(mc)
+
     @pytest.mark.parametrize("critic_epochs", [1, 2])
     def test_accepts_streaming_with_one_policy_epoch(self, critic_epochs):
         mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)

@@ -1307,15 +1307,13 @@ def test_regular_model_does_not_delegate_packing():
 
 
 def test_model_cp_slicing_capability_is_detected():
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _model_slices_context_parallel_inputs,
-    )
+    from nemo_rl.models.megatron.common import model_slices_context_parallel_inputs
 
     class ModelSlicesContextParallelInputs:
         model_slices_context_parallel_inputs = True
 
-    assert _model_slices_context_parallel_inputs(ModelSlicesContextParallelInputs())
-    assert not _model_slices_context_parallel_inputs(object())
+    assert model_slices_context_parallel_inputs(ModelSlicesContextParallelInputs())
+    assert not model_slices_context_parallel_inputs(object())
 
 
 def test_model_cp_slicing_accepts_data_plane_setup():
@@ -3461,8 +3459,8 @@ def test_worker_initialization_preserves_only_restored_rng(
             "_model_has_chunkwise_cp",
             "_model_needs_router_padding_mask",
             "_model_self_packs_mtp_loss_mask",
-            "_model_slices_context_parallel_inputs",
-            "_model_accepts_media_token_validity_mask",
+            "model_slices_context_parallel_inputs",
+            "model_media_placeholder_token_id",
             "_reserved_http_server_port_for_rank",
         )
     }

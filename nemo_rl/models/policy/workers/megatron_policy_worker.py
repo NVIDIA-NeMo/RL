@@ -66,8 +66,6 @@ from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
-    chunks_accept_media_token_validity_mask,
-    media_placeholder_token_id_from_chunks,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -91,6 +89,8 @@ from nemo_rl.models.megatron.common import (
     clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
+    model_media_placeholder_token_id,
+    model_slices_context_parallel_inputs,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -242,18 +242,6 @@ def _model_self_packs_mtp_loss_mask(model: Any) -> bool:
     )
 
 
-def _model_slices_context_parallel_inputs(model: Any) -> bool:
-    """Whether the model consumes full THD input and slices CP after embedding."""
-    from megatron.core.utils import unwrap_model
-
-    unwrapped = unwrap_model(model)
-    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-    return any(
-        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
-        for chunk in chunks
-    )
-
-
 def _unwrapped_chunks(model: Any) -> list[Any]:
     """Model chunks as a flat list, whatever wrapping the caller handed us."""
     from megatron.core.utils import unwrap_model
@@ -321,16 +309,6 @@ def _model_needs_router_padding_mask(
             "HybridBlock chunkwise context parallelism."
         )
     return True
-
-
-def _model_media_placeholder_token_id(model: Any) -> Optional[int]:
-    """The vocabulary id this model treats as a media placeholder, if any."""
-    return media_placeholder_token_id_from_chunks(_unwrapped_chunks(model))
-
-
-def _model_accepts_media_token_validity_mask(model: Any) -> bool:
-    """Whether the model's forward takes an explicit media-token validity mask."""
-    return chunks_accept_media_token_validity_mask(_unwrapped_chunks(model))
 
 
 def _estimate_refit_tensor_size_in_bytes(
@@ -1119,18 +1097,14 @@ class MegatronPolicyWorkerImpl(
             not self.delegate_mtp_loss_mask_to_model or self.delegate_pack_to_model
         ), "A model cannot own MTP-mask packing without owning sequence packing"
         self.model_slices_context_parallel_inputs = (
-            _model_slices_context_parallel_inputs(self.model)
+            model_slices_context_parallel_inputs(self.model)
         )
         mtp_num_layers = self._get_model_config().mtp_num_layers
         self.mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
         # A media placeholder is an ordinary vocabulary entry, so text that
         # legitimately contains it must not be read as an anchor demanding a
         # projected feature. Only models that accept the mask are sent one.
-        self.media_placeholder_token_id = (
-            _model_media_placeholder_token_id(self.model)
-            if _model_accepts_media_token_validity_mask(self.model)
-            else None
-        )
+        self.media_placeholder_token_id = model_media_placeholder_token_id(self.model)
         if self.model_slices_context_parallel_inputs:
             if self.delegate_pack_to_model:
                 raise RuntimeError(

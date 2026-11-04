@@ -1414,10 +1414,20 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "See examples/configs/ppo_math_1B_megatron_single_controller.yaml."
             )
 
+    value_config = master_config.value
+    assert value_config is not None
+    if master_config.policy.get("is_vlm", False):
+        policy_model_name = master_config.policy.get("model_name")
+        if not policy_model_name or value_config.get("model_name") != policy_model_name:
+            raise ValueError(
+                "Multimodal PPO requires the policy and critic to use the same VLM: "
+                "set value.model_name to policy.model_name."
+            )
+
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
     # setup_data_plane unconditionally, so an Automodel critic dies in Ray with the
     # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
-    value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
+    value_megatron_cfg = value_config.get("megatron_cfg", {})
     if not value_megatron_cfg.get("enabled"):
         raise ValueError(
             "PPO on the SingleController path requires a Megatron critic "
