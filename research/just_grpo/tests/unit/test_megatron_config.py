@@ -111,5 +111,5 @@ def test_every_recipe_uses_megatron(path):
     config = recipe(path.name)
     validate_config(config)
     assert config.policy.megatron_cfg.enabled
-    assert not config.policy.dtensor_cfg.enabled
+    assert not config.policy.automodel_cfg.enabled
     assert "reference_device" not in config.just_grpo

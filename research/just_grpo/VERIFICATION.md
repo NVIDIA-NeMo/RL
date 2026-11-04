@@ -2,6 +2,39 @@
 
 The research driver supports Megatron training with reference vLLM or in-process Megatron generation. The earlier Transformers training adapter and its verification-only worker have been removed. Historical artifacts remain in their original run directories and Git history.
 
+## Rebase onto RL main (2026-11-04)
+
+Rebased onto `95095b7124f9b2526c12be772b04fac918ba0a47`, retaining Bridge
+`7bb664b85e36c741ac94025ecf658f2c31ebadac` and Core
+`e0a4bfed7f1e233b857187ceff0104645858d7d1`. The recipes now disable the
+Automodel backend and explicitly preserve uncached diffusion generation as
+upstream changes its KV-cache defaults. The diffusion loss adapter accepts the
+new prepacked-mask argument and rejects packed inputs. Same-position score
+centering slices sampler metadata consistently with the other loss inputs.
+
+The GPU regression suite initially passed 494 tests with two adapter failures;
+after updating the adapter, all 19 adapter tests passed. The 33 affected recipe
+and driver tests also passed. The suites cover research adapters, streaming
+workers, checkpoint import/cache cleanup, tokenizer compatibility, clipped PG,
+score centering, distributed token alignment, and dependency guards.
+`uv lock --check` resolves 593 packages; formatting and lint hooks pass.
+
+Job **21296831** completed three updates each of Standard (microbatch 4) and
+Fast (microbatch 1) on two H100s, TP=1/DP=2, with 2 prompts x 4 generations,
+512 generated tokens, context limit 1536, and block size 16. Both passed the
+functional metric checker with finite nonzero gradients and initial/final
+validation. Maximum generation/training KL was 0.000287 (Standard) and
+0.000894 (Fast). Validation started at 0.200000 and ended at 0.240476 for
+Standard and 0.273810 for Fast.
+
+The task-local runtime adds Transformers 5.16.1, current NeMo Lens and storage
+client dependencies to the provisioned Python 3.13.14 runtime. GPU binaries
+remain PyTorch 2.10.0+cu129 and TE 2.14, with provisioned ModelOpt 0.40 and
+Ray 2.54; the updated lock selects PyTorch 2.13.0 and TE 2.18. This does not verify a complete rebuild of the locked environment.
+
+Artifacts and exact validation/submission scripts:
+`/lustre/fsw/portfolios/coreai/users/snorouzi/runs/diffusion_rl/pr4258_rebase_20261104/`.
+
 ## Asymmetric attention with Bridge PR #6771 (2026-11-03)
 
 The current implementation uses response-relative noisy blocks and unmodified

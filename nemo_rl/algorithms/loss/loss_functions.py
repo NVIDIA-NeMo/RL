@@ -1083,7 +1083,7 @@ class ClippedPGLossFn(LossFunction):
             )
             centering, head_mass = compute_score_centering_term(
                 policy_logprobs_at_sampler_topk,
-                sampler_topk_logprobs=data["sampler_topk_logprobs"][:, 1:],
+                sampler_topk_logprobs=data["sampler_topk_logprobs"][:, start:],
                 importance_sampling_mode=self._score_centering_is_mode,
                 is_bounds=self._get_score_centering_is_bounds(),
                 token_mask=mask,

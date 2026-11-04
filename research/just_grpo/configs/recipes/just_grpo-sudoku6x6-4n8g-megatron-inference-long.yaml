@@ -10,6 +10,9 @@ grpo:
   val_at_end: true
   max_num_epochs: 1000
   normalize_rewards: false
+  async_grpo:
+    # Diffusion generation uses uncached forwards.
+    recompute_kv_cache_after_weight_updates: false
 loss_fn:
   use_importance_sampling_correction: true
   truncated_importance_sampling_type: tis
@@ -19,7 +22,7 @@ policy:
   model_name: nvidia/Nemotron-Labs-Diffusion-3B
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step},${grpo.num_generations_per_prompt}}
   max_total_sequence_length: 1536
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
@@ -51,6 +54,7 @@ policy:
     refit_transport: mcore
     mcore_generation_config:
       refit_backend: gloo
+      kv_cache_management_mode: persist
       cuda_graph_impl: none
       materialize_only_last_token_logits: false
 data:

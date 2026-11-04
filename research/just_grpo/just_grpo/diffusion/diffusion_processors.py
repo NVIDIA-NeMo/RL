@@ -104,8 +104,9 @@ class DiffusionLossPostProcessor(LossPostProcessor):
         packed_seq_params: Any = None,
         global_valid_seqs: torch.Tensor | None = None,
         global_valid_toks: torch.Tensor | None = None,
+        prepacked_loss_mask: torch.Tensor | None = None,
     ) -> Callable:
-        if packed_seq_params is not None:
+        if packed_seq_params is not None or prepacked_loss_mask is not None:
             raise ValueError("Diffusion processors require unpacked microbatches")
         process_loss = super().__call__(
             data_dict=data_dict,

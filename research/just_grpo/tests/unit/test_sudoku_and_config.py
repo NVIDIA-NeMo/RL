@@ -125,7 +125,7 @@ def test_validation_inherits_training_decoder(tmp_path):
             {"just_grpo": {"schedule": {"reveal_tokens_per_step": 3}}},
             "divisible by reveal width",
         ),
-        ({"policy": {"dtensor_cfg": {"enabled": True}}}, "DTensor"),
+        ({"policy": {"automodel_cfg": {"enabled": True}}}, "Automodel"),
         ({"policy": {"megatron_cfg": {"enabled": False}}}, "Megatron training backend"),
         ({"checkpointing": {"enabled": True}}, "Resumable checkpointing"),
         ({"loss_fn": {"use_kl_in_reward": True}}, "reward-side KL"),

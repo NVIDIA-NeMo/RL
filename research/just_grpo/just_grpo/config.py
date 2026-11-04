@@ -120,12 +120,12 @@ def validate_config(config: "DictConfig") -> JustGRPOConfig:
     if p.max_grad_norm <= 0:
         raise ValueError("max_grad_norm must be positive")
     if (
-        p.dtensor_cfg.enabled
+        p.automodel_cfg.enabled
         or p.sequence_packing.enabled
         or p.dynamic_batching.enabled
     ):
         raise ValueError(
-            "DTensor, packing, and dynamic batching are not supported by this research driver"
+            "Automodel, packing, and dynamic batching are not supported by this research driver"
         )
     if not p.megatron_cfg.enabled:
         raise ValueError("JustGRPO requires the Megatron training backend")
@@ -201,7 +201,7 @@ def validate_config(config: "DictConfig") -> JustGRPOConfig:
         raise ValueError(
             "Megatron requires complete training and logprob microbatches per DP replica"
         )
-    if p.precision != "bfloat16" or p.dtensor_cfg.lora_cfg.enabled or p.draft.enabled:
+    if p.precision != "bfloat16" or p.draft.enabled:
         raise ValueError(
             "The research driver requires a full-parameter bf16-compute policy"
         )

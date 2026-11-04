@@ -42,7 +42,7 @@ def test_driver_uses_unmodified_setup_and_selects_upstream_trainer(
     if mode == "megatron-async":
         config.grpo.async_grpo.enabled = True
         config.grpo.async_grpo.max_trajectory_age_steps = 2
-    policy = Mock()
+    policy = Mock(cfg=OmegaConf.to_container(config.policy, resolve=True))
     logger = Mock(wandb_logger=None)
     checkpointer = MagicMock()
     returned_native = []
