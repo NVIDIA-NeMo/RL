@@ -447,9 +447,13 @@ def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, 
     return resolved
 
 
-def enable_batch_invariant_mode(config: PolicyConfig) -> None:
+def enable_batch_invariant_mode(
+    config: PolicyConfig, *, generation_only: bool = False
+) -> None:
     """Validate, then enable Megatron-Core batch-invariant kernels before CUDA init."""
-    validate_zero_train_gen_kl(config, check_environment=True)
+    validate_zero_train_gen_kl(
+        config, check_environment=True, generation_only=generation_only
+    )
     if config["megatron_cfg"].get("batch_invariant_mode"):
         enable_batch_invariant_kernels(config)
 
@@ -1308,6 +1312,8 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
     model_cfg.sequence_parallel = config["megatron_cfg"]["sequence_parallel"]
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
+    if "cp_comm_type" in config["megatron_cfg"]:
+        model_cfg.cp_comm_type = config["megatron_cfg"]["cp_comm_type"]
 
     if model_cfg.context_parallel_size > 1:
         # Either NeMo-RL does the packing+CP-sharding itself (classic mcore
@@ -1388,6 +1394,14 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     if "inference_flashinfer_mxfp8_token_capacity" in config["megatron_cfg"]:
         model_cfg.inference_flashinfer_mxfp8_token_capacity = config["megatron_cfg"][
             "inference_flashinfer_mxfp8_token_capacity"
+        ]
+    if "inference_moe_nvfp4_recipe" in config["megatron_cfg"]:
+        model_cfg.inference_moe_nvfp4_recipe = config["megatron_cfg"][
+            "inference_moe_nvfp4_recipe"
+        ]
+    if "moe_training_matches_inference" in config["megatron_cfg"]:
+        model_cfg.moe_training_matches_inference = config["megatron_cfg"][
+            "moe_training_matches_inference"
         ]
     if "moe_router_num_groups" in config["megatron_cfg"]:
         model_cfg.moe_router_num_groups = config["megatron_cfg"][

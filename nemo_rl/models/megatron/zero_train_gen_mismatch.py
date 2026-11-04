@@ -15,7 +15,8 @@
 """Zero train/generation KL (batch-invariant Megatron): validate the recipe, then enable.
 
 The recipe sets every required value; this module only checks them. Supported
-precisions are BF16 and MXFP8 (the same on train and generation).
+precisions are BF16 and MXFP8 (the same on train and generation), and FlashInfer
+MXFP8 or per-token NVFP4 experts with moe_training_matches_inference.
 """
 
 from __future__ import annotations
@@ -99,14 +100,21 @@ def validate_zero_train_gen_mismatch(
     *,
     check_packages: bool = True,
     check_platform: bool = True,
+    generation_only: bool = False,
 ) -> ZeroTrainGenValidation:
-    """Run all zero-KL gates; return violations and non-fatal warnings."""
+    """Run all zero-KL gates; return violations and non-fatal warnings.
+
+    ``generation_only`` is for a dedicated generation policy, whose
+    ``megatron_cfg`` is the merged inference config: the training-only
+    ``moe_training_matches_inference`` is cleared there, so the checks on the
+    training side's value are left to the driver, which sees the full config.
+    """
     out = ZeroTrainGenValidation()
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return out
 
     _validate_required_values(config, out)
-    _validate_backend(config, out)
+    _validate_backend(config, out, generation_only=generation_only)
     _validate_platform(out, check_device=check_platform)
     if check_packages:
         _validate_packages(out)
@@ -139,10 +147,15 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "policy.megatron_cfg.tensor_model_parallel_size <= 2: at TP >= 3 "
             "Megatron-Core's TP reductions sum in a message-layout dependent order."
         )
-    if megatron_cfg.get("context_parallel_size") != 1:
+    # Generation always runs at CP=1. Megatron-Core's a2a CP gives each rank whole
+    # sequences of a subset of heads, which reproduces the CP=1 forward bitwise
+    # (NVIDIA/Megatron-LM#8935); the other CP types split attention by sequence.
+    cp_size = megatron_cfg.get("context_parallel_size") or 1
+    if cp_size > 1 and megatron_cfg.get("cp_comm_type") != "a2a":
         out.violations.append(
-            "batch_invariant_mode=True currently requires training context "
-            "parallel size 1."
+            "batch_invariant_mode=True with training context_parallel_size > 1 "
+            "requires policy.megatron_cfg.cp_comm_type='a2a' "
+            f"(got {megatron_cfg.get('cp_comm_type')!r})."
         )
     token_multiple = batch_invariant_token_multiple(
         megatron_cfg["tensor_model_parallel_size"]
@@ -226,7 +239,6 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             )
         matching_fields = (
             "tensor_model_parallel_size",
-            "context_parallel_size",
             "batch_invariant_mode",
             "batch_invariant_backend",
             "batch_invariant_collective",
@@ -426,13 +438,14 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
 
 
 def validate_zero_train_gen_kl(
-    config: PolicyConfig, *, check_environment: bool
+    config: PolicyConfig, *, check_environment: bool, generation_only: bool = False
 ) -> None:
     """Raise if the zero-KL / batch-invariant config is invalid.
 
     ``check_environment=False`` runs only the config checks, so the driver can
     call it before Ray allocates GPUs; workers also check the installed
-    packages and the GPU.
+    packages and the GPU. ``generation_only`` is as in
+    :func:`validate_zero_train_gen_mismatch`.
     """
     if "megatron_cfg" not in config:  # Automodel policies
         return
@@ -440,6 +453,7 @@ def validate_zero_train_gen_kl(
         config,
         check_packages=check_environment,
         check_platform=check_environment,
+        generation_only=generation_only,
     )
     result.emit_warnings()
     result.raise_if_invalid(
@@ -464,7 +478,9 @@ def _validate_required_values(
             )
 
 
-def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
+def _validate_backend(
+    config: PolicyConfig, out: ZeroTrainGenValidation, *, generation_only: bool = False
+) -> None:
     generation = config.get("generation")
     if generation is None or generation.get("backend") != "megatron":
         out.violations.append(
@@ -487,19 +503,96 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
         )
 
     fp8_cfg = inference_cfg.get("fp8_cfg") or {}
-    backend = inference_cfg.get("inference_grouped_gemm_backend")
-    backend = getattr(backend, "value", backend)
+    backend = _grouped_gemm_backend(inference_cfg)
+    quantized_experts = (
+        fp8_cfg.get("enabled") and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    ) or inference_cfg.get("inference_moe_nvfp4_recipe") is not None
     if (
-        impl == "inference_optimized"
+        not generation_only
+        and impl == "inference_optimized"
         and backend == "flashinfer"
-        and fp8_cfg.get("enabled")
-        and fp8_cfg.get("fp8_recipe") == "mxfp8"
+        and quantized_experts
+        and not config["megatron_cfg"].get("moe_training_matches_inference")
     ):
         out.violations.append(
-            "zero_train_gen_mismatch does not support "
-            "inference_grouped_gemm_backend='flashinfer' with MXFP8: the FlashInfer "
+            "zero_train_gen_mismatch with inference_grouped_gemm_backend='flashinfer' "
+            "and MXFP8 or NVFP4 experts requires "
+            "policy.megatron_cfg.moe_training_matches_inference=true: the FlashInfer "
             "kernel is batch-invariant but not bitwise identical to TE training. "
-            "Use 'torch' or 'vllm'."
+            "Otherwise use 'torch' or 'vllm' with MXFP8."
+        )
+    if config["megatron_cfg"].get("moe_training_matches_inference"):
+        _validate_training_matches_inference(config, inference_cfg, out)
+
+
+def _grouped_gemm_backend(cfg: dict[str, Any]) -> Any:
+    backend = cfg.get("inference_grouped_gemm_backend")
+    return getattr(backend, "value", backend)
+
+
+def _validate_training_matches_inference(
+    config: PolicyConfig, inference_cfg: dict[str, Any], out: ZeroTrainGenValidation
+) -> None:
+    """The training MoE forward runs generation's FlashInfer kernel; TE recompute backs it."""
+    megatron_cfg = config["megatron_cfg"]
+    prefix = "moe_training_matches_inference=true requires"
+    if megatron_cfg.get("transformer_impl") != "inference_optimized":
+        out.violations.append(
+            f"{prefix} policy.megatron_cfg.transformer_impl='inference_optimized' "
+            f"(got {megatron_cfg.get('transformer_impl')!r})."
+        )
+    for label, cfg in (
+        ("policy.megatron_cfg", megatron_cfg),
+        ("policy.generation.mcore_generation_config", inference_cfg),
+    ):
+        if _grouped_gemm_backend(cfg) != "flashinfer":
+            out.violations.append(
+                f"{prefix} {label}.inference_grouped_gemm_backend='flashinfer' "
+                f"(got {_grouped_gemm_backend(cfg)!r})."
+            )
+    fp8_cfg = megatron_cfg.get("fp8_cfg") or {}
+    mxfp8 = fp8_cfg.get("enabled") and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    if not mxfp8 and megatron_cfg.get("inference_moe_nvfp4_recipe") is None:
+        out.violations.append(
+            f"{prefix} MXFP8 experts (policy.megatron_cfg.fp8_cfg with "
+            "fp8_recipe='mxfp8') or policy.megatron_cfg.inference_moe_nvfp4_recipe: "
+            "the FlashInfer BF16 kernel is not batch invariant."
+        )
+    recompute_modules = megatron_cfg.get("recompute_modules") or []
+    if not (
+        megatron_cfg.get("activation_checkpointing")
+        and megatron_cfg.get("recompute_granularity") == "selective"
+        and "moe" in recompute_modules
+    ):
+        out.violations.append(
+            f"{prefix} activation_checkpointing=true, "
+            "recompute_granularity='selective' and 'moe' in recompute_modules: the "
+            "backward comes from the TE recompute pass."
+        )
+    if megatron_cfg.get("cuda_graph_impl") == "local":
+        out.violations.append(
+            f"{prefix} a training cuda_graph_impl other than 'local', which disables "
+            "MoE-layer recompute."
+        )
+    if megatron_cfg.get("moe_token_dispatcher_type") != "alltoall":
+        out.violations.append(
+            f"{prefix} policy.megatron_cfg.moe_token_dispatcher_type='alltoall': the "
+            "value pass dispatches through training's dispatcher, and only the "
+            "all-to-all combine adds the EP ranks in generation's order "
+            f"(got {megatron_cfg.get('moe_token_dispatcher_type')!r})."
+        )
+    mismatched = [
+        key
+        for key in (
+            "inference_moe_nvfp4_recipe",
+            "expert_model_parallel_size",
+        )
+        if megatron_cfg.get(key) != inference_cfg.get(key)
+    ]
+    if mismatched:
+        out.violations.append(
+            f"{prefix} the same training and generation values for: "
+            f"{', '.join(mismatched)}."
         )
 
 

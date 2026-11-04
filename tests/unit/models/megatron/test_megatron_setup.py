@@ -815,6 +815,26 @@ class TestApplyParallelismConfig:
 
         assert model_cfg.context_parallel_size == 4
 
+    def test_cp_comm_type_is_applied_only_when_set(self):
+        from nemo_rl.models.megatron.setup import _apply_parallelism_config
+
+        megatron_cfg = {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "num_layers_in_first_pipeline_stage": None,
+            "num_layers_in_last_pipeline_stage": None,
+            "sequence_parallel": False,
+            "context_parallel_size": 2,
+        }
+        model_cfg = MagicMock(cp_comm_type="p2p")
+        config = {"megatron_cfg": dict(megatron_cfg), "sequence_packing": {"enabled": True}}
+        _apply_parallelism_config(model_cfg, config)
+        assert model_cfg.cp_comm_type == "p2p"
+
+        config["megatron_cfg"]["cp_comm_type"] = "a2a"
+        _apply_parallelism_config(model_cfg, config)
+        assert model_cfg.cp_comm_type == "a2a"
+
 
 @pytest.mark.mcore
 class TestApplyMultimodalConfig:
@@ -994,6 +1014,8 @@ class TestApplyMoeConfig:
 
         assert not hasattr(model_cfg, "moe_grouped_gemm")
         assert not hasattr(model_cfg, "inference_flashinfer_mxfp8_token_capacity")
+        assert not hasattr(model_cfg, "inference_moe_nvfp4_recipe")
+        assert not hasattr(model_cfg, "moe_training_matches_inference")
 
     def test_flashinfer_mxfp8_token_capacity_forwarded(self):
         """Without this key MCore runs FlashInfer MXFP8 MoE over the full dispatcher buffer."""
@@ -1039,6 +1061,34 @@ class TestApplyMoeConfig:
         else:
             _apply_moe_config(model_cfg, config)
             assert model_cfg.moe_router_dtype == moe_router_dtype
+
+    def test_training_matches_inference_forwarded(self):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["inference_moe_nvfp4_recipe"] = "per_token"
+        megatron_cfg["moe_training_matches_inference"] = True
+        config = {"megatron_cfg": megatron_cfg}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.inference_moe_nvfp4_recipe == "per_token"
+        assert model_cfg.moe_training_matches_inference is True
+
+    def test_training_matches_inference_false_resets_a_copied_provider(self):
+        """Generation can start from the training provider and must clear the flag."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        model_cfg.moe_training_matches_inference = True
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["moe_training_matches_inference"] = False
+        config = {"megatron_cfg": megatron_cfg}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_training_matches_inference is False
 
     def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
         from nemo_rl.models.megatron import setup

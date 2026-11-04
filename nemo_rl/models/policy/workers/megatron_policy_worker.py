@@ -886,7 +886,7 @@ class MegatronPolicyWorkerImpl(
         local_rank = int(gpu_ids[0])
         os.environ["LOCAL_RANK"] = str(local_rank)
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
-        enable_batch_invariant_mode(config)
+        enable_batch_invariant_mode(config, generation_only=is_refit_destination)
         torch.cuda.set_device(local_rank)
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
@@ -986,12 +986,13 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
-        if (
+        if self.megatron_cfg.model.transformer_impl == "inference_optimized" and (
             not init_optimizer
-            and self.megatron_cfg.model.transformer_impl == "inference_optimized"
+            or getattr(self.megatron_cfg.model, "moe_training_matches_inference", False)
         ):
             # Bridge's generic GPT provider defaults to its training layer spec.
-            # Dedicated inference workers need MCore inference linears instead.
+            # Dedicated inference workers need MCore inference linears instead, and
+            # so does training when its MoE forward runs the inference expert kernel.
             # A model-specific provider already handles this itself.
             _configure_inference_optimized_layer_spec(self.megatron_cfg.model)
         self.dtype = runtime_config.dtype
