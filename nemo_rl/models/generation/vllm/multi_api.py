@@ -230,7 +230,7 @@ def run_api_process(
     )
 
     host = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    host._initialize_http_state()
+    host._init_frontend_state()
     host.cfg = generation_config
     host.routed_experts_dtype = routed_experts_dtype
     host.is_model_owner = True

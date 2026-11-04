@@ -357,17 +357,13 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     if vllm_cfg is None:
         return
     api_server_count = vllm_cfg.get("http_api_server_count", 1)
-    if api_server_count > 1 and not (
-        vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
-    ):
-        raise ValueError(
-            "Multiple API servers require async_engine=true and expose_http_server=true"
-        )
-    if (
-        api_server_count > 1
-        and config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS
-    ):
-        raise ValueError("Multiple HTTP API servers do not support sparse refit")
+    if api_server_count > 1:
+        if not (vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")):
+            raise ValueError(
+                "Multiple API servers require async_engine=true and expose_http_server=true"
+            )
+        if config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS:
+            raise ValueError("Multiple HTTP API servers do not support sparse refit")
     if vllm_cfg.get("flat_logprobs") and not (
         vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
     ):
