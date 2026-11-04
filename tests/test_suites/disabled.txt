@@ -110,7 +110,7 @@ research/flow_grpo/tests/test_suites/flow_grpo_qwen_image_ocr.sh
 # and for Qwen2.5-32B, GPT-OSS and DeepSeek-R1-Distill the docs still describe
 # support we would no longer be able to show. One representative recipe per
 # model is kept here: it costs no compute (nothing schedules disabled.txt) but
-# stays schema-validated by test_all_config_files_have_required_keys and
+# stays schema-validated by test_shipped_config and
 # path-checked by test_all_tests_can_find_config_if_dryrun, so it cannot rot.
 #
 # The remaining recipes for these models are in the groups below. These become
