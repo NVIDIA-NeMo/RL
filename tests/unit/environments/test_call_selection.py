@@ -12,6 +12,7 @@ from nemo_rl.environments.call_selection import (
     resolve_selection_policy,
     select_all_captured,
     select_captured_calls,
+    select_continued_chains,
 )
 
 
@@ -20,6 +21,7 @@ from nemo_rl.environments.call_selection import (
     [
         ("returned_history", select_captured_calls),
         ("all_captured", select_all_captured),
+        ("continued_chains", select_continued_chains),
     ],
 )
 def test_builtin_selection_policy(name: str, expected: SelectionPolicy) -> None:

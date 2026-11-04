@@ -722,6 +722,7 @@ class VllmGeneration(GenerationInterface):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        invalidate_rewritten_history: bool = False,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -741,6 +742,7 @@ class VllmGeneration(GenerationInterface):
             staging_partition=staging_partition,
             capture_media=capture_media,
             top_logprobs=top_logprobs,
+            invalidate_rewritten_history=invalidate_rewritten_history,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         return agreed_media_columns(ray.get(futures))

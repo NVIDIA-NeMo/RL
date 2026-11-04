@@ -14,6 +14,7 @@
 """Validate logical owners for replay restore and the existing GRPO estimator."""
 
 from dataclasses import dataclass, fields
+from typing import Literal
 
 import torch
 
@@ -126,11 +127,17 @@ def build_logical_owner_batch(
     rewards: torch.Tensor,
     sample_mask: torch.Tensor,
     expected_group_size: int,
+    live_mask: torch.Tensor | None = None,
+    failure_scope: Literal["owner", "row"] = "owner",
 ) -> LogicalOwnerBatch:
     """Check complete groups, deduplicate owner rows, and combine their validity.
 
     Dispatch IDs determine the estimator's grouping, independently of prompt
     tokens. Each logical owner contributes once, regardless of segment count.
+    ``live_mask`` marks the rows the finalizer published as trainable; rows it
+    masked inside a valid owner do not decide that owner. With
+    ``failure_scope="owner"`` every live row must survive filtering; with
+    ``"row"`` one surviving live row keeps the owner.
     """
     if (
         prompt_ids.ndim != 2
@@ -163,7 +170,13 @@ def build_logical_owner_batch(
             row_owner[rows] = len(representatives)
             representatives.append(first)
             group_ids.append(group_index)
-            validity.append(sample_mask[rows].amin())
+            live = rows if live_mask is None else [r for r in rows if live_mask[r] > 0]
+            if not live:
+                validity.append(sample_mask.new_zeros(()))
+            elif failure_scope == "row":
+                validity.append(sample_mask[live].amax())
+            else:
+                validity.append(sample_mask[live].amin())
     if (sample_mask[row_owner < 0] != 0).any():
         raise ValueError("Forest execution padding must be masked")
     return LogicalOwnerBatch(

@@ -27,6 +27,7 @@ from nemo_rl.experience.reward_penalties import (
     RewardLogContext,
     aggregate_capture_reward_metrics,
     capture_reward_result_tables,
+    capture_token_penalty_counts,
     compute_reward_checks,
     finalize_capture_reward,
     has_duplicated_reasoning,
@@ -218,6 +219,31 @@ def test_malformed_think_tag_parity(turns, with_ids):
     )
     assert counts["malformed_think_tag"] == expected["malformed_think_tag"]
     assert reward == result["full_result"]["reward"]
+
+
+@pytest.mark.parametrize("turns", THINK_TURNS)
+def test_segment_token_counts_include_malformed_think_tag(turns):
+    """Forest's all_segments helper runs the same think-tag check as the finalizer."""
+    prompt_1, gen_1, prompt_2, gen_2 = turns
+    penalty_config = RewardPenaltyConfig(
+        penalize_malformed_think_tag=True,
+        token_ids={"think_open": THINK_OPEN, "think_close": THINK_CLOSE},
+    )
+    kwargs = dict(
+        token_ids=[*prompt_1, *gen_1, *prompt_2, *gen_2],
+        link_spans=[
+            ("c1", len(prompt_1), len(gen_1)),
+            ("c2", len(prompt_2), len(gen_2)),
+        ],
+        decode=_decode,
+        thinking_tags=["<think>", "</think>"],
+    )
+    _, counts, _ = finalize_capture_reward(
+        1.0, checks=None, penalty_config=penalty_config, effort_config=None, **kwargs
+    )
+    assert capture_token_penalty_counts(penalty_config, **kwargs) == {
+        "malformed_think_tag": counts["malformed_think_tag"]
+    }
 
 
 def test_malformed_think_tag_string_check_catches_spelled_out_tags():

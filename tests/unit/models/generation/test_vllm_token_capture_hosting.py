@@ -194,6 +194,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         staging_partition="rollout_staging",
         capture_media=False,
         top_logprobs=4,
+        invalidate_rewritten_history=False,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -695,6 +696,32 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
         worker, request, _served_content([3], [-0.1])
     )
     assert "ng_commit_coords" not in out
+
+
+def test_invalidated_call_is_served_but_fails_its_capture():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _FakeRequest(
+        ng_capture={
+            "capture_key": "r0",
+            "model_call_id": "c2",
+            "parent_call_id": None,
+            "prev_len": 0,
+            "mode": "text",
+        },
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker, request, [10, 11], invalidate=True
+    )
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, _served_content([12], [-0.1])
+    )
+    # The harness still gets the completion; the ledger records a failure.
+    assert content["choices"][0]["message"]["content"] == "x"
+    assert content["ng_commit_coords"]["disposition"] == "capture_failed"
+    assert sink.records == []
+    assert worker._capture_calls == {}
 
 
 @pytest.mark.vllm

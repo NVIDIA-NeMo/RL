@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
 import torch
 
@@ -143,6 +143,11 @@ class AdvantageStageConfig:
     filtering_on: bool = False
     # Which writer the dump uses; ignored while train_data_dump_dir is None.
     debug_writer: DebugWriterConfig = field(default_factory=DebugWriterConfig)
+    # token_capture.owner_failure_scope; only Forest batches read it.
+    owner_failure_scope: Literal["owner", "row"] = "owner"
+    # Whether the finalizer may mask single rows of a valid owner (row scope or
+    # token_capture.mask_retried_roots); otherwise any masked row voids its owner.
+    finalizer_masks_rows: bool = False
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -184,6 +189,11 @@ class AdvantageStageConfig:
             message_level_advantage_penalties_enabled=(
                 algo_cfg.invalid_tool_call_advantage is not None
                 or algo_cfg.malformed_thinking_advantage is not None
+            ),
+            owner_failure_scope=master_config.token_capture.owner_failure_scope,
+            finalizer_masks_rows=(
+                master_config.token_capture.owner_failure_scope == "row"
+                or master_config.token_capture.mask_retried_roots
             ),
             shardable=algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS,
             # Use the resolved logger config shared by controller and pool.
@@ -460,6 +470,8 @@ class AdvantageComputer:
                 rewards=rewards,
                 sample_mask=final_sample_mask,
                 expected_group_size=cfg.algo.num_generations_per_prompt,
+                live_mask=sample_mask if cfg.finalizer_masks_rows else None,
+                failure_scope=cfg.owner_failure_scope,
             )
             # Any flagged segment filters its owner; padding has no owner.
             num_mask_sample_filtered = (
@@ -467,8 +479,15 @@ class AdvantageComputer:
                 .unique()
                 .numel()
             )
-            # Environment and overlong filtering apply to the whole owner.
+            # Owner scope: environment and overlong filtering mask every row of
+            # the owner. Row scope: rows fail alone. Rows the finalizer masked
+            # inside a valid owner stay masked.
+            row_mask = final_sample_mask
             final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
+            if cfg.owner_failure_scope == "row":
+                final_sample_mask = final_sample_mask * row_mask
+            elif cfg.finalizer_masks_rows:
+                final_sample_mask = final_sample_mask * sample_mask
 
         final_sample_mask = final_sample_mask * has_response_tokens
         pre_seq_error_sample_mask = final_sample_mask.clone()
@@ -507,7 +526,12 @@ class AdvantageComputer:
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
                 filtering_on=cfg.filtering_on,
-                row_owner=owner_batch.row_owner if owner_batch is not None else None,
+                # Row scope tests each segment alone instead of pooling its owner.
+                row_owner=(
+                    owner_batch.row_owner
+                    if owner_batch is not None and cfg.owner_failure_scope == "owner"
+                    else None
+                ),
             )
             final_sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(

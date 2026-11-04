@@ -4726,6 +4726,7 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
         mc.token_capture.staging_partition,
         capture_media=multimodal,
         top_logprobs=0,
+        invalidate_rewritten_history=False,
     )
     # What the workers pinned the media column to is what the finalizers get.
     assert (

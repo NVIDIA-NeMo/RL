@@ -78,7 +78,10 @@ from nemo_rl.models.generation.vllm.utils import (
     remap_multimodal_placeholders,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
-from nemo_rl.models.generation.capture_context import decide_capture_input
+from nemo_rl.models.generation.capture_context import (
+    decide_capture_input,
+    rewrites_history,
+)
 from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
     splice_prefix_tokens,
@@ -98,6 +101,8 @@ class CapturedRequest:
     call: "ActiveCall"
     prompt_token_ids: list[int]
     media: CapturedMedia | None
+    # Serve the call but fail its capture, masking the rollout.
+    invalidate: bool = False
 
 
 # Paths the bearer-token check protects: the OpenAI-compatible routes this module
@@ -305,6 +310,8 @@ class VllmAsyncGenerationWorkerImpl(
         # snapshot the engine ran on (see CapturedRequest).
         self._capture_calls: dict[int, CapturedRequest] = {}
         self._capture_media = False
+        # token_capture.invalidate_rewritten_history; set by setup_token_capture.
+        self._invalidate_rewritten_history = False
         self._capture_patch_size: int | None = None
         self._capture_image_token_id: int | None = None
         # TQTokenSource installed by setup_token_capture. The media path reads
@@ -637,6 +644,7 @@ class VllmAsyncGenerationWorkerImpl(
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        invalidate_rewritten_history: bool = False,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -702,6 +710,7 @@ class VllmAsyncGenerationWorkerImpl(
             self._capture_image_token_id = int(context_ids[0])
             self._capture_patch_size = int(info.get_hf_config().patch_size)
         self._capture_media = capture_media
+        self._invalidate_rewritten_history = invalidate_rewritten_history
         source = TQTokenSource(
             dp_client, staging_partition=staging_partition, capture_media=capture_media
         )
@@ -750,6 +759,7 @@ class VllmAsyncGenerationWorkerImpl(
         admission: Any | None = None,
         prefix_token_ids: list[int] | None = None,
         media: CapturedMedia | None = None,
+        invalidate: bool = False,
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
 
@@ -780,7 +790,7 @@ class VllmAsyncGenerationWorkerImpl(
             stream=bool(getattr(request, "stream", False)),
         )
         self._capture_calls[id(request)] = CapturedRequest(
-            call, list(prompt_token_ids), media
+            call, list(prompt_token_ids), media, invalidate
         )
 
     def _capture_request_media(
@@ -1025,7 +1035,9 @@ class VllmAsyncGenerationWorkerImpl(
                 sampler_topk_token_ids=sampler_topk[0],
                 sampler_topk_logprobs=sampler_topk[1],
             )
-        if self._capture_top_logprobs > 0 and sampler_topk is None:
+        if state.invalidate:
+            coords = self.token_capture.fail_call(call, reason="rewritten_history")
+        elif self._capture_top_logprobs > 0 and sampler_topk is None:
             coords = self.token_capture.fail_call(
                 call, reason="missing sampler top-k tensors"
             )
@@ -1257,6 +1269,10 @@ class VllmAsyncGenerationWorkerImpl(
                 # prefix to the request, so the inline-prefix branch below is
                 # the single splice path for staged and inline prefixes.
                 admission = worker_self._capture_admission(request)
+                invalidate_capture = (
+                    worker_self._invalidate_rewritten_history
+                    and rewrites_history(admission)
+                )
                 serving_admission = admission
                 verify_retained_media = False
                 if admission is not None and (
@@ -1316,6 +1332,7 @@ class VllmAsyncGenerationWorkerImpl(
                         res[1][0]["prompt_token_ids"],
                         admission=admission,
                         media=media,
+                        invalidate=invalidate_capture,
                     )
                     return res
 
