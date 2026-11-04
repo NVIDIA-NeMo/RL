@@ -149,14 +149,6 @@ class _FinishedEngineRequest:
     stop_reason: str | int | None
 
 
-# The capture state of a cuttable call whose sampling params were just built.
-# vLLM's chat handler submits the request in the same task, where the HTTP
-# engine client takes it to note the vLLM request ID that cuts read progress by.
-_PENDING_ENGINE_REQUEST_CAPTURE: contextvars.ContextVar[Any] = contextvars.ContextVar(
-    "_PENDING_ENGINE_REQUEST_CAPTURE", default=None
-)
-
-
 # vLLM's _SAMPLING_EPS: below this temperature a request decodes greedily.
 _GREEDY_TEMPERATURE = 1e-5
 
@@ -237,6 +229,7 @@ def _generation_cut_blockers(sampling_params: Any, tokenizer: Any) -> list[str]:
     ):
         blockers.append("seed")
     return blockers
+
 
 # The captured model call the current HTTP request serves. Set when capture
 # begins the call, in the request's task, and read by the engine client when the
@@ -520,21 +513,18 @@ class _AsyncLLMHTTPClient:
         engine_loop: asyncio.AbstractEventLoop,
         *,
         flat_logprobs: bool,
-        on_generate: Callable[[str], None] | None = None,
     ):
         self._engine_client = engine_client
         self._engine_loop = engine_loop
         self._flat_logprobs = flat_logprobs
         # Engine request ID -> captured model call ID, while the request runs.
         self._captured_requests: dict[str, str] = {}
-        self._on_generate = on_generate
         # Direct progress reads (enable_generation_progress_reads). Reentrant:
         # vLLM's finish hook runs inside the process_outputs call that holds it.
         self._progress_lock = threading.RLock()
         self._progress_reads_enabled = False
-        # External request IDs this client is serving, and the finished ones
-        # whose consumers have not yet taken the final output.
-        self._serving_request_ids: set[str] = set()
+        # Finished captured requests whose consumers have not yet taken the
+        # final output, by engine request ID.
         self._finished_requests: dict[str, _FinishedEngineRequest | None] = {}
         self.model_config = engine_client.model_config
         self.renderer = engine_client.renderer
@@ -567,8 +557,6 @@ class _AsyncLLMHTTPClient:
             and sampling_params.prompt_logprobs is None
         ):
             sampling_params.flat_logprobs = True
-        if self._on_generate is not None:
-            self._on_generate(request_id)
         return self._generate(prompt, sampling_params, request_id, kwargs)
 
     async def _generate(
@@ -592,9 +580,6 @@ class _AsyncLLMHTTPClient:
         model_call_id = _CAPTURED_MODEL_CALL.get()
         if model_call_id is not None:
             self._captured_requests[request_id] = model_call_id
-        if self._progress_reads_enabled:
-            with self._progress_lock:
-                self._serving_request_ids.add(request_id)
 
         async def next_output() -> Any:
             nonlocal iterator
@@ -626,7 +611,6 @@ class _AsyncLLMHTTPClient:
                     # The consumer took the final output before asking for the
                     # next one, so its capture state has recorded the tokens.
                     with self._progress_lock:
-                        self._serving_request_ids.discard(request_id)
                         self._finished_requests.pop(request_id, None)
 
     def enable_generation_progress_reads(self) -> None:
@@ -672,7 +656,7 @@ class _AsyncLLMHTTPClient:
         def retaining_finish_request(req_state: Any) -> Any:
             with self._progress_lock:
                 request_id = req_state.external_req_id
-                if request_id in self._serving_request_ids:
+                if request_id in self._captured_requests:
                     # vLLM queued the final output just before this hook.
                     output = getattr(req_state.queue, "output", None)
                     choices = getattr(output, "outputs", None) or ()
@@ -696,19 +680,19 @@ class _AsyncLLMHTTPClient:
         self._progress_reads_enabled = True
 
     def read_generation_progress(
-        self, requests: list[tuple[str, int]], *, timeout_s: float | None
+        self, calls: list[tuple[str, int]], *, timeout_s: float | None
     ) -> _EngineProgressRead:
-        """Copy each request's generated token IDs past ``start``, all at one boundary.
+        """Copy each captured call's generated token IDs past ``start``, at one boundary.
 
         Args:
-            requests: ``(engine request ID, start)`` per call; ``start`` is the
+            calls: ``(model call ID, start)`` per call; ``start`` is the
                 number of generated tokens the call has already recorded.
             timeout_s: How long to wait for vLLM to finish its current output
                 chunk; ``None`` waits indefinitely.
 
         Returns:
-            Per request, its progress, or ``None`` when vLLM has not started
-            it, it was aborted, or it is not a single engine request.
+            Per call, its progress, or ``None`` when it has not reached vLLM
+            yet, it was aborted, or it is not a single engine request.
 
         Raises:
             TimeoutError: vLLM held the lock past ``timeout_s``.
@@ -721,9 +705,16 @@ class _AsyncLLMHTTPClient:
         acquired = time.perf_counter()
         try:
             processor = self._engine_client.output_processor
+            # One C-level copy under the GIL; the HTTP thread may add entries.
+            engine_request_ids = {
+                model_call_id: request_id
+                for request_id, model_call_id in list(self._captured_requests.items())
+            }
             progress = [
-                self._read_one_request(processor, request_id, start)
-                for request_id, start in requests
+                None
+                if (request_id := engine_request_ids.get(model_call_id)) is None
+                else self._read_one_request(processor, request_id, start)
+                for model_call_id, start in calls
             ]
         finally:
             self._progress_lock.release()
@@ -1208,7 +1199,6 @@ class VllmAsyncGenerationWorkerImpl(
                 self.llm,
                 self._engine_loop,
                 flat_logprobs=bool(self.cfg["vllm_cfg"].get("flat_logprobs")),
-                on_generate=self._bind_capture_engine_request,
             )
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
@@ -1480,15 +1470,6 @@ class VllmAsyncGenerationWorkerImpl(
             state.observe(generation_token_ids, generation_logprobs, start=observed)
             _record_terminal_reason(state, finish_reason, stop_reason)
 
-    def _bind_capture_engine_request(self, engine_request_id: str) -> None:
-        """Note the vLLM request ID of the captured call being submitted, if any."""
-        state = _PENDING_ENGINE_REQUEST_CAPTURE.get()
-        if state is None:
-            return
-        _PENDING_ENGINE_REQUEST_CAPTURE.set(None)
-        with state.lock:
-            state.engine_request_id = engine_request_id
-
     def _record_generation_progress(
         self, states: list[_RequestCaptureState], *, deadline: float | None
     ) -> None:
@@ -1504,19 +1485,18 @@ class VllmAsyncGenerationWorkerImpl(
         pending = []
         for state in states:
             with state.lock:
-                if state.engine_request_id is not None:
-                    pending.append(
-                        (
-                            state,
-                            state.engine_request_id,
-                            state.observed_generation_token_count,
-                        )
+                pending.append(
+                    (
+                        state,
+                        state.call.model_call_id,
+                        state.observed_generation_token_count,
                     )
+                )
         if not pending:
             return
         try:
             read = self._http_engine_client.read_generation_progress(
-                [(request_id, start) for _, request_id, start in pending],
+                [(model_call_id, start) for _, model_call_id, start in pending],
                 timeout_s=None if deadline is None else deadline - time.monotonic(),
             )
         except TimeoutError:
@@ -2488,9 +2468,6 @@ class VllmAsyncGenerationWorkerImpl(
                 ):
                     # A cut reads the call's progress from vLLM's request
                     # state, so the output kind stays vLLM's own.
-                    _PENDING_ENGINE_REQUEST_CAPTURE.set(
-                        worker_self._get_request_capture(self)
-                    )
                     worker_self._record_request_effective_output_limit(
                         self, int(sampling_params.max_tokens)
                     )

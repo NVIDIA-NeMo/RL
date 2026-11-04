@@ -90,8 +90,6 @@ class _RequestCaptureState:
     media: Any | None = None
     resumed_generation_token_ids: list[int] = field(default_factory=list)
     effective_output_limit: int | None = None
-    # vLLM's ID for the request decoding this call, which a cut reads progress by.
-    engine_request_id: str | None = None
     terminal_finish_reason: Literal["stop", "length"] | None = None
     terminal_stop_reason: str | int | None = None
     observation_error: str | None = None
