@@ -47,19 +47,25 @@ _SEQ_METRIC_MAX: frozenset[str] = frozenset(
 
 
 class StreamingObjectiveLoss:
-    """Accumulate objective sums until the split worker knows the denominator."""
+    """Hand the split worker's placeholder count to the loss as its explicit denominator.
+
+    The forward callbacks pass ``global_valid_toks = global_valid_seqs = 1``;
+    the worker divides the raw sums by the all-reduced objective count at finish.
+    """
 
     def __init__(self, loss_fn: LossFunction) -> None:
         self.loss_fn = loss_fn
 
     def __getattr__(self, name: str) -> Any:
+        if name == "loss_fn":  # deepcopy/unpickle probe before __init__ ran
+            raise AttributeError(name)
         return getattr(self.loss_fn, name)
 
-    def __call__(self, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
-        # Existing forward callbacks already supply placeholder token/sequence
-        # counts of one; the objective has its own finish-time denominator.
+    def __call__(
+        self, *args: Any, **kwargs: Any
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         return self.loss_fn(
-            global_objective_denominator=kwargs["global_valid_toks"], **kwargs
+            *args, global_objective_denominator=kwargs["global_valid_toks"], **kwargs
         )
 
 
