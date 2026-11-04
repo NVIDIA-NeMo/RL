@@ -1499,13 +1499,13 @@ async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chat_handler_rejects_off_policy_sampling_and_pins_top_k(monkeypatch):
-    """The route asserts on-policy sampling, then hands vLLM top_k=-1."""
+    """The route rejects off-policy sampling, then hands vLLM top_k=-1."""
     _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
     serving_chat.create_chat_completion = AsyncMock(return_value=iter(()))
 
     off_policy = _fake_chat_request()
     off_policy.temperature = 0.5
-    with pytest.raises(AssertionError, match="matches neither"):
+    with pytest.raises(ValueError, match="matches neither"):
         await chat_handler(off_policy, MagicMock())
     serving_chat.create_chat_completion.assert_not_awaited()
 
