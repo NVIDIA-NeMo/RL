@@ -474,6 +474,20 @@ def test_fp8_kv_scales_reject_pipeline_parallelism() -> None:
         list(worker._iter_params_with_optional_kv_scales())
 
 
+def test_fp8_kv_scales_reject_mla_attention() -> None:
+    worker = _fp8_kv_worker()
+    # MLA has no linear_qkv, so it has no per-tensor K/V scales to refit.
+    worker.refit_conversion_tasks = [
+        _bridge_task(
+            "decoder.layers.0.self_attention.linear_q_proj.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+        )
+    ]
+
+    with pytest.raises(ValueError, match="kv_cache_dtype='auto'"):
+        list(worker._iter_params_with_optional_kv_scales())
+
+
 @pytest.mark.parametrize("include_q", [True, False])
 def test_calibrate_qkv_fp8_scales_keys_hybrid_and_mtp_attention(
     include_q: bool,
