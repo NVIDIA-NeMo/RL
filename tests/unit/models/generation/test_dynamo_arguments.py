@@ -30,6 +30,7 @@ from nemo_rl.models.generation.dynamo.config import (
     DynamoConfig,
     DynamoWorkerArgs,
 )
+from nemo_rl.models.generation.interfaces import DisaggConfig
 
 
 def _config(**overrides) -> dict:
@@ -84,7 +85,6 @@ def _dynamo_cfg() -> dict:
             "tokenizer_cache": False,
             "tokenizer_cache_bytes": 50 * 1024 * 1024,
             "router_mode": "kv",
-            "router_reset_states": True,
             "extra_cli_args": [],
         },
     }
@@ -175,6 +175,48 @@ def test_config_warns_only_for_active_unsupported_fields(field) -> None:
     assert [str(warning.message) for warning in caught] == [
         f"policy.generation.vllm_cfg.{field} is ignored by backend='dynamo'"
     ]
+
+
+@pytest.mark.parametrize(
+    ("override", "ignored"),
+    [
+        ({"bad_words": ["foo"]}, ["bad_words"]),
+        ({"ignore_eos": True}, ["ignore_eos"]),
+        # The validator receives disaggregation as a DisaggConfig, not a dict.
+        ({"disaggregation": DisaggConfig(enabled=True)}, ["disaggregation"]),
+        # Inherited shared-YAML settings the exemplars carry stay quiet.
+        ({"disaggregation": DisaggConfig(enabled=False)}, []),
+        ({"ignore_eos": False}, []),
+        ({"refit_cfg": {"nixl": {}}, "mcore_generation_config": {"x": 1}}, []),
+        ({"real_quant_export_cpu_offload": True}, []),
+    ],
+)
+def test_config_warns_for_ignored_generation_keys(override, ignored) -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        DynamoConfig.model_validate(_config(**override))
+    expected = (
+        [f"policy.generation keys ignored by backend='dynamo': {ignored}"]
+        if ignored
+        else []
+    )
+    assert [str(warning.message) for warning in caught] == expected
+
+
+def test_config_rejects_a_required_http_server_api_key() -> None:
+    """The managed Dynamo frontend checks no bearer token, so asking for one
+    fails loudly instead of leaving the exposed server open; the exemplar's
+    explicit ``false`` is accepted without an "ignored" warning."""
+    config = _config()
+    config["vllm_cfg"]["http_server_api_key_required"] = True
+    with pytest.raises(ValidationError, match="http_server_api_key_required"):
+        DynamoConfig.model_validate(config)
+
+    config["vllm_cfg"]["http_server_api_key_required"] = False
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        DynamoConfig.model_validate(config)
+    assert caught == []
 
 
 @pytest.mark.parametrize(
@@ -300,6 +342,8 @@ def test_frontend_argv_and_environment_are_runtime_owned() -> None:
         host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=cfg
     )
     assert _flag_value(argv, "--router-mode") == "kv"
+    assert not any(arg.startswith("--router-reset-states") for arg in argv)
+    assert not any(arg.startswith("--no-router-reset-states") for arg in argv)
 
     env = build_managed_worker_env(
         base_env={

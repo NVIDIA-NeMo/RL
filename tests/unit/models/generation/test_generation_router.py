@@ -25,6 +25,8 @@ misbehave over an actual socket.
 """
 
 import asyncio
+from concurrent.futures import Future
+from typing import Any
 
 import pytest
 from aiohttp import ClientConnectionResetError, ClientSession, web
@@ -343,6 +345,107 @@ class TestBackendErrorHandling:
     no_healthy_backend_status validator exists to prevent, arriving through the error
     path the validator never covered.
     """
+
+    @pytest.mark.asyncio
+    async def test_client_disconnect_cancels_upstream_without_backend_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The production server propagates cancellation without dropping a shard."""
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def generate(request: web.Request) -> web.Response:
+            await request.read()
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return web.Response()  # pragma: no cover - generation never completes
+
+        backend_app = web.Application()
+        backend_app.router.add_post("/v1/chat/completions", generate)
+        backend_runner = web.AppRunner(
+            backend_app, handler_cancellation=True, shutdown_timeout=0.1
+        )
+        await backend_runner.setup()
+        backend_port = _free_port()
+        await web.TCPSite(backend_runner, "127.0.0.1", backend_port).start()
+        backend_url = f"http://127.0.0.1:{backend_port}/v1"
+        router = GenerationRouterImpl(
+            backend_urls=[backend_url],
+            host="127.0.0.1",
+            port=_free_port(),
+            backend_timeout_s=30.0,
+            connect_timeout_s=2.0,
+            no_healthy_backend_status=409,
+            health_managed=True,
+        )
+        # Exercise serve_in_background itself: a harness that constructs its own
+        # AppRunner would not detect a missing production cancellation setting.
+        # Capture its real runner and loop solely to shut down the daemon cleanly.
+        created: Future[tuple[asyncio.AbstractEventLoop, web.AppRunner]] = Future()
+        app_runner = web.AppRunner
+
+        def record_runner(app: web.Application, **kwargs: Any) -> web.AppRunner:
+            runner = app_runner(app, shutdown_timeout=0.1, **kwargs)
+            created.set_result((asyncio.get_event_loop(), runner))
+            return runner
+
+        monkeypatch.setattr(web, "AppRunner", record_runner)
+        writer = None
+        router_loop = None
+        runner = None
+        try:
+            router.serve_in_background()
+            router_loop, runner = await asyncio.wait_for(
+                asyncio.wrap_future(created), 5
+            )
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", router._port), 5
+            )
+            writer.write(
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                b"Host: localhost\r\nContent-Length: 2\r\n\r\n{}"
+            )
+            await writer.drain()
+            await asyncio.wait_for(started.wait(), 5)
+            assert router._inflight[backend_url] == 1
+            writer.close()
+            await writer.wait_closed()
+            await asyncio.wait_for(cancelled.wait(), 5)
+
+            assert router._inflight[backend_url] == 0
+            assert router.drain_backend_outcomes() == {}
+            assert router.metrics()["router/backend_error_total"] == 0.0
+            assert router._serving == [backend_url]
+        finally:
+            try:
+                if writer is not None:
+                    writer.close()
+                    await writer.wait_closed()
+            finally:
+                try:
+                    if router_loop is not None and runner is not None:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.wrap_future(
+                                    asyncio.run_coroutine_threadsafe(
+                                        runner.cleanup(), router_loop
+                                    )
+                                ),
+                                5,
+                            )
+                        finally:
+                            router_loop.call_soon_threadsafe(router_loop.stop)
+                            await asyncio.to_thread(router._thread.join, 5)
+                            assert not router._thread.is_alive()
+                            router_loop.close()
+                finally:
+                    if router._socket is not None:
+                        router._socket.close()
+                    await asyncio.wait_for(backend_runner.cleanup(), 5)
 
     def test_a_disconnected_models_probe_does_not_condemn_the_backend(self):
         """Gym accepts any probe status, so its disconnect is not shard health."""

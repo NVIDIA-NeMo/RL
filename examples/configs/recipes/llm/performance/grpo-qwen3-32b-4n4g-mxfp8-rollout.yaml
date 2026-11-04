@@ -8,6 +8,7 @@ policy:
     vllm_cfg:
       precision: "fp8"
       is_mx: true
+      refit_prequantize: true
       quantization_ignore_patterns:
         - model.layers.*.self_attn.*
         - lm_head

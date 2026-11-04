@@ -71,6 +71,13 @@ env:
           model_server:
             type: responses_api_models
             name: policy_model
+    single_step_tool_use_with_argument_comparison_swe_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: single_step_tool_use_with_argument_comparison_swe
 
 logger:
   wandb_enabled: true

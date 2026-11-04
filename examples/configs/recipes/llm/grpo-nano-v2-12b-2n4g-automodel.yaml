@@ -1,0 +1,10 @@
+defaults: ./grpo-nano-v2-12b-2n8g-automodel.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-nano-v2-12b-2n4g-automodel
+logger:
+  log_dir: logs/grpo-nano-v2-12b-2n4g-automodel
+  wandb:
+    name: grpo-nano-v2-12b-2n4g-automodel
+cluster:
+  gpus_per_node: 4
+

@@ -1,3 +1,5 @@
+defaults: ../legacy_environment_servers/super_rlvr.yaml
+
 checkpointing:
   enabled: true
   checkpoint_dir: "results/super_v3_prod_stage1"
@@ -96,6 +98,8 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   automodel_cfg:
     enabled: false
@@ -193,6 +197,7 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
+    speculator_type: "eagle3"
     num_layers: null
     aux_layer_indices: null
 

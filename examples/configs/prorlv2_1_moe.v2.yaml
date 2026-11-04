@@ -38,7 +38,7 @@ loss_fn:
 
   # ============================================================================
   # Seq-Mask-TIS: Sequence-Level Masking for MoE Stability
-  # Handles Backend Mismatch (FSDP vs vLLM) by filtering entire sequences
+  # Handles Backend Mismatch (Automodel vs vLLM) by filtering entire sequences
   # whose geometric-mean IS ratio falls outside tight bounds.
   # Preserves Chain-of-Thought coherence vs token-level ICE-POP.
   # ============================================================================

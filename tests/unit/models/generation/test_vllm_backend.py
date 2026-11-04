@@ -48,6 +48,586 @@ def _make_collective_update_extension(backend):
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("speculator_type", ["eagle3", "dflash", "dspark"])
+def test_prepare_refit_info_builds_common_speculator_manifest(
+    monkeypatch, speculator_type
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    draft_model = object()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        get_draft_model=lambda: draft_model,
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method=speculator_type)
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+    state_dict_info = {
+        "model.weight": ((2,), torch.float32),
+        "draft.model.weight": ((2,), torch.float32),
+    }
+
+    ext.prepare_refit_info(state_dict_info)
+
+    assert ext._draft_runtime_adapter is not None
+    assert ext._draft_runtime_adapter.model is draft_model
+    assert ext._model_update_manifest is not None
+    assert ext._model_update_manifest.target.ordered_names == ("model.weight",)
+    assert ext._model_update_manifest.draft is not None
+    assert ext._model_update_manifest.draft.ordered_names == ("draft.model.weight",)
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_rejects_trtllm_moe_draft_before_first_refit(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    draft_model = object()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        get_draft_model=lambda: draft_model,
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method="dflash")
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "_model_uses_unquantized_flashinfer_trtllm",
+        lambda model: model is draft_model,
+    )
+    monkeypatch.setattr(ext, "_uses_unquantized_flashinfer_trtllm", lambda: True)
+    monkeypatch.setattr(ext, "_mtp_drafter_refit_enabled", lambda: False)
+
+    with pytest.raises(RuntimeError, match="draft model with TRTLLM MoE layers"):
+        ext.prepare_refit_info(
+            {
+                "model.weight": ((2,), torch.float32),
+                "draft.model.weight": ((2,), torch.float32),
+            }
+        )
+    assert not hasattr(ext, "state_dict_info")
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("transport", ["ipc", "collective", "nccl_reshard"])
+def test_native_refit_validation_accepts_dense_draft(monkeypatch, transport):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=torch.nn.Module())
+    ext._model_update_manifest = _draft_manifest()
+    ext._draft_runtime_adapter = _draft_adapter(model=torch.nn.Linear(2, 2))
+    monkeypatch.setattr(ext, "_uses_unquantized_flashinfer_trtllm", lambda: True)
+    monkeypatch.setattr(ext, "_uses_fp8_kv_cache", lambda: False)
+    monkeypatch.setattr(ext, "_mtp_drafter_refit_enabled", lambda: False)
+
+    ext._validate_native_layerwise_refit(transport)
+
+
+def _draft_manifest(*, draft_owner_ranks=(0,)):
+    from nemo_rl.models.generation.vllm.speculator_runtime import ModelUpdateManifest
+
+    return ModelUpdateManifest.from_state_dict_info(
+        {
+            "model.weight": ((2,), torch.float32),
+            "draft.model.weight": ((2,), torch.float32),
+        },
+        target_owner_ranks=(0,),
+        draft_owner_ranks=draft_owner_ranks,
+    )
+
+
+def _draft_adapter(*, model, pp_rank=0, pp_size=1):
+    from nemo_rl.models.generation.vllm.speculator_runtime import DraftRuntimeAdapter
+
+    return DraftRuntimeAdapter(
+        model=model,
+        pp_size=pp_size,
+        is_owner=pp_rank == pp_size - 1,
+    )
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_rejects_draft_keys_for_unsupported_speculator(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.speculator_runtime import (
+        SpeculatorRuntimeError,
+    )
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(speculative_config=SimpleNamespace(method="bogus"))
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+
+    with pytest.raises(
+        SpeculatorRuntimeError, match="^draft weights require a supported speculator"
+    ):
+        ext.prepare_refit_info(
+            {
+                "model.weight": ((2,), torch.float32),
+                "draft.model.weight": ((2,), torch.float32),
+            }
+        )
+
+
+@pytest.mark.vllm
+def test_load_draft_weights_raises_when_owner_model_is_missing():
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.speculator_runtime import (
+        SpeculatorRuntimeError,
+    )
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+
+    with pytest.raises(
+        SpeculatorRuntimeError, match="owning vLLM speculative model is unavailable$"
+    ):
+        ext._load_draft_weights(
+            [("draft.model.weight", torch.ones(2))],
+            runtime_adapter=_draft_adapter(model=None),
+        )
+
+
+@pytest.mark.vllm
+def test_load_weights_records_draft_owner_skip_on_non_owner_rank(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.speculator_runtime import ModelUpdateCoverage
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=None,
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=[]), speculative_config=None
+        ),
+    )
+    ext._draft_runtime_adapter = _draft_adapter(model=None, pp_rank=0, pp_size=2)
+    ext._load_hf_weights = MagicMock()
+    ext._maybe_refit_mtp_drafter = MagicMock()
+    monkeypatch.setattr(vllm_backend, "_tied_embedding_aliases", lambda _: {})
+    coverage = ModelUpdateCoverage(_draft_manifest(draft_owner_ranks=(1,)), rank=0)
+
+    ext._load_weights(
+        [("model.weight", torch.ones(2)), ("draft.model.weight", torch.ones(2))],
+        coverage=coverage,
+    )
+
+    coverage.require_complete()
+    loaded = ext._load_hf_weights.call_args.args[0]
+    assert [name for name, _ in loaded] == ["model.weight"]
+
+
+def _make_incomplete_coverage_collective_extension(monkeypatch, vllm_backend):
+    ext, _ = _make_collective_update_extension(vllm_backend)
+    ext._model_update_manifest = _draft_manifest()
+    finalize = MagicMock()
+
+    @contextlib.contextmanager
+    def lifecycle(_transport):
+        yield finalize
+
+    ext._weight_update_lifecycle = lifecycle
+    ext._load_weights = lambda weights, coverage=None: coverage.record_loaded(
+        [name for name, _ in weights]
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+
+    def consume(*, iterator, group, src, post_unpack_func, num_buffers=None):
+        post_unpack_func([("model.weight", torch.ones(2))])
+
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", consume)
+    return ext, finalize
+
+
+@pytest.mark.vllm
+def test_collective_refit_raises_on_incomplete_speculator_coverage(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.speculator_runtime import (
+        SpeculatorRuntimeError,
+    )
+
+    ext, finalize = _make_incomplete_coverage_collective_extension(
+        monkeypatch, vllm_backend
+    )
+
+    # The structured error reaches the caller instead of a bare False.
+    with pytest.raises(
+        SpeculatorRuntimeError, match=r"^missing keys \(1\): \['draft.model.weight'\]$"
+    ):
+        ext.update_weights_from_collective()
+    finalize.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_collective_refit_reports_abort_before_incomplete_coverage(monkeypatch):
+    from nemo_rl.distributed import refit_watchdog
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.speculator_runtime import (
+        SpeculatorRuntimeError,
+    )
+
+    class FiredWatchdog:
+        fired = True
+
+        def __init__(self, *_args):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc_info):
+            return None
+
+    monkeypatch.setattr(refit_watchdog, "RefitAbortWatchdog", FiredWatchdog)
+    ext, finalize = _make_incomplete_coverage_collective_extension(
+        monkeypatch, vllm_backend
+    )
+
+    # An aborted broadcast leaves missing keys; the abort stays recoverable.
+    with pytest.raises(refit_watchdog.RefitAborted) as exc_info:
+        ext.update_weights_from_collective()
+    assert isinstance(exc_info.value.__cause__, SpeculatorRuntimeError)
+    finalize.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_ipc_refit_acks_and_raises_on_incomplete_speculator_coverage(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.speculator_runtime import (
+        SpeculatorRuntimeError,
+    )
+    from nemo_rl.models.policy.utils import IPCProtocol
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        def recv_pyobj(self):
+            return IPCProtocol.COMPLETE
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    # Empty IPC manifest: only the speculator coverage is incomplete.
+    ext.state_dict_info = {}
+    ext.zmq_socket = FakeSocket()
+    ext.maybe_init_zmq = lambda: None
+    ext._model_update_manifest = _draft_manifest()
+    finalize = MagicMock()
+
+    @contextlib.contextmanager
+    def lifecycle(_transport):
+        yield finalize
+
+    ext._weight_update_lifecycle = lifecycle
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+
+    with pytest.raises(SpeculatorRuntimeError, match="^missing keys"):
+        ext.update_weights_via_ipc_zmq()
+
+    finalize.assert_not_called()
+    assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()]
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("has_manifest", "has_draft", "has_adapter", "is_owner", "expect_call"),
+    [
+        (False, False, True, True, False),
+        (True, False, True, True, False),
+        (True, True, False, True, False),
+        (True, True, True, False, False),
+        (True, True, True, True, True),
+    ],
+    ids=["no-manifest", "no-draft", "no-adapter", "non-owner", "owner"],
+)
+def test_maybe_process_draft_after_loading(
+    has_manifest, has_draft, has_adapter, is_owner, expect_call
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.speculator_runtime import ModelUpdateManifest
+
+    draft_model = object()
+    draft_config = object()
+    device = object()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.device = device
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(draft_model_config=draft_config)
+        )
+    )
+    ext._model_update_manifest = None
+    if has_manifest:
+        ext._model_update_manifest = (
+            _draft_manifest()
+            if has_draft
+            else ModelUpdateManifest.from_state_dict_info(
+                {"model.weight": ((2,), torch.float32)},
+                target_owner_ranks=(0,),
+                draft_owner_ranks=(),
+            )
+        )
+    ext._draft_runtime_adapter = (
+        _draft_adapter(
+            model=draft_model,
+            pp_size=1 if is_owner else 2,
+        )
+        if has_adapter
+        else None
+    )
+    process = MagicMock()
+
+    ext._maybe_process_draft_after_loading(process)
+
+    if expect_call:
+        process.assert_called_once_with(draft_model, draft_config, device)
+    else:
+        process.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_native_refit_transports_reject_cotrained_draft_manifest():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        vllm_backend.VllmInternalWorkerExtensionWithCheckpointEngine
+    )
+    ext._uses_unquantized_flashinfer_trtllm = lambda: False
+    ext._uses_deepseek_v4_fp8_refit = lambda: False
+    ext._model_update_manifest = _draft_manifest()
+
+    with pytest.raises(
+        RuntimeError, match="^checkpoint-engine refit does not support co-trained draft"
+    ):
+        ext._validate_checkpoint_engine_weight_update()
+    with pytest.raises(
+        RuntimeError, match="^sparse-delta refit does not support co-trained draft"
+    ):
+        ext.prepare_sparse_delta_refit_info({})
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("speculator_type", ["dflash", "dspark"])
+def test_common_speculator_refit_drops_tied_alias_then_finalizes_target_and_draft(
+    monkeypatch, speculator_type
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.speculator_runtime import (
+        DraftRuntimeAdapter,
+        ModelUpdateCoverage,
+        ModelUpdateManifest,
+    )
+
+    call_order = []
+    target_model = SimpleNamespace(
+        load_weights=MagicMock(
+            side_effect=lambda **_: call_order.append("load_target")
+        ),
+        modules=lambda: (),
+    )
+    draft_model = SimpleNamespace(
+        load_weights=MagicMock(side_effect=lambda **_: call_order.append("load_draft")),
+        named_modules=lambda: (),
+    )
+    target_config = object()
+    draft_config = object()
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=[]),
+        speculative_config=SimpleNamespace(
+            method=speculator_type, draft_model_config=draft_config
+        ),
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.device = torch.device("cpu")
+    ext.model_config = target_config
+    ext.model_runner = SimpleNamespace(model=target_model, vllm_config=vllm_config)
+    ext._draft_runtime_adapter = DraftRuntimeAdapter.resolve(
+        SimpleNamespace(get_draft_model=lambda: draft_model),
+        speculator_type=speculator_type,
+        vllm_version="0.27.1",
+        pp_rank=0,
+        pp_size=1,
+    )
+    ext._model_update_manifest = ModelUpdateManifest.from_state_dict_info(
+        {
+            "model.weight": ((2,), torch.float32),
+            "lm_head.weight": ((2,), torch.float32),
+            "draft.model.weight": ((2,), torch.float32),
+        },
+        target_owner_ranks=(0,),
+        draft_owner_ranks=(0,),
+    )
+    coverage = ModelUpdateCoverage(ext._model_update_manifest, rank=0)
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+    monkeypatch.setattr(
+        vllm_backend,
+        "_tied_embedding_aliases",
+        lambda _: {"lm_head.weight": "model.weight"},
+    )
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+
+    finalize_configs = {}
+
+    def process_weights_after_loading(model, model_config, _device):
+        label = "finalize_draft" if model is draft_model else "finalize_target"
+        call_order.append(label)
+        finalize_configs[label] = model_config
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process_weights_after_loading,
+    )
+
+    weights = [
+        ("model.weight", torch.ones(2)),
+        ("lm_head.weight", torch.ones(2)),
+        ("draft.model.weight", torch.ones(2)),
+    ]
+    with ext._weight_update_lifecycle("collective") as finalize:
+        ext._load_weights(weights, coverage=coverage)
+        coverage.require_complete()
+        finalize()
+
+    assert call_order == [
+        "load_target",
+        "load_draft",
+        "finalize_target",
+        "finalize_draft",
+    ]
+    assert [
+        name for name, _ in target_model.load_weights.call_args.kwargs["weights"]
+    ] == ["model.weight"]
+    draft_model.load_weights.assert_called_once()
+    assert draft_model.load_weights.call_args.kwargs["weights"][0][0] == "model.weight"
+    assert finalize_configs["finalize_target"] is target_config
+    assert finalize_configs["finalize_draft"] is draft_config
+
+
+@pytest.mark.vllm
+def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=None),
+    )
+    ext.model_config = object()
+    ext.device = object()
+
+    class _ExplodingInfo:
+        def __getitem__(self, key):
+            raise RuntimeError("bulk receive failed")
+
+        def get(self, key, default=None):
+            raise RuntimeError("bulk receive failed")
+
+    ext.nccl_reshard_refit_info = _ExplodingInfo()
+    ext.hf_to_local_param_map = {}
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+
+    # A failure inside the bulk receive must not propagate (nonfatal contract,
+    # matching ipc/collective) but must mark the worker as holding partial weights.
+    assert ext.nccl_reshard_refit() is False
+    assert ext._refit_unusable_reason is not None
+    assert "bulk receive failed" in ext._refit_unusable_reason
+
+    # A retry that fails again keeps the mark and still reports failure.
+    assert ext.nccl_reshard_refit() is False
+    assert "bulk receive failed" in ext._refit_unusable_reason
+
+    # Paths that cannot recover in place keep the fatal contract.
+    monkeypatch.setattr(ext, "_weight_update_errors_are_fatal", lambda: True)
+    with pytest.raises(RuntimeError, match="^bulk receive failed$"):
+        ext.nccl_reshard_refit()
+
+
+@pytest.mark.vllm
+def test_postprocess_failure_is_recovered_by_next_refit(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=None),
+    )
+    ext.model_config = object()
+    ext.device = object()
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    process_weights = MagicMock(
+        side_effect=[RuntimeError("weight post-processing failed"), None]
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process_weights,
+    )
+
+    with pytest.raises(RuntimeError, match="^weight post-processing failed$"):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            finalize()
+    assert "weight post-processing failed" in ext._refit_unusable_reason
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        finalize()
+    assert ext._refit_unusable_reason is None
+    assert process_weights.call_count == 2
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     ("cache_dtype", "expected"),
     [("fp8", True), ("fp8_e4m3", True), ("fp8_ds_mla", False), ("auto", False)],
@@ -112,6 +692,7 @@ def _make_extension_with_drafter(mtp_start_layer_idx, num_mtp_layers):
         mtp_start_layer_idx=mtp_start_layer_idx, num_mtp_layers=num_mtp_layers
     )
     ext.model_runner = MagicMock()
+    ext.model_runner.get_draft_model = None
     draft_model = torch.nn.Module()
     setattr(draft_model, "model", predictor)
     ext.model_runner.drafter.model = draft_model
@@ -391,6 +972,86 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("transport", ["ipc", "collective"])
+def test_unquantized_native_refit_processes_dense_draft(monkeypatch, transport):
+    """Native refit reloads target experts and post-processes only the drafter."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    call_order = []
+    model = _make_unquantized_moe_model("FlashInfer TRTLLM")
+    moe_module = vllm_backend._unquantized_flashinfer_trtllm_modules(model)[0]
+    draft_model = torch.nn.Linear(2, 2)
+    model_config = object()
+    draft_model_config = object()
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="auto"),
+        quant_config=None,
+        speculative_config=SimpleNamespace(draft_model_config=draft_model_config),
+    )
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._model_update_manifest = _draft_manifest()
+    ext._draft_runtime_adapter = _draft_adapter(model=draft_model)
+    ext._mtp_drafter_refit_enabled = lambda: False
+    ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    @contextlib.contextmanager
+    def set_current_vllm_config(config):
+        assert config is vllm_config
+        call_order.append("config_enter")
+        try:
+            yield
+        finally:
+            call_order.append("config_exit")
+
+    monkeypatch.setattr("vllm.config.set_current_vllm_config", set_current_vllm_config)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda reload_model: call_order.append(("initialize", reload_model)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
+        lambda reload_model, config: call_order.append(
+            ("finalize", reload_model, config)
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "_refresh_hpc_modules_after_layerwise_reload",
+        lambda reload_model: call_order.append(("hpc", reload_model)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda reload_model, config, device: call_order.append(
+            ("process", reload_model, config, device)
+        ),
+    )
+
+    with ext._weight_update_lifecycle(transport) as finalize:
+        call_order.append("load")
+        finalize()
+
+    assert call_order == [
+        "config_enter",
+        ("initialize", moe_module),
+        "load",
+        ("finalize", model, model_config),
+        ("hpc", model),
+        ("process", draft_model, draft_model_config, ext.device),
+        "mtp",
+        "config_exit",
+    ]
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize("transport", ["ipc", "collective", "nccl_reshard"])
 def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transport):
     """Mixed refits reload BF16 experts and rebuild each MXFP8 layout once."""
@@ -579,22 +1240,28 @@ def test_fp8_load_uses_buffer_safe_model_loader(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_fp8_layerwise_reload_passes_entire_quantized_generator(monkeypatch):
+@pytest.mark.parametrize("native_reload", [False, True])
+def test_fp8_layerwise_reload_passes_entire_quantized_generator(
+    monkeypatch, native_reload
+):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
 
     received_weights = []
+    produced_weights = 0
 
     def model_load_weights(*, weights):
+        assert produced_weights == 0
         received_weights.extend(weights)
         return {name for name, _ in received_weights}
 
-    model = SimpleNamespace(load_weights=model_load_weights)
+    model = torch.nn.Module()
+    model.load_weights = model_load_weights
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
-    ext._nrl_layerwise_reload_active = True
+    ext._nrl_layerwise_reload_active = native_reload
     source_weights = [("model.weight", torch.ones(2))]
     quantized_weights = [
         ("model.weight", torch.ones(2, dtype=torch.float8_e4m3fn)),
@@ -602,10 +1269,13 @@ def test_fp8_layerwise_reload_passes_entire_quantized_generator(monkeypatch):
     ]
 
     def get_quantized_weight_iterator(weights, model_runner, *, refit_with_reload_api):
+        nonlocal produced_weights
         assert weights is source_weights
         assert model_runner is ext.model_runner
         assert refit_with_reload_api is False
-        yield from quantized_weights
+        for weight in quantized_weights:
+            produced_weights += 1
+            yield weight
 
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
     monkeypatch.setattr(
@@ -774,7 +1444,7 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
 
     process.assert_called_once_with(model, model_config, ext.device)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
-    ext._maybe_process_fp8_kv_cache.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
 
 
 @pytest.mark.vllm
@@ -1140,6 +1810,115 @@ def test_sparse_delta_refit_rejected_for_native_trtllm_backend():
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prepare_refit_info_reports_only_fp8_weights(monkeypatch, enabled):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    model = torch.nn.Module()
+    config = object()
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=config)
+    state_dict_info = {
+        "model.linear.weight": ((2, 2), torch.bfloat16),
+        "model.norm.weight": ((2,), torch.bfloat16),
+    }
+    is_fp8_model = MagicMock(return_value=True)
+    checked_names = []
+
+    def is_fp8_weight(name, candidate_model):
+        assert candidate_model is model
+        checked_names.append(name)
+        return name == "model.linear.weight"
+
+    source_config = fp8.FP8Config(
+        is_mx=True,
+        refit_prequantize=enabled,
+        use_fp8_weights=True,
+    )
+    monkeypatch.setattr(fp8, "global_fp8_config", source_config)
+    serialized_config = fp8.serialize_fp8_config()
+    monkeypatch.setattr(fp8, "global_fp8_config", None)
+    monkeypatch.setattr(fp8, "is_fp8_model", is_fp8_model)
+    monkeypatch.setattr(fp8, "_is_fp8_weight", is_fp8_weight)
+    _patch_pp_group(monkeypatch, vllm_backend)
+
+    result = ext.prepare_refit_info(state_dict_info, serialized_config)
+
+    assert ext.state_dict_info is state_dict_info
+    assert fp8.global_fp8_config == source_config
+    if enabled:
+        assert result == ["model.linear.weight"]
+        is_fp8_model.assert_called_once_with(config)
+        assert checked_names == list(state_dict_info)
+    else:
+        assert result is None
+        is_fp8_model.assert_not_called()
+        assert checked_names == []
+
+
+@pytest.mark.vllm
+def test_sync_prepare_refit_info_unions_worker_names(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_worker import (
+        VllmGenerationWorkerImpl,
+    )
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    state_dict_info = {"model.weight": ((2, 2), torch.bfloat16)}
+    serialized_config = {"is_mx": True, "refit_prequantize": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
+    worker.llm = SimpleNamespace(
+        collective_rpc=MagicMock(
+            return_value=[
+                None,
+                ["model.b.weight", "model.a.weight"],
+                ["model.a.weight"],
+            ]
+        )
+    )
+
+    assert worker.prepare_refit_info(state_dict_info) == [
+        "model.a.weight",
+        "model.b.weight",
+    ]
+    worker.llm.collective_rpc.assert_called_once_with(
+        "prepare_refit_info",
+        args=(state_dict_info, serialized_config),
+    )
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_async_prepare_refit_info_unions_worker_names(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    state_dict_info = {"model.weight": ((2, 2), torch.bfloat16)}
+    serialized_config = {"is_mx": True, "refit_prequantize": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(
+            return_value=[None, ["model.b.weight"], ["model.a.weight"]]
+        )
+    )
+
+    assert await worker.prepare_refit_info_async(state_dict_info) == [
+        "model.a.weight",
+        "model.b.weight",
+    ]
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "prepare_refit_info",
+        args=(state_dict_info, serialized_config),
+    )
+
+
+@pytest.mark.vllm
 def test_update_weights_from_collective_uses_legacy_loader_by_default(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
@@ -1463,7 +2242,6 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
         post_unpack_func([("model.weight", "weight-value")])
 
     ext._load_weights = load_weights
-    ext._maybe_process_fp8_kv_cache = lambda: call_order.append("kv")
     monkeypatch.setattr(
         vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
     )
@@ -1486,7 +2264,6 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
         "config_enter",
         "process_mtp",
         "config_exit",
-        "kv",
         "gc",
         "empty_cache",
     ]
@@ -1494,6 +2271,316 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
 
     assert process_calls == expected_process_calls
     assert call_order == expected_call_order
+
+
+@pytest.mark.vllm
+def test_native_lora_collective_clones_buffers_and_installs_adapter(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.lora_utils import NATIVE_LORA_CONFIG_KEY
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = {
+        "model.layer.lora_A.weight": (torch.Size([2, 4]), torch.bfloat16),
+        "model.layer.lora_B.weight": (torch.Size([4, 2]), torch.bfloat16),
+    }
+    ext.model_update_group = object()
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            additional_config={NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}}
+        )
+    )
+    source_a = torch.randn(2, 4, dtype=torch.bfloat16)
+    source_b = torch.randn(4, 2, dtype=torch.bfloat16)
+    installed = {}
+
+    def packed_broadcast_consumer(*, post_unpack_func, **_kwargs):
+        post_unpack_func(
+            [
+                ("model.layer.lora_A.weight", source_a),
+                ("model.layer.lora_B.weight", source_b),
+            ]
+        )
+
+    ext._install_native_lora = lambda tensors: installed.update(tensors)
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+
+    assert ext._update_weights_from_collective(refit_with_reload_api=False) is True
+    assert set(installed) == set(ext.state_dict_info)
+    torch.testing.assert_close(installed["model.layer.lora_A.weight"], source_a)
+    torch.testing.assert_close(installed["model.layer.lora_B.weight"], source_b)
+    assert installed["model.layer.lora_A.weight"].data_ptr() != source_a.data_ptr()
+    assert installed["model.layer.lora_B.weight"].data_ptr() != source_b.data_ptr()
+
+
+@pytest.mark.vllm
+def test_install_native_lora_replaces_and_activates_stable_adapter(monkeypatch):
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.lora_utils import (
+        NATIVE_LORA_ADAPTER_ID,
+        NATIVE_LORA_CONFIG_KEY,
+    )
+
+    rename_mapper = object()
+    weights_mapper = MagicMock()
+    weights_mapper.get_rename_mapper.return_value = rename_mapper
+    model = SimpleNamespace(hf_to_vllm_mapper=weights_mapper)
+    adapter_manager = MagicMock()
+    adapter_manager.model = model
+    adapter_manager.modules = {
+        "model.experts": object(),
+        "model.layer": object(),
+    }
+    adapter_manager.packed_modules = {}
+    adapter_manager.is_pooling_model = False
+    adapter_manager.add_adapter.return_value = True
+    lora_manager = SimpleNamespace(
+        _adapter_manager=adapter_manager,
+        lora_config=SimpleNamespace(lora_dtype=torch.bfloat16),
+        vocab_size=128,
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.device = torch.device("cpu")
+    ext.model_runner = SimpleNamespace(
+        lora_manager=lora_manager,
+        vllm_config=SimpleNamespace(
+            additional_config={NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}}
+        ),
+    )
+    peft_helper = MagicMock()
+    lora = SimpleNamespace(
+        loras={
+            "model.experts.base_layer": SimpleNamespace(
+                lora_a=torch.ones(2, 4), lora_b=torch.ones(4, 2)
+            ),
+            "model.layer": SimpleNamespace(
+                lora_a=torch.ones(2, 4), lora_b=torch.ones(4, 2)
+            ),
+        }
+    )
+    from_dict = MagicMock(return_value=peft_helper)
+    from_lora_tensors = MagicMock(return_value=lora)
+    monkeypatch.setattr(PEFTHelper, "from_dict", from_dict)
+    monkeypatch.setattr(LoRAModel, "from_lora_tensors", from_lora_tensors)
+    synchronize = MagicMock()
+    monkeypatch.setattr(vllm_backend.torch.cuda, "synchronize", synchronize)
+    tensors = {
+        "model.experts.base_layer.lora_A.weight": torch.ones(2, 4),
+        "model.experts.base_layer.lora_B.weight": torch.ones(4, 2),
+        "model.layer.lora_A.weight": torch.ones(2, 4),
+        "model.layer.lora_B.weight": torch.ones(4, 2),
+    }
+
+    ext._install_native_lora(tensors)
+
+    from_dict.assert_called_once_with({"r": 2, "lora_alpha": 8, "target_modules": []})
+    peft_helper.validate_legal.assert_called_once_with(lora_manager.lora_config)
+    from_lora_tensors.assert_called_once()
+    assert from_lora_tensors.call_args.kwargs["device"] == "cpu"
+    assert from_lora_tensors.call_args.kwargs["weights_mapper"] is rename_mapper
+    weights_mapper.get_rename_mapper.assert_called_once_with()
+    adapter_manager.remove_adapter.assert_called_once_with(NATIVE_LORA_ADAPTER_ID)
+    adapter_manager.add_adapter.assert_called_once_with(lora)
+    adapter_manager.activate_adapter.assert_called_once_with(NATIVE_LORA_ADAPTER_ID)
+    synchronize.assert_called_once_with(ext.device)
+
+
+@pytest.mark.vllm
+def test_install_native_lora_rejects_unapplied_runtime_module(monkeypatch):
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.lora_utils import NATIVE_LORA_CONFIG_KEY
+
+    adapter_manager = MagicMock()
+    adapter_manager.model = SimpleNamespace(hf_to_vllm_mapper=None)
+    adapter_manager.modules = {"model.layer": object()}
+    adapter_manager.packed_modules = {}
+    adapter_manager.is_pooling_model = False
+    lora_manager = SimpleNamespace(
+        _adapter_manager=adapter_manager,
+        lora_config=SimpleNamespace(lora_dtype=torch.bfloat16),
+        vocab_size=128,
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.device = torch.device("cpu")
+    ext.model_runner = SimpleNamespace(
+        lora_manager=lora_manager,
+        vllm_config=SimpleNamespace(
+            additional_config={NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}}
+        ),
+    )
+    peft_helper = MagicMock()
+    monkeypatch.setattr(PEFTHelper, "from_dict", MagicMock(return_value=peft_helper))
+    monkeypatch.setattr(
+        LoRAModel,
+        "from_lora_tensors",
+        MagicMock(
+            return_value=SimpleNamespace(
+                loras={
+                    "model.typo": SimpleNamespace(
+                        lora_a=torch.ones(2, 4), lora_b=torch.ones(4, 2)
+                    )
+                }
+            )
+        ),
+    )
+    tensors = {
+        "model.typo.lora_A.weight": torch.ones(2, 4),
+        "model.typo.lora_B.weight": torch.ones(4, 2),
+    }
+
+    with pytest.raises(RuntimeError, match="vLLM cannot apply") as exc_info:
+        ext._install_native_lora(tensors)
+
+    assert "match_all_linear: false" in str(exc_info.value)
+    assert 'exclude_modules: ["*lm_head*"]' in str(exc_info.value)
+    assert "policy.generation.lora_refit_mode: merged" in str(exc_info.value)
+    adapter_manager.add_adapter.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_install_native_lora_rejects_trainable_skipped_module(monkeypatch):
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.lora_utils import NATIVE_LORA_CONFIG_KEY
+
+    adapter_manager = MagicMock()
+    adapter_manager.model = SimpleNamespace(
+        hf_to_vllm_mapper=None,
+        lora_skip_prefixes=["mtp."],
+    )
+    adapter_manager.modules = {"model.layer": object()}
+    adapter_manager.packed_modules = {}
+    adapter_manager.is_pooling_model = False
+    lora_manager = SimpleNamespace(
+        _adapter_manager=adapter_manager,
+        lora_config=SimpleNamespace(lora_dtype=torch.bfloat16),
+        vocab_size=128,
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.device = torch.device("cpu")
+    ext.model_runner = SimpleNamespace(
+        lora_manager=lora_manager,
+        vllm_config=SimpleNamespace(
+            additional_config={NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}}
+        ),
+    )
+    from_lora_tensors = MagicMock()
+    monkeypatch.setattr(PEFTHelper, "from_dict", MagicMock())
+    monkeypatch.setattr(LoRAModel, "from_lora_tensors", from_lora_tensors)
+    tensors = {
+        "base_model.model.mtp.layer.lora_A.weight": torch.ones(2, 4),
+        "base_model.model.mtp.layer.lora_B.weight": torch.ones(4, 2),
+    }
+
+    with pytest.raises(RuntimeError, match="configured to skip"):
+        ext._install_native_lora(tensors)
+
+    from_lora_tensors.assert_not_called()
+    adapter_manager.remove_adapter.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_native_lora_ipc_clones_buffers_and_installs_adapter(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.lora_utils import NATIVE_LORA_CONFIG_KEY
+    from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
+
+    tensor_names = ["model.layer.lora_A.weight", "model.layer.lora_B.weight"]
+    state_dict_info = {
+        tensor_names[0]: (torch.Size([2, 4]), torch.bfloat16),
+        tensor_names[1]: (torch.Size([4, 2]), torch.bfloat16),
+    }
+    used_bytes = calculate_aligned_size(
+        torch.bfloat16.itemsize * torch.Size([2, 4]).numel()
+    )
+    backing_storage = torch.zeros(used_bytes, dtype=torch.uint8)
+    backing_values = backing_storage[: 2 * 4 * torch.bfloat16.itemsize].view(
+        dtype=torch.bfloat16
+    )
+    backing_values.fill_(1)
+    events = []
+
+    class FakeSocket:
+        def __init__(self):
+            self.payload_index = 0
+            self.sent = []
+
+        def recv_pyobj(self):
+            if self.payload_index == 0:
+                payload = (object(), [tensor_names[0]], used_bytes)
+            elif self.payload_index == 1:
+                # Simulate producer reuse immediately after the first data ACK.
+                backing_values.fill_(2)
+                payload = (object(), [tensor_names[1]], used_bytes)
+            else:
+                payload = IPCProtocol.COMPLETE
+            self.payload_index += 1
+            return payload
+
+        def send(self, payload):
+            events.append("ack")
+            self.sent.append(payload)
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = state_dict_info
+    ext.zmq_socket = FakeSocket()
+    ext.maybe_init_zmq = lambda: None
+    ext.device = SimpleNamespace(index=0)
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            additional_config={NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}}
+        )
+    )
+    installed = {}
+
+    def install_native_lora(tensors):
+        events.append("install")
+        installed.update(tensors)
+
+    ext._install_native_lora = install_native_lora
+    ext._synchronize_before_ipc_data_ack = lambda: events.append("sync")
+    monkeypatch.setattr(
+        vllm_backend,
+        "rebuild_cuda_tensor_from_ipc",
+        lambda _handle, _device: backing_storage,
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+
+    assert ext.update_weights_via_ipc_zmq() is True
+    assert set(installed) == set(state_dict_info)
+    torch.testing.assert_close(
+        installed[tensor_names[0]], torch.ones(2, 4, dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(
+        installed[tensor_names[1]], torch.full((4, 2), 2, dtype=torch.bfloat16)
+    )
+    assert all(
+        tensor.data_ptr() != backing_storage.data_ptr() for tensor in installed.values()
+    )
+    assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * 3
+    assert events == ["sync", "ack", "sync", "ack", "install", "ack"]
 
 
 @pytest.mark.vllm
@@ -1615,17 +2702,20 @@ async def test_async_weight_update_fails_when_encoder_cache_reset_fails():
 
 
 @pytest.mark.vllm
-def test_worker_prepare_refit_info_forwards_state_dict_info():
+def test_worker_prepare_refit_info_forwards_state_dict_info(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
     from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
     worker.llm = SimpleNamespace(collective_rpc=MagicMock())
     state_dict_info = {"model.weight": object()}
+    serialized_config = {"is_mx": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
 
     worker.prepare_refit_info(state_dict_info)
 
     assert worker.llm.collective_rpc.call_args_list == [
-        call("prepare_refit_info", args=(state_dict_info,)),
+        call("prepare_refit_info", args=(state_dict_info, serialized_config)),
     ]
 
 
@@ -1664,8 +2754,38 @@ def test_generation_prepare_refit_info_allows_mxfp8_grouped_moe(
 
 
 @pytest.mark.vllm
+def test_generation_prepare_refit_info_rejects_empty_prequant_selection(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import vllm_generation
+
+    generation = vllm_generation.VllmGeneration.__new__(vllm_generation.VllmGeneration)
+    generation.cfg = {
+        "vllm_cfg": {
+            "async_engine": False,
+            "precision": "fp8",
+            "is_mx": True,
+            "refit_prequantize": True,
+        }
+    }
+    leader = MagicMock()
+    generation.worker_group = SimpleNamespace(workers=[leader])
+    generation.dp_size = 1
+    generation._refit_membership = None
+    monkeypatch.setattr(vllm_generation.ray, "get", MagicMock(return_value=[None]))
+    state_dict_info = {"model.layers.0.mlp.experts.gate_up_proj": object()}
+
+    with pytest.raises(RuntimeError, match="reported no FP8-eligible parameters"):
+        generation.prepare_refit_info(state_dict_info)
+    leader.prepare_refit_info.remote.assert_called_once_with(
+        state_dict_info=state_dict_info
+    )
+
+
+@pytest.mark.vllm
 @pytest.mark.asyncio
-async def test_async_worker_prepare_refit_info_forwards_state_dict_info():
+async def test_async_worker_prepare_refit_info_forwards_state_dict_info(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
         VllmAsyncGenerationWorkerImpl,
     )
@@ -1673,11 +2793,13 @@ async def test_async_worker_prepare_refit_info_forwards_state_dict_info():
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.llm = SimpleNamespace(collective_rpc=AsyncMock())
     state_dict_info = {"model.weight": object()}
+    serialized_config = {"is_mx": True}
+    monkeypatch.setattr(fp8, "serialize_fp8_config", lambda: serialized_config)
 
     await worker.prepare_refit_info_async(state_dict_info)
 
     assert worker.llm.collective_rpc.await_args_list == [
-        call("prepare_refit_info", args=(state_dict_info,)),
+        call("prepare_refit_info", args=(state_dict_info, serialized_config)),
     ]
 
 
@@ -2178,6 +3300,7 @@ def test_load_mtp_weights_from_disk_without_drafter(
     ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
     ext.device = torch.device("cpu")
     ext.model_runner = MagicMock()
+    ext.model_runner.get_draft_model = None
     # A runner without a drafter has neither proposer attribute; MagicMock would
     # otherwise conjure a `speculator.model` for the v2-runner lookup.
     ext.model_runner.drafter = None
@@ -2469,15 +3592,15 @@ def test_installed_vllm_runners_keep_the_drafter_under_a_known_attribute():
     acceptance in a nightly."""
     import inspect
 
-    from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+    from nemo_rl.models.generation.vllm.speculator_runtime import (
+        DRAFTER_OWNER_ATTRS,
     )
 
     pytest.importorskip("vllm")
     from vllm.v1.worker import gpu_model_runner as legacy_runner_module
     from vllm.v1.worker.gpu import model_runner as v2_runner_module
 
-    known = VllmInternalWorkerExtension._DRAFTER_OWNER_ATTRS
+    known = tuple(attr for attr, _ in DRAFTER_OWNER_ATTRS)
     for module in (legacy_runner_module, v2_runner_module):
         source = inspect.getsource(module.GPUModelRunner)
         assigned = {
@@ -2563,6 +3686,546 @@ def test_maybe_process_mtp_drafter_after_loading_noop_when_disk_loaded(monkeypat
     ext._maybe_process_mtp_drafter_after_loading()
 
     process_weights.assert_not_called()
+
+
+def _patch_pp_group(monkeypatch, vllm_backend, *, is_last_rank=True):
+    # vllm_backend binds get_pp_group at import; draft_utils resolves it per call.
+    # A non-last rank is stage 0 of a two-stage pipeline.
+    group = SimpleNamespace(
+        is_last_rank=is_last_rank,
+        rank_in_group=0,
+        world_size=1 if is_last_rank else 2,
+    )
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_pp_group", lambda: group)
+    monkeypatch.setattr(vllm_backend, "get_pp_group", lambda: group)
+
+
+def _make_dspark_refit_extension(
+    vllm_backend, *, has_speculator=True, drafter_param_names=None, method="dspark"
+):
+    """Extension wired for co-trained-draft refit-manifest tests.
+
+    The default fake drafter mimics the pinned vLLM Qwen3DSparkForCausalLM
+    layout: fused qkv/gate_up parameters, a mask_embedding placeholder, and an
+    owned lm_head. Ownership is controlled via
+    _patch_pp_group in tests.
+    """
+    if drafter_param_names is None:
+        drafter_param_names = [
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.mlp.gate_up_proj.weight",
+            "model.fc.weight",
+            "model.hidden_norm.weight",
+            "model.norm.weight",
+            "model.markov_head.markov_w1.weight",
+            "model.markov_head.markov_w2.weight",
+            "model.mask_embedding",
+            "lm_head.weight",
+        ]
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    drafter_model = None
+    if has_speculator:
+        drafter_model = SimpleNamespace(
+            named_parameters=lambda: [(n, None) for n in drafter_param_names],
+            load_weights=MagicMock(),
+        )
+    ext.model_runner = SimpleNamespace(
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=SimpleNamespace(method=method)),
+        speculator=SimpleNamespace(model=drafter_model) if has_speculator else None,
+    )
+    return ext, drafter_model
+
+
+# The pinned vLLM Eagle3Qwen3ForCausalLM layout: single fused decoder layer,
+# aux-feature fc, d2t exposed as the draft_id_to_target_id parameter.
+_EAGLE3_DRAFTER_PARAM_NAMES = [
+    "model.embed_tokens.weight",
+    "model.layers.0.self_attn.qkv_proj.weight",
+    "model.layers.0.self_attn.o_proj.weight",
+    "model.layers.0.self_attn.q_norm.weight",
+    "model.layers.0.self_attn.k_norm.weight",
+    "model.layers.0.hidden_norm.weight",
+    "model.layers.0.input_layernorm.weight",
+    "model.layers.0.post_attention_layernorm.weight",
+    "model.layers.0.mlp.gate_up_proj.weight",
+    "model.layers.0.mlp.down_proj.weight",
+    "model.fc.weight",
+    "model.norm.weight",
+    "lm_head.weight",
+    "draft_id_to_target_id",
+]
+
+
+def _complete_eagle3_draft_info():
+    keys = [
+        "draft.embed_tokens.weight",
+        "draft.layers.0.self_attn.q_proj.weight",
+        "draft.layers.0.self_attn.k_proj.weight",
+        "draft.layers.0.self_attn.v_proj.weight",
+        "draft.layers.0.self_attn.o_proj.weight",
+        "draft.layers.0.self_attn.q_norm.weight",
+        "draft.layers.0.self_attn.k_norm.weight",
+        "draft.layers.0.hidden_norm.weight",
+        "draft.layers.0.input_layernorm.weight",
+        "draft.layers.0.post_attention_layernorm.weight",
+        "draft.layers.0.mlp.gate_proj.weight",
+        "draft.layers.0.mlp.up_proj.weight",
+        "draft.layers.0.mlp.down_proj.weight",
+        "draft.fc.weight",
+        "draft.norm.weight",
+        "draft.lm_head.weight",
+        "draft.d2t",
+    ]
+    info = {key: ((4, 4), torch.bfloat16) for key in keys}
+    info["model.weight"] = ((4, 4), torch.bfloat16)
+    return info
+
+
+def _complete_dspark_draft_info():
+    keys = [
+        "draft.embed_tokens.weight",
+        "draft.layers.0.self_attn.q_proj.weight",
+        "draft.layers.0.self_attn.k_proj.weight",
+        "draft.layers.0.self_attn.v_proj.weight",
+        "draft.layers.0.self_attn.q_norm.weight",
+        "draft.layers.0.mlp.gate_proj.weight",
+        "draft.layers.0.mlp.up_proj.weight",
+        "draft.fc.weight",
+        "draft.hidden_norm.weight",
+        "draft.norm.weight",
+        "draft.markov_head.markov_w1.weight",
+        "draft.markov_head.markov_w2.weight",
+        "draft.lm_head.weight",
+    ]
+    info = {key: ((4, 4), torch.bfloat16) for key in keys}
+    info["model.weight"] = ((4, 4), torch.bfloat16)
+    return info
+
+
+@pytest.mark.vllm
+def test_dspark_owner_accepts_complete_draft_manifest(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(vllm_backend)
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = _complete_dspark_draft_info()
+    # Keys the drafter's loader intentionally skips are tolerated as extras.
+    info["draft.confidence_head.proj.weight"] = ((4,), torch.bfloat16)
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "dropped_key",
+    ["draft.embed_tokens.weight", "draft.lm_head.weight"],
+)
+def test_dspark_owner_rejects_missing_draft_keys(monkeypatch, dropped_key):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(vllm_backend)
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = _complete_dspark_draft_info()
+    del info[dropped_key]
+    with pytest.raises(RuntimeError, match="missing draft keys"):
+        ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("method", ["dspark", "dflash"])
+def test_owner_accepts_stream_without_target_shared_draft_keys(monkeypatch, method):
+    # vLLM aliases the target's embed_tokens/lm_head into a drafter whose
+    # checkpoint has none, so the Megatron stream leaves them out.
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, drafter_model = _make_dspark_refit_extension(vllm_backend, method=method)
+    target_model = torch.nn.Module()
+    target_model.embed_tokens = torch.nn.Embedding(4, 4)
+    target_model.lm_head = torch.nn.Linear(4, 4, bias=False)
+    ext.model_runner.model = target_model
+    shared = {
+        "model.embed_tokens.weight": target_model.embed_tokens.weight,
+        "lm_head.weight": target_model.lm_head.weight,
+    }
+    names = [name for name, _ in drafter_model.named_parameters()]
+    drafter_model.named_parameters = lambda: [(n, shared.get(n)) for n in names]
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = _complete_dspark_draft_info()
+    del info["draft.embed_tokens.weight"]
+    del info["draft.lm_head.weight"]
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+def test_dspark_owner_rejects_unexpected_draft_keys(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(vllm_backend)
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = _complete_dspark_draft_info()
+    info["draft.renamed_bogus.weight"] = ((4, 4), torch.bfloat16)
+    with pytest.raises(RuntimeError, match="unexpected draft keys"):
+        ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+def test_eagle3_non_owner_skips_draft_payloads(monkeypatch):
+    # DFlash/DSpark run only at PP=1, so eagle3 is the speculator with
+    # non-owning stages.
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend, has_speculator=False, method="eagle3"
+    )
+    _patch_pp_group(monkeypatch, vllm_backend, is_last_rank=False)
+    # Non-owning ranks neither validate the draft manifest nor require a
+    # drafter for draft payloads.
+    ext.prepare_refit_info(_complete_eagle3_draft_info())
+    assert not ext._load_draft_weights(
+        [("draft.embed_tokens.weight", torch.zeros(1))],
+        runtime_adapter=ext._draft_runtime_adapter,
+    )
+
+
+@pytest.mark.vllm
+def test_dspark_owner_without_speculator_raises(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(vllm_backend, has_speculator=False)
+    _patch_pp_group(monkeypatch, vllm_backend)
+    with pytest.raises(RuntimeError, match="no drafter"):
+        ext._load_draft_weights([("embed_tokens.weight", torch.zeros(1))])
+
+
+@pytest.mark.vllm
+def test_dspark_static_drafter_manifest_without_draft_keys_passes(monkeypatch):
+    """policy.draft.enabled=false: drafter loads from disk, refits carry only
+    policy weights, and the manifest legitimately has zero draft.* keys."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(vllm_backend)
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = {"model.weight": ((4, 4), torch.bfloat16)}
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+def test_dspark_alias_guard_rejects_target_shared_modules():
+    from nemo_rl.models.generation.vllm import draft_utils
+
+    shared_embed = SimpleNamespace(weight=torch.zeros(4, 2))
+    shared_head = SimpleNamespace(weight=torch.zeros(4, 2))
+    model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=shared_embed), lm_head=shared_head
+        )
+    )
+    draft_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed), lm_head=shared_head
+    )
+    weights = [
+        ("model.embed_tokens.weight", torch.zeros(4, 2)),
+        ("lm_head.weight", torch.zeros(4, 2)),
+    ]
+    with pytest.raises(RuntimeError, match="share storage"):
+        draft_utils._assert_drafter_owns_modules(model_runner, draft_model, weights)
+
+
+@pytest.mark.vllm
+def test_dspark_alias_guard_accepts_drafter_owned_modules():
+    from nemo_rl.models.generation.vllm import draft_utils
+
+    model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            model=SimpleNamespace(
+                embed_tokens=SimpleNamespace(weight=torch.zeros(4, 2))
+            ),
+            lm_head=SimpleNamespace(weight=torch.zeros(4, 2)),
+        )
+    )
+    draft_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=SimpleNamespace(weight=torch.zeros(4, 2))),
+        lm_head=SimpleNamespace(weight=torch.zeros(4, 2)),
+    )
+    weights = [
+        ("model.embed_tokens.weight", torch.zeros(4, 2)),
+        ("lm_head.weight", torch.zeros(4, 2)),
+    ]
+    draft_utils._assert_drafter_owns_modules(model_runner, draft_model, weights)
+
+
+@pytest.mark.vllm
+def test_dspark_alias_guard_ignores_shared_modules_not_in_refit():
+    from nemo_rl.models.generation.vllm import draft_utils
+
+    shared_embed = SimpleNamespace(weight=torch.zeros(4, 2))
+    shared_head = SimpleNamespace(weight=torch.zeros(4, 2))
+    model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=shared_embed), lm_head=shared_head
+        )
+    )
+    draft_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed), lm_head=shared_head
+    )
+    # A static-drafter-style refit without embed/lm_head keys may keep sharing.
+    weights = [("model.fc.weight", torch.zeros(4, 2))]
+    draft_utils._assert_drafter_owns_modules(model_runner, draft_model, weights)
+
+
+@pytest.mark.vllm
+def test_dflash_owner_accepts_dspark_shaped_manifest_without_markov(monkeypatch):
+    """The dflash drafter layout is the dspark layout minus the markov head."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    param_names = [
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.qkv_proj.weight",
+        "model.layers.0.self_attn.q_norm.weight",
+        "model.layers.0.mlp.gate_up_proj.weight",
+        "model.fc.weight",
+        "model.hidden_norm.weight",
+        "model.norm.weight",
+        "model.mask_embedding",
+        "lm_head.weight",
+    ]
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend, drafter_param_names=param_names, method="dflash"
+    )
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = _complete_dspark_draft_info()
+    del info["draft.markov_head.markov_w1.weight"]
+    del info["draft.markov_head.markov_w2.weight"]
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+def test_dflash_owner_rejects_markov_keys(monkeypatch):
+    """dflash drafts must not stream markov-head weights."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        drafter_param_names=[
+            "model.embed_tokens.weight",
+            "model.fc.weight",
+            "lm_head.weight",
+        ],
+        method="dflash",
+    )
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = {
+        "draft.embed_tokens.weight": ((4, 4), torch.bfloat16),
+        "draft.fc.weight": ((4, 4), torch.bfloat16),
+        "draft.lm_head.weight": ((4, 4), torch.bfloat16),
+        "draft.markov_head.markov_w1.weight": ((4, 4), torch.bfloat16),
+    }
+    with pytest.raises(RuntimeError, match="unexpected draft keys"):
+        ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+def test_eagle3_owner_accepts_complete_draft_manifest(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
+        method="eagle3",
+    )
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = _complete_eagle3_draft_info()
+    # t2d is training-only and tolerated as an extra.
+    info["draft.t2d"] = ((4,), torch.bool)
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "dropped_key",
+    ["draft.fc.weight", "draft.d2t", "draft.lm_head.weight"],
+)
+def test_eagle3_owner_rejects_missing_draft_keys(monkeypatch, dropped_key):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
+        method="eagle3",
+    )
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = _complete_eagle3_draft_info()
+    del info[dropped_key]
+    with pytest.raises(RuntimeError, match="missing draft keys"):
+        ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+def test_eagle3_owner_rejects_dspark_only_extras(monkeypatch):
+    """mask_embedding/confidence_head are tolerated for dspark, not eagle3."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
+        method="eagle3",
+    )
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = _complete_eagle3_draft_info()
+    info["draft.mask_embedding"] = ((4,), torch.bfloat16)
+    with pytest.raises(RuntimeError, match="unexpected draft keys"):
+        ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+def test_eagle3_megatron_partial_manifest_accepted(monkeypatch):
+    """The megatron eagle3 exporter streams a PARTIAL drafter (midlayer.*
+    alias, no embed_tokens) and relies on drafter module sharing; exact-key
+    validation must only apply to the Automodel full stream."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
+        method="eagle3",
+    )
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = {
+        "model.weight": ((4, 4), torch.bfloat16),
+        "draft.fc.weight": ((4, 4), torch.bfloat16),
+        "draft.midlayer.self_attn.q_proj.weight": ((4, 4), torch.bfloat16),
+        "draft.norm.weight": ((4,), torch.bfloat16),
+        "draft.lm_head.weight": ((4, 4), torch.bfloat16),
+        "draft.d2t": ((4,), torch.int64),
+    }
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+def test_eagle3_megatron_partial_manifest_without_drafter_hard_fails_at_prepare(
+    monkeypatch,
+):
+    """An owning rank with a non-empty (even partial) draft manifest but no
+    drafter model must hard-fail in prepare_refit_info, when it resolves the
+    draft runtime, not defer to _load_draft_weights's warn-and-skip path."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        has_speculator=False,
+        method="eagle3",
+    )
+    _patch_pp_group(monkeypatch, vllm_backend)
+    info = {
+        "model.weight": ((4, 4), torch.bfloat16),
+        "draft.fc.weight": ((4, 4), torch.bfloat16),
+        "draft.midlayer.self_attn.q_proj.weight": ((4, 4), torch.bfloat16),
+    }
+    with pytest.raises(RuntimeError, match="owner draft model is unavailable"):
+        ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+def test_eagle3_megatron_partial_stream_skips_alias_guard():
+    """Loading the megatron partial stream through target-shared modules is
+    the pre-existing behavior and must not trip the full-stream alias guard."""
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    shared_head = SimpleNamespace(weight=torch.zeros(4, 2))
+    drafter = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=None),
+        lm_head=shared_head,
+        named_parameters=lambda: [],
+        named_modules=lambda: [],
+        load_weights=MagicMock(),
+    )
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method="eagle3")
+        ),
+        speculator=SimpleNamespace(model=drafter),
+        model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=None), lm_head=shared_head
+        ),
+    )
+    weights = [("lm_head.weight", torch.zeros(4, 2))]
+    ext._load_draft_weights(weights)
+    drafter.load_weights.assert_called_once()
+
+
+@pytest.mark.vllm
+def test_eagle3_full_stream_alias_guard_still_fires():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    shared_embed = SimpleNamespace(weight=torch.zeros(4, 2))
+    drafter = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed),
+        lm_head=SimpleNamespace(weight=torch.zeros(4, 2)),
+        named_parameters=lambda: [],
+        load_weights=MagicMock(),
+    )
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method="eagle3")
+        ),
+        speculator=SimpleNamespace(model=drafter),
+        model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=shared_embed),
+            lm_head=SimpleNamespace(weight=torch.zeros(4, 2)),
+        ),
+    )
+    weights = [("embed_tokens.weight", torch.zeros(4, 2))]
+    with pytest.raises(RuntimeError, match="share storage"):
+        ext._load_draft_weights(weights)
+
+
+@pytest.mark.vllm
+def test_disable_draft_module_sharing_forces_ownership():
+    from vllm.v1.worker.gpu.spec_decode.dflash import utils as dflash_utils
+    from vllm.v1.worker.gpu.spec_decode.dspark import utils as dspark_utils
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
+
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        disable_draft_module_sharing,
+    )
+
+    # The pinned vLLM's dspark utils module doesn't define _should_share at
+    # all (unlike eagle/dflash, which import it from eagle's utils module);
+    # disable_draft_module_sharing() assigns it unconditionally regardless,
+    # so the "original" to restore may be absence, not a prior value.
+    _missing = object()
+    originals = [
+        (module, getattr(module, "_should_share", _missing))
+        for module in (eagle_utils, dspark_utils, dflash_utils)
+    ]
+    try:
+        disable_draft_module_sharing()
+        for module, _ in originals:
+            assert (
+                module._should_share(None, "has_own_embed_tokens", None, None) is False
+            )
+    finally:
+        for module, original in originals:
+            if original is _missing:
+                del module._should_share
+            else:
+                module._should_share = original
 
 
 class _FakeHfToVllmMapper:

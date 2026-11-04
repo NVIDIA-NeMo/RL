@@ -34,7 +34,7 @@ uv run python examples/run_grpo.py \
   logger.num_val_samples_to_print=10
 ```
 
-The default configuration uses the DTensor training backend. We also provide a config `examples/configs/grpo_math_1B_megatron.yaml` which is set up to use the Megatron backend out of the box.
+The default configuration uses the Automodel training backend. We also provide a config `examples/configs/grpo_math_1B_megatron.yaml` which is set up to use the Megatron backend out of the box.
 
 To train using this config on a single GPU:
 
@@ -80,7 +80,7 @@ This section outlines how to run GRPO for Qwen2.5-32B with a 16k sequence length
 NUM_ACTOR_NODES=32
 
 # Download Qwen before the job starts to avoid spending time downloading during the training loop
-HF_HOME=/path/to/hf_home huggingface-cli download Qwen/Qwen2.5-32B
+HF_HOME=/path/to/hf_home hf download Qwen/Qwen2.5-32B
 
 # Ensure HF_HOME is included in your MOUNTS
 HF_HOME=/path/to/hf_home \
