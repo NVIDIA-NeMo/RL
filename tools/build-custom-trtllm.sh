@@ -203,6 +203,8 @@ TRTLLM_BUILD_CMD=(
 # release image, which does not ship it).
 if command -v ccache >/dev/null; then
     TRTLLM_BUILD_CMD+=(--use_ccache)
+else
+    echo "[TRTLLM_CCACHE] ccache not found; building without compiler cache"
 fi
 set +e
 NINJA_STATUS='NINJA_PROGRESS:%f:%t:%p:' \
