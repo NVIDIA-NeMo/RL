@@ -1752,13 +1752,18 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
             )
+        # GRPO takes one optimizer step per RL step and recomputes prev_logprobs
+        # with the weights it trains, so its PPO ratio is 1 regardless of how
+        # many versions a batch mixes; TIS corrects generation staleness.
         if (
             master_config.loss_fn.force_on_policy_ratio
             and not master_config.loss_fn.use_cispo
+            and is_ppo_run(master_config)
         ):
             raise ValueError(
                 "the ready_first sampler requires "
-                "loss_fn.force_on_policy_ratio=false unless loss_fn.use_cispo=true"
+                "loss_fn.force_on_policy_ratio=false for PPO unless "
+                "loss_fn.use_cispo=true"
             )
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no
