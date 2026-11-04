@@ -1,0 +1,20 @@
+{
+  "title": "Metric check history - Mistral NeMo DPO - 2026-11-03",
+  "metric": "train/loss",
+  "gate": {
+    "kind": "point",
+    "step": 100,
+    "op": "lt",
+    "threshold": 0.6
+  },
+  "proposed_gate": {
+    "kind": "point",
+    "step": 100,
+    "op": "lt",
+    "threshold": 0.65
+  },
+  "runs": 30,
+  "excluded_count": 0,
+  "current_alias": "run-30",
+  "note": "Exact selected metric values; aliases replace private run identifiers. Run comparisons are not controlled experiments."
+}

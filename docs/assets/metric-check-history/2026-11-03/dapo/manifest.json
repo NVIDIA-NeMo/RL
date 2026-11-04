@@ -1,0 +1,16 @@
+{
+  "title": "Metric check history - DAPO Mistral Medium 3.5 128B - 2026-11-03",
+  "metric": "train/token_mult_prob_error",
+  "gate": {
+    "kind": "median",
+    "start_step": 1,
+    "end_step": 20,
+    "op": "lt",
+    "threshold": 1.1
+  },
+  "proposed_gate": null,
+  "runs": 7,
+  "excluded_count": 0,
+  "current_alias": "run-07",
+  "note": "Exact selected metric values; aliases replace private run identifiers. Run comparisons are not controlled experiments."
+}

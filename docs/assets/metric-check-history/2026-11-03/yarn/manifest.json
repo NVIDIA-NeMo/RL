@@ -1,0 +1,20 @@
+{
+  "title": "Metric check history - Qwen2.5 1.5B YaRN 256K - 2026-11-03",
+  "metric": "train/reward",
+  "gate": {
+    "kind": "point",
+    "step": 30,
+    "op": "gt",
+    "threshold": 0.5
+  },
+  "proposed_gate": {
+    "kind": "point",
+    "step": 30,
+    "op": "gt",
+    "threshold": 0.3
+  },
+  "runs": 31,
+  "excluded_count": 0,
+  "current_alias": "run-31",
+  "note": "Exact selected metric values; aliases replace private run identifiers. Run comparisons are not controlled experiments."
+}

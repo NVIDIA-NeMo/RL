@@ -1,0 +1,20 @@
+{
+  "title": "Metric check history - Qwen3 32B to 4B distillation - 2026-11-03",
+  "metric": "validation/accuracy",
+  "gate": {
+    "kind": "point",
+    "step": 20,
+    "op": "gt",
+    "threshold": 0.1
+  },
+  "proposed_gate": {
+    "kind": "point",
+    "step": 20,
+    "op": "gt",
+    "threshold": 0.05
+  },
+  "runs": 13,
+  "excluded_count": 0,
+  "current_alias": "run-13",
+  "note": "Exact selected metric values; aliases replace private run identifiers. Run comparisons are not controlled experiments."
+}

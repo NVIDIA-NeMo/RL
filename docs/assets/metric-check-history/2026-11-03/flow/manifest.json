@@ -1,0 +1,22 @@
+{
+  "title": "Metric check history - Flow-GRPO Qwen-Image OCR - 2026-11-03",
+  "metric": "val/reward_mean",
+  "gate": {
+    "kind": "difference",
+    "step": 59,
+    "baseline_step": 0,
+    "op": "gt",
+    "threshold": 0.03
+  },
+  "proposed_gate": {
+    "kind": "difference",
+    "step": 59,
+    "baseline_step": 0,
+    "op": "gt",
+    "threshold": 0
+  },
+  "runs": 14,
+  "excluded_count": 0,
+  "current_alias": "run-14",
+  "note": "Exact selected metric values; aliases replace private run identifiers. Run comparisons are not controlled experiments."
+}
