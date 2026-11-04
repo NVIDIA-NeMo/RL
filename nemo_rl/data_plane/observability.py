@@ -1353,18 +1353,17 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # codec timer is drained destructively, so an inspection snapshot that
         # took it would delete that time from the series the step reader
         # reports. Both callers that consume a step pass True.
-        if reset_step_window:
-            codec = drain_codec_ms()
+        codec = drain_codec_ms() if reset_step_window else {}
+        with self._stats_lock:
             self._stats.pack_ms += codec.get("pack", 0.0)
             self._stats.unpack_ms += codec.get("unpack", 0.0)
-        with self._stats_lock:
             out = asdict(self._stats)
             if reset_step_window:
                 self._stats.step_wall_ms = 0.0
                 for bucket in self._stats.by_op.values():
                     bucket.step_max_ms = 0.0
         out["n_keys_outstanding"] = sum(
-            len(k) for k in self._keys_by_partition.values()
+            len(k) for k in list(self._keys_by_partition.values())
         )
         _derive_op_metrics(out["by_op"], out["total_wall_ms"])
         # Communication volume, derived from by_op so there is one source of
