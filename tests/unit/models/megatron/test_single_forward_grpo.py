@@ -128,6 +128,7 @@ def test_survivor_normalization_reduces_dp_counts_on_every_pipeline_stage(
             global_valid_seqs=torch.tensor(4.0 * sample_weight),
             global_valid_toks=torch.tensor(9.0 * sample_weight),
             eval_mode=eval_mode,
+            mtp_detached=False,
         )
     )
     assert sequences.item() == 3 * sample_weight
@@ -146,6 +147,46 @@ def test_survivor_normalization_reduces_dp_counts_on_every_pipeline_stage(
     else:
         synchronize.assert_called_once()
         model.scale_gradients.assert_called_once_with(1.5)
+
+
+@pytest.mark.mcore
+def test_survivor_normalization_restores_detached_mtp_denominator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detached MTP heads undo the survivor rescale and keep 1/G."""
+    # Optional Megatron imports are available only in the mcore test environment.
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    monkeypatch.setattr(
+        worker_module.parallel_state, "get_data_parallel_group", lambda: None
+    )
+    monkeypatch.setattr(
+        worker_module.parallel_state, "is_pipeline_last_stage", lambda **_: True
+    )
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "get_pipeline_model_parallel_world_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", Mock())
+    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    worker = SimpleNamespace(model=Mock(), _scale_mtp_param_grads=Mock())
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(seq_logprob_error_in_loss=True, force_on_policy_ratio=True),
+        seq_logprob_error_threshold=2.0,
+    )
+    worker_module.MegatronPolicyWorkerImpl._normalize_in_loss_seq_filter(
+        worker,
+        loss_fn,
+        [{"seq_logprob_error_valid_seqs": 2.0, "seq_logprob_error_valid_tokens": 4.0}],
+        global_valid_seqs=torch.tensor(3.0),
+        global_valid_toks=torch.tensor(8.0),
+        eval_mode=False,
+        mtp_detached=True,
+    )
+
+    worker.model.scale_gradients.assert_called_once_with(2.0)
+    worker._scale_mtp_param_grads.assert_called_once_with(0.5)
 
 
 @pytest.mark.mcore
@@ -184,6 +225,7 @@ def test_empty_survivor_batch_never_scales_gradients(
         global_valid_seqs=torch.tensor(2.0),
         global_valid_toks=torch.tensor(8.0),
         eval_mode=eval_mode,
+        mtp_detached=False,
     )
     normalize = worker_module.MegatronPolicyWorkerImpl._normalize_in_loss_seq_filter
     if eval_mode:
@@ -257,6 +299,7 @@ def test_fractional_survivor_gradients_match_prefiltering(
             global_valid_seqs=original_weight,
             global_valid_toks=original_weight,
             eval_mode=False,
+            mtp_detached=False,
         )
     )
     assert sequences.item() == tokens.item() == sample_weight
