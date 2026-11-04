@@ -2440,6 +2440,8 @@ def _train_pump_controller(*, sampler) -> object:
         set_weight_version=MagicMock(),
         suspend_request_deadlines=MagicMock(),
         resume_request_deadlines=MagicMock(),
+        drain_step_reward_metrics=MagicMock(return_value={}),
+        filter_zero_variance_groups=False,
     )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
@@ -2450,6 +2452,13 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    # Read by _target_groups_for_step to decide whether the short-step error names the
+    # spare pool as a third cause. Set here rather than in each caller: this builder is
+    # shared with the forest and logical-advantage suites, and a field added to only
+    # some of them is an AttributeError rather than a wrong answer.
+    ctrl._dynamic_sampling_enabled = False
+    ctrl._rollout_runtime.finalizer_metrics_by_group = {}
+    ctrl._rollout_runtime.finalizer_rewards_by_group = {}
     ctrl._log_full_result_tables = False
     ctrl._step_log_dict = {
         "reward_partials": [],

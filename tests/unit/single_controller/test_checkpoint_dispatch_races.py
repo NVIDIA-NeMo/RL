@@ -360,8 +360,9 @@ class _BlockingRolloutManager:
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
         lineage_group_id: str | None = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
-        del inflight_registry
+        del inflight_registry, replacement_index
         if lineage_group_id is None:
             lineage_group_id = self.reserve_prompt_group(
                 None,
@@ -557,6 +558,9 @@ def _reserve_controller() -> Any:
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._rollout_runtime.sampler_stamps_target_steps = True
     controller._rollout_recovery_enabled = True
+    # Dynamic sampling off: these fixtures exercise the fault-tolerance path.
+    controller._dynamic_sampling_enabled = False
+    controller._dynamic_sampling_max_replacements = 0
     controller._async_cfg = SimpleNamespace(
         rollout_failure=SimpleNamespace(
             on_dropped_prompt="replace",
@@ -1904,7 +1908,7 @@ def test_checkpoint_waits_for_replacement_pop_and_reownership() -> None:
 
         async def replace() -> None:
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
-                replacement = controller._take_replacement(7, 0)
+                replacement = controller._take_replacement(0)
                 assert replacement is not None
                 manager.discard_prompt_group(cut, old_group_id)
                 manager.reserve_prompt_group(cut, replacement, target_step=7)

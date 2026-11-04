@@ -30,6 +30,8 @@ import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
+from nemo_rl.algorithms.utils import rewards_carry_no_signal
+from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
@@ -40,7 +42,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
-from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
@@ -205,6 +206,12 @@ class RolloutOutcome(str, enum.Enum):
     # releasing its backpressure permit and atomically replacing the ledger owner or
     # crediting the step's shortfall.
     SKIPPED = "skipped"
+    # Dynamic sampling dropped the group before commit: every generation scored the
+    # same, so it carries no advantage signal. The rollout itself was healthy, which is
+    # why this is not SKIPPED -- the caller must replace it out of the dynamic-sampling
+    # budget rather than the rollout fault-tolerance budget, and credits the step short
+    # only when the spare pool is dry.
+    FILTERED = "filtered"
 
 
 @dataclass(frozen=True)
@@ -272,6 +279,75 @@ class RolloutRetryPolicy:
         return min(self.backoff_base_s * 2 ** (attempt - 1), self.max_backoff_s)
 
 
+def participating_rewards(
+    record: PromptGroupRecord,
+    *,
+    masked_reward_policy: Optional[str],
+    overlong_filtering: bool,
+) -> list[float]:
+    """The rewards that vote in this group's baseline and std.
+
+    Mirrors v1's ``_dynamic_sampling_valid_mask``, which is the mask the group
+    statistics are actually computed under. Filtering on the full reward list instead
+    would keep groups whose voters are uniform, and drop groups whose only spread
+    comes from rows that never vote.
+
+    A zero dataset weight is excluded under either policy: ``processors.py`` cuts a
+    prompt that did not fit the sequence limit down to a few tokens and gives it
+    ``loss_multiplier == 0`` before any rollout, so its rewards are placeholders
+    rather than measurements. That is group-level here, so such a group has no voters
+    at all and is trivial by construction.
+
+    Under ``exclude`` the environment's ``mask_sample`` rows drop out, and with
+    ``overlong_filtering`` so do truncated ones -- the rows the loss drops later in
+    the step. Under ``include`` both still vote: their rewards are measurements of
+    the policy even though they carry no loss.
+    """
+    if record.loss_multiplier == 0:
+        return []
+    # None is PPO: no group-relative baseline exists to mask rows out of.
+    if masked_reward_policy != "exclude":
+        return [completion.reward for completion in record.completions]
+    return [
+        completion.reward
+        for completion in record.completions
+        if not _mask_sample_flagged(completion.env_extras)
+        and not (overlong_filtering and completion.truncated)
+    ]
+
+
+def _mask_sample_flagged(extra: Optional[dict[str, Any]]) -> bool:
+    """Whether the environment asked for this row to be masked from the loss.
+
+    Both reads are consulted for the reason ``rollouts._mask_sample_flags`` gives:
+    Gym serializes ``mask_sample: false`` on every response, so an environment that
+    flags only the nested ``instance_config`` one carries a false first-class field
+    beside the true nested one.
+    """
+    extra = extra or {}
+    if extra.get(MASK_SAMPLE):
+        return True
+    return bool((extra.get("instance_config") or {}).get(MASK_SAMPLE, False))
+
+
+@dataclass
+class StepRewardStats:
+    """Reward totals for the groups generated for one training step.
+
+    Counts every group that finished generating, whether dynamic sampling kept or
+    dropped it. The kept groups all have reward spread, so their mean alone says
+    little about how well the policy is doing.
+    """
+
+    groups: int = 0
+    zero_variance_groups: int = 0
+    reward_sum: float = 0.0
+    samples: int = 0
+    # First attempts only: the prompts originally scheduled, not their replacements.
+    first_attempt_reward_sum: float = 0.0
+    first_attempt_samples: int = 0
+
+
 @dataclass
 class RolloutStats:
     """Counters describing what the retry policy has been doing.
@@ -283,6 +359,10 @@ class RolloutStats:
 
     committed: int = 0
     skipped: int = 0
+    # Groups dropped by dynamic sampling because all generations got the same reward.
+    # Kept apart from the failure counts: the rollout was healthy, so counting it as a
+    # failure would make the fleet look sick.
+    zero_variance_groups: int = 0
     # Infra re-dispatches: the fleet is degrading. Kept apart from data retries because
     # conflating them defeats the whole point of the two-budget split -- an operator
     # watching redispatch_total climb needs to know whether the cluster is sick or the
@@ -345,6 +425,7 @@ class RolloutStats:
         metrics: dict[str, float] = {
             "rollout/committed_total": float(self.committed),
             "rollout/skipped_total": float(self.skipped),
+            "rollout/zero_variance_groups_total": float(self.zero_variance_groups),
             "rollout/redispatch_total": float(
                 sum(self.redispatches_by_reason.values())
             ),
@@ -2195,10 +2276,20 @@ class RolloutManager:
         log_full_result_tables: bool = False,
         forest_training: bool = False,
         execution_row_multiple: int = 1,
+        filter_zero_variance_groups: bool = False,
+        # Which rows vote in a group's reward statistics. Read only when the filter
+        # above is on or a step's rewards are tallied; setup always passes the run's
+        # own grpo values, so these are not a second home for those defaults.
+        masked_reward_policy: Optional[str] = None,
+        overlong_filtering: bool = False,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
+        # DAPO: drop a group whose voting generations all scored the same.
+        self._filter_zero_variance_groups = filter_zero_variance_groups
+        self._masked_reward_policy = masked_reward_policy
+        self._overlong_filtering = overlong_filtering
         # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
         # budget out of it at construction time, and shares the counters so its
         # row-level re-dispatches land in the same place as everything else.
@@ -2208,6 +2299,9 @@ class RolloutManager:
             else RolloutRetryPolicy.single_attempt()
         )
         self._stats = RolloutStats()
+        # Keyed by the step a group was generated for; the controller pops a step's
+        # entry when that step closes.
+        self._step_rewards: dict[int, StepRewardStats] = {}
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
         self._request_deadlines = RequestDeadlineRegistry()
@@ -2469,6 +2563,80 @@ class RolloutManager:
             dispatch_recorder=dispatch_recorder,
         )
 
+    def _participating_rewards(self, record: PromptGroupRecord) -> list[float]:
+        """This group's voting rewards under the run's masking policy."""
+        return participating_rewards(
+            record,
+            masked_reward_policy=self._masked_reward_policy,
+            overlong_filtering=self._overlong_filtering,
+        )
+
+    def _is_zero_variance_group(self, record: PromptGroupRecord) -> bool:
+        """Whether this group's voters leave every row zero advantage."""
+        return rewards_carry_no_signal(self._participating_rewards(record))
+
+    def record_group_rewards(
+        self,
+        target_step: Optional[int],
+        rewards: Sequence[float],
+        *,
+        replacement_index: int,
+        zero_variance: bool,
+    ) -> None:
+        """Add one finished group's rewards to the tally of the step it was made for.
+
+        Args:
+            target_step: Step the group was stamped for. ``None`` (sampler does not
+                stamp steps) means there is nothing to report against, so skip.
+            rewards: Every row's reward, voting or not. ``unfiltered_reward`` is the
+                pre-filter progress signal, so it averages the whole group.
+            replacement_index: 0 for the originally scheduled prompt, N for its N-th
+                replacement.
+            zero_variance: Whether the group's *voting* rewards carry no signal.
+                Passed in rather than recomputed here, so the count cannot disagree
+                with the decision the filter actually made on the same group.
+        """
+        if target_step is None or not rewards:
+            return
+        tally = self._step_rewards.setdefault(target_step, StepRewardStats())
+        total = float(sum(rewards))
+        tally.groups += 1
+        tally.zero_variance_groups += int(zero_variance)
+        tally.reward_sum += total
+        tally.samples += len(rewards)
+        if replacement_index == 0:
+            tally.first_attempt_reward_sum += total
+            tally.first_attempt_samples += len(rewards)
+
+    def drain_step_reward_metrics(self, step: int) -> dict[str, float]:
+        """Return the reward metrics for ``step`` and forget that step and older ones.
+
+        Groups count toward the step they were generated for, even if a later step
+        borrowed them (``promote_ready_group``). With lookahead above zero that can
+        differ from the step that trained on them.
+
+        Returns:
+            ``unfiltered_reward`` (mean over every generated group, kept or dropped),
+            ``first_attempt_reward`` (same, but first attempts only),
+            ``generated_prompt_groups``, ``zero_variance_prompt_groups`` and
+            ``zero_variance_fraction``. Empty if nothing was generated for the step.
+        """
+        tally = self._step_rewards.get(step)
+        self._step_rewards = {s: t for s, t in self._step_rewards.items() if s > step}
+        if tally is None or not tally.groups:
+            return {}
+        metrics = {
+            "unfiltered_reward": tally.reward_sum / tally.samples,
+            "generated_prompt_groups": float(tally.groups),
+            "zero_variance_prompt_groups": float(tally.zero_variance_groups),
+            "zero_variance_fraction": tally.zero_variance_groups / tally.groups,
+        }
+        if tally.first_attempt_samples:
+            metrics["first_attempt_reward"] = (
+                tally.first_attempt_reward_sum / tally.first_attempt_samples
+            )
+        return metrics
+
     async def generate_and_push(
         self,
         input_sample: DatumSpec,
@@ -2476,6 +2644,7 @@ class RolloutManager:
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
         lineage_group_id: Optional[str] = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
         """Roll out one prompt and commit it, re-dispatching on infrastructure failure.
 
@@ -2499,6 +2668,9 @@ class RolloutManager:
             lineage_group_id: Stable group minted by the rollout ledger before
                 dataloader dispatch. TQ records this same ID rather than minting one.
                 ``None`` preserves the ordinary non-checkpointed fresh-ID retry path.
+            replacement_index: 0 for the originally scheduled prompt, N for its N-th
+                replacement after a group was dropped. Only used to separate first
+                attempts in the per-step reward metrics.
 
         Returns:
             ``COMMITTED`` when the group reached the buffer, or ``SKIPPED`` when the
@@ -2508,6 +2680,13 @@ class RolloutManager:
             so the caller owns both its backpressure permit and the checkpoint-atomic
             transition from its retained ledger record to either a replacement prompt
             or the shortfall for the training step it was stamped for.
+
+            ``FILTERED`` when dynamic sampling dropped the group before commit because
+            every generation scored the same reward. It carries the same two caller
+            obligations as ``SKIPPED`` -- the backpressure permit and the ledger
+            transition -- but the rollout itself succeeded, so its replacement is paid
+            for out of ``grpo.dynamic_sampling_max_replacements_per_slot`` rather than
+            the rollout fault-tolerance budget.
 
         Raises:
             RolloutRedispatchExhausted: The infra budget ran out and the fleet has not
@@ -2592,12 +2771,46 @@ class RolloutManager:
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(tq_group_id, None)
+                if self._filter_zero_variance_groups and self._is_zero_variance_group(
+                    record
+                ):
+                    # Filtering happens before commit, so removing the reservation writes no rows.
+                    await self._tq_buffer.remove_group(tq_group_id)
+                    # A filtered group is a healthy rollout and breaks a consecutive infrastructure-failure run.
+                    self._consecutive_infra_drops = 0
+                    self._stats.zero_variance_groups += 1
+                    rewards = [c.reward for c in record.completions]
+                    voting = self._participating_rewards(record)
+                    self.record_group_rewards(
+                        target_step,
+                        rewards,
+                        replacement_index=replacement_index,
+                        zero_variance=True,
+                    )
+                    # Report the voting rows; under exclude they differ from the group size.
+                    scored = voting[0] if voting else float("nan")
+                    print(
+                        f"  dynamic sampling: dropped group {tq_group_id} "
+                        f"(target_step={target_step}), {len(voting)} of "
+                        f"{len(rewards)} generation(s) vote in the baseline and all "
+                        f"scored {scored}; "
+                        f"{self._stats.zero_variance_groups} dropped so far",
+                        flush=True,
+                    )
+                    return RolloutOutcome.FILTERED
                 end_version = self._weight_version
                 await self._tq_buffer.commit(
                     tq_group_id,
                     record,
                     start_weight_version=start_version,
                     end_weight_version=end_version,
+                )
+                # After the commit, so a re-run on commit failure cannot count twice.
+                self.record_group_rewards(
+                    target_step,
+                    [c.reward for c in record.completions],
+                    replacement_index=replacement_index,
+                    zero_variance=self._is_zero_variance_group(record),
                 )
             except Exception as error:
                 # A failed rollout must not leave an unready slot that can block an

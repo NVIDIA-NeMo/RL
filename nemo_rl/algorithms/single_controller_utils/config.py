@@ -236,8 +236,10 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # race the iteration order that checkpoint/resume accounting depends on. Diverting
     # happens before admit(), so a diverted batch never burns a target step.
     #
-    # Read only when on_dropped_prompt="replace". Borrowing draws on it too: a group is
-    # only ever taken from a later step when a spare is in hand to repay that step.
+    # Read when on_dropped_prompt="replace", and whenever dynamic sampling is on --
+    # filtering draws on the same pool under "shrink" too. Borrowing draws on it as
+    # well: a group is only ever taken from a later step when a spare is in hand to
+    # repay that step.
     replacement_reserve_prompts: NonNegativeInt = 1
     # ── path-specific ──
     native: NativeRolloutFTConfig = Field(default_factory=NativeRolloutFTConfig)
@@ -1320,13 +1322,20 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "with max_num_steps."
         )
 
+    # The SC dataloader batches num_prompts_per_step directly, so nothing over-generates.
+    if algo_cfg.batch_multiplier != 1.0:
+        raise ValueError(
+            f"batch_multiplier={algo_cfg.batch_multiplier} has no effect on the "
+            "SingleController path: the dataloader batches num_prompts_per_step "
+            "directly, so nothing over-generates. Set it to 1."
+        )
+
     # An enabled one here describes shaping this run does not do. An entry leaves
     # this list once the SC path implements it; overlong_filtering is applied in
     # the advantage stage from the raw completion flags in the TransferQueue.
     unsupported = [
         name
         for name, enabled in (
-            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
             ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
             # getattr: PPO's config has no length_penalty field.
@@ -1402,6 +1411,96 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "but max_buffered_rollouts is still validated against the wider one. "
             "Remove it, or add a `ppo` block with policy_training_start_step > 0."
         )
+
+    # Dynamic sampling uses a replacement budget separate from rollout failures.
+    if algo_cfg.use_dynamic_sampling:
+        # Zero within-group reward variance does not imply zero PPO advantage.
+        if is_ppo_run(master_config):
+            raise ValueError(
+                "ppo.use_dynamic_sampling must be false: zero within-group reward "
+                "variance does not imply zero PPO advantage. This filtering rule "
+                "is GRPO-only."
+            )
+        # Reached only for GRPO (PPO is rejected above); name the key accordingly.
+        algo_prefix = "grpo"
+        grpo_cfg = cast(GRPOConfig, algo_cfg)
+        rollout_failure = async_config.rollout_failure
+        # Capture cannot borrow future groups, so routine filtering would stall training.
+        if master_config.token_capture.enabled:
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling is not supported together with "
+                "token_capture.enabled: on the capture path a replacement cannot borrow "
+                "a finished group from a later step, so every dropped group stalls its "
+                "step for a full fresh rollout. Disable one of the two."
+            )
+        # A zero low-water mark disables spare-pool refills, including under shrink mode.
+        if rollout_failure.replacement_reserve_prompts < 1:
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling requires "
+                "async_rl.rollout_failure.replacement_reserve_prompts >= 1, got "
+                f"{rollout_failure.replacement_reserve_prompts}: at 0 the spare pool "
+                "is never refilled, so every filtered group shrinks its step instead "
+                "of being resampled."
+            )
+        # Reserve headroom is checked only once per dataloader batch.
+        if rollout_failure.replacement_reserve_prompts < algo_cfg.num_prompts_per_step:
+            warnings.warn(
+                f"async_rl.rollout_failure.replacement_reserve_prompts="
+                f"{rollout_failure.replacement_reserve_prompts} is below "
+                f"{algo_prefix}.num_prompts_per_step="
+                f"{algo_cfg.num_prompts_per_step}, so the spare pool can empty "
+                "between refills: it is topped up only once it falls below the mark, "
+                "and that check runs once per dataloader batch. Filtering is routine, "
+                "so a group filtered after the pool empties shrinks its step instead "
+                "of being resampled, and enough of them fail the step against "
+                "async_rl.rollout_failure.min_step_batch_fraction. Set it to at least "
+                f"{algo_prefix}.num_prompts_per_step, which covers any drop rate "
+                "below 50%.",
+                stacklevel=2,
+            )
+        if grpo_cfg.dynamic_sampling_max_replacements_per_slot < 1:
+            raise ValueError(
+                f"{algo_prefix}.dynamic_sampling_max_replacements_per_slot must be >= 1 "
+                f"when {algo_prefix}.use_dynamic_sampling is set (got "
+                f"{grpo_cfg.dynamic_sampling_max_replacements_per_slot}): with no "
+                "replacement budget the first zero-variance group fails the run."
+            )
+        if async_config.sampler.name not in ("in_order", "custom"):
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling requires a sampler that stamps a "
+                "target step (async_rl.sampler.name must be 'in_order', or a 'custom' "
+                f"sampler that stamps one), but got '{async_config.sampler.name}': "
+                "without a stamped step a filtered group cannot be credited short or "
+                "replaced, so every filtered group silently shrinks the batch."
+            )
+        # SC replaces individual slots instead of regenerating batches.
+        inert = [
+            f"{algo_prefix}.{name}={value!r}"
+            for name, value, default in (
+                (
+                    "dynamic_sampling_max_gen_batches",
+                    grpo_cfg.dynamic_sampling_max_gen_batches,
+                    10,
+                ),
+            )
+            if value != default
+        ]
+        if inert:
+            warnings.warn(
+                f"{', '.join(inert)} has no effect on the SingleController path: "
+                "dynamic sampling resamples per dropped slot, budgeted by "
+                f"{algo_prefix}.dynamic_sampling_max_replacements_per_slot, rather "
+                "than regenerating whole batches. See "
+                "docs/guides/single-controller.md#dynamic-sampling.",
+                stacklevel=2,
+            )
+        if algo_cfg.num_generations_per_prompt < 2:
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling requires "
+                "num_generations_per_prompt >= 2: a single generation has no "
+                "within-group spread, so every group would be filtered "
+                f"(got {algo_cfg.num_generations_per_prompt})."
+            )
 
     if not is_ppo_run(master_config):
         # A value block without `ppo` is inert -- nothing builds the critic --

@@ -16,6 +16,7 @@ import math
 import random
 import re
 import warnings
+from collections.abc import Sequence
 from functools import partial, wraps
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -234,6 +235,22 @@ def calculate_baseline_and_std_per_prompt(
     return baseline, std, is_trivial_distribution
 
 
+def rewards_carry_no_signal(rewards: Sequence[float]) -> bool:
+    """Whether a group's participating rewards leave every row zero advantage.
+
+    True for at most one participating reward, or when they are all exactly equal.
+    Exact equality rather than a std threshold because float roundoff can give a
+    uniform group a tiny nonzero std.
+
+    ``rewards`` must already be restricted to the rows that vote in the group
+    statistics. Passing every row instead keeps groups whose voters are uniform: at
+    ``masked_reward_policy="exclude"`` with ``overlong_filtering``, ``[0 (truncated),
+    1, 1, 1]`` has spread overall and none at all among the three rows the baseline
+    actually sees.
+    """
+    return len(rewards) <= 1 or max(rewards) == min(rewards)
+
+
 def calculate_trivial_reward_distributions(
     prompts: torch.Tensor,
     rewards: torch.Tensor,
@@ -250,9 +267,7 @@ def calculate_trivial_reward_distributions(
     for prompt in torch.unique(prompts, dim=0):
         prompt_mask = (prompts == prompt).all(1)
         valid_rewards = rewards[prompt_mask & valid_mask.bool()]
-        is_trivial = valid_rewards.numel() <= 1 or (
-            valid_rewards.amin() == valid_rewards.amax()
-        )
+        is_trivial = rewards_carry_no_signal(valid_rewards.tolist())
         is_trivial_prompt_distribution[prompt_mask] = is_trivial
 
     return is_trivial_prompt_distribution
