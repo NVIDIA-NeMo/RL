@@ -178,6 +178,46 @@ def reject_outdated_rollout_recovery_granularity(config: dict[str, Any]) -> None
     raise ValueError(message)
 
 
+def reject_outdated_checkpoint_experiments(config: dict[str, Any]) -> None:
+    """Reject retired output backpressure and automatic stack-sampling options."""
+    policy = config.get("policy")
+    if not isinstance(policy, dict):
+        return
+    generation = policy.get("generation")
+    if not isinstance(generation, dict):
+        return
+    vllm_config = generation.get("vllm_cfg")
+    if isinstance(vllm_config, dict):
+        compact = vllm_config.get("compact_output")
+        if isinstance(compact, dict) and "backpressure" in compact:
+            raise ValueError(
+                "policy.generation.vllm_cfg.compact_output.backpressure was removed. "
+                "Delete the backpressure block, including enabled=false; checkpoint "
+                "cuts no longer use automatic scheduler pause/resume."
+            )
+    control = generation.get("generation_cut_control")
+    if not isinstance(control, dict):
+        return
+    diagnostics = control.get("latency_diagnostics")
+    if not isinstance(diagnostics, dict):
+        return
+    removed = {
+        "stack_sample_worker_ips",
+        "stack_sampler_executable",
+        "stack_sample_rate_hz",
+        "stack_sample_duration_s",
+        "stack_output_dir",
+    }
+    present = removed.intersection(diagnostics)
+    if present:
+        raise ValueError(
+            "Automatic checkpoint stack sampling was removed. Delete "
+            "policy.generation.generation_cut_control.latency_diagnostics keys "
+            f"{', '.join(sorted(present))}; use an external profiler when needed. "
+            "Fence, TQ and GC timing diagnostics remain available."
+        )
+
+
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -194,3 +234,4 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_metric_name_format(config)
     reject_outdated_mcore_refit_offload_key(config)
     reject_outdated_rollout_recovery_granularity(config)
+    reject_outdated_checkpoint_experiments(config)

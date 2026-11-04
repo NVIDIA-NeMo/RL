@@ -7,11 +7,17 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
+import logging
 import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+
+from nemo_rl.utils.prefix_cut_diagnostics import current_prefix_cut_probe
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(eq=False)
@@ -23,6 +29,9 @@ class _Member:
     tickets: frozenset[str]
     waiters: int
     claimed: bool
+    enqueued_at: float
+    enqueued_unix_s: float
+    diagnostics: bool
 
 
 class GenerationCutGrouper:
@@ -95,9 +104,36 @@ class GenerationCutGrouper:
         if member is None:
             result = loop.create_future()
             result.add_done_callback(self._consume_result)
-            member = _Member(inventory, deadline, result, calls, tickets, 0, False)
+            member = _Member(
+                inventory,
+                deadline,
+                result,
+                calls,
+                tickets,
+                0,
+                False,
+                time.monotonic(),
+                time.time(),
+                current_prefix_cut_probe() is not None,
+            )
             self._jobs[key] = member
             self._pending.append(member)
+            if member.diagnostics:
+                LOGGER.info(
+                    "generation_cut_group %s",
+                    json.dumps(
+                        {
+                            "event": "enqueue",
+                            "unix_s": member.enqueued_unix_s,
+                            "checkpoint_id": inventory.checkpoint_id,
+                            "inventory_digest": inventory.inventory_digest,
+                            "calls": len(calls),
+                            "active_groups": len(self._tasks),
+                            "pending_inventories": len(self._pending),
+                        },
+                        sort_keys=True,
+                    ),
+                )
         elif member.inventory != inventory:
             raise ValueError("Duplicate inventory digest has different content")
         member.waiters += 1
@@ -172,6 +208,31 @@ class GenerationCutGrouper:
             self._counts["members"] += len(group)
             self._counts["max_members"] = max(self._counts["max_members"], len(group))
             self._counts["max_calls"] = max(self._counts["max_calls"], len(calls))
+            if any(member.diagnostics for member in group):
+                now = time.monotonic()
+                LOGGER.info(
+                    "generation_cut_group %s",
+                    json.dumps(
+                        {
+                            "event": "dispatch",
+                            "unix_s": time.time(),
+                            "checkpoint_id": group[0].inventory.checkpoint_id,
+                            "active_groups": len(self._tasks) + 1,
+                            "pending_inventories": len(self._pending),
+                            "group_calls": len(calls),
+                            "members": [
+                                {
+                                    "inventory_digest": member.inventory.inventory_digest,
+                                    "calls": len(member.calls),
+                                    "enqueued_unix_s": member.enqueued_unix_s,
+                                    "pending_wait_s": now - member.enqueued_at,
+                                }
+                                for member in group
+                            ],
+                        },
+                        sort_keys=True,
+                    ),
+                )
             task = asyncio.create_task(self._run_group(group))
             self._tasks.add(task)
             task.add_done_callback(functools.partial(self._group_finished))

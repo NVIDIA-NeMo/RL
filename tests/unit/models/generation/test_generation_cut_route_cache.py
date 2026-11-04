@@ -27,6 +27,8 @@ import pytest
 import torch
 from packaging.version import Version
 
+from nemo_rl.models.generation.generation_cut_pipeline import GenerationCutPipeline
+from nemo_rl.models.generation.vllm.config import GenerationCutControlConfig
 from nemo_rl.models.generation.vllm.packed_logprobs import PackedSelectedLogprobs
 
 pytest.importorskip("nemo_gym.token_id_capture.staging.capture")
@@ -58,6 +60,114 @@ from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
 )
 
 pytestmark = pytest.mark.nemo_gym
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_write", [False, True])
+async def test_streaming_pipeline_keeps_original_receipts_and_real_restore_integrity(
+    grouped_implementation, owner_loop, monkeypatch, fail_write
+):
+    m = grouped_implementation
+    worker, states, processor, whole = enable_engine_tokens(
+        m, owner_loop, monkeypatch, count=16, packed=True
+    )
+    worker._generation_cut_receipts = {}
+    worker._generation_cut_control_config = GenerationCutControlConfig(
+        max_workers=4,
+        pipeline=dict(
+            enabled=True,
+            max_batch_payload_bytes=1024 * 1024,
+            max_buffered_payload_bytes=4 * 1024 * 1024,
+        ),
+    )
+    worker._generation_cut_control = m.GenerationCutControl(
+        max_workers=4, max_active_inventories=128
+    )
+    pipeline = GenerationCutPipeline(
+        worker._capture_sink,
+        prepare=worker._checkpoint_generation_cut_pipeline_steps,
+        max_buffered_bytes=4 * 1024 * 1024,
+        max_batch_bytes=1024 * 1024,
+        max_rows=256,
+        max_tokens=4_194_304,
+        write_concurrency=4,
+        coalesce_wait_seconds=0.25,
+    )
+    worker._generation_cut_pipeline = pipeline
+    worker._capture_sink.fail = fail_write
+
+    def inputs(checkpoint):
+        return [
+            GenerationCutInventory.build(
+                checkpoint_id=checkpoint,
+                server_name=f"participant-{i}",
+                active_prefixes=list(whole.active_prefixes[i * 2 : i * 2 + 2]),
+            )
+            for i in range(8)
+        ]
+
+    try:
+        first_inputs = inputs("pipeline-first")
+        first = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    worker._checkpoint_generation_cut_control(item, deadline=None)
+                    for item in first_inputs
+                )
+            ),
+            timeout=10,
+        )
+        for item, answer in zip(first_inputs, first, strict=True):
+            answer.validate_for(item)
+            assert all(
+                ack.disposition
+                == ("durable_failure" if fail_write else "durable_prefix")
+                for ack in answer.prefixes
+            )
+        assert_group_released(states)
+        if fail_write:
+            assert not worker._capture_sink.records
+            assert pipeline.stats()["failed_merged_writes"] > 0
+            return
+        assert pipeline.stats()["max_inventories_per_write"] > 1
+        _, restored = restore(
+            worker,
+            first[0].prefixes[0],
+            chunks(m, worker._capture_sink, first[0].prefixes[0]),
+        )
+        assert restored.routed_experts.flatten().tolist() == [1, 2, 3, -1]
+        for i in range(16):
+            engine = processor.request_states[f"internal-{i}"]
+            engine.detokenizer.output_token_ids.append(69)
+            engine.logprobs_processor.logprobs.append_arrays(
+                np.array([[69]]), np.array([[-0.3]]), np.array([1])
+            )
+            engine.routed_experts_chunks.append(routes(9))
+        second_inputs = inputs("pipeline-second")
+        second = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    worker._checkpoint_generation_cut_control(item, deadline=None)
+                    for item in second_inputs
+                )
+            ),
+            timeout=10,
+        )
+        for item, answer in zip(second_inputs, second, strict=True):
+            answer.validate_for(item)
+            assert all(ack.disposition == "durable_prefix" for ack in answer.prefixes)
+        _, restored = restore(
+            worker,
+            second[0].prefixes[0],
+            chunks(m, worker._capture_sink, second[0].prefixes[0]),
+        )
+        assert restored.routed_experts.flatten().tolist() == [1, 2, 3, 9, -1]
+        assert all(state.staged_token_count == 3 for state in states)
+        assert_group_released(states)
+        assert pipeline.stats()["buffered_payload_bytes"] == 0
+    finally:
+        worker._generation_cut_control.close()
+        await asyncio.to_thread(pipeline.close, wait=True)
 
 
 @pytest.mark.asyncio

@@ -111,7 +111,9 @@ from nemo_rl.models.generation.vllm.compact_output import (
     NumericCaptureLogprobs,
     install_compact_output_pipeline,
 )
+from nemo_rl.models.generation.vllm.queued_logprobs import LogprobBufferDetachment
 from nemo_rl.models.generation.generation_cut_grouping import GenerationCutGrouper
+from nemo_rl.models.generation.generation_cut_pipeline import GenerationCutPipeline
 from nemo_rl.models.generation.generation_cut_control import (
     GenerationCutControl,
     generation_cut_deadline,
@@ -152,6 +154,7 @@ from nemo_rl.utils.routed_experts_codec import (
     encode_routed_experts,
 )
 from nemo_rl.utils.vllm_engine_diagnostics import EngineLoopDiagnostics
+from nemo_rl.utils.checkpoint_latency import CheckpointLatencyDiagnostics
 
 LOGGER = logging.getLogger(__name__)
 _RESTORED_PREFIX_TERMINAL_PROMPT_KEY = "__nemo_rl_restored_prefix_terminal__"
@@ -162,6 +165,8 @@ _GENERATION_CUT_ROUTE = "/ng-control/v1/generation-cut"
 
 if TYPE_CHECKING:
     from nemo_gym.token_id_capture.staging.capture import ActiveCall
+
+    from nemo_rl.models.generation.vllm.frontend_timings import FrontendStageTimings
 
 
 # Reasons already logged by this worker process; calls sharing a setting log once.
@@ -1173,6 +1178,8 @@ class VllmAsyncGenerationWorkerImpl(
         self._restored_generation_prefix_calls = 0
         self._restored_generation_prefix_tokens = 0
         self._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
+        self._checkpoint_latency: CheckpointLatencyDiagnostics | None = None
+        self._tq_latency_hooks: Any | None = None
         # A dedicated executor prevents completions waiting on the closed gate
         # from consuming all threads needed to create the checkpoint cut.
         cut_control_config = (
@@ -1181,8 +1188,14 @@ class VllmAsyncGenerationWorkerImpl(
             else GenerationCutControlConfig()
         )
         self._generation_cut_control = GenerationCutControl(
-            max_workers=cut_control_config.max_workers
+            max_workers=cut_control_config.max_workers,
+            max_active_inventories=(
+                cut_control_config.pipeline.max_pending_inventories
+                if cut_control_config.pipeline.enabled
+                else None
+            ),
         )
+        self._generation_cut_pipeline: GenerationCutPipeline | None = None
         self._generation_cut_control_config = cut_control_config
         self._generation_cut_grouper = (
             GenerationCutGrouper(
@@ -1226,7 +1239,9 @@ class VllmAsyncGenerationWorkerImpl(
         self._generation_prefix_reader: PrefixReadBatcher | None = None
         self._engine_loop_diagnostics: EngineLoopDiagnostics | None = None
         self._owned_array_decode_stats: dict[str, int] = {}
+        self._logprob_buffer_detachment: LogprobBufferDetachment | None = None
         self._compact_output_pipeline: CompactOutputPipeline | None = None
+        self._frontend_stage_timings: FrontendStageTimings | None = None
         # Resolved staging-chain prefixes, shared implementation with the Megatron
         # preparer. Installed by setup_token_capture; fetch runs on executor threads.
         # Deferred import: tq_token_sink pulls in the data-plane stack.
@@ -1383,6 +1398,27 @@ class VllmAsyncGenerationWorkerImpl(
         compact = CompactOutputConfig.model_validate(
             self.cfg["vllm_cfg"].get("compact_output", {})
         )
+        if compact.detach_queued_logprobs:
+            self._logprob_buffer_detachment = LogprobBufferDetachment(
+                self.llm.engine_core.decoder
+            )
+            LOGGER.info(
+                "vllm_queued_logprobs enabled; sample logprobs=owned_before_queue "
+                "router_arrays=unchanged tensor_ipc=unchanged"
+            )
+        if compact.frontend_timings:
+            # Optional vLLM frontend internals are only inspected on opt-in.
+            from nemo_rl.models.generation.vllm.frontend_timings import (
+                install_frontend_stage_timings,
+            )
+
+            self._frontend_stage_timings = install_frontend_stage_timings(
+                self.llm.output_processor,
+                sample_every=compact.frontend_timing_sample_every,
+            )
+            # Wrap before compact installation so both queue modes measure the
+            # same native wire decoding, wherever it executes.
+            self._frontend_stage_timings.observe_decoder(self.llm.engine_core.decoder)
         if compact.enabled:
             self._compact_output_pipeline = install_compact_output_pipeline(
                 self.llm.engine_core,
@@ -1582,9 +1618,7 @@ class VllmAsyncGenerationWorkerImpl(
                 disable_direct_route_snapshot=self.cfg.get(
                     "disable_direct_route_snapshot"
                 ),
-                numeric_capture_logprobs=(
-                    compact.enabled and compact.numeric_capture_logprobs
-                ),
+                numeric_capture_logprobs=compact.capture_logprobs_enabled,
                 packed_capture_logprobs=compact.packed_capture_logprobs,
             )
             LOGGER.info(
@@ -1665,6 +1699,42 @@ class VllmAsyncGenerationWorkerImpl(
         self._generation_prefix_batch_max_rows = generation_prefix_batch_size
         self._generation_prefix_batch_max_tokens = generation_prefix_batch_max_tokens
         write_config = self._generation_cut_control_config
+        latency_config = write_config.latency_diagnostics
+        if latency_config.enabled and self._checkpoint_latency is None:
+            self._checkpoint_latency = CheckpointLatencyDiagnostics(
+                latency_config, worker_ip=ray.util.get_node_ip_address()
+            )
+            self._token_capture_snapshot_gate.diagnostics = self._checkpoint_latency
+        if latency_config.enabled and latency_config.tq_internal_phases:
+            # Optional backend: verify the pinned native seams before serving traffic.
+            from nemo_rl.data_plane.tq_latency import install_transfer_queue_latency
+            import transfer_queue as tq
+
+            self._tq_latency_hooks = install_transfer_queue_latency(
+                tq.get_client(),
+                max_events=latency_config.max_events,
+                slow_call_s=latency_config.slow_call_s,
+                diagnostics=self._checkpoint_latency,
+            )
+        if write_config.pipeline.enabled:
+            if not generation_prefix_cuts_enabled:
+                raise ValueError(
+                    "generation cut pipeline requires generation-prefix cuts"
+                )
+            if self._generation_cut_pipeline is not None:
+                raise RuntimeError("generation cut pipeline is already configured")
+            pipeline_config = write_config.pipeline
+            self._generation_cut_pipeline = GenerationCutPipeline(
+                sink,
+                prepare=self._checkpoint_generation_cut_pipeline_steps,
+                max_buffered_bytes=pipeline_config.max_buffered_payload_bytes,
+                max_batch_bytes=pipeline_config.max_batch_payload_bytes,
+                max_rows=generation_prefix_batch_size,
+                max_tokens=generation_prefix_batch_max_tokens,
+                write_concurrency=pipeline_config.write_concurrency,
+                coalesce_wait_seconds=pipeline_config.coalesce_wait_seconds,
+                latency_diagnostics=latency_config if latency_config.enabled else None,
+            )
         if write_config.direct_prefix_batch_encoding:
             if not generation_prefix_cuts_enabled:
                 raise ValueError(
@@ -2394,7 +2464,11 @@ class VllmAsyncGenerationWorkerImpl(
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Run terminal token staging outside an active checkpoint cut."""
-        self._token_capture_snapshot_gate.enter()
+        state = self._get_request_capture(request)
+        self._token_capture_snapshot_gate.enter(
+            operation="terminal",
+            model_call_id=None if state is None else state.call.model_call_id,
+        )
         try:
             content, background_keys = (
                 self._finish_request_capture_after_snapshot_fence(request, content)
@@ -3113,7 +3187,8 @@ class VllmAsyncGenerationWorkerImpl(
             except TimeoutError as error:
                 raise HTTPException(status_code=408, detail=str(error)) from error
             with prefix_cut_probe(
-                enabled=telemetry_metrics_exporting(),
+                enabled=telemetry_metrics_exporting()
+                or (worker_self._checkpoint_latency is not None),
                 checkpoint_id=typed_inventory.checkpoint_id,
                 inventory_digest=typed_inventory.inventory_digest,
                 calls=len(typed_inventory.active_prefixes),
@@ -4371,7 +4446,9 @@ class VllmAsyncGenerationWorkerImpl(
 
     @accepts_trace_context
     @checkpoint_phase_async("generation_fence")
-    async def begin_token_capture_snapshot_fence_async(self) -> bool:
+    async def begin_token_capture_snapshot_fence_async(
+        self, *, checkpoint_id: str | None = None
+    ) -> bool:
         """Fence terminal staging without pausing vLLM decoding."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError(
@@ -4380,15 +4457,17 @@ class VllmAsyncGenerationWorkerImpl(
         gate = self._token_capture_snapshot_gate
         # Take the epoch on the loop, in call order with the matching end: if
         # the driver times out and releases first, the late close is a no-op.
-        epoch = gate.begin_epoch()
+        epoch = gate.begin_epoch(checkpoint_id)
         context = contextvars.copy_context()
 
         def drain() -> None:
             context.run(gate.close_and_wait, epoch)
 
+        gate.mark_submitted()
         await asyncio.get_running_loop().run_in_executor(
             self._token_capture_fence_executor, cast(Callable[..., None], drain)
         )
+        gate.reply_ready()
         return True
 
     async def resume_generation_async(self) -> bool:
@@ -4414,6 +4493,9 @@ class VllmAsyncGenerationWorkerImpl(
                 "end_token_capture_snapshot_fence_async requires async_engine=True"
             )
         self._token_capture_snapshot_gate.reopen()
+        latency = getattr(self, "_checkpoint_latency", None)
+        if latency is not None and latency.checkpoint_id is not None:
+            latency.end(latency.checkpoint_id)
         return True
 
     async def sleep_async(self):
@@ -4491,6 +4573,9 @@ class VllmAsyncGenerationWorkerImpl(
             cut_control = getattr(self, "_generation_cut_control", None)
             if cut_control is not None:
                 cut_control.close()
+            pipeline = getattr(self, "_generation_cut_pipeline", None)
+            if pipeline is not None:
+                pipeline.close(wait=False)
             if self.server_thread is not None:
                 # Uvicorn cancels outstanding generation requests at this
                 # deadline. Keep their cleanup executor alive through cancellation.
@@ -4507,6 +4592,14 @@ class VllmAsyncGenerationWorkerImpl(
                 self.server_thread = None
 
             await self._drain_generation_cut_cleanup()
+            if pipeline is not None:
+                # The preparation owner drains running native writes and rolls
+                # back unstarted batches. Never abandon their lifecycle locks.
+                await asyncio.wait_for(
+                    asyncio.to_thread(pipeline.close, wait=True),
+                    timeout=30.0,
+                )
+                self._generation_cut_pipeline = None
             prefix_writer = getattr(self, "_generation_prefix_write_batcher", None)
             if prefix_writer is not None:
                 await asyncio.to_thread(prefix_writer.close)
@@ -4551,6 +4644,12 @@ class VllmAsyncGenerationWorkerImpl(
             print(f"Error during vLLM shutdown: {e}")
             return False
         finally:
+            latency = getattr(self, "_checkpoint_latency", None)
+            if latency is not None:
+                await asyncio.to_thread(latency.close)
+            tq_hooks = getattr(self, "_tq_latency_hooks", None)
+            if tq_hooks is not None:
+                tq_hooks.close()
             diagnostics = getattr(self, "_engine_loop_diagnostics", None)
             if diagnostics is not None:
                 try:

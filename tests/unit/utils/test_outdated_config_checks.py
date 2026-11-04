@@ -20,6 +20,54 @@ from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_retired_checkpoint_backpressure_has_actionable_migration(enabled):
+    config = {
+        "policy": {
+            "generation": {
+                "vllm_cfg": {"compact_output": {"backpressure": {"enabled": enabled}}}
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="Delete the backpressure block"):
+        check_outdated_config(config)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("stack_sample_worker_ips", []),
+        ("stack_sampler_executable", "py-spy"),
+        ("stack_sample_rate_hz", 19),
+        ("stack_sample_duration_s", 180),
+        ("stack_output_dir", "/tmp/profiles"),
+    ],
+)
+def test_retired_checkpoint_sampler_has_actionable_migration(key, value):
+    config = {
+        "policy": {
+            "generation": {
+                "generation_cut_control": {"latency_diagnostics": {key: value}}
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="use an external profiler"):
+        check_outdated_config(config)
+
+
+@pytest.mark.parametrize(
+    "generation",
+    [
+        {},
+        {"vllm_cfg": {"compact_output": {"enabled": False}}},
+        {"generation_cut_control": {"latency_diagnostics": {"enabled": True}}},
+    ],
+)
+def test_current_checkpoint_settings_do_not_require_retired_experiments(generation):
+    check_outdated_config({"policy": {"generation": generation}})
+
+
 # The entrypoints under test are every file under ENTRYPOINTS_DIRS that imports
 # MasterConfig, plus ENTRYPOINTS_EXTRA_FILES.
 ENTRYPOINTS_DIRS = ["examples", "research"]

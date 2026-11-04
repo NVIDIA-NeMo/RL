@@ -26,7 +26,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from nemo_rl.utils.prefix_cut_diagnostics import (
     PrefixCutProbe,
@@ -79,7 +79,7 @@ async def run_generation_cut_request(
         while (await receive())["type"] != "http.disconnect":
             pass
 
-    work = asyncio.create_task(operation())
+    work = asyncio.ensure_future(operation())
     watcher = asyncio.create_task(disconnected())
     try:
         done, _ = await asyncio.wait(
@@ -122,10 +122,21 @@ class GenerationCutControl:
     actor's shutdown thread and refuses new work without cancelling active cuts.
     """
 
-    def __init__(self, *, max_workers: int) -> None:
+    def __init__(
+        self, *, max_workers: int, max_active_inventories: int | None = None
+    ) -> None:
         if type(max_workers) is not int or not 1 <= max_workers <= 4:
             raise ValueError("generation-cut max_workers must be between 1 and 4")
         self._max_workers = max_workers
+        if max_active_inventories is not None and (
+            type(max_active_inventories) is not int or max_active_inventories < 1
+        ):
+            raise ValueError("max_active_inventories must be positive or None")
+        # Pipeline admission reserves metadata/call identities, not executor
+        # threads. Its writer concurrency and payload capacity are independent.
+        self._max_active_inventories = (
+            max_workers if max_active_inventories is None else max_active_inventories
+        )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._changed = asyncio.Event()
         self._jobs: dict[tuple[str, str], _Inventory] = {}
@@ -195,7 +206,7 @@ class GenerationCutControl:
 
     def _blocking_reason(self, job: _Inventory) -> str | None:
         """Report the first unsatisfied admission predicate, in admission order."""
-        if len(self._active) >= self._max_workers:
+        if len(self._active) >= self._max_active_inventories:
             return "capacity"
         if any(active.key[0] != job.key[0] for active in self._active):
             return "active_checkpoint"
@@ -290,7 +301,7 @@ class GenerationCutControl:
                     wait_s = (
                         _ADMISSION_SAMPLE_SECONDS
                         if remaining is None
-                        else min(remaining, _ADMISSION_SAMPLE_SECONDS)
+                        else min(cast(float, remaining), _ADMISSION_SAMPLE_SECONDS)
                     )
                 started = time.perf_counter() if job.probe is not None else 0.0
                 cpu_started = time.thread_time() if job.probe is not None else 0.0

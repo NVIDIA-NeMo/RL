@@ -17,6 +17,7 @@ from typing import Any, Callable, cast
 
 import pytest
 
+from nemo_rl.data_plane.tq_latency import trace_tq_put
 from nemo_rl.utils import prefix_cut_diagnostics as diagnostics
 
 
@@ -175,6 +176,7 @@ def test_actual_cut_control_wrapper_preserves_queue_context_and_result(caplog):
         checkpoint_phase=lambda phase: nullcontext(),
         prefix_cut_wait=diagnostics.prefix_cut_wait,
         prefix_cut_timing=diagnostics.prefix_cut_timing,
+        trace_tq_put=trace_tq_put,
     )
     exec(
         compile(
@@ -376,6 +378,7 @@ def test_actual_put_adapter_separates_preparation_api_and_return(caplog, slow_ph
         KVBatchMeta=meta,
         tq=SimpleNamespace(kv_batch_put=put),
         prefix_cut_timing=diagnostics.prefix_cut_timing,
+        trace_tq_put=trace_tq_put,
     )
     exec(
         compile(

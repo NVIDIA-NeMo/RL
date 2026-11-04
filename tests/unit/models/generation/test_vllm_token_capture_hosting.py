@@ -89,6 +89,9 @@ from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
 from nemo_rl.models.generation.prefix_read_batcher import (  # noqa: E402
     PrefixReadBatcher,
 )
+from nemo_rl.models.generation.vllm.config import (  # noqa: E402
+    GenerationCutControlConfig,
+)
 from nemo_rl.models.generation.vllm.utils import (  # noqa: E402
     attach_routed_experts_to_chat_response_choices,
 )
@@ -103,6 +106,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     _restored_prefix_terminal_routes,
     _RestoredPrefixTerminal,
 )
+from nemo_rl.utils.prefix_cut_diagnostics import CaptureLifecycleLock  # noqa: E402
 from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
     decode_routed_experts,
     encode_routed_experts,
@@ -204,6 +208,12 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _capture_calls_by_model_call_id={},
         _completed_capture_calls={},
         _generation_cut_receipts={},
+        _generation_cut_control_config=GenerationCutControlConfig(),
+        _generation_cut_pipeline=None,
+        _generation_cut_grouper=None,
+        _generation_prefix_write_batcher=None,
+        _checkpoint_latency=None,
+        _tq_latency_hooks=None,
         _generation_prefix_batch_max_rows=256,
         _generation_prefix_batch_max_tokens=4_194_304,
         _capture_registry_lock=threading.Lock(),
@@ -485,8 +495,8 @@ def test_prefix_capture_with_router_replay_fails_at_setup_without_route_state(
     else:
         match = "verified on vLLM"
         worker._http_engine_client = MagicMock(name="http_engine_client")
-        worker._http_engine_client.check_route_snapshot_support.side_effect = (
-            RuntimeError("router-replay prefix recovery ... verified on vLLM 0.29.0")
+        worker._http_engine_client.enable_token_snapshots.side_effect = RuntimeError(
+            "router-replay prefix recovery ... verified on vLLM 0.29.0"
         )
 
     with pytest.raises(RuntimeError, match=match):
@@ -1475,6 +1485,8 @@ def test_generation_cut_stages_prefix_then_terminal_row_replaces_it():
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
     state = worker._capture_calls[id(request)]
+    # This engine-free fixture supplies its captured tokens directly.
+    state.engine_token_snapshot = False
     with state.lock:
         state.effective_output_limit = 8
         state.observe([20, 21], [-0.1, -0.2])
@@ -1610,6 +1622,8 @@ def _active_call_inventory(
         )
         VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10])
         state = worker._capture_calls[id(request)]
+        # This engine-free fixture supplies its captured tokens directly.
+        state.engine_token_snapshot = False
         with state.lock:
             state.effective_output_limit = 16
             state.observe(generated, [-0.1] * len(generated))
@@ -3358,6 +3372,8 @@ def _cut_active_call(worker, sink, model_call_id: str = "c1"):
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
     state = worker._capture_calls[id(request)]
+    # This engine-free fixture supplies its captured tokens directly.
+    state.engine_token_snapshot = False
     with state.lock:
         state.effective_output_limit = 8
         state.observe([20, 21], [-0.1, -0.2])
@@ -3550,7 +3566,7 @@ def test_background_cleanup_only_receives_acknowledged_prefix_keys(failure):
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     state = SimpleNamespace(
-        lifecycle_lock=threading.Lock(),
+        lifecycle_lock=CaptureLifecycleLock(),
         terminal_started=False,
         call=SimpleNamespace(model_call_id="call"),
     )
@@ -3630,7 +3646,7 @@ def test_background_cleanup_completion_does_not_wait_for_delete():
     worker._prefix_cleanup = cleanup
     worker._capture_sink = SimpleNamespace(clear=clear)
     worker._get_request_capture = lambda request: SimpleNamespace(
-        lifecycle_lock=threading.Lock(),
+        lifecycle_lock=CaptureLifecycleLock(),
         terminal_started=False,
         call=SimpleNamespace(model_call_id="call"),
     )
@@ -3679,7 +3695,7 @@ def _background_cleanup_worker(
     )
     worker._capture_sink = SimpleNamespace(clear=clear)
     worker._get_request_capture = lambda request: SimpleNamespace(
-        lifecycle_lock=threading.Lock(),
+        lifecycle_lock=CaptureLifecycleLock(),
         terminal_started=False,
         call=SimpleNamespace(model_call_id="call"),
     )

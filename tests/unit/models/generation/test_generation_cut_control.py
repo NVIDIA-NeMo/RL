@@ -14,7 +14,6 @@
 
 """CPU-only admission regressions; no Ray actor or vLLM process is started."""
 
-import ast
 import asyncio
 import importlib.util
 import json
@@ -24,10 +23,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Annotated
 
 import pytest
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import ValidationError
 
 from nemo_rl.utils import prefix_cut_diagnostics as diagnostics
 
@@ -407,20 +405,9 @@ def test_duplicate_identity_mismatch_is_rejected(implementation):
 
 @pytest.mark.parametrize("value", [0, 5, -1, True, 1.5, "2"])
 def test_control_config_rejects_invalid_worker_counts(implementation, value):
-    path = (
-        Path(__file__).resolve().parents[4] / "nemo_rl/models/generation/vllm/config.py"
-    )
-    tree = ast.parse(path.read_text())
-    model = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "GenerationCutControlConfig"
-    )
-    namespace = {"BaseModel": BaseModel, "Field": Field, "Annotated": Annotated}
-    exec(
-        compile(ast.Module(body=[model], type_ignores=[]), str(path), "exec"), namespace
-    )
-    config = namespace["GenerationCutControlConfig"]
+    from nemo_rl.models.generation.vllm.config import GenerationCutControlConfig
+
+    config = GenerationCutControlConfig
     assert config().max_workers == 1
     assert config(max_workers=2).max_workers == 2
     assert config(max_workers=4).max_workers == 4

@@ -34,6 +34,30 @@ from nemo_gym._checkpoint.generation_cut import (
     GenerationCutReceipt,
 )
 
+from nemo_rl.models.generation.vllm.config import (
+    CompactOutputConfig,
+    GenerationCutPipelineConfig,
+)
+from nemo_rl.utils.checkpoint_latency import CheckpointLatencyConfig
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
+
+
+def worker_pipeline_config(
+    generation_config: dict[str, Any], *, enabled: bool, write_concurrency: int
+) -> GenerationCutPipelineConfig:
+    """Preserve inherited payload bounds while applying benchmark CLI controls."""
+    inherited = (generation_config.get("generation_cut_control") or {}).get(
+        "pipeline"
+    ) or {}
+    return GenerationCutPipelineConfig.model_validate(
+        {
+            **inherited,
+            "enabled": enabled,
+            "write_concurrency": write_concurrency,
+        }
+    )
+
+
 G_WORKER_FQN = (
     "tools.model_diagnostics.prefix_cut_benchmark_worker.PrefixCutBenchmarkWorker"
 )
@@ -355,7 +379,9 @@ async def run_snapshot(
         fence_results = await asyncio.gather(
             *(
                 asyncio.to_thread(
-                    generation.begin_token_capture_snapshot_fence, timeout_s=180
+                    generation.begin_token_capture_snapshot_fence,
+                    timeout_s=180,
+                    checkpoint_id=checkpoint_id,
                 )
                 for generation in generations
             ),
@@ -421,6 +447,8 @@ async def run_snapshot(
                 and not status["pending_inventories"]
                 and not status.get("inventory_grouping", {}).get("pending_members", 0)
                 and not status.get("inventory_grouping", {}).get("active_groups", 0)
+                and not status.get("cut_pipeline", {}).get("pending_inventories", 0)
+                and not status.get("cut_pipeline", {}).get("active_writes", 0)
                 for status in statuses
             ):
                 break
@@ -639,9 +667,12 @@ async def exercise(
                     ):
                         log_values[f"benchmark/{name}/decoder_copy/{key}"] = value
                     for group in (
+                        "logprob_detachment",
                         "compact_output",
+                        "frontend_timings",
                         "numeric_capture",
                         "inventory_grouping",
+                        "cut_pipeline",
                     ):
                         for key, value in worker["diagnostics"].get(group, {}).items():
                             log_values[f"benchmark/{name}/{group}/{key}"] = value
@@ -717,13 +748,29 @@ def main() -> None:
     parser.add_argument("--check-runtime-imports", action="store_true")
     parser.add_argument(
         "--compact-output",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Queue encoded engine payloads and batch numeric captured logprobs",
     )
     parser.add_argument(
         "--packed-capture-logprobs",
         action="store_true",
-        help="Keep selected-token histories in packed numeric buffers (requires --compact-output)",
+        help="Keep selected-token histories in packed numeric buffers with either queue mode",
+    )
+    parser.add_argument("--frontend-timings", action="store_true")
+    parser.add_argument(
+        "--checkpoint-latency-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Fence, pipeline, native TQ and GC timing probes; otherwise inherit config",
+    )
+    parser.add_argument(
+        "--cut-pipeline",
+        action="store_true",
+        help="Stream all inventories through byte-bounded preparation and concurrent writes",
+    )
+    parser.add_argument(
+        "--compact-queue-max-bytes", type=int, default=2 * 1024 * 1024 * 1024
     )
     parser.add_argument(
         "--heap-census",
@@ -753,12 +800,34 @@ def main() -> None:
         parser.error("Storage units must be positive")
     if args.output_chunk_size < 1:
         parser.error("Output chunk size must be positive")
-    if args.packed_capture_logprobs and not args.compact_output:
-        parser.error("Packed capture requires --compact-output")
+    if args.compact_queue_max_bytes < 1:
+        parser.error("Compact queue byte limit must be positive")
     if args.compact_output and args.copy_decoded_arrays:
         parser.error("Compact output and decoder copying are mutually exclusive")
+    if args.cut_pipeline and (
+        args.group_pending_inventories or args.batch_inventory_writes
+    ):
+        parser.error(
+            "Cut pipeline replaces --group-pending-inventories and --batch-inventory-writes"
+        )
     config = yaml.safe_load(Path(args.reference_config).read_text())
+    check_outdated_config(config)
     generation_config = copy.deepcopy(config["policy"]["generation"])
+    control_config = generation_config.get("generation_cut_control")
+    raw_latency_config = (
+        control_config.get("latency_diagnostics")
+        if control_config is not None
+        else None
+    )
+    latency_config = CheckpointLatencyConfig.model_validate(raw_latency_config or {})
+    if args.checkpoint_latency_diagnostics is not None:
+        latency_config = latency_config.model_copy(
+            update={"enabled": args.checkpoint_latency_diagnostics}
+        )
+        latency_config = type(latency_config).model_validate(
+            latency_config.model_dump()
+        )
+
     if args.gil_switch_interval_ms is not None:
         generation_config["_benchmark_gil_switch_interval_ms"] = (
             args.gil_switch_interval_ms
@@ -767,11 +836,22 @@ def main() -> None:
     # This benchmark controls copying through its instrumented worker hook.
     # Prevent an inherited production setting from enabling a second hook.
     generation_config["vllm_cfg"]["copy_decoded_arrays"] = False
+    inherited_compact = CompactOutputConfig.model_validate(
+        generation_config["vllm_cfg"].get("compact_output", {})
+    )
+    if inherited_compact.detach_queued_logprobs and (
+        args.compact_output or args.copy_decoded_arrays
+    ):
+        parser.error(
+            "Queued logprob detachment requires the native queue without full decoder copying"
+        )
     generation_config["vllm_cfg"]["compact_output"] = {
         "enabled": args.compact_output,
         "packed_capture_logprobs": args.packed_capture_logprobs,
-        "max_queued_bytes": 2 * 1024 * 1024 * 1024,
+        "detach_queued_logprobs": inherited_compact.detach_queued_logprobs,
+        "max_queued_bytes": args.compact_queue_max_bytes,
         "max_queued_messages": 32768,
+        "frontend_timings": args.frontend_timings,
     }
     generation_config["_mtp_weights_from_refit"] = False
     generation_config["_draft_weights_from_refit"] = False
@@ -812,12 +892,28 @@ def main() -> None:
         "gil_switch_interval_ms": args.gil_switch_interval_ms,
         "batch_inventory_writes": args.batch_inventory_writes,
         "group_pending_inventories": args.group_pending_inventories,
+        "cut_pipeline": args.cut_pipeline,
+        "pipeline": worker_pipeline_config(
+            generation_config,
+            enabled=args.cut_pipeline,
+            write_concurrency=args.slots[0],
+        ).model_dump(),
+        "pipeline_per_worker": [
+            worker_pipeline_config(
+                generation_config, enabled=args.cut_pipeline, write_concurrency=slots
+            ).model_dump()
+            for slots in args.slots
+        ],
+        "checkpoint_latency_diagnostics": latency_config.model_dump(),
         "direct_prefix_batch_encoding": args.direct_prefix_batch_encoding,
         "copy_decoded_arrays": args.copy_decoded_arrays,
         "production_decoder_copy": generation_config["vllm_cfg"]["copy_decoded_arrays"],
         "heap_census": args.heap_census,
         "compact_output": args.compact_output,
+        "frontend_timings": args.frontend_timings,
+        "compact_queue_max_bytes": args.compact_queue_max_bytes,
         "packed_capture_logprobs": args.packed_capture_logprobs,
+        "detach_queued_logprobs": inherited_compact.detach_queued_logprobs,
     }
     print(json.dumps({"event": "benchmark_plan", **plan}), flush=True)
     if args.dry_run:
@@ -900,6 +996,10 @@ def main() -> None:
         per_worker = copy.deepcopy(generation_config)
         per_worker["generation_cut_control"] = {
             "max_workers": slots,
+            "latency_diagnostics": latency_config.model_dump(),
+            "pipeline": worker_pipeline_config(
+                generation_config, enabled=args.cut_pipeline, write_concurrency=slots
+            ).model_dump(),
             "batch_inventory_writes": args.batch_inventory_writes,
             "group_pending_inventories": args.group_pending_inventories,
             "direct_prefix_batch_encoding": args.direct_prefix_batch_encoding,

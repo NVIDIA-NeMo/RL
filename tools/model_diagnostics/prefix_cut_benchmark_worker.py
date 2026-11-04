@@ -11,7 +11,9 @@ import contextlib
 import functools
 import math
 import os
+import resource
 import sys
+from pathlib import Path
 from typing import Any
 
 import ray
@@ -169,7 +171,20 @@ class PrefixCutBenchmarkWorker(VllmAsyncGenerationWorkerImpl):  # pragma: no cov
             pending_inventories=len(self._generation_cut_control._pending),
             slots=self._generation_cut_control._max_workers,
             decoder_copy=dict(self._bench_decoder_copy_stats),
+            logprob_detachment=(
+                self._logprob_buffer_detachment.stats()
+                if self._logprob_buffer_detachment is not None
+                else {}
+            ),
             output_queue_depth=self.llm.engine_core.outputs_queue.qsize(),
+            rss_bytes=int(Path("/proc/self/statm").read_text().split()[1])
+            * os.sysconf("SC_PAGE_SIZE"),
+            peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+            frontend_timings=(
+                self._frontend_stage_timings.stats()
+                if self._frontend_stage_timings is not None
+                else {}
+            ),
             compact_output=(
                 self._compact_output_pipeline.stats()
                 if self._compact_output_pipeline is not None
@@ -183,6 +198,11 @@ class PrefixCutBenchmarkWorker(VllmAsyncGenerationWorkerImpl):  # pragma: no cov
             inventory_grouping=(
                 self._generation_cut_grouper.stats()
                 if self._generation_cut_grouper is not None
+                else {}
+            ),
+            cut_pipeline=(
+                self._generation_cut_pipeline.stats()
+                if self._generation_cut_pipeline is not None
                 else {}
             ),
             write_batching=(

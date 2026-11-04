@@ -60,6 +60,7 @@ from nemo_rl.data_plane.interfaces import (
     storage_unit_placement,
 )
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
+from nemo_rl.data_plane.tq_latency import trace_tq_put
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 from nemo_rl.telemetry.rollout_checkpoint import checkpoint_phase_sync
 from nemo_rl.utils.prefix_cut_diagnostics import prefix_cut_timing
@@ -1470,7 +1471,7 @@ class TQDataPlaneClient(DataPlaneClient):
 
             self._mark_data_operation_started()
             wire_keys = list(sample_ids)
-        with prefix_cut_timing("tq_kv_batch_put_api"):
+        with prefix_cut_timing("tq_kv_batch_put_api"), trace_tq_put():
             tq.kv_batch_put(
                 keys=wire_keys,
                 partition_id=partition_id,

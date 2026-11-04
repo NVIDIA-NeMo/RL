@@ -36,7 +36,19 @@ from nemo_rl.experience.route_assembly import (
     verify_route_fragment_integrity,
 )
 from nemo_rl.models.generation.generation_cut_grouping import GenerationCutGrouper
+from nemo_rl.models.generation.generation_cut_pipeline import (
+    CutSteps,
+    GenerationCutPipeline,
+    PrefixCutBatchReleased,
+    PrefixCutWrite,
+)
 from nemo_rl.telemetry.rollout_checkpoint import checkpoint_phase, checkpoint_phase_sync
+from nemo_rl.utils.checkpoint_latency import (
+    G_GATE_WORK,
+    CheckpointLatencyDiagnostics,
+    GateWork,
+    emit_latency,
+)
 from nemo_rl.utils.prefix_cut_diagnostics import (
     CaptureLifecycleLock,
     current_prefix_cut_probe,
@@ -279,25 +291,57 @@ class _RequestCaptureState:
             raise ValueError("vLLM replaced a published route piece")
         if len(pieces) > covered:
             with prefix_cut_timing("route_history_concat"):
-                arrays = [np.asarray(piece) for piece in pieces[covered:]]
-                shape = tuple(arrays[0].shape[1:])
-                if (
-                    any(
-                        array.ndim != 3
-                        or tuple(array.shape[1:]) != shape
-                        or array.dtype.kind not in "iu"
-                        for array in arrays
+                # vLLM publishes unsigned fragments, while checkpoint routes
+                # use a signed dtype for the -1 sentinel. Concatenate in the
+                # source dtype, then check values before copying into the cache.
+                dtype = torch.empty((), dtype=self.routed_experts_dtype).numpy().dtype
+                new_pieces = pieces[covered:]
+                try:
+                    first_piece = new_pieces[0]
+                    if (
+                        not isinstance(first_piece, np.ndarray)
+                        or first_piece.dtype.kind not in "iu"
+                    ):
+                        raise TypeError("route fragments need integer dtypes")
+                    # Exact source-dtype matching keeps mixed/noninteger
+                    # fragments on the existing per-fragment validation path.
+                    added = np.concatenate(
+                        new_pieces, axis=0, dtype=first_piece.dtype, casting="no"
                     )
-                    or not shape
-                    or min(shape) < 1
-                ):
-                    raise ValueError(
-                        "vLLM route chunks must share shape [*, layers, topk]"
-                    )
+                except (TypeError, ValueError):
+                    arrays = [np.asarray(piece) for piece in new_pieces]
+                    shape = tuple(arrays[0].shape[1:])
+                    if (
+                        any(
+                            array.ndim != 3
+                            or tuple(array.shape[1:]) != shape
+                            or array.dtype.kind not in "iu"
+                            for array in arrays
+                        )
+                        or not shape
+                        or min(shape) < 1
+                    ):
+                        raise ValueError(
+                            "vLLM route chunks must share shape [*, layers, topk]"
+                        ) from None
+                    added = np.concatenate(arrays, axis=0)
+                    prefix_cut_count("route_history_bulk_fallbacks", 1)
+                else:
+                    shape = tuple(added.shape[1:])
+                    if added.ndim != 3 or not shape or min(shape) < 1:
+                        raise ValueError(
+                            "vLLM route chunks must share shape [*, layers, topk]"
+                        )
+                    prefix_cut_count("route_history_bulk_fast_calls", 1)
+                if added.size and not np.can_cast(added.dtype, dtype, casting="safe"):
+                    limits = np.iinfo(dtype)
+                    if int(added.min()) < limits.min or int(added.max()) > limits.max:
+                        raise ValueError(
+                            f"vLLM routed expert IDs do not fit checkpoint dtype {dtype}"
+                        )
                 buffer = self.engine_route_buffer
                 if buffer is not None and tuple(buffer.shape[1:]) != shape:
                     raise ValueError("vLLM route model dimensions changed between cuts")
-                added = np.concatenate(arrays, axis=0)
                 rows = self.engine_route_rows + len(added)
                 if buffer is None or rows > len(buffer):
                     capacity = max(rows, 2 * len(buffer) if buffer is not None else 1)
@@ -316,7 +360,7 @@ class _RequestCaptureState:
                 self.engine_route_rows = rows
                 self.engine_route_piece_count = len(pieces)
                 self.engine_route_last_piece = pieces[-1]
-            prefix_cut_count("route_history_chunks", len(arrays))
+            prefix_cut_count("route_history_chunks", len(new_pieces))
             prefix_cut_count("route_history_bytes", added.nbytes)
         assert self.engine_route_buffer is not None
         return torch.from_numpy(self.engine_route_buffer[: self.engine_route_rows])
@@ -463,13 +507,10 @@ def _ends_inside_character(tokenizer: Any, generated_token_ids: list[int]) -> bo
 
 
 class _TokenCaptureSnapshotGate:
-    """Fence terminal writes and background prefix CLEARs across a TQ snapshot.
+    """Fence terminal writes and background CLEARs; optionally observe holders.
 
-    A closed gate waits for active permit holders and blocks new ones until
-    ``reopen``. Each fence takes an epoch before its close is queued.
-    ``reopen`` releases every epoch issued so far, so a close that runs after
-    the driver already timed out and released its fence is a no-op instead of
-    a stuck gate.
+    Epochs preserve late-close/reopen behavior. Diagnostics copy numeric holder
+    descriptions under the condition and log only after releasing it.
     """
 
     def __init__(self) -> None:
@@ -478,37 +519,180 @@ class _TokenCaptureSnapshotGate:
         self._active = 0
         self._epoch = 0
         self._released_epoch = 0
+        self.diagnostics: CheckpointLatencyDiagnostics | None = None
+        self._holders: dict[int, list[tuple[GateWork, Any]]] = {}
+        self._last_holder: GateWork | None = None
+        self._last_holder_finished = 0.0
+        self._executor_submitted_at = 0.0
+        self._fence_id: str | None = None
+        self._requested_at = 0.0
+        self._drained_at = 0.0
 
-    def enter(self) -> None:
+    def enter(
+        self, *, operation: str = "unknown", model_call_id: str | None = None
+    ) -> None:
         with self._condition:
             while not self._open:
                 self._condition.wait()
             self._active += 1
+            if self.diagnostics is not None:
+                work = GateWork(
+                    operation,
+                    model_call_id,
+                    time.time(),
+                    threading.get_ident(),
+                    threading.get_native_id(),
+                )
+                self._holders.setdefault(work.thread_id, []).append(
+                    (work, G_GATE_WORK.set(work))
+                )
 
     def exit(self) -> None:
         with self._condition:
             self._active -= 1
+            if self.diagnostics is not None:
+                work, token = self._holders[threading.get_ident()].pop()
+                if not self._holders[work.thread_id]:
+                    del self._holders[work.thread_id]
+                self._last_holder = work
+                self._last_holder_finished = time.time()
+                G_GATE_WORK.reset(token)
             if self._active == 0:
                 self._condition.notify_all()
 
-    def begin_epoch(self) -> int:
+    def begin_epoch(self, checkpoint_id: str | None = None) -> int:
         with self._condition:
             self._epoch += 1
-            return self._epoch
+            epoch = self._epoch
+            self._requested_at = time.time()
+            self._fence_id = checkpoint_id or f"fence-{epoch}"
+            self._drained_at = 0.0
+            self._last_holder = None
+            self._last_holder_finished = 0.0
+            self._executor_submitted_at = 0.0
+        if self.diagnostics is not None:
+            self.diagnostics.begin(self._fence_id)
+        return epoch
+
+    def mark_submitted(self) -> None:
+        self._executor_submitted_at = time.time()
+
+    def _holder_snapshot(self) -> list[dict[str, Any]]:
+        # Called under _condition; cardinality is bounded by active permits.
+        now = time.time()
+        limit = (
+            self.diagnostics.config.max_events if self.diagnostics is not None else 0
+        )
+        return [
+            {
+                "operation": w.operation,
+                "model_call_id": w.model_call_id,
+                "thread_id": w.thread_id,
+                "native_thread_id": w.native_thread_id,
+                "started_unix_s": w.started_unix_s,
+                "age_s": now - w.started_unix_s,
+            }
+            for entries in self._holders.values()
+            for w, _ in entries
+        ][:limit]
 
     def close_and_wait(self, epoch: int) -> None:
+        entered = time.time()
         with self._condition:
             if epoch <= self._released_epoch:
                 return
             self._open = False
-            while self._active and self._released_epoch < epoch:
-                self._condition.wait()
+            closed_at = time.time()
+            initial_active = self._active
+            holders = self._holder_snapshot()
+            checkpoint_id, requested = self._fence_id, self._requested_at
+        if self.diagnostics is not None:
+            emit_latency(
+                "checkpoint_fence",
+                event="closed",
+                checkpoint_id=checkpoint_id,
+                executor_dispatch_wait_s=entered
+                - (self._executor_submitted_at or requested),
+                request_to_submit_s=(self._executor_submitted_at or requested)
+                - requested,
+                executor_initial_lock_wait_s=closed_at - entered,
+                gate_closed_unix_s=closed_at,
+                requested_unix_s=requested,
+                active_holders=initial_active,
+                holders=holders,
+            )
+        interval = (
+            self.diagnostics.config.progress_interval_s
+            if self.diagnostics is not None
+            else None
+        )
+        while True:
+            with self._condition:
+                if not self._active or self._released_epoch >= epoch:
+                    active = self._active
+                    last = self._last_holder
+                    last_finished = self._last_holder_finished
+                    self._drained_at = time.time()
+                    drained = self._drained_at
+                    break
+                self._condition.wait(timeout=interval)
+                active = self._active
+                holders = self._holder_snapshot()
+            if self.diagnostics is not None and active:
+                emit_latency(
+                    "checkpoint_fence",
+                    event="waiting",
+                    checkpoint_id=checkpoint_id,
+                    active_holders=active,
+                    holders=holders,
+                    drain_elapsed_s=time.time() - entered,
+                )
+        if self.diagnostics is not None:
+            emit_latency(
+                "checkpoint_fence",
+                event="drained",
+                checkpoint_id=checkpoint_id,
+                drain_wait_s=drained - closed_at,
+                last_holder_finished_unix_s=last_finished or None,
+                last_exit_to_drain_wakeup_s=None
+                if not last_finished
+                else drained - last_finished,
+                remaining_holders=active,
+                last_holder=None
+                if last is None
+                else {
+                    "operation": last.operation,
+                    "model_call_id": last.model_call_id,
+                    "thread_id": last.thread_id,
+                    "native_thread_id": last.native_thread_id,
+                    "started_unix_s": last.started_unix_s,
+                },
+            )
+
+    def reply_ready(self) -> None:
+        if self.diagnostics is not None:
+            emit_latency(
+                "checkpoint_fence",
+                event="reply_ready",
+                checkpoint_id=self._fence_id,
+                requested_unix_s=self._requested_at,
+                total_s=time.time() - self._requested_at,
+                drained_to_reply_s=None
+                if not self._drained_at
+                else time.time() - self._drained_at,
+            )
 
     def reopen(self) -> None:
         with self._condition:
             self._released_epoch = self._epoch
             self._open = True
             self._condition.notify_all()
+
+
+@dataclass
+class _PrefixBatchSize:
+    tokens: int
+    payload_bytes: int
 
 
 class GenerationCutCaptureMixin:
@@ -528,6 +712,7 @@ class GenerationCutCaptureMixin:
     routed_experts_dtype: torch.dtype
     _generation_prefix_write_batcher: GenerationPrefixWriteBatcher | None = None
     _generation_cut_grouper: GenerationCutGrouper | None = None
+    _generation_cut_pipeline: GenerationCutPipeline | None = None
 
     def _refresh_generation_cut_tokens(
         self, state: _RequestCaptureState, *, deadline: float | None
@@ -1021,7 +1206,7 @@ class GenerationCutCaptureMixin:
     ) -> None:
         """Delete an ended call's chunk rows outside any cut-to-snapshot window."""
         gate = self._token_capture_snapshot_gate
-        gate.enter()
+        gate.enter(operation="abort_cleanup", model_call_id=model_call_id)
         try:
             GenerationCutCaptureMixin._clear_generation_cut_rows(
                 self, model_call_id, staging_keys
@@ -1103,6 +1288,10 @@ class GenerationCutCaptureMixin:
             )
         if cached is not None:
             return cached
+        if self._generation_cut_pipeline is not None:
+            return await self._admit_generation_cut_inventory(
+                inventory, deadline=deadline
+            )
         if self._generation_cut_grouper is not None:
             return await self._generation_cut_grouper.run(inventory, deadline=deadline)
         return await self._admit_generation_cut_inventory(inventory, deadline=deadline)
@@ -1195,6 +1384,10 @@ class GenerationCutCaptureMixin:
         submitted_at = time.perf_counter()
 
         async def execute() -> Any:
+            pipeline = self._generation_cut_pipeline
+            if pipeline is not None:
+                future = pipeline.submit(inventory, deadline=deadline)
+                return await asyncio.shield(asyncio.wrap_future(future))
             prefix_cut_wait(
                 "control_admission_wait", time.perf_counter() - submitted_at
             )
@@ -1491,6 +1684,7 @@ class GenerationCutCaptureMixin:
                 chunk_digests = state.generation_cut_chunk_digests
                 new_layout = state.capture_routed_experts and chunk_digests is not None
                 if new_layout:
+                    assert chunk_digests is not None
                     cumulative_extras = {
                         **(cumulative_extras or {}),
                         _CUT_DIGEST_LAYOUT: 2,
@@ -1647,6 +1841,44 @@ class GenerationCutCaptureMixin:
     def _checkpoint_generation_cut_batched(
         self, inventory: Any, *, deadline: float | None = None
     ) -> list[Any]:
+        """Drive the same transaction steps synchronously for the legacy path."""
+        steps = self._checkpoint_generation_cut_batched_steps(
+            inventory, deadline=deadline
+        )
+        response = None
+        result: list[Any] = []
+        try:
+            while True:
+                try:
+                    request = steps.send(response)
+                except StopIteration as finished:
+                    result = finished.value
+                    break
+                response = (
+                    request.fallback() if isinstance(request, PrefixCutWrite) else None
+                )
+        finally:
+            steps.close()
+        return result
+
+    def _checkpoint_generation_cut_pipeline_steps(
+        self, inventory: Any, *, deadline: float | None
+    ) -> CutSteps:
+        """Prepare native transactions; the pipeline owns their durable writes."""
+        with self._capture_registry_lock:
+            cached = self._generation_cut_receipts.get(
+                (inventory.checkpoint_id, inventory.inventory_digest)
+            )
+        if cached is not None:
+            return cached
+        acknowledgements = yield from self._checkpoint_generation_cut_batched_steps(
+            inventory, deadline=deadline
+        )
+        return self._generation_cut_receipt(inventory, acknowledgements)
+
+    def _checkpoint_generation_cut_batched_steps(
+        self, inventory: Any, *, deadline: float | None = None
+    ) -> CutSteps:
         """Batch active prefixes while retaining each call's lifecycle lock.
 
         Past ``deadline`` no further TQ write starts: rows frozen for the next
@@ -1678,10 +1910,11 @@ class GenerationCutCaptureMixin:
                 RoutedExpertsStagingPayload | None,
             ]
         ] = []
-        pending_tokens = 0
-        pending_payload_bytes = 0
+        pending_size = _PrefixBatchSize(0, 0)
         payload_limit = (
-            None
+            self._generation_cut_control_config.pipeline.max_batch_payload_bytes
+            if self._generation_cut_pipeline is not None
+            else None
             if self._generation_cut_grouper is None
             else self._generation_cut_grouper.max_payload_bytes
         )
@@ -1696,13 +1929,12 @@ class GenerationCutCaptureMixin:
             return deadline is not None and time.monotonic() >= deadline
 
         def release_pending() -> None:
-            nonlocal pending_tokens, pending_payload_bytes
             for transaction, _, _, prefix, _ in pending:
                 transaction.close()
                 uncut.append(prefix)
             pending.clear()
-            pending_tokens = 0
-            pending_payload_bytes = 0
+            pending_size.tokens = 0
+            pending_size.payload_bytes = 0
 
         def release_route_pending() -> None:
             nonlocal route_pending_tokens
@@ -1763,7 +1995,9 @@ class GenerationCutCaptureMixin:
         ) -> list[str | None]:
             """Write a batch; if its put fails, write each row alone."""
             try:
-                return write(batch, coalesce=True)
+                keys: list[str | None] = []
+                keys.extend(write(batch, coalesce=True))
+                return keys
             except Exception:
                 # The sink has already discarded the batch's keys.
                 if len(batch) == 1:
@@ -1790,17 +2024,17 @@ class GenerationCutCaptureMixin:
                     keys.append(None)
             return keys
 
-        def flush() -> None:
-            nonlocal pending_tokens, pending_payload_bytes
+        def flush(*, final: bool = False) -> CutSteps:
             if not pending:
                 return
             if past_deadline():
                 release_pending()
                 return
             batch = list(pending)
+            batch_payload_bytes = pending_size.payload_bytes
             pending.clear()
-            pending_tokens = 0
-            pending_payload_bytes = 0
+            pending_size.tokens = 0
+            pending_size.payload_bytes = 0
             keys: list[str | None] = []
             handed = 0
             try:
@@ -1811,14 +2045,40 @@ class GenerationCutCaptureMixin:
                     sum(len(record.token_ids_delta) for _, record, _, _, _ in batch),
                 )
                 prefix_cut_count("max_batch_rows", len(batch), maximum=True)
-                with (
-                    prefix_cut_timing("batch_stage_total"),
-                    checkpoint_phase(
-                        "prefix_batch_put",
-                        attributes={"rl.checkpoint.rows": len(batch)},
-                    ),
-                ):
-                    keys = stage(batch)
+
+                def fallback() -> list[str | None]:
+                    with (
+                        prefix_cut_timing("batch_stage_total"),
+                        checkpoint_phase(
+                            "prefix_batch_put",
+                            attributes={"rl.checkpoint.rows": len(batch)},
+                        ),
+                    ):
+                        return stage(batch)
+
+                records = tuple(record for _, record, _, _, _ in batch)
+                attachments = tuple(
+                    {ROUTED_EXPERTS_STAGING_ATTACHMENT: routes}
+                    if routes is not None
+                    else None
+                    for _, _, _, _, routes in batch
+                )
+                # The existing synchronous wrapper executes fallback immediately.
+                # The pipeline may merge these rows with other inventories and
+                # sends back ordered keys only after the native write completes.
+                received_keys = yield PrefixCutWrite(
+                    checkpoint_id=inventory.checkpoint_id,
+                    records=records,
+                    chunk_sequences=tuple(sequence for _, _, sequence, _, _ in batch),
+                    attachments=attachments,
+                    payload_bytes=batch_payload_bytes,
+                    deadline=deadline,
+                    fallback=fallback,
+                    measured=current_prefix_cut_probe() is not None,
+                )
+                if received_keys is None:
+                    raise TypeError("prefix write completion requires ordered keys")
+                keys = received_keys
                 ready = []
                 for (transaction, _, _, prefix, _), key in zip(
                     batch, keys, strict=True
@@ -1867,6 +2127,13 @@ class GenerationCutCaptureMixin:
                 with prefix_cut_timing("transaction_release"):
                     for transaction, _, _, _, _ in batch:
                         transaction.close()
+            # Yield only after every lifecycle lock is released. The scheduler
+            # can now release this payload reservation before preparing more.
+            batch.clear()
+            records = ()
+            attachments = ()
+            if not final:
+                yield PrefixCutBatchReleased()
 
         def queue_record(
             transaction: Generator[Any, Any, Any],
@@ -1874,8 +2141,7 @@ class GenerationCutCaptureMixin:
             record: Any,
             sequence: int,
             routes: RoutedExpertsStagingPayload | None,
-        ) -> None:
-            nonlocal pending_tokens, pending_payload_bytes
+        ) -> CutSteps:
             tokens = len(record.token_ids_delta)
             payload_bytes = 0
             if payload_limit is not None:
@@ -1891,21 +2157,21 @@ class GenerationCutCaptureMixin:
                 )
                 return
             if pending and (
-                pending_tokens + tokens > max_tokens
+                pending_size.tokens + tokens > max_tokens
                 or (
                     payload_limit is not None
-                    and pending_payload_bytes + payload_bytes > payload_limit
+                    and pending_size.payload_bytes + payload_bytes > payload_limit
                 )
             ):
-                flush()
+                yield from flush()
             pending.append((transaction, record, sequence, prefix, routes))
-            pending_tokens += tokens
-            pending_payload_bytes += payload_bytes
-            if len(pending) >= max_rows or pending_tokens >= max_tokens:
+            pending_size.tokens += tokens
+            pending_size.payload_bytes += payload_bytes
+            if len(pending) >= max_rows or pending_size.tokens >= max_tokens:
                 # An oversized single row is written alone, never split.
-                flush()
+                yield from flush()
 
-        def resolve_route_pending() -> None:
+        def resolve_route_pending() -> CutSteps:
             """Fetch a frozen group's routes, then transfer records to TQ batching."""
             nonlocal route_pending_tokens
             if not route_pending:
@@ -1946,7 +2212,9 @@ class GenerationCutCaptureMixin:
                             record, sequence, routes = transaction.send(
                                 snapshots[request.engine_request_id]
                             )
-                        queue_record(transaction, prefix, record, sequence, routes)
+                        yield from queue_record(
+                            transaction, prefix, record, sequence, routes
+                        )
                         transferred = True
                     except StopIteration as finished:
                         acknowledgements.append(finished.value)
@@ -2023,7 +2291,7 @@ class GenerationCutCaptureMixin:
                             and route_pending_tokens + prepared.token_positions
                             > max_tokens
                         ):
-                            resolve_route_pending()
+                            yield from resolve_route_pending()
                     except BaseException:
                         transaction.close()
                         raise
@@ -2033,16 +2301,18 @@ class GenerationCutCaptureMixin:
                         len(route_pending) >= route_group_limit
                         or route_pending_tokens >= max_tokens
                     ):
-                        resolve_route_pending()
+                        yield from resolve_route_pending()
                 else:
                     try:
                         record, sequence, routes = prepared
-                        queue_record(transaction, prefix, record, sequence, routes)
+                        yield from queue_record(
+                            transaction, prefix, record, sequence, routes
+                        )
                     except BaseException:
                         transaction.close()
                         raise
-            resolve_route_pending()
-            flush()
+            yield from resolve_route_pending()
+            yield from flush(final=True)
         finally:
             for transaction, _, _ in route_pending:
                 transaction.close()
@@ -2075,8 +2345,6 @@ class GenerationCutCaptureMixin:
         acknowledged as failures (they regenerate after restore) instead of
         holding the single cut-control thread for the next checkpoint.
         """
-        from nemo_gym._checkpoint.generation_cut import GenerationCutReceipt
-
         capture = self.token_capture
         sink = self._capture_sink
         if capture is None or sink is None:
@@ -2089,6 +2357,16 @@ class GenerationCutCaptureMixin:
         acknowledgements = self._checkpoint_generation_cut_batched(
             inventory, deadline=deadline
         )
+        return self._generation_cut_receipt(inventory, acknowledgements)
+
+    def _generation_cut_receipt(
+        self, inventory: Any, acknowledgements: list[Any]
+    ) -> Any:
+        """Publish exact original-inventory receipts after all writes and seals."""
+        # Gym is optional outside capture integration.
+        from nemo_gym._checkpoint.generation_cut import GenerationCutReceipt
+
+        receipt_key = (inventory.checkpoint_id, inventory.inventory_digest)
         receipt = GenerationCutReceipt(
             checkpoint_id=inventory.checkpoint_id,
             cut_id=f"worker-{inventory.inventory_digest}",

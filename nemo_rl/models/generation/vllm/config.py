@@ -23,6 +23,7 @@ from pydantic import (
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
+    model_validator,
 )
 
 from nemo_rl.models.generation.interfaces import (
@@ -35,6 +36,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NvFp4PerTokenRolloutConfig,
     resolve_boundary_ignore_patterns,
 )
+from nemo_rl.utils.checkpoint_latency import CheckpointLatencyConfig
 
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
@@ -61,7 +63,21 @@ class CompactOutputConfig(BaseModel, extra="forbid"):
     max_queued_messages: Annotated[int, Field(gt=0, strict=True)] = 8192
     numeric_capture_logprobs: bool = True
     # Three packed numeric buffers for eligible captured FINAL_ONLY requests.
+    # Explicitly enabling this also enables numeric capture with the native queue.
     packed_capture_logprobs: bool = False
+    # Native queue only: own the three decoded sample-logprob arrays before
+    # queueing, releasing their received-buffer wrappers. Default off.
+    detach_queued_logprobs: bool = False
+    # CPU stage sampling is diagnostic-only; normal generation is unchanged when off.
+    frontend_timings: bool = False
+    frontend_timing_sample_every: Annotated[int, Field(gt=0, strict=True)] = 64
+
+    @property
+    def capture_logprobs_enabled(self) -> bool:
+        """Preserve default-off behavior while allowing a queue-independent packed path."""
+        return self.numeric_capture_logprobs and (
+            self.enabled or self.packed_capture_logprobs
+        )
 
 
 class VllmSpecificArgs(TypedDict):
@@ -232,11 +248,40 @@ class VllmRefitConfig(BaseModel, extra="allow"):
     nixl: VllmNixlRefitConfig = Field(default_factory=VllmNixlRefitConfig)
 
 
+class GenerationCutPipelineConfig(BaseModel, extra="forbid"):
+    """Opt-in shared preparation stream and bounded concurrent prefix writes."""
+
+    enabled: bool = False
+    max_pending_inventories: Annotated[int, Field(gt=0, strict=True)] = 128
+    # Includes prepared/in-flight tensor payload and one preparation reservation.
+    # This is not a cap on total RSS or on live generation histories.
+    max_buffered_payload_bytes: Annotated[int, Field(gt=0, strict=True)] = (
+        1024 * 1024 * 1024
+    )
+    max_batch_payload_bytes: Annotated[int, Field(gt=0, strict=True)] = (
+        256 * 1024 * 1024
+    )
+    write_concurrency: Annotated[int, Field(ge=1, le=4, strict=True)] = 4
+    coalesce_wait_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.25
+
+    @model_validator(mode="after")
+    def validate_buffer(self) -> "GenerationCutPipelineConfig":
+        if self.max_buffered_payload_bytes < self.max_batch_payload_bytes:
+            raise ValueError("Pipeline payload buffer must hold one maximum batch")
+        return self
+
+
 class GenerationCutControlConfig(BaseModel, extra="forbid"):
-    """Bound concurrent independent checkpoint inventories per generation worker."""
+    """Select legacy inventory slots or a shared, byte-bounded cut pipeline."""
 
     # One to four independent inventories; overlapping calls still serialize.
     max_workers: Annotated[int, Field(ge=1, le=4, strict=True)] = 1
+    latency_diagnostics: CheckpointLatencyConfig = Field(
+        default_factory=CheckpointLatencyConfig
+    )
+    pipeline: GenerationCutPipelineConfig = Field(
+        default_factory=GenerationCutPipelineConfig
+    )
     # Merge prepared writes across admitted inventories on a dedicated thread.
     batch_inventory_writes: bool = False
     # Construct text prefix columns directly, avoiding intermediate row tensors.
@@ -251,6 +296,16 @@ class GenerationCutControlConfig(BaseModel, extra="forbid"):
     write_batch_max_payload_bytes: Annotated[int, Field(gt=0, strict=True)] = (
         256 * 1024 * 1024
     )
+
+    @model_validator(mode="after")
+    def validate_pipeline_mode(self) -> "GenerationCutControlConfig":
+        if self.pipeline.enabled and (
+            self.batch_inventory_writes or self.group_pending_inventories
+        ):
+            raise ValueError(
+                "Cut pipeline replaces legacy inventory grouping and write batching; disable both"
+            )
+        return self
 
 
 class VllmConfig(GenerationConfig):
@@ -296,10 +351,23 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     if vllm_cfg is None:
         return
     compact = CompactOutputConfig.model_validate(vllm_cfg.get("compact_output", {}))
-    if compact.packed_capture_logprobs and not (
-        compact.enabled and compact.numeric_capture_logprobs
-    ):
-        raise ValueError("packed capture requires compact output and numeric capture")
+    if compact.detach_queued_logprobs:
+        if not vllm_cfg.get("async_engine"):
+            raise ValueError("queued logprob detachment requires async_engine: true")
+        if compact.enabled or vllm_cfg.get("copy_decoded_arrays"):
+            raise ValueError(
+                "queued logprob detachment requires the native queue and cannot "
+                "be combined with copy_decoded_arrays"
+            )
+    if compact.packed_capture_logprobs and not compact.numeric_capture_logprobs:
+        raise ValueError("packed capture requires numeric capture")
+    if compact.capture_logprobs_enabled:
+        if not vllm_cfg.get("async_engine") or not vllm_cfg.get("expose_http_server"):
+            raise ValueError("numeric capture requires the async HTTP engine")
+        if not vllm_cfg.get("flat_logprobs"):
+            raise ValueError("numeric capture requires flat_logprobs: true")
+    if compact.frontend_timings and not vllm_cfg.get("async_engine"):
+        raise ValueError("frontend timings require async_engine: true")
     if compact.enabled:
         if not vllm_cfg.get("async_engine"):
             raise ValueError("compact_output requires async_engine: true")
@@ -307,8 +375,6 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
             raise ValueError(
                 "compact_output cannot be combined with copy_decoded_arrays"
             )
-        if compact.numeric_capture_logprobs and not vllm_cfg.get("flat_logprobs"):
-            raise ValueError("numeric compact capture requires flat_logprobs: true")
     if vllm_cfg.get("copy_decoded_arrays") and not vllm_cfg.get("async_engine"):
         raise ValueError(
             "policy.generation.vllm_cfg.copy_decoded_arrays requires async_engine: true."

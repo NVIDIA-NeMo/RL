@@ -1779,7 +1779,7 @@ class VllmGeneration(GenerationInterface):
         return True
 
     def begin_token_capture_snapshot_fence(
-        self, *, timeout_s: Optional[float] = None
+        self, *, timeout_s: Optional[float] = None, checkpoint_id: str | None = None
     ) -> bool:
         """Fence terminal staging while vLLM keeps decoding into live buffers."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
@@ -1790,6 +1790,7 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Worker group is not initialized")
         futures = self.worker_group.run_all_workers_single_data(
             "begin_token_capture_snapshot_fence_async",
+            **({"checkpoint_id": checkpoint_id} if checkpoint_id is not None else {}),
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             **trace_context_kwargs(),
         )

@@ -16,8 +16,10 @@ import ast
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Annotated
 
 import pytest
+from pydantic import BaseModel, Field
 
 # Compile the production constructor/generate method without Ray or GPU imports.
 # Only the downstream engine iterator is fake; the option handling is unchanged.
@@ -57,16 +59,30 @@ G_VALIDATOR = next(
     for n in G_CONFIG.body
     if isinstance(n, ast.FunctionDef) and n.name == "validate_vllm_async_actor_settings"
 )
+# The real validator depends on these schemas. Compile them too instead of
+# replacing their guards with stubs or importing GPU/Ray worker modules.
+G_SCHEMAS = [
+    node
+    for node in G_CONFIG.body
+    if isinstance(node, ast.ClassDef) and node.name == "CompactOutputConfig"
+]
+G_NAMESPACE.update(
+    Annotated=Annotated,
+    BaseModel=BaseModel,
+    Field=Field,
+)
 exec(
     compile(
         ast.fix_missing_locations(
-            ast.Module(body=[G_FUTURE, G_VALIDATOR], type_ignores=[])
+            ast.Module(body=[G_FUTURE, *G_SCHEMAS, G_VALIDATOR], type_ignores=[])
         ),
         "<production-validator>",
         "exec",
     ),
     G_NAMESPACE,
 )
+for _schema in G_SCHEMAS:
+    G_NAMESPACE[_schema.name].model_rebuild(_types_namespace=G_NAMESPACE)
 validate_vllm_async_actor_settings = G_NAMESPACE["validate_vllm_async_actor_settings"]
 
 

@@ -34,6 +34,7 @@ from nemo_rl.models.generation.vllm.compact_output import (
     append_numeric_logprobs,
 )
 from nemo_rl.models.generation.vllm.packed_logprobs import PackedSelectedLogprobs
+from nemo_rl.models.generation.vllm.queued_logprobs import LogprobBufferDetachment
 from nemo_rl.models.generation.vllm.utils import (
     _extract_selected_token_logprobs,
     own_routed_expert_fragments,
@@ -362,9 +363,11 @@ async def test_stats_and_finished_metadata_preserved(native: Any) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("overflow", [False, True])
+@pytest.mark.parametrize(
+    "overflow,detach", [(False, False), (True, False), (False, True)]
+)
 async def test_actual_receiver_dispatches_utility_and_propagates_overflow(
-    native: Any, overflow: bool
+    native: Any, overflow: bool, detach: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = Path("/tmp/nano35-vllm029-core-client.py")
     if not source.exists():
@@ -422,7 +425,10 @@ async def test_actual_receiver_dispatches_utility_and_propagates_overflow(
     reply = client.utility_results[42]
     client.decoder = native.MsgpackDecoder(native.EngineCoreOutputs)
     client._format_exception = lambda error: error
-    pipeline = CompactOutputPipeline(client, max_bytes=100000, max_messages=1)
+    if detach:
+        hook = install_logprob_detachment(native, client.decoder, monkeypatch)
+    else:
+        pipeline = CompactOutputPipeline(client, max_bytes=100000, max_messages=1)
     encoder = native.MsgpackEncoder()
     socket_queue.put_nowait(encoder.encode(make_output(native)))
     socket_queue.put_nowait(
@@ -439,7 +445,15 @@ async def test_actual_receiver_dispatches_utility_and_propagates_overflow(
     client._ensure_output_queue_task()
     try:
         assert await asyncio.wait_for(reply, 1) == "ack"
-        assert pipeline.stats()["decoded_messages"] == 0
+        if detach:
+            assert hook.stats()["copied_outputs"] == 1
+            # The native receiver has queued this message before the consumer runs.
+            queued = client.outputs_queue._queue[0]
+            assert all(
+                array.flags.owndata for array in queued.outputs[0].new_logprobs[:3]
+            )
+        else:
+            assert pipeline.stats()["decoded_messages"] == 0
         assert (await client.get_output_async()).outputs[0].request_id == "call"
         if overflow:
             with pytest.raises(BufferError):
@@ -755,7 +769,7 @@ def test_native_final_output_keeps_packed_history_without_materialization(
     ]
 
 
-@pytest.mark.parametrize("enabled,numeric", [(False, True), (True, False)])
+@pytest.mark.parametrize("enabled,numeric", [(False, False), (True, False)])
 def test_packed_config_rejects_missing_prerequisites(
     enabled: bool, numeric: bool
 ) -> None:
@@ -773,3 +787,168 @@ def test_packed_config_rejects_missing_prerequisites(
                 }
             }
         )
+
+
+@pytest.mark.parametrize("compact_queue", [False, True])
+def test_packed_capture_and_timings_work_with_either_queue(compact_queue: bool) -> None:
+    from nemo_rl.models.generation.vllm.config import (
+        CompactOutputConfig,
+        validate_vllm_async_actor_settings,
+    )
+
+    compact = dict(
+        enabled=compact_queue, packed_capture_logprobs=True, frontend_timings=True
+    )
+    validate_vllm_async_actor_settings(
+        {
+            "vllm_cfg": {
+                "async_engine": True,
+                "expose_http_server": True,
+                "flat_logprobs": True,
+                "compact_output": compact,
+            }
+        }
+    )
+    assert CompactOutputConfig.model_validate(compact).capture_logprobs_enabled
+    assert not CompactOutputConfig().capture_logprobs_enabled
+
+
+def install_logprob_detachment(
+    native: Any, decoder: Any, monkeypatch: pytest.MonkeyPatch
+) -> LogprobBufferDetachment:
+    """Bind the real extracted wire types at the optional vLLM import seam."""
+    engine = ModuleType("vllm.v1.engine")
+    engine.EngineCoreOutputs = native.EngineCoreOutputs
+    monkeypatch.setitem(sys.modules, engine.__name__, engine)
+    outputs = ModuleType("vllm.v1.outputs")
+    outputs.LogprobsLists = native.LogprobsLists
+    monkeypatch.setitem(sys.modules, outputs.__name__, outputs)
+    return LogprobBufferDetachment(decoder)
+
+
+@pytest.mark.parametrize("threshold", [0, 1_000_000])
+@pytest.mark.parametrize("positions", [0, 1, 8])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("width", [1, 4])
+def test_detached_logprobs_preserve_native_values_and_speculative_slices(
+    native: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    threshold: int,
+    positions: int,
+    dtype: Any,
+    width: int,
+) -> None:
+    client = make_client(native, threshold=threshold)
+    message = make_output(native, positions=positions)
+    lp = message.outputs[0].new_logprobs
+    message.outputs[0].new_logprobs = lp._replace(
+        logprob_token_ids=(
+            lp.logprob_token_ids.astype(np.int64) + np.arange(width) * 1000
+        ),
+        logprobs=np.repeat(lp.logprobs.astype(dtype), width, axis=1),
+        cu_num_generated_tokens=[0, positions],
+    )
+    frames = client.encoder.encode(message)
+    expected = client.decoder.decode(frames)
+    hook = install_logprob_detachment(native, client.decoder, monkeypatch)
+    actual = client.decoder.decode(frames)
+    left, right = expected.outputs[0], actual.outputs[0]
+    assert (
+        right.new_token_ids == left.new_token_ids
+        and actual.timestamp == expected.timestamp
+    )
+    assert type(right.new_logprobs) is type(left.new_logprobs)
+    assert right.new_logprobs.cu_num_generated_tokens == [0, positions]
+    for a, b in zip(left.new_logprobs[:3], right.new_logprobs[:3], strict=True):
+        assert a.dtype == b.dtype and a.shape == b.shape
+        np.testing.assert_array_equal(a, b)
+        assert b.flags.owndata
+        assert not np.shares_memory(a, b)
+    sliced = right.new_logprobs.slice_request(0, positions)
+    np.testing.assert_array_equal(sliced.logprobs, left.new_logprobs.logprobs)
+    np.testing.assert_array_equal(right.routed_experts, left.routed_experts)
+    assert right.routed_experts.flags.owndata == left.routed_experts.flags.owndata
+    assert hook.stats()["arrays_copied"] == 3
+    # Selected values, ranks and accumulation must also match the native consumer.
+    processors = [
+        native.LogprobsProcessor(
+            tokenizer=None,
+            logprobs=native.FlatLogprobs(),
+            prompt_logprobs=None,
+            cumulative_logprob=0.0,
+            num_logprobs=0,
+            num_prompt_logprobs=None,
+        )
+        for _ in range(2)
+    ]
+    processors[0]._update_sample_logprobs(left.new_logprobs)
+    processors[1]._update_sample_logprobs(right.new_logprobs)
+    assert processors[0].cumulative_logprob == processors[1].cumulative_logprob
+    assert processors[0].logprobs.logprobs == processors[1].logprobs.logprobs
+    assert processors[0].logprobs.ranks == processors[1].logprobs.ranks
+
+
+def test_detachment_releases_received_views_without_changing_other_payloads(
+    native: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = make_client(native, threshold=0)
+    decoded = client.decoder.decode(client.encoder.encode(make_output(native)))
+    lp = decoded.outputs[0].new_logprobs
+    arrays = lp[:3]
+    references = [weakref.ref(array) for array in arrays]
+    buffers = []
+    for array in arrays:
+        base = array
+        while isinstance(base, np.ndarray):
+            base = base.base
+        assert isinstance(base, memoryview)
+        buffers.append(weakref.ref(base))
+    routes = decoded.outputs[0].routed_experts
+    prompt = object()
+    decoded.outputs[0].new_prompt_logprobs_tensors = prompt
+    client.decoder.decode = lambda frames: decoded
+    hook = install_logprob_detachment(native, client.decoder, monkeypatch)
+    actual = client.decoder.decode([])
+    del lp, arrays, array, base
+    gc.collect()
+    assert all(reference() is None for reference in references + buffers)
+    assert actual is decoded
+    assert actual.outputs[0].routed_experts is routes
+    assert actual.outputs[0].new_prompt_logprobs_tensors is prompt
+    assert hook.stats()["arrays_copied"] == 3
+    before = hook.stats()["bytes_copied"]
+    client.decoder.decode([])
+    assert hook.stats()["bytes_copied"] == before  # Already owned: no second copy.
+
+
+def test_detachment_keeps_utility_and_decode_failure_behavior(
+    native: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = make_client(native)
+    hook = install_logprob_detachment(native, client.decoder, monkeypatch)
+    utility = native.EngineCoreOutputs(
+        utility_output=native.UtilityOutput(42, result=native.UtilityResult("ack"))
+    )
+    actual = client.decoder.decode(client.encoder.encode(utility))
+    assert actual.utility_output.result.result == "ack"
+    assert hook.stats()["arrays_copied"] == 0
+    with pytest.raises(msgspec.DecodeError):
+        client.decoder.decode([b"\xc1"])
+
+
+def test_detachment_config_is_opt_in_and_rejects_incompatible_paths() -> None:
+    from nemo_rl.models.generation.vllm.config import (
+        CompactOutputConfig,
+        validate_vllm_async_actor_settings,
+    )
+
+    assert not CompactOutputConfig().detach_queued_logprobs
+    base = {"async_engine": True, "compact_output": {"detach_queued_logprobs": True}}
+    validate_vllm_async_actor_settings({"vllm_cfg": base})
+    for bad in [
+        {**base, "async_engine": False},
+        {**base, "copy_decoded_arrays": True},
+        {**base, "compact_output": {"detach_queued_logprobs": True, "enabled": True}},
+    ]:
+        with pytest.raises(ValueError, match="logprob detachment"):
+            validate_vllm_async_actor_settings({"vllm_cfg": bad})

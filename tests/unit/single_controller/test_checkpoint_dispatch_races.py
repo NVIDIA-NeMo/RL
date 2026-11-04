@@ -1969,7 +1969,9 @@ def test_prefix_checkpoint_fences_terminal_writes_through_tq_cut(
         fence_timeouts: list[float | None] = []
 
         class FakeGeneration:
-            def begin_token_capture_snapshot_fence(self, *, timeout_s=None):
+            def begin_token_capture_snapshot_fence(
+                self, *, timeout_s=None, checkpoint_id=None
+            ):
                 fence_timeouts.append(timeout_s)
                 actor.mark("generation-fence")
                 return True
@@ -2029,7 +2031,9 @@ def test_prefix_checkpoint_reports_its_fence_hold_and_gym_cut_counts(
         )
 
         class FakeGeneration:
-            def begin_token_capture_snapshot_fence(self, *, timeout_s=None):
+            def begin_token_capture_snapshot_fence(
+                self, *, timeout_s=None, checkpoint_id=None
+            ):
                 return True
 
             def end_token_capture_snapshot_fence(self, *, timeout_s=None):
@@ -2069,7 +2073,9 @@ def test_prefix_checkpoint_releases_the_fence_when_it_fails(
     actor = FakeGymActor()
 
     class FakeGeneration:
-        def begin_token_capture_snapshot_fence(self, *, timeout_s=None):
+        def begin_token_capture_snapshot_fence(
+            self, *, timeout_s=None, checkpoint_id=None
+        ):
             actor.mark("generation-fence")
             if failure == "fence":
                 raise RuntimeError("fence timed out on worker 1")
@@ -2106,7 +2112,7 @@ class _FailingFenceGeneration:
         self.begin_error = begin_error
         self.end_error = end_error
 
-    def begin_token_capture_snapshot_fence(self, *, timeout_s=None):
+    def begin_token_capture_snapshot_fence(self, *, timeout_s=None, checkpoint_id=None):
         self.calls.append("begin")
         if self.begin_error is not None:
             raise self.begin_error

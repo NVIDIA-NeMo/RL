@@ -422,6 +422,25 @@ policy:
     port_range_low: 3000
     port_range_high: 4999
     backend: "vllm"
+    # Optional shared prefix-cut pipeline, configured under generation_cut_control:
+    # generation_cut_control:
+    #   max_workers: 4  # Legacy execution slots; pipeline has independent writers
+    #   group_pending_inventories: false  # Replaced by the shared pipeline
+    #   batch_inventory_writes: false  # Replaced by the shared pipeline
+    #   latency_diagnostics:
+    #     enabled: false  # Opt-in fence blockers, scheduler phases, native TQ timings and GC intervals
+    #     progress_interval_s: 5.0  # Positive seconds between bounded progress records
+    #     slow_call_s: 1.0  # Positive threshold for logging ordinary terminal PUTs
+    #     max_events: 256  # 16-4096 events per PUT / retained GC intervals
+    #     tq_internal_phases: true  # Validated pinned TQ/Mooncake client seams
+    #     gc_intervals: true  # Numeric callbacks only; no heap census or collection-policy changes
+    #   pipeline:
+    #     enabled: false
+    #     max_pending_inventories: 128  # Positive metadata admission limit
+    #     max_buffered_payload_bytes: 1073741824  # Tensor payload; excludes live engine histories
+    #     max_batch_payload_bytes: 268435456  # Must fit in the buffered byte limit
+    #     write_concurrency: 4  # 1-4 simultaneous native TQ writes
+    #     coalesce_wait_seconds: 0.25  # Finite, >=0; idle writers collect ready rows
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
     top_p: 1.0
@@ -533,6 +552,16 @@ policy:
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
       flat_logprobs: false # Flat engine logprob storage reduces GC pauses under large backlogs
+      # Optional vLLM 0.29 DP=1 diagnostic/flow-control block (all opt-in):
+      # compact_output:
+      #   enabled: false
+      #   max_queued_bytes: 536870912  # Encoded queue cap, not total frontend RSS
+      #   max_queued_messages: 8192
+      #   numeric_capture_logprobs: true  # Requires flat_logprobs + async HTTP engine
+      #   packed_capture_logprobs: false  # Can enable numeric capture with native queue
+      #   detach_queued_logprobs: false  # Own sample-logprob arrays before native queueing; async engine only, incompatible with compact queue / copy_decoded_arrays
+      #   frontend_timings: false  # Sample disjoint CPU stages without heap scans
+      #   frontend_timing_sample_every: 64  # Positive number of output chunks
       output_loop_yield_budget_ms: null # e.g. 20: yield to fence/refit calls while processing output backlogs
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
       http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.

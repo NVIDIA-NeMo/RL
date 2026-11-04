@@ -45,7 +45,7 @@ class GenerationPrefixCleanupConfig(BaseModel, extra="forbid"):
 class SnapshotGate(Protocol):
     """The worker's token-capture snapshot gate (``_TokenCaptureSnapshotGate``)."""
 
-    def enter(self) -> None: ...
+    def enter(self, *, operation: str = "unknown") -> None: ...
 
     def exit(self) -> None: ...
 
@@ -103,7 +103,7 @@ class BackgroundPrefixCleanup:
                     break
             keys = list(dict.fromkeys(key for call_keys in batch for key in call_keys))
             # A checkpoint fence waits for this CLEAR and blocks the next one.
-            self._gate.enter()
+            self._gate.enter(operation="background_cleanup")
             try:
                 self._clear(keys)
             except Exception:  # noqa: BLE001 - a lost delete only leaves extra rows

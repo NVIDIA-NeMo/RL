@@ -5279,7 +5279,9 @@ class SingleControllerActor:
                 )
             with checkpoint_phase("generation_fence"):
                 await asyncio.to_thread(
-                    self._gen.begin_token_capture_snapshot_fence, timeout_s=timeout_s
+                    self._gen.begin_token_capture_snapshot_fence,
+                    timeout_s=timeout_s,
+                    checkpoint_id=checkpoint_identity(),
                 )
             acquired = time.monotonic()
             if self._batch_attribution is not None:
