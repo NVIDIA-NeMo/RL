@@ -295,6 +295,14 @@ if [[ ! -f "${CONFIG}" ]]; then
   echo "ERROR: config file not found: ${CONFIG}" >&2
   exit 1
 fi
+# Omega configs need this checkout to have the Omega code (omega-algo branch). Without it the config schema
+# silently ignores grpo.loss_function and the job runs plain GRPO instead.
+if grep -qE '^[[:space:]]*loss_function:[[:space:]]*omega' "${CONFIG}" \
+    && [[ ! -f nemo_rl/algorithms/loss/omega_loss.py ]]; then
+  echo "ERROR: ${CONFIG} sets grpo.loss_function: omega, but $(pwd) has no nemo_rl/algorithms/loss/omega_loss.py." >&2
+  echo "       Check out the omega-algo branch there first, or the run would silently be GRPO." >&2
+  exit 1
+fi
 
 # Default checkpoints into BASE_LOG_DIR (same directory as ray.sub's
 # <jobid>-logs/ and the slurm-%j.out file below) when set, so everything for

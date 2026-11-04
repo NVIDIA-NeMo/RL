@@ -335,6 +335,11 @@ def validate_omega_setup(master_config: Any) -> None:
         "Omega loss is only wired into the synchronous grpo_train loop "
         "(set grpo.async_grpo.enabled=false)"
     )
+    data_plane = getattr(master_config, "data_plane", None) or {}
+    assert not data_plane.get("enabled"), (
+        "Omega loss is not supported with data_plane.enabled=true (the data plane "
+        "only ships a fixed set of train fields, so omega_coef would be dropped)"
+    )
     generation = policy["generation"]
     assert generation["top_k"] is None and generation["top_p"] == 1.0, (
         "Omega loss does not support top-k/top-p training-time filtering "

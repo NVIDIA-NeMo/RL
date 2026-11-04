@@ -74,7 +74,7 @@ LOGIN_HOST="${LOGIN_HOST:?Set LOGIN_HOST, e.g. user@cluster-login.example.com}"
 REMOTE_REPO_DIR="${REMOTE_REPO_DIR:?Set REMOTE_REPO_DIR to the Offline-RL-Internal path on the cluster}"
 SYNC="${SYNC:-0}"
 SYNC_CONFIGS="${SYNC_CONFIGS:-1}"  # lightweight: always sync the BIRD GRPO configs by default. Set 0 to disable.
-SYNC_CONFIGS_INCLUDE="${SYNC_CONFIGS_INCLUDE:-grpo_birdbench*.yaml}"  # only these files: the remote checkout may be a release branch whose other configs must stay as they are
+SYNC_CONFIGS_INCLUDE="${SYNC_CONFIGS_INCLUDE:-*_birdbench*.yaml}"  # grpo_ and omega_birdbench*.yaml; only these files: the remote checkout may be a release branch whose other configs must stay as they are
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 LOCAL_REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)

@@ -192,3 +192,51 @@ def test_per_sequence_invalid_and_empty_rows():
     torch.testing.assert_close(
         g, torch.autograd.grad(loss, logp)[0], rtol=1e-4, atol=1e-6
     )
+
+
+def _coef(logp, data, prompt_ids):
+    prev = torch.cat([torch.zeros(logp.shape[0], 1), logp.detach()], dim=1)
+    return compute_omega_coefficients(
+        prompt_ids=prompt_ids,
+        prev_logprobs=prev,
+        token_mask=data["token_mask"],
+        sample_mask=data["sample_mask"],
+        advantages=data["advantages"],
+        h_fn=H_FUNCTIONS["inverse_length"],
+        data=data,
+    )
+
+
+def test_per_sequence_fully_invalid_group_and_single_valid_response():
+    # Group 0: all invalid. Group 1: only row K valid (w = 1, so A - Abar = 0).
+    invalid = tuple(range(K)) + tuple(range(K + 1, 2 * K))
+    logp, data, _, _ = _make(invalid_rows=invalid)
+    coef, metrics = _coef(logp, data, _prompt_ids())
+    assert torch.isfinite(coef).all()
+    assert coef[: 2 * K].abs().sum() == 0
+    assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
+
+
+def test_per_sequence_extreme_logprobs_stay_finite():
+    logp, data, _, _ = _make()
+    with torch.no_grad():
+        logp[0] -= 5e4  # one response wildly unlikely
+        logp[K] = 0.0  # one response certain
+    coef, _ = _coef(logp, data, _prompt_ids())
+    assert torch.isfinite(coef).all()
+    g, _ = _per_sequence_grad(logp, data, _prompt_ids(), B * K)
+    assert torch.isfinite(g).all()
+
+
+def test_per_sequence_accepts_bf16_logprobs():
+    logp, data, _, _ = _make()
+    prev = torch.cat([torch.zeros(logp.shape[0], 1), logp.detach()], 1).bfloat16()
+    coef, _ = compute_omega_coefficients(
+        prompt_ids=_prompt_ids(),
+        prev_logprobs=prev,
+        token_mask=data["token_mask"],
+        sample_mask=data["sample_mask"],
+        advantages=data["advantages"],
+        h_fn=H_FUNCTIONS["inverse_length"],
+    )
+    assert coef.dtype == torch.float32 and torch.isfinite(coef).all()
