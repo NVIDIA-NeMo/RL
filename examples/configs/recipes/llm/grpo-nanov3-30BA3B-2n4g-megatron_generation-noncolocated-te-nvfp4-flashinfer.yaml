@@ -1,0 +1,83 @@
+# Nemotron Nano v3 with TE per-token NVFP4 routed experts in training and FlashInfer
+# per-token NVFP4 routed experts in Megatron generation, without batch-invariant mode:
+# train/generation KL is small but nonzero. Refit stays BF16 and generation requantizes
+# the experts. Attention, Mamba and shared experts stay BF16 on both sides.
+# Training runs TP2 x EP4 on one node; generation runs TP2 x EP4 on the other.
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  max_num_steps: 5
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-te-nvfp4-flashinfer
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  hf_config_overrides:
+    router_aux_loss_coef: 0
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: 4
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 128
+  automodel_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NVTE_NVFP4_ROW_SCALED_ACTIVATION: '1'
+      NVTE_NVFP4_DISABLE_RHT: '1'
+      NVTE_NVFP4_DISABLE_2D_QUANTIZATION: '1'
+      NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING: '1'
+      NVTE_BACKWARD_OVERRIDE: dequantized
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    defer_fp32_logits: true
+    use_fused_weighted_squared_relu: true
+    fp4_cfg:
+      enabled: true
+    te_precision_config_file: examples/te_precision/attn_bf16_mlp_nvfp4.yaml
+  generation:
+    backend: megatron
+    refit_transport: mcore
+    mcore_generation_config:
+      refit_backend: nccl
+      transformer_impl: inference_optimized
+      inference_grouped_gemm_backend: flashinfer
+      inference_moe_token_dispatcher_type: nvls
+      inference_moe_nvfp4_recipe: per_token
+      # Training's TE FP4 setup is merged into generation otherwise; the inference
+      # model quantizes its BF16 experts itself.
+      fp4_cfg:
+        enabled: false
+      te_precision_config_file: null
+      tensor_model_parallel_size: 2
+      expert_model_parallel_size: 4
+      sequence_parallel: true
+      moe_router_dtype: fp32
+      logprobs_mode: raw_logprobs
+      mamba_inference_ssm_states_dtype: float32
+      max_tokens: 256
+      max_requests: 32
+      moe_pad_experts_for_cuda_graph_inference: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: ${cluster.gpus_per_node}
+        num_nodes: 1
+logger:
+  log_dir: logs/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-te-nvfp4-flashinfer
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-te-nvfp4-flashinfer
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2
