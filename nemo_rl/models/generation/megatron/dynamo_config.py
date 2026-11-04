@@ -23,7 +23,7 @@ comes from the backend-neutral ``policy.generation.disaggregation`` block.
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, PositiveFloat
+from pydantic import BaseModel, Field, PositiveFloat, PositiveInt
 
 from nemo_rl.models.generation.interfaces import DisaggConfig
 
@@ -40,8 +40,8 @@ class EngineLayoutOverrides(BaseModel, extra="forbid"):
     engines may span different numbers of GPUs.
     """
 
-    tensor_model_parallel_size: int | None = None
-    pipeline_model_parallel_size: int | None = None
+    tensor_model_parallel_size: PositiveInt | None = None
+    pipeline_model_parallel_size: PositiveInt | None = None
 
 
 class MegatronDynamoFrontendArgs(BaseModel, extra="forbid"):

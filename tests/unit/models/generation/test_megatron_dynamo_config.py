@@ -14,9 +14,13 @@
 
 """Megatron prefill/decode engines behind Dynamo: the config switch and widths."""
 
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 
+from nemo_rl.models.generation import resolve_generation_class
+from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.megatron.dynamo_config import (
     MegatronDynamoCfg,
     disaggregation_cfg,
@@ -111,6 +115,25 @@ def test_dynamo_cfg_defaults_and_rejects_unknown_keys() -> None:
         megatron_dynamo_cfg(
             {"dynamo_cfg": {"decode_engine": {"context_parallel_size": 2}}}
         )
+
+
+@pytest.mark.parametrize("size", [0, -2])
+@pytest.mark.parametrize(
+    "key", ["tensor_model_parallel_size", "pipeline_model_parallel_size"]
+)
+def test_engine_layout_overrides_must_be_positive(key, size) -> None:
+    with pytest.raises(ValidationError, match="greater_than"):
+        megatron_dynamo_cfg({"dynamo_cfg": {"prefill_engine": {key: size}}})
+
+
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm", "dynamo"])
+def test_dynamo_switch_is_refused_for_non_megatron_backends(backend) -> None:
+    with pytest.raises(ValueError, match=f"does not apply to backend='{backend}'"):
+        resolve_generation_class({"backend": backend, "dynamo": True})
+
+
+def test_dynamo_switch_resolves_to_megatron_generation() -> None:
+    assert resolve_generation_class(_megatron_config()) is MegatronGeneration
 
 
 def test_engines_take_their_width_from_the_policy_layout() -> None:
@@ -283,3 +306,26 @@ def test_validation_rejects_unsupported_shapes(mutate, match) -> None:
 def test_validation_accepts_the_reference_shape_and_null_colocated() -> None:
     validate_megatron_dynamo_generation(_megatron_config())
     validate_megatron_dynamo_generation(_megatron_config(colocated=None))
+
+
+def _master_config(generation: dict) -> SimpleNamespace:
+    """The fields MegatronGeneration.validate_settings reads, at accepted values."""
+    return SimpleNamespace(
+        policy=_policy(generation),
+        async_rl=SimpleNamespace(
+            recompute_kv_cache_after_weight_updates=False,
+            generation_fleet_health=SimpleNamespace(enabled=False),
+        ),
+    )
+
+
+def test_megatron_generation_refuses_the_switch_until_the_fleet_exists() -> None:
+    with pytest.raises(NotImplementedError, match="not served by MegatronGeneration"):
+        MegatronGeneration.validate_settings(_master_config(_megatron_config()))
+
+
+def test_megatron_generation_names_an_unservable_shape_first() -> None:
+    generation = _megatron_config()
+    generation["disaggregation"]["enabled"] = False
+    with pytest.raises(ValueError, match="disaggregation.enabled=true"):
+        MegatronGeneration.validate_settings(_master_config(generation))
