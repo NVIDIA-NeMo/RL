@@ -48,9 +48,15 @@ def test_normalization_selectors_and_roundtrip() -> None:
                 loss = ClippedPGLossFn(config)
         assert loss.normalization == expected
 
-    for legacy in (True, False):
-        with pytest.raises(ValidationError, match="Set only one"):
-            ClippedPGLossConfig(normalization="sequence_mean", token_level_loss=legacy)
+    # Strict during the deprecation window: one selector, even when they agree.
+    # The error must name the fix for an inherited legacy value.
+    for normalization in ("global_token_mean", "sequence_mean"):
+        for legacy in (True, False):
+            with pytest.raises(ValidationError, match="Set only one") as error:
+                ClippedPGLossConfig(
+                    normalization=normalization, token_level_loss=legacy
+                )
+            assert "token_level_loss=null" in str(error.value)
     with pytest.raises(ValidationError):
         ClippedPGLossConfig(normalization="typo")
 
