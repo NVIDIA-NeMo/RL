@@ -398,6 +398,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 recovery_state = build_rollout_recovery_state(
                     self._rollout_manager.recovery_ledger,
                     batch_shortfall=self._rollout_runtime.batch_shortfall,
+                    steps_allowed_short=self._rollout_runtime.steps_allowed_short,
                     sampler_stamps_target_steps=self._rollout_runtime.sampler_stamps_target_steps,
                     finalizer_metrics_by_group=self._rollout_runtime.finalizer_metrics_by_group,
                     finalizer_rewards_by_group=self._rollout_runtime.finalizer_rewards_by_group,

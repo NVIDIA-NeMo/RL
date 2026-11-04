@@ -2609,7 +2609,7 @@ def test_data_exhausted_step_respects_batch_floor(
     monkeypatch, credit_in_evict: bool, fraction: float, skipped: bool
 ) -> None:
     ctrl = _dropping_controller(credit_in_evict=credit_in_evict)
-    ctrl._steps_allowed_short.add(0)
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
     ctrl._async_cfg.rollout_failure.min_step_batch_fraction = fraction
     ctrl._trainer.abort_train_step = MagicMock()
     ctrl._trainer.finish_train_step = MagicMock(return_value={})
@@ -2643,8 +2643,8 @@ def test_skipped_exhausted_step_allows_later_admitted_step_to_train(
     ]
     ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
     ctrl._algo_cfg.max_num_steps = 2
-    ctrl._steps_allowed_short.add(0)
-    ctrl._batch_shortfall[0] = 1
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._rollout_runtime.batch_shortfall[0] = 1
     ctrl._trainer.abort_train_step = MagicMock()
     ctrl._trainer.finish_train_step = MagicMock(return_value={})
     ctrl._sync_weights = AsyncMock(return_value=0)
@@ -2670,8 +2670,8 @@ def test_data_exhausted_step_with_no_groups_skips_without_opening_optimizer(
     monkeypatch,
 ) -> None:
     ctrl = _train_pump_controller(sampler=_EmptySampler())
-    ctrl._steps_allowed_short.add(0)
-    ctrl._batch_shortfall[0] = 2
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._rollout_runtime.batch_shortfall[0] = 2
     ctrl._trainer.begin_train_step = MagicMock()
     ctrl._trainer.abort_train_step = MagicMock()
     ctrl._trainer.finish_train_step = MagicMock()
@@ -4721,6 +4721,7 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     state = build_rollout_recovery_state(
         RolloutRecoveryLedger(),
         batch_shortfall={},
+        steps_allowed_short=set(),
         sampler_stamps_target_steps=True,
         finalizer_metrics_by_group=pending,
         finalizer_rewards_by_group={
