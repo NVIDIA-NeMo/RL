@@ -67,6 +67,32 @@ H_FUNCTIONS: dict[str, HFunction] = {
 }
 
 
+def _token_mult_prob_error(
+    data: BatchedDataDict[Any],
+    sample_mask: torch.Tensor,
+    global_valid_toks: torch.Tensor | None,
+) -> float:
+    """vLLM-vs-training logprob mismatch, computed exactly as ClippedPGLossFn does.
+
+    mean over valid response tokens of exp(|generation_logprobs - prev_logprobs|).
+    The GRPO loop reads ``metrics["token_mult_prob_error"]`` after every step
+    (and plots samples above 1.05), so every policy loss must report it; it
+    also keeps this diagnostic comparable between GRPO and Omega runs.
+    """
+    token_mask = data["token_mask"][:, 1:].to(torch.float32)
+    mask = token_mask * sample_mask.to(torch.float32).unsqueeze(-1)
+    gen = data["generation_logprobs"][:, 1:].to(torch.float32)
+    prev = data["prev_logprobs"][:, 1:].to(torch.float32)
+    gen = torch.where(mask.bool(), gen, 0.0)
+    prev = torch.where(mask.bool(), prev, 0.0)
+    lp_error = torch.abs(gen - prev)
+    return masked_mean(
+        torch.exp(lp_error * mask),
+        mask,
+        global_normalization_factor=global_valid_toks,
+    ).item()
+
+
 class OmegaLossConfig(BaseModel, extra="allow"):
     # Name of the exponent function h(x, y); one of ``H_FUNCTIONS``.
     h: str = "inverse_length"
@@ -105,6 +131,7 @@ class OmegaLossFn(LossFunction):
             "response_len_mean": MetricNormalizer.SEQUENCES,
             "h_mean": MetricNormalizer.SEQUENCES,
             "num_empty_responses": MetricNormalizer.NONE,
+            "token_mult_prob_error": MetricNormalizer.TOKENS,
         }
 
     def __call__(
@@ -178,6 +205,9 @@ class OmegaLossFn(LossFunction):
                 "h_mean": masked_mean(
                     h, sample_mask, global_normalization_factor=global_valid_seqs
                 ).item(),
+                "token_mult_prob_error": _token_mult_prob_error(
+                    data, data["sample_mask"], global_valid_toks
+                ),
             }
         return loss, metrics
 
@@ -283,6 +313,7 @@ class OmegaPerSequenceLossFn(LossFunction):
         self.metric_normalizations = {
             "loss": MetricNormalizer.SEQUENCES,
             "seq_logprob_mean": MetricNormalizer.SEQUENCES,
+            "token_mult_prob_error": MetricNormalizer.TOKENS,
         }
 
     def __call__(
@@ -310,6 +341,9 @@ class OmegaPerSequenceLossFn(LossFunction):
                 sample_mask,
                 global_normalization_factor=global_valid_seqs,
             ).item(),
+            "token_mult_prob_error": _token_mult_prob_error(
+                data, sample_mask, global_valid_toks
+            ),
         }
         return loss, metrics
 

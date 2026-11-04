@@ -40,11 +40,15 @@ def _make(seed=0, invalid_rows=()):
     sample_mask = torch.ones(B * K)
     for r in invalid_rows:
         sample_mask[r] = 0
+    gen_lp = torch.cat([torch.zeros(B * K, 1), logp.detach()], 1)
+    gen_lp = gen_lp + 0.05 * torch.randn(gen_lp.shape, generator=g)  # vLLM drift
     data = BatchedDataDict(
         {
             "token_mask": token_mask,
             "sample_mask": sample_mask,
             "advantages": adv.expand(-1, T).clone(),
+            "generation_logprobs": gen_lp,
+            "prev_logprobs": torch.cat([torch.zeros(B * K, 1), logp.detach()], 1),
         }
     )
     return logp, data, lens, rewards
@@ -240,3 +244,42 @@ def test_per_sequence_accepts_bf16_logprobs():
         h_fn=H_FUNCTIONS["inverse_length"],
     )
     assert coef.dtype == torch.float32 and torch.isfinite(coef).all()
+
+
+def _clipped_pg_mult_prob_error(data, global_valid_toks):
+    """Reference: the ClippedPGLossFn computation of token_mult_prob_error."""
+    token_mask = data["token_mask"][:, 1:]
+    mask = token_mask * data["sample_mask"].unsqueeze(-1)
+    gen = torch.where(mask.bool(), data["generation_logprobs"][:, 1:], 0.0)
+    prev = torch.where(mask.bool(), data["prev_logprobs"][:, 1:], 0.0)
+    return (torch.exp(torch.abs(gen - prev) * mask) * mask).sum() / (
+        global_valid_toks + 1e-8
+    )
+
+
+def test_both_forms_report_token_mult_prob_error_like_grpo():
+    """grpo_train reads metrics["token_mult_prob_error"] after every step."""
+    logp, data, _, _ = _make(invalid_rows=(3,))
+    gvt = (data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)).sum()
+    ref = _clipped_pg_mult_prob_error(data, gvt).item()
+    assert ref > 1.0  # the injected drift is visible
+
+    group = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K)
+    _, m = group(logp, data, torch.tensor(float(B * K - 1)), gvt)
+    assert abs(m["token_mult_prob_error"] - ref) < 1e-5
+
+    data["omega_coef"] = torch.zeros(B * K)
+    _, m = OmegaPerSequenceLossFn()(logp, data, torch.tensor(float(B * K - 1)), gvt)
+    assert abs(m["token_mult_prob_error"] - ref) < 1e-5
+
+    # Packed, non-fused path: one row per call, metrics summed by the wrapper.
+    total = sum(
+        OmegaPerSequenceLossFn()(
+            logp[i : i + 1],
+            BatchedDataDict({k: v[i : i + 1] for k, v in data.items()}),
+            torch.tensor(float(B * K - 1)),
+            gvt,
+        )[1]["token_mult_prob_error"]
+        for i in range(B * K)
+    )
+    assert abs(total - ref) < 1e-4
