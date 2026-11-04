@@ -413,17 +413,30 @@ def parse_reward_log_context(value: object) -> RewardLogContext | None:
     return RewardLogContext(value["agent_name"], value["full_result_json"])
 
 
+def scored_text_checks(result: dict[str, Any]) -> tuple[bool, bool]:
+    """Duplicated-reasoning and empty-final-answer checks on the scored response."""
+    response = result.get("response")
+    output = response.get("output", []) if isinstance(response, dict) else []
+    return has_duplicated_reasoning(output), has_empty_final_answer(output)
+
+
 def compute_reward_checks(
     result: dict[str, Any],
     row: dict[str, Any],
     effort_config: EffortLevelsConfig | None,
+    text_checks: tuple[bool, bool] | None = None,
 ) -> RewardChecks:
-    """Evaluate available checks before sealing, without changing the raw reward."""
-    response = result.get("response")
-    output = response.get("output", []) if isinstance(response, dict) else []
+    """Evaluate available checks before sealing, without changing the raw reward.
+
+    ``text_checks`` comes from ``scored_text_checks`` when the caller no longer
+    holds the scored response (Forest results carry scalar fields only).
+    """
+    duplicated, empty = (
+        text_checks if text_checks is not None else scored_text_checks(result)
+    )
     return RewardChecks(
-        has_duplicated_reasoning(output),
-        has_empty_final_answer(output),
+        duplicated,
+        empty,
         is_low_effort(row, effort_config)
         if effort_shaping_enabled(effort_config) and effort_config is not None
         else False,
@@ -476,49 +489,75 @@ def finalize_capture_reward(
                     counts[spec.name] = int(
                         spec.enabled(penalty_config) and spec.text_match(checks)
                     )
-        unwanted_ids: list[int] | None = None
-        if penalty_config.penalize_unwanted_tokens:
-            assert penalty_config.token_ids is not None
-            unwanted_ids = penalty_config.token_ids.unwanted
-            assert unwanted_ids is not None
-        think_tags: Sequence[str] | None = None
-        think_tag_ids: tuple[int, int] | None = None
-        if penalty_config.penalize_malformed_think_tag:
-            if decode is None or thinking_tags is None or len(thinking_tags) < 2:
-                raise RuntimeError(
-                    "penalize_malformed_think_tag needs decode and open/close "
-                    "thinking_tags; the finalizer was built without them"
-                )
-            think_tags = thinking_tags
-            think_ids = penalty_config.token_ids
-            if (
-                think_ids is not None
-                and think_ids.think_open is not None
-                and think_ids.think_close is not None
-            ):
-                think_tag_ids = (think_ids.think_open, think_ids.think_close)
-        offset = 0
-        for _, carry, generated in link_spans:
-            start = offset + carry
-            end = start + generated
-            generation = token_ids[start:end]
-            if unwanted_ids is not None and has_unwanted_tokens(
-                (generation,), unwanted_ids
-            ):
-                counts["unwanted_token"] = 1
-            if think_tags is not None and not counts["malformed_think_tag"]:
-                assert decode is not None
-                counts["malformed_think_tag"] = int(
-                    has_malformed_think_tag(
-                        token_ids[offset:start],
-                        generation,
-                        think_tag_ids=think_tag_ids,
-                        thinking_tags=think_tags,
-                        decode=decode,
-                    )
-                )
-            offset = end
+        counts.update(
+            capture_token_penalty_counts(
+                penalty_config,
+                token_ids=token_ids,
+                link_spans=link_spans,
+                decode=decode,
+                thinking_tags=thinking_tags,
+            )
+        )
     return (0.0 if any(counts.values()) else reward), counts, metrics
+
+
+def capture_token_penalty_counts(
+    penalty_config: RewardPenaltyConfig,
+    *,
+    token_ids: list[int],
+    link_spans: list[tuple[str, int, int]],
+    decode: Callable[[Sequence[int]], str] | None = None,
+    thinking_tags: Sequence[str] | None = None,
+) -> dict[str, int]:
+    """Count token-level penalties over the generated spans of one captured row.
+
+    Text penalties are rollout-scoped and read the final result instead. The
+    malformed-think-tag check needs ``decode`` and the open/close ``thinking_tags``.
+    """
+    counts: dict[str, int] = {}
+    unwanted_ids: list[int] | None = None
+    if penalty_config.penalize_unwanted_tokens:
+        assert penalty_config.token_ids is not None
+        unwanted_ids = penalty_config.token_ids.unwanted
+        assert unwanted_ids is not None
+        counts["unwanted_token"] = 0
+    think_tag_ids: tuple[int, int] | None = None
+    if penalty_config.penalize_malformed_think_tag:
+        if decode is None or thinking_tags is None or len(thinking_tags) < 2:
+            raise RuntimeError(
+                "penalize_malformed_think_tag needs decode and open/close "
+                "thinking_tags; the finalizer was built without them"
+            )
+        think_ids = penalty_config.token_ids
+        if (
+            think_ids is not None
+            and think_ids.think_open is not None
+            and think_ids.think_close is not None
+        ):
+            think_tag_ids = (think_ids.think_open, think_ids.think_close)
+        counts["malformed_think_tag"] = 0
+    offset = 0
+    for _, carry, generated in link_spans:
+        start = offset + carry
+        end = start + generated
+        generation = token_ids[start:end]
+        if unwanted_ids is not None and has_unwanted_tokens(
+            (generation,), unwanted_ids
+        ):
+            counts["unwanted_token"] = 1
+        if "malformed_think_tag" in counts and not counts["malformed_think_tag"]:
+            assert decode is not None and thinking_tags is not None
+            counts["malformed_think_tag"] = int(
+                has_malformed_think_tag(
+                    token_ids[offset:start],
+                    generation,
+                    think_tag_ids=think_tag_ids,
+                    thinking_tags=thinking_tags,
+                    decode=decode,
+                )
+            )
+        offset = end
+    return counts
 
 
 CAPTURE_PENALTY_METRICS = {spec.name: spec.metric for spec in CAPTURE_PENALTIES}

@@ -19,10 +19,15 @@ pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
 from responses_api_models.vllm_model.tests import test_framework_context as gym
 
+from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTER_EXCLUDED_ROWS
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.environments.call_selection import select_captured_calls
-from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
+from nemo_rl.experience.reward_penalties import (
+    RewardChecks,
+    RewardLogContext,
+    compute_reward_checks,
+)
 from nemo_rl.experience.rollout_reassembler import (
     ActionOutputFlags,
     RolloutReassembler,
@@ -757,6 +762,37 @@ def test_all_captured_never_guesses_scored_terminal(forest, contradictory):
         )
 
 
+@pytest.mark.parametrize("final_text,empty", [("Done.", False), ("", True)])
+def test_forest_text_checks_read_the_scored_response(forest, final_text, empty):
+    # Forest results keep scalar fields only, so the text checks must be taken
+    # from the scored response before it is dropped.
+    records, replies = forest.capture([None, 0])
+    env = _env(forest.harness)
+    env._selection_policy = "all_captured"
+    result = ordinary(replies)
+    result["reward"] = 1.0
+    result["response"]["output"].append(
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": final_text}],
+        }
+    )
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+    )
+    assert "response" not in processed["full_result"]
+    assert processed["scored_text_checks"] == (False, empty)
+    checks = compute_reward_checks(
+        processed["full_result"],
+        {},
+        None,
+        text_checks=processed["scored_text_checks"],
+    )
+    assert checks.empty_final_answer is empty
+    assert not checks.duplicated_reasoning
+
+
 @pytest.mark.parametrize("compact", [False, True])
 def test_twenty_calls_keep_baseline_rows(forest: ForestCapture, compact: bool) -> None:
     parents = [None] + list(range(19))
@@ -1285,6 +1321,59 @@ def test_forest_rows_flag_padding_for_router_statistics(forest: ForestCapture) -
         for key in result.meta.sample_ids
     ]
     assert flags == [False, False, True, True]
+
+
+_UNWANTED = 54321
+
+
+@pytest.mark.parametrize("scope", ["scored_segment", "all_segments"])
+@pytest.mark.parametrize("hit", [None, "scored", "other"])
+def test_forest_penalty_scope_combines_segment_token_checks(
+    forest: ForestCapture,
+    monkeypatch: pytest.MonkeyPatch,
+    scope: str,
+    hit: str | None,
+) -> None:
+    # Calls 0-1 form the scored segment; call 2 opens an independent root.
+    complete = gym.RolloutTokenCapture.complete_call
+    completed: list[None] = []
+
+    def tagged_completion(capture: Any, active: Any, **kwargs: Any) -> Any:
+        completed.append(None)
+        if hit is not None and len(completed) == (2 if hit == "scored" else 3):
+            kwargs["generated_token_ids"] = [_UNWANTED] * len(
+                kwargs["generated_token_ids"]
+            )
+        return complete(capture, active, **kwargs)
+
+    monkeypatch.setattr(gym.RolloutTokenCapture, "complete_call", tagged_completion)
+    records, _ = forest.capture([None, 0, None])
+    forest.finalizer._reward_penalty_config = RewardPenaltyConfig(
+        penalize_unwanted_tokens=True, token_ids={"unwanted": [_UNWANTED]}
+    )
+    forest.finalizer._forest_penalty_scope = scope
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [receipt(records, terminal=records[1])],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[selection(records)],
+    )
+    penalized = hit == "scored" or (hit == "other" and scope == "all_segments")
+    assert result.valid_row_count == 2
+    assert [obs.reward for obs in result.reward_observations] == [
+        0.0 if penalized else 1.0
+    ]
+    for key in result.meta.sample_ids:
+        assert forest.plane.rows["canonical", key]["total_reward"].item() == (
+            0.0 if penalized else 1.0
+        )
+    # Counted once per owner, however many segments hit.
+    assert result.metrics["finalize/penalty_count/unwanted_token"] == float(penalized)
 
 
 def test_publication_identity_drift_preserves_staging(forest, monkeypatch):

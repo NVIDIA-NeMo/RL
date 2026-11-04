@@ -710,6 +710,12 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Step padding only. Which real rows the padding copies: row0 repeats the
     # batch's first row; cyclic takes rows 0, 1, 2, ...
     forest_pad_source: Literal["row0", "cyclic"] = "row0"
+    # Which Forest segments the token-level reward penalties (unwanted tokens,
+    # malformed think tags) check.
+    # scored_segment: only the segment holding the scored call (default).
+    # all_segments: every segment; a hit in any of them zeroes the owner's reward.
+    # Rollout-scoped text penalties always run once, on the scored segment.
+    forest_penalty_scope: Literal["scored_segment", "all_segments"] = "scored_segment"
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
@@ -719,6 +725,7 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
                 f"selection_policy={self.selection_policy} requires forest_training=true"
             )
         forest_only = {
+            "forest_penalty_scope": self.forest_penalty_scope != "scored_segment",
             "exclude_padding_from_router_stats": self.exclude_padding_from_router_stats,
             "forest_padding_scope": self.forest_padding_scope != "group",
         }
@@ -1819,10 +1826,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
         validate_forest_objective(forest_algo_cfg, master_config.loss_fn)
-        if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
-            raise ValueError(
-                "Forest does not support reward penalties or on-policy distillation"
-            )
+        if opd_module.is_opd_enabled(master_config):
+            raise ValueError("Forest does not support on-policy distillation")
         # Validate the fixed-batch policy and critic shapes before
         # workers/generation start. Setup recomputes Q from the actual DP meshes.
         forest_execution_row_multiple(
