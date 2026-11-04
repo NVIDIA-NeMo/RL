@@ -15,7 +15,7 @@
 import enum
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar, Literal, Protocol
 
 import torch
 
@@ -93,8 +93,8 @@ class ObjectiveReduction:
     def validate_setup(
         self,
         *,
-        trainer: str,
-        algorithm: str,
+        trainer: Literal["single_controller", "grpo", "ppo"],
+        algorithm: Literal["grpo", "ppo"],
         megatron_enabled: bool,
         on_policy_distillation: bool,
     ) -> None:
@@ -288,6 +288,8 @@ class SequenceMeanReduction(ObjectiveReduction):
 class GroupTokenMeanReduction(GlobalTokenMeanReduction):
     """Average valid tokens within each prompt group, then average groups equally."""
 
+    # metric_normalizer=TOKENS is inherited for the token diagnostics only;
+    # ClippedPGLossFn drops the loss/kl entries because the group denominator applies.
     requires_explicit_denominator: ClassVar[bool] = True
     token_normalized: ClassVar[bool] = False
     extra_fields: ClassVar[tuple[str, ...]] = (GROUP_TOKEN_MEAN_WEIGHT,)
@@ -295,8 +297,8 @@ class GroupTokenMeanReduction(GlobalTokenMeanReduction):
     def validate_setup(
         self,
         *,
-        trainer: str,
-        algorithm: str,
+        trainer: Literal["single_controller", "grpo", "ppo"],
+        algorithm: Literal["grpo", "ppo"],
         megatron_enabled: bool,
         on_policy_distillation: bool,
     ) -> None:

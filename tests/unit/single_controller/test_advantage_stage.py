@@ -800,6 +800,7 @@ def test_group_token_mean_weights_use_complete_groups_and_final_masks() -> None:
     store = _RowStore(rows)
     ctrl = _controller("grpo", 3, store, group_token_mean=True)
     asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    assert rows["s0"]["sample_mask"].item() == 0.0  # mask_sample reached the row
     for group in range(NUM_GROUPS):
         siblings = [
             rows[f"s{group * GROUP_SIZE + member}"] for member in range(GROUP_SIZE)

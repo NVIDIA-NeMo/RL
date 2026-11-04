@@ -1595,6 +1595,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         megatron_enabled=megatron_cfg is not None and megatron_cfg["enabled"],
         on_policy_distillation=opd_module.is_opd_enabled(master_config),
     )
+    # Also checked in ClippedPGLossFn.__init__; here it fails before the cluster starts.
     reduction.validate_loss_options(
         sequence_level_importance_ratios=loss_config.sequence_level_importance_ratios,
         opd_full=opd_module.get_opd_full_config(master_config) is not None,
