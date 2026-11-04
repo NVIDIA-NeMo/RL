@@ -92,6 +92,12 @@ policy:
     manual_gc: false
     manual_gc_interval: 10
     activation_checkpointing: false
+    # Optional checkpoint-I/O knobs forwarded to Megatron Bridge's
+    # CheckpointConfig. When unset, the historical hard-coded defaults are used.
+    # checkpoint:
+    #   fully_parallel_save: true   # Set false to simplify debugging at the cost of throughput
+    #   fully_parallel_load: true   # Set false to simplify debugging at the cost of throughput
+    #   load_rng: false             # Set true to include/restore RNG state for bit-exact resume
     # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
     cuda_graph_impl: "none"
     cuda_graph_modules: []
