@@ -1267,9 +1267,7 @@ def _in_loss_seq_filter_loss_fn():
 
 
 class TestFinishInLossSeqFilter:
-    def test_divides_by_survivor_counts_summed_across_chunks(
-        self, mock_module_symbols
-    ):
+    def test_divides_by_survivor_counts_summed_across_chunks(self, mock_module_symbols):
         """Survivor counts from the loss, not the pre-filter masks, set 1/N."""
         from nemo_rl.algorithms.loss.interfaces import LossType
 
