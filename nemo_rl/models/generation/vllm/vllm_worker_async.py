@@ -588,10 +588,6 @@ class VllmAsyncGenerationWorkerImpl(
         # Initialize the vLLM engine
         api_server_count = self.cfg["vllm_cfg"].get("http_api_server_count", 1)
         if api_server_count > 1:
-            if self._sparse_refit_receiver is not None:
-                raise ValueError(
-                    "Multiple HTTP API servers do not support sparse refit"
-                )
             if self._reserved_socket is None:
                 self._reserve_port()
             # Multiple API servers require separate frontend and engine setup.
