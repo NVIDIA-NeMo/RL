@@ -40,6 +40,7 @@ from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
     GRPOConfig,
     RewardPenaltyConfig,
+    _validate_seq_logprob_error_in_loss,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -991,7 +992,10 @@ def logprob_passes_required(
     return (
         not (
             master_config.loss_fn.force_on_policy_ratio
-            and algo_cfg.seq_logprob_error_threshold is None
+            and (
+                algo_cfg.seq_logprob_error_threshold is None
+                or master_config.loss_fn.seq_logprob_error_in_loss
+            )
         ),
         bool(
             master_config.loss_fn.reference_policy_kl_penalty > 0
@@ -1559,11 +1563,15 @@ def resolve_ppo_chunk_alignment(
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
-        raise ValueError(
-            "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "
-            "its advantage baselines depend on the pre-training sequence mask. "
-            "Use the non-streaming GRPO trainer."
-        )
+        if is_ppo_run(master_config):
+            raise ValueError("loss_fn.seq_logprob_error_in_loss requires GRPO")
+        # The loss filters physical rows; forest training masks whole owners.
+        if master_config.token_capture.forest_training:
+            raise ValueError(
+                "loss_fn.seq_logprob_error_in_loss does not support "
+                "token_capture.forest_training"
+            )
+        _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl
