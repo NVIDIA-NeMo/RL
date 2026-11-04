@@ -19,6 +19,7 @@ _SPEC = importlib.util.spec_from_file_location("frozen_engram_loader", _SOURCE)
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 load_frozen_engram_tables = _MODULE.load_frozen_engram_tables
+_bulk_read_rows = _MODULE._bulk_read_rows
 
 
 class _Mapper:
@@ -79,3 +80,30 @@ def test_native_bytes_and_trainable_weights_unchanged(tmp_path, first, last):
     model.table.dim = 32
     with pytest.raises(ValueError, match="layout mismatch"):
         load_frozen_engram_tables(model, str(tmp_path))
+
+
+@pytest.mark.parametrize("first,last,chunk_bytes", [(0, 1000, 256 * 1024 * 1024), (37, 963, 1000), (999, 1000, 7)])
+def test_bulk_read_rows_matches_safetensors_slice(tmp_path, first, last, chunk_bytes):
+    """Byte-offset reads must return exactly what the safetensors slice API returns."""
+    from safetensors import safe_open
+
+    torch.manual_seed(3)
+    width = 96
+    table = torch.randint(0, 256, (1000, width), dtype=torch.uint8)
+    other = torch.randint(0, 256, (10, 16), dtype=torch.uint8)
+    save_file({"zz.first": other, "layers.1.engram.embed.weight": table.view(torch.float8_e4m3fn)}, tmp_path / "t.safetensors")
+    destination = torch.empty(last - first, width, dtype=torch.float8_e4m3fn)
+    _bulk_read_rows(tmp_path / "t.safetensors", "layers.1.engram.embed.weight", first, last, width, destination, chunk_bytes=chunk_bytes)
+    with safe_open(tmp_path / "t.safetensors", framework="pt", device="cpu") as reader:
+        expected = reader.get_slice("layers.1.engram.embed.weight")[first:last].view(torch.uint8)
+    torch.testing.assert_close(destination.view(torch.uint8), expected, rtol=0, atol=0)
+    torch.testing.assert_close(destination.view(torch.uint8), table[first:last], rtol=0, atol=0)
+
+
+def test_bulk_read_rows_rejects_width_and_size_mismatch(tmp_path):
+    table = torch.zeros(8, 32, dtype=torch.uint8)
+    save_file({"t": table}, tmp_path / "t.safetensors")
+    with pytest.raises(ValueError, match="header width mismatch"):
+        _bulk_read_rows(tmp_path / "t.safetensors", "t", 0, 8, 16, torch.empty(8, 16, dtype=torch.uint8))
+    with pytest.raises(ValueError, match="destination size mismatch"):
+        _bulk_read_rows(tmp_path / "t.safetensors", "t", 0, 8, 32, torch.empty(4, 32, dtype=torch.uint8))
