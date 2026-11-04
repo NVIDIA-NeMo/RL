@@ -12,8 +12,14 @@ from nemo_rl.algorithms.loss import (
     SequencePackingFusionLossWrapper,
     SequencePackingLossWrapper,
 )
-from nemo_rl.algorithms.loss.interfaces import GroupTokenMeanReduction
+from nemo_rl.algorithms.loss.interfaces import (
+    GroupTokenMeanReduction,
+    MetricNormalizer,
+    make_objective_reduction,
+)
+from nemo_rl.algorithms.loss.utils import group_token_mean_weights
 from nemo_rl.algorithms.loss.wrapper import StreamingObjectiveLoss
+from nemo_rl.data_plane.schema import GROUP_TOKEN_MEAN_WEIGHT
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 GROUP_INDICES = torch.tensor([0, 0, 1, 1, 1, 2, 2])
@@ -182,4 +188,114 @@ def test_sequence_packing_preserves_group_weights_and_gradients(fused: bool) -> 
     torch.testing.assert_close(
         torch.autograd.grad(packed_loss, current, retain_graph=True)[0],
         torch.autograd.grad(full, current)[0],
+    )
+
+
+def _weights_inputs() -> dict[str, Any]:
+    """Valid inputs for group_token_mean_weights: two groups of two rows."""
+    token_mask = torch.ones(4, 4)
+    token_mask[:, 0] = 0
+    return {
+        "sample_ids": ["a", "b", "c", "d"],
+        "token_mask": token_mask,
+        "sample_mask": torch.ones(4),
+        "group_indices": torch.tensor([0, 1, 0, 1]),
+        "expected_group_size": 2,
+    }
+
+
+def _loss_data() -> tuple[BatchedDataDict[Any], torch.Tensor]:
+    """One group of two responses with three valid tokens each (T_g = 6)."""
+    token_mask = torch.tensor([[0.0, 1, 1, 1], [0, 1, 1, 1]])
+    sample_mask = torch.ones(2)
+    data = BatchedDataDict(
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+        advantages=torch.tensor([[0.0, 1, -1, 2], [0, -2, 1, 1]]),
+        prev_logprobs=torch.full((2, 4), -2.0),
+        generation_logprobs=torch.full((2, 4), -2.0),
+        reference_policy_logprobs=torch.full((2, 4), -2.1),
+    )
+    data[GROUP_TOKEN_MEAN_WEIGHT] = group_token_mean_weights(
+        ["a", "b"], token_mask, sample_mask, group_indices=torch.tensor([0, 0])
+    )
+    return data, torch.full((2, 3), -2.5, requires_grad=True)
+
+
+def test_group_token_mean_requires_an_explicit_denominator() -> None:
+    data, current = _loss_data()
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(normalization="group_token_mean"))
+    with pytest.raises(ValueError, match="split training path"):
+        loss_fn(
+            data=data,
+            next_token_logprobs=current,
+            global_valid_toks=torch.tensor(6.0),
+            global_valid_seqs=torch.tensor(2.0),
+        )
+
+
+def test_group_token_mean_rejects_malformed_row_weights() -> None:
+    data, current = _loss_data()
+    data[GROUP_TOKEN_MEAN_WEIGHT] = torch.full((2, 1), 1 / 6)
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(normalization="group_token_mean"))
+    with pytest.raises(ValueError, match="must match sample_mask"):
+        loss_fn(
+            data=data,
+            next_token_logprobs=current,
+            global_valid_toks=torch.tensor(6.0),
+            global_valid_seqs=torch.tensor(2.0),
+            global_objective_denominator=torch.tensor(1.0),
+        )
+
+
+def test_group_token_mean_defers_loss_metrics_to_the_group_denominator() -> None:
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(normalization="group_token_mean"))
+    assert "loss" not in loss_fn.metric_normalizations
+    assert "kl_penalty" not in loss_fn.metric_normalizations
+    assert (
+        loss_fn.metric_normalizations["token_mult_prob_error"]
+        is MetricNormalizer.TOKENS
+    )
+
+
+@pytest.mark.parametrize(
+    "override,match",
+    [
+        ({"sample_ids": ["a", "a", "c", "d"]}, "unique sample ID"),
+        ({"sample_mask": torch.tensor([1.0, -0.5, 1.0, 1.0])}, "nonnegative"),
+        ({"token_mask": torch.full((4, 4), float("nan"))}, "finite"),
+        (
+            {"group_indices": torch.tensor([0, 1, 0, 1], dtype=torch.int32)},
+            "integer group index",
+        ),
+        ({"group_indices": torch.tensor([0, 1, 0, 2])}, "incomplete group"),
+    ],
+)
+def test_group_token_mean_weights_rejects_bad_inputs(override, match) -> None:
+    with pytest.raises(ValueError, match=match):
+        group_token_mean_weights(**{**_weights_inputs(), **override})
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"trainer": "grpo"},
+        {"trainer": "ppo", "algorithm": "ppo"},
+        {"algorithm": "ppo"},
+        {"on_policy_distillation": True},
+    ],
+)
+def test_group_token_mean_validate_setup_rejects_unsupported_paths(overrides) -> None:
+    supported = dict(
+        trainer="single_controller",
+        algorithm="grpo",
+        megatron_enabled=True,
+        on_policy_distillation=False,
+    )
+    reduction = make_objective_reduction("group_token_mean")
+    reduction.validate_setup(**supported)
+    with pytest.raises(ValueError, match="group_token_mean requires"):
+        reduction.validate_setup(**{**supported, **overrides})
+    make_objective_reduction("global_token_mean").validate_setup(
+        **{**supported, **overrides}
     )
