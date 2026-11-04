@@ -631,6 +631,9 @@ class SingleControllerActor:
         self._finalizer_actors = list(actor_args.finalizer_actors)
         for actor in (*self._finalizer_actors, *self._advantage_actors):
             self._trainer.add_data_plane_snapshot_source(actor)
+        gen_snapshots = getattr(self._gen, "get_data_plane_snapshots", None)
+        if gen_snapshots is not None:
+            self._trainer.add_data_plane_snapshot_fn(gen_snapshots)
         self._storage_units = tuple(actor_args.storage_units)
         self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
         for actor in self._finalizer_actors:

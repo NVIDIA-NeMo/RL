@@ -36,7 +36,7 @@ from collections import Counter, defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import ray
 
@@ -184,6 +184,7 @@ class TQPolicy(TQDriverMixin, Policy):
         # Data-plane clients outside the worker group (e.g. the rollout
         # actor); Ray actor handles exposing ``get_data_plane_snapshot``.
         self._extra_snapshot_sources: list[Any] = []
+        self._extra_snapshot_fns: list[Callable[[], list[dict[str, Any]]]] = []
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -320,7 +321,18 @@ class TQPolicy(TQDriverMixin, Policy):
             logger.warning("data-plane snapshot from extra sources failed: %s", exc)
         else:
             snapshots.extend(s for s in extra if s)
+        for fn in self._extra_snapshot_fns:
+            try:
+                snapshots.extend(fn())
+            except Exception as exc:  # noqa: BLE001 - metrics must never fail a step
+                logger.warning("data-plane snapshot from %s failed: %s", fn, exc)
         return snapshots
+
+    def add_data_plane_snapshot_fn(
+        self, fn: Callable[[], list[dict[str, Any]]]
+    ) -> None:
+        """Include a group of data-plane clients read through one call."""
+        self._extra_snapshot_fns.append(fn)
 
     def add_data_plane_snapshot_source(self, actor: Any) -> None:
         """Include a non-worker actor's data-plane client in the cluster view."""
