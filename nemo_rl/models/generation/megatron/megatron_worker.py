@@ -348,6 +348,7 @@ class MegatronGenerationMixin:
         self.inference_context = None
         self.inference_wrapped_model = None
         self.base_url = None
+        self.coordinator_addr = None
         self._inference_engine_initialized = False
         self._inference_engine_asleep = (
             True  # Start paused since we begin with training
@@ -357,6 +358,8 @@ class MegatronGenerationMixin:
         self._token_capture_enabled = False
         self._request_payload_stager = None
         self._request_prompt_preparer = None
+        # True between pause_for_refit and the suspend that follows it.
+        self._inference_engine_paused = False
 
     def _inference_config_overrides(self) -> dict[str, Any]:
         """Extra ``InferenceConfig`` kwargs; the plain engine needs none."""
@@ -784,6 +787,7 @@ class MegatronGenerationMixin:
 
         self._inference_engine_initialized = True
         self._inference_engine_asleep = True
+        self._inference_engine_paused = False
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
 
     async def _start_inference_coordinator(self):
@@ -804,6 +808,25 @@ class MegatronGenerationMixin:
                 await result
 
         self._inference_engine_asleep = False
+        self._inference_engine_paused = False
+
+    def _pause(self) -> None:
+        """Pause scheduling without suspending. No-op if asleep or already paused.
+
+        Requests already admitted keep their KV; nothing new is scheduled until
+        the engine is woken. A prefill engine paused this way starts no new
+        handoff, which lets a caller wait for the pinned blocks to drain before
+        suspending it.
+        """
+        if self._inference_engine_asleep or self._inference_engine_paused:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._pause_engine(), self._inference_loop
+        )
+        future.result()
+        torch.distributed.barrier()
+        self._inference_engine_paused = True
+        print(f"[Rank {self.rank}] paused inference engine scheduling")
 
     def _sleep(self) -> None:
         """Pause + suspend the engine. No-op if already asleep."""
@@ -815,37 +838,54 @@ class MegatronGenerationMixin:
         future.result()
         torch.distributed.barrier()
         self._inference_engine_asleep = True
+        self._inference_engine_paused = False
         print(f"[Rank {self.rank}] paused inference engine")
 
-    async def _sleep_engine(self):
+    async def _pause_engine(self):
         if torch.distributed.get_rank() == 0:
             self.inference_client.pause_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
 
+    async def _suspend_engine(self):
         if torch.distributed.get_rank() == 0:
             self.inference_client.suspend_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.SUSPENDED)
 
+    async def _sleep_engine(self):
+        # A pause that already happened (pause_for_refit) is not repeated.
+        if not self._inference_engine_paused:
+            await self._pause_engine()
+        await self._suspend_engine()
+
     def _wake(self) -> None:
-        """Resume + unpause the engine. No-op if already awake."""
-        if not self._inference_engine_asleep:
+        """Get the engine back to RUNNING. No-op if already running.
+
+        An asleep engine is resumed and unpaused; an engine that was only
+        paused (``pause_for_refit`` without the suspend) is just unpaused.
+        """
+        if self._inference_engine_asleep:
+            coroutine = self._wake_engine()
+        elif self._inference_engine_paused:
+            coroutine = self._unpause_engine()
+        else:
             return
-        future = asyncio.run_coroutine_threadsafe(
-            self._wake_engine(), self._inference_loop
-        )
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._inference_loop)
         future.result()
         torch.distributed.barrier()
         self._inference_engine_asleep = False
+        self._inference_engine_paused = False
         print(f"[Rank {self.rank}] resumed inference engine")
+
+    async def _unpause_engine(self):
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.unpause_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
 
     async def _wake_engine(self):
         if torch.distributed.get_rank() == 0:
             self.inference_client.resume_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.RESUMED)
-
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.unpause_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
+        await self._unpause_engine()
 
     def _start_inference_loop_thread(self):
         """Start a background thread with a persistent event loop for inference."""
@@ -2444,6 +2484,17 @@ class MegatronGenerationRefitMixin:
         )
         # TODO: Optimize away the full synchronization.
         torch.cuda.synchronize()
+
+    def pause_for_refit(self) -> None:
+        """Stop scheduling new work ahead of a refit, without suspending.
+
+        Used on prefill engines so no new handoff starts while the caller waits
+        for decode to pull the blocks prefill still pins; ``suspend_for_refit``
+        then completes the sleep.
+        """
+        if not self._inference_engine_initialized:
+            return
+        self._pause()
 
     def suspend_for_refit(self) -> None:
         """Pause+suspend the inference engine before a weight refit."""

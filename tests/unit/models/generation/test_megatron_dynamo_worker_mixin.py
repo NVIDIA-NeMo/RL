@@ -107,18 +107,33 @@ def test_dynamo_worker_builds_the_handoff_engine(engine_modules, role):
     plain.assert_not_called()
 
 
-def test_engine_state_reset_clears_the_event_reporter_and_endpoint():
+def test_engine_state_reset_clears_the_event_reporter():
     worker = _bare_worker(role="prefill")
     worker._dynamo_event_reporter = MagicMock()
-    worker._dynamo_endpoint_future = MagicMock()
-    worker._dynamo_endpoint_metadata = {"event_port": 1}
 
     worker._init_inference_engine_state()
 
     assert worker._dynamo_event_reporter is None
-    assert worker._dynamo_endpoint_future is None
-    assert worker._dynamo_endpoint_metadata is None
     assert worker.dynamic_inference_engine is None
+    assert worker.coordinator_addr is None
+    assert worker.dynamo_coordinator_address() is None
+
+
+def test_pinned_handoff_block_count_is_zero_without_an_engine():
+    worker = _bare_worker(role="prefill")
+    worker._init_inference_engine_state()
+    worker._inference_loop = None
+
+    assert worker.pinned_handoff_block_count() == 0
+
+
+def test_attach_dynamo_events_needs_a_built_engine():
+    worker = _bare_worker(role="prefill")
+    worker._init_inference_engine_state()
+    worker._inference_engine_initialized = False
+
+    with pytest.raises(RuntimeError, match="engine to be built"):
+        worker.attach_dynamo_events(parent_event_address="tcp://10.0.0.5:4001")
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +185,7 @@ def dynamo_endpoint_env(monkeypatch):
         engines=[],
         workers=[],
         fetched=[],
+        attested=[],
         run_started=None,
         run_cancelled=False,
         reporters=[],
@@ -242,6 +258,11 @@ def dynamo_endpoint_env(monkeypatch):
         def to_dict(self):
             return {"coordinator_address": self.address}
 
+    async def confirm_terminated(address, owner, timeout=30.0):
+        records.attested.append((address, owner, timeout))
+        if address.endswith(":dead"):
+            raise ConnectionError(address)
+
     def module(name, **attrs):
         mod = types.ModuleType(name)
         mod.__dict__.update(attrs)
@@ -258,6 +279,10 @@ def dynamo_endpoint_env(monkeypatch):
     module(
         "megatron.inference.integrations.dynamo.llm_engine",
         MegatronLLMEngine=MegatronLLMEngine,
+    )
+    module(
+        "megatron.inference.integrations.dynamo.handoff_recovery",
+        confirm_terminated=confirm_terminated,
     )
     module(
         "megatron.inference.integrations.dynamo.telemetry",
@@ -362,6 +387,7 @@ def test_start_dynamo_endpoint_hosts_the_adapter_on_the_inference_loop(
     # It runs on the inference loop, the loop the engine itself will use.
     assert env.records.run_started is env.worker._inference_loop
     assert not env.worker._dynamo_endpoint_future.done()
+    assert env.worker.dynamo_endpoint_metadata() == metadata
 
     # A repeat start hands back the same endpoint and launches no second adapter.
     assert _start(env, role=role, excluded_ports=[]) == metadata
@@ -537,3 +563,24 @@ def test_attach_dynamo_events_on_a_non_leader_rank_sends_no_ready(
     (reporter,) = env.records.reporters
     assert reporter.events == []
     assert env.worker._dynamo_event_reporter is reporter
+
+
+@pytest.mark.parametrize(
+    ("addresses", "confirmed"),
+    [
+        pytest.param([], True, id="no_prefill_coordinators"),
+        pytest.param(
+            ["tcp://10.0.0.1:5555", "tcp://10.0.0.2:5555"], True, id="every_one"
+        ),
+        # One unreachable coordinator makes the attestation False, not an exception.
+        pytest.param(
+            ["tcp://10.0.0.1:5555", "tcp://10.0.0.3:dead"], False, id="unreachable"
+        ),
+    ],
+)
+def test_confirm_decode_terminated_attests_to_every_prefill_coordinator(
+    dynamo_endpoint_env, addresses, confirmed
+):
+    env = dynamo_endpoint_env
+    assert env.worker.confirm_decode_terminated(addresses, "owner-1", 3.0) is confirmed
+    assert env.records.attested == [(address, "owner-1", 3.0) for address in addresses]

@@ -750,6 +750,28 @@ class MegatronGeneration(GenerationInterface):
             self._policy.worker_group.run_all_workers_single_data("resume_after_refit")
         )
 
+    def dynamo_coordinator_address(self) -> Optional[str]:
+        """This engine's coordinator address once it is listening, else None."""
+        return ray.get(
+            self._policy.worker_group.run_single_worker_single_data(
+                method_name="dynamo_coordinator_address", worker_idx=0
+            )
+        )
+
+    def confirm_decode_terminated(
+        self, coordinator_addresses: list[str], owner: str, timeout_s: float
+    ) -> bool:
+        """Attest a decode owner's termination to prefill coordinators from rank zero."""
+        return ray.get(
+            self._policy.worker_group.run_single_worker_single_data(
+                method_name="confirm_decode_terminated",
+                worker_idx=0,
+                coordinator_addresses=list(coordinator_addresses),
+                owner=owner,
+                timeout_s=timeout_s,
+            )
+        )
+
     def prepare_refit_info(
         self, state_dict_info: Optional[dict[str, Any]]
     ) -> Optional[list[str]]:
