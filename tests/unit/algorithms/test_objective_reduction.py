@@ -1,6 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
+import pickle
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import ClassVar
@@ -57,8 +59,9 @@ def test_named_reduction_fractional_masks(mode: str) -> None:
     )
 
 
-@pytest.mark.parametrize("mode", ["global_token_mean", "sequence_mean"])
+@pytest.mark.parametrize("mode", ["global_token_mean", "sequence_mean", "explicit"])
 def test_streaming_preserves_legacy_objective(mode: str) -> None:
+    # "explicit" needs the wrapper's denominator: a bypass trips its assert.
     data = BatchedDataDict(
         token_mask=torch.tensor([[0, 1, 0.5], [0, 1, 1], [0, 0, 0]]),
         sample_mask=torch.tensor([1.0, 0.25, 1.0]),
@@ -69,17 +72,20 @@ def test_streaming_preserves_legacy_objective(mode: str) -> None:
     current = torch.full((3, 2), -3.0, requires_grad=True)
     loss_fn = ClippedPGLossFn(
         ClippedPGLossConfig(
-            normalization=mode,
+            normalization="global_token_mean" if mode == "explicit" else mode,
             disable_ppo_ratio=True,
             reference_policy_kl_penalty=0,
         )
     )
+    if mode == "explicit":
+        loss_fn.objective_reduction = _ExplicitDenominatorReduction()
     sequences, tokens, denominator = loss_fn.objective_reduction.local_counts(data)
     full, _ = loss_fn(
         data=data,
         next_token_logprobs=current,
         global_valid_toks=tokens,
         global_valid_seqs=sequences,
+        global_objective_denominator=denominator,
     )
     chunks = []
     for indices in ([2, 0], [1]):
@@ -142,6 +148,18 @@ def test_streaming_objective_loss_forwards_denominator_and_proxies_attributes() 
     )
     token_sum = -(data["advantages"][:, 1:] * current * data["token_mask"][:, 1:]).sum()
     torch.testing.assert_close(loss, token_sum / placeholder)
+    with pytest.raises(TypeError, match="global_valid_toks"):
+        streaming(current, data, torch.tensor(99.0), placeholder)
+
+
+def test_streaming_objective_loss_survives_deepcopy_and_pickle() -> None:
+    # __getattr__ must not recurse when copy/pickle probe before __init__ ran.
+    streaming = StreamingObjectiveLoss(
+        ClippedPGLossFn(ClippedPGLossConfig(normalization="sequence_mean"))
+    )
+    for clone in (copy.deepcopy(streaming), pickle.loads(pickle.dumps(streaming))):
+        assert isinstance(clone.loss_fn, ClippedPGLossFn)
+        assert clone.normalization == "sequence_mean"
 
 
 def test_get_objective_reduction_prefers_reducer_then_legacy_loss_type() -> None:

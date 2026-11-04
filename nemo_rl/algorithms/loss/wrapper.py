@@ -62,10 +62,19 @@ class StreamingObjectiveLoss:
         return getattr(self.loss_fn, name)
 
     def __call__(
-        self, *args: Any, **kwargs: Any
+        self,
+        *args: Any,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # Keyword-only, so a positional caller fails loudly here.
         return self.loss_fn(
-            *args, global_objective_denominator=kwargs["global_valid_toks"], **kwargs
+            *args,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            global_objective_denominator=global_valid_toks,
+            **kwargs,
         )
 
 
