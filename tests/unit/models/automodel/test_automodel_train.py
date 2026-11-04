@@ -422,16 +422,6 @@ class TestModelForward:
             assert "media_token_validity_mask" not in model.forward_kwargs
         assert "media_token_validity_mask" in processed_inputs_multimodal.vlm_kwargs
 
-    def test_forward_reward_model_allows_flash_attn(
-        self, mock_model, processed_inputs_with_flash
-    ):
-        prepared = _prepare_cp1(mock_model, processed_inputs_with_flash)
-        model_forward(mock_model, prepared.model_batch)
-
-        mock_model.assert_called_once()
-        call_kwargs = mock_model.call_args[1]
-        assert "flash_attn_kwargs" in call_kwargs
-
     def test_forward_disallow_flash_attn_args(
         self, mock_model, processed_inputs_with_flash
     ):

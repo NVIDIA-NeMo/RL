@@ -350,7 +350,7 @@ tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-noncolocated-async.s
 # Automodel PPO value sequence packing (TP2+SP) (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-pack.sh
 
-# Automodel PPO value context parallelism (TP2+SP+CP2) (Qwen2.5-1.5B, GSM8K)
+# Automodel PPO value context parallelism (TP2+CP2) (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2-cp2.sh
 
 # Megatron PPO with value sequence parallelism (TP2+SP) and dynamic batching (Qwen2.5-1.5B, GSM8K)
