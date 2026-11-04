@@ -44,11 +44,33 @@ def group_token_mean_weights(
     group_indices: torch.Tensor,
     expected_group_size: int | None = None,
 ) -> torch.Tensor:
-    """Build float32 row weights using the advantage stage's integer group indices.
+    """Build float32 per-response weights ``1 / T_g`` for equal prompt-group token means.
 
-    Nonnegative fractional masks contribute their full mass. An entirely
-    excluded group receives zero weight and zero denominator mass. The
-    controller supplies its configured group size to reject incomplete groups.
+    ``T_g`` is the valid generated-token mass of response ``i``'s prompt group:
+    ``sum_j token_mask[j, 1:].sum() * sample_mask[j]`` over the group's rows.
+    Nonnegative fractional masks contribute their full mass. A group with
+    ``T_g == 0`` receives weight 0, so it adds no denominator mass.
+
+    Args:
+        sample_ids: One unique identifier per response row; used only to
+            reject duplicated rows.
+        token_mask: ``[B, S]`` loss mask aligned with ``input_ids``; position
+            0 is never a predicted token and is excluded.
+        sample_mask: ``[B]`` nonnegative per-response loss weights.
+        group_indices: ``[B]`` ``torch.long`` prompt-group index per row,
+            local to this batch (see ``group_index_column``).
+        expected_group_size: When set, every nonempty group must have exactly
+            this many rows; the advantage stage passes
+            ``num_generations_per_prompt`` so a partial group fails loudly.
+            ``None`` disables that check.
+
+    Returns:
+        ``[B]`` float32 detached weights; ``sum_i valid_toks_i * w_i`` equals
+        the number of groups with positive token mass.
+
+    Raises:
+        ValueError: On shape/dtype mismatch, non-finite or negative masks,
+            duplicate sample ids, or an incomplete group.
     """
     if token_mask.ndim != 2 or sample_mask.shape != (token_mask.shape[0],):
         raise ValueError("group token mean expects token_mask[B,S], sample_mask[B]")

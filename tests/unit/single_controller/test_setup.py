@@ -90,6 +90,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import (
+    GROUP_TOKEN_MEAN_WEIGHT,
     OPD_FULL_TEACHER_INDEX_FIELD,
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
@@ -4725,3 +4726,16 @@ def test_generation_top_logprobs_requires_score_centering_or_replay():
     mc.policy["generation"]["top_logprobs"] = 4
     with pytest.raises(ValueError, match="only read by loss_fn.score_centering"):
         validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize("normalization", ["global_token_mean", "group_token_mean"])
+def test_partition_warmup_registers_reducer_columns(patched_factories, normalization):
+    mc = _make_master_config(
+        megatron_enabled=True,
+        loss_cfg=ClippedPGLossConfig(normalization=normalization),
+    )
+    actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs["fields"]
+    assert (GROUP_TOKEN_MEAN_WEIGHT in warmup_fields) is (
+        normalization == "group_token_mean"
+    )
