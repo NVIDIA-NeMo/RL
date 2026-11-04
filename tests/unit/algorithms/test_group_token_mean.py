@@ -61,10 +61,10 @@ def _batch(*, empty: bool = False) -> tuple[BatchedDataDict[Any], torch.Tensor]:
     return data, (previous[:, 1:] + torch.linspace(-0.3, 0.3, 9)).requires_grad_()
 
 
-def _loss_fn() -> ClippedPGLossFn:
+def _loss_fn(normalization: str = "group_token_mean") -> ClippedPGLossFn:
     return ClippedPGLossFn(
         ClippedPGLossConfig(
-            normalization="group_token_mean",
+            normalization=normalization,
             use_cispo=True,
             use_importance_sampling_correction=True,
             truncated_importance_sampling_type="icepop",
@@ -147,6 +147,49 @@ def test_group_loss_gradient_and_partition_invariance(empty: bool) -> None:
     assert sum(token_errors) / tokens.clamp_min(1).item() == pytest.approx(
         metrics["token_mult_prob_error"]
     )
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_group_token_mean_equals_global_token_mean_on_group_scaled_masks(
+    empty: bool,
+) -> None:
+    """Scaling each row's token_mask by its 1/T_g weight turns global_token_mean
+    into group_token_mean: the global token mass becomes the group count, and
+    every token carries its group's weight. The GPU parity test uses this
+    synchronous oracle."""
+    data, current = _batch(empty=empty)
+    group_loss, _ = _call(_loss_fn(), data, current)
+    weights = data[GROUP_TOKEN_MEAN_WEIGHT]
+    plain = BatchedDataDict(
+        {key: value for key, value in data.items() if key != GROUP_TOKEN_MEAN_WEIGHT}
+    )
+    scaled = BatchedDataDict(
+        {**plain, "token_mask": plain["token_mask"] * weights.unsqueeze(-1)}
+    )
+    global_fn = _loss_fn("global_token_mean")
+
+    def global_loss(batch: BatchedDataDict[Any]) -> torch.Tensor:
+        sequences, tokens, _ = global_fn.objective_reduction.local_counts(batch)
+        return global_fn(
+            data=batch,
+            next_token_logprobs=current,
+            global_valid_toks=tokens,
+            global_valid_seqs=sequences,
+        )[0]
+
+    _, _, groups = _loss_fn().objective_reduction.local_counts(data)
+    torch.testing.assert_close(
+        global_fn.objective_reduction.local_counts(scaled)[1], groups
+    )
+    oracle = global_loss(scaled)
+    torch.testing.assert_close(oracle, group_loss)
+    torch.testing.assert_close(
+        torch.autograd.grad(oracle, current, retain_graph=True)[0],
+        torch.autograd.grad(group_loss, current, retain_graph=True)[0],
+    )
+    if not empty:
+        # Unequal group masses: the unscaled global mean is a different objective.
+        assert not torch.allclose(global_loss(plain), oracle, rtol=1e-2)
 
 
 @pytest.mark.parametrize("fused", [False, True])
