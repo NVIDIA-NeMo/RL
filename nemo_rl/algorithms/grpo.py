@@ -559,8 +559,12 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 
 
-def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
-    """Validate the single-forward threshold path before allocating workers."""
+def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
+    """Validate the single-forward threshold path before allocating workers.
+
+    Shared by the GRPO and SingleController trainers, whose master configs are
+    separate classes with the fields read here.
+    """
     if not master_config.loss_fn.seq_logprob_error_in_loss:
         return
     if master_config.grpo.seq_logprob_error_threshold is None:
