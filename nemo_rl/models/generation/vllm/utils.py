@@ -567,8 +567,12 @@ def chat_routed_experts(
     device: torch.device,
     logger: Any,
     routed_experts_dtype: torch.dtype,
-) -> str:
-    """The routed-experts envelope the chat endpoint attaches to one choice."""
+    encode_for_wire: bool = True,
+) -> str | torch.Tensor:
+    """The routes the chat endpoint attaches to one choice.
+
+    The wire envelope, or the tensor itself when ``encode_for_wire`` is False.
+    """
     generation_token_count = len(getattr(generation_details, "token_ids", []) or [])
     # return_stats=True returns the (routes, stats) pair.
     routed_experts, r3_stats = cast(
@@ -602,8 +606,12 @@ def chat_routed_experts(
             r3_stats["actual_routes"],
             r3_stats["expected_routes"],
         )
+    routed_experts = routed_experts.to(dtype=routed_experts_dtype)
+    # Capture stages the native tensor before the response leaves this worker.
+    if not encode_for_wire:
+        return routed_experts
     # Keep routes opaque across Gym HTTP hops to avoid nested-list validation.
-    return encode_routed_experts(routed_experts.to(dtype=routed_experts_dtype))
+    return encode_routed_experts(routed_experts)
 
 
 def attach_routed_experts_to_chat_response_choices(
@@ -613,8 +621,9 @@ def attach_routed_experts_to_chat_response_choices(
     device: torch.device,
     logger: Any = None,
     routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
+    encode_for_wire: bool = True,
 ) -> Any:
-    """Attach aligned routed experts to OpenAI chat response choices."""
+    """Attach aligned routes, retaining tensors for worker-local capture."""
     outputs_by_index = {
         output.index: output for output in getattr(final_request_output, "outputs", [])
     }
@@ -636,6 +645,7 @@ def attach_routed_experts_to_chat_response_choices(
             device=device,
             logger=logger,
             routed_experts_dtype=routed_experts_dtype,
+            encode_for_wire=encode_for_wire,
         )
 
     if len(attached_choice_indices) != len(choices):
