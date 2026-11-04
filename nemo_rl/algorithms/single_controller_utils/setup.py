@@ -2042,9 +2042,8 @@ def setup_single_controller(
             if preloaded_training_data is not None:
                 dataset, _val_dataset, env_handles, dataloader = preloaded_training_data
             else:
-                # Generation and Gym are building; load the dataset meanwhile.
-                # train_iters is not written by the load: a trainer build that
-                # started before it finished is reading that config.
+                # Generation and Gym build meanwhile; the load does not write train_iters,
+                # which a trainer already building would be reading.
                 t0 = time.perf_counter()
                 with ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="training-data-load"
