@@ -19,10 +19,11 @@
 #
 # EXTERNAL_VLLM_MODE=serve runs the pools on their own instead, as a plain
 # (non-heterogeneous) job that outlives any training job: replicas on this job's
-# nodes, load balancers on its first node. Once every pool is healthy it
-# publishes the pools to EXTERNAL_VLLM_POOL_DIR, and training jobs attach to
-# them with attach_and_run.sh, so a training job can crash and be resubmitted
-# without the judges reloading. See README.md, "Persistent pools".
+# nodes, load balancers on its first node. It publishes the pools to
+# EXTERNAL_VLLM_POOL_DIR as soon as the load balancers are placed and writes
+# READY once every pool is healthy; training jobs attach to them with
+# attach_and_run.sh, so a training job can crash and be resubmitted without the
+# judges reloading. See README.md, "Persistent pools".
 
 set -euo pipefail
 
@@ -940,11 +941,8 @@ if [[ "${EXTERNAL_VLLM_MODE}" == serve ]]; then
     sleep 5
   done
 
-  # Publish, READY last. manifest.tsv is what attach_and_run.sh reads; the
-  # <pool>_url files and pools.env are for launchers that read single URLs.
-  # Already published right after the load balancers were placed; rewrite so the files reflect the final state.
-  publish_manifest
-
+  # manifest.tsv, pools.env and the <pool>_url files were published right after the load balancers were placed;
+  # only READY is written here, last.
   ready_published=0
   publish_ready() {
     echo "${pool_generation} $(date -Iseconds)" > "${EXTERNAL_VLLM_POOL_DIR}/READY.tmp"

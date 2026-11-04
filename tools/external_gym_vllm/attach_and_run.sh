@@ -15,8 +15,9 @@
 
 # Batch script for a NeMo RL training job attached to a persistent pool job
 # (run_in_allocation.sh, EXTERNAL_VLLM_MODE=serve). At job start it waits until
-# the expected pool job publishes READY, resolves COMMAND's URL placeholders and
-# the external-service readiness gate from the pool's manifest, then runs ray.sub
+# the expected pool job has published its URLs (READY, with EXTERNAL_VLLM_ATTACH_EARLY=0),
+# resolves COMMAND's URL placeholders and the external-service readiness gate from
+# the pool's manifest, then runs ray.sub
 # while watching the pool: if the pool job stops, is replaced or goes silent,
 # the training job is stopped rather than left training against dead judges.
 #
@@ -104,17 +105,19 @@ pool_is_ready() {
 manifest_is_published() {
   local generation heartbeat_age
   [[ -f "${pool_dir}/manifest.tsv" ]] || return 1
+  # The pool's exit trap removes READY but leaves manifest.tsv; STOPPED marks a generation that is over.
+  [[ ! -f "${pool_dir}/STOPPED" ]] || return 1
   generation=$(cat "${pool_dir}/generation" 2>/dev/null || true)
   [[ "${generation%%-*}" == "${pool_job}" ]] || return 1
   heartbeat_age=$(external_vllm_file_age_s "${pool_dir}/heartbeat")
   [[ -n "${heartbeat_age}" ]] && (( heartbeat_age <= heartbeat_stale_s ))
 }
 
-# EXTERNAL_VLLM_ATTACH_EARLY=1: start ray.sub once the URLs are known instead of once every replica is healthy, as an
-# inline hetjob does. The readiness gate substituted into COMMAND below still holds rollout setup until every pool
-# reports its full backend count, so Ray, the trainer and Gym init overlap the judges' model load.
-wait_for=pool_is_ready
-[[ "${EXTERNAL_VLLM_ATTACH_EARLY:-0}" == 1 ]] && wait_for=manifest_is_published
+# Start ray.sub once the URLs are published (the default), as an inline hetjob does. The readiness gate substituted
+# into COMMAND below still holds rollout setup until every pool reports its full backend count, so Ray, the trainer
+# and Gym init overlap the judges' model load. EXTERNAL_VLLM_ATTACH_EARLY=0 waits for READY instead.
+wait_for=manifest_is_published
+[[ "${EXTERNAL_VLLM_ATTACH_EARLY:-1}" == 0 ]] && wait_for=pool_is_ready
 
 echo "[INFO] $(date -Iseconds) waiting for pool job ${pool_job} (${pool_dir}) via ${wait_for}"
 deadline=$((SECONDS + timeout_s))
@@ -124,7 +127,11 @@ until "${wait_for}"; do
     exit 1
   fi
   if (( SECONDS >= deadline )); then
-    echo "[FATAL] pool job ${pool_job} not READY after ${timeout_s}s" >&2
+    if [[ "${wait_for}" == manifest_is_published ]]; then
+      echo "[FATAL] pool job ${pool_job} has not published its manifest after ${timeout_s}s" >&2
+    else
+      echo "[FATAL] pool job ${pool_job} not READY after ${timeout_s}s" >&2
+    fi
     exit 1
   fi
   sleep "${poll_s}"
