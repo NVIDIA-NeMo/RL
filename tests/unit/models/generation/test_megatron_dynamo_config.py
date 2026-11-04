@@ -329,14 +329,6 @@ def _master_config(generation: dict) -> SimpleNamespace:
     )
 
 
-def test_megatron_generation_refuses_the_switch_until_rollouts_are_served() -> None:
-    generation = _megatron_config()
-    with pytest.raises(NotImplementedError, match="not served by MegatronGeneration"):
-        resolve_generation_class(generation).validate_settings(
-            _master_config(generation)
-        )
-
-
 def test_megatron_generation_names_an_unservable_shape_first() -> None:
     generation = _megatron_config()
     generation["disaggregation"]["enabled"] = False

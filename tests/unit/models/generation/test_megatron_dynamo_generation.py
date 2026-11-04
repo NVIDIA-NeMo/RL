@@ -529,9 +529,20 @@ def _with_role(policy_config: dict, role: str) -> dict:
     }
 
 
-def _widths(width: int) -> dict[str, int]:
-    """One width for both roles."""
-    return {"prefill": width, "decode": width}
+def _serving_config(**overrides) -> dict[str, Any]:
+    """The generation config with the sampling keys a rollout through the frontend reads."""
+    config = _megatron_config(
+        max_new_tokens=16,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=None,
+        stop_token_ids=[2],
+        stop_strings=None,
+        _pad_token_id=0,
+    )
+    config["mcore_generation_config"].update(max_model_len=5, refit_backend=None)
+    config.update(overrides)
+    return config
 
 
 def _with_layout(prefill: dict | None = None, decode: dict | None = None) -> dict:
@@ -1602,19 +1613,154 @@ def test_refit_membership_must_be_every_engine_in_order(
 # ---------------------------------------------------------------------------
 
 
-def test_rollouts_are_not_served_yet(env):
-    generation = env.started()
+def test_rollouts_go_through_the_frontend(env, monkeypatch):
+    generation = env.started(generation_config=_serving_config())
+    requests: list[tuple[str, dict[str, Any], Any]] = []
+
+    async def fake_post(url, payload, timeout_s):
+        requests.append((url, payload, timeout_s))
+        return {
+            "choices": [
+                {"finish_reason": "stop", "logprobs": {"token_logprobs": [-0.5]}}
+            ],
+            "nvext": {"completion_token_ids": [8]},
+        }
+
+    from nemo_rl.models.generation.megatron import dynamo_rollouts
+
+    monkeypatch.setattr(dynamo_rollouts, "async_http_post_json", fake_post)
     data = BatchedDataDict(
         {"input_ids": torch.tensor([[1, 2, 3, 0]]), "input_lengths": torch.tensor([3])}
     )
-    with pytest.raises(NotImplementedError, match="do not serve rollouts yet"):
+    with pytest.raises(NotImplementedError, match="generate_async"):
         generation.generate(data)
-    assert generation.get_inference_world_size() == 6
 
     async def collect():
         return [item async for item in generation.generate_async(data)]
 
-    with pytest.raises(NotImplementedError, match="do not serve rollouts yet"):
-        asyncio.run(collect())
+    ((index, output),) = asyncio.run(collect())
+    assert index == 0
+    assert output["output_ids"].tolist() == [[1, 2, 3, 8]]
+    assert output["gen_leader_worker_idx"] == [0]
+    assert requests[0][0] == "http://10.0.0.1:3000/v1/completions"
+    assert requests[0][2] is None, "request_timeout_s defaults to no deadline"
     with pytest.raises(NotImplementedError, match="NeMo-Gym"):
         generation.setup_token_capture({}, "staging")  # type: ignore[arg-type]
+    assert generation.get_inference_world_size() == 6
+
+
+def _master_config(
+    *,
+    megatron_trainer: bool = True,
+    recompute_kv_cache: bool = False,
+    data_plane: dict[str, Any] | None = None,
+    gym: bool = False,
+    is_vlm: bool = False,
+    generation_overrides: dict[str, Any] | None = None,
+) -> SimpleNamespace:
+    generation = _serving_config(**(generation_overrides or {}))
+    return SimpleNamespace(
+        async_rl=SimpleNamespace(
+            generation_fleet_health=SimpleNamespace(
+                enabled=False, refit_timeout_s=None
+            ),
+            recompute_kv_cache_after_weight_updates=recompute_kv_cache,
+        ),
+        data_plane=data_plane or {"backend": "simple"},
+        env={"should_use_nemo_gym": gym},
+        policy={
+            "megatron_cfg": {"enabled": megatron_trainer},
+            "is_vlm": is_vlm,
+            "generation": generation,
+        },
+    )
+
+
+_MOONCAKE_UNITS = {"storage_unit_segment_size": 1 << 30}
+_STORAGE_ON_INFERENCE = "must not include the 'inference'"
+
+
+@pytest.mark.parametrize(
+    ("settings", "match"),
+    [
+        pytest.param({}, None, id="accepted"),
+        pytest.param(
+            {"megatron_trainer": False}, "requires the Megatron trainer", id="trainer"
+        ),
+        # The engines keep their caches (persist), so the recompute flag must be off.
+        pytest.param(
+            {"recompute_kv_cache": True}, "kv_cache_management_mode='persist'", id="kv"
+        ),
+        pytest.param({"gym": True}, "NeMo-Gym rollouts are not yet served", id="gym"),
+        pytest.param({"is_vlm": True}, "text prompts only", id="vlm"),
+        pytest.param(
+            {"generation_overrides": {"colocated": {"enabled": True}}},
+            "colocated.enabled must be false",
+            id="colocated",
+        ),
+        # Storage units placed on ``inference`` would reserve the engines' GPUs.
+        pytest.param(
+            {"data_plane": {"backend": "simple", "simple": {"num_storage_units": 2}}},
+            None,
+            id="simple_placement_null",
+        ),
+        pytest.param(
+            {
+                "data_plane": {
+                    "backend": "simple",
+                    "simple": {"num_storage_units": 2, "storage_unit_placement": "all"},
+                }
+            },
+            _STORAGE_ON_INFERENCE,
+            id="simple_all",
+        ),
+        pytest.param(
+            {"data_plane": {"backend": "mooncake_cpu", "mooncake_cpu": {}}},
+            None,
+            id="mooncake_units_off",
+        ),
+        pytest.param(
+            {
+                "data_plane": {
+                    "backend": "mooncake_cpu",
+                    "mooncake_cpu": _MOONCAKE_UNITS,
+                }
+            },
+            _STORAGE_ON_INFERENCE,
+            id="mooncake_all",
+        ),
+        pytest.param(
+            {
+                "data_plane": {
+                    "backend": "mooncake_cpu",
+                    "mooncake_cpu": {
+                        **_MOONCAKE_UNITS,
+                        "storage_unit_placement": ["inference"],
+                    },
+                }
+            },
+            _STORAGE_ON_INFERENCE,
+            id="mooncake_inference",
+        ),
+        pytest.param(
+            {
+                "data_plane": {
+                    "backend": "mooncake_cpu",
+                    "mooncake_cpu": {
+                        **_MOONCAKE_UNITS,
+                        "storage_unit_placement": ["train"],
+                    },
+                }
+            },
+            None,
+            id="mooncake_train",
+        ),
+    ],
+)
+def test_validate_settings(settings, match) -> None:
+    master_config = _master_config(**settings)
+    if match is None:
+        MegatronDynamoGeneration.validate_settings(master_config)  # type: ignore[arg-type]
+    else:
+        with pytest.raises((ValueError, NotImplementedError), match=match):
+            MegatronDynamoGeneration.validate_settings(master_config)  # type: ignore[arg-type]

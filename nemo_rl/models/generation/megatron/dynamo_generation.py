@@ -60,7 +60,6 @@ from nemo_rl.models.generation.megatron.dynamo_config import (
     validate_megatron_dynamo_generation,
 )
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
-from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
@@ -303,8 +302,8 @@ class MegatronDynamoGeneration(GenerationInterface):
     copy drives refits and starts the engines' endpoints without being able to
     shut an engine or a service down.
 
-    Rollouts are still not posted to the frontend, so :meth:`validate_settings`
-    refuses the switch and ``generate_async`` raises.
+    ``generate_async`` posts native rollouts to the frontend as token-ID
+    completions, one request per prompt.
     """
 
     # How often the refit pause re-reads the prefill engines' pinned handoff
@@ -315,29 +314,49 @@ class MegatronDynamoGeneration(GenerationInterface):
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
-        """Refuse ``policy.generation.dynamo=true`` until rollouts are served.
+        """Reject what prefill/decode engines behind the Dynamo frontend cannot serve."""
+        # Deferred: both modules pull in the rollout and data-plane stacks.
+        from nemo_rl.data_plane.interfaces import storage_unit_placement
+        from nemo_rl.models.megatron.router_replay import router_replay_enabled
 
-        The Megatron backend's checks run first, then the engines' config is checked
-        so a shape the engines could never serve is named as such. Router replay
-        is refused next: the KV handoff moves a prompt's cache from a prefill to
-        a decode engine but not its routing-replay buffers. Any config is then
-        refused, because the prefill/decode engines are built, refit and
-        registered with the frontend, but nothing posts rollouts to it yet, and
-        the run would otherwise fail at its first generation.
-        """
         MegatronGeneration.validate_settings(master_config)
-        validate_megatron_dynamo_generation(master_config.policy["generation"])
-        if router_replay_enabled(master_config.policy):
+        policy_config = master_config.policy
+        validate_megatron_dynamo_generation(policy_config["generation"])
+        # The raw flag: should_use_nemo_gym() asserts the HTTP server is exposed,
+        # which this mode never does, so it cannot answer the question.
+        if master_config.env.get("should_use_nemo_gym"):
+            # Gym needs a server URL before generation is built; the frontend's
+            # is known only once the runtime is up.
+            raise NotImplementedError(
+                "NeMo-Gym rollouts are not yet served through the Dynamo frontend "
+                "with policy.generation.dynamo=true; set env.should_use_nemo_gym="
+                "false or leave policy.generation.dynamo false."
+            )
+        if policy_config.get("is_vlm"):
+            raise ValueError(
+                "policy.is_vlm=true is not supported with policy.generation.dynamo="
+                "true; the frontend serves text prompts only."
+            )
+        if router_replay_enabled(policy_config):
             raise ValueError(
                 "policy.router_replay.enabled must be false when "
                 "policy.generation.dynamo=true: the KV handoff does not transfer "
                 "the prompt's routing-replay buffers."
             )
-        raise NotImplementedError(
-            "policy.generation.dynamo=true is not served by MegatronGeneration yet: "
-            "the Megatron prefill/decode engines register with the frontend, but "
-            "nothing posts rollouts to it. Remove policy.generation.dynamo."
-        )
+        dp_config = master_config.data_plane
+        placement = storage_unit_placement(dp_config)
+        if placement is not None and (placement == "all" or "inference" in placement):
+            # Planning storage units materializes the named clusters' placement
+            # groups. The engines run on their own per-engine clusters, so a
+            # materialized inference cluster would book their GPUs a second
+            # time and the engines could never start.
+            raise ValueError(
+                f"data_plane.{dp_config['backend']}.storage_unit_placement="
+                f"{placement!r} must not include the 'inference' cluster with "
+                "policy.generation.dynamo=true; the Megatron engines reserve the "
+                "inference GPUs through their own clusters. Place storage units "
+                "on 'train' instead."
+            )
 
     def __init__(
         self,
@@ -1120,19 +1139,30 @@ class MegatronDynamoGeneration(GenerationInterface):
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Not served yet: the engines register with no frontend."""
         raise NotImplementedError(
-            "Megatron engines behind Dynamo do not serve rollouts yet; nothing "
-            "posts requests to the frontend."
+            "Megatron engines behind Dynamo serve generate_async() only; the "
+            "frontend takes one request at a time."
         )
 
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
-        """Not served yet: the engines register with no frontend."""
-        raise NotImplementedError(
-            "Megatron engines behind Dynamo do not serve rollouts yet; nothing "
-            "posts requests to the frontend."
+        """Post the batch to the frontend, one request per prompt; yield the assembled batch."""
+        # Deferred: the rollout client pulls in aiohttp.
+        from nemo_rl.models.generation.megatron.dynamo_rollouts import (
+            generate_through_frontend,
         )
-        yield  # pragma: no cover  (makes this an async generator)
+
+        if len(data["input_ids"]) == 0:
+            return
+        output = await generate_through_frontend(
+            self.cfg,
+            frontend_url=self.dp_openai_server_base_urls[0] or "",
+            data=data,
+            greedy=greedy,
+            request_timeout_s=self._dynamo_cfg.request_timeout_s,
+        )
+        output["gen_leader_worker_idx"] = [0]
+        yield 0, output
 
     def setup_token_capture(
         self,
