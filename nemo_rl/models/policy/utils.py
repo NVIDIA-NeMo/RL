@@ -16,6 +16,7 @@ import gc
 import os
 import traceback
 import warnings
+from collections.abc import Mapping
 from datetime import timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, cast
@@ -36,7 +37,9 @@ from nemo_rl.models.generation.vllm.patches import (
 from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
 if TYPE_CHECKING:
-    from nemo_rl.models.policy import PolicyConfig
+    from transformers import PretrainedConfig
+
+    from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 
 # Environment for bitwise-reproducible policy workers. These are read when the
 # worker creates its cuBLAS handles and selects Transformer Engine kernels, so
@@ -165,6 +168,96 @@ def configure_lora_refit(policy_config: "PolicyConfig") -> None:
 
     validate_vllm_lora_refit(policy_config)
     configure_vllm_lora_refit(policy_config)
+
+
+def automodel_pipeline_parallel_size(automodel_cfg: Mapping[str, Any]) -> int:
+    """Return the pipeline size; older configs omit the key and use PP=1."""
+    if "pipeline_parallel_size" not in automodel_cfg:
+        return 1
+    return automodel_cfg["pipeline_parallel_size"]
+
+
+def validate_automodel_pipeline_config(
+    config: "PolicyConfig",
+    *,
+    is_vlm: bool,
+    model_config: "PretrainedConfig",
+) -> None:
+    """Reject unsupported PP settings on the driver before creating workers."""
+    from nemo_rl.models.policy import AutomodelPipelineConfig
+    from nemo_rl.models.policy.draft_config import draft_refit_enabled
+
+    automodel_cfg = cast("AutomodelConfig", config["automodel_cfg"])
+    pp_size = automodel_pipeline_parallel_size(automodel_cfg)
+    if pp_size < 1:
+        raise ValueError(
+            f"policy.automodel_cfg.pipeline_parallel_size must be >= 1, got {pp_size}."
+        )
+    if pp_size == 1:
+        return
+
+    if "pipeline" not in automodel_cfg:
+        raise ValueError(
+            "PP > 1 requires policy.automodel_cfg.pipeline.microbatches_per_step."
+        )
+    pipeline_cfg = AutomodelPipelineConfig.model_validate(automodel_cfg["pipeline"])
+    if pipeline_cfg.microbatches_per_step < pp_size:
+        raise ValueError(
+            "policy.automodel_cfg.pipeline.microbatches_per_step="
+            f"{pipeline_cfg.microbatches_per_step} must be >= "
+            f"pipeline_parallel_size={pp_size}."
+        )
+
+    if "defer_fsdp_grad_sync" not in automodel_cfg:
+        raise ValueError(
+            "PP > 1 requires policy.automodel_cfg.defer_fsdp_grad_sync to be set "
+            "explicitly (false is recommended)."
+        )
+
+    if (
+        "logprob_batch_size" in config
+        and config["logprob_batch_size"] != config["train_micro_batch_size"]
+    ):
+        raise ValueError(
+            "PP > 1 requires policy.logprob_batch_size "
+            f"({config['logprob_batch_size']}) to equal "
+            f"policy.train_micro_batch_size ({config['train_micro_batch_size']})."
+        )
+
+    generation_cfg = config.get("generation")
+    unsupported = {
+        "sequence_packing.enabled": "sequence_packing" in config
+        and config["sequence_packing"]["enabled"],
+        "dynamic_batching.enabled": config["dynamic_batching"]["enabled"],
+        "automodel_cfg.sequence_parallel": automodel_cfg["sequence_parallel"],
+        "automodel_cfg.cpu_offload": automodel_cfg["cpu_offload"],
+        "automodel_cfg.clear_cache_every_n_steps": automodel_cfg.get(
+            "clear_cache_every_n_steps"
+        ),
+        "automodel_cfg.lora_cfg.enabled": "lora_cfg" in automodel_cfg
+        and automodel_cfg["lora_cfg"]["enabled"],
+        "draft.enabled": draft_refit_enabled(config.get("draft")),
+        "router_replay.enabled": "router_replay" in config
+        and config["router_replay"]["enabled"],
+        "reward_model_cfg.enabled": "reward_model_cfg" in config
+        and config["reward_model_cfg"]["enabled"],
+        "quant_cfg": config.get("quant_cfg") is not None,
+        "multimodal (VLM) models": is_vlm,
+        "generation.colocated.enabled=false": generation_cfg is not None
+        and not generation_cfg["colocated"]["enabled"],
+        "generation.refit_transport": generation_cfg is not None
+        and generation_cfg.get("refit_transport") is not None,
+    }
+    enabled_unsupported = [name for name, enabled in unsupported.items() if enabled]
+    if enabled_unsupported:
+        raise ValueError(f"PP > 1 does not support: {', '.join(enabled_unsupported)}.")
+
+    text_config = getattr(model_config, "text_config", None) or model_config
+    if getattr(text_config, "tie_word_embeddings", False):
+        raise ValueError(
+            f"PP > 1 does not support tied embeddings ({config['model_name']} "
+            "sets tie_word_embeddings=true)."
+        )
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:

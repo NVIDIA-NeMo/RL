@@ -1,0 +1,12 @@
+defaults: ./grpo-qwen3.5-35ba3b-2n8g-automodel-ep8pp2.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-35ba3b-2n8g-automodel-ep8pp2cp2
+policy:
+  # HybridEP needs a multiple of 64 tokens per rank, and CP2 halves each rank's
+  # sequence.
+  make_sequence_length_divisible_by: 128
+  automodel_cfg:
+    context_parallel_size: 2
+logger:
+  wandb:
+    name: grpo-qwen3.5-35ba3b-2n8g-automodel-ep8pp2cp2

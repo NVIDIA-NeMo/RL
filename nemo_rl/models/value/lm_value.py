@@ -30,6 +30,7 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.policy.utils import automodel_pipeline_parallel_size
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface, ValueOutputSpec
 from nemo_rl.utils.path_utils import checkpoint_abspath
@@ -111,11 +112,15 @@ class Value(ValueInterface):
                     "value.automodel_cfg.deterministic is not supported; "
                     "it applies to policy workers only."
                 )
+            if automodel_pipeline_parallel_size(config["automodel_cfg"]) > 1:
+                raise ValueError(
+                    "value.automodel_cfg.pipeline_parallel_size > 1 is not supported."
+                )
 
             worker_builder_cls = "nemo_rl.models.value.workers.automodel_value_worker.AutomodelValueWorker"
 
             tp_size = config["automodel_cfg"]["tensor_parallel_size"]
-            # Automodel does not pipeline-parallel; pp_size stays at the
+            # Value-model Automodel PP is rejected above; pp_size stays at the
             # default of 1 initialised above.
             cp_size = config["automodel_cfg"]["context_parallel_size"]
 
