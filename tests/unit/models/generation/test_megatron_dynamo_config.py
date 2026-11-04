@@ -294,6 +294,11 @@ def test_engine_width_must_hold_the_expert_parallel_grid(layout, decode, match) 
             "expose_http_server",
             id="http_server",
         ),
+        pytest.param(
+            _set("_dynamo_role", value="prefill"),
+            "set per engine by the Dynamo engine fleet",
+            id="engine_role",
+        ),
     ],
 )
 def test_validation_rejects_unsupported_shapes(mutate, match) -> None:
