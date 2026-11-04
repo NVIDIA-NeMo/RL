@@ -13,6 +13,10 @@ policy:
   router_replay:
     enabled: true
   generation:
+    vllm_kwargs:
+      # Keep automatic scheduler sizing for this quick NVFP4 recipe.
+      max_num_seqs: null
+      max_num_batched_tokens: null
     nvfp4_pertoken_rollout:
       enabled: true
     vllm_cfg:

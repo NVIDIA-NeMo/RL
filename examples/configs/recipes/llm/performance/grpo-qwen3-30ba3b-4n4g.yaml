@@ -11,7 +11,7 @@ policy:
   model_name: Qwen/Qwen3-30B-A3B
   train_global_batch_size: 2048
   train_micro_batch_size: 4
-  logprob_batch_size: 4
+  logprob_batch_size: 8
   # Bound full-vocabulary logprob temporaries for the larger training microbatch.
   logprob_chunk_size: 1024
   max_total_sequence_length: 4096
@@ -46,6 +46,8 @@ policy:
   generation:
     vllm_kwargs:
       moe_backend: flashinfer_trtllm
+      max_num_seqs: 256
+      max_num_batched_tokens: 8192
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n4g
   wandb_enabled: true
