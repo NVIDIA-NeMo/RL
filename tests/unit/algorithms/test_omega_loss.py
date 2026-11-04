@@ -15,7 +15,13 @@
 import pytest
 import torch
 
-from nemo_rl.algorithms.loss.omega_loss import OmegaLossConfig, OmegaLossFn
+from nemo_rl.algorithms.loss.omega_loss import (
+    H_FUNCTIONS,
+    OmegaLossConfig,
+    OmegaLossFn,
+    OmegaPerSequenceLossFn,
+    compute_omega_coefficients,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 B, K, T = 3, 4, 9
@@ -111,3 +117,78 @@ def test_empty_response_is_dropped_not_dominant():
     assert metrics["num_empty_responses"] == 1
     g = torch.autograd.grad(loss, logp)[0]
     assert g[2].abs().sum() == 0
+
+
+def _per_sequence_grad(logp, data, prompt_ids, n_valid, rows_separately=False):
+    """Gradient of the per-sequence form, with coefficients from logp's values."""
+    prev = torch.cat([torch.zeros(logp.shape[0], 1), logp.detach()], dim=1)
+    coef, metrics = compute_omega_coefficients(
+        prompt_ids=prompt_ids,
+        prev_logprobs=prev,
+        token_mask=data["token_mask"],
+        sample_mask=data["sample_mask"],
+        advantages=data["advantages"],
+        h_fn=H_FUNCTIONS["inverse_length"],
+        data=data,
+    )
+    data = BatchedDataDict({**data, "omega_coef": coef})
+    fn = OmegaPerSequenceLossFn()
+    gvs = torch.tensor(float(n_valid))
+    if not rows_separately:
+        loss, _ = fn(logp, data, gvs)
+        return torch.autograd.grad(loss, logp)[0], metrics
+    # Mimic the non-fused packing wrapper: one sequence per call, losses summed.
+    total = 0
+    for i in range(logp.shape[0]):
+        row = BatchedDataDict({k: v[i : i + 1] for k, v in data.items()})
+        loss, _ = fn(logp[i : i + 1], row, gvs)
+        total = total + loss
+    return torch.autograd.grad(total, logp)[0], metrics
+
+
+def _prompt_ids():
+    # Distinct prompt tokens per group; identical within a group.
+    return torch.arange(B).repeat_interleave(K).unsqueeze(-1).expand(-1, 5).clone()
+
+
+def test_per_sequence_gradient_matches_exact_group_form():
+    logp, data, _, _ = _make()
+    exact = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K)
+    loss, _ = exact(logp, data, torch.tensor(float(B * K)))
+    g_exact = torch.autograd.grad(loss, logp)[0]
+    g, metrics = _per_sequence_grad(logp, data, _prompt_ids(), B * K)
+    torch.testing.assert_close(g, g_exact, rtol=1e-4, atol=1e-6)
+    torch.testing.assert_close(  # logged objective equals the exact loss value
+        torch.tensor(metrics["objective"]), loss.detach(), rtol=1e-4, atol=1e-6
+    )
+    g_rows, _ = _per_sequence_grad(
+        logp, data, _prompt_ids(), B * K, rows_separately=True
+    )
+    torch.testing.assert_close(g_rows, g_exact, rtol=1e-4, atol=1e-6)
+
+
+def test_per_sequence_groups_by_prompt_not_row_order():
+    logp, data, _, _ = _make()
+    pids = _prompt_ids()
+    g_ref, _ = _per_sequence_grad(logp, data, pids, B * K)
+    perm = torch.randperm(B * K, generator=torch.Generator().manual_seed(1))
+    logp_p = logp.detach()[perm].clone().requires_grad_(True)
+    data_p = BatchedDataDict({k: v[perm] for k, v in data.items()})
+    g_p, _ = _per_sequence_grad(logp_p, data_p, pids[perm], B * K)
+    torch.testing.assert_close(g_p, g_ref[perm], rtol=1e-4, atol=1e-6)
+
+
+def test_per_sequence_invalid_and_empty_rows():
+    logp, data, _, _ = _make(invalid_rows=(1,))
+    data["token_mask"][6] = 0  # empty response
+    g, metrics = _per_sequence_grad(logp, data, _prompt_ids(), B * K - 2)
+    assert torch.isfinite(g).all()
+    assert g[1].abs().sum() == 0 and g[6].abs().sum() == 0
+    assert metrics["num_empty_responses"] == 1
+    # Matches the exact form on the same masked data.
+    data_e = BatchedDataDict({**data, "sample_mask": data["sample_mask"].clone()})
+    exact = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K)
+    loss, _ = exact(logp, data_e, torch.tensor(float(B * K - 2)))
+    torch.testing.assert_close(
+        g, torch.autograd.grad(loss, logp)[0], rtol=1e-4, atol=1e-6
+    )

@@ -48,8 +48,11 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.omega_loss import (
+    H_FUNCTIONS,
     OmegaLossConfig,
     OmegaLossFn,
+    OmegaPerSequenceLossFn,
+    compute_omega_coefficients,
     validate_omega_setup,
 )
 from nemo_rl.algorithms.metric_utils import (
@@ -863,11 +866,16 @@ def setup(
 
     if grpo_config.loss_function == "omega":
         validate_omega_setup(master_config)
-        loss_fn = OmegaLossFn(
-            grpo_config.omega_loss,
-            num_generations_per_prompt=grpo_config.num_generations_per_prompt,
-            use_fused_linear_logprobs=use_fused_linear_logprobs,
-        )
+        if grpo_config.omega_loss.form == "per_sequence":
+            loss_fn = OmegaPerSequenceLossFn(
+                use_fused_linear_logprobs=use_fused_linear_logprobs
+            )
+        else:
+            loss_fn = OmegaLossFn(
+                grpo_config.omega_loss,
+                num_generations_per_prompt=grpo_config.num_generations_per_prompt,
+                use_fused_linear_logprobs=use_fused_linear_logprobs,
+            )
     else:
         loss_fn = ClippedPGLossFn(
             loss_config,
@@ -3757,6 +3765,27 @@ def _grpo_train_impl(
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
+                    if (
+                        master_config.grpo.loss_function == "omega"
+                        and master_config.grpo.omega_loss.form == "per_sequence"
+                    ):
+                        # Group softmax weights from the current policy's logprobs;
+                        # makes the loss a per-sequence term (packing-compatible).
+                        (
+                            train_data["omega_coef"],
+                            omega_metrics,
+                        ) = compute_omega_coefficients(
+                            prompt_ids=prompt_ids_for_adv,
+                            prev_logprobs=train_data["prev_logprobs"],
+                            token_mask=train_data["token_mask"],
+                            sample_mask=train_data["sample_mask"],
+                            advantages=train_data["advantages"],
+                            h_fn=H_FUNCTIONS[master_config.grpo.omega_loss.h],
+                            data=train_data,
+                        )
+                        metrics.update(
+                            {f"omega/{k}": v for k, v in omega_metrics.items()}
+                        )
                     del prompt_ids_for_adv
 
                     # Log rewards and advantages information

@@ -7,6 +7,11 @@ grpo:
   max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
+  # Policy loss: "clipped_pg" (GRPO/PPO family, configured under loss_fn) or "omega" (softmax-over-group weighted loss).
+  loss_function: clipped_pg
+  omega_loss:
+    h: inverse_length  # exponent h(x,y) on pi(y|x); inverse_length = 1/|y|
+    form: group  # "group" (exact, no sequence packing) or "per_sequence" (packing-compatible, 1 update per rollout)
   val_period: 10
   val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay
   val_at_start: false
