@@ -2239,6 +2239,46 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
     assert moved == (["cpu"] if offload_optimizer else [])
 
 
+@pytest.mark.parametrize("clear_caches", [True, False])
+def test_megatron_offload_before_refit_clears_transient_caches_when_configured(
+    monkeypatch, clear_caches
+):
+    """clear_memory_caches_before_refit releases the policy's RoPE/MoE caches."""
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    cleared = []
+    model = object()
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = model
+    worker.optimizer = None
+    worker.optimizer_cpu_offload = False
+    worker.fp8_cfg = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": clear_caches}}
+    worker.finalize_async_save = lambda: None
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
+    worker.move_model = lambda model, device, move_params, move_grads: model
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            pass
+
+    monkeypatch.setattr(
+        megatron_policy_worker, "clear_transient_megatron_caches", cleared.append
+    )
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+
+    MegatronPolicyWorkerImpl.offload_before_refit(worker)
+
+    assert cleared == ([model] if clear_caches else [])
+
+
 @pytest.mark.parametrize(
     "generation_backend, colocated, has_inference_model, shared_buffer, "
     "expect_move_params, expect_move_grads",
@@ -2922,76 +2962,6 @@ def test_reference_model_swap_restores_state():
         torch.testing.assert_close(worker.model.extra_state_cache, torch.tensor([2.0]))
 
 
-def test_clear_rope_and_moe_dispatcher_caches_clears_tensor_state(monkeypatch):
-    from megatron.core.models.common.embeddings import rotary_pos_embedding
-
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
-
-    cache_clear = MagicMock()
-
-    def forward():
-        return None
-
-    forward.cache_clear = cache_clear
-    monkeypatch.setattr(
-        rotary_pos_embedding,
-        "RotaryEmbedding",
-        SimpleNamespace(forward=forward),
-    )
-    dispatcher = SimpleNamespace(
-        probs=torch.ones(1),
-        routing_map=torch.ones(1),
-        reversed_local_input_permutation_mapping=torch.ones(1),
-        local_probs=torch.ones(1),
-        local_map=torch.ones(1),
-        non_tensor="keep",
-    )
-    worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = SimpleNamespace(
-        modules=lambda: [
-            SimpleNamespace(),
-            SimpleNamespace(token_dispatcher=None),
-            SimpleNamespace(token_dispatcher=dispatcher),
-        ]
-    )
-
-    worker._clear_rope_and_moe_dispatcher_caches()
-
-    cache_clear.assert_called_once_with()
-    assert dispatcher.probs is None
-    assert dispatcher.routing_map is None
-    assert dispatcher.reversed_local_input_permutation_mapping is None
-    assert dispatcher.local_probs is None
-    assert dispatcher.local_map is None
-    assert dispatcher.non_tensor == "keep"
-
-
-def test_clear_rope_and_moe_dispatcher_caches_is_best_effort(monkeypatch):
-    from megatron.core.models.common.embeddings import rotary_pos_embedding
-
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
-
-    def forward():
-        return None
-
-    forward.cache_clear = MagicMock(side_effect=RuntimeError("rotary cache"))
-    monkeypatch.setattr(
-        rotary_pos_embedding,
-        "RotaryEmbedding",
-        SimpleNamespace(forward=forward),
-    )
-    worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = SimpleNamespace(
-        modules=MagicMock(side_effect=RuntimeError("module traversal"))
-    )
-
-    worker._clear_rope_and_moe_dispatcher_caches()
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_maybe_prequantize_param_passthrough_when_not_selected(dtype):
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -3141,7 +3111,11 @@ def test_offload_after_refit_uses_standard_cleanup(monkeypatch):
         ddp=SimpleNamespace(overlap_param_gather=False),
     )
     worker._clear_fp8_caches = MagicMock()
-    worker._clear_rope_and_moe_dispatcher_caches = MagicMock()
+    clear_caches = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.clear_transient_megatron_caches",
+        clear_caches,
+    )
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
     worker.offload_optimizer_for_refit = True
@@ -3174,7 +3148,7 @@ def test_offload_after_refit_uses_standard_cleanup(monkeypatch):
     model.eval.assert_called_once_with()
     worker.offload_before_refit.assert_called_once_with()
     worker._clear_fp8_caches.assert_not_called()
-    worker._clear_rope_and_moe_dispatcher_caches.assert_not_called()
+    clear_caches.assert_not_called()
     worker.move_optimizer.assert_not_called()
     collect.assert_not_called()
     empty_cache.assert_not_called()

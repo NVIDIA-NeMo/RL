@@ -198,6 +198,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "logical_selections",
         "execution_row_multiple",
         "resolved_agent_name",
+        "attribution_key",
         "reward_checks",
         "reward_log_contexts",
     }
@@ -213,6 +214,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "drop_reason",
         "valid_row_count",
         "total_row_count",
+        "token_metrics",
     }
 
 
