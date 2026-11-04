@@ -159,6 +159,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
@@ -2651,6 +2652,7 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
         require_router_replay: bool = True,
+        keep_on_gpu: bool = False,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -2658,7 +2660,8 @@ class MegatronPolicyWorkerImpl(
         Input data is assumed to be right-padded. The method internally converts to
         left-padded format for computation, and returns outputs in right-padded format.
         If micro_batch_size is provided, it will be used instead of the configured
-        logprob_batch_size.
+        logprob_batch_size. With ``keep_on_gpu`` the logprobs stay on this GPU
+        instead of being copied to pinned CPU memory.
 
         Returns:
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
@@ -2749,6 +2752,8 @@ class MegatronPolicyWorkerImpl(
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
 
+        if keep_on_gpu:
+            return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs)
         # TODO: @nan: will remove in the future
         cpu_logprobs = torch.empty_like(
             logprobs,
@@ -2940,6 +2945,7 @@ class MegatronPolicyWorkerImpl(
         payload: str,
         payload_dtype: str,
         micro_batch_size: Optional[int] = None,
+        keep_on_gpu: bool = False,
     ) -> BatchedDataDict[TeacherFullPayloadOutputSpec]:
         """Run a teacher forward returning sampled-token logprobs and the full payload.
 
@@ -2957,11 +2963,15 @@ class MegatronPolicyWorkerImpl(
             payload: ``"hidden_states"`` or ``"logits"``.
             payload_dtype: Torch dtype name for the transported payload.
             micro_batch_size: Overrides the configured logprob batch size.
+            keep_on_gpu: Keep both outputs on this GPU instead of copying them
+                to CPU; the payload then skips the per-microbatch copy during
+                the forward.
 
         Returns:
             A BatchedDataDict with ``logprobs`` ``[B, S]`` on every rank and
-            ``teacher_full_payload`` ``[B, S, D]`` on CPU on the last pipeline
-            stage (``None`` elsewhere).
+            ``teacher_full_payload`` ``[B, S, D]`` on the last pipeline stage
+            (``None`` elsewhere), both on this GPU if ``keep_on_gpu``, else on
+            CPU.
 
         Raises:
             ValueError: If ``payload`` is ``"hidden_states"`` but this teacher
@@ -3028,6 +3038,7 @@ class MegatronPolicyWorkerImpl(
                 cfg=self.cfg,
                 payload=payload,
                 payload_dtype=getattr(torch, payload_dtype),
+                keep_payload_on_gpu=keep_on_gpu,
                 sampling_params=self.sampling_params,
             ),
             forward_only=True,
@@ -3045,9 +3056,9 @@ class MegatronPolicyWorkerImpl(
                     [o["logprobs"] for o in list_of_outputs], target_len=seq_length
                 )
             }
-            # Already on CPU: the post-processor moves each microbatch off the
-            # device as it is produced, so this pad-and-concatenate never puts
-            # the payload back on the GPU.
+            # Unless keep_on_gpu, already on CPU: the post-processor
+            # moves each microbatch off the device as it is produced, so this
+            # pad-and-concatenate never puts the payload back on the GPU.
             teacher_full_payload = pad_and_concat(
                 [o["teacher_full_payload"] for o in list_of_outputs],
                 target_len=seq_length,
@@ -3059,7 +3070,7 @@ class MegatronPolicyWorkerImpl(
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs_with_full_payload")
         return BatchedDataDict[TeacherFullPayloadOutputSpec](
-            logprobs=logprobs.to("cpu"),
+            logprobs=logprobs if keep_on_gpu else logprobs.to("cpu"),
             teacher_full_payload=teacher_full_payload,
         )
 
@@ -4703,6 +4714,7 @@ class MegatronPolicyWorkerImpl(
         # The plan is consumed (provider mutated to the inference layout); release it.
         self._colocated_reshard_plan = None
 
+    @accepts_trace_context
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/pause_train_step_with_offloading")
     def pause_train_step_with_offloading(self) -> None:

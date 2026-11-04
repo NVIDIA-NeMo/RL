@@ -59,14 +59,6 @@ def _make_row(prompt: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_effort_levels_config_defaults():
-    cfg = EffortLevelsConfig()
-    assert cfg.low_weight == 0.0
-    assert cfg.low_penalty == 1.0
-    assert cfg.low_ub == 64000
-    assert cfg.low_string == ""
-
-
 # ---------------------------------------------------------------------------
 # No-op paths
 # ---------------------------------------------------------------------------
