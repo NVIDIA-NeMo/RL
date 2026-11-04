@@ -3667,6 +3667,7 @@ class TestNativeTQRecoverySetup:
             save_state=save_state,
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored == metadata
@@ -3688,6 +3689,7 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(trainer_version=7),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored == metadata
@@ -3705,6 +3707,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
         policy.load_data_plane_checkpoint.assert_not_called()
@@ -3722,6 +3725,7 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored is None
@@ -3744,6 +3748,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
     def test_rejects_tq_checkpoint_from_different_training_step(self, tmp_path):
@@ -3760,6 +3765,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
     @pytest.mark.parametrize(
@@ -3796,6 +3802,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
                 opd_full_teacher_checkpoints=current,
             )
 
@@ -3814,7 +3821,71 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
             opd_full_teacher_checkpoints=["ckpt-a", "ckpt-b"],
+        )
+
+        assert restored == metadata
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [
+            ("global_token_mean", "sequence_mean"),
+            ("sequence_mean", "global_token_mean"),
+            # Written before the field existed, so it can only have been one
+            # of the two original modes.
+            (None, "group_token_mean"),
+        ],
+    )
+    def test_rejects_tq_checkpoint_written_under_another_loss_normalization(
+        self, tmp_path, saved, current
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if saved is not None:
+            metadata["loss_normalization"] = saved
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        with pytest.raises(ValueError, match="new checkpoint_dir"):
+            sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+                load_checkpoint=policy.load_data_plane_checkpoint,
+                last_checkpoint_path=str(checkpoint_path),
+                save_state=_save_state(),
+                partition_id="rollout_data",
+                sampler_name="in_order",
+                loss_normalization=current,
+            )
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [
+            ("sequence_mean", "sequence_mean"),
+            (None, "global_token_mean"),
+            (None, "sequence_mean"),
+        ],
+    )
+    def test_accepts_tq_checkpoint_with_a_compatible_loss_normalization(
+        self, tmp_path, saved, current
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if saved is not None:
+            metadata["loss_normalization"] = saved
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+            load_checkpoint=policy.load_data_plane_checkpoint,
+            last_checkpoint_path=str(checkpoint_path),
+            save_state=_save_state(),
+            partition_id="rollout_data",
+            sampler_name="in_order",
+            loss_normalization=current,
         )
 
         assert restored == metadata

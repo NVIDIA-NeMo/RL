@@ -3025,6 +3025,7 @@ class TestDataPlaneCheckpoint:
         assert metadata["single_controller_train_steps"] == 3
         assert metadata["single_controller_trainer_version"] == 7
         assert metadata["single_controller_epoch"] == 2
+        assert metadata["loss_normalization"] == "global_token_mean"
         assert metadata["forest_training"] is forest_training
         assert metadata["forest_execution_row_multiple"] == (
             4 if forest_training else None
