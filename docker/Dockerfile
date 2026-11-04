@@ -423,7 +423,7 @@ if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
 fi
 
 # ccache is a build-only tool: install it here and purge it at the end of this RUN so
-# it never lands in this layer or the release image.
+# no ccache binaries or package files remain in this layer or the release image.
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends ccache
@@ -713,12 +713,9 @@ if [[ -z "$(find /root/.cache/ccache -mindepth 1 -print -quit)" ]]; then
     rsync -a /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
 fi
 echo "TRT-LLM ccache state before export:"
-# ccache is not part of `base`; this stage only needs it for the stats report and is
-# never shipped (only /tmp/trtllm-ccache-export is copied out).
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends ccache
-ccache --show-stats
+# ccache is not part of `base`, and this stage only copies files, so report the cache size
+# without the binary (no apt/network dependency here).
+du -sh /root/.cache/ccache
 mkdir -p /tmp/trtllm-ccache-export
 case "${CCACHE_EXPORT_MODE}" in
     incremental)

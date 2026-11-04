@@ -33,6 +33,9 @@ assert_patch_target() {
 show_ccache_status() {
     local phase=$1
 
+    # ccache is not part of the release image; it is only present for CI builds.
+    command -v ccache >/dev/null || return 0
+
     echo "[TRTLLM_CCACHE] status ${phase}:"
     # Includes cache size, limits, hit rates, misses, errors, and uncacheable
     # calls. Prefix every line so the outer uv log filter can retain this
@@ -179,7 +182,9 @@ echo "Building TensorRT-LLM wheel (arch=${ARCH}, jobs=${JOBS})..."
 # Reset only the counters so the final report describes this build.
 # `--zero-stats` keeps cached objects.
 show_ccache_status "before TRT-LLM build"
-ccache --zero-stats
+if command -v ccache >/dev/null; then
+    ccache --zero-stats
+fi
 
 # Keep full output for failure diagnostics, but stream only 5% Ninja milestones.
 TRTLLM_BUILD_LOG=$(mktemp /tmp/trtllm-build.XXXXXX.log)
@@ -189,11 +194,15 @@ TRTLLM_BUILD_CMD=(
     -a "$ARCH"
     -G Ninja
     --clean
-    --use_ccache
     --nvrtc_dynamic_linking
     --job_count "$JOBS"
     -D "ENABLE_UCX=OFF"
 )
+# Compile without a cache when ccache is not installed (for example a rebuild inside the
+# release image, which does not ship it).
+if command -v ccache >/dev/null; then
+    TRTLLM_BUILD_CMD+=(--use_ccache)
+fi
 set +e
 NINJA_STATUS='NINJA_PROGRESS:%f:%t:%p:' \
     PYTHONUNBUFFERED=1 \
