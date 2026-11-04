@@ -416,7 +416,11 @@ is available before Gym resolves the concrete agent and SC reserves the recovery
 group. When a row already carries an `agent_ref`, a matching
 `agent_target_level_overrides` entry wins over a matching task-source entry,
 mirroring Gym's concrete-route precedence. Otherwise the task-source override,
-then the global default, applies. The agent map also keeps datasets collated
+then the global default, applies. A materialized Gym task row carries no agent,
+so its `task_id.taskset` is looked up in `task_source_granularity_overrides`
+instead, and `agent_granularity_overrides` does not apply. Set taskset keys in
+YAML: a command-line override cannot express a key that contains `:`, such as
+`weather:train`. The agent map also keeps datasets collated
 before Gym recorded `task_source` working, although re-collating them is
 recommended. Overrides may only select a coarser level than the global target,
 and are not supported with `turn` yet: a checkpointing Gym deployment exports

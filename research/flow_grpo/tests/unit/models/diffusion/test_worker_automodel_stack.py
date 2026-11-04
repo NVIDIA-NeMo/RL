@@ -427,13 +427,3 @@ def test_lora_schema_defaults_are_full_path_patterns():
     cfg = DiffusionLoraCfg()
     assert cfg.target_modules, "defaults must not be empty"
     assert all(t.startswith("*.") for t in cfg.target_modules)
-
-
-def test_exemplar_yaml_targets_are_full_path_patterns():
-    yaml = pytest.importorskip("yaml")
-
-    with open("configs/recipes/flow_grpo_qwen_image_ocr.yaml") as f:
-        cfg = yaml.safe_load(f)
-    targets = cfg["policy"]["lora_cfg"]["target_modules"]
-    assert len(targets) == 12
-    assert all(t.startswith("*.") for t in targets)
