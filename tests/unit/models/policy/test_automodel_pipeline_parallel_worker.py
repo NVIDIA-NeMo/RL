@@ -25,6 +25,7 @@ import shutil
 import tempfile
 
 import pytest
+import ray
 import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn, NLLLossFn
@@ -243,6 +244,7 @@ def _run_steps(
     loss_fn,
     *,
     num_steps: int = 2,
+    data: BatchedDataDict | None = None,
 ) -> dict[str, list]:
     """Logprobs, then ``num_steps`` x (train, logprobs) on a fresh policy."""
     cluster = _cluster(num_gpus, name)
@@ -255,10 +257,11 @@ def _run_steps(
             init_reference_model=False,
             name_prefix=name,
         )
-        data = _batch(
-            config["train_global_batch_size"],
-            seq_len=config["max_total_sequence_length"],
-        )
+        if data is None:
+            data = _batch(
+                config["train_global_batch_size"],
+                seq_len=config["max_total_sequence_length"],
+            )
         out = {"logprobs": [], "loss": [], "grad_norm": [], "mb_loss": []}
         policy.prepare_for_lp_inference()
         out["logprobs"].append(policy.get_logprobs(data)["logprobs"])
@@ -275,6 +278,13 @@ def _run_steps(
         if policy is not None:
             policy.shutdown()
         cluster.shutdown()
+
+
+def _allocated_mb(policy: Policy) -> list[float]:
+    """GPU memory allocated on each worker, in MB."""
+    workers = policy.worker_group.workers
+    gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])
+    return [info["memory_allocated_mb"] for info in gpu_infos]
 
 
 def _assert_runs_close(reference: dict[str, list], actual: dict[str, list]) -> None:
@@ -335,6 +345,29 @@ def test_pipeline_matches_non_pipelined(
         loss_fn,
     )
     _assert_runs_close(reference_runs[loss_name], actual)
+
+
+@pytest.mark.timeout(900)
+def test_pipeline_masked_samples_and_larger_microbatches_match_non_pipelined(
+    tiny_untied_llama_path,
+):
+    """Samples with sample_mask=0 add nothing under PP with 2-sample microbatches.
+
+    GRPO zeroes sample_mask for filtered samples. Three of eight are masked, and
+    one masked sample shares a microbatch with a real one.
+    """
+    data = _batch(8)
+    data["sample_mask"] = torch.tensor([1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0])
+
+    def config(pp_size: int) -> PolicyConfig:
+        cfg = _policy_config(tiny_untied_llama_path, pp_size=pp_size)
+        cfg["train_micro_batch_size"] = 2
+        cfg["logprob_batch_size"] = 2
+        return cfg
+
+    reference = _run_steps(config(1), 1, "masked_ref", _clipped_pg_loss_fn(), data=data)
+    actual = _run_steps(config(2), 2, "masked_pp", _clipped_pg_loss_fn(), data=data)
+    _assert_runs_close(reference, actual)
 
 
 @pytest.mark.timeout(900)
@@ -517,6 +550,54 @@ def test_pipeline_logprobs_with_uneven_dp_shards(
 
 
 @pytest.mark.timeout(900)
+def test_pipeline_eval_mode_matches_non_pipelined(
+    tiny_untied_llama_path, reference_runs
+):
+    """SFT validation's forward-only train(eval_mode=True) under PP.
+
+    Eval returns the loss of the first non-pipelined step, leaves the weights
+    unchanged, and the next training step still matches the non-pipelined run.
+    """
+    config = _policy_config(tiny_untied_llama_path, pp_size=2)
+    data = _batch(config["train_global_batch_size"])
+    reference = reference_runs["nll"]
+    cluster = _cluster(2, "pp_eval")
+    policy = None
+    try:
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=get_tokenizer(config["tokenizer"]),
+            init_reference_model=False,
+            name_prefix="pp_eval",
+        )
+        policy.prepare_for_training()
+        evaluated = policy.train(
+            copy.deepcopy(data), NLLLossFn(), eval_mode=True, gbs=8, mbs=1
+        )
+        policy.prepare_for_lp_inference()
+        logprobs = policy.get_logprobs(data)["logprobs"]
+        policy.prepare_for_training()
+        trained = policy.train(copy.deepcopy(data), NLLLossFn())
+        for got, expected in (
+            (evaluated["loss"], reference["loss"][0]),
+            (logprobs, reference["logprobs"][0]),
+            (trained["loss"], reference["loss"][0]),
+            (trained["grad_norm"], reference["grad_norm"][0]),
+        ):
+            torch.testing.assert_close(
+                torch.as_tensor(got, dtype=torch.float32),
+                torch.as_tensor(expected, dtype=torch.float32),
+                rtol=1e-4,
+                atol=1e-5,
+            )
+    finally:
+        if policy is not None:
+            policy.shutdown()
+        cluster.shutdown()
+
+
+@pytest.mark.timeout(900)
 def test_pipeline_reference_logprobs_and_checkpoint_resume(tiny_untied_llama_path):
     """Reference swap, then save, resume, and keep training under PP."""
     config = _policy_config(tiny_untied_llama_path, pp_size=2)
@@ -594,7 +675,7 @@ def test_pipeline_reference_logprobs_and_checkpoint_resume(tiny_untied_llama_pat
 
 
 @pytest.mark.timeout(900)
-def test_pipeline_refit_info_and_offload(tiny_untied_llama_path):
+def test_pipeline_refit_info_and_offload(tiny_untied_llama_path, reference_runs):
     """The PP weight manifest equals the non-PP one; offload frees and recovers."""
     infos = {}
     for pp_size, num_gpus in ((1, 1), (2, 2)):
@@ -613,12 +694,31 @@ def test_pipeline_refit_info_and_offload(tiny_untied_llama_path):
             if pp_size > 1:
                 data = _batch(config["train_global_batch_size"])
                 policy.prepare_for_training()
-                policy.train(copy.deepcopy(data), NLLLossFn())
+                first = policy.train(copy.deepcopy(data), NLLLossFn())
+                before = _allocated_mb(policy)
                 policy.offload_before_refit()
                 policy.offload_after_refit()
+                after = _allocated_mb(policy)
+                # Each stage's weights and optimizer state leave the GPU.
+                assert all(a < b / 2 for a, b in zip(after, before)), (before, after)
                 policy.prepare_for_training()
-                results = policy.train(copy.deepcopy(data), NLLLossFn())
-                assert torch.isfinite(results["loss"]).all()
+                second = policy.train(copy.deepcopy(data), NLLLossFn())
+                reference = reference_runs["nll"]
+                _assert_runs_close(
+                    {key: reference[key] for key in ("loss", "grad_norm")},
+                    {
+                        "loss": [first["loss"], second["loss"]],
+                        "grad_norm": [first["grad_norm"], second["grad_norm"]],
+                    },
+                )
+                # Post-update logprobs catch optimizer state lost in the offload.
+                policy.prepare_for_lp_inference()
+                torch.testing.assert_close(
+                    policy.get_logprobs(data)["logprobs"],
+                    reference["logprobs"][2],
+                    rtol=1e-4,
+                    atol=1e-5,
+                )
         finally:
             if policy is not None:
                 policy.shutdown()

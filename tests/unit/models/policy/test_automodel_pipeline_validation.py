@@ -163,6 +163,7 @@ def test_logprob_batch_size_must_match_train_micro_batch_size():
             lambda c: c["automodel_cfg"]["lora_cfg"].update(enabled=True),
             "lora_cfg.enabled",
         ),
+        (lambda c: c.update(draft={"enabled": True}), "draft.enabled"),
         (lambda c: c.update(router_replay={"enabled": True}), "router_replay"),
         (
             lambda c: c.update(reward_model_cfg={"enabled": True}),

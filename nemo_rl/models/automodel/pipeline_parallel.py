@@ -50,6 +50,7 @@ from nemo_rl.models.automodel.train import (
     LogprobsPostProcessor,
     LossPostProcessor,
     _build_model_batch,
+    backward_loss_scale,
     post_process_logits,
     scale_metrics_for_global_batches,
     shard_model_batch_for_cp,
@@ -324,9 +325,12 @@ def pipeline_forward_backward(
     Returns (loss, metrics) per microbatch, including padding, on the last stage;
     other stages return an empty list. The caller owns the optimizer step.
     """
-    loss_scale = dp_size * cp_size / post_processing_fn.cp_gradient_fanout
+    loss_scale = backward_loss_scale(
+        post_processing_fn, dp_size=dp_size, cp_size=cp_size
+    )
     if not forward_only:
-        # Defer MoE expert-gradient synchronization until the final backward.
+        # Set Automodel's optim-step / first-microbatch flags, as its pipeline recipe
+        # does; under PP these calls do not change FSDP gradient sync.
         prepare_for_grad_accumulation(pipeline.parts, pp_enabled=True)
     results: list[tuple[torch.Tensor, dict[str, Any]]] = []
     for call_idx, execution_batch in enumerate(execution_batches):

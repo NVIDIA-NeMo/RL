@@ -364,8 +364,9 @@ class AutomodelCheckpointManager:
                 consolidates these checkpoints. Timeout recovery checkpoints are
                 resumable and are not considered final.
             peft_config: Optional PEFT configuration.
-            optimizer_part_ids: Global pipeline stage index of the model under
-                pipeline parallelism; namespaces its optimizer state.
+            optimizer_part_ids: Global stage indices of this rank's pipeline
+                stages (one under 1F1B), passed to Automodel's optimizer
+                checkpointing as its pipeline recipe does; None without PP.
         """
         print(f"Saving checkpoint to {weights_path}")
         assert self.checkpointer is not None, (
@@ -450,8 +451,9 @@ class AutomodelCheckpointManager:
             optimizer: Optional optimizer to load state into.
             optimizer_path: Optional path to optimizer checkpoint.
             scheduler: Optional learning rate scheduler.
-            optimizer_part_ids: Global pipeline stage index of the model under
-                pipeline parallelism; namespaces its optimizer state.
+            optimizer_part_ids: Global stage indices of this rank's pipeline
+                stages (one under 1F1B), passed to Automodel's optimizer
+                checkpointing as its pipeline recipe does; None without PP.
         """
         print(f"Loading weights from {weights_path}")
         assert self.checkpointer is not None, (

@@ -509,6 +509,19 @@ def scale_metrics_for_global_batches(
         metrics[k] /= num_global_batches
 
 
+def backward_loss_scale(
+    post_processing_fn: "LossPostProcessor", *, dp_size: int, cp_size: int
+) -> float:
+    """Scale applied to the loss before backward.
+
+    FSDP averages gradients over its DP mesh (dp_size * cp_size), while loss
+    normalization expects their sum, so cancel that average here. Replicated CP
+    losses send each local model contribution to cp_size loss consumers; divide
+    by that fanout to avoid overcounting. Partitioned losses have a fanout of 1.
+    """
+    return dp_size * cp_size / post_processing_fn.cp_gradient_fanout
+
+
 def automodel_forward_backward(
     model: nn.Module,
     data_iterator: Iterator[ProcessedMicrobatch],
@@ -644,17 +657,8 @@ def automodel_forward_backward(
                         ## NOTE: invalid samples should be multiplied
                         ## by zero in the loss function to prevent them
                         ## from affecting the gradient calculation
-
-                        # FSDP averages gradients over its DP mesh (dp_size * cp_size),
-                        # while loss normalization expects their sum, so cancel that
-                        # average here. Replicated CP losses send each local model
-                        # contribution to cp_size loss consumers; divide by that fanout
-                        # to avoid overcounting. Partitioned losses have a fanout of 1.
-                        loss = (
-                            result
-                            * dp_size
-                            * cp_size
-                            / post_processing_fn.cp_gradient_fanout
+                        loss = result * backward_loss_scale(
+                            post_processing_fn, dp_size=dp_size, cp_size=cp_size
                         )
                         loss.backward()
 

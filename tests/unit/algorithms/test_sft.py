@@ -381,6 +381,35 @@ def test_setup_rejects_deferred_checkpoint_finalize(mock_components):
             setup(master_config, mock_components["tokenizer"], MagicMock(), None)
 
 
+@pytest.mark.parametrize("val_micro_batch_size,raises", [(1, True), (2, False)])
+def test_setup_checks_val_micro_batch_size_for_automodel_pipeline_parallel(
+    mock_components, val_micro_batch_size, raises
+):
+    master_config = mock_components["master_config"]
+    master_config.sft.val_micro_batch_size = val_micro_batch_size
+    master_config.data = {"shuffle": False, "num_workers": 0}
+    master_config.logger = {}
+    master_config.policy.update(
+        {
+            "automodel_cfg": {"enabled": True, "pipeline_parallel_size": 2},
+            "train_micro_batch_size": 2,
+        }
+    )
+
+    with patch(
+        "nemo_rl.algorithms.sft.Logger",
+        side_effect=AssertionError("setup continued into logger initialization"),
+    ):
+        if raises:
+            ctx = pytest.raises(ValueError, match=r"sft\.val_micro_batch_size to equal")
+        else:
+            ctx = pytest.raises(
+                AssertionError, match="setup continued into logger initialization"
+            )
+        with ctx:
+            setup(master_config, mock_components["tokenizer"], MagicMock(), None)
+
+
 def test_setup_rejects_only_unmask_final_for_direct_packed_sft_before_side_effects(
     mock_components,
 ):
