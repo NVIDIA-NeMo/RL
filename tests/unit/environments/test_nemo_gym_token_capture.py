@@ -95,12 +95,20 @@ def test_capture_stream_yields_ready_sibling_before_slow_drain(
         try:
             await asyncio.wait_for(drain_started.wait(), timeout=1)
             ready = await asyncio.wait_for(first, timeout=1)
-            assert ready[:3] == (1, {"name": "agent"}, {"owner": 1, "reward": 1.0})
+            assert ready[:3] == (
+                1,
+                {"name": "agent"},
+                {"owner": 1, "reward": 1.0, "attribution_key": "agent"},
+            )
             assert ready[3] is None
             assert not release_drain.is_set()
             release_drain.set()
             last = await asyncio.wait_for(anext(stream), timeout=1)
-            assert last[:3] == (0, {"name": "agent"}, {"owner": 0, "reward": 1.0})
+            assert last[:3] == (
+                0,
+                {"name": "agent"},
+                {"owner": 0, "reward": 1.0, "attribution_key": "agent"},
+            )
             assert 0 <= last[3]["test/postprocess_results_pct"] <= 100
             with pytest.raises(StopAsyncIteration):
                 await anext(stream)
