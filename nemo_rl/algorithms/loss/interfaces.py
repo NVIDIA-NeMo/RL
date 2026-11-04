@@ -358,11 +358,10 @@ def group_token_mean_weights(
 
 
 @dataclass(frozen=True)
-class GroupTokenMeanReduction(GlobalTokenMeanReduction):
+class GroupTokenMeanReduction(ObjectiveReduction):
     """Average valid tokens within each prompt group, then average groups equally."""
 
-    # metric_normalizer=TOKENS is inherited for the token diagnostics only;
-    # ClippedPGLossFn drops the loss/kl entries because the group denominator applies.
+    loss_type: ClassVar[LossType] = LossType.TOKEN_LEVEL
     requires_explicit_denominator: ClassVar[bool] = True
     token_normalized: ClassVar[bool] = False
     extra_fields: ClassVar[tuple[str, ...]] = (GROUP_TOKEN_MEAN_WEIGHT,)
@@ -475,14 +474,14 @@ class GroupTokenMeanReduction(GlobalTokenMeanReduction):
         denominator: torch.Tensor,
         per_response_weights: torch.Tensor | None,
     ) -> torch.Tensor:
+        # Keep the interface importable without the optional tokenizer dependencies.
+        from nemo_rl.algorithms.utils import masked_mean
+
         assert per_response_weights is not None
-        return super().reduce(
+        return masked_mean(
             values * per_response_weights.unsqueeze(-1),
-            token_mask=token_mask,
-            sample_mask=sample_mask,
-            mask=mask,
-            denominator=denominator,
-            per_response_weights=None,
+            mask,
+            global_normalization_factor=denominator,
         )
 
 
