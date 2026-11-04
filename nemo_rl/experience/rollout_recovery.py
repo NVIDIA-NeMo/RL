@@ -44,12 +44,13 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
     from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 6
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 7
 # Schemas 2 to 5 predate turn-level recovery; they load through
 # _upgrade_pre_turn_recovery_groups.
 _PRE_TURN_RECOVERY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
 SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
     *_PRE_TURN_RECOVERY_SCHEMA_VERSIONS,
+    6,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
 }
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
@@ -74,6 +75,7 @@ _GROUP_STATE_FIELDS = frozenset(
         "prompt_ref",
         "task_source",
         "resolved_agent_name",
+        "attribution_key",
         "restore_level",
         "expected_generations",
         "target_step",
@@ -338,9 +340,11 @@ class PromptGroupRecoveryRecord:
     siblings: list[RolloutSiblingRecord]
     phase: PromptGroupPhase
     status: PromptGroupStatus = PromptGroupStatus.GENERATING
-    # Gym's authoritative route, sealed with receipts rather than inferred from
-    # task_source. Needed when recovery can reuse every sibling without rollout.
+    # Flat-row agent identity is retained for compatibility. Materialized tasks
+    # have taskset attribution instead of a single agent.
     resolved_agent_name: Optional[str] = None
+    # Sealed with receipts so all-sealed recovery retains teacher/metric routing.
+    attribution_key: Optional[str] = None
 
     @property
     def recovery_granularity(self) -> RecoveryGranularity:
@@ -437,6 +441,7 @@ class SiblingSealResult:
     reward_log_context: RewardLogContext | None = None
     logical_selection: RolloutSelection | None = None
     resolved_agent_name: Optional[str] = field(default=None, kw_only=True)
+    attribution_key: Optional[str] = field(default=None, kw_only=True)
 
 
 class UnresolvedCaptureAcknowledgement(ValueError):
@@ -1184,6 +1189,7 @@ class RolloutRecoveryLedger:
         reward: float,
         mask_sample: bool,
         resolved_agent_name: Optional[str] = None,
+        attribution_key: Optional[str] = None,
         reward_checks: RewardChecks | None = None,
         reward_log_context: RewardLogContext | None = None,
         logical_selection: RolloutSelection | None = None,
@@ -1202,6 +1208,9 @@ class RolloutRecoveryLedger:
         if not isinstance(mask_sample, bool):
             raise TypeError("mask_sample must be a bool")
         self._validate_agent_name(record, resolved_agent_name)
+        if attribution_key is None:
+            attribution_key = resolved_agent_name
+        self._validate_attribution_key(record, attribution_key)
         if gate_rollout_id != expected_gate_rollout_id:
             raise ValueError(
                 "streamed rollout identity mismatch: "
@@ -1235,6 +1244,7 @@ class RolloutRecoveryLedger:
             )
 
         record.resolved_agent_name = resolved_agent_name
+        record.attribution_key = attribution_key
         attempt.receipt = copy.deepcopy(receipt)
         attempt.logical_selection = copy.deepcopy(logical_selection)
         attempt.reward = float(reward)
@@ -1279,6 +1289,18 @@ class RolloutRecoveryLedger:
             raise ValueError("prompt-group siblings resolved to different agents")
         resolved_agent_name = next(iter(agent_names))
         self._validate_agent_name(record, resolved_agent_name)
+        attribution_keys = {
+            result.attribution_key
+            if result.attribution_key is not None
+            else result.resolved_agent_name
+            for result in results.values()
+        }
+        if len(attribution_keys) != 1:
+            raise ValueError(
+                "prompt-group siblings resolved to different attribution keys"
+            )
+        attribution_key = next(iter(attribution_keys))
+        self._validate_attribution_key(record, attribution_key)
 
         validated: list[tuple[RolloutAttemptRecord, SiblingSealResult, list[str]]] = []
         for generation_index in range(record.expected_generations):
@@ -1322,6 +1344,7 @@ class RolloutRecoveryLedger:
         # Validate the complete cohort before changing any sibling. A checkpoint
         # therefore observes either no committed siblings or the complete group.
         record.resolved_agent_name = resolved_agent_name
+        record.attribution_key = attribution_key
         for generation_index, (attempt, result, staging_keys) in enumerate(validated):
             attempt.receipt = copy.deepcopy(result.receipt)
             attempt.logical_selection = copy.deepcopy(result.logical_selection)
@@ -1347,6 +1370,22 @@ class RolloutRecoveryLedger:
             and record.resolved_agent_name != agent_name
         ):
             raise ValueError("prompt-group siblings resolved to different agents")
+
+    @staticmethod
+    def _validate_attribution_key(
+        record: PromptGroupRecoveryRecord, attribution_key: Optional[str]
+    ) -> None:
+        if attribution_key is not None and (
+            not isinstance(attribution_key, str) or not attribution_key
+        ):
+            raise ValueError("attribution_key must be a non-empty string or None")
+        if (
+            record.attribution_key is not None
+            and record.attribution_key != attribution_key
+        ):
+            raise ValueError(
+                "prompt-group siblings resolved to different attribution keys"
+            )
 
     def abandon_unsealed(self, cut: DataPlaneMutationCut, group_id: str) -> None:
         """Abandon failed work at the group's persisted recovery granularity."""
@@ -1513,6 +1552,7 @@ class RolloutRecoveryLedger:
                     },
                     "task_source": record.task_source,
                     "resolved_agent_name": record.resolved_agent_name,
+                    "attribution_key": record.attribution_key,
                     "restore_level": record.restore_level.value,
                     "expected_generations": record.expected_generations,
                     "target_step": record.target_step,
@@ -1647,6 +1687,8 @@ class RolloutRecoveryLedger:
         prompt_id = raw_group.get("prompt_id")
         task_source = raw_group.get("task_source")
         resolved_agent_name = raw_group.get("resolved_agent_name")
+        # Schemas 2 to 6 predate taskset attribution and stored only the flat agent.
+        attribution_key = raw_group.get("attribution_key", resolved_agent_name)
         raw_restore_level = raw_group.get("restore_level")
         expected_generations = raw_group.get("expected_generations")
         siblings_state = raw_group.get("siblings")
@@ -1662,6 +1704,10 @@ class RolloutRecoveryLedger:
             not isinstance(resolved_agent_name, str) or not resolved_agent_name
         ):
             raise ValueError("resolved_agent_name must be a non-empty string or None")
+        if attribution_key is not None and (
+            not isinstance(attribution_key, str) or not attribution_key
+        ):
+            raise ValueError("attribution_key must be a non-empty string or None")
         if not isinstance(raw_restore_level, str):
             raise ValueError("restore_level must be a string")
         try:
@@ -1905,6 +1951,7 @@ class RolloutRecoveryLedger:
             phase=phase,
             status=status,
             resolved_agent_name=resolved_agent_name,
+            attribution_key=attribution_key,
         )
 
     def _require_group(self, group_id: str) -> PromptGroupRecoveryRecord:

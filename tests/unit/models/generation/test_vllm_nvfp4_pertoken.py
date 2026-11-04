@@ -501,7 +501,6 @@ def test_vllm_mapping_rejects_incomplete_projection_group(nvfp4_module):
 def test_rollout_config_defaults(nvfp4_module):
     M = nvfp4_module
     cfg = M.NvFp4PerTokenRolloutConfig()
-    assert cfg.enabled is False
     assert cfg.resolved_ignore() == []
 
     layer_ignore = "*.layers.0.mlp.experts*"

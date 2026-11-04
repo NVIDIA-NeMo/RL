@@ -1427,8 +1427,11 @@ def grpo_train_sync(
             # / KV calibration.
             if not _should_log_nemo_gym_responses(master_config):
                 log_data: dict = {}
-                if "agent_ref" in repeated_batch:
-                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                for key in ("agent_ref", "attribution_key"):
+                    if driver_carry is not None and key in driver_carry:
+                        log_data[key] = driver_carry[key]
+                    elif key in repeated_batch:
+                        log_data[key] = repeated_batch[key]
                 if master_config.grpo.use_dynamic_sampling:
                     # Legacy semantics: ``rewards`` is unfiltered total_reward,
                     # ``filtered_rewards`` is the kept slice that's trained on.

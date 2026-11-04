@@ -980,7 +980,9 @@ class TeacherFullPayloadPostProcessor:
 
     The payload is returned in canonical ``[B, S, D]`` layout with tensor,
     context, and sequence parallelism already undone, so the student's own
-    parallelism can differ from the teacher's.
+    parallelism can differ from the teacher's. It moves to CPU as each
+    microbatch is produced, unless ``keep_payload_on_gpu`` keeps it on the
+    device for a GPU-sourced data-plane PUT.
     """
 
     def __init__(
@@ -989,6 +991,7 @@ class TeacherFullPayloadPostProcessor:
         payload: str,
         payload_dtype: torch.dtype,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        keep_payload_on_gpu: bool = False,
     ):
         if payload not in ("hidden_states", "logits"):
             raise ValueError(
@@ -998,6 +1001,7 @@ class TeacherFullPayloadPostProcessor:
         self.payload = payload
         self.payload_dtype = payload_dtype
         self.sampling_params = sampling_params
+        self.keep_payload_on_gpu = keep_payload_on_gpu
         self._logprobs_post_processor = LogprobsPostProcessor(
             cfg=cfg, sampling_params=sampling_params
         )
@@ -1133,14 +1137,15 @@ class TeacherFullPayloadPostProcessor:
                 payload_full = unpacked_payload
             payload_full = payload_full[:, :original_seq_length, :]
 
+            # Off the GPU here, inside the schedule, unless kept for a
+            # GPU-sourced PUT: mcore retains every microbatch's output dict until
+            # the whole forward completes, so a device tensor accumulates the
+            # entire data-parallel shard's payload rather than one microbatch's.
+            payload_device = payload_full.device if self.keep_payload_on_gpu else "cpu"
             return output_tensor.new_zeros(()), {
                 "logprobs": logprob_outputs["logprobs"],
-                # Off the GPU here, inside the schedule: mcore retains every
-                # microbatch's output dict until the whole forward completes, so
-                # a device tensor would accumulate the entire data-parallel
-                # shard's payload rather than one microbatch's.
                 "teacher_full_payload": payload_full.to(
-                    device="cpu", dtype=self.payload_dtype
+                    device=payload_device, dtype=self.payload_dtype
                 ),
             }
 

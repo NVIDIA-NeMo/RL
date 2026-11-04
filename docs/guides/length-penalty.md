@@ -138,13 +138,17 @@ grpo:
         enabled: false
 ```
 
+A materialized Gym task row carries no agent, so key its entry in `agent_overrides` by the row's
+`task_id.taskset` instead. Set such keys in YAML: a command-line override cannot express a key
+that contains `:`, such as `weather:train`.
+
 ## Flag Reference
 
 | Flag | Short description |
 | --- | --- |
 | `verbose` | Prints per-group length adjustment details during rollout processing. |
 | `default` | Default length-adjustment config used for agents without an override. |
-| `agent_overrides` | Per-agent config overrides keyed by agent name. |
+| `agent_overrides` | Per-agent config overrides keyed by agent name, or by `task_id.taskset` for materialized task rows. |
 | `enabled` | Enables length adjustment for this config block. |
 | `length_type` | Selects length unit: `tokens` (re-tokenized text), `chars` (character counts), or `all_generated_tokens` (every generated token, total length only). |
 | `top_percentile` | Fraction of positive scorers treated as top scorers for longest-penalty selection. |
@@ -697,7 +701,8 @@ All five are per-rollout means, so they read the same whether the hook sees the 
 once (legacy and data-plane drivers) or one prompt group at a time (async collector, whose
 per-group values are averaged).
 
-`total_reward` and the per-agent `<agent>/reward/*` metrics carry the adjusted reward. The reward
+`total_reward` and the per-agent `<agent>/reward/*` metrics (`<taskset>/reward/*` for materialized
+task rows) carry the adjusted reward. The reward
 as handed to the length hook (after effort shaping and reward penalties) is kept on the rollout
 batch as `env_reward`, and the `baseline_reward/pct_0` / `pct_1` / `pct_mixed` diagnostics are
 computed from it so they keep reporting the environment's all-wrong / all-correct / mixed prompt

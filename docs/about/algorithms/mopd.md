@@ -100,7 +100,7 @@ loss_fn:
 
 on_policy_distillation:
   enabled: true
-  # Map each NeMo Gym agent name to a teacher checkpoint.
+  # Map each NeMo Gym agent name, or taskset for materialized task rows, to a teacher.
   teacher_model_by_agent_name:
     default_teacher: Qwen/Qwen3-1.7B
   # Agents not present in the map fall back to this alias (must be a mapped key).
@@ -154,13 +154,15 @@ without token capture. Remove it from `data.default`, `data.train`, and
 
 ### Teacher routing
 
-Each rollout sample carries its NeMo Gym `agent_ref`. At collection time the
-agent name is resolved to a teacher alias (`teacher_model_by_agent_name`, falling
+Each rollout sample carries an attribution key: its NeMo Gym agent name for a
+flat row, or its `task_id.taskset` for a materialized task row. At collection
+time the key is resolved to a teacher alias (`teacher_model_by_agent_name`, falling
 back to `default_teacher_alias`), samples are grouped by teacher, and each group
 is scored by exactly one teacher — there is no ensemble averaging across
 teachers. When several aliases map to the same checkpoint,
 `deduplicate_shared_teacher_checkpoints` collapses them onto a single worker
-group so they share GPUs.
+group so they share GPUs. Set taskset keys in YAML: a command-line override
+cannot express a key that contains `:`, such as `weather:train`.
 
 ### Resourcing
 
