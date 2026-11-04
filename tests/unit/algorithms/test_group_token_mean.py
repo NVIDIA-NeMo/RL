@@ -15,9 +15,9 @@ from nemo_rl.algorithms.loss import (
 from nemo_rl.algorithms.loss.interfaces import (
     GroupTokenMeanReduction,
     MetricNormalizer,
+    group_token_mean_weights,
     make_objective_reduction,
 )
-from nemo_rl.algorithms.loss.utils import group_token_mean_weights
 from nemo_rl.algorithms.loss.wrapper import StreamingObjectiveLoss
 from nemo_rl.data_plane.schema import GROUP_TOKEN_MEAN_WEIGHT
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
