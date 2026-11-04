@@ -54,6 +54,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import (
@@ -3092,6 +3093,162 @@ def test_prepare_nemo_gym_rows_updates_mixed_materialized_and_flat_inputs():
         assert params["max_output_tokens"] == 64
     assert [row["_rowidx"] for row in rows] == [0, 1]
     assert rows[0][NEMO_GYM_GROUP_ID_KEY] != rows[1][NEMO_GYM_GROUP_ID_KEY]
+
+
+def _flat_rows(count: int) -> list[dict]:
+    return [
+        {"agent_ref": {"name": "flat_row_agent"}, "responses_create_params": {}}
+        for _ in range(count)
+    ]
+
+
+def _prepare_with_dataset_indices(rows: list[dict], dataset_indices, num_generations=2):
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+        num_generations=num_generations,
+        dataset_indices=dataset_indices,
+    )
+
+
+def test_prepare_nemo_gym_rows_gives_flat_rows_a_gym_episode_identity():
+    """single_agent_turn_legacy needs a rollout id and a task identity for each flat row."""
+    episode_types = pytest.importorskip("nemo_gym.episode_types", reason="Requires Gym")
+    from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
+    from nemo_gym.task_materialization import materialize_task
+
+    rows = _flat_rows(4)
+    for row in rows:
+        row[NEMO_GYM_GROUP_ATTEMPT_KEY] = 2
+    _prepare_with_dataset_indices(rows, torch.tensor([7, 7, 3, 3]))
+
+    assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in rows] == [7, 7, 3, 3]
+    assert [row["_ng_rollout_id"] for row in rows] == [
+        f"{row[NEMO_GYM_GROUP_ID_KEY]}-g{index % 2}-t2"
+        for index, row in enumerate(rows)
+    ]
+    for row in rows:
+        # The explicit id wins over the task and rollout indices, so a second
+        # validation pass over the same prompt gets new episode ids.
+        capture_key = maybe_rollout_id_from_run_body(row)
+        assert capture_key == row["_ng_rollout_id"]
+        assert (
+            episode_types.EpisodeId.from_capture_key(capture_key).rollout_id
+            == capture_key
+        )
+        task = materialize_task(row, taskset="agentic_mme")
+        assert task["task_id"]["task_id"] == str(row[NEMO_GYM_TASK_INDEX_KEY])
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [{"_ng_rollout_id": "caller-owned-rollout"}, {NEMO_GYM_TASK_INDEX_KEY: 17}],
+    ids=["explicit_rollout_id", "gym_task_index"],
+)
+def test_prepare_nemo_gym_rows_keeps_an_existing_gym_identity(identity):
+    rows = [{**row, **identity} for row in _flat_rows(2)]
+    _prepare_with_dataset_indices(rows, [5, 5])
+
+    for row in rows:
+        assert {
+            key: row.get(key) for key in ("_ng_rollout_id", NEMO_GYM_TASK_INDEX_KEY)
+        } == {
+            "_ng_rollout_id": identity.get("_ng_rollout_id"),
+            NEMO_GYM_TASK_INDEX_KEY: identity.get(NEMO_GYM_TASK_INDEX_KEY),
+        }
+
+
+def test_prepare_nemo_gym_rows_leaves_materialized_rows_and_rows_without_indices():
+    task = {
+        "task_id": {"taskset": "workplace:train", "task_id": "17"},
+        "task_input": {"responses_create_params": {}},
+    }
+    _prepare_with_dataset_indices([task], [4], num_generations=1)
+    assert "_ng_rollout_id" not in task and NEMO_GYM_TASK_INDEX_KEY not in task
+
+    rows = _flat_rows(2)
+    _prepare_with_dataset_indices(rows, None)
+    assert all(
+        "_ng_rollout_id" not in row and NEMO_GYM_TASK_INDEX_KEY not in row
+        for row in rows
+    )
+
+
+def test_prepare_nemo_gym_rows_refuses_dataset_indices_of_another_length():
+    with pytest.raises(ValueError, match="dataset indices"):
+        _prepare_with_dataset_indices(_flat_rows(2), [1])
+
+
+def _postprocess_rows_with_task_indices(task_indices: list, group_size: int):
+    rows = []
+    results = []
+    for row_index, task_index in enumerate(task_indices):
+        row = {"agent_ref": {"name": "agent"}}
+        if task_index is not None:
+            row[NEMO_GYM_TASK_INDEX_KEY] = task_index
+        rows.append(row)
+        prompt = {"role": "user", "content": "prompt", "token_ids": torch.tensor([1])}
+        results.append(
+            {
+                "input_message_log": [prompt],
+                "message_log": [
+                    prompt,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.tensor([-0.1]),
+                    },
+                ],
+                "full_result": {"reward": float(row_index % 2)},
+            }
+        )
+    return rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=SimpleNamespace(cfg={"vllm_cfg": {"max_model_len": 128}}),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(len(rows))}),
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        log_full_result_tables=False,
+        group_size=group_size,
+    )
+
+
+@pytest.mark.parametrize(
+    ("task_indices", "group_size", "expected_task_index"),
+    [
+        ([7, 7], 2, 7),
+        ([7, 7, 3, 3], 2, None),
+        ([0, 1, 2], 1, None),
+    ],
+    ids=["one_group", "sync_training_batch", "validation_batch"],
+)
+def test_postprocess_nemo_gym_rows_checks_task_indices_per_prompt_group(
+    task_indices, group_size, expected_task_index
+):
+    """The synchronous path passes every prompt group of a batch in one call.
+
+    Once flat rows carry their dataset index as the task index, a validation
+    batch holds one index per row, and only a single-group call has one task
+    index to report.
+    """
+    rollout_result = _postprocess_rows_with_task_indices(task_indices, group_size)
+
+    assert rollout_result.task_index == expected_task_index
+    assert rollout_result.final_batch["total_reward"].tolist() == [
+        float(index % 2) for index in range(len(task_indices))
+    ]
+
+
+@pytest.mark.parametrize("task_indices", [[7, 3, 3, 3], [7, 7, 3, None]])
+def test_postprocess_nemo_gym_rows_refuses_mixed_task_indices_in_a_prompt_group(
+    task_indices,
+):
+    with pytest.raises(ValueError, match="one _ng_task_index per prompt group"):
+        _postprocess_rows_with_task_indices(task_indices, group_size=2)
 
 
 def test_rollout_manager_rotates_replicas_and_reports_group_share():
