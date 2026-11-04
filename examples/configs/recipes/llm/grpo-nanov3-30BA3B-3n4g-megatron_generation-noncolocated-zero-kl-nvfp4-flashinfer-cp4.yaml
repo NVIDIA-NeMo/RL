@@ -74,8 +74,9 @@ policy:
       moe_router_dtype: fp32
       logprobs_mode: raw_logprobs
       mamba_inference_ssm_states_dtype: float32
-      max_tokens: 256
+      max_tokens: 2048
       max_requests: 32
+      inference_flashinfer_mxfp8_token_capacity: 128
       enable_prefix_caching: false
       moe_pad_experts_for_cuda_graph_inference: false
     colocated:

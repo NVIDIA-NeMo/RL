@@ -76,9 +76,12 @@ policy:
       fp8_cfg:
         enabled: false
       # FlashInfer MoE processes the full round_up(max_tokens) / TP * EP dispatcher
-      # buffer every step, so keep it small; ~96 rollouts land on each generation GPU.
-      max_tokens: 512
+      # buffer on steps where any EP rank prefills; steps where every EP rank decodes
+      # are bounded to the token capacity, which must cover max_requests * EP.
+      # ~96 rollouts land on each generation GPU.
+      max_tokens: 8192
       max_requests: 128
+      inference_flashinfer_mxfp8_token_capacity: 512
       buffer_size_gb: 80
 data:
   max_input_seq_length: 2048
