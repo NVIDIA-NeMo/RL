@@ -180,6 +180,25 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             for connection in pool.connections + peers:
                 connection.close()
 
+    def test_health_detects_an_exited_frontend(self):
+        pool = module.MultiAPIServerPool(SimpleNamespace(), 2)
+        pool.children = [Mock(name="frontend", is_alive=Mock(return_value=False))]
+        with self.assertRaisesRegex(RuntimeError, "exited"):
+            pool.check_health()
+
+    async def test_dead_child_before_send_cleans_up_and_stays_unhealthy(self):
+        pool = module.MultiAPIServerPool(SimpleNamespace(), 2)
+        process = Mock(is_alive=Mock(return_value=False))
+        pool.children = [process]
+        pool.engine_manager = Mock()
+        engine = pool.engine_manager
+        with self.assertRaisesRegex(RuntimeError, "exited"):
+            await pool.command("stop")
+        engine.shutdown.assert_called_once()
+        self.assertEqual(pool.children, [])
+        with self.assertRaisesRegex(RuntimeError, "pool failed"):
+            pool.check_health()
+
     async def test_child_error_cleans_pool_and_engine(self):
         pool = module.MultiAPIServerPool(SimpleNamespace(), 8)
         parent, child = multiprocessing.Pipe()

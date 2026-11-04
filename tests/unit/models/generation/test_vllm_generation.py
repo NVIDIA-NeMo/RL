@@ -53,6 +53,7 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
+from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
@@ -4877,3 +4878,15 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
         client.check_admission(3, request_id="req-3")
 
     assert calls == [(1, None), (2, "req-2"), (3, "req-3")]
+
+
+@pytest.mark.parametrize("alive", [True, False])
+def test_async_worker_liveness_includes_http_frontends(alive):
+    pool = MultiAPIServerPool(types.SimpleNamespace(), 2)
+    pool.children = [types.SimpleNamespace(name="NRL-HTTP-1", is_alive=lambda: alive)]
+    worker = types.SimpleNamespace(_api_server_pool=pool)
+    if alive:
+        assert VllmAsyncGenerationWorkerImpl.is_alive(worker)
+    else:
+        with pytest.raises(RuntimeError, match="NRL-HTTP-1 exited"):
+            VllmAsyncGenerationWorkerImpl.is_alive(worker)
