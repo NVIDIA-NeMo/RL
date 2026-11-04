@@ -257,17 +257,25 @@ def test_score_centering_replay_rejects_a_corrupt_capture(packed, corruption):
 
 
 @pytest.mark.parametrize("score_centering", [False, True])
-@pytest.mark.parametrize("sampled_in_head", [True, False])
+@pytest.mark.parametrize(
+    ("missing_mass", "sampled_in_head"),
+    [
+        # The kept ties the head left out hold 0.1 of the sampler's mass.
+        (0.1, True),
+        (0.1, False),
+        # They hold 5e-5, under the mass tolerance, and the sampler drew one.
+        (5e-5, False),
+    ],
+)
 def test_replay_drops_tokens_whose_head_misses_support(
-    score_centering, sampled_in_head
+    score_centering, missing_mass, sampled_in_head
 ):
-    """A head the sampler outgrew (ties at the k-th logit) drops that token, not training."""
+    """A full head the sampler outgrew (ties at the k-th logit) drops that token, not training."""
     from nemo_rl.algorithms.loss.interfaces import LossInputType
     from nemo_rl.algorithms.loss.loss_input import prepare_loss_input
 
-    ids, sampler_logprobs = _captured_head(1, 4, 7, 3, filtered_slot=2)
-    # Position 2's head holds only 0.9 of the sampler's mass.
-    sampler_logprobs[0, 2, :2] = torch.tensor([0.6, 0.3]).log()
+    ids, sampler_logprobs = _captured_head(1, 4, 7, 3)
+    sampler_logprobs[0, 2] = torch.tensor([0.5, 0.3, 0.2 - missing_mass]).log()
     input_ids = ids[..., 0].clone()
     if not sampled_in_head:
         # A tied token the head did not capture.

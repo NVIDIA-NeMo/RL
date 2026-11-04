@@ -38,6 +38,7 @@ from nemo_rl.distributed.model_utils import (
     _compute_distributed_selected_logprobs,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
+    check_sampler_support,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
@@ -2365,6 +2366,36 @@ def test_sampler_support_logprob_matches_the_renormalized_support(chunk_size):
         expected.where(finite, 0.0).mul(weights).sum(), logits
     )[0]
     torch.testing.assert_close(grad, reference)
+
+
+@pytest.mark.parametrize(
+    ("head", "sampled_in_head", "expected"),
+    [
+        # vLLM's small-batch top-k path keeps a tie the full head left out, and
+        # the sampler drew it: drop the position, don't raise.
+        ("full", False, False),
+        ("full", True, True),
+        # A head with a -inf slot holds every kept token: a miss is corruption.
+        ("filtered", False, None),
+        ("filtered", True, True),
+    ],
+)
+def test_check_sampler_support_drops_a_tie_left_out_of_a_full_head(
+    head, sampled_in_head, expected
+):
+    ids = torch.tensor([[[0, 1, 2, 3], [4, 5, 6, 7]]])
+    # Position 1's head misses 5e-5 of the sampler's mass, under the 1e-4
+    # tolerance; the full head's last slot is a finite near-zero entry.
+    last = 5e-5 if head == "full" else 0.0
+    probs = torch.tensor([[[0.4, 0.3, 0.2, 0.1], [0.5, 0.3, 0.19995 - last, last]]])
+    input_ids = torch.tensor([[0, 5 if sampled_in_head else 8]])
+    args = (input_ids, ids, probs.log(), torch.ones(1, 2))
+    if expected is None:
+        with pytest.raises(ValueError, match="not in its captured sampler support"):
+            check_sampler_support(*args)
+        return
+    complete = check_sampler_support(*args)
+    assert complete.tolist() == [[True, expected]]
 
 
 def _run_sampler_support_tp_gloo(rank, world_size, init_file):

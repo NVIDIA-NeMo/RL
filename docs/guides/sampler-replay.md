@@ -87,9 +87,13 @@ With top-k alone and `top_logprobs < top_k`, only the most peaked positions,
 where the tokens past the head hold almost no probability, would stay in the
 loss.
 
-A position can still exceed its head at runtime: for small batches, vLLM keeps
-every token tied at the `top_k`-th logit. Such positions are dropped from the
-loss and counted in the `policy_support_excluded_tokens` metric.
+A position can still exceed its head at runtime: when a vLLM step samples fewer
+than 8 rows, vLLM keeps every token tied at the `top_k`-th logit, so `S_q` can
+be larger than the head. If the sampled token is a tie the head left out, or the
+tokens left out hold at least 1e-4 of the probability, the position is dropped
+from the loss and counted in the `policy_support_excluded_tokens` metric.
+Otherwise it stays, scored over the head, which misses less than 1e-4 of the
+probability.
 
 ## Cost
 

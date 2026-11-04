@@ -720,11 +720,14 @@ def check_sampler_support(
     """Which positions' captured heads hold all of the sampler's support.
 
     Under replay every sampled token was drawn from the finite entries of its
-    captured head. A head can miss part of the support when the sampler kept more
-    tokens than the head holds (vLLM keeps ties at the top_k-th logit for small
-    batches); its finite mass then falls short of 1. Such positions are reported,
-    not raised on, so the caller can drop them. An empty head, or a sampled token
-    missing from a complete head, means the capture is corrupt and raises.
+    captured head. The head misses part of the support when the sampler kept more
+    tokens than it holds: vLLM's PyTorch top-k path, which it takes for fewer than
+    8 rows, keeps every token tied at the top_k-th logit. A position whose head
+    mass falls short of 1 by 1e-4 or more, or whose sampled token is missing from
+    a full head (no ``-inf`` slot), is reported, not raised on, so the caller can
+    drop it. An empty head, or a sampled token missing from a head that has a
+    ``-inf`` slot and passes the mass check, means the capture is corrupt and
+    raises.
 
     Returns:
         ``[B, S]`` bool, True where the head holds the whole support.
@@ -737,9 +740,13 @@ def check_sampler_support(
             "candidate in its captured head; the top-K capture is corrupt"
         )
     head_mass = sampler_topk_logprobs.to(support.device).float().exp().sum(-1)
-    complete = head_mass >= 1.0 - 1e-4
     sampled = input_ids.to(support.device).unsqueeze(-1)
-    if not (support == sampled).any(-1)[active & complete].all():
+    in_head = (support == sampled).any(-1)
+    # A head with a -inf slot and full mass holds every token the sampler kept,
+    # so a miss there is corruption; a full head can miss a tie, which is dropped.
+    full = (support >= 0).all(-1)
+    complete = (head_mass >= 1.0 - 1e-4) & (in_head | ~full)
+    if not in_head[active & complete].all():
         raise ValueError(
             "sampler replay: a sampled token is not in its captured sampler "
             "support (the finite entries of its top-K head); the capture is corrupt"
