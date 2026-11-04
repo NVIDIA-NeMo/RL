@@ -105,8 +105,8 @@ loss_fn:
   use_on_policy_kl_approximation: false
   # Corrects the vLLM-vs-Megatron logprob mismatch (largest for MoE routing). TIS clamps the per-token weight
   # pi_train/pi_vllm to [0.2, 5]; same values as the Lightning RLVR reference (nemotron-3.5-lightning/rlvr.yaml).
-  use_importance_sampling_correction: true
-  truncated_importance_sampling_type: tis
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_type: null # tis
   truncated_importance_sampling_ratio: 5
   truncated_importance_sampling_ratio_min: 0.2
   token_level_loss: true
