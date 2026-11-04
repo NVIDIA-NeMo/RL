@@ -124,10 +124,11 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs: null
 
-  # 4 optimizer updates per rollout: 32 prompts x 16 generations = 512 samples, trained in mini-batches of 128. Must divide 512
-  # (the trainer runs 512 // gbs updates and drops the remainder). Don't set loss_fn.force_on_policy_ratio with this: it needs
-  # gbs == prompts x generations (grpo.py:988). With 512 here there would be 1 update per rollout, as in rlvr.yaml.
-  train_global_batch_size: 128
+  # ONE optimizer update per rollout (same in grpo_birdbench.yaml and omega_birdbench.yaml for a side-by-side comparison):
+  # gbs == num_prompts_per_step x num_generations_per_prompt = 32 x 16 = 512. Omega requires this (its group weights come from
+  # the policy at the start of the step); for GRPO it makes the PPO ratio 1, so clipping is inactive and TIS still applies.
+  # Don't set loss_fn.force_on_policy_ratio: Omega needs real prev_logprobs (keep it off in both for parity).
+  train_global_batch_size: 512
   train_micro_batch_size: 1  # as in the Lightning RLVR reference (packing, not the micro-batch, sets token count)
   logprob_batch_size: ${policy.train_micro_batch_size}  # keep equal to train_micro_batch_size for TP >= 4 numerical consistency
 
@@ -250,7 +251,7 @@ policy:
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
       lr_decay_iters: 100000
-      lr_warmup_iters: 8  # counts optimizer updates, not rollouts: 2 rollouts x 4 updates per rollout (a 4h job is only ~55 rollouts)
+      lr_warmup_iters: 8  # counts optimizer updates, not rollouts: with 1 update per rollout this is 8 rollouts
       lr_warmup_init: 5.0e-7
       override_opt_param_scheduler: true
 
