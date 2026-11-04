@@ -110,7 +110,6 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
-    extract_generation_logprobs,
     format_prompt_for_vllm_generation,
     check_sampling_param,
     validate_rollout_prompt,
@@ -424,10 +423,11 @@ class VllmAsyncGenerationWorkerImpl(
         self.http_server = None
         self._engine_loop = None
         self._http_engine_client = None
+        # API server pool for multiple HTTP API servers
+        self._api_server_pool = None
 
+        # Token capture state
         self._init_token_capture_state()
-
-        self._api_server_pool: MultiAPIServerPool | None = None
 
     def _init_token_capture_state(self) -> None:
         """Token-capture and generation-cut state, dormant until setup_token_capture.
