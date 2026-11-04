@@ -43,7 +43,7 @@ COMMON_OVERRIDES=(
     checkpointing.save_period=1
     ++checkpointing.save_data_plane=true
     ++token_capture.enabled=true
-    ++rollout_recovery.default_granularity=sibling
+    ++rollout_recovery.target_level=sibling
     async_rl.sampler.name=in_order
     async_rl.sampler.max_lookahead_versions=1
     async_rl.max_inflight_prompts=8
@@ -75,7 +75,7 @@ PARTIAL_GROUP_ID=$(uv run --directory "$PROJECT_ROOT" --no-sync python -c \
     'import json, sys; events = [json.loads(line) for line in open(sys.argv[1])]; sealed = [event for event in events if event["event"] == "sibling_sealed"]; blocked = [event for event in events if event["event"] == "blocked_before_ledger_seal"]; assert len(sealed) == 1, sealed; assert len(blocked) == 1, blocked; assert sealed[0]["group_id"] == blocked[0]["group_id"], (sealed, blocked); assert sealed[0]["generation_index"] != blocked[0]["generation_index"], (sealed, blocked); print(sealed[0]["group_id"])' \
     "$PHASE1_EVENTS")
 uv run --directory "$PROJECT_ROOT" --no-sync python -c \
-    'import sys, torch; state = torch.load(sys.argv[1], weights_only=True); group_id = sys.argv[2]; groups = [group for group in state["groups"] if group["group_id"] == group_id]; assert len(groups) == 1, state; group = groups[0]; statuses = [sibling["attempts"][-1]["status"] for sibling in group["siblings"]]; assert group["recovery_granularity"] == "sibling", group; assert sorted(statuses) == ["dispatched", "sealed"], statuses' \
+    'import sys, torch; state = torch.load(sys.argv[1], weights_only=True); group_id = sys.argv[2]; groups = [group for group in state["groups"] if group["group_id"] == group_id]; assert len(groups) == 1, state; group = groups[0]; statuses = [sibling["attempts"][-1]["status"] for sibling in group["siblings"]]; assert group["restore_level"] == "sibling", group; assert sorted(statuses) == ["dispatched", "sealed"], statuses' \
     "$STEP1/rollout_recovery.pt" "$PARTIAL_GROUP_ID"
 
 echo "=== Phase 2: reuse the sealed sibling and regenerate only its peer ==="
