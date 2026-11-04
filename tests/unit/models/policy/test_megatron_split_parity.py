@@ -24,6 +24,8 @@ metric agree. TP=2 additionally exercises the replica-leader dedup in the
 split-path result aggregation.
 """
 
+from collections.abc import Sequence
+
 import numpy as np
 import pytest
 import ray
@@ -34,7 +36,9 @@ import torch
 pytest.importorskip("megatron.bridge")
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.interfaces import group_token_mean_weights
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data_plane.schema import GROUP_TOKEN_MEAN_WEIGHT
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
@@ -50,7 +54,14 @@ SEQ_LEN = 64
 VOCAB_SIZE = 32000
 
 
-def _make_policy(model_name: str, tp: int, cluster_name: str, pp: int = 1):
+def _make_policy(
+    model_name: str,
+    tp: int,
+    cluster_name: str,
+    pp: int = 1,
+    *,
+    sequence_packing: bool = False,
+):
     cluster = RayVirtualCluster(
         name=cluster_name,
         bundle_ct_per_node_list=[NUM_GPUS],
@@ -59,6 +70,13 @@ def _make_policy(model_name: str, tp: int, cluster_name: str, pp: int = 1):
         max_colocated_worker_groups=1,
     )
     config = create_megatron_test_config(model_name=model_name, tp=tp, pp=pp)
+    if sequence_packing:
+        config["sequence_packing"] = {
+            "enabled": True,
+            "train_mb_tokens": 2 * SEQ_LEN,
+            "logprob_mb_tokens": 2 * SEQ_LEN,
+            "algorithm": "modified_first_fit_decreasing",
+        }
     tokenizer = get_tokenizer(config["tokenizer"])
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
     policy = Policy(
@@ -70,14 +88,25 @@ def _make_policy(model_name: str, tp: int, cluster_name: str, pp: int = 1):
     return policy, cluster, config
 
 
-def _make_grpo_batch(batch_size: int) -> BatchedDataDict:
-    """Deterministic ClippedPG batch with non-trivial masks."""
+def _make_grpo_batch(
+    batch_size: int, *, input_lengths: Sequence[int] | None = None
+) -> BatchedDataDict:
+    """Deterministic ClippedPG batch with non-trivial masks.
+
+    By default every row spans SEQ_LEN and row 0 has a masked tail. Given
+    ``input_lengths``, row ``i`` is right-padded after ``input_lengths[i]``
+    tokens instead, with no extra tail masking.
+    """
     torch.manual_seed(42)
     input_ids = torch.randint(0, VOCAB_SIZE, (batch_size, SEQ_LEN))
-    attention_mask = torch.ones(batch_size, SEQ_LEN)
-    token_mask = torch.ones(batch_size, SEQ_LEN)
+    lengths = torch.full((batch_size,), SEQ_LEN)
+    if input_lengths is not None:
+        lengths = torch.tensor(input_lengths)
+    attention_mask = (torch.arange(SEQ_LEN) < lengths[:, None]).float()
+    token_mask = attention_mask.clone()
     token_mask[:, :8] = 0  # mask a "prompt" prefix
-    token_mask[0, -4:] = 0  # ragged tail so valid counts are non-trivial
+    if input_lengths is None:
+        token_mask[0, -4:] = 0  # ragged tail so valid counts are non-trivial
     return BatchedDataDict(
         {
             "input_ids": input_ids,
@@ -324,3 +353,158 @@ def test_in_loss_filter_matches_prefiltering(tp, pp, tiny_llama_model_path):
                 f"step {step}: metric {key!r} diverged "
                 f"(sync={sync_val}, split={split_val})"
             )
+
+
+GROUP_SIZE = 2
+# Prompt group of each row. Each group has one row in each half-batch
+# train_microbatch chunk; without packing the split run also puts those rows
+# on different DP ranks (rows 0-1 and 4-5 on rank 0, rows 2-3 and 6-7 on rank 1).
+GROUP_INDICES = torch.tensor([0, 1, 2, 3, 2, 3, 0, 1])
+# Ragged case: per-row input lengths (8 prompt tokens each) and a row with
+# sample_mask=0. Valid response tokens per row are 56, 4, 32, 20, 52, 0, 8, 6,
+# so the group token masses T_g are 64, 10, 84 and 20.
+RAGGED_INPUT_LENGTHS = (64, 12, 40, 28, 60, 20, 16, 14)
+RAGGED_MASKED_ROW = 5
+
+
+def _initial_logprobs(policy: Policy, data: BatchedDataDict) -> torch.Tensor:
+    """Sampled-token logprobs of the untrained policy, ``[B, S]``."""
+    policy.prepare_for_lp_inference()
+    inputs = BatchedDataDict(
+        {key: data[key] for key in ("input_ids", "input_lengths", "attention_mask")}
+    )
+    return policy.get_logprobs(inputs)["logprobs"].float().cpu()
+
+
+def _cpu_global_token_mean_loss(
+    loss_fn: ClippedPGLossFn, data: BatchedDataDict, logprobs: torch.Tensor
+) -> float:
+    """Synchronous global_token_mean loss of one full batch, computed on CPU."""
+    mask = data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+    loss, _ = loss_fn(
+        next_token_logprobs=logprobs[:, 1:],
+        data=data,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=mask.sum(),
+    )
+    return loss.item()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize(
+    "lengths", ["equal", "ragged"], ids=["equal_lengths", "ragged_lengths_packed"]
+)
+def test_split_group_token_mean_matches_sync_oracle(lengths, tiny_llama_model_path):
+    """Streaming group_token_mean against a sync global_token_mean oracle.
+
+    The oracle runs sync train() with global_token_mean on a token_mask scaled
+    per row by its group weight 1/T_g. The global token mass is then the group
+    count G and the objective is exactly (1/G) sum_g (1/T_g) sum_tokens, which
+    for equal group masses is plain global_token_mean. "ragged" has unequal
+    T_g and a sample_mask=0 row, and the split run uses sequence packing.
+    """
+    tp = 1  # DP2
+    ragged = lengths == "ragged"
+    oracle_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            use_importance_sampling_correction=True, normalization="global_token_mean"
+        )
+    )
+    group_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            use_importance_sampling_correction=True, normalization="group_token_mean"
+        )
+    )
+
+    policy, cluster, config = _make_policy(
+        tiny_llama_model_path, tp, f"parity-sync-group-oracle-{lengths}"
+    )
+    gbs = config["train_global_batch_size"]
+    mbs = config["train_micro_batch_size"]
+    assert gbs == len(GROUP_INDICES) == len(RAGGED_INPUT_LENGTHS)
+    data = _make_grpo_batch(
+        batch_size=gbs,
+        input_lengths=RAGGED_INPUT_LENGTHS if ragged else [SEQ_LEN] * gbs,
+    )
+    if ragged:
+        data["sample_mask"][RAGGED_MASKED_ROW] = 0
+    weights = group_token_mean_weights(
+        [f"s{row}" for row in range(gbs)],
+        data["token_mask"],
+        data["sample_mask"],
+        group_indices=GROUP_INDICES,
+        expected_group_size=GROUP_SIZE,
+    )
+    if ragged:
+        assert torch.unique(weights).numel() > 1
+    else:
+        assert torch.unique(weights).numel() == 1
+    data[GROUP_TOKEN_MEAN_WEIGHT] = weights
+    plain_data = BatchedDataDict(
+        {key: value for key, value in data.items() if key != GROUP_TOKEN_MEAN_WEIGHT}
+    )
+    oracle_data = BatchedDataDict(
+        {**plain_data, "token_mask": data["token_mask"] * weights.unsqueeze(-1)}
+    )
+    try:
+        initial_logprobs = _initial_logprobs(policy, plain_data)
+        sync_results = _run_sync(policy, oracle_data, oracle_fn)
+    finally:
+        policy.shutdown()
+        cluster.shutdown()
+
+    policy, cluster, _ = _make_policy(
+        tiny_llama_model_path,
+        tp,
+        f"parity-split-group-token-mean-{lengths}",
+        sequence_packing=ragged,
+    )
+    try:
+        split_results = _run_split(policy, data, group_fn, gbs=gbs, mbs=mbs)
+    finally:
+        policy.shutdown()
+        cluster.shutdown()
+
+    # Step-0 loss recomputed on CPU from the untrained policy's logprobs: the
+    # oracle must reproduce the sync run, and in the ragged case plain
+    # global_token_mean on the unscaled mask must miss it by far more than the
+    # parity tolerance, so wrong per-group weighting cannot pass.
+    oracle_step0 = _cpu_global_token_mean_loss(oracle_fn, oracle_data, initial_logprobs)
+    plain_step0 = _cpu_global_token_mean_loss(oracle_fn, plain_data, initial_logprobs)
+    print(
+        f"[{lengths}] step 0 CPU loss: oracle={oracle_step0:.6g} "
+        f"plain global_token_mean={plain_step0:.6g}"
+    )
+    for step, (sync_r, split_r) in enumerate(zip(sync_results, split_results)):
+        print(
+            f"[{lengths}] step {step}: loss split={float(split_r['loss']):.6g} "
+            f"oracle={float(sync_r['loss']):.6g}; "
+            f"grad_norm split={float(split_r['grad_norm']):.6g} "
+            f"oracle={float(sync_r['grad_norm']):.6g}"
+        )
+
+    for step, (sync_r, split_r) in enumerate(zip(sync_results, split_results)):
+        torch.testing.assert_close(
+            split_r["loss"],
+            sync_r["loss"],
+            rtol=1e-3,
+            atol=1e-5,
+            msg=f"step {step}: group loss diverged from the oracle "
+            f"(sync={sync_r['loss']}, split={split_r['loss']})",
+        )
+        torch.testing.assert_close(
+            split_r["grad_norm"].float(),
+            sync_r["grad_norm"].float(),
+            rtol=1e-3,
+            atol=1e-5,
+            msg=f"step {step}: grad_norm diverged from the oracle "
+            f"(sync={sync_r['grad_norm']}, split={split_r['grad_norm']})",
+        )
+    assert oracle_step0 == pytest.approx(
+        float(sync_results[0]["loss"]), rel=1e-3, abs=1e-5
+    )
+    if ragged:
+        assert abs(plain_step0 - oracle_step0) > 1e-2 * abs(oracle_step0)
+    else:
+        assert plain_step0 == pytest.approx(oracle_step0, rel=1e-5)
