@@ -775,6 +775,15 @@ def test_load_balancers_use_lb_container_and_its_python():
     assert "PYTHON='${lb_python}' /opt/external-vllm-tools/lb_watchdog.sh" in source
 
 
+def test_pool_cache_is_seeded_before_ray_and_survives_pool_env_vars():
+    source = (REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh").read_text()
+
+    seed = source.index('"${CACHE_SYNC}" seed "${POOL_CACHE_DIR}"')
+    assert seed < source.index("  ray start")
+    env_vars = source.index('done <<< "$(pool_value ENV_VARS)"')
+    assert source.index("export_cache_env", env_vars) < source.index("vllm_args=()")
+
+
 def test_private_ray_and_vllm_ports_match_sub_ephemeral_layout():
     script = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh"
     source = script.read_text()

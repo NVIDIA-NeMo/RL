@@ -80,6 +80,7 @@ from nemo_rl.telemetry.setup import (
     vllm_native_tracing_requested,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils import compile_cache
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -332,10 +333,13 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = (
+            # With persistent compile caches, the engine's folder is under the
+            # node-local cache and filled from it before the engine starts.
+            env_vars["VLLM_CACHE_ROOT"] = compile_cache.vllm_engine_dir(seed) or (
                 os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
                 + f"_{seed}"
             )
+            env_vars.update(compile_cache.env_overrides("vllm"))
 
             # Give each vLLM engine a deterministic starting VLLM_PORT for the
             # TP/DP rendezvous. vLLM's _get_open_port() reads VLLM_PORT and
@@ -503,7 +507,10 @@ class BaseVllmGenerationWorker:
         vllm_cfg = self.cfg["vllm_cfg"]
         _apply_vllm_patches(
             self.py_executable,
-            extra_env_vars=extra_env_vars,
+            extra_env_vars=[
+                *(extra_env_vars or []),
+                *compile_cache.env_overrides("vllm"),
+            ],
             nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
             require_moe_routed_experts_capture=bool(
                 (self.cfg.get("vllm_kwargs") or {}).get(
@@ -788,6 +795,8 @@ class BaseVllmGenerationWorker:
         _configure_nvfp4_pertoken_engine_kwargs(self.cfg, llm_kwargs)
         llm_kwargs.setdefault("worker_extension_cls", default_worker_extension_cls)
         _maybe_enable_vllm_native_tracing(llm_kwargs)
+        # Seed every node this engine runs on before it compiles.
+        compile_cache.prepare_vllm_engine(bundle_indices)
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
