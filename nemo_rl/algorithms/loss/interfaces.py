@@ -375,6 +375,10 @@ class GroupTokenMeanReduction(GlobalTokenMeanReduction):
         megatron_enabled: bool,
         on_policy_distillation: bool,
     ) -> None:
+        """Accept only SingleController GRPO on Megatron without OPD.
+
+        The synchronous train() path never supplies the group denominator.
+        """
         if (
             trainer != "single_controller"
             or algorithm != "grpo"
@@ -394,6 +398,7 @@ class GroupTokenMeanReduction(GlobalTokenMeanReduction):
         positive_example_nll_weight: float,
         seq_logprob_error_in_loss: bool,
     ) -> None:
+        """Reject options whose terms or masks would not share the group weights."""
         if sequence_level_importance_ratios:
             raise ValueError(
                 "group_token_mean requires sequence_level_importance_ratios=False"
@@ -414,6 +419,7 @@ class GroupTokenMeanReduction(GlobalTokenMeanReduction):
         group_indices: torch.Tensor,
         expected_group_size: int | None,
     ) -> dict[str, torch.Tensor]:
+        """Return the ``1 / T_g`` row-weight column from the final masks."""
         return {
             GROUP_TOKEN_MEAN_WEIGHT: group_token_mean_weights(
                 sample_ids,
