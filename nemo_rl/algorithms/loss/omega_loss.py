@@ -96,6 +96,7 @@ class OmegaLossFn(LossFunction):
             "weight_concentration": MetricNormalizer.SEQUENCES,
             "response_len_mean": MetricNormalizer.SEQUENCES,
             "h_mean": MetricNormalizer.SEQUENCES,
+            "num_empty_responses": MetricNormalizer.NONE,
         }
 
     def __call__(
@@ -113,8 +114,13 @@ class OmegaLossFn(LossFunction):
             f"num_generations_per_prompt={k}; groups would be split."
         )
 
-        sample_mask = data["sample_mask"].to(torch.float32)  # [N]
         token_mask = data["token_mask"][:, 1:].to(torch.float32)  # [N, T-1]
+        # A response with no model-generated tokens (|y| = 0) has log pi(y) = 0,
+        # the *maximum* possible score, so left alone it would dominate the
+        # softmax. Treat it like an invalid sample: no weight, no gradient.
+        has_tokens = token_mask.sum(-1) > 0
+        sample_mask = data["sample_mask"].to(torch.float32) * has_tokens  # [N]
+        num_empty = ((data["sample_mask"] > 0) & ~has_tokens).sum()
         logp = next_token_logprobs.to(torch.float32)
 
         # log pi(y|x) of the whole response under the *current* policy (has grad).
@@ -159,6 +165,8 @@ class OmegaLossFn(LossFunction):
                     sample_mask,
                     global_normalization_factor=global_valid_seqs,
                 ).item(),
+                # Valid-by-mask rollouts dropped for having no generated tokens.
+                "num_empty_responses": num_empty.item(),
                 "h_mean": masked_mean(
                     h, sample_mask, global_normalization_factor=global_valid_seqs
                 ).item(),

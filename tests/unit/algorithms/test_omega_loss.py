@@ -100,3 +100,14 @@ def test_split_groups_rejected():
 def test_unknown_h_rejected():
     with pytest.raises(ValueError):
         OmegaLossFn(OmegaLossConfig(h="nope"), num_generations_per_prompt=K)
+
+
+def test_empty_response_is_dropped_not_dominant():
+    logp, data, _, _ = _make()
+    data["token_mask"][2] = 0  # row 2 generated nothing: |y| = 0
+    fn = OmegaLossFn(OmegaLossConfig(), num_generations_per_prompt=K)
+    loss, metrics = fn(logp, data, global_valid_seqs=torch.tensor(float(B * K - 1)))
+    assert torch.isfinite(loss)
+    assert metrics["num_empty_responses"] == 1
+    g = torch.autograd.grad(loss, logp)[0]
+    assert g[2].abs().sum() == 0
