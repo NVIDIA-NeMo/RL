@@ -68,7 +68,8 @@ from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     _GENERATION_CUT_ROUTE,
-    _PENDING_ENGINE_REQUEST_CAPTURE,
+    _CAPTURED_MODEL_CALL,
+    _EngineProgressRead,
     _AsyncLLMHTTPClient,
     VllmAsyncGenerationWorkerImpl,
     _classify_restored_prefix_terminal,
@@ -129,6 +130,13 @@ class _ByteTokenizer:
         return bytes(token_ids).decode("utf-8", errors="replace")
 
 
+class _NoCallsInVllm:
+    """An HTTP engine client none of whose captured calls has reached vLLM."""
+
+    def read_generation_progress(self, calls, *, timeout_s):
+        return _EngineProgressRead([None] * len(calls), 0.0, 0.0)
+
+
 def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
     """The attribute surface setup_token_capture touches, minus the engine."""
     worker = SimpleNamespace(
@@ -148,6 +156,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _generation_cut_tokenizer=_ByteTokenizer(),
         _restored_generation_prefix_calls=0,
         _restored_generation_prefix_tokens=0,
+        _http_engine_client=_NoCallsInVllm(),
         _generation_cut_counts=initial_generation_cut_counts(),
         _token_capture_snapshot_gate=_TokenCaptureSnapshotGate(),
         _generation_cut_cleanup_executor=ThreadPoolExecutor(max_workers=1),
@@ -669,17 +678,15 @@ def test_finished_request_stays_readable_until_its_consumer_is_done(monkeypatch)
     unserved = _engine_request([30], [-0.3], request_id="offline-1")
     processor = _OutputProcessor(request, unserved)
     client = _progress_client(monkeypatch, processor)
-    client._serving_request_ids.add("chatcmpl-1")
+    client._captured_requests["chatcmpl-1"] = "c1"
 
     processor._finish_request(request)
     processor._finish_request(unserved)
-    read = client.read_generation_progress(
-        [("chatcmpl-1", 1), ("offline-1", 0)], timeout_s=None
-    )
+    read = client.read_generation_progress([("c1", 1), ("c2", 0)], timeout_s=None)
 
     [finished, gone] = read.progress
     assert (finished.token_ids, finished.finish_reason) == ([21], "stop")
-    # Only requests this client serves are kept after they finish.
+    # Only captured requests are kept after they finish.
     assert gone is None
     assert "offline-1" not in client._finished_requests
 
@@ -698,6 +705,7 @@ def test_finished_request_is_released_once_its_consumer_has_the_output(monkeypat
             yield "final output"
 
         client._engine_client.generate = engine_generate
+        _CAPTURED_MODEL_CALL.set("c1")
         async for output in client._generate("prompt", None, "chatcmpl-1", {}):
             # The consumer records the output while vLLM's state is still kept.
             seen.append(client._finished_requests["chatcmpl-1"].finish_reason)
@@ -705,7 +713,7 @@ def test_finished_request_is_released_once_its_consumer_has_the_output(monkeypat
 
     assert asyncio.run(consume()) == ["length"]
     assert client._finished_requests == {}
-    assert client._serving_request_ids == set()
+    assert client._captured_requests == {}
 
 
 def test_progress_reads_refuse_an_unchecked_vllm(monkeypatch):
@@ -723,9 +731,6 @@ def test_cut_reads_each_call_progress_from_vllm_request_state(monkeypatch):
         worker._capture_calls[id(_captured_text_call(worker, call_id))]
         for call_id in ("c1", "c2", "c3", "c4")
     )
-    decoding.engine_request_id = "chatcmpl-1"
-    resumed.engine_request_id = "chatcmpl-2"
-    finished.engine_request_id = "chatcmpl-3"
     resumed.observe([30], [-0.3])  # recorded by an earlier cut
     done = _engine_request(
         [40, 41], [-0.5, -0.6], request_id="chatcmpl-3", finish_reason="stop"
@@ -737,7 +742,10 @@ def test_cut_reads_each_call_progress_from_vllm_request_state(monkeypatch):
         done,
     )
     worker._http_engine_client = _progress_client(monkeypatch, processor)
-    worker._http_engine_client._serving_request_ids.add("chatcmpl-3")
+    # c4 has not reached vLLM yet, so the HTTP client has no request for it.
+    worker._http_engine_client._captured_requests.update(
+        {"chatcmpl-1": "c1", "chatcmpl-2": "c2", "chatcmpl-3": "c3"}
+    )
     processor._finish_request(done)
 
     VllmAsyncGenerationWorkerImpl._record_generation_progress(
@@ -761,17 +769,17 @@ def test_cut_reads_each_call_progress_from_vllm_request_state(monkeypatch):
         state.observation_error is None
         for state in (decoding, resumed, finished, unsubmitted)
     )
-    counts = _cut_counts(worker)
-    assert (counts["progress_reads"], counts["progress_read_calls"]) == (1, 3)
+    counts = _cut_counts(worker, progress_reads=True)
+    assert (counts["progress_reads"], counts["progress_read_calls"]) == (1, 4)
 
 
 def test_cut_past_its_deadline_skips_reading_vllm_progress(monkeypatch, caplog):
     worker = _worker_with_capture(_MemorySink())
     state = worker._capture_calls[id(_captured_text_call(worker))]
-    state.engine_request_id = "chatcmpl-1"
     client = _progress_client(
         monkeypatch, _OutputProcessor(_engine_request([20], [-0.1]))
     )
+    client._captured_requests["chatcmpl-1"] = "c1"
     worker._http_engine_client = client
     vllm_busy, release = threading.Event(), threading.Event()
 
@@ -1133,13 +1141,19 @@ class _FakeRequest(SimpleNamespace):
     pass
 
 
-def _cut_counts(worker) -> dict[str, int]:
-    """The worker's nonzero generation-cut counters."""
+def _cut_counts(worker, *, progress_reads: bool = False) -> dict[str, int]:
+    """The worker's nonzero generation-cut counters.
+
+    Every cut reads vLLM's progress first; those counters are left out unless
+    ``progress_reads`` asks for them.
+    """
     counts = VllmAsyncGenerationWorkerImpl.get_generation_prefix_counts(worker)
     return {
         name: count
         for name, count in counts.items()
-        if count and name not in ("restored_calls", "restored_prefix_tokens")
+        if count
+        and name not in ("restored_calls", "restored_prefix_tokens")
+        and (progress_reads or not name.startswith("progress_read"))
     }
 
 
@@ -1346,20 +1360,14 @@ def test_generation_cut_stages_the_tokens_it_reads_from_vllm(monkeypatch):
     state = worker._capture_calls[id(request)]
     with state.lock:
         state.effective_output_limit = 8
-    VllmAsyncGenerationWorkerImpl._bind_capture_engine_request(worker, "unbound")
-    token = _PENDING_ENGINE_REQUEST_CAPTURE.set(state)
-    try:
-        VllmAsyncGenerationWorkerImpl._bind_capture_engine_request(worker, "chatcmpl-1")
-    finally:
-        _PENDING_ENGINE_REQUEST_CAPTURE.reset(token)
     worker._http_engine_client = _progress_client(
         monkeypatch, _OutputProcessor(_engine_request([20, 21], [-0.1, -0.2]))
     )
+    worker._http_engine_client._captured_requests["chatcmpl-1"] = "c1"
     inventory = _single_call_inventory()
 
     receipt = worker._checkpoint_generation_cut(inventory)
 
-    assert state.engine_request_id == "chatcmpl-1"
     assert receipt.prefixes[0].disposition == "durable_prefix"
     assert receipt.prefixes[0].prefix_token_count == 2
     assert sink.generation_prefix_records[0][1].token_ids_delta == [10, 11, 20, 21]
