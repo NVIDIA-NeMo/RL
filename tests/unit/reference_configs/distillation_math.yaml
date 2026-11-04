@@ -224,6 +224,7 @@ policy: &POLICY_BASE
         stop_strings: null
         lora_refit_mode: native
         vllm_cfg:
+            http_api_server_count: 1 # Positive process count; values >1 require async_engine: true and expose_http_server: true.
             async_engine: false
             precision: ${...precision}
             kv_cache_dtype: "auto"

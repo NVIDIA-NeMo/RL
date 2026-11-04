@@ -160,6 +160,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> VllmAsyncGenerationWorkerImp
     worker._init_token_capture_state()
     worker.is_model_owner = is_model_owner
     worker._http_engine_client = None
+    worker._api_server_pool = None
     return worker
 
 
