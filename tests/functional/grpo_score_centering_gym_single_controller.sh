@@ -27,7 +27,7 @@ fi
 
 cd "$PROJECT_ROOT"
 
-for IS_MODE in ${SC_IS_MODES:-off is tis icepop}; do
+for IS_MODE in ${SC_IS_MODES:-off is tis icepop adaptive-ppo-clip}; do
     EXP_NAME=${EXP_PREFIX}_$IS_MODE
     EXP_DIR=$SCRIPT_DIR/$EXP_NAME
     IS_OVERRIDES=(
@@ -37,9 +37,10 @@ for IS_MODE in ${SC_IS_MODES:-off is tis icepop}; do
         loss_fn.truncated_importance_sampling_ratio=null
     )
     PACK_LOSS=false
+    MODE_CHECKS=()
     if [[ "$IS_MODE" == is ]]; then
         IS_OVERRIDES[0]=loss_fn.use_importance_sampling_correction=true
-    elif [[ "$IS_MODE" == tis || "$IS_MODE" == icepop ]]; then
+    elif [[ "$IS_MODE" == tis || "$IS_MODE" == icepop || "$IS_MODE" == adaptive-ppo-clip ]]; then
         PACK_LOSS=true
         IS_OVERRIDES=(
             loss_fn.use_importance_sampling_correction=true
@@ -47,6 +48,10 @@ for IS_MODE in ${SC_IS_MODES:-off is tis icepop}; do
             ++loss_fn.truncated_importance_sampling_ratio_min=0.5
             loss_fn.truncated_importance_sampling_ratio=2.0
         )
+    fi
+    if [[ "$IS_MODE" == adaptive-ppo-clip ]]; then
+        # One logged k per step: the controller ran alongside the centering.
+        MODE_CHECKS=('len(data["train/cur_adaptive_ppo_clip_k"]) == 3')
     fi
 
     # The parent recipe uses GSPO; explicitly select the supported token-level
@@ -86,5 +91,6 @@ for IS_MODE in ${SC_IS_MODES:-off is tis icepop}; do
         'max(data["train/finalize/total_ms"]) > 0' \
         'max(data["train/finalize/invalid_row_rate"]) == 0' \
         'max(data["train/finalize/capture_poisoned_rollouts"]) == 0' \
-        ${REPLAY_CHECKS[@]+"${REPLAY_CHECKS[@]}"}
+        ${REPLAY_CHECKS[@]+"${REPLAY_CHECKS[@]}"} \
+        ${MODE_CHECKS[@]+"${MODE_CHECKS[@]}"}
 done

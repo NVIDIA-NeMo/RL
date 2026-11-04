@@ -84,6 +84,7 @@ from nemo_rl.models.generation.openai_server_utils import (
     splice_prefix_tokens,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
+from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
 LOGGER = logging.getLogger(__name__)
 
@@ -926,56 +927,47 @@ class VllmAsyncGenerationWorkerImpl(
     @staticmethod
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
-    ) -> None:
-        """Normalize optional vLLM routes to the staged token delta (plus boundary row)."""
+    ) -> torch.Tensor | None:
+        """Slice native routes for the delta plus boundary row and bind metadata."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
-            return
+            return None
         choice = dict(choices[0])
         message = dict(choice.get("message") or {})
         routed = message.get("routed_experts")
         if routed is None:
-            return
+            return None
         try:
-            from nemo_rl.utils.routed_experts_codec import (
-                decode_routed_experts,
-                encode_routed_experts,
-            )
-
-            if isinstance(routed, str):
-                dtype_name = routed.split(":", 3)[1]
-                dtype = {
-                    "int8": torch.int8,
-                    "int16": torch.int16,
-                    "int32": torch.int32,
-                }.get(dtype_name)
-                if dtype is None:
-                    raise ValueError(f"unsupported routed_experts dtype {dtype_name!r}")
-            else:
-                dtype = torch.int16
-            experts = decode_routed_experts(routed, dtype)
+            if not isinstance(routed, torch.Tensor):
+                raise TypeError("captured routed_experts must be a native tensor")
             expected_full_len = prompt_len + generated_len
-            if experts.dim() != 3 or experts.shape[0] != expected_full_len:
+            if routed.dim() != 3 or routed.shape[0] != expected_full_len:
                 raise ValueError(
-                    f"route length {experts.shape[0]} does not match engine sequence "
+                    f"route shape {tuple(routed.shape)} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
             start = prev_len - boundary_route_rows(prev_len)
-            message["routed_experts"] = encode_routed_experts(experts[start:])
+            # Keep this as a view: capture uses a local client, and SimpleStorage
+            # serializes only the slice's bytes. Message routes sent through
+            # Ray/pickle use slice_routed_experts() to copy only their token span.
+            routed = routed[start:]
+            message["routed_experts"] = routed_experts_tensor_metadata(routed)
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
             )
             message.pop("routed_experts", None)
+            routed = None
         choice["message"] = message
         payload["choices"] = [choice]
+        return routed
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Stage the finished call and ride its coords on the response.
 
-        Tokens and the call's new media tensors go to TQ in one write (the
-        media ride as opaque attachments beside the record), so ``staged``
-        coords vouch for both and any failure is ``capture_failed`` at call
+        Tokens, routes, and the call's new media tensors go to TQ in one write
+        (routes and media ride as opaque attachments beside the record), so
+        ``staged`` coords vouch for all and any failure is ``capture_failed`` at call
         time. Token ids, logprobs, and routes are stripped after staging, so
         the worker->gate hop carries the completion and coords only.
         Sampler tensors ride as opaque attachments in that same staging write.
@@ -1008,18 +1000,21 @@ class VllmAsyncGenerationWorkerImpl(
             # digest-covered extras; the pixels themselves are attachments.
             payload[MEDIA_SPANS_FIELD] = [item.to_dict() for item in state.media.items]
         adapter = self.token_capture.adapter
+        routed_experts = None
         if adapter is not None:
             try:
                 generated_token_ids, _ = adapter.extract_generation(payload)
             except Exception:  # capture core will report the authoritative failure
                 generated_token_ids = []
-            self._delta_align_routed_experts(
+            routed_experts = self._delta_align_routed_experts(
                 payload,
                 prev_len=call.admission.prev_len,
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
         attachments = dict(state.media.tensors or {}) if state.media is not None else {}
+        if routed_experts is not None:
+            attachments["routed_experts"] = routed_experts
         if sampler_topk is not None:
             attachments.update(
                 sampler_topk_token_ids=sampler_topk[0],
@@ -1037,6 +1032,7 @@ class VllmAsyncGenerationWorkerImpl(
             )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
+            choice.pop("routed_experts", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
             # remove the serializer's message fields before the worker->gate hop.
             message = choice.get("message")
@@ -1122,6 +1118,15 @@ class VllmAsyncGenerationWorkerImpl(
         if engine_client is None:
             raise RuntimeError("The HTTP engine client is not initialized.")
         model_config = self.llm_async_engine_args.create_model_config()
+        # vLLM adds the generation config's EOS to every request's stop set
+        # regardless of the configured stops, so a turn can end on either.
+        model_stop_token_ids = set(self.cfg.get("stop_token_ids") or ())
+        generation_eos_token_ids = model_config.try_get_generation_config().get(
+            "eos_token_id"
+        )
+        if isinstance(generation_eos_token_ids, int):
+            generation_eos_token_ids = [generation_eos_token_ids]
+        model_stop_token_ids |= set(generation_eos_token_ids or ())
         base_model_paths = [
             BaseModelPath(
                 name=model_config.served_model_name, model_path=model_config.model
@@ -1364,6 +1369,10 @@ class VllmAsyncGenerationWorkerImpl(
                     model_prefix_token_ids=model_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
+                    # The template's own EOS must stay countable even when the
+                    # configured stops don't include it.
+                    eos_token_id=model_stop_token_ids
+                    | {self.renderer.tokenizer.eos_token_id},
                 )
                 final_prompt_token_ids = splice.token_ids
                 # Reject overflows before media validation can mask the length error.
@@ -1458,6 +1467,7 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 final_res = None
+                capture_routes = id(request) in worker_self._capture_calls
                 cancelled = False
 
                 async def capture_result_generator():
@@ -1465,6 +1475,16 @@ class VllmAsyncGenerationWorkerImpl(
                     try:
                         async for res in result_generator:
                             final_res = res
+                            if capture_routes:
+                                # vLLM encodes choice-level routes in its response.
+                                # Keep engine arrays for our native capture, and
+                                # hide them only in the superclass's shallow view.
+                                res = copy.copy(res)
+                                res.outputs = [
+                                    copy.copy(output) for output in res.outputs
+                                ]
+                                for output in res.outputs:
+                                    output.routed_experts = None
                             yield res
                     except asyncio.CancelledError:
                         cancelled = True
@@ -1523,6 +1543,7 @@ class VllmAsyncGenerationWorkerImpl(
                         device=torch.device("cpu"),
                         logger=LOGGER,
                         routed_experts_dtype=worker_self.routed_experts_dtype,
+                        encode_for_wire=not capture_routes,
                     )
 
                 return response
@@ -1904,6 +1925,10 @@ class VllmAsyncGenerationWorkerImpl(
         # We initialize the FastAPI app here in case we want to do some generic configuration before the subsequent server inits
         # e.g. last-run middleware.
         app = FastAPI()
+
+        @app.get("/health")
+        async def health() -> dict[str, str]:
+            return {"status": "ok"}
 
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:

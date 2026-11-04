@@ -328,22 +328,52 @@ def test_score_centering_preparation_rejects_missing_sampler_data(packed, missin
             prepare_loss_input(torch.randn(1, 4, 7), data, loss_fn)
 
 
-@pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop"])
+def _adaptive_ppo_clip_reference_weights(ratios, advantage):
+    # adaptive-ppo-clip at lo = 0.5, hi = 2 and outer bound 5, written out
+    # independently of adaptive_ppo_clip_kept_mask: a positive advantage drops
+    # ratios above 2, a negative one ratios below 0.5, and any sign ratios
+    # above 5.
+    if advantage > 0:
+        sign_bound = ratios <= 2.0
+    elif advantage < 0:
+        sign_bound = ratios >= 0.5
+    else:
+        sign_bound = torch.ones_like(ratios, dtype=torch.bool)
+    return torch.where((ratios <= 5.0) & sign_bound, ratios, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("mode", "advantage"),
+    [
+        ("off", 1.0),
+        ("is", 1.0),
+        ("tis", 1.0),
+        ("icepop", 1.0),
+        # adaptive-ppo-clip picks its bounds by the advantage's sign.
+        ("adaptive-ppo-clip", 1.0),
+        ("adaptive-ppo-clip", -1.0),
+    ],
+)
 @pytest.mark.parametrize("head_probs", [(0.1, 0.6), (0.3, 0.65)])
-def test_score_centering_matches_full_distribution_gradient(mode, head_probs):
+def test_score_centering_matches_full_distribution_gradient(
+    mode, advantage, head_probs
+):
     logits = torch.tensor([0.6, -0.2, 0.1, -0.7], requires_grad=True)
     logp = logits.log_softmax(-1)
     q_head = torch.tensor(head_probs, requires_grad=True)
     q = torch.cat(
         [q_head.detach(), (1 - q_head.detach().sum()) * logp[2:].softmax(-1).detach()]
     )
+    truncated = mode in ("tis", "icepop", "adaptive-ppo-clip")
     correction, _ = compute_score_centering_term(
         logp[:2].reshape(1, 1, 2),
         sampler_topk_logprobs=q_head.log().reshape(1, 1, 2),
         importance_sampling_mode=mode,
-        is_bounds=(0.5, 2.0) if mode in ("tis", "icepop") else None,
+        is_bounds=(0.5, 2.0) if truncated else None,
         token_mask=torch.ones(1, 1),
         sampler_replay=False,
+        adaptive_ppo_clip_advantages=torch.full((1, 1), advantage),
+        adaptive_ppo_clip_outer_bound=5.0,
     )
     ratios = logp.detach().exp() / q
     if mode == "off":
@@ -352,8 +382,13 @@ def test_score_centering_matches_full_distribution_gradient(mode, head_probs):
         weights = ratios
     elif mode == "tis":
         weights = ratios.clamp(0.5, 2.0)
-    else:
+    elif mode == "icepop":
         weights = torch.where((ratios >= 0.5) & (ratios <= 2.0), ratios, 0.0)
+    else:
+        # Head ratios (4.3, 0.32) with tail 1.26 for the first head_probs,
+        # (1.43, 0.30) with tail 7.55 for the second: each sign drops some, and
+        # the outer bound drops the second tail for a negative advantage.
+        weights = _adaptive_ppo_clip_reference_weights(ratios, advantage)
     expected = (q * weights * logp).sum()
     torch.testing.assert_close(
         torch.autograd.grad(correction.sum(), logits, retain_graph=True)[0],
@@ -366,7 +401,7 @@ def test_score_centering_matches_full_distribution_gradient(mode, head_probs):
         torch.testing.assert_close(correction, torch.zeros_like(correction))
 
 
-@pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop"])
+@pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop", "adaptive-ppo-clip"])
 def test_score_centering_is_exact_over_the_sampler_support(mode):
     """Replay: p and q share S_q and the head covers it, so there is no tail (rho = 0)."""
     logits = torch.tensor([0.6, -0.2, 0.1, -0.7, -1.5], requires_grad=True)
@@ -383,17 +418,21 @@ def test_score_centering_is_exact_over_the_sampler_support(mode):
         mass = p
     elif mode == "tis":
         mass = q * ratio.clamp(lo, hi)
-    else:
+    elif mode == "icepop":
         mass = torch.where((ratio >= lo) & (ratio <= hi), p, 0.0)
+    else:
+        mass = q * _adaptive_ppo_clip_reference_weights(ratio, 1.0)
     expected = (mass[kept] * logp[kept]).sum()
 
     correction, head_mass = compute_score_centering_term(
         logp.reshape(1, 1, -1),
         sampler_topk_logprobs=q.log().reshape(1, 1, -1),
         importance_sampling_mode=mode,
-        is_bounds=(lo, hi) if mode in ("tis", "icepop") else None,
+        is_bounds=None if mode in ("off", "is") else (lo, hi),
         token_mask=torch.ones(1, 1),
         sampler_replay=True,
+        adaptive_ppo_clip_advantages=torch.ones(1, 1),
+        adaptive_ppo_clip_outer_bound=5.0,
     )
 
     assert torch.isfinite(correction).all() and correction.abs().max() < 10
@@ -408,7 +447,7 @@ def test_score_centering_is_exact_over_the_sampler_support(mode):
         torch.testing.assert_close(correction, torch.zeros_like(correction))
 
 
-@pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop"])
+@pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop", "adaptive-ppo-clip"])
 def test_score_centering_replay_has_no_tail(mode):
     """Under replay the head holds all of p, so rho is zero.
 
@@ -424,9 +463,11 @@ def test_score_centering_replay_has_no_tail(mode):
         logp.reshape(1, 1, -1),
         sampler_topk_logprobs=q.log().reshape(1, 1, -1),
         importance_sampling_mode=mode,
-        is_bounds=(0.5, 2.0) if mode in ("tis", "icepop") else None,
+        is_bounds=None if mode in ("off", "is") else (0.5, 2.0),
         token_mask=torch.ones(1, 1),
         sampler_replay=True,
+        adaptive_ppo_clip_advantages=torch.ones(1, 1),
+        adaptive_ppo_clip_outer_bound=5.0,
     )
     assert torch.isfinite(correction).all() and correction.abs().max() < 10
 
@@ -481,7 +522,7 @@ def _replayed_score_centering_loss(mode, sampled_ids, token_level_loss, sample_w
         }
     )
     token_lp = logp[ids][None]
-    tis = mode in ("tis", "icepop")
+    tis = mode in ("tis", "icepop", "adaptive-ppo-clip")
     cfg = ClippedPGLossConfig(
         score_centering=True,
         reference_policy_kl_penalty=0,
@@ -506,7 +547,7 @@ def _replayed_score_centering_loss(mode, sampled_ids, token_level_loss, sample_w
 @pytest.mark.parametrize("sample_weight", [1.0, 0.5])  # a fractional loss_multiplier
 @pytest.mark.parametrize("token_level_loss", [True, False])
 @pytest.mark.parametrize("num_tokens", [1, 2])
-@pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop"])
+@pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop", "adaptive-ppo-clip"])
 def test_score_centering_cancels_in_expectation_over_the_sampler_support(
     mode, num_tokens, token_level_loss, sample_weight
 ):
@@ -521,9 +562,49 @@ def test_score_centering_cancels_in_expectation_over_the_sampler_support(
     torch.testing.assert_close(expected_grad, torch.zeros(5), atol=1e-6, rtol=0)
 
 
-@pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop"])
-@pytest.mark.parametrize("force_on_policy", [True, False])
-def test_score_centering_masks_nonfinite_positions_and_keeps_icepop_correction(
+def test_score_centering_adaptive_ppo_clip_filters_by_each_positions_advantage():
+    logits = torch.tensor([0.6, -0.2, 0.1, -0.7], requires_grad=True)
+    logp = logits.log_softmax(-1)
+    q_head = torch.tensor([0.1, 0.6])
+    q = torch.cat([q_head, (1 - q_head.sum()) * logp[2:].softmax(-1).detach()])
+    # Head ratios (4.3, 0.32) with tail 1.26: a positive advantage drops 4.3, a
+    # negative one 0.32, and a zero one neither, so each sign has its own
+    # gradient. Rows and positions mix signs; position (1, 1) is masked.
+    advantages = torch.tensor([[1.0, -1.0, 0.0], [-1.0, 1.0, 1.0]])
+    token_mask = torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 1.0]])
+    correction, _ = compute_score_centering_term(
+        logp[:2].expand(2, 3, 2),
+        sampler_topk_logprobs=q_head.log().expand(2, 3, 2),
+        importance_sampling_mode="adaptive-ppo-clip",
+        is_bounds=(0.5, 2.0),
+        token_mask=token_mask,
+        sampler_replay=False,
+        adaptive_ppo_clip_advantages=advantages,
+        adaptive_ppo_clip_outer_bound=5.0,
+    )
+    assert correction[1, 1] == 0
+    ratios = logp.detach().exp() / q
+    for row, position in token_mask.nonzero().tolist():
+        weights = _adaptive_ppo_clip_reference_weights(
+            ratios, advantages[row, position].item()
+        )
+        expected = (q * weights * logp).sum()
+        (actual_grad,) = torch.autograd.grad(
+            correction[row, position], logits, retain_graph=True
+        )
+        (expected_grad,) = torch.autograd.grad(expected, logits, retain_graph=True)
+        torch.testing.assert_close(actual_grad, expected_grad, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("mode", "force_on_policy"),
+    [
+        *itertools.product(("off", "is", "tis", "icepop"), (True, False)),
+        # adaptive-ppo-clip requires force_on_policy_ratio.
+        ("adaptive-ppo-clip", True),
+    ],
+)
+def test_score_centering_masks_nonfinite_positions_and_keeps_filtered_correction(
     mode, force_on_policy
 ):
     lp = torch.tensor([0.6, -0.2, 0.1, -0.7]).log_softmax(-1)
@@ -549,16 +630,15 @@ def test_score_centering_masks_nonfinite_positions_and_keeps_icepop_correction(
             ).log(),
         }
     )
+    truncated = mode in ("tis", "icepop", "adaptive-ppo-clip")
     cfg = ClippedPGLossConfig(
         score_centering=True,
         reference_policy_kl_penalty=0,
         force_on_policy_ratio=force_on_policy,
         use_importance_sampling_correction=mode != "off",
-        truncated_importance_sampling_type=mode if mode in ("tis", "icepop") else None,
-        truncated_importance_sampling_ratio=2.0 if mode in ("tis", "icepop") else None,
-        truncated_importance_sampling_ratio_min=0.5
-        if mode in ("tis", "icepop")
-        else None,
+        truncated_importance_sampling_type=mode if truncated else None,
+        truncated_importance_sampling_ratio=2.0 if truncated else None,
+        truncated_importance_sampling_ratio_min=0.5 if truncated else None,
     )
     loss, _ = ClippedPGLossFn(cfg)(
         next_token_logprobs=token_lp,
@@ -574,8 +654,9 @@ def test_score_centering_masks_nonfinite_positions_and_keeps_icepop_correction(
     assert advantage.grad is None
     if not force_on_policy:
         assert token_lp.grad[0, 0] == 0
-    if mode == "icepop":
-        # p(sampled)/q(sampled) exceeds the upper bound: the sampled loss is
-        # zero, but the head/tail correction still supplies a gradient.
+    if mode in ("icepop", "adaptive-ppo-clip"):
+        # p(sampled)/q(sampled) exceeds the upper bound (for adaptive-ppo-clip,
+        # the positive-advantage one): the sampled loss is zero, but the
+        # head/tail correction still supplies a gradient.
         assert token_lp.grad[0, 0] == 0
         assert head_lp.grad[0, 0].abs().sum() > 0
