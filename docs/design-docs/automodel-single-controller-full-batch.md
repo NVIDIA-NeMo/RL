@@ -207,7 +207,7 @@ and lookahead zero. V1 uses legacy Ray data transport; SC uses TQ.
 | Model | Plotted updates | Prompts × responses per prompt | Global batch | Microbatch |
 | --- | ---: | ---: | ---: | ---: |
 | Gemma4 E2B IT | 1–150 | 32 × 16 | 512 | 1 |
-| Qwen3.5-35B-A3B Base, EP=16 | 1–300 | 8 × 4 | 32 | 1 |
+| Qwen3.5-35B-A3B Base, EP=16 | 1–500 | 8 × 4 | 32 | 1 |
 
 Both comparisons use a 4,096-token total sequence limit and at most 2,048
 generated tokens. Dynamic sampling and reward shaping are disabled. Rollouts
@@ -247,14 +247,14 @@ starter batch; the curves use the overrides above.
 
 ![Gemma4 E2B IT at batch 512: V1 versus full-batch SC over 150 updates, showing reward, mean generated tokens per sample, loss, generation KL error, and approximate entropy.](../assets/automodel-sc/gemma4-e2b-b512-v1-vs-sc-150steps.png)
 
-### Qwen3.5-35B-A3B Base: EP=16, 300 updates
+### Qwen3.5-35B-A3B Base: EP=16, 500 updates
 
 Each run uses sixteen training H100 GPUs with HybridEP and eight rollout H100
 GPUs with TP=8. The histories include checkpoint/resume and contain updates
-1–300 once. Mean reward increases from 0.2919 / 0.2766 (V1 / SC) in updates
-1–100 to 0.6172 / 0.5981 in updates 201–300. The final 20-update means are
-0.6281 / 0.6219. SC policy-version lag stays zero in both model comparisons.
+1–500 once. Mean reward increases from 0.2919 / 0.2766 (V1 / SC) in updates
+1–100 to 0.6291 / 0.6413 in updates 401–500. The final 20-update means are
+0.6750 / 0.7219. SC policy-version lag stays zero in both model comparisons.
 
-Use the Qwen3.5 recipe above with `grpo.max_num_steps=300` for this run length.
+Use the Qwen3.5 recipe above with `grpo.max_num_steps=500` for this run length.
 
-![Qwen3.5-35B-A3B Base at EP=16: V1 versus full-batch SC over 300 updates, showing reward, mean generated tokens per sample, loss, generation KL error, and approximate entropy.](../assets/automodel-sc/qwen3.5-35ba3b-ep16-v1-vs-sc-300steps.png)
+![Qwen3.5-35B-A3B Base at EP=16: V1 versus full-batch SC over 500 updates, showing reward, mean generated tokens per sample, loss, generation KL error, and approximate entropy.](../assets/automodel-sc/qwen3.5-35ba3b-ep16-v1-vs-sc-500steps.png)
