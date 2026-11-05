@@ -77,7 +77,10 @@ policy:
       max_tokens: 2048
       max_requests: 32
       inference_flashinfer_mxfp8_token_capacity: 128
-      enable_prefix_caching: false
+      enable_prefix_caching: true
+      # Only full blocks are cached, and batch-invariant Mamba caching needs a multiple
+      # of the 128-token SSM chunk; 128 lets ~100-token math prompts share blocks.
+      block_size_tokens: 128
       moe_pad_experts_for_cuda_graph_inference: false
     colocated:
       enabled: false
