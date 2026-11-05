@@ -250,6 +250,7 @@ def test_get_values_passes_multimodal_batch_to_model_forward(
         eval=lambda: None,
     )
     worker = SimpleNamespace(
+        _train_step_state=None,
         cfg={"train_micro_batch_size": 1},
         model=model,
         _policy_like_cfg={},
