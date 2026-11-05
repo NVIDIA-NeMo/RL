@@ -33,10 +33,14 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    # With a few number of steps the logprob can have spikes that can move the average up.
-    # Enabling fp8 kvcache can cause the logprob to be slightly higher than fp8 linear only path, so we allow a larger tolerance.
+    # token_mult_prob_error is not gated: with FP8 KV a few tokens per step still differ
+    # by tens of nats even under Router Replay, so its per-step mean swings from ~30 to
+    # ~1e9. gen_kl_error stays at 0.005-0.007 and tracks the FP8 KV mismatch instead.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 2.0'
+        'mean(data["train/gen_kl_error"]) < 0.01' \
+        'all_finite(data["train/loss"])' \
+        'mean(data["train/reward"]) > 0.35' \
+        'data["validation/accuracy"]["20"] > 0.25'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
