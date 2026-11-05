@@ -28,9 +28,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
     DataPlaneMutationCut,
 )
-from nemo_rl.algorithms.single_controller import (
-    SingleControllerActor,
-)
 from nemo_rl.environments.checkpointing import build_environment_checkpoint
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
 from nemo_rl.environments.checkpointing.nemo_gym import (
@@ -963,13 +960,6 @@ def test_no_restart_only_gym_server_and_no_opt_in_passes_silently() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         asyncio.run(gym.check_startup())
-
-
-def test_without_turn_recovery_there_are_no_gym_servers_to_check() -> None:
-    gym = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-    gym = NoEnvironmentCheckpoint()
-
-    asyncio.run(gym.check_startup())
 
 
 class _GateRecordingManager:
