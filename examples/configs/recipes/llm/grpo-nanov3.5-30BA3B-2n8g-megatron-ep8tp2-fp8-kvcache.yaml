@@ -4,6 +4,8 @@ defaults: ../../grpo_math_1B.yaml
 # layers among the Mamba/MoE ones, and calibration covers the MTP heads' attention.
 # H100 blockwise FP8 cannot cover the routed experts (moe_intermediate_size 1856 is
 # not a multiple of 128), so rollout quantizes only the attention qkv/o projections.
+# Router Replay keeps near-tied MoE top-k flips from producing tokens whose logprobs
+# differ by tens of nats, which would otherwise swamp the FP8 KV mismatch metrics.
 grpo:
   val_period: 20
 checkpointing:
@@ -17,6 +19,8 @@ policy:
   max_total_sequence_length: 8192
   automodel_cfg:
     enabled: false
+  router_replay:
+    enabled: true
   optimizer: null
   scheduler: null
   megatron_cfg:
@@ -51,6 +55,8 @@ policy:
       kv_cache_dtype: fp8
       tensor_parallel_size: 4
       gpu_memory_utilization: 0.5
+      # R3 needs vLLM to return routes for every prompt token, not cached prefixes.
+      enable_prefix_caching: false
       quantization_ignored_layer_kws:
       - mixer.in_proj
       - mixer.out_proj
