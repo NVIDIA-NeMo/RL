@@ -130,6 +130,7 @@ policy:
 
   automodel_cfg:
     enabled: false
+    distributed_timeout_minutes: null
     checkpoint:
       model_save_format: "safetensors"
       save_consolidated: "false"
@@ -344,6 +345,7 @@ value:
 
   automodel_cfg:
     enabled: false
+    distributed_timeout_minutes: null
     checkpoint:
       model_save_format: "safetensors"
       save_consolidated: "false"

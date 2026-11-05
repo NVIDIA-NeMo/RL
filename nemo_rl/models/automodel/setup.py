@@ -14,6 +14,7 @@
 
 """Setup utilities for automodel-based training in NeMo RL."""
 
+import datetime
 import importlib
 import inspect
 import json
@@ -491,6 +492,35 @@ def setup_reference_model_state(
     return get_cpu_state_dict(model.state_dict().items(), pin_memory=True)
 
 
+def _distributed_timeout_minutes(config: PolicyConfig) -> Optional[float]:
+    """Return ``automodel_cfg.distributed_timeout_minutes``, or None when unset."""
+    timeout_minutes = config["automodel_cfg"].get("distributed_timeout_minutes")
+    if timeout_minutes is not None and timeout_minutes <= 0:
+        raise ValueError(
+            "automodel_cfg.distributed_timeout_minutes must be positive, "
+            f"got {timeout_minutes}"
+        )
+    return timeout_minutes
+
+
+def _init_process_group(config: PolicyConfig, runtime_config: RuntimeConfig) -> None:
+    """Initialize the default process group, honoring the configured collective timeout.
+
+    ``automodel_cfg.distributed_timeout_minutes`` replaces torch's default (10 minutes
+    for NCCL) for the default group. The per-axis groups that ``DeviceMesh`` creates do
+    not inherit it, so ``setup_distributed`` also forwards the value to
+    ``MeshContext.build``. Unset keeps torch's default everywhere.
+    """
+    backend = "nccl" if not runtime_config.cpu_offload else "cuda:nccl,cpu:gloo"
+    timeout_minutes = _distributed_timeout_minutes(config)
+    if timeout_minutes is None:
+        torch.distributed.init_process_group(backend=backend)
+    else:
+        torch.distributed.init_process_group(
+            backend=backend, timeout=datetime.timedelta(minutes=timeout_minutes)
+        )
+
+
 def setup_distributed(
     config: PolicyConfig,
     runtime_config: RuntimeConfig,
@@ -508,8 +538,7 @@ def setup_distributed(
         DistributedContext containing device meshes and distributed configuration
     """
     # Initialize process group
-    backend = "nccl" if not runtime_config.cpu_offload else "cuda:nccl,cpu:gloo"
-    torch.distributed.init_process_group(backend=backend)
+    _init_process_group(config, runtime_config)
     world_size = torch.distributed.get_world_size()
 
     # Extract configuration values
@@ -561,7 +590,9 @@ def setup_distributed(
             "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
         )
 
-    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
+    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep)).
+    # The mesh axes get their own NCCL groups, which keep torch's default timeout
+    # unless Automodel is told otherwise, so the configured timeout goes here too.
     mesh_context = MeshContext.build(
         fsdp2_config,
         ParallelismSizes(
@@ -572,6 +603,7 @@ def setup_distributed(
             ep_size=ep_size,
         ),
         world_size=world_size,
+        timeout_minutes=_distributed_timeout_minutes(config),
     )
     device_mesh, moe_mesh = mesh_context.device_mesh, mesh_context.moe_mesh
 
