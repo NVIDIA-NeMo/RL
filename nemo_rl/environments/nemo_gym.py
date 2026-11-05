@@ -2109,6 +2109,7 @@ Depending on your data shape, you may want to change these values."""
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
         from nemo_rl.environments.call_selection import resolve_selection_policy
+        from nemo_rl.experience.reward_penalties import scored_text_checks
         from nemo_rl.experience.rollout_reassembler import (
             ActionOutputFlags,
             RolloutSelection,
@@ -2243,6 +2244,8 @@ Depending on your data shape, you may want to change these values."""
             "receipt": receipt,
             "logical_selection": selection,
             "truncated": truncated,
+            # full_result drops the response; its text checks are taken here.
+            "scored_text_checks": scored_text_checks(result),
         }
 
     @staticmethod

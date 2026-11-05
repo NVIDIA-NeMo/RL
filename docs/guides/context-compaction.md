@@ -233,7 +233,7 @@ The critic trains on all of a step's rows as one optimizer step, and execution
 padding is sized for both the policy's and the critic's data-parallel and
 microbatch shapes.
 
-Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding.
+Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping and message-level advantage overrides remain unsupported for forest training. Reward penalties apply once per logical rollout: rollout-scoped text checks and token checks run on the scored segment, and `token_capture.forest_penalty_scope: all_segments` also runs the token checks on every other segment, zeroing the rollout's reward on any hit. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 
 `token_capture.forest_padding_scope: step` (Forest only; default `group`) pads
 each training batch once to the row multiple, instead of padding every

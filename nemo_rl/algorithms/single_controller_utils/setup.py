@@ -2329,6 +2329,7 @@ def setup_single_controller(
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
                 media_columns=media_columns,
+                forest_penalty_scope=token_capture_cfg.forest_penalty_scope,
                 effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config

@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import ray
 
@@ -140,6 +140,8 @@ class RolloutReassemblerActorConfig:
     # media rows in this geometry for groups without media), ``None`` otherwise.
     media_columns: Optional[MediaColumnSpec]
     top_logprobs: int
+    # ``token_capture.forest_penalty_scope``.
+    forest_penalty_scope: Literal["scored_segment", "all_segments"]
     reward_penalty_config: RewardPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
     # Policy tokenizer and resolved think tags, set only when
@@ -185,6 +187,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             tokenizer=tokenizer,
             thinking_tags=config.thinking_tags,
             top_logprobs=config.top_logprobs,
+            forest_penalty_scope=config.forest_penalty_scope,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
