@@ -121,6 +121,9 @@ def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
     # bootstrap=False only connects to an existing controller; stubbing that
     # lets the real __init__ run, so this test cannot drift from it.
     monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
+    remote_client = MagicMock()
+    remote_client._run_coroutine.return_value = None
+    monkeypatch.setattr(tq_adapter.tq, "get_client", lambda: remote_client)
 
     client = tq_adapter.TQDataPlaneClient(
         {
@@ -171,6 +174,47 @@ def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
         {"keys": [schema_keys[0]], "partition_id": "obj-backend"},
         {"keys": [schema_keys[1]], "partition_id": "obj-backend"},
     ]
+
+
+def test_attached_client_preserves_live_integer_schema(tq_client, monkeypatch):
+    """A restored driver must not warm live integer fields with float rows."""
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    partition = "restore-int-schema"
+    tq_client.register_partition(
+        partition_id=partition,
+        fields=["input_ids"],
+        num_samples=1,
+        consumer_tasks=["train"],
+    )
+    expected = torch.tensor([[10, 20, 30]], dtype=torch.int64)
+    tq_client.put_samples(
+        sample_ids=["owned"],
+        partition_id=partition,
+        fields=TensorDict({"input_ids": expected}, batch_size=[1]),
+    )
+    attached = tq_adapter.TQDataPlaneClient(tq_client._cfg, bootstrap=False)
+    put = MagicMock(wraps=tq_adapter.tq.kv_batch_put)
+    monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", put)
+    attached.register_partition(
+        partition_id=partition,
+        fields=["input_ids"],
+        num_samples=1,
+        consumer_tasks=["train"],
+    )
+    put.assert_not_called()
+    result = attached.get_samples(
+        sample_ids=["owned"], partition_id=partition, select_fields=["input_ids"]
+    )
+    torch.testing.assert_close(result["input_ids"], expected, rtol=0, atol=0)
+    attached.register_partition(
+        partition_id=partition,
+        fields=["input_ids", "new_field"],
+        num_samples=1,
+        consumer_tasks=["train"],
+    )
+    assert list(put.call_args.kwargs["fields"].keys()) == ["new_field"]
+    tq_client.clear_samples(sample_ids=["owned"], partition_id=partition)
 
 
 def test_data_operation_guard_covers_the_full_interface() -> None:
