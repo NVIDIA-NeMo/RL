@@ -180,6 +180,8 @@ class _FakeEngine:
         self.attached: list[tuple[int, str]] = []
         self.metadata = None
         self.endpoint_kwargs = None
+        # What rank zero's dynamo_endpoint_error reports; None while serving.
+        self.endpoint_error = None
         # Refit fakes: rank zero's calls land in the log. ``faults`` maps a
         # worker method to an exception, or "hang".
         self.faults: dict[str, object] = {}
@@ -195,7 +197,14 @@ class _FakeEngine:
     def call(self, rank: int, method: str, kwargs: dict) -> _Ref:
         if method == "is_alive":
             return _Ref(self.alive)
-        if method in ("start_dynamo_endpoint", "attach_dynamo_events"):
+        if method in (
+            "start_dynamo_endpoint",
+            "attach_dynamo_events",
+            "stop_dynamo_endpoint",
+            "dynamo_endpoint_error",
+        ):
+            if self.faults.get(method) == "hang":
+                return _Ref(hang=True)
             try:
                 return _Ref(getattr(self, f"_{method}")(rank, **kwargs))
             except Exception as error:
@@ -260,10 +269,15 @@ class _FakeEngine:
             self.log.append(f"attach {self.name}")
         return True
 
-    def stop_dynamo_endpoint(self):
+    def _stop_dynamo_endpoint(self, rank):
+        assert rank == 0
         if self.fail_calls:
             raise RuntimeError(f"engine {self.name} is gone")
         self.log.append(f"stop-endpoint {self.name}")
+
+    def _dynamo_endpoint_error(self, rank):
+        assert rank == 0
+        return self.endpoint_error
 
     def shutdown(self):
         self.shutdown_calls += 1
@@ -803,6 +817,26 @@ def test_shutdown_stops_every_endpoint_and_engine_then_its_cluster_then_the_runt
     assert env.log == []
 
 
+def test_shutdown_bounds_every_endpoint_call_and_still_stops_the_engines(env, caplog):
+    """A hung endpoint call is cut off at the control timeout; the engine still stops."""
+    generation = env.started()
+    _start_endpoints(generation)
+    env.engine("d1").faults["stop_dynamo_endpoint"] = "hang"
+    env.log.clear()
+    env.ray.get_timeouts.clear()
+
+    with caplog.at_level("ERROR"):
+        assert generation.shutdown() is True
+
+    assert [line for line in env.log if line.startswith("engine ")] == [
+        "engine prefill-0 down",
+        "engine decode-0 down",
+        "engine decode-1 down",
+    ]
+    assert "Could not stop a Megatron engine's Dynamo endpoint" in caplog.text
+    assert env.ray.get_timeouts == [_CONTROL_TIMEOUT_S] * len(_IDS)
+
+
 # ---------------------------------------------------------------------------
 # Serving through the frontend: endpoints and the readiness wait
 # ---------------------------------------------------------------------------
@@ -879,6 +913,23 @@ def test_check_alive_names_the_dead_engines(env):
         generation.check_alive()
 
 
+def test_check_alive_names_the_engine_whose_endpoint_stopped(env):
+    """Once the endpoints started, a failed or exited endpoint task fails the check."""
+    generation = env.started()
+    env.engine("d1").endpoint_error = "RuntimeError('adapter failed')"
+    # Before the endpoints start there is nothing to report.
+    generation.check_alive()
+    _start_endpoints(generation)
+    env.ray.get_timeouts.clear()
+    with pytest.raises(
+        RuntimeError,
+        match=r"stopped serving: decode-1: RuntimeError\('adapter failed'\)",
+    ):
+        generation.check_alive()
+    # Both the liveness probe and the endpoint check are bounded.
+    assert env.ray.get_timeouts == [_CONTROL_TIMEOUT_S] * 2
+
+
 def test_first_resume_starts_the_endpoints_and_awaits_the_frontend(env):
     generation = env.started()
 
@@ -937,6 +988,11 @@ def test_pickled_copy_awaits_the_frontend_over_http(env, monkeypatch):
     clone._dynamo_fleet_ready = False
     env.engine("d0").alive = False
     with pytest.raises(RuntimeError, match="Megatron engines died: decode-0"):
+        clone.resume_after_refit()
+    # So does an engine whose endpoint stopped serving.
+    env.engine("d0").alive = True
+    env.engine("p0").endpoint_error = "exited"
+    with pytest.raises(RuntimeError, match="stopped serving: prefill-0: exited"):
         clone.resume_after_refit()
 
 

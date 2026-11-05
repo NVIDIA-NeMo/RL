@@ -138,6 +138,17 @@ class _LoopThread:
         self._thread.start()
 
     def close(self) -> None:
+        import asyncio
+
+        async def _drain() -> None:
+            # Run every cancelled or still-running task to completion, so none is
+            # garbage-collected pending (and logged) during a later test.
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        asyncio.run_coroutine_threadsafe(_drain(), self.loop).result(timeout=5)
         self.loop.call_soon_threadsafe(self.loop.stop)
         self._thread.join(timeout=5)
         self.loop.close()
@@ -160,6 +171,7 @@ def dynamo_endpoint_env(monkeypatch):
         workers=[],
         fetched=[],
         run_started=None,
+        run_cancelled=False,
         reporters=[],
     )
     control = SimpleNamespace(finish=None, fail=None)
@@ -187,8 +199,12 @@ def dynamo_endpoint_env(monkeypatch):
 
         async def run(self):
             records.run_started = asyncio.get_running_loop()
-            while control.finish is None and control.fail is None:
-                await asyncio.sleep(0.01)
+            try:
+                while control.finish is None and control.fail is None:
+                    await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                records.run_cancelled = True
+                raise
             if control.fail is not None:
                 raise control.fail
             return None
@@ -262,7 +278,11 @@ def dynamo_endpoint_env(monkeypatch):
     worker_module = "nemo_rl.models.generation.megatron.dynamo_worker_mixin"
     monkeypatch.setattr(f"{worker_module}._get_node_ip_local", lambda: "10.0.0.5")
     monkeypatch.setattr(f"{worker_module}._get_free_port_local", free_port)
-    monkeypatch.delenv("DYN_SYSTEM_PORT", raising=False)
+    # start_dynamo_endpoint writes the manager env and DYN_SYSTEM_PORT into
+    # os.environ; setenv records each key so teardown restores (or removes) it.
+    for key in ("DYN_SYSTEM_PORT", "ETCD_ENDPOINTS", "DYN_NAMESPACE"):
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
     loop_thread = _LoopThread()
@@ -394,15 +414,46 @@ def test_stop_dynamo_endpoint_cancels_the_adapter_task(dynamo_endpoint_env):
 
     env.worker.stop_dynamo_endpoint()
 
-    _wait_until(future.done)
-    assert future.cancelled()
+    # Worker.run itself is cancelled on the inference loop.
+    _wait_until(lambda: env.records.run_cancelled)
     assert reporter.stopped and env.worker._dynamo_event_reporter is None
+    assert env.worker.dynamo_endpoint_error() == "cancelled"
     # The stopped task stays recorded: Dynamo's runtime serves one Worker per
     # process, so a second start in this process is refused.
     assert env.worker._dynamo_endpoint_future is future
-    with pytest.raises(RuntimeError, match="restart the engine"):
+    with pytest.raises(RuntimeError, match=r"\(cancelled\).*restart the engine"):
         _start(env, excluded_ports=[])
     assert len(env.records.configs) == 1
+
+
+def test_a_failed_endpoint_reports_its_error_and_refuses_a_restart(
+    dynamo_endpoint_env,
+):
+    env = dynamo_endpoint_env
+    metadata = _start(env)
+    _wait_until(lambda: env.records.run_started is not None)
+    assert env.worker.dynamo_endpoint_error() is None
+    # A repeat start while it serves hands back the same endpoint.
+    assert _start(env, excluded_ports=[]) == metadata
+
+    env.control.fail = ConnectionError("etcd unreachable")
+    _wait_until(env.worker._dynamo_endpoint_future.done)
+
+    assert env.worker.dynamo_endpoint_error() == repr(env.control.fail)
+    with pytest.raises(RuntimeError, match="etcd unreachable"):
+        _start(env, excluded_ports=[])
+    assert len(env.records.configs) == 1
+
+
+def test_an_endpoint_that_returned_reports_exited(dynamo_endpoint_env):
+    env = dynamo_endpoint_env
+    _start(env)
+    env.control.finish = True
+    _wait_until(env.worker._dynamo_endpoint_future.done)
+
+    assert env.worker.dynamo_endpoint_error() == "exited"
+    with pytest.raises(RuntimeError, match=r"\(exited\)"):
+        _start(env, excluded_ports=[])
 
 
 def test_dynamo_endpoint_and_events_need_a_built_engine(dynamo_endpoint_env):
@@ -471,3 +522,18 @@ def test_attach_dynamo_events_retries_until_ready_and_pins_the_address(
     assert len(env.records.reporters) == 2
     with pytest.raises(ValueError, match="tcp://10.0.0.5:9999"):
         env.worker.attach_dynamo_events(parent_event_address="tcp://10.0.0.5:9999")
+
+
+def test_attach_dynamo_events_on_a_non_leader_rank_sends_no_ready(
+    dynamo_endpoint_env, monkeypatch
+):
+    """Only rank zero reports "ready"; other ranks attach without a coordinator."""
+    env = dynamo_endpoint_env
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    env.worker.coordinator_addr = None
+
+    env.worker.attach_dynamo_events(parent_event_address="tcp://10.0.0.5:4001")
+
+    (reporter,) = env.records.reporters
+    assert reporter.events == []
+    assert env.worker._dynamo_event_reporter is reporter

@@ -50,6 +50,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.generation.megatron.dynamo_config import (
+    DYNAMO_COMPONENT_BY_ROLE,
     MegatronDynamoCfg,
     MegatronDynamoRole,
     disaggregation_cfg,
@@ -74,10 +75,6 @@ if TYPE_CHECKING:
     from nemo_rl.models.policy.lm_policy import Policy
 
 LOGGER = logging.getLogger(__name__)
-
-# Dynamo component each role registers under: the frontend's prefill router
-# sends the prefill leg to "prefill" and the decode leg to "backend".
-_COMPONENT_BY_ROLE: dict[str, str] = {"prefill": "prefill", "decode": "backend"}
 
 
 def role_policy_config(
@@ -389,7 +386,8 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._node_resource_constraints = cluster.node_resource_constraints
         # Every control call is bounded: suspend and resume by their timeout_s
         # (control_timeout_s when None), one deadline per call, and
-        # prepare_refit_info by control_timeout_s.
+        # prepare_refit_info, the liveness checks and the endpoint stop at
+        # shutdown by control_timeout_s.
         self._control_timeout_s = float(self._dynamo_cfg.control_timeout_s)
         # One record per engine, in launch (refit rank) order; what refit calls use.
         self._engine_records: list[MegatronDynamoEngine] = []
@@ -485,7 +483,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         """Dynamo component name to the number of engines registering under it."""
         counts: dict[str, int] = {}
         for record in self._engine_records:
-            component = _COMPONENT_BY_ROLE[record.role]
+            component = DYNAMO_COMPONENT_BY_ROLE[record.role]
             counts[component] = counts.get(component, 0) + 1
         return counts
 
@@ -496,10 +494,12 @@ class MegatronDynamoGeneration(GenerationInterface):
         return str(self._engines[0].worker_group.py_executable)
 
     def check_alive(self) -> None:
-        """Raise if any engine's leading worker has died.
+        """Raise if any engine's leading worker has died or its endpoint stopped serving.
 
         Used while waiting for the engines to register with the frontend, so a
-        dead engine fails the wait at once instead of at the startup timeout.
+        dead engine, or an endpoint task that failed or exited on rank zero,
+        fails the wait at once instead of at the startup timeout. Endpoints are
+        checked only once ``start_endpoints`` started all of them.
         """
         alive = ray.get(
             [record.liveness_ref() for record in self._engine_records],
@@ -512,6 +512,25 @@ class MegatronDynamoGeneration(GenerationInterface):
         ]
         if dead:
             raise RuntimeError(f"Megatron engines died: {', '.join(dead)}")
+        if not self._endpoints_started:
+            return
+        errors = ray.get(
+            [
+                record.leader.dynamo_endpoint_error.remote()
+                for record in self._engine_records
+            ],
+            timeout=self._control_timeout_s,
+        )
+        stopped = [
+            f"{record.instance_id}: {error}"
+            for record, error in zip(self._engine_records, errors)
+            if error is not None
+        ]
+        if stopped:
+            raise RuntimeError(
+                "The Dynamo endpoint of Megatron engines stopped serving: "
+                + "; ".join(stopped)
+            )
 
     def get_inference_world_size(self) -> int | None:
         """Ranks across the engines: their widths summed."""
@@ -1113,23 +1132,32 @@ class MegatronDynamoGeneration(GenerationInterface):
         return True
 
     def _stop_engine(self, index: int) -> bool:
-        """Stop one engine's Dynamo endpoint and policy; whether both stopped cleanly."""
+        """Stop one engine's Dynamo endpoint and policy; whether both stopped cleanly.
+
+        A hung or failed endpoint stop is logged and the engine is shut down
+        anyway, which kills its workers.
+        """
         stopped = True
-        engine = self._engines[index]
-        try:
-            engine.stop_dynamo_endpoint()
-        except Exception:
-            LOGGER.exception("Could not stop a Megatron engine's Dynamo endpoint")
-            stopped = False
-        try:
-            engine_stopped = engine.shutdown()
-        except Exception:
-            LOGGER.exception("Could not stop a Megatron engine")
-            stopped = False
-        else:
-            if not engine_stopped:
-                LOGGER.error("A Megatron engine did not shut down cleanly")
+        if index < len(self._engine_records):
+            try:
+                ray.get(
+                    self._engine_records[index].leader.stop_dynamo_endpoint.remote(),
+                    timeout=self._control_timeout_s,
+                )
+            except Exception:
+                LOGGER.exception("Could not stop a Megatron engine's Dynamo endpoint")
                 stopped = False
+        if index < len(self._engines):
+            engine = self._engines[index]
+            try:
+                engine_stopped = engine.shutdown()
+            except Exception:
+                LOGGER.exception("Could not stop a Megatron engine")
+                stopped = False
+            else:
+                if not engine_stopped:
+                    LOGGER.error("A Megatron engine did not shut down cleanly")
+                    stopped = False
         return stopped
 
     def __del__(self) -> None:

@@ -28,6 +28,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
+from nemo_rl.models.generation.megatron.dynamo_config import DYNAMO_COMPONENT_BY_ROLE
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts.dynamic_context import (
@@ -141,16 +142,19 @@ class MegatronDynamoGenerationMixin:
         Runs on every rank once the engine and its coordinator are up, after
         rank zero started the adapter, the way the vLLM worker registers an
         engine that already serves. Only rank zero's reporter connects: it
-        forwards progress and KV events and sends "ready" with the coordinator
-        address, which is what lets the adapter register the engine with the
-        frontend. The reporter is kept only once "ready" is sent, so a failed
-        attach can be retried; a repeat call with the same address is a no-op.
+        forwards progress and KV events and queues "ready" with the coordinator
+        address for the adapter, which is what lets the adapter register the
+        engine with the frontend. The reporter is kept only once "ready" is
+        queued, so a failed attach can be retried; a repeat call with the same
+        address is a no-op.
 
         Args:
             parent_event_address: ZMQ address the adapter listens on for
                 engine events.
 
         Raises:
+            RuntimeError: The engine is not built yet, or (on rank zero) its
+                inference coordinator is not listening yet.
             ValueError: A repeat call names a different adapter address.
         """
         if not self._inference_engine_initialized:
@@ -201,9 +205,10 @@ class MegatronDynamoGenerationMixin:
         event socket, waits for the "ready" message ``attach_dynamo_events``
         sends, connects an ``InferenceClient`` to the coordinator, and only
         then registers the engine with the frontend. The engine's role comes
-        from its config. A second call returns the first call's metadata; after
-        ``stop_dynamo_endpoint`` the endpoint cannot be started again in this
-        process (Dynamo's runtime serves one ``Worker`` per process).
+        from its config. A second call while the endpoint serves returns the
+        first call's metadata; once it stopped, failed or exited (see
+        ``dynamo_endpoint_error``) it cannot be started again in this process
+        (Dynamo's runtime serves one ``Worker`` per process).
 
         Args:
             namespace: Dynamo namespace shared with the frontend.
@@ -219,13 +224,18 @@ class MegatronDynamoGenerationMixin:
             ``node_ip``, ``event_port``, ``system_port``, ``parent_event_address``
             (what every rank's event reporter connects to) and ``handoff_owner``
             (decode only: the identity prefill pins KV blocks for).
+
+        Raises:
+            RuntimeError: The engine is not built yet, or its endpoint already
+                stopped serving in this process.
         """
         role = self._dynamo_role
-        stopped = self._dynamo_endpoint_future
-        if stopped is not None and stopped.cancelled():
+        endpoint_error = self.dynamo_endpoint_error()
+        if endpoint_error is not None:
             raise RuntimeError(
-                "This engine's Dynamo endpoint was stopped; Dynamo's runtime "
-                "serves one Worker per process, so restart the engine instead"
+                f"This engine's Dynamo endpoint stopped serving ({endpoint_error}); "
+                "Dynamo's runtime serves one Worker per process, so restart the "
+                "engine instead"
             )
         if self._dynamo_endpoint_metadata is not None:
             return dict(self._dynamo_endpoint_metadata)
@@ -266,7 +276,7 @@ class MegatronDynamoGenerationMixin:
             model=model_name,
             served_model_name=served_model_name,
             namespace=namespace,
-            component="prefill" if role == "prefill" else "backend",
+            component=DYNAMO_COMPONENT_BY_ROLE[role],
             endpoint="generate",
             discovery_backend=manager_env.get("DYN_DISCOVERY_BACKEND", "etcd"),
             request_plane=manager_env.get("DYN_REQUEST_PLANE", "tcp"),
@@ -321,6 +331,23 @@ class MegatronDynamoGenerationMixin:
             "handoff_owner": handoff_owner,
         }
         return dict(self._dynamo_endpoint_metadata)
+
+    def dynamo_endpoint_error(self) -> Optional[str]:
+        """Why this engine's Dynamo endpoint stopped serving; None while it serves.
+
+        Returns:
+            None before ``start_dynamo_endpoint`` or while the endpoint task
+            runs; ``"cancelled"`` after ``stop_dynamo_endpoint``; ``"exited"``
+            when ``Worker.run`` returned; otherwise the ``repr`` of the
+            exception the task raised.
+        """
+        future = self._dynamo_endpoint_future
+        if future is None or not future.done():
+            return None
+        if future.cancelled():
+            return "cancelled"
+        error = future.exception()
+        return "exited" if error is None else repr(error)
 
     def stop_dynamo_endpoint(self) -> None:
         """Cancel the Dynamo endpoint task and stop the engine's event reporter.
