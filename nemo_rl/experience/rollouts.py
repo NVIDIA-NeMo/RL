@@ -3560,18 +3560,17 @@ def _postprocess_single_nemo_gym_group(
     group_task_index = None
     if nemo_gym_rows and NEMO_GYM_TASK_INDEX_KEY in nemo_gym_rows[0]:
         identity_size = group_size if group_size is not None else len(nemo_gym_rows)
-        task_indices = [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in nemo_gym_rows]
-        for group_start in range(0, len(task_indices), identity_size):
-            group_task_indices = task_indices[group_start : group_start + identity_size]
-            if any(task_index is None for task_index in group_task_indices) or (
-                len({int(task_index) for task_index in group_task_indices}) != 1
+        for group_start in range(0, len(nemo_gym_rows), identity_size):
+            group_rows = nemo_gym_rows[group_start : group_start + identity_size]
+            if any(row.get(NEMO_GYM_TASK_INDEX_KEY) is None for row in group_rows) or (
+                len({int(row[NEMO_GYM_TASK_INDEX_KEY]) for row in group_rows}) != 1
             ):
                 raise ValueError(
                     "Expected one _ng_task_index per prompt group, got "
-                    f"{group_task_indices}"
+                    f"{[row.get(NEMO_GYM_TASK_INDEX_KEY) for row in group_rows]}"
                 )
         if identity_size == len(nemo_gym_rows):
-            group_task_index = int(task_indices[0])
+            group_task_index = int(nemo_gym_rows[0][NEMO_GYM_TASK_INDEX_KEY])
 
     return NemoGymRolloutResult(
         input_ids=input_ids,
