@@ -489,15 +489,45 @@ def check_sampling_param(
     return profile_top_k
 
 
-def validate_rollout_prompt(expected: list[int], actual: list[int] | None) -> None:
-    """Reject rollouts generated from a different prompt than the learner's."""
-    if actual != expected:
-        actual_length = None if actual is None else len(actual)
-        raise ValueError(
-            "vLLM processed prompt differs from the learner prompt: "
-            f"expected_length={len(expected)}, actual_length={actual_length}. "
-            "Refusing to train on a different prompt."
-        )
+def validate_rollout_prompt(
+    expected: list[int],
+    actual: list[int] | None,
+    *,
+    expanded_placeholder_token_id: int | None = None,
+) -> None:
+    """Reject changed text, allowing an explicitly declared single media expansion.
+
+    Some models keep one media placeholder token in the learner prompt and
+    expand it inside their forward, while vLLM returns the expanded run of
+    placeholder tokens. With ``expanded_placeholder_token_id`` set, only that
+    one contiguous run may differ; the prefix and suffix must match exactly.
+    Without it, the prompts must be token-identical.
+    """
+    if actual == expected:
+        return
+    if (
+        actual is not None
+        and expanded_placeholder_token_id is not None
+        and expected.count(expanded_placeholder_token_id) == 1
+    ):
+        start = expected.index(expanded_placeholder_token_id)
+        width = len(actual) - len(expected) + 1
+        if (
+            width > 1
+            and actual[:start] == expected[:start]
+            and all(
+                token == expanded_placeholder_token_id
+                for token in actual[start : start + width]
+            )
+            and actual[start + width :] == expected[start + 1 :]
+        ):
+            return
+    actual_length = None if actual is None else len(actual)
+    raise ValueError(
+        "vLLM processed prompt differs from the learner prompt: "
+        f"expected_length={len(expected)}, actual_length={actual_length}. "
+        "Refusing to train on a different prompt."
+    )
 
 
 def format_prompt_for_vllm_generation(
