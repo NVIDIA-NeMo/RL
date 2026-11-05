@@ -22,11 +22,15 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+    LogicalOwnerBatch,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
+    environment_sample_counts,
     fields_for_put,
     reduce_advantage_pump_metrics,
     squeeze_trailing_unit_dim,
@@ -42,6 +46,116 @@ def _meta(size: int, sequence_lengths: list[int] | None = None) -> KVBatchMeta:
         sample_ids=[f"s{i}" for i in range(size)],
         sequence_lengths=sequence_lengths,
     )
+
+
+def test_environment_counts_match_loss_masks_across_chunks() -> None:
+    tags = [{"rollout_environment": name} for name in ("swe", "swe", "math", "math")]
+    flagged = torch.tensor([True, False, False, True])
+    # Include a fractional prompt weight and a valid row without response tokens.
+    samples = torch.tensor([0.0, 0.5, 1.0, 0.0])
+    tokens = torch.tensor(
+        [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
+    )
+    chunks = [
+        environment_sample_counts(
+            tags[start:end],
+            mask_sample=flagged[start:end],
+            final_sample_mask=samples[start:end],
+            final_token_mask=tokens[start:end] * samples[start:end, None],
+        )
+        for start, end in ((0, 1), (1, 4))
+    ]
+    metrics = reduce_advantage_pump_metrics([], [], [], environment_counts=chunks)
+    assert metrics == {
+        "environment/swe/num_samples": 2,
+        "environment/swe/num_mask_sample_filtered": 1,
+        "environment/swe/num_valid_samples": 0.5,
+        "environment/swe/num_valid_tokens": 1,
+        "environment/math/num_samples": 2,
+        "environment/math/num_mask_sample_filtered": 1,
+        "environment/math/num_valid_samples": 1,
+        "environment/math/num_valid_tokens": 0,
+    }
+
+
+def test_environment_counts_old_replay_and_all_masked() -> None:
+    metrics = environment_sample_counts(
+        None,
+        mask_sample=torch.tensor([True, False]),
+        final_sample_mask=torch.zeros(2),
+        final_token_mask=torch.zeros(2, 3),
+    )
+    assert metrics["environment/unknown/num_samples"] == 2
+    assert metrics["environment/unknown/num_mask_sample_filtered"] == 1
+    assert metrics["environment/unknown/num_valid_samples"] == 0
+    assert metrics["environment/unknown/num_valid_tokens"] == 0
+    with pytest.raises(ValueError, match="align"):
+        environment_sample_counts(
+            [],
+            mask_sample=torch.zeros(2),
+            final_sample_mask=torch.zeros(2),
+            final_token_mask=torch.zeros(2, 3),
+        )
+
+
+def test_environment_counts_follow_selected_row_order() -> None:
+    meta = _meta(3)
+    meta.tags = [{"rollout_environment": name} for name in ("swe", "unused", "math")]
+    selected = meta.subset([2, 0])
+    counts = environment_sample_counts(
+        selected.tags,
+        mask_sample=torch.tensor([True, False]),
+        final_sample_mask=torch.tensor([0.0, 1.0]),
+        final_token_mask=torch.tensor([[0.0, 0.0], [1.0, 1.0]]),
+    )
+    assert counts["environment/math/num_mask_sample_filtered"] == 1
+    assert counts["environment/swe/num_valid_samples"] == 1
+    assert not any("unused" in key for key in counts)
+
+
+def test_environment_counts_pool_forest_owners_and_exclude_padding() -> None:
+    owners = LogicalOwnerBatch(
+        representative_rows=torch.tensor([1, 2]),
+        group_ids=torch.tensor([[0], [0]]),
+        row_owner=torch.tensor([-1, 0, 1, 0]),
+        valid_mask=torch.tensor([1.0, 0.0]),
+    )
+    counts = environment_sample_counts(
+        [{"rollout_environment": name} for name in ("padding", "swe", "math", "swe")],
+        mask_sample=torch.tensor([True, False, True, False]),
+        final_sample_mask=torch.tensor([0.0, 0.0, 0.0, 1.0]),
+        final_token_mask=torch.tensor(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]]
+        ),
+        logical_owners=owners,
+    )
+    assert counts == {
+        "environment/swe/num_samples": 1,
+        "environment/swe/num_mask_sample_filtered": 0,
+        "environment/swe/num_valid_samples": 1,
+        "environment/swe/num_valid_tokens": 2,
+        "environment/math/num_samples": 1,
+        "environment/math/num_mask_sample_filtered": 1,
+        "environment/math/num_valid_samples": 0,
+        "environment/math/num_valid_tokens": 0,
+    }
+
+
+def test_environment_counts_reject_conflicting_forest_owner_environments() -> None:
+    owners = LogicalOwnerBatch(
+        representative_rows=torch.tensor([0]),
+        group_ids=torch.tensor([[0]]),
+        row_owner=torch.tensor([0, 0]),
+        valid_mask=torch.ones(1),
+    )
+    with pytest.raises(ValueError, match="disagree on environment"):
+        environment_sample_counts(
+            [{"rollout_environment": name} for name in ("swe", "math")],
+            mask_sample=torch.zeros(2, dtype=torch.bool),
+            final_sample_mask=torch.ones(2),
+            final_token_mask=torch.ones(2, 3),
+            logical_owners=owners,
+        )
 
 
 class TestSqueezeTrailingUnitDim:

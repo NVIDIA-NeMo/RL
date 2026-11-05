@@ -1592,6 +1592,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
                         attempt.pop("logical_selection", None)
                         attempt.pop("gym_instance_id")
                         attempt.pop("gym_attempt")
+                        attempt.pop("telemetry")
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
         torch.save(saved_state, recovery_path)
         payload_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()
@@ -2398,6 +2399,32 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
         }
 
     asyncio.run(exercise())
+
+
+def test_recovery_rejects_mismatched_sidecar_version(tmp_path) -> None:
+    state = RolloutRecoveryLedger().state_dict()
+    state["schema_version"] = 2
+    path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
+    torch.save(state, path)
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    controller._master_config = SimpleNamespace(
+        token_capture=SimpleNamespace(enabled=False, forest_training=False)
+    )
+    controller._last_checkpoint_path = str(tmp_path)
+    controller._data_plane_checkpoint_metadata = {
+        "forest_training": False,
+        "forest_execution_row_multiple": None,
+        "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+        "rollout_recovery_payload_sha256": hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest(),
+        "rollout_recovery_group_count": 0,
+    }
+    with pytest.raises(ValueError, match="sidecar schema does not match"):
+        asyncio.run(
+            controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        )
 
 
 def test_recovery_rejects_a_corrupt_ledger_sidecar(tmp_path) -> None:

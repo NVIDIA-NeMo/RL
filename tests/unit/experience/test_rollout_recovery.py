@@ -33,6 +33,12 @@ from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryCon
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
 from nemo_rl.experience import rollout_reassembler
+from nemo_rl.experience.metric_utils import (
+    Metric,
+    RolloutTelemetry,
+    distribution,
+    reduce_step,
+)
 from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, RolloutSelection
 from nemo_rl.experience.rollout_recovery import (
     _ATTEMPT_STATE_FIELDS,
@@ -1393,6 +1399,98 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
         RolloutRecoveryLedger.from_state_dict(state)
 
 
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_sealed_telemetry_roundtrip_and_duplicate_seal(granularity, tmp_path):
+    state = _sealed_attempt_state()
+    snapshot = RolloutTelemetry.from_metrics(
+        "swe",
+        {
+            **distribution("environment/swe/turns_per_sample", [3]),
+            "environment/swe/sample_count": Metric([1], "sum"),
+            "effort/length_reward/mean": Metric([0.5], "mean"),
+            "swe/full_result": Metric([object()], "concat"),
+        },
+    )
+    assert "swe/full_result" not in snapshot.metrics
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    state["groups"][0]["status"] = "generating"
+    state["groups"][0]["restore_level"] = granularity.value
+    attempt.update(
+        status="dispatched",
+        receipt=None,
+        reward=None,
+        mask_sample=None,
+        staging_keys=[],
+        telemetry=None,
+    )
+    ledger = RolloutRecoveryLedger.from_state_dict(state)
+    _bind(ledger, "g7", _prompt())
+    group = ledger.get_group("g7")
+    result = SiblingSealResult(
+        group.gate_rollout_id(0), None, 1.0, True, telemetry=snapshot
+    )
+    if granularity is RecoveryGranularity.PROMPT_GROUP:
+        _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", {0: result}))
+    else:
+        for _ in range(2):
+            _mutate(
+                lambda cut: ledger.mark_sibling_sealed(
+                    cut,
+                    "g7",
+                    generation_index=0,
+                    gate_rollout_id=result.gate_rollout_id,
+                    receipt=None,
+                    reward=1.0,
+                    mask_sample=True,
+                    telemetry=snapshot,
+                )
+            )
+    checkpoint = ledger.state_dict()
+    assert checkpoint["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
+    path = tmp_path / "rollout_recovery.pt"
+    torch.save(checkpoint, path)
+    checkpoint = torch.load(path, weights_only=True)
+    restored = RolloutRecoveryLedger.from_state_dict(checkpoint)
+    saved = restored.get_group("g7").siblings[0].current_attempt.telemetry
+    assert saved == snapshot
+    assert reduce_step([saved.to_metrics()])[
+        "environment/swe/turns_per_sample/histogram"
+    ] == [3.0]
+    snapshot.metrics["environment/swe/turns_per_sample"].values[0] = 99
+    assert saved.metrics["environment/swe/turns_per_sample"].values == [3]
+
+
+@pytest.mark.parametrize("version", [6, 7, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+def test_restore_without_telemetry_does_not_fabricate_observations(
+    version: int,
+) -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = version
+    del state["groups"][0]["siblings"][0]["attempts"][0]["telemetry"]
+    ledger = RolloutRecoveryLedger.from_state_dict(state)
+    assert ledger.get_group("g7").siblings[0].current_attempt.telemetry is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"environment": "swe", "observations": {"turns": [1, 2]}, "scalars": {}},
+        {
+            "environment": "swe",
+            "observations": {},
+            "scalars": {"tokens": torch.ones(2)},
+        },
+        {"environment": "", "observations": {}, "scalars": {}},
+        {"environment": "swe", "observations": {}, "scalars": {}, "token_ids": [1]},
+    ],
+)
+def test_restore_rejects_non_numeric_telemetry(bad):
+    state = _sealed_attempt_state()
+    state["groups"][0]["siblings"][0]["attempts"][0]["telemetry"] = bad
+    with pytest.raises(ValueError, match="[Tt]elemetry"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
 def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
@@ -1434,6 +1532,24 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
         RolloutAttemptStatus.RESERVED,
         RolloutAttemptStatus.RESERVED,
     ]
+
+
+def test_atomic_group_restore_clears_telemetry_with_abandoned_receipt() -> None:
+    ledger = _forest_sealed_ledger()
+    state = ledger.state_dict()
+    state["groups"][0]["restore_level"] = RecoveryTargetLevel.PROMPT_GROUP.value
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    attempt["telemetry"] = RolloutTelemetry.from_metrics(
+        "swe", {"environment/swe/sample_count": Metric([1], "sum")}
+    ).to_state()
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+    _bind(restored, "g7", _prompt())
+    roundtrip = RolloutRecoveryLedger.from_state_dict(restored.state_dict())
+    assert all(
+        sibling.current_attempt.telemetry is None
+        for sibling in roundtrip.get_group("g7").siblings
+    )
 
 
 def test_turn_restore_target_is_persisted_separately_from_live_retry() -> None:
@@ -1549,7 +1665,7 @@ def test_pre_turn_recovery_schemas_refuse_turn_recovery_state(
         RolloutRecoveryLedger.from_state_dict(state)
 
 
-@pytest.mark.parametrize("version", [6, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [6, 7, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_turn_restart_preserves_gym_owner_and_advances_attempt(version: int) -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
@@ -1955,7 +2071,7 @@ def test_restore_rejects_unsupported_schema_version(version: int) -> None:
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, 7, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
     state = {
         "schema_version": version,
@@ -1978,7 +2094,7 @@ def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
     assert parsed.sampler_stamps_target_steps is False
 
 
-@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, 7, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> None:
     state = _sealed_attempt_state()
     if version < 6:

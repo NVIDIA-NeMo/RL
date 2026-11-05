@@ -410,7 +410,7 @@ def test_forest_retry_and_restart_reuse_durable_selection(
                     raise ValueError("invalid unfinished sibling")
                 if interruption == "cold" or index == 1:
                     raise asyncio.CancelledError()
-        return SimpleNamespace(rollout_metrics={})
+        return SimpleNamespace(rollout_metrics={}, metadata={})
 
     async def exercise():
         nonlocal manager

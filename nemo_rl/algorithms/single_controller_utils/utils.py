@@ -24,7 +24,14 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.metric_utils import REWARD_KEY
+from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+    LogicalOwnerBatch,
+)
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import (
+    ROLLOUT_ENVIRONMENT_TAG,
+    UNKNOWN_ROLLOUT_ENVIRONMENT,
+)
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -185,6 +192,7 @@ def reduce_advantage_pump_metrics(
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
     num_mask_sample_filtered: list[int] | None = None,
     sample_mask_metrics: list[dict[str, int]] | None = None,
+    environment_counts: list[dict[str, float]] | None = None,
     num_invalid_tool_calls: list[int] | None = None,
     num_malformed_thinking: list[int] | None = None,
     num_assistant_messages: list[int] | None = None,
@@ -207,6 +215,7 @@ def reduce_advantage_pump_metrics(
             streaming chunk.
         sample_mask_metrics: Per-reason masked-row counts, one record per
             streaming chunk; each key is summed across chunks.
+        environment_counts: Per-environment training counts for selected chunks.
         num_invalid_tool_calls: Per-sample invalid tool-call counts.
         num_malformed_thinking: Per-sample malformed-thinking counts.
         num_assistant_messages: Per-sample assistant message counts (rate denominator).
@@ -244,6 +253,9 @@ def reduce_advantage_pump_metrics(
     if sample_mask_metrics:
         for key in sample_mask_metrics[0]:
             out[key] = float(sum(record[key] for record in sample_mask_metrics))
+    for counts in environment_counts or []:
+        for key, value in counts.items():
+            out[key] = out.get(key, 0.0) + value
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     n_asst = sum(num_assistant_messages or [])
@@ -262,6 +274,92 @@ def reduce_advantage_pump_metrics(
         out["routed_experts_backfilled_rate"] = n_backfilled / n_asst
         out["num_routed_experts_backfilled"] = float(n_backfilled)
     return out
+
+
+def environment_sample_counts(
+    tags: list[dict[str, Any]] | None,
+    *,
+    mask_sample: torch.Tensor,
+    final_sample_mask: torch.Tensor,
+    final_token_mask: torch.Tensor,
+    logical_owners: LogicalOwnerBatch | None = None,
+) -> dict[str, float]:
+    """Count selected samples and trainable next-token targets by environment.
+
+    Older replay checkpoints lack environment tags and are reported as unknown.
+    Environment flags count independently of other, potentially overlapping filters.
+    Valid samples sum the final sample weights, as in the policy loss; valid tokens
+    sum the weighted next-token mask, excluding the first sequence position.
+    Forest samples count each logical owner once and exclude execution padding.
+
+    Args:
+        tags: One data-plane tag dict per selected physical row, or None when the
+            rows carry no tags at all.
+        mask_sample: Bool tensor, True where the environment flagged the row.
+        final_sample_mask: Per-row loss weights after every filter.
+        final_token_mask: Per-token loss mask already multiplied by
+            final_sample_mask.
+        logical_owners: Validated Forest ownership with final owner validity,
+            or None for one sample per physical row.
+
+    Returns:
+        Dict mapping "environment/<name>/<counter>" to its total for this
+        chunk, for counters num_samples, num_mask_sample_filtered,
+        num_valid_samples and num_valid_tokens.
+
+    Raises:
+        ValueError: If tags is given but its length does not match the
+            number of selected rows, or an owner's rows disagree on environment.
+    """
+    size = mask_sample.numel()
+    if tags is not None and len(tags) != size:
+        raise ValueError("Environment tags must align with selected samples")
+    environments = (
+        [tag.get(ROLLOUT_ENVIRONMENT_TAG, UNKNOWN_ROLLOUT_ENVIRONMENT) for tag in tags]
+        if tags is not None
+        else [UNKNOWN_ROLLOUT_ENVIRONMENT] * size
+    )
+    valid_tokens = final_token_mask[:, 1:].sum(dim=-1).detach().cpu().tolist()
+    valid_samples = final_sample_mask.detach().cpu().tolist()
+    flagged = mask_sample.detach().cpu().tolist()
+    if logical_owners is not None:
+        owner_environments = [
+            environments[row]
+            for row in logical_owners.representative_rows.detach().cpu().tolist()
+        ]
+        owner_tokens = [0.0] * len(owner_environments)
+        owner_flagged = [False] * len(owner_environments)
+        for environment, tokens, masked, owner in zip(
+            environments,
+            valid_tokens,
+            flagged,
+            logical_owners.row_owner.detach().cpu().tolist(),
+            strict=True,
+        ):
+            if owner < 0:
+                continue
+            if environment != owner_environments[owner]:
+                raise ValueError("Forest owner rows disagree on environment")
+            owner_tokens[owner] += tokens
+            owner_flagged[owner] |= masked
+        environments = owner_environments
+        valid_tokens = owner_tokens
+        flagged = owner_flagged
+        valid_samples = logical_owners.valid_mask.detach().cpu().tolist()
+    counts: dict[str, float] = {}
+    for environment, tokens, valid, masked in zip(
+        environments, valid_tokens, valid_samples, flagged, strict=True
+    ):
+        prefix = f"environment/{environment}"
+        for name, value in (
+            ("num_samples", 1),
+            ("num_mask_sample_filtered", int(masked)),
+            ("num_valid_samples", valid),
+            ("num_valid_tokens", tokens),
+        ):
+            key = f"{prefix}/{name}"
+            counts[key] = counts.get(key, 0.0) + value
+    return counts
 
 
 def _reduce_seq_logprob_error_metrics(

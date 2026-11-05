@@ -4,6 +4,7 @@
 
 from dataclasses import replace
 
+from nemo_rl.experience.metric_utils import reduce_step
 from nemo_rl.experience.reward_penalties import RewardLogContext
 from nemo_rl.experience.rollout_reassembler import (
     FinalizedRollout,
@@ -31,8 +32,14 @@ def test_compaction_lengths_and_invalid_owner() -> None:
 
     first, second = row(1000), row(2400)
     invalid = replace(first, valid=False)
-    metrics = _capture_token_metrics(
-        [first, second, invalid], [0, 0, 1], [RewardLogContext("agent", None)] * 2
+    metrics = reduce_step(
+        [
+            _capture_token_metrics(
+                [first, second, invalid],
+                [0, 0, 1],
+                [RewardLogContext("agent", None)] * 2,
+            )
+        ]
     )
     assert len(first.token_ids) + len(second.token_ids) == 7200
     assert metrics["gen_tokens_per_sample/histogram"] == [3000, 0]
@@ -55,6 +62,6 @@ def test_adjacent_generations_still_have_separate_turn_lengths() -> None:
         staging_keys=[],
         generation_lengths=(2, 3),
     )
-    metrics = _capture_token_metrics([row], [0], [None])
+    metrics = reduce_step([_capture_token_metrics([row], [0], [None])])
     assert metrics["gen_tokens_per_sample/mean"] == 5
     assert metrics["max_gen_tokens_per_turn/max"] == 3

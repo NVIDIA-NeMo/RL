@@ -557,6 +557,28 @@ Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-
 | *(no legacy equivalent — matches legacy `max_trajectory_age + 1` batches in flight)* | `max_inflight_prompts: num_prompts_per_step × (max_lookahead_versions + 1)` |
 | *(no legacy equivalent — legacy sizes its buffer to `num_prompts_per_step × max_trajectory_age_steps × 2`)* | `max_buffered_rollouts: num_prompts_per_step × (max_lookahead_versions + 1)` (tight; see the [Config → behavior map](#config--behavior-map) for per-sampler values) |
 
+### Rollout metrics
+
+SC logs rollout metrics for the prompt groups selected for the training step, and adds:
+
+| Key | Meaning |
+| --- | --- |
+| `train/environment/<name>/<metric>` | Rollout metric for that environment. The name is the Gym agent or task; unsafe characters become underscores plus a short hash. |
+| `train/environment/<name>/num_samples` | Samples selected before filtering; segmented Forest rollouts count each logical owner once and exclude execution padding. |
+| `train/environment/<name>/num_mask_sample_filtered` | Samples flagged by the environment; can overlap with other filters. |
+| `train/environment/<name>/num_valid_samples` | Sum of final sample weights, which can be fractional. |
+| `train/environment/<name>/num_valid_tokens` | Weighted trainable next-token targets after all filters. |
+
+Token capture is off by default. When enabled:
+
+| Message-log name | Token-capture name |
+| --- | --- |
+| `turns_per_sample` | `capture/calls_per_sample` (captured model calls) |
+
+The finalizer computes `total_tokens_per_sample`, `gen_tokens_per_sample`, `max_gen_tokens_per_turn`, and the global `mean_gen_tokens_per_sample` from verified tokens, pooling observations by logical owner rather than physical segment or execution-padding row.
+
+SC computes distribution medians, stddev and p95/p99 from pooled observations, not averages of group summaries; legacy async GRPO and PPO are unchanged. Old replay rows without declared metrics are omitted from rollout summaries with a warning, while their validity counts remain included; rows without environment tags are counted under `unknown`.
+
 ## Known Missing Features
 
 The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:

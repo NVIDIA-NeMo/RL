@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock
@@ -33,6 +34,12 @@ from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
+from nemo_rl.experience.metric_utils import (
+    Metric,
+    RolloutTelemetry,
+    distribution,
+    reduce_step,
+)
 from nemo_rl.experience.reward_penalties import FinalizedReward
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
@@ -233,12 +240,14 @@ def _token_metrics_result(token_metrics: dict[str, Any]) -> FinalizedGroup:
     )
 
 
-@pytest.mark.parametrize("rollout_metrics", [{"turns_per_sample/mean": 2.0}, {}])
+@pytest.mark.parametrize(
+    "rollout_metrics", [{"turns_per_sample": Metric([2.0], "dist")}, {}]
+)
 def test_finalizer_token_metrics_and_rollout_metrics_share_one_sidecar(
-    rollout_metrics: dict[str, float],
+    rollout_metrics: dict[str, Metric],
 ) -> None:
     """Neither source overwrites the other, including on partial-retry groups."""
-    token_metrics = {"gen_tokens_per_sample/mean": 7.0}
+    token_metrics = distribution("gen_tokens_per_sample", [7.0])
     result = _token_metrics_result(token_metrics)
     ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
 
@@ -248,6 +257,47 @@ def test_finalizer_token_metrics_and_rollout_metrics_share_one_sidecar(
     assert committed_meta.extra_info[ROLLOUT_METRICS] == [
         {**rollout_metrics, **token_metrics}
     ]
+    assert (
+        reduce_step(committed_meta.extra_info[ROLLOUT_METRICS])[
+            "gen_tokens_per_sample/mean"
+        ]
+        == 7.0
+    )
+
+
+def test_capture_commit_preserves_finalized_sibling_metrics_without_double_counting() -> (
+    None
+):
+    raw = {
+        "environment/swe/sample_count": Metric([1], "sum"),
+        **distribution("environment/swe/total_reward", [999.0]),
+    }
+    corrected = {
+        "environment/swe/sample_count": Metric([1], "sum"),
+        **distribution("environment/swe/total_reward", [0.25]),
+    }
+    result = _token_metrics_result(distribution("gen_tokens_per_sample", [7.0]))
+    result.meta.extra_info[ROLLOUT_METRICS] = [corrected]
+    request = replace(
+        _request(), telemetry=(RolloutTelemetry.from_metrics("swe", raw),)
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    asyncio.run(
+        ctrl._finalize_with_actor(
+            request,
+            {
+                **raw,
+                "timing/rollout/total": Metric([2.0], "mean"),
+            },
+        )
+    )
+    committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
+    reduced = reduce_step(committed_meta.extra_info[ROLLOUT_METRICS])
+    assert reduced["environment/swe/sample_count"] == 1
+    assert reduced["environment/swe/total_reward/histogram"] == [0.25]
+    assert reduced["gen_tokens_per_sample/histogram"] == [7.0]
+    assert reduced["timing/rollout/total"] == 2.0
+    assert result.meta.extra_info[ROLLOUT_METRICS] == [corrected]
 
 
 def test_overlapping_finalizer_and_rollout_metrics_fail_the_commit() -> None:

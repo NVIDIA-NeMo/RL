@@ -31,6 +31,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
+from nemo_rl.experience.metric_utils import RolloutTelemetry
 from nemo_rl.experience.reward_penalties import (
     CaptureRewardSettings,
     FinalizedReward,
@@ -44,13 +45,14 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
     from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 7
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 8
 # Schemas 2 to 5 predate turn-level recovery; they load through
 # _upgrade_pre_turn_recovery_groups.
 _PRE_TURN_RECOVERY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
 SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
     *_PRE_TURN_RECOVERY_SCHEMA_VERSIONS,
     6,
+    7,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
 }
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
@@ -100,6 +102,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "logical_selection",
         "gym_instance_id",
         "gym_attempt",
+        "telemetry",
     }
 )
 
@@ -293,6 +296,7 @@ class RolloutAttemptRecord:
     logical_selection: RolloutSelection | None = None
     gym_instance_id: Optional[str] = None
     gym_attempt: int = 0
+    telemetry: Optional[RolloutTelemetry] = None
 
     @property
     def attempt_id(self) -> str:
@@ -442,6 +446,7 @@ class SiblingSealResult:
     logical_selection: RolloutSelection | None = None
     resolved_agent_name: Optional[str] = field(default=None, kw_only=True)
     attribution_key: Optional[str] = field(default=None, kw_only=True)
+    telemetry: Optional[RolloutTelemetry] = None
 
 
 class UnresolvedCaptureAcknowledgement(ValueError):
@@ -807,6 +812,7 @@ class RolloutRecoveryLedger:
             attempt.mask_sample = None
             attempt.reward_checks = None
             attempt.reward_log_context = None
+            attempt.telemetry = None
             attempt.staging_keys.clear()
         record.status = PromptGroupStatus.GENERATING
 
@@ -1193,6 +1199,7 @@ class RolloutRecoveryLedger:
         reward_checks: RewardChecks | None = None,
         reward_log_context: RewardLogContext | None = None,
         logical_selection: RolloutSelection | None = None,
+        telemetry: Optional[RolloutTelemetry] = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -1230,6 +1237,7 @@ class RolloutRecoveryLedger:
                 and attempt.reward_checks == reward_checks
                 and attempt.reward_log_context == reward_log_context
                 and attempt.staging_keys == staging_keys
+                and attempt.telemetry == telemetry
             ):
                 return
             raise ValueError(
@@ -1252,6 +1260,7 @@ class RolloutRecoveryLedger:
         attempt.reward_checks = reward_checks
         attempt.reward_log_context = reward_log_context
         attempt.staging_keys = staging_keys
+        attempt.telemetry = copy.deepcopy(telemetry)
         attempt.status = RolloutAttemptStatus.SEALED
         self._record_gym_forget_if_restored(record, generation_index)
         if all(
@@ -1353,6 +1362,7 @@ class RolloutRecoveryLedger:
             attempt.reward_checks = result.reward_checks
             attempt.reward_log_context = result.reward_log_context
             attempt.staging_keys = staging_keys
+            attempt.telemetry = copy.deepcopy(result.telemetry)
             attempt.status = RolloutAttemptStatus.SEALED
             self._record_gym_forget_if_restored(record, generation_index)
         record.status = PromptGroupStatus.READY_TO_FINALIZE
@@ -1587,6 +1597,11 @@ class RolloutRecoveryLedger:
                                     "staging_keys": list(attempt.staging_keys),
                                     "gym_instance_id": attempt.gym_instance_id,
                                     "gym_attempt": attempt.gym_attempt,
+                                    "telemetry": (
+                                        attempt.telemetry.to_state()
+                                        if attempt.telemetry is not None
+                                        else None
+                                    ),
                                 }
                                 for attempt in sibling.attempts
                             ],
@@ -1838,6 +1853,12 @@ class RolloutRecoveryLedger:
                 if gym_attempt > 0 and gym_instance_id is None:
                     raise ValueError("resumed Gym attempts require gym_instance_id")
                 gate_id = GymCheckpointEpisode(base_gate_id, gym_attempt).capture_key
+                telemetry_state = attempt_state.get("telemetry")
+                telemetry = (
+                    RolloutTelemetry.from_state(telemetry_state)
+                    if telemetry_state is not None
+                    else None
+                )
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
                 ):
@@ -1874,6 +1895,7 @@ class RolloutRecoveryLedger:
                     or checks is not None
                     or log_context is not None
                     or staging_keys
+                    or telemetry is not None
                 ):
                     raise ValueError("only sealed attempts may retain receipt data")
                 attempts.append(
@@ -1889,6 +1911,7 @@ class RolloutRecoveryLedger:
                         staging_keys=list(staging_keys),
                         gym_instance_id=gym_instance_id,
                         gym_attempt=gym_attempt,
+                        telemetry=telemetry,
                     )
                 )
             siblings.append(
