@@ -155,7 +155,9 @@ def apply_simulator_overrides(
         clamped by a short dataset) when ``num_steps`` is set.
       - the inference node count when ``num_nodes`` is set: every node of a
         rollout-only run serves generation, so the generation resources and
-        ``cluster.num_nodes`` are the same number.
+        ``cluster.num_nodes`` are the same number. SGLang's
+        ``sglang_server_config.num_gpus`` follows, since SGLang counts its
+        engines from it rather than from the cluster.
       - ``data.validation``: there is no validation pass without a trainer.
       - ``policy.generation.vllm_cfg.load_format`` defaults to ``auto``: the
         engine serves the checkpoint, since no refit follows to replace the
@@ -180,9 +182,15 @@ def apply_simulator_overrides(
             else max(int(recipe_epochs), settings.num_steps)
         )
     if settings.num_nodes is not None:
-        colocated = raw_config["policy"]["generation"]["colocated"]
+        generation = raw_config["policy"]["generation"]
+        colocated = generation["colocated"]
         if not colocated["enabled"]:
             colocated["resources"]["num_nodes"] = settings.num_nodes
+            if generation["backend"] == "sglang":
+                # SGLang sizes its engines from num_gpus, not from the cluster.
+                generation["sglang_cfg"]["sglang_server_config"]["num_gpus"] = (
+                    colocated["resources"]["gpus_per_node"] * settings.num_nodes
+                )
         raw_config["cluster"]["num_nodes"] = settings.num_nodes
     raw_config["data"]["validation"] = None
     generation = raw_config["policy"]["generation"]
@@ -272,9 +280,14 @@ def validate_simulator_config(
                 "trainer for."
             )
     elif backend == "sglang":
-        pause_mode = generation_config["sglang_cfg"]["sglang_server_config"][
-            "pause_generation_mode"
-        ]
+        server_cfg = generation_config["sglang_cfg"]["sglang_server_config"]
+        if server_cfg["needs_offload"]:
+            raise ValueError(
+                "rollout_only cannot run with sglang_server_config.needs_offload="
+                "true: setup releases the engine memory and only a real refit "
+                "restores it. Set needs_offload: false."
+            )
+        pause_mode = server_cfg["pause_generation_mode"]
         if pause_mode == "in_place":
             # Same rule as the SGLang weight synchronizers: the simulated refit
             # clears the KV cache like a real one, which in_place cannot.

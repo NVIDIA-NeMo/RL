@@ -15,7 +15,7 @@
 import asyncio
 import logging
 import os
-from typing import Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import ray
 import torch
@@ -57,6 +57,9 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -74,6 +77,32 @@ class SGLangGeneration(GenerationInterface):
     TODO: one sglang router(router ip, router port) --> different server group(eg: PD, different tp size, ...; each server group multiple engines/servsers with same settings)
     router + [[p, ..., p] [d, ..., d]] or router + [[tp = 2, ... tp = 2], ..., [tp = 8, ..., tp = 8]]
     """
+
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject SingleController settings SGLang cannot honor.
+
+        The SingleController pickles this handle into its actor, and the
+        RolloutHealthMonitor thread cannot follow it (see ``__getstate__``).
+        Fleet health tracks a worker group's shards, which SGLang does not have.
+        """
+        fault_tolerance = SGLangFaultToleranceConfig.model_validate(
+            master_config.policy["generation"]["sglang_cfg"][
+                "sglang_fault_tolerance_config"
+            ]
+        )
+        if fault_tolerance.use_fault_tolerance:
+            raise NotImplementedError(
+                "SGLang fault tolerance is not supported on the SingleController: "
+                "set policy.generation.sglang_cfg.sglang_fault_tolerance_config."
+                "use_fault_tolerance to false."
+            )
+        if master_config.async_rl.generation_fleet_health.enabled:
+            raise ValueError(
+                "async_rl.generation_fleet_health.enabled=true is not supported with "
+                "policy.generation.backend='sglang'. Set "
+                "async_rl.generation_fleet_health.enabled=false."
+            )
 
     def __init__(
         self,

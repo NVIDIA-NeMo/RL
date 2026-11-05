@@ -130,6 +130,17 @@ def test_apply_overrides_sets_steps_nodes_and_drops_validation() -> None:
     assert "is_trajectory_collection" not in raw["env"]["nemo_gym"]
 
 
+def test_apply_overrides_sizes_sglang_engines_from_num_nodes() -> None:
+    raw = _raw_config()
+    generation = raw["policy"]["generation"]
+    generation["backend"] = "sglang"
+    generation["sglang_cfg"] = {"sglang_server_config": {"num_gpus": 1}}
+    apply_simulator_overrides(raw, SimulatorSettings(num_nodes=4))
+    # SGLang counts its engines from num_gpus, so it follows the node count.
+    assert generation["sglang_cfg"]["sglang_server_config"]["num_gpus"] == 4 * 8
+    assert generation["colocated"]["resources"]["num_nodes"] == 4
+
+
 def test_apply_overrides_keeps_recipe_values_when_flags_absent() -> None:
     raw = _raw_config()
     apply_simulator_overrides(raw, SimulatorSettings())
@@ -184,6 +195,7 @@ def _master_config(
     defer_routes: bool = False,
     forest_training: bool = False,
     sglang_pause_mode: str = "retract",
+    sglang_needs_offload: bool = False,
 ) -> MasterConfig:
     generation: dict[str, Any] = {
         "backend": backend,
@@ -193,7 +205,10 @@ def _master_config(
     }
     if backend == "sglang":
         generation["sglang_cfg"] = {
-            "sglang_server_config": {"pause_generation_mode": sglang_pause_mode}
+            "sglang_server_config": {
+                "pause_generation_mode": sglang_pause_mode,
+                "needs_offload": sglang_needs_offload,
+            }
         }
     return MasterConfig.model_construct(
         policy={"generation": generation},
@@ -236,6 +251,15 @@ def test_validate_rejects_sglang_in_place_pause() -> None:
     with pytest.raises(ValueError, match="in_place"):
         validate_simulator_config(
             _master_config(backend="sglang", sglang_pause_mode="in_place"),
+            SimulatorSettings(),
+        )
+
+
+def test_validate_rejects_sglang_needs_offload() -> None:
+    # Setup releases the engine memory and the no-op refit never restores it.
+    with pytest.raises(ValueError, match="needs_offload"):
+        validate_simulator_config(
+            _master_config(backend="sglang", sglang_needs_offload=True),
             SimulatorSettings(),
         )
 
