@@ -2,7 +2,9 @@
 
 Use an existing CoreWeave deployment to generate rollouts while NeMo-RL uses the training cluster's GPUs for the policy. NeMo-RL exports Hugging Face safetensors checkpoints and waits for CoreWeave to load them on every replica before the next round.
 
-This draft supports synchronous text GRPO with the stock Automodel policy worker. Use `examples/run_grpo.py` for native environments or `examples/nemo_gym/run_grpo_nemo_gym.py` for NeMo-Gym. Gym requires the exact-token `external_model` adapter from [Gym PR #5560](https://github.com/NVIDIA-NeMo/Gym/pull/5560). SingleController, TransferQueue rollouts, Megatron, LoRA, VLMs, quantized exports, draft training, and routing replay are not supported yet. Real-service validation of this port is pending.
+This draft supports synchronous text GRPO with the stock Automodel policy worker. Use `examples/run_grpo.py` for native environments or `examples/nemo_gym/run_grpo_nemo_gym.py` for NeMo-Gym. Gym requires the exact-token `external_model` adapter from [Gym PR #5560](https://github.com/NVIDIA-NeMo/Gym/pull/5560). SingleController, TransferQueue rollouts, Megatron, LoRA, VLMs, quantized exports, draft training, and routing replay are not supported yet.
+
+Verified with Nemotron 3.5 Lightning 30B-A3B BF16 on eight H100 80GB training GPUs and `dynamo-vllm 0.32.0+crwv.5` inference. The run completed two GRPO steps and 64 Gym math rollouts with nonzero gradients. Both the full checkpoint and a nonempty trained-weight delta reached verified activation before sampling.
 
 ## Setup
 
@@ -18,6 +20,8 @@ uv pip install --python /path/to/driver/venv/bin/python \
 The policy workers use NeMo-RL's exporter and do not need cwtrain. Use the frozen driver environment when launching so dependency sync does not remove the optional package. The adapter uses the cookbook's NeMo-RL transport and synchronizer API at the pinned commit; dependency packaging remains a draft review item.
 
 For Gym, the `grpo-nemotron3.5-lightning-30ba3b-1n8g-automodel-coreweave-gym-quick.yaml` recipe runs two steps on one eight-GPU node. Set `CWTRAIN_MODEL_DIR` to the prepared BF16 checkpoint and `CWTRAIN_GYM_DATA_PATH` to a `NemoGymDataset` JSONL file. The Gym tokenizer path, context limit, gateway key file, and served-identity file must match the policy's configuration. The synchronizer removes the identity record before each update and writes it only after the deployment confirms activation, so Gym cannot sample through an incomplete update.
+
+The tested Nemotron checkpoint uses the main model weights with MTP heads removed (`num_nextn_predict_layers=0`). Use the same prepared checkpoint on the trainer and inference service. For `math_with_judge`, request a final answer in `\boxed{...}` so the default verifier can score it.
 
 Set the recipe's `CWTRAIN_ROLLOUT_BASE_URL`, `CWTRAIN_ROLLOUT_MODEL`, `CWTRAIN_HOTLOAD_DEPLOYMENT_ID`, `CWTRAIN_HOTLOAD_RUN_ID`, and `CWTRAIN_HOTLOAD_STATE_DIR`. Use a unique run ID and a local directory containing the model checkpoint for `policy.model_name`. The driver and policy rank zero must share the staging directory, including across nodes.
 
