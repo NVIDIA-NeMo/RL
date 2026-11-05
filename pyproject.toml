@@ -85,8 +85,10 @@ dependencies = [
   # rev is lens main past v0.3.0, which still declares 0.2.0 in its
   # package_info, so a 0.3.0 floor would not resolve. The aiohttp extra is what stamps a traceparent on
   # the HTTP calls NeMo-Gym's client makes, so a Gym rollout continues the
-  # run's trace rather than starting its own.
-  "nemo-lens[sdk,aiohttp]>=0.2.0",
+  # run's trace rather than starting its own; the fastapi extra is what Gym
+  # copies into its server venvs so the server reads that traceparent rather
+  # than starting a new trace.
+  "nemo-lens[sdk,aiohttp,fastapi]>=0.2.0",
   # Headers for transformer-engine's no-build-isolation install, and the runtime floor for
   # TE 2.18 fused-attention backward with 256-wide heads on SM 10.x (cuDNN >= 9.23.0 for
   # bshd/sbhd, >= 9.25.0 for thd; see TE fused_attn.cpp). Keep equal to the override below.
@@ -518,7 +520,7 @@ override-dependencies = [
   # kinds behind `rl.host.memory.*` -- a rev rather than a tag because there is
   # no release carrying the last of those yet. Drop this once Megatron-LM bumps
   # to the same or newer rev.
-  "nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@4d045c03186b90afdc815db46b671f6a21bc7e98",
+  "nemo-lens[sdk,aiohttp,fastapi] @ git+https://github.com/NVIDIA-NeMo/Lens.git@4d045c03186b90afdc815db46b671f6a21bc7e98",
 ]
 
 # CVE fixes
