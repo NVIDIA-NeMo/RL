@@ -70,6 +70,11 @@ def frontend_argv(
         "--router-mode",
         dynamo_cfg.frontend_args.router_mode,
     ]
+    if dynamo_cfg.frontend_args.session_affinity_ttl_secs is not None:
+        argv += [
+            "--router-session-affinity-ttl-secs",
+            str(dynamo_cfg.frontend_args.session_affinity_ttl_secs),
+        ]
     extra = dynamo_cfg.frontend_args.extra_cli_args
     for token in extra:
         flag = token.split("=", 1)[0].replace("_", "-")
@@ -158,7 +163,7 @@ class ManagedDynamoRuntime:
         if not self._started:
             raise RuntimeError("Managed Dynamo runtime has not been started")
         # An OS-assigned system port makes each engine serve its own model-card
-        # files to a frontend on another node.
+        # files (a custom chat template included) to a frontend on another node.
         return {**self._manager_env, "DYN_SYSTEM_PORT": "0"}
 
     def start(self) -> None:
@@ -190,8 +195,17 @@ class ManagedDynamoRuntime:
             "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
             "DYN_NAMESPACE": self._namespace,
             "DYN_DISCOVERY_BACKEND": "etcd",
+            # Dynamo's legacy tool jail rebuilds response chunks with nvext=None.
+            # Its v2 parser path preserves engine_data, which NeMo-Gym needs for
+            # exact token IDs and log probabilities.
+            "DYN_ENABLE_EXPERIMENTAL_PARSERS_V2": "1",
             "DYN_REQUEST_PLANE": "tcp",
             "DYN_EVENT_PLANE": "nats",
+            # NeMo-Gym sends media inline: raise the frontend's 45 MB HTTP body
+            # limit, and the 32 MiB request-plane limit above it (the engine
+            # request carries the same media plus token IDs).
+            "DYN_HTTP_BODY_LIMIT_MB": "512",
+            "DYN_TCP_MAX_MESSAGE_SIZE": str(1 << 30),
             # A canary request would stall behind a refit pause; engine liveness
             # is the Ray actor's, as for every other vLLM worker.
             "DYN_HEALTH_CHECK_ENABLED": "false",

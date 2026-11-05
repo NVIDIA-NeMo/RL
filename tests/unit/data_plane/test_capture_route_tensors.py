@@ -123,6 +123,9 @@ def test_served_capture_bypasses_codec_through_route_consumers(
     worker._capture_admission = (
         VllmAsyncGenerationWorkerImpl._capture_admission.__get__(worker)
     )
+    worker._parse_capture_admission = (
+        VllmAsyncGenerationWorkerImpl._parse_capture_admission.__get__(worker)
+    )
     worker._delta_align_routed_experts = (
         VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
     )

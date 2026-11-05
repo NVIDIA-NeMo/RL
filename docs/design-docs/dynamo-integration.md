@@ -25,18 +25,38 @@ which is the loop that owns the `AsyncLLM`.
 vLLM. The adapter, `nemo_rl/models/generation/dynamo/native_engine.py`,
 implements its `LLMEngine` over the worker's `AsyncLLM`:
 
-- `generate` serves only the rollouts NeMo RL itself sends, which carry an
-  annotation, and refuses other requests. The worker's own `_serve_rollout` runs
-  each rollout exactly as native `generate_async` does, and
-  `request_pipeline.rollout_result` builds its result, routed experts included.
-  The result travels in `engine_data`, and the driver assembles the same output
-  with `request_pipeline.rollout_output`.
+- `generate` maps Dynamo's token request onto vLLM `SamplingParams` the way
+  vLLM's OpenAI server does, and streams token deltas back. Rollouts that NeMo RL
+  itself sends carry an annotation. For those, the engine uses the same code as
+  native `generate_async`:
+  - the worker's `_rollout_max_new_tokens` and `_rollout_sampling_params` build
+    the request;
+  - `request_pipeline.rollout_result` builds the result, routed experts
+    included.
+
+  The result travels in `engine_data`, and the driver assembles the same
+  output with `request_pipeline.rollout_output`.
+
+  NeMo-Gym's calls also carry an annotation (Gym's Dynamo dialect). The engine
+  applies the native chat endpoint's rules to them (on-policy sampling, the
+  prefix splice, the context clamp), stages a token-capture call through the
+  worker's own capture lifecycle, and takes the token fields and routed experts
+  from the native endpoint's helpers.
+
+  A request with media carries the frontend's tokens, with one unexpanded
+  placeholder per item, and the media URLs. The adapter loads the media with
+  vLLM's media connector. It then builds the processed prompt with the engine's
+  renderer (`process_for_engine_async`), the same step that follows rendering
+  on the native endpoint. The splice, the placeholder remap
+  (`remap_multimodal_placeholders`) and media capture (`_capture_request_media`)
+  all run on that processed prompt.
 - `abort` cancels the vLLM request on client disconnect.
 - Registration advertises the context length, the KV block size (from vLLM's
   KV-cache group metadata), the block count and the scheduler limits. It
   publishes no token budget. The engine owns the context check and the output
-  cap, as the native server does. With a budget, the frontend would refuse NeMo
-  RL's own rollouts that fill the context.
+  cap, as the native server does. With a budget, the frontend would fill an
+  omitted `max_tokens` from the prompt it rendered, which a prefix splice then
+  changes, and would refuse NeMo RL's own rollouts that fill the context.
 - `kv_event_sources` points Dynamo at the engine's own vLLM KV-event ZMQ
   publisher. It is set only when the engine caches prefixes. Each engine binds
   its own Linux abstract-namespace socket (`ipc://@...`), so engines on one node
@@ -80,9 +100,10 @@ imports `dynamo.common.backend`, `dynamo.llm.exceptions` and `dynamo._core`.
 
 What a Dynamo upgrade has to re-check:
 - the `dynamo.common.backend` contract (`LLMEngine`, `Worker`, `WorkerConfig`,
-  publisher);
+  publisher and logprob helpers);
 - the request fields of Dynamo's preprocessed request;
-- the frontend's `nvext` extensions and annotation forwarding.
+- the frontend's `nvext` extensions and annotation forwarding;
+- the parser names the native settings map to (`dynamo/config.py`).
 
 The one vLLM↔Dynamo wire coupling is vLLM's KV-event msgpack, which Dynamo's
 router decodes. A change there degrades routing, not serving. The managed

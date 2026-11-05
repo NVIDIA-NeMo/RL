@@ -193,7 +193,11 @@ def test_capture_stream_stops_receipt_waits_and_closes_collection(
 
 @pytest.mark.parametrize(
     ("generation_backend", "expected"),
-    [("vllm", "vllm_worker"), ("megatron", "megatron_worker")],
+    [
+        ("vllm", "vllm_worker"),
+        ("megatron", "megatron_worker"),
+        ("dynamo", "dynamo_worker"),
+    ],
 )
 def test_external_staging_backend_maps_generation_backend(
     generation_backend: str, expected: str
@@ -915,30 +919,105 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
     assert should_use_nemo_gym(config) is True
 
 
-def test_setup_nemo_gym_config_refuses_dynamo_serving() -> None:
-    """Dynamo does not serve NeMo-Gym's calls yet, so the pairing fails at startup."""
+@pytest.mark.parametrize(
+    ("vllm_model", "expected"),
+    [
+        ({}, {"enable_thinking": True, "truncate_history_thinking": False}),
+        (
+            {"chat_template_kwargs": {"enable_thinking": False}},
+            {"enable_thinking": False, "truncate_history_thinking": False},
+        ),
+        (
+            {"extra_body": {"chat_template_kwargs": {"force_nonempty_content": True}}},
+            {
+                "enable_thinking": True,
+                "truncate_history_thinking": False,
+                "force_nonempty_content": True,
+            },
+        ),
+        # The frontend answers every request carrying bad_words with a 400.
+        ({"extra_body": {"bad_words": ["x"]}}, None),
+    ],
+)
+def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
+    vllm_model: dict, expected: dict | None
+) -> None:
+    """The native server's default template kwargs sit under the ones Gym sends."""
+    from responses_api_models.vllm_model.app import VLLMModelConfig
+
     from nemo_rl.algorithms.grpo import MasterConfig
     from nemo_rl.environments.nemo_gym import (
+        build_nemo_gym_config,
         setup_nemo_gym_config,
         should_use_nemo_gym,
     )
 
+    user_vllm_model = copy.deepcopy(vllm_model)
+
     config = MasterConfig.model_construct(
-        env={"should_use_nemo_gym": True},
+        env={
+            "should_use_nemo_gym": True,
+            "nemo_gym": {
+                "policy_model": {"responses_api_models": {"vllm_model": vllm_model}}
+            },
+        },
         data={},
         policy={
             "generation": {
                 "backend": "vllm",
                 "dynamo": True,
-                "vllm_cfg": {"async_engine": False, "expose_http_server": False},
+                "vllm_cfg": {
+                    "async_engine": True,
+                    "http_server_serving_chat_kwargs": {
+                        "default_chat_template_kwargs": {
+                            "enable_thinking": True,
+                            "truncate_history_thinking": False,
+                        }
+                    },
+                },
             }
         },
     )
 
     setup_nemo_gym_config(config, tokenizer=None)
+    assert should_use_nemo_gym(config) is True
 
-    with pytest.raises(ValueError, match="does not serve NeMo-Gym rollouts yet"):
-        should_use_nemo_gym(config)
+    def build() -> dict:
+        return build_nemo_gym_config(
+            config.env,
+            base_urls=["http://frontend"],
+            model_name="test-model",
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )["initial_global_config_dict"]
+
+    if expected is None:
+        with pytest.raises(ValueError, match="bad_words"):
+            build()
+        return
+    gym_config = build()
+    composed = gym_config["policy_model"]["responses_api_models"]["vllm_model"]
+    # Read back through Gym's own config, which ignores keys it does not know.
+    gym_model = VLLMModelConfig(
+        host="localhost",
+        port=8000,
+        name="policy_model",
+        entrypoint="app.py",
+        base_url="http://frontend",
+        api_key="dummy_key",
+        model="test-model",
+        return_token_id_information=True,
+        uses_reasoning_parser=True,
+        **composed,
+    )
+    assert gym_model.dynamo_frontend is True
+    # The frontend refuses reasoning under both of Gym's keys.
+    assert gym_model.reasoning_field == "reasoning_content"
+    assert gym_model.chat_template_kwargs == expected
+    assert "dynamo_dialect" not in gym_config
+    # The user's overlay is left as written.
+    assert vllm_model == user_vllm_model
 
 
 def test_public_postprocess_waits_for_commit_instead_of_masking(monkeypatch) -> None:

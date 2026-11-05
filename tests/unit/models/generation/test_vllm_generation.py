@@ -2657,7 +2657,7 @@ def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
     VllmGeneration.validate_settings(master_config)
 
 
-def _dynamo_master_config(*, fleet_health=False):
+def _dynamo_master_config(*, router=False, fleet_health=False):
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["dynamo"] = True
     vllm_config["vllm_cfg"]["async_engine"] = True
@@ -2665,6 +2665,7 @@ def _dynamo_master_config(*, fleet_health=False):
     return types.SimpleNamespace(
         policy={"generation": vllm_config},
         async_rl=types.SimpleNamespace(
+            generation_router=types.SimpleNamespace(enabled=router),
             generation_fleet_health=types.SimpleNamespace(enabled=fleet_health),
         ),
     )
@@ -2674,6 +2675,7 @@ def _dynamo_master_config(*, fleet_health=False):
     ("settings", "error"),
     [
         ({}, None),
+        ({"router": True}, "routes the whole fleet behind one URL"),
         ({"fleet_health": True}, "Disable fleet health"),
     ],
 )
@@ -2727,6 +2729,8 @@ def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
     # The frontend request carries token IDs only, so media prompts stay native.
     media = BatchedDataDict({**data, "vllm_content": [None]})
     assert generation._dynamo_serves(data) and not generation._dynamo_serves(media)
+    # NeMo-Gym is pointed at the frontend too.
+    assert generation.client_base_urls == ["http://frontend/v1"]
 
     _, output = asyncio.run(anext(generation.generate_async(data, greedy=True)))
 
