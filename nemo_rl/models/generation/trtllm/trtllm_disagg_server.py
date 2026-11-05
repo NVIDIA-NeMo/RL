@@ -415,9 +415,6 @@ def _build_frontend_tokenizer(
     off-policy tokens (the adapter shadow-validates a sample under
     NRL_TOKENIZE_SHADOW_RATE).
     """
-    import base64
-
-    import numpy as np
     from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
     from nemo_rl.models.generation.openai_server_utils import encode_token_ids_b64
