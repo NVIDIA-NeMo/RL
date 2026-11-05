@@ -94,7 +94,10 @@ class VllmSpecificArgs(TypedDict):
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
     # Supports exact names, substrings, and fnmatch wildcards.
     quantization_ignore_patterns: NotRequired[list[str]]
-    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
+    # Dynamic per-(token, head) scales require FP8 precision and Triton attention.
+    kv_cache_dtype: Literal[
+        "auto", "fp8", "fp8_e4m3", "fp8_ds_mla", "fp8_per_token_head"
+    ]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
     # Collect vLLM request, cache, and cumulative token counters in a model-owner
@@ -270,11 +273,36 @@ class VllmConfig(GenerationConfig):
     worker_extension_cls_fqn: NotRequired[str | None]
 
 
+def resolve_vllm_kv_cache_dtype(vllm_cfg: VllmSpecificArgs) -> str:
+    """Return the selected cache format and validate dynamic FP8 precision."""
+    kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
+    if kv_cache_dtype == "fp8_per_token_head" and vllm_cfg.get("precision") != "fp8":
+        raise ValueError("fp8_per_token_head requires precision='fp8'")
+    return kv_cache_dtype
+
+
 def validate_vllm_quantization_config(config: VllmConfig) -> None:
     """Reject quantization options that would otherwise be silently ignored."""
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    if vllm_cfg.get("kv_cache_dtype") == "fp8_per_token_head":
+        resolve_vllm_kv_cache_dtype(vllm_cfg)
+        if config.get("real_quant"):
+            raise ValueError("fp8_per_token_head does not support real_quant")
+        vllm_kwargs = config.get("vllm_kwargs") or {}
+        attention_config = vllm_kwargs.get("attention_config") or {}
+        for backend in (
+            vllm_kwargs.get("attention_backend"),
+            attention_config.get("backend"),
+        ):
+            if backend is not None and backend != "TRITON_ATTN":
+                raise ValueError(
+                    "kv_cache_dtype='fp8_per_token_head' requires TRITON_ATTN; "
+                    "set vllm_kwargs.attention_backend or "
+                    "vllm_kwargs.attention_config.backend to 'TRITON_ATTN'. "
+                    f"Got {backend!r}."
+                )
     refit_prequantize = vllm_cfg.get("refit_prequantize")
     if refit_prequantize is not None and not isinstance(refit_prequantize, bool):
         raise ValueError(
