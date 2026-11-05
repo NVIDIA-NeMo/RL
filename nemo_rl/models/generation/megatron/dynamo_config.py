@@ -206,17 +206,17 @@ def engine_roles(
 
 
 def validate_megatron_dynamo_generation(generation_cfg: Mapping[str, Any]) -> None:
-    """What a prefill/decode fleet of Megatron engines can and cannot carry.
+    """What prefill/decode Megatron engines behind Dynamo can and cannot carry.
 
     Raises:
-        ValueError: For a config whose shape the fleet cannot serve.
+        ValueError: For a config whose shape the engines cannot serve.
     """
     assert generation_cfg["backend"] == "megatron" and dynamo_enabled(generation_cfg)
     megatron_dynamo_cfg(generation_cfg)
     if "_dynamo_role" in generation_cfg:
         raise ValueError(
-            "policy.generation._dynamo_role is set per engine by the Dynamo engine "
-            "fleet; remove it from the config"
+            "policy.generation._dynamo_role is set per engine by "
+            "MegatronDynamoGeneration; remove it from the config"
         )
     disaggregation = disaggregation_cfg(generation_cfg)
     if not disaggregation.enabled:

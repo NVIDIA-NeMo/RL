@@ -139,6 +139,7 @@ from nemo_rl.models.generation.generation_router import (
     GenerationRouterImpl,
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.megatron import megatron_generation_cls
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -674,7 +675,9 @@ def _build_generation(
         # at the dispatch and never reaches here.
         # The inference and trainer policies build in parallel;
         # the inference engine only becomes live at the initial refit, which delivers weights.
-        gen = MegatronGeneration(
+        # With policy.generation.dynamo=true this is MegatronDynamoGeneration, which
+        # builds one engine per prefill/decode role instead of one inference policy.
+        gen = megatron_generation_cls(generation_config)(
             config=master_config.policy,
             tokenizer=tokenizer,
             cluster=inference_cluster,

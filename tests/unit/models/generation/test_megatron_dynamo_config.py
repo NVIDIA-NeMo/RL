@@ -20,7 +20,11 @@ import pytest
 from pydantic import ValidationError
 
 from nemo_rl.models.generation import resolve_generation_class
+from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.megatron.dynamo_generation import (
+    MegatronDynamoGeneration,
+)
 from nemo_rl.models.generation.megatron.dynamo_config import (
     MegatronDynamoCfg,
     disaggregation_cfg,
@@ -132,8 +136,12 @@ def test_dynamo_switch_is_refused_for_non_megatron_backends(backend) -> None:
         resolve_generation_class({"backend": backend, "dynamo": True})
 
 
-def test_dynamo_switch_resolves_to_megatron_generation() -> None:
-    assert resolve_generation_class(_megatron_config()) is MegatronGeneration
+def test_dynamo_switch_resolves_to_the_dynamo_subclass() -> None:
+    assert resolve_generation_class(_megatron_config()) is MegatronDynamoGeneration
+    assert issubclass(MegatronDynamoGeneration, GenerationInterface)
+    assert not issubclass(MegatronDynamoGeneration, MegatronGeneration)
+    plain = {**_megatron_config(), "dynamo": False}
+    assert resolve_generation_class(plain) is MegatronGeneration
 
 
 def test_engines_take_their_width_from_the_policy_layout() -> None:
@@ -296,7 +304,7 @@ def test_engine_width_must_hold_the_expert_parallel_grid(layout, decode, match) 
         ),
         pytest.param(
             _set("_dynamo_role", value="prefill"),
-            "set per engine by the Dynamo engine fleet",
+            "set per engine by MegatronDynamoGeneration",
             id="engine_role",
         ),
     ],
@@ -324,13 +332,18 @@ def _master_config(generation: dict) -> SimpleNamespace:
     )
 
 
-def test_megatron_generation_refuses_the_switch_until_the_fleet_exists() -> None:
+def test_megatron_generation_refuses_the_switch_until_rollouts_are_served() -> None:
+    generation = _megatron_config()
     with pytest.raises(NotImplementedError, match="not served by MegatronGeneration"):
-        MegatronGeneration.validate_settings(_master_config(_megatron_config()))
+        resolve_generation_class(generation).validate_settings(
+            _master_config(generation)
+        )
 
 
 def test_megatron_generation_names_an_unservable_shape_first() -> None:
     generation = _megatron_config()
     generation["disaggregation"]["enabled"] = False
     with pytest.raises(ValueError, match="disaggregation.enabled=true"):
-        MegatronGeneration.validate_settings(_master_config(generation))
+        resolve_generation_class(generation).validate_settings(
+            _master_config(generation)
+        )

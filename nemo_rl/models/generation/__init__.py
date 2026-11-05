@@ -103,11 +103,9 @@ def resolve_generation_class(
 
         return SGLangGeneration
     if backend == "megatron":
-        from nemo_rl.models.generation.megatron.megatron_generation import (
-            MegatronGeneration,
-        )
+        from nemo_rl.models.generation.megatron import megatron_generation_cls
 
-        return MegatronGeneration
+        return megatron_generation_cls(generation_config)
     if backend == "trtllm":
         from nemo_rl.models.generation.trtllm import TrtllmGeneration
 
