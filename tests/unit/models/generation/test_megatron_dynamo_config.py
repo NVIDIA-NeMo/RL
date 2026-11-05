@@ -33,6 +33,8 @@ from nemo_rl.models.generation.megatron.dynamo_config import (
     validate_megatron_dynamo_generation,
 )
 
+pytestmark = pytest.mark.mcore
+
 _DELETE = object()
 MEGATRON_POLICY = {
     "model_name": "Qwen/Qwen3-0.6B",
