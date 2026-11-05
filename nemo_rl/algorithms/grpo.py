@@ -338,6 +338,14 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = True
+    # Version-point gradients (Megatron policy): compute each step's gradient at the weights
+    # that generated its batch, where the PPO ratio and IS weight are 1 (exactly 1 under
+    # bitwise trainer/generator parity, e.g. policy.megatron_cfg.batch_invariant_mode), and
+    # apply it to the current weights with the normal optimizer step. Keeps a host snapshot of
+    # each rank's param shards for the last max_trajectory_age_steps + 1 versions (saved with
+    # checkpoints). Batches without a snapshot or mixing versions take the IS path.
+    # See docs/guides/vpg.md.
+    version_point_gradient: bool = False
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -3338,6 +3346,98 @@ def _validate_use_kl_in_reward_compat(master_config: MasterConfig) -> None:
         )
 
 
+def validate_version_point_config(master_config: MasterConfig) -> None:
+    """Reject settings ``grpo.async_grpo.version_point_gradient`` does not support."""
+    async_cfg = master_config.grpo.async_grpo
+    if not async_cfg.version_point_gradient:
+        return
+    policy = master_config.policy
+    megatron = policy.get("megatron_cfg")
+    problems = []
+    if not async_cfg.enabled:
+        problems.append("async GRPO (grpo.async_grpo.enabled=true)")
+    if not (megatron and megatron["enabled"]):
+        problems.append("the Megatron policy (policy.megatron_cfg.enabled=true)")
+        megatron = {}
+    if async_cfg.in_flight_weight_updates:
+        problems.append(
+            "in_flight_weight_updates=false (each rollout must come from one weight version)"
+        )
+    if (master_config.data_plane or {}).get("enabled"):
+        problems.append("the in-process replay buffer (data_plane.enabled=false)")
+    if master_config.loss_fn.force_on_policy_ratio:
+        problems.append("loss_fn.force_on_policy_ratio=false")
+    if policy["generation"]["colocated"]["enabled"]:
+        problems.append("non-colocated generation")
+    if router_replay_enabled(policy):
+        problems.append("policy.router_replay disabled")
+    fp8_cfg = megatron.get("fp8_cfg") or {}
+    if fp8_cfg.get("enabled") and fp8_cfg.get("fp8_param"):
+        problems.append("fp8_cfg.fp8_param=false (BF16 param buffers are swapped)")
+    optimizer = megatron.get("optimizer") or {}
+    if megatron and not optimizer.get("use_distributed_optimizer"):
+        problems.append("the distributed optimizer")
+    if optimizer.get("optimizer_cpu_offload"):
+        problems.append("no optimizer CPU offload")
+    ddp = megatron.get("distributed_data_parallel_config") or {}
+    if ddp.get("use_custom_fsdp") or megatron.get("use_megatron_fsdp"):
+        problems.append("Megatron DDP (not Megatron-FSDP)")
+    if ddp.get("overlap_param_gather_with_optimizer_step"):
+        problems.append("overlap_param_gather_with_optimizer_step=false")
+    if (megatron.get("pipeline_model_parallel_size") or 1) != 1:
+        problems.append("pipeline_model_parallel_size=1")
+    rollout_batch = (
+        master_config.grpo.num_prompts_per_step
+        * master_config.grpo.num_generations_per_prompt
+    )
+    if policy["train_global_batch_size"] != rollout_batch:
+        problems.append(
+            f"one optimizer step per rollout batch (train_global_batch_size={rollout_batch})"
+        )
+    if problems:
+        raise ValueError(
+            "grpo.async_grpo.version_point_gradient requires: "
+            + "; ".join(problems)
+            + "."
+        )
+    if not megatron.get("batch_invariant_mode"):
+        warnings.warn(
+            "grpo.async_grpo.version_point_gradient without "
+            "policy.megatron_cfg.batch_invariant_mode: the gradient is taken at the "
+            "generation weights, but trainer and generator log-probs are not bitwise equal, "
+            "so the IS weight is only approximately 1 (see train/version_point_parity).",
+            stacklevel=2,
+        )
+
+
+def version_point_keep_versions(max_trajectory_age_steps: int) -> int:
+    """Weight versions a fixed-lead replay buffer can still reference: L + 1.
+
+    Before the step that trains on weight version t, the buffer serves the batch generated
+    by version max(0, t - L), and every batch still buffered comes from a version in
+    t - L .. t. Each older version is evicted at the refit that makes it unreferenced.
+    """
+    return max_trajectory_age_steps + 1
+
+
+def version_point_candidate(
+    generation_versions: set[int], has_snapshot: Callable[[int], bool]
+) -> tuple[Optional[int], dict[str, float]]:
+    """The version a batch's gradient is computed at, or None (IS path at the current weights).
+
+    A batch qualifies when all its rows come from one generation version (the fixed-lead
+    replay buffer serves one target per step, generated by one version) and that version
+    still has a snapshot.
+    """
+    version = next(iter(generation_versions)) if len(generation_versions) == 1 else None
+    available = version is not None and has_snapshot(version)
+    metrics = {
+        "version_point_mixed_batch": float(len(generation_versions) > 1),
+        "version_point_no_snapshot": float(version is not None and not available),
+    }
+    return (version if available else None), metrics
+
+
 def _resolve_logprob_skip_flags(
     master_config: MasterConfig,
 ) -> tuple[bool, bool | None]:
@@ -5298,6 +5398,9 @@ def async_grpo_train(
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
     max_generation_failures = master_config.grpo.async_grpo.max_generation_failures
+    validate_version_point_config(master_config)
+    version_point = master_config.grpo.async_grpo.version_point_gradient
+    version_point_keep = version_point_keep_versions(max_trajectory_age_steps)
 
     if router_replay_enabled(master_config.policy) and (
         master_config.data_plane or {}
@@ -5417,6 +5520,15 @@ def async_grpo_train(
             current_training_step=step,
             max_age_steps=max_trajectory_age_steps,
         )
+        if version_point:
+            restored_versions = policy.load_version_snapshots(
+                os.path.join(last_checkpoint_path, "policy", "version_snapshots"),
+                keep_versions=version_point_keep,
+            )
+            print(
+                f"📦 Version-point snapshots restored: versions {restored_versions}",
+                flush=True,
+            )
 
         rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
         if path_exists(rollouts_path):
@@ -5588,6 +5700,18 @@ def async_grpo_train(
     # Generation must hold the policy's real weights before any backend starts
     # collecting. In particular, vLLM starts with dummy weights when
     # the first refit supplies model parameters.
+    if version_point:
+        # The generator holds exactly these weights as this version (a fresh start, or
+        # restored bitwise from the checkpoint the restored snapshots came from).
+        snapshot_info = policy.snapshot_version_weights(
+            weight_version, version_point_keep
+        )
+        if not snapshot_info["consistent"]:
+            warnings.warn(
+                f"Version-point snapshot of version {weight_version} from the checkpoint "
+                "differs from the restored weights; its buffered batches take the IS path.",
+                stacklevel=1,
+            )
     ray.get(trajectory_collector.set_weight_version.remote(weight_version))
     ray.get(trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader)))
     print("📦 Started continuous background trajectory collection")
@@ -5870,6 +5994,11 @@ def async_grpo_train(
                     # Extract trajectories and metadata from sample result
                     trajectories = sample_result["trajectories"]
                     avg_trajectory_age = sample_result["avg_trajectory_age"]
+                    generation_versions = (
+                        set(sample_result["generation_weight_versions"])
+                        if version_point
+                        else set()
+                    )
 
                     # Advance the trained frontier from the sampled groups'
                     # own stream ordinals.
@@ -6036,6 +6165,26 @@ def async_grpo_train(
                 skip_prev_logprobs, skip_reference_logprobs = (
                     _resolve_logprob_skip_flags(master_config)
                 )
+                # Version-point gradient: the batch's single generation version, if its
+                # snapshot exists (otherwise this step takes the IS path).
+                vp_version: Optional[int] = None
+                vp_metrics: dict[str, float] = {}
+                if version_point:
+                    vp_version, vp_metrics = version_point_candidate(
+                        generation_versions, policy.has_version_weights
+                    )
+                    if vp_version is None:
+                        print(
+                            "  Version point: IS path this step (generation versions "
+                            f"{sorted(generation_versions)}: mixed or without snapshot)",
+                            flush=True,
+                        )
+                    else:
+                        vp_metrics["version_point_age"] = float(
+                            weight_version - vp_version
+                        )
+                        # The trainer log-probs at the current weights are not needed.
+                        skip_prev_logprobs = True
                 seq_logprob_error_threshold = (
                     master_config.grpo.seq_logprob_error_threshold
                 )
@@ -6090,6 +6239,17 @@ def async_grpo_train(
                             train_data["prev_logprobs"]
                         )
                     del logprob_data
+
+                if vp_version is not None:
+                    # At the generation weights the PPO ratio and the IS weight are 1.
+                    train_data["prev_logprobs"] = train_data[
+                        "generation_logprobs"
+                    ].clone()
+                    print(
+                        f"  Version point: gradient at generation version {vp_version} "
+                        f"(age {weight_version - vp_version})",
+                        flush=True,
+                    )
 
                 # Separate-pass seq-level metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
@@ -6225,11 +6385,21 @@ def async_grpo_train(
                         tracer=_tracer,
                     ),
                 ):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if vp_version is not None and not policy.set_version_point(
+                        vp_version
+                    ):
+                        raise RuntimeError(
+                            f"Version-point snapshot {vp_version} disappeared."
+                        )
+                    try:
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
+                    finally:
+                        if vp_version is not None:
+                            policy.set_version_point(None)
 
                 is_last_step = step + 1 == max_num_steps
                 should_save_by_step = (
@@ -6252,6 +6422,15 @@ def async_grpo_train(
                     and policy_generation.wake_carries_weight_updates()
                 )
 
+                if version_point:
+                    # Exactly the weights the coming refit sends as version weight_version + 1.
+                    with timer.time("version_point_snapshot"):
+                        snapshot_info = policy.snapshot_version_weights(
+                            weight_version + 1, version_point_keep
+                        )
+                    vp_metrics["version_point_snapshot_gb"] = (
+                        snapshot_info["stored_bytes"] / 1e9
+                    )
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 if defer_wake_for_save:
                     # Wake-deferral (checkpoint scheduling, which the backend
@@ -6479,6 +6658,17 @@ def async_grpo_train(
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
+                if version_point:
+                    metrics.update(vp_metrics)
+                    metrics["version_point_applied"] = float(vp_version is not None)
+                    if vp_version is not None:
+                        # max |PPO ratio - 1| over loss tokens: the ratio is exp(trainer lp at the
+                        # generation weights - generation lp), exactly 1 under bitwise parity.
+                        if "probs_ratio_max" in metrics:
+                            metrics["version_point_parity"] = max(
+                                metrics["probs_ratio_max"] - 1.0,
+                                1.0 - metrics["probs_ratio_min"],
+                            )
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
                 metrics.update(seq_logprob_error_metrics)
@@ -6557,6 +6747,14 @@ def async_grpo_train(
                                 is_last_step or early_stop_message is not None
                             ),
                         )
+                        if version_point:
+                            # The versions the restored replay buffer can reference, so a
+                            # resume keeps computing their gradients at the generation weights.
+                            policy.save_version_snapshots(
+                                os.path.join(
+                                    checkpoint_path, "policy", "version_snapshots"
+                                )
+                            )
                         # Save the dataloader state at the checkpoint cut
                         # rather than the live cursor; a resume re-yields the
                         # covered window and regenerates what the restored

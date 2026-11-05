@@ -595,7 +595,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         loses its last chance to be used for its intended training step.
 
         Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
+            Dictionary with 'trajectories', 'avg_trajectory_age' and 'generation_weight_versions'
+            keys, or None if insufficient data
         """
         with self._lock:
             if not self.trajectories:
@@ -714,6 +715,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             return {
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
+                # Generation weight version of each sampled group (version-point gradients).
+                "generation_weight_versions": sampled_weights,
             }
 
     def size(self) -> int:
