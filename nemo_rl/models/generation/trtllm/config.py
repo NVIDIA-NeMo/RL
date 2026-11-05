@@ -84,6 +84,10 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
     model_name: NotRequired[str]
     max_model_len: int
     precision: str
+    # "auto" | "dummy", mirroring vllm_cfg.load_format. Defaults to "dummy" for
+    # training and "auto" for evaluation; an explicit value is kept. Shared by
+    # both engine roles, so it is not a per-role override.
+    load_format: NotRequired[str]
     # With precision="fp8", use MXFP8 (UE8M0 1x32 scales) instead of 128x128 block-FP8.
     is_mx: NotRequired[bool]
     expose_http_server: NotRequired[bool]

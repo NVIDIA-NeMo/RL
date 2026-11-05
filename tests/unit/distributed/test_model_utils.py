@@ -2130,6 +2130,86 @@ def test_student_teacher_kernels_normalize_bf16_logits_in_fp32(
     torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
+@pytest.mark.parametrize("leaf", [False, True])
+def test_chunked_logprob_backward_grad_reuses_logits_storage(
+    single_rank_collectives, leaf, dtype
+):
+    """Activation logits take their grad in place; leaves are never overwritten."""
+    torch.manual_seed(0)
+    batch, seq, vocab = 2, 7, 11
+    base = torch.randn(batch, seq, vocab, dtype=dtype, requires_grad=True)
+    target = torch.randint(0, vocab, (batch, seq))
+
+    ref = base.detach().float().requires_grad_(True)
+    expected = torch.log_softmax(ref, dim=-1).gather(-1, target.unsqueeze(-1))
+    (expected_grad,) = torch.autograd.grad(expected.sum(), ref)
+    # The grad is computed in fp32 and rounded to the logits' dtype.
+    expected_grad = expected_grad.to(dtype)
+
+    logits = base if leaf else base * 1.0  # non-leaf activation
+    before = logits.detach().clone()
+    logprobs = ChunkedDistributedLogprob.apply(
+        logits, target, 0, vocab, 3, None, False, True
+    )
+    logprobs.sum().backward()
+
+    torch.testing.assert_close(base.grad, expected_grad)
+    if leaf:
+        torch.testing.assert_close(logits.detach(), before)
+    else:
+        # The grad was written into the logits' own storage.
+        torch.testing.assert_close(logits.detach(), expected_grad)
+
+
+def test_chunked_logprob_fp32_default_grad_with_shared_logits(single_rank_collectives):
+    """Reverse KL and logprob on the same fp32 logits: the default must not reuse them."""
+    torch.manual_seed(1)
+    base = torch.randn(1, 4, 6, requires_grad=True)
+    teacher = torch.randn(1, 4, 6)
+    target = torch.randint(0, 6, (1, 4))
+    ref = base.detach().double().requires_grad_(True)
+    log_p = torch.log_softmax(ref, -1)
+    expected_loss = (
+        log_p.exp() * (log_p - torch.log_softmax(teacher.double(), -1))
+    ).sum()
+    expected_loss = expected_loss + log_p.gather(-1, target.unsqueeze(-1)).sum()
+    (expected,) = torch.autograd.grad(expected_loss, ref)
+
+    logits = base * 1.0
+    kl = ChunkedDistributedReverseKLToFixedLogits.apply(logits, teacher, 2, None, False)
+    lp = ChunkedDistributedLogprob.apply(logits, target, 0, 6, 2, None, False)
+    (kl.sum() + lp.sum()).backward()
+    torch.testing.assert_close(base.grad, expected.float(), rtol=1e-5, atol=1e-5)
+
+
+def test_chunked_logprob_fp32_default_grad_with_narrow_views(single_rank_collectives):
+    """Two sequences as narrow views of one packed logits (non-fused packing)."""
+    torch.manual_seed(2)
+    base = torch.randn(1, 6, 5, requires_grad=True)
+    target = torch.randint(0, 5, (1, 6))
+    expected_loss = torch.log_softmax(base.double(), -1).gather(
+        -1, target.unsqueeze(-1)
+    )
+    (expected,) = torch.autograd.grad(expected_loss.sum(), base)
+
+    logits = base * 1.0
+    total = sum(
+        ChunkedDistributedLogprob.apply(
+            logits.narrow(1, start, 3),
+            target[:, start : start + 3],
+            0,
+            5,
+            2,
+            None,
+            False,
+        ).sum()
+        for start in (0, 3)
+    )
+    total.backward()
+    torch.testing.assert_close(base.grad, expected.float(), rtol=1e-5, atol=1e-5)
+
+
 def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, device):
     """Compare packed TP/CP values and gradients with a full-vocabulary reference."""
     from types import SimpleNamespace
@@ -2275,3 +2355,103 @@ def test_score_centering_packed_tp_cp_gloo(tmp_path, tp_size, cp_size):
         nprocs=tp_size * cp_size,
         join=True,
     )
+
+
+def _score_centering_packed_inputs():
+    torch.manual_seed(13)
+    full = torch.randn(2, 8, 12, requires_grad=True)
+    ids = torch.randint(0, 12, (2, 8, 3))
+    packed = torch.cat(
+        [
+            torch.cat([full[i : i + 1, :n], full.new_zeros(1, p - n, 12)], dim=1)
+            for i, (n, p) in enumerate([(5, 8), (7, 12)])
+        ],
+        dim=1,
+    )
+    data = {
+        "input_ids": ids[..., 0],
+        "sampler_topk_token_ids": ids,
+        "sampler_topk_logprobs": torch.zeros_like(ids, dtype=torch.float32),
+    }
+    return full, ids, packed * 1.0, data  # non-leaf logits, as in training
+
+
+@pytest.fixture
+def single_rank_gloo_group(tmp_path):
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'init'}", rank=0, world_size=1
+    )
+    yield torch.distributed.group.WORLD
+    torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "reuse,chunk_size", [(False, 2), (True, 2), (True, None)], ids=str
+)
+def test_packed_logits_reuse_follows_the_flag_and_chunking(
+    single_rank_gloo_group, monkeypatch, reuse, chunk_size
+):
+    """The chunked logprob reuses the logits' storage only when asked and chunked."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.loss import loss_input as loss_input_module
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+
+    seen = []
+    original = loss_input_module.from_parallel_logits_to_logprobs_packed_sequences
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["reuse_logits_storage"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        loss_input_module, "from_parallel_logits_to_logprobs_packed_sequences", spy
+    )
+    _, _, logits, data = _score_centering_packed_inputs()
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=False)
+    loss_input_module.prepare_packed_loss_input(
+        logits,
+        data,
+        loss_fn,
+        (0, 5, 12),
+        (0, 8, 20),
+        vocab_parallel_rank=0,
+        vocab_parallel_group=single_rank_gloo_group,
+        chunk_size=chunk_size,
+        reuse_logits_storage=reuse,
+    )
+    assert seen == [reuse and chunk_size is not None]
+
+
+def test_score_centering_chunked_grad_with_activation_logits(single_rank_gloo_group):
+    """Both consumers of the packed logits get their grad from the original values."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+    from nemo_rl.algorithms.loss.loss_input import prepare_packed_loss_input
+
+    full, ids, logits, data = _score_centering_packed_inputs()
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
+    prepared, _ = prepare_packed_loss_input(
+        logits,
+        data,
+        loss_fn,
+        (0, 5, 12),
+        (0, 8, 20),
+        vocab_parallel_rank=0,
+        vocab_parallel_group=single_rank_gloo_group,
+        chunk_size=2,
+    )
+    mask = torch.zeros(2, 7, 1)
+    mask[0, :4] = 1
+    mask[1, :6] = 1
+    actual = (prepared["policy_logprobs_at_sampler_topk"] * mask).sum()
+    actual = actual + (prepared["next_token_logprobs"] * mask[..., 0]).sum()
+    actual.backward()
+
+    ref = full.detach().double().requires_grad_(True)
+    log_p = ref[:, :-1].log_softmax(-1)
+    expected = (log_p.gather(-1, ids[:, 1:]) * mask).sum()
+    expected = expected + (log_p.gather(-1, ids[:, 1:, :1]) * mask).sum()
+    expected.backward()
+    torch.testing.assert_close(full.grad, ref.grad.float(), atol=1e-6, rtol=1e-5)
