@@ -67,6 +67,7 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.vllm.output_limits import per_request_output_limits
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -2062,6 +2063,14 @@ class VllmAsyncGenerationWorkerImpl(
             max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
             remaining_ctx = max_model_len - current_input_actual_length
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
+            output_caps = data.get("max_output_tokens")
+            if output_caps is not None and allowed_new_tokens > 0:
+                (allowed_new_tokens,) = per_request_output_limits(
+                    output_caps[sample_idx : sample_idx + 1],
+                    [current_input_actual_length],
+                    configured_max_new_tokens=allowed_new_tokens,
+                    max_model_len=max_model_len,
+                )
 
             spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
             spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
@@ -2143,6 +2152,7 @@ class VllmAsyncGenerationWorkerImpl(
             validate_rollout_prompt(
                 input_ids_batch[sample_idx, :current_input_actual_length].tolist(),
                 final_request_output.prompt_token_ids,
+                expanded_placeholder_token_id=self._expanded_placeholder_token_id,
             )
 
             # Process the output

@@ -82,6 +82,12 @@ class VllmSpecificArgs(TypedDict):
     # fits within max_model_len. This is needed when multimodal processing makes
     # the training prompt longer than its text-only representation.
     cap_max_tokens_to_context: NotRequired[bool]
+    # Media placeholder token that the learner prompt keeps as one token while
+    # vLLM expands it into a contiguous run (for example, one audio token that
+    # becomes an encoder-length run). When set, rollout prompt validation accepts
+    # exactly that one expansion; any other prompt difference still fails.
+    # Absent: generation and learner prompts must be token-identical.
+    expanded_placeholder_token: NotRequired[str]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
     # With is_mx, quantize weights to MXFP8 on the trainer during refit and

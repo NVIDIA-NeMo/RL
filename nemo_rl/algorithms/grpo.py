@@ -652,6 +652,20 @@ def _uses_managed_noncolocated_refit(
     )
 
 
+def _merge_vllm_hf_overrides(
+    vllm_kwargs: dict[str, Any], policy_config: PolicyConfig
+) -> None:
+    """Make vLLM HF overrides match the policy while keeping generation-only keys.
+
+    Policy ``hf_config_overrides`` win on shared keys so generation and training
+    see the same model config.
+    """
+    vllm_kwargs["hf_overrides"] = {
+        **(vllm_kwargs.get("hf_overrides") or {}),
+        **(policy_config.get("hf_config_overrides") or {}),
+    }
+
+
 def _shutdown_completed_nemo_gym_startup(
     future: Future[tuple[NemoGymShardSet, float]] | None,
 ) -> None:
@@ -1788,9 +1802,7 @@ def setup(
 
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
-
-        ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        _merge_vllm_hf_overrides(vllm_kwargs, policy_config)
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
@@ -4017,6 +4029,7 @@ def _grpo_train_impl(
                             rewards.cuda(device_id),
                             valid_mask.cuda(device_id),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            full_group_std=master_config.grpo.adv_estimator.full_group_std,
                             std_rewards=(
                                 std_rewards.cuda(device_id)
                                 if std_rewards is not None
@@ -4035,6 +4048,7 @@ def _grpo_train_impl(
                             rewards,
                             valid_mask,
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            full_group_std=master_config.grpo.adv_estimator.full_group_std,
                             std_rewards=std_rewards,
                         )
                     if "env_reward" in repeated_batch:

@@ -403,6 +403,30 @@ def _add_r3_fallback_metrics(
     )
 
 
+def _attach_output_caps(
+    generation_input_data: BatchedDataDict[GenerationDatumSpec],
+    batch: BatchedDataDict[DatumSpec],
+    policy_generation: GenerationInterface,
+) -> None:
+    """Forward per-sample ``extra_env_info["max_output_tokens"]`` caps to generation."""
+    metadata = batch.get("extra_env_info")
+    if metadata is None:
+        return
+    caps = [
+        info.get("max_output_tokens") if isinstance(info, dict) else None
+        for info in metadata
+    ]
+    if all(cap is None for cap in caps):
+        return
+    generation_config = getattr(policy_generation, "cfg", None) or {}
+    if generation_config.get("backend") != "vllm":
+        raise ValueError(
+            "Per-sample max_output_tokens caps are only supported by the vLLM "
+            "generation backend."
+        )
+    generation_input_data["max_output_tokens"] = caps
+
+
 def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
     """Return True for samples the environment asks GRPO to mask from loss.
 
@@ -673,6 +697,7 @@ def generate_responses(
     else:
         # Ensure the key exists even if it's None, matching GenerationDatumSpec
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
+    _attach_output_caps(generation_input_data, batch, policy_generation)
 
     # Always use synchronous generation
     generation_outputs = policy_generation.generate(
@@ -758,6 +783,7 @@ async def generate_responses_async(
     else:
         # Ensure the key exists even if it's None, matching GenerationDatumSpec
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
+    _attach_output_caps(generation_input_data, batch, policy_generation)
 
     # Check if this is a supported inference engine with async generation enabled.
     # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``;
