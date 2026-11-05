@@ -67,6 +67,7 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -288,6 +289,32 @@ class VllmAsyncGenerationWorkerImpl(
         self._deferred_bundle_indices = None
         self._deferred_seed = None
 
+        # Initialize HTTP server, token capture, and API server pool state.
+        self._init_frontend_state()
+
+        if bundle_indices is not None and config["vllm_cfg"].get("expose_http_server"):
+            self._reserve_port()
+
+        super().__init__(
+            config,
+            bundle_indices,
+            fraction_of_gpus,
+            seed,
+            extra_env_vars,
+            defer_model_load,
+        )
+
+        if not self.is_model_owner or not defer_model_load:
+            return
+
+        self._deferred_bundle_indices = bundle_indices
+        self._deferred_seed = seed
+
+        self.llm = None
+        self.vllm_device_ids = None
+
+    def _init_frontend_state(self) -> None:
+        """Initialize frontend state without constructing a GPU worker."""
         # Defaults for HTTP server state; populated after the actor loop starts.
         self.server_thread = None
         self.base_url = None
@@ -322,26 +349,8 @@ class VllmAsyncGenerationWorkerImpl(
         # captured call's delta; 0 leaves captured calls as they are.
         self._capture_top_logprobs = 0
 
-        super().__init__(
-            config,
-            bundle_indices,
-            fraction_of_gpus,
-            seed,
-            extra_env_vars,
-            defer_model_load,
-        )
-
-        if not self.is_model_owner or not defer_model_load:
-            return
-
-        self._deferred_bundle_indices = bundle_indices
-        self._deferred_seed = seed
-
-        if self.cfg["vllm_cfg"].get("expose_http_server"):
-            self._reserve_port()
-
-        self.llm = None
-        self.vllm_device_ids = None
+        # API server pool for multiple HTTP API servers
+        self._api_server_pool = None
 
     async def start_gpu_profiling(self) -> None:
         """Start GPU profiling on the inner TP workers.
@@ -438,9 +447,20 @@ class VllmAsyncGenerationWorkerImpl(
             if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
             else []
         )
-        self.llm = AsyncLLM.from_engine_args(
-            self.llm_async_engine_args, stat_loggers=self.stat_loggers
-        )
+
+        # Initialize the vLLM engine
+        api_server_count = self.cfg["vllm_cfg"].get("http_api_server_count", 1)
+        if api_server_count > 1:
+            # Multiple API servers require separate frontend and engine setup.
+            self._api_server_pool = MultiAPIServerPool(self, api_server_count)
+            self.llm = self._api_server_pool.create_engine(
+                self.llm_async_engine_args, self.stat_loggers
+            )
+        else:
+            self.llm = AsyncLLM.from_engine_args(
+                self.llm_async_engine_args, stat_loggers=self.stat_loggers
+            )
+
         # Keep vLLM's output loops from monopolizing this actor's event loop under a
         # generation backlog (see install_output_loop_yield).
         output_loop_yield_budget_ms = self.cfg["vllm_cfg"].get(
@@ -617,6 +637,8 @@ class VllmAsyncGenerationWorkerImpl(
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
+            if self._api_server_pool is not None:
+                await self._api_server_pool.command("start")
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -714,6 +736,10 @@ class VllmAsyncGenerationWorkerImpl(
             weight_version_fn=lambda: self._rollout_weight_version,
             adapter=VLLMCaptureAdapter(),
         )
+        if self._api_server_pool is not None:
+            await self._api_server_pool.command(
+                "capture", dp_cfg, staging_partition, capture_media, top_logprobs
+            )
         if not capture_media:
             return None
         return MediaColumnSpec(
@@ -727,6 +753,8 @@ class VllmAsyncGenerationWorkerImpl(
     async def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version stamped on subsequent captured calls."""
         self._rollout_weight_version = int(version)
+        if self._api_server_pool is not None:
+            await self._api_server_pool.command("version", int(version))
 
     def _capture_admission(self, request: Any) -> Any | None:
         """Parse the ledger's ``ng_capture`` context into a ``CaptureAdmission``.
@@ -1915,6 +1943,17 @@ class VllmAsyncGenerationWorkerImpl(
         async def health() -> dict[str, str]:
             return {"status": "ok"}
 
+        @app.get("/metrics")
+        async def metrics() -> Response:
+            # vLLM metrics are optional outside generation workers.
+            from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+            from vllm.v1.metrics.prometheus import get_prometheus_registry
+
+            return Response(
+                generate_latest(get_prometheus_registry()),
+                media_type=CONTENT_TYPE_LATEST,
+            )
+
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.setup_api_server(app)
@@ -2698,6 +2737,9 @@ class VllmAsyncGenerationWorkerImpl(
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self._api_server_pool is not None:
+                await self._api_server_pool.command("stop")
+                self._api_server_pool.stop_children()
             if self.server_thread is not None:
                 self.http_server.should_exit = True
                 await asyncio.to_thread(self.server_thread.join)
@@ -2718,6 +2760,9 @@ class VllmAsyncGenerationWorkerImpl(
                 del self.llm
 
             self.llm = None
+            if self._api_server_pool is not None:
+                self._api_server_pool.close_engines()
+                self._api_server_pool = None
             self.tokenizer = None
 
             # Force garbage collection
