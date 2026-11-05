@@ -199,6 +199,7 @@ policy:
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    reuse_logits_storage: false
     fp32_lm_head: false
     moe_per_layer_logging: False
 
