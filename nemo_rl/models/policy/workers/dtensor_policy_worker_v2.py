@@ -1331,8 +1331,13 @@ class DTensorPolicyWorkerV2Impl(
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
             )
 
-        # Manually move model to cuda for cpu offload case
-        if self.cpu_offload:
+        # CPU-offloaded parameters are staged individually by the iterator, as
+        # in stream_weights_via_ipc_zmq. Onloading the whole model first puts
+        # every trainer shard on the GPU at once -- with EP64 on 80 GB GPUs that
+        # is ~76 GiB before the first packed buffer is allocated.
+        # Keep LoRA's existing merge/onload path until it has staging coverage.
+        stage_cpu_parameters = self.cpu_offload and not self.lora_enabled
+        if self.cpu_offload and not stage_cpu_parameters:
             print(
                 "[WARNING]: Unless you are lacking of memory, it is not recommended to enable cpu_offload when "
                 "using non-colocated generation since it will have an extra onload and offload at refit stage."
@@ -1343,7 +1348,9 @@ class DTensorPolicyWorkerV2Impl(
         dtensor_post_iter_func = lambda x: x[1]
 
         packed_broadcast_producer(
-            iterator=dtensor_params_generator(self.model, self.dtype),
+            iterator=dtensor_params_generator(
+                self.model, self.dtype, stage_cpu_parameters=stage_cpu_parameters
+            ),
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
@@ -1353,7 +1360,7 @@ class DTensorPolicyWorkerV2Impl(
 
         # Manually move model to cpu for cpu offload case
         # cpu offload needs model on CPU before model forward
-        if self.cpu_offload:
+        if self.cpu_offload and not stage_cpu_parameters:
             self.model = self.move_to_cpu(self.model)
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
