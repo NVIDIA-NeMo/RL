@@ -1530,6 +1530,59 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         ray.get(futures)
 
+    # Version-point gradients (grpo.async_grpo.version_point_gradient; Megatron policy).
+    def snapshot_version_weights(
+        self, version: int, keep_versions: int
+    ) -> dict[str, Any]:
+        """Snapshot the current weights as ``version`` on every worker (newest ``keep_versions`` kept).
+
+        Returns the largest per-worker host bytes held and whether every worker's restored
+        snapshot of the same version (after a resume) matched the current weights bitwise.
+        """
+        results = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "snapshot_version_weights", version=version, keep_versions=keep_versions
+            )
+        )
+        return {
+            "stored_bytes": max(r["stored_bytes"] for r in results),
+            "consistent": all(r["consistent"] for r in results),
+        }
+
+    def has_version_weights(self, version: int) -> bool:
+        """Whether every worker holds a snapshot of ``version``."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "has_version_weights", version=version
+        )
+        return all(ray.get(futures))
+
+    def set_version_point(self, version: Optional[int]) -> bool:
+        """Compute the next train()'s gradient at snapshot ``version`` (None: at the current weights).
+
+        Returns whether every worker had the version.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "set_version_point", version=version
+        )
+        return all(ray.get(futures))
+
+    def save_version_snapshots(self, path: str) -> None:
+        """Save every worker's version snapshots into a checkpoint directory."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "save_version_snapshots", path=path
+            )
+        )
+
+    def load_version_snapshots(self, path: str, keep_versions: int) -> list[int]:
+        """Restore version snapshots from a checkpoint; returns the versions every worker restored."""
+        restored = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "load_version_snapshots", path=path, keep_versions=keep_versions
+            )
+        )
+        return sorted(set.intersection(*(set(v) for v in restored)))
+
     def finalize_async_save(self) -> None:
         """Block until all workers' in-flight async checkpoint writes complete.
 
