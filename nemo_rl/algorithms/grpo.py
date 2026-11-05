@@ -4688,6 +4688,8 @@ def _grpo_train_impl(
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
+                if "attribution_key" in repeated_batch:
+                    log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:
@@ -6662,6 +6664,8 @@ def async_grpo_train(
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
+                if "attribution_key" in repeated_batch:
+                    log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages_content
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:
