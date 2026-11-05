@@ -60,6 +60,7 @@ from nemo_rl.algorithms.grpo import (
     _needs_hf_refit_handshake,
     _raise_if_length_penalty_enabled_without_nemo_gym,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
+    _raise_if_single_controller_masking_options_set,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _restore_adaptive_loss_state,
@@ -1503,6 +1504,26 @@ def test_raise_if_reward_penalties_enabled_without_nemo_gym_allows_nemo_gym(
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=True
     )
+
+
+def test_raise_if_single_controller_masking_options_set_noops_on_defaults(
+    mock_grpo_components,
+):
+    _raise_if_single_controller_masking_options_set(
+        mock_grpo_components["master_config"]
+    )
+
+
+def test_raise_if_single_controller_masking_options_set_rejects_rules(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.env["mask_sample_rules"] = [
+        {"field": "evaluation_completed", "equals": False}
+    ]
+
+    with pytest.raises(ValueError, match="SingleController"):
+        _raise_if_single_controller_masking_options_set(master_config)
 
 
 def test_raise_if_length_penalty_enabled_without_nemo_gym_noops_when_unset(

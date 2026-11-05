@@ -33,8 +33,9 @@ A rule matches when the dotted ``field`` exists in the rollout's Gym response
 and equals ``equals`` (type-strict for booleans, so ``false`` does not match
 ``0``). A match sets the same ``instance_config.mask_sample`` flag an
 environment would, so everything downstream is unchanged: the finalizer's
-``mask_sample`` column, the advantage stage's ``final_sample_mask``, the
-baseline's ``valid_mask`` and ``train/num_mask_sample_filtered``. A missing
+``mask_sample`` column, the advantage stage's ``final_sample_mask`` and
+``train/num_mask_sample_filtered``; ``grpo.masked_reward_policy`` decides
+whether the row's reward still votes in its group baseline. A missing
 field never matches. Per-group match rates are logged as
 ``mask_rules/<name>_rate`` (with ``mask_rules/<name>_reward_mean`` and
 ``mask_rules/any_rate``).

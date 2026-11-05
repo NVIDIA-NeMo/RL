@@ -759,7 +759,11 @@ def _run(estimator_name: str, num_actors: int):
         seq_logprob_error_metrics=ctrl._step_log_dict["seq_logprob_error_metrics"],
     )
     opd = (ctrl._opd_stat_sum, ctrl._opd_stat_sumsq, ctrl._opd_stat_count)
-    return ctrl, advantages, metrics, has_valid, opd
+    stats = (
+        reduce_masking_stats(ctrl._masking_stats_acc),
+        reduce_rollout_stats(ctrl._rollout_stats_acc),
+    )
+    return ctrl, advantages, metrics, has_valid, opd, stats
 
 
 @pytest.mark.parametrize("estimator_name", sorted(SHARD_INVARIANT_ESTIMATORS))
@@ -771,14 +775,23 @@ def test_sharded_pool_matches_in_process(estimator_name: str) -> None:
     that share prompt text too, now that the baseline keys on GROUP_ID_TAG
     rather than on the prompt tokens.
     """
-    _, adv_local, metrics_local, valid_local, opd_local = _run(estimator_name, 0)
-    ctrl, adv_pool, metrics_pool, valid_pool, opd_pool = _run(estimator_name, 3)
+    _, adv_local, metrics_local, valid_local, opd_local, stats_local = _run(
+        estimator_name, 0
+    )
+    ctrl, adv_pool, metrics_pool, valid_pool, opd_pool, stats_pool = _run(
+        estimator_name, 3
+    )
     # 6 groups over 3 actors: every actor got exactly 2 whole groups.
     assert [actor.calls for actor in ctrl._advantage_actors] == [[8], [8], [8]]
     torch.testing.assert_close(adv_pool, adv_local)
     assert metrics_pool == pytest.approx(metrics_local)
     assert valid_pool == valid_local
     assert opd_pool == pytest.approx(opd_local)
+    # Each shard numbers its groups from 0; the controller must re-base them.
+    assert stats_pool[1]["groups/count"] == NUM_GROUPS
+    assert stats_pool[0]["masking/groups"] == NUM_GROUPS
+    assert stats_pool[0] == pytest.approx(stats_local[0])
+    assert stats_pool[1] == pytest.approx(stats_local[1])
 
 
 @pytest.mark.parametrize("full_vocab", [False, True])
