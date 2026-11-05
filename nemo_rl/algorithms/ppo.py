@@ -16,7 +16,7 @@ import os
 import time
 import traceback
 import warnings
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, Literal, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -218,6 +218,8 @@ class PPOConfig(BaseModel, extra="allow"):
     # Number of critic (value) passes over each rollout batch. Defaults to
     # ppo_epochs (see validate_epoch) unless explicitly set.
     critic_ppo_epochs: int = 4
+    # SingleController only: split accumulates chunks; whole_batch uses train_from_meta.
+    value_training_mode: Literal["split", "whole_batch"] = "whole_batch"
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     adv_estimator: GAEConfig = Field(default_factory=GAEConfig)
@@ -369,6 +371,10 @@ def setup(
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env
     loss_config: ClippedPGLossConfig = master_config.loss_fn
+    if loss_config.score_centering:
+        raise ValueError(
+            "Score centering requires SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy PPO trainer does not capture sampler tensors."
+        )
     ppo_config = master_config.ppo
     data_config = master_config.data
     logger_config = master_config.logger

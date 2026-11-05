@@ -35,6 +35,7 @@ from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
 )
+from megatron.bridge.training.setup import _preserve_rng_state
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
@@ -49,6 +50,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.utils import get_model_config, unwrap_model
 from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
     FileSystemWriterAsync,
@@ -86,6 +88,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NvFp4PerTokenRolloutConfig,
 )
 from nemo_rl.models.megatron.common import (
+    clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
 )
@@ -156,6 +159,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
@@ -730,6 +734,35 @@ class MegatronPolicyWorkerImpl(
         """Return the route layout from the initialized Megatron model config."""
         return router_replay_layout(self._get_model_config())
 
+    def validate_forest_execution_padding(self) -> None:
+        """Reject unqualified dummy-sensitive routers in the actual loaded model.
+
+        Policy/reference logprobs and training use this same model (reference
+        inference swaps weights only). Inspect nested routers, not just the outer
+        VLM config, after checkpoint settings and provider overrides resolve.
+        """
+        # TODO: Exclude artificial inputs from expert-bias update counts; see
+        # https://github.com/NVIDIA-NeMo/RL/pull/4519. Allow configured updates
+        # meanwhile: dummy rows can affect the counts despite zero policy loss.
+        for chunk in _unwrapped_chunks(self.model):
+            for module in chunk.modules():
+                if not isinstance(module, Router):
+                    continue
+                config = module.config
+                if (
+                    not isinstance(module, TopKRouter)
+                    or module.routing_type in ("sinkhorn", "quantile_balancing")
+                    or config.moe_expert_capacity_factor is not None
+                    or config.moe_expert_rank_capacity_factor is not None
+                    or config.moe_pad_experts_for_cuda_graph_inference
+                    or config.moe_token_dropping
+                    or get_aux_loss_track_names(config)
+                ):
+                    raise ValueError(
+                        "Forest execution padding requires dropless per-token MoE routing "
+                        "without auxiliary losses"
+                    )
+
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
 
@@ -1021,36 +1054,44 @@ class MegatronPolicyWorkerImpl(
         if param_sync_func is not None:
             get_model_config(self.model).param_sync_func = param_sync_func
 
-        # Step 5: Setup reference model if needed
-        if init_reference_model:
-            self.model = self.move_model(self.model, "cpu")
-            self.reference_state_dict = setup_reference_model_state(
+        # Reference construction must not advance the restored policy RNG.
+        # Keep fresh-run RNG ordering unchanged, including PEFT warm starts.
+        checkpoint_cfg = self.megatron_cfg.checkpoint
+        with (
+            _preserve_rng_state()
+            if checkpoint_cfg.load_rng and not checkpoint_cfg.finetune
+            else nullcontext()
+        ):
+            # Step 5: Setup reference model if needed
+            if init_reference_model:
+                self.model = self.move_model(self.model, "cpu")
+                self.reference_state_dict = setup_reference_model_state(
+                    config,
+                    self.megatron_cfg,
+                    pretrained_path,
+                    pre_load_checkpoint_hook=getattr(
+                        self, "_pre_load_checkpoint_hook", None
+                    ),
+                )
+                self.model = self.move_model(self.model, "cuda")
+                log_gpu_memory_diagnostics(
+                    label="after_ref_model", worker_type="MegatronPolicyWorker"
+                )
+
+            # Step 6: Finalize setup (including the HF bridge wrapper).
+            (
+                self.megatron_tokenizer,
+                self.megatron_bridge,
+                self.should_disable_forward_pre_hook,
+                self.dp_size,
+            ) = finalize_megatron_setup(
                 config,
                 self.megatron_cfg,
-                pretrained_path,
-                pre_load_checkpoint_hook=getattr(
-                    self, "_pre_load_checkpoint_hook", None
-                ),
+                hf_model_name,
+                worker_sharding_annotations,
+                self.model,
+                self.optimizer,
             )
-            self.model = self.move_model(self.model, "cuda")
-            log_gpu_memory_diagnostics(
-                label="after_ref_model", worker_type="MegatronPolicyWorker"
-            )
-
-        # Step 6: Finalize setup
-        (
-            self.megatron_tokenizer,
-            self.megatron_bridge,
-            self.should_disable_forward_pre_hook,
-            self.dp_size,
-        ) = finalize_megatron_setup(
-            config,
-            self.megatron_cfg,
-            hf_model_name,
-            worker_sharding_annotations,
-            self.model,
-            self.optimizer,
-        )
         self._first_train_step_forward_pre_hook_disabled = False
         self._first_train_step_param_sync_func = None
         if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
@@ -2605,6 +2646,7 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
         require_router_replay: bool = True,
+        keep_on_gpu: bool = False,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -2612,7 +2654,8 @@ class MegatronPolicyWorkerImpl(
         Input data is assumed to be right-padded. The method internally converts to
         left-padded format for computation, and returns outputs in right-padded format.
         If micro_batch_size is provided, it will be used instead of the configured
-        logprob_batch_size.
+        logprob_batch_size. With ``keep_on_gpu`` the logprobs stay on this GPU
+        instead of being copied to pinned CPU memory.
 
         Returns:
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
@@ -2703,6 +2746,8 @@ class MegatronPolicyWorkerImpl(
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
 
+        if keep_on_gpu:
+            return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs)
         # TODO: @nan: will remove in the future
         cpu_logprobs = torch.empty_like(
             logprobs,
@@ -2894,6 +2939,7 @@ class MegatronPolicyWorkerImpl(
         payload: str,
         payload_dtype: str,
         micro_batch_size: Optional[int] = None,
+        keep_on_gpu: bool = False,
     ) -> BatchedDataDict[TeacherFullPayloadOutputSpec]:
         """Run a teacher forward returning sampled-token logprobs and the full payload.
 
@@ -2911,11 +2957,15 @@ class MegatronPolicyWorkerImpl(
             payload: ``"hidden_states"`` or ``"logits"``.
             payload_dtype: Torch dtype name for the transported payload.
             micro_batch_size: Overrides the configured logprob batch size.
+            keep_on_gpu: Keep both outputs on this GPU instead of copying them
+                to CPU; the payload then skips the per-microbatch copy during
+                the forward.
 
         Returns:
             A BatchedDataDict with ``logprobs`` ``[B, S]`` on every rank and
-            ``teacher_full_payload`` ``[B, S, D]`` on CPU on the last pipeline
-            stage (``None`` elsewhere).
+            ``teacher_full_payload`` ``[B, S, D]`` on the last pipeline stage
+            (``None`` elsewhere), both on this GPU if ``keep_on_gpu``, else on
+            CPU.
 
         Raises:
             ValueError: If ``payload`` is ``"hidden_states"`` but this teacher
@@ -2982,6 +3032,7 @@ class MegatronPolicyWorkerImpl(
                 cfg=self.cfg,
                 payload=payload,
                 payload_dtype=getattr(torch, payload_dtype),
+                keep_payload_on_gpu=keep_on_gpu,
                 sampling_params=self.sampling_params,
             ),
             forward_only=True,
@@ -2999,9 +3050,9 @@ class MegatronPolicyWorkerImpl(
                     [o["logprobs"] for o in list_of_outputs], target_len=seq_length
                 )
             }
-            # Already on CPU: the post-processor moves each microbatch off the
-            # device as it is produced, so this pad-and-concatenate never puts
-            # the payload back on the GPU.
+            # Unless keep_on_gpu, already on CPU: the post-processor
+            # moves each microbatch off the device as it is produced, so this
+            # pad-and-concatenate never puts the payload back on the GPU.
             teacher_full_payload = pad_and_concat(
                 [o["teacher_full_payload"] for o in list_of_outputs],
                 target_len=seq_length,
@@ -3013,7 +3064,7 @@ class MegatronPolicyWorkerImpl(
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs_with_full_payload")
         return BatchedDataDict[TeacherFullPayloadOutputSpec](
-            logprobs=logprobs.to("cpu"),
+            logprobs=logprobs if keep_on_gpu else logprobs.to("cpu"),
             teacher_full_payload=teacher_full_payload,
         )
 
@@ -4657,6 +4708,7 @@ class MegatronPolicyWorkerImpl(
         # The plan is consumed (provider mutated to the inference layout); release it.
         self._colocated_reshard_plan = None
 
+    @accepts_trace_context
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/pause_train_step_with_offloading")
     def pause_train_step_with_offloading(self) -> None:
@@ -4833,7 +4885,7 @@ class MegatronPolicyWorkerImpl(
             self._clear_fp8_caches()
 
         if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
-            self._clear_rope_and_moe_dispatcher_caches()
+            clear_transient_megatron_caches(self.model)
 
         torch.randn(1).cuda()  # wake up torch allocator
         if (
@@ -4854,59 +4906,6 @@ class MegatronPolicyWorkerImpl(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
         no_grad.__exit__(None, None, None)
-
-    def _clear_rope_and_moe_dispatcher_caches(self) -> None:
-        """Clear rotary-embedding and MoE dispatcher caches repopulated by forwards."""
-        # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
-        # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
-        # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
-        # runs at different sequence lengths, the cache fills quickly and the tensors
-        # anchor large CUDA segments.
-        try:
-            from megatron.core.models.common.embeddings.rotary_pos_embedding import (
-                RotaryEmbedding,
-            )
-
-            RotaryEmbedding.forward.cache_clear()
-        except Exception:
-            pass
-
-        # Clear MoE token dispatcher persistent routing tensors.
-        #
-        # MoETokenDispatcher is a plain Python class (NOT an nn.Module), so iterating
-        # self.model.modules() never yields it. We must access it via the token_dispatcher
-        # attribute on MoELayer nn.Module objects.
-        #
-        # When recompute_mlp=True and fp8=True,
-        # transformer_layer._forward_mlp wraps self.mlp (the MoE layer) with te_checkpoint.
-        # te_checkpoint._CheckpointFunction.backward recomputes the forward with
-        # torch.enable_grad(), which causes dispatch_preprocess to store
-        #   dispatcher.probs = routing_probs   (with grad_fn, under enable_grad)
-        # This creates a reference cycle:
-        #   _CheckpointFunctionBackward → ctx → ctx.run_function=mlp
-        #   → mlp.token_dispatcher.probs → probs.grad_fn → ... → _CheckpointFunctionBackward
-        #
-        # Breaking this cycle by nulling dispatcher.probs frees BOTH:
-        #   - the routing tensors
-        #   - the te_checkpoint ctx saved tensors
-        try:
-            for module in self.model.modules():
-                if not hasattr(module, "token_dispatcher"):
-                    continue
-                dispatcher = module.token_dispatcher
-                if dispatcher is None:
-                    continue
-                for attr in (
-                    "probs",  # AllToAll + AllGather
-                    "routing_map",  # AllToAll
-                    "reversed_local_input_permutation_mapping",  # AllToAll
-                    "local_probs",  # AllGather
-                    "local_map",  # AllGather
-                ):
-                    if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
-                        setattr(dispatcher, attr, None)
-        except Exception:
-            pass
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):

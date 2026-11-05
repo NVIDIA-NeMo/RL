@@ -43,7 +43,7 @@ run_test env REFIT_PREQUANTIZE=true uv run --no-sync bash \
 # Native MXFP8 dense linear backends keep their runtime layouts across refit.
 run_test env LINEAR_BACKEND=flashinfer_cutedsl uv run --no-sync bash \
     ./tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh
-run_test env LINEAR_BACKEND=flashinfer_trtllm uv run --no-sync bash \
+run_test env REFIT_PREQUANTIZE=false LINEAR_BACKEND=flashinfer_trtllm uv run --no-sync bash \
     ./tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh
 
 # MXFP8 leg of the Megatron M-to-N reshard refit. Sized for 2 GPUs

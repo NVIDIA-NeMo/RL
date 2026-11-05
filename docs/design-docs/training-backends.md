@@ -226,7 +226,7 @@ export HF_HOME="/shared/nfs/huggingface"
 - **Prefer HF_HOME**: If you already have `HF_HOME` mounted across nodes, this reduces the number of environment variables to manage.
 - **Sufficient space**: Ensure adequate disk space for the converted model checkpoints.
 
-### Force Reconvert ###
+### Force Reconvert
 
 By default, NeMo RL skips the HF → Megatron conversion if a converted checkpoint already exists at the target path. If you need to force a fresh conversion (e.g., after updating megatron-bridge or changing `hf_config_overrides`), set the following option in your config:
 
@@ -237,3 +237,18 @@ policy:
 ```
 
 This is equivalent to deleting the converted checkpoint directory and rerunning — the old checkpoint will be overwritten with a freshly converted one.
+
+### Parallel Checkpoint Reads ###
+
+When Megatron loads a `torch_dist` checkpoint from a local or shared filesystem, each rank reads its checkpoint files with several threads instead of PyTorch's single stream. This roughly halved per-rank read time in our measurements. The example configs turn it on with 4 threads; set it to 1 to use PyTorch's reader:
+
+```yaml
+policy:
+  megatron_cfg:
+    checkpoint:
+      parallel_read_threads: 4  # 1 = off
+```
+
+- Only Megatron `torch_dist` loads from a filesystem path use it; `msc://` checkpoints and the Automodel backend keep PyTorch's reader.
+- Peak host memory per rank grows to about 1 GiB of read-ahead plus twice the largest checkpoint item.
+- It replaces PyTorch's `FileSystemReader.read_data`, checked against the version in torch 2.11 to 2.13. If a torch upgrade changes that function, setup fails with a message to set `parallel_read_threads: 1` or update `nemo_rl/models/megatron/ckpt_parallel_read.py`.

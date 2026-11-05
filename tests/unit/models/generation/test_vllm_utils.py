@@ -32,6 +32,7 @@ from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
     attach_routed_experts_to_chat_response_choices,
+    attach_sampler_topk_logprobs_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
@@ -460,7 +461,18 @@ def test_normalize_routed_experts_strict_mode_rejects_surplus_routes():
         )
 
 
-def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index():
+@pytest.mark.parametrize("encode_for_wire", [False, True])
+def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index(
+    monkeypatch, encode_for_wire
+):
+    if not encode_for_wire:
+
+        def reject_codec(*args, **kwargs):
+            pytest.fail("worker-owned capture must retain native route tensors")
+
+        monkeypatch.setattr(
+            "nemo_rl.models.generation.vllm.utils.encode_routed_experts", reject_codec
+        )
     final_res = SimpleNamespace(
         prompt_token_ids=[101, 102, 103],
         prompt_routed_experts=torch.tensor(
@@ -494,17 +506,26 @@ def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_i
         response,
         final_res,
         device=torch.device("cpu"),
+        encode_for_wire=encode_for_wire,
     )
 
-    # Routes travel as a base64 string envelope, one opaque object per choice.
-    assert isinstance(response.choices[0].message.routed_experts, str)
-    assert _decoded_routes(response.choices[0].message.routed_experts) == [
+    def route_values(choice):
+        routes = choice.message.routed_experts
+        if encode_for_wire:
+            assert isinstance(routes, str)
+            return _decoded_routes(routes)
+        assert isinstance(routes, torch.Tensor)
+        assert routes.device.type == "cpu"
+        assert routes.dtype == ROUTED_EXPERTS_FALLBACK_DTYPE
+        return routes.tolist()
+
+    assert route_values(response.choices[0]) == [
         [[10]],
         [[11]],
         [[30]],
         [[R3_MISSING_ROUTE_SENTINEL]],
     ]
-    assert _decoded_routes(response.choices[1].message.routed_experts) == [
+    assert route_values(response.choices[1]) == [
         [[10]],
         [[11]],
         [[31]],
@@ -663,6 +684,72 @@ def test_attach_token_information_to_chat_response_choices():
     assert response_dict["choices"][1]["message"]["generation_log_probs"] == []
 
 
+def _ranked(*entries):
+    """One position's engine log-probs as vLLM reports them: sampled token first."""
+    return {
+        token_id: SimpleNamespace(logprob=logprob, rank=rank)
+        for token_id, logprob, rank in entries
+    }
+
+
+def test_attach_sampler_topk_logprobs_to_chat_response_choices():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[7, 9, 5],
+                logprobs=[
+                    # Sampled token inside the top-2: exactly k entries; finite logprobs are retained.
+                    _ranked((7, -0.2, 1), (8, -10000.0, 2)),
+                    # Sampled token outside the top-2: k + 1 entries, ranks pick the head.
+                    _ranked((9, -3.0, 7), (1, -0.7, 1), (2, -0.9, 2)),
+                    # A tie at the boundary still yields exactly k entries.
+                    _ranked((5, -1.2, 2), (3, -0.8, 1), (4, -1.2, 2)),
+                ],
+            ),
+            SimpleNamespace(index=1, token_ids=[], logprobs=[]),
+        ]
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ],
+        model_dump=lambda: {"choices": [{"message": {}}, {"message": {}}]},
+    )
+
+    attach_sampler_topk_logprobs_to_chat_response_choices(response, final_res, top_k=2)
+    response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
+
+    ids = response_dict["choices"][0]["message"]["sampler_topk_token_ids"]
+    logprobs = response_dict["choices"][0]["message"]["sampler_topk_logprobs"]
+    assert ids.dtype == torch.int32
+    assert logprobs.dtype == torch.float32
+    assert ids.tolist() == [[7, 8], [1, 2], [3, 5]]
+    torch.testing.assert_close(
+        logprobs, torch.tensor([[-0.2, -10000.0], [-0.7, -0.9], [-0.8, -1.2]])
+    )
+    empty = response_dict["choices"][1]["message"]
+    assert tuple(empty["sampler_topk_token_ids"].shape) == (0, 2)
+    assert tuple(empty["sampler_topk_logprobs"].shape) == (0, 2)
+
+
+def test_attach_sampler_topk_logprobs_to_chat_response_choices_requires_k_entries():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(index=0, token_ids=[7], logprobs=[_ranked((7, -0.2, 1))])
+        ]
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match="fewer than top_k"):
+        attach_sampler_topk_logprobs_to_chat_response_choices(
+            response, final_res, top_k=2
+        )
+
+
 @pytest.mark.parametrize(
     ("token_ids", "logprobs", "error_match"),
     [
@@ -750,7 +837,10 @@ def test_attach_token_information_to_chat_response_choices_rejects_invalid_struc
         attach_token_information_to_chat_response_choices(response, final_res)
 
 
-def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields():
+@pytest.mark.parametrize("encode_for_wire", [False, True])
+def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields(
+    encode_for_wire,
+):
     final_res = SimpleNamespace(
         prompt_token_ids=[101, 102],
         prompt_routed_experts=torch.tensor(
@@ -794,11 +884,12 @@ def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fiel
         response,
         final_res,
         device=torch.device("cpu"),
+        encode_for_wire=encode_for_wire,
     )
     response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
 
     message = response_dict["choices"][0]["message"]
-    assert message["routed_experts"] == response.choices[0].message.routed_experts
+    assert message["routed_experts"] is response.choices[0].message.routed_experts
     assert message["prompt_token_ids"] == [101, 102]
     assert message["generation_token_ids"] == [201]
     assert message["generation_log_probs"] == [-0.1]

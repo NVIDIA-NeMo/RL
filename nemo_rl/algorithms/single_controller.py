@@ -55,8 +55,8 @@ import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -75,6 +75,7 @@ from ray.exceptions import RayActorError
 from wandb import Table
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
     DATA_PLANE_CHECKPOINT_DIR,
@@ -87,6 +88,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneMutationCut,
     TQReplayGroupMetadata,
     TQReplayMetadataState,
+    validate_forest_checkpoint_metadata,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
@@ -94,12 +96,14 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     create_sampler,
 )
 from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
     GRPOSaveState,
     _save_adaptive_loss_state,
     _update_adaptive_loss_state,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
 )
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
     ROLLOUT_CHECKPOINT_ATTEMPT_DURATION_KEY,
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
@@ -126,10 +130,14 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
     is_ppo_run,
+    validate_forest_objective,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     ChunkReceipt,
     make_debug_writer,
+)
+from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+    has_logical_owners,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
@@ -172,10 +180,24 @@ from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
+    SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
+from nemo_rl.environments.gym_checkpoint_coordinator import (
+    GymCheckpointCommitResult,
+    GymCheckpointCoordinator,
+    GymCheckpointOperationError,
+    is_transient_gym_checkpoint_failure,
+    load_gym_checkpoint_manifest,
+    staging_keys_of,
+    write_gym_checkpoint_manifest,
+)
+from nemo_rl.environments.nemo_gym import (
+    as_nemo_gym_shard_set,
+    should_use_nemo_gym,
+)
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import (
@@ -184,17 +206,20 @@ from nemo_rl.experience.reward_penalties import (
     aggregate_capture_reward_metrics,
     capture_reward_result_tables,
 )
-from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.experience.rollout_manager import (
+    RolloutOutcome,
+)
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     PromptGroupPhase,
+    RecoveryTargetLevel,
     RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
-from nemo_rl.experience.rollouts import get_effort_config
+from nemo_rl.experience.rollouts import get_effort_config, get_nemo_gym_thinking_tags
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
@@ -257,6 +282,28 @@ log = logging.getLogger(__name__)
 # cleaner exit. Not configurable for the same reason.
 _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
 
+# Rollout-deadline pause owned by a Gym checkpoint while it holds rollouts parked.
+_GYM_CHECKPOINT_DEADLINE_HOLDER = "gym_checkpoint"
+
+# Episodes named in a Gym checkpoint error; the rest are only counted.
+_GYM_EPISODE_SAMPLE_SIZE = 5
+
+
+def _summarize_gym_episodes(episodes_by_instance: Mapping[str, Iterable[Any]]) -> str:
+    """Count episodes per instance and name a few, however many there are."""
+    parts = []
+    for instance_id, episodes in sorted(episodes_by_instance.items()):
+        ordered = sorted(episodes, key=repr)
+        if not ordered:
+            continue
+        sample = ordered[:_GYM_EPISODE_SAMPLE_SIZE]
+        more = len(ordered) - len(sample)
+        parts.append(
+            f"{instance_id}: {len(ordered)} episode(s), e.g. {sample!r}"
+            + (f" and {more} more" if more else "")
+        )
+    return "; ".join(parts) or "none"
+
 
 @dataclass(frozen=True)
 class _RolloutCheckpointSaveResult:
@@ -272,6 +319,7 @@ class _RolloutCheckpointCut:
 
     dataloader_state: dict[str, Any]
     sampler_dispatch_index: int
+    next_nemo_gym_task_index: int
     replacement_reserve: list[DatumSpec]
     replay_metadata: Optional[TQReplayMetadataState]
     rollout_recovery_payload: Optional[bytes]
@@ -334,14 +382,18 @@ def _train_fields_for_step(
     *,
     policy_logprobs_required: bool,
     reference_logprobs_required: bool,
+    score_centering: bool,
 ) -> tuple[str, ...]:
     """Return only the data-plane columns produced for this train step."""
-    return tuple(
+    fields = tuple(
         field
         for field in DP_TRAIN_FIELDS
         if (policy_logprobs_required or field != "prev_logprobs")
         and (reference_logprobs_required or field != "reference_policy_logprobs")
     )
+    if score_centering:
+        fields += SAMPLER_TOPK_FIELDS
+    return fields
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -424,6 +476,8 @@ class SingleControllerActor:
             and self._async_cfg.min_groups_for_streaming_train
             < self._algo_cfg.num_prompts_per_step
         )
+        self._ppo_group_multiple = actor_args.ppo_group_multiple
+        self._ppo_min_remaining_groups = actor_args.ppo_min_remaining_groups
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -444,6 +498,7 @@ class SingleControllerActor:
         self._train_fields = _train_fields_for_step(
             policy_logprobs_required=self._policy_logprobs_required,
             reference_logprobs_required=self._reference_logprobs_required,
+            score_centering=master_config.loss_fn.score_centering,
         )
         self._dp_client = actor_args.dp_client
         if master_config.data_plane["backend"] == "mooncake_cpu":
@@ -530,9 +585,14 @@ class SingleControllerActor:
             advantage_estimator=self._advantage_estimator,
         )
         self._loss_fn = actor_args.loss_fn
-        self._value_loss_fn = getattr(actor_args, "value_loss_fn", None)
+        self._value_loss_fn: LossFunction | None = getattr(
+            actor_args, "value_loss_fn", None
+        )
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
+        self._rollout_manager.set_next_nemo_gym_task_index(
+            actor_args.save_state.next_nemo_gym_task_index
+        )
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -546,6 +606,24 @@ class SingleControllerActor:
         # exists to remove. A missing field should break loudly at construction, where
         # it costs five minutes, not quietly at hour three of a run.
         self._env_handles = actor_args.env_handles
+        self._gym_checkpoint_coordinator: Optional[GymCheckpointCoordinator] = None
+        # Separate from the data-plane barrier: it pauses only Gym /run
+        # submissions while a Gym checkpoint is prepared.
+        self._rollout_dispatch_admission_gate: Optional[DataPlaneCheckpointBarrier] = (
+            None
+        )
+        if self._master_config.rollout_recovery.turn_checkpointing_enabled:
+            self._gym_checkpoint_coordinator = GymCheckpointCoordinator(
+                as_nemo_gym_shard_set(self._env_handles["nemo_gym"]),
+                control_timeout_s=(self._master_config.token_capture.control_timeout_s),
+                prepare_timeout_s=(
+                    self._master_config.rollout_recovery.gym_prepare_timeout_s
+                ),
+            )
+            self._rollout_dispatch_admission_gate = DataPlaneCheckpointBarrier()
+            self._rollout_manager.set_rollout_dispatch_admission_gate(
+                self._rollout_dispatch_admission_gate
+            )
         # These two keep the getattr for a genuinely different reason: None is a
         # meaningful value meaning "feature off", and it is also their default. Absence
         # therefore degrades to the documented off state rather than to a broken one.
@@ -628,6 +706,7 @@ class SingleControllerActor:
         # already defaulted any fields missing from older checkpoints.
         self._save_state: GRPOSaveState = actor_args.save_state
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
+        self._restored_from_rollout_snapshot = actor_args.restored_from_rollout_snapshot
         self._data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = (
             data_plane_checkpoint_metadata
         )
@@ -646,7 +725,6 @@ class SingleControllerActor:
             if actor_args.save_state.trainer_version is not None
             else actor_args.save_state.current_step
         )
-        num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         self._sampler = create_sampler(
             self._buffer,
             self._async_cfg.sampler,
@@ -718,11 +796,18 @@ class SingleControllerActor:
             actor_args.bootstrap_identity
         )
         self._rollout_checkpoint_stop_requested = asyncio.Event()
+        # Set by a turn-level trainer checkpoint, which holds no Gym state, so
+        # the next rollout snapshot captures Gym soon after it.
+        self._rollout_checkpoint_wakeup = asyncio.Event()
         # Narrow unsafe window after an optimizer mutates model state and before
         # SC publishes the matching TQ cleanup and trainer counters. Gradient
         # accumulation remains snapshot-safe because selected rows stay owned by
         # the replay buffer and are re-indexed in periodic snapshots.
         self._optimizer_commit_in_progress = False
+        # Set whenever a step starts committing. A rollout snapshot clears it when
+        # it starts and stops its Gym phase once it is set, since the snapshot
+        # can no longer be kept.
+        self._optimizer_commit_started = asyncio.Event()
 
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
@@ -788,6 +873,7 @@ class SingleControllerActor:
             "num_mask_sample_filtered": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
+            "sample_mask_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
         self._opd_gap_sum = 0.0
@@ -843,6 +929,7 @@ class SingleControllerActor:
 
     async def _run_pumps(self) -> dict[str, Any]:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
+        await self._check_restart_only_gym_servers()
         # Synchronize weights before starting the pumps, unless setup already delivered them.
         if self._weight_synchronizer.is_stale:
             await self._sync_weights()
@@ -1060,6 +1147,19 @@ class SingleControllerActor:
 
     # ── internal helpers ───────────────────────────────────────────────────
 
+    def _validate_forest_checkpoint_metadata(self) -> None:
+        """Validate checkpoint row semantics before replay or custody changes."""
+        if self._data_plane_checkpoint_metadata is not None:
+            validate_forest_checkpoint_metadata(
+                self._data_plane_checkpoint_metadata,
+                forest_training=self._master_config.token_capture.forest_training,
+                execution_row_multiple=(
+                    self._rollout_manager.execution_row_multiple
+                    if self._master_config.token_capture.forest_training
+                    else None
+                ),
+            )
+
     async def _maybe_restore_replay_buffer(self) -> int:
         """Restore the local replay index for the native TQ checkpoint.
 
@@ -1069,6 +1169,7 @@ class SingleControllerActor:
         """
         if self._last_checkpoint_path is None:
             return 0
+        self._validate_forest_checkpoint_metadata()
         metadata_path = os.path.join(
             self._last_checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME
         )
@@ -1177,6 +1278,7 @@ class SingleControllerActor:
         """Restore unfinished ownership for prioritized rollout-pump redispatch."""
         if self._last_checkpoint_path is None:
             return
+        self._validate_forest_checkpoint_metadata()
         recovery_path = Path(
             self._last_checkpoint_path,
             ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -1262,33 +1364,117 @@ class SingleControllerActor:
             "recovery_restore"
         ) as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
-            recovery_ledger.prepare_for_restart(cut)
-            self._batch_shortfall = parsed_state.batch_shortfall
-            canonical_state = self._buffer.metadata_state_dict(
-                saved_capacity=self._async_cfg.max_buffered_rollouts
-            )
-            canonical_group_ids = {
-                group["group_id"] for group in canonical_state["groups"]
-            }
-            recovery_ledger.discard_canonical_groups(cut, canonical_group_ids)
-            self._finalizer_metrics_by_group = {
-                group_id: metrics
-                for group_id, metrics in parsed_state.finalizer_metrics_by_group.items()
-                if group_id in canonical_group_ids
-            }
-            self._finalizer_rewards_by_group = {
-                group_id: rows
-                for group_id, rows in parsed_state.finalizer_rewards_by_group.items()
-                if group_id in canonical_group_ids
-            }
-            if self._master_config.token_capture.enabled:
-                await self._validate_rollout_recovery_inventory(
-                    cut,
-                    replay_metadata=canonical_state,
-                    clear_unreferenced=True,
+            recovery_ledger.assert_checkpoint_safe()
+            turn_groups = [
+                group
+                for group in recovery_ledger.groups()
+                if group.restore_level is RecoveryTargetLevel.TURN
+            ]
+            restored_gym_episodes: set[tuple[str, str, int]] = set()
+            restored_gym_staging_keys: set[str] = set()
+            # Gym stays restored until the rest of this restore succeeds; on any
+            # failure its replacement attempts are retired before it reopens.
+            async with contextlib.AsyncExitStack() as gym_restore:
+                if turn_groups and not self._restored_from_rollout_snapshot:
+                    # A trainer checkpoint never holds Gym state; with no later
+                    # rollout snapshot, its unfinished turns start over below.
+                    print(
+                        "📦 Restoring a trainer checkpoint without Gym state: "
+                        f"{len(turn_groups)} unfinished turn-level group(s) "
+                        "restart from their tasks",
+                        flush=True,
+                    )
+                elif turn_groups:
+                    coordinator = self._gym_checkpoint_coordinator
+                    if coordinator is None:
+                        raise RuntimeError(
+                            "rollout checkpoint contains turn-level Gym state, but "
+                            "Gym checkpoint coordination is disabled"
+                        )
+                    manifest = await asyncio.to_thread(
+                        load_gym_checkpoint_manifest,
+                        self._last_checkpoint_path,
+                    )
+                    expected_inventory = {
+                        instance_id: set(episodes)
+                        for instance_id, episodes in self._gym_checkpoint_inventory(
+                            coordinator
+                        ).items()
+                    }
+                    # Restarts are not restored: prepare_for_restart starts every
+                    # episode Gym did not restore over from its task.
+                    saved_inventory = {
+                        instance_id: set(episodes)
+                        | set(manifest.restarts.get(instance_id, ()))
+                        for instance_id, episodes in manifest.instances.items()
+                    }
+                    if saved_inventory != expected_inventory:
+                        differing = sorted(
+                            instance_id
+                            for instance_id in saved_inventory.keys()
+                            | expected_inventory.keys()
+                            if saved_inventory.get(instance_id)
+                            != expected_inventory.get(instance_id)
+                        )
+                        raise ValueError(
+                            "Gym checkpoint manifest does not match the rollout "
+                            f"recovery ledger for Gym instances {differing!r}"
+                        )
+                    await gym_restore.enter_async_context(
+                        coordinator.restored(
+                            f"restore-{uuid.uuid4().hex}",
+                            self._last_checkpoint_path,
+                            manifest,
+                        )
+                    )
+                    restored_gym_episodes = {
+                        (instance_id, episode.rollout_id, episode.attempt)
+                        for instance_id, episodes in manifest.instances.items()
+                        for episode in episodes
+                    }
+                    restored_gym_staging_keys = {
+                        key for keys in manifest.staging_keys.values() for key in keys
+                    }
+
+                self._batch_shortfall = parsed_state.batch_shortfall
+                canonical_state = self._buffer.metadata_state_dict(
+                    saved_capacity=self._async_cfg.max_buffered_rollouts
                 )
-            await self._rehydrate_rollout_recovery_prompts(cut)
-            await self._queue_restored_replay_groups_for_regeneration(cut)
+                canonical_group_ids = {
+                    group["group_id"] for group in canonical_state["groups"]
+                }
+                recovery_ledger.discard_canonical_groups(cut, canonical_group_ids)
+                self._finalizer_metrics_by_group = {
+                    group_id: metrics
+                    for group_id, metrics in parsed_state.finalizer_metrics_by_group.items()
+                    if group_id in canonical_group_ids
+                }
+                self._finalizer_rewards_by_group = {
+                    group_id: rows
+                    for group_id, rows in parsed_state.finalizer_rewards_by_group.items()
+                    if group_id in canonical_group_ids
+                }
+                if self._master_config.token_capture.enabled:
+                    # Validate saved custody before restart normalization can discard it.
+                    await self._validate_rollout_recovery_inventory(
+                        cut,
+                        replay_metadata=canonical_state,
+                        clear_unreferenced=False,
+                        additional_expected_staging_keys=restored_gym_staging_keys,
+                    )
+                recovery_ledger.prepare_for_restart(
+                    cut,
+                    restored_gym_episodes=restored_gym_episodes,
+                )
+                if self._master_config.token_capture.enabled:
+                    await self._validate_rollout_recovery_inventory(
+                        cut,
+                        replay_metadata=canonical_state,
+                        clear_unreferenced=True,
+                        additional_expected_staging_keys=restored_gym_staging_keys,
+                    )
+                await self._rehydrate_rollout_recovery_prompts(cut)
+                await self._queue_restored_replay_groups_for_regeneration(cut)
         self._sampler_stamps_target_steps = (
             parsed_state.sampler_stamps_target_steps
             if parsed_state.sampler_stamps_target_steps is not None
@@ -1563,6 +1749,7 @@ class SingleControllerActor:
         recovery_started = time.monotonic()
         reused_siblings = 0
         redispatched_siblings = 0
+        continued_siblings = 0
 
         recognized_phases = (
             PromptGroupPhase.ADMITTED,
@@ -1591,6 +1778,7 @@ class SingleControllerActor:
                 reused = len(group.sealed_generation_indices)
                 reused_siblings += reused
                 redispatched_siblings += group.expected_generations - reused
+                continued_siblings += len(group.continued_generation_indices)
 
         # A checkpoint may land after dataloader ownership is recorded but before
         # sampler admission commits. Re-admit each original dataloader batch once and
@@ -1613,6 +1801,7 @@ class SingleControllerActor:
                 reused = len(group.sealed_generation_indices)
                 reused_siblings += reused
                 redispatched_siblings += group.expected_generations - reused
+                continued_siblings += len(group.continued_generation_indices)
 
         self._rollout_manager.record_recovery_siblings(
             reused=reused_siblings,
@@ -1624,6 +1813,10 @@ class SingleControllerActor:
                 "groups_unfinished_found": float(len(groups_to_recover)),
                 "siblings_reused": float(reused_siblings),
                 "siblings_rerun": float(redispatched_siblings),
+                # The re-run siblings split by where they resume: restored Gym
+                # state (turn level) or their prompt.
+                "siblings_continued": float(continued_siblings),
+                "siblings_restarted": float(redispatched_siblings - continued_siblings),
             },
             step=self._train_steps,
             prefix="timing/rollout_recovery",
@@ -1631,7 +1824,9 @@ class SingleControllerActor:
 
         print(
             f"📦 Redispatched {len(groups_to_recover)} unfinished rollout "
-            "group(s) before new dataloader work",
+            f"group(s) before new dataloader work: {reused_siblings} sibling(s) "
+            f"reused, {continued_siblings} continued from Gym state, "
+            f"{redispatched_siblings - continued_siblings} restarted from their prompt",
             flush=True,
         )
 
@@ -1680,18 +1875,27 @@ class SingleControllerActor:
         *,
         replay_metadata: Optional[TQReplayMetadataState],
         clear_unreferenced: bool,
+        additional_expected_staging_keys: Optional[set[str]] = None,
     ) -> int:
         """Validate staging ownership while the caller holds a stable cut."""
         cut.require_live()
         expected_staging_keys = self._rollout_recovery_ledger.expected_staging_keys()
+        required_staging_keys = self._rollout_recovery_ledger.expected_staging_keys(
+            required_only=True
+        )
+        # Gym re-stages a restored turn's rows; they are owned and must exist.
+        expected_staging_keys.update(additional_expected_staging_keys or ())
+        required_staging_keys.update(additional_expected_staging_keys or ())
         if replay_metadata is not None:
             for group in replay_metadata["groups"]:
                 for tag in group["meta"].tags or []:
                     encoded_plan = tag.get(ROUTE_PLAN_TAG)
                     if encoded_plan is not None:
-                        expected_staging_keys.update(
-                            decode_route_plan(encoded_plan).cleanup_staging_keys
-                        )
+                        route_keys = decode_route_plan(
+                            encoded_plan
+                        ).cleanup_staging_keys
+                        expected_staging_keys.update(route_keys)
+                        required_staging_keys.update(route_keys)
 
         staging_partition = self._master_config.token_capture.staging_partition
         actual_staging_keys = set(
@@ -1700,7 +1904,7 @@ class SingleControllerActor:
                 partition_id=staging_partition,
             )
         )
-        missing = sorted(expected_staging_keys - actual_staging_keys)
+        missing = sorted(required_staging_keys - actual_staging_keys)
         if missing:
             raise RuntimeError(
                 "rollout-recovery ownership references staging rows missing "
@@ -1721,10 +1925,10 @@ class SingleControllerActor:
             )
         print(
             "📦 Rollout-recovery staging inventory validated: "
-            f"referenced={len(expected_staging_keys)}",
+            f"referenced={len(expected_staging_keys & actual_staging_keys)}",
             flush=True,
         )
-        return len(expected_staging_keys)
+        return len(expected_staging_keys & actual_staging_keys)
 
     async def _maybe_restore_replacement_reserve(self) -> None:
         """Restore spare prompts diverted before the previous run's checkpoint.
@@ -1745,10 +1949,12 @@ class SingleControllerActor:
         reserve_path = os.path.join(
             self._last_checkpoint_path, REPLACEMENT_RESERVE_FILENAME
         )
-        # Absent for every run that never diverted a batch, which is every run that
-        # does not use "replace" -- so silence here rather than the buffer restore's
-        # warning, since this is the ordinary case rather than a lost artifact.
+        # New checkpoints write even an empty reserve; legacy absence remains valid.
         if not path_exists(reserve_path):
+            if (self._data_plane_checkpoint_metadata or {}).get(
+                "rollout_recovery_schema_version", 0
+            ) >= 5:
+                raise FileNotFoundError(f"checkpoint is missing {reserve_path}")
             return
         # weights_only=False: spares are pickled DatumSpecs, and the checkpoint is a
         # trusted same-job artifact (the replay buffer restore loads on the same terms).
@@ -1808,6 +2014,12 @@ class SingleControllerActor:
             "partition_id": self._partition_id,
             "sampler_name": self._async_cfg.sampler.name,
             "mode": "authoritative" if replay_metadata is not None else "shadow",
+            "forest_training": self._master_config.token_capture.forest_training,
+            "forest_execution_row_multiple": (
+                self._rollout_manager.execution_row_multiple
+                if self._master_config.token_capture.forest_training
+                else None
+            ),
         }
         if replay_metadata is not None:
             metadata["replay_metadata_schema_version"] = (
@@ -1863,7 +2075,7 @@ class SingleControllerActor:
     def _request_staging_keys(request: "ReassemblyRequest") -> list[str]:
         """Return the full receipt-manifest staging ownership for a request."""
         keys: list[str] = []
-        for receipt in request.receipts:
+        for receipt in request.capture_receipts:
             if receipt is None:
                 continue
             manifest = receipt.get("manifest")
@@ -1887,7 +2099,7 @@ class SingleControllerActor:
         try:
             await self._call_dp(
                 "clear_samples",
-                sample_ids=list(request.canonical_sample_ids),
+                sample_ids=list(request.cleanup_sample_ids),
                 partition_id=self._partition_id,
             )
         except Exception as error:
@@ -1895,7 +2107,7 @@ class SingleControllerActor:
                 RuntimeError(
                     "pre-publication canonical cleanup failed for "
                     f"group={request.group_id!r}, "
-                    f"ids={request.canonical_sample_ids!r}"
+                    f"ids={request.cleanup_sample_ids!r}"
                 )
             )
             errors[-1].__cause__ = error
@@ -1942,16 +2154,16 @@ class SingleControllerActor:
         self._finalizer_rewards_by_group.pop(request.group_id, None)
 
     async def _finalize_with_actor(
-        self, request: "ReassemblyRequest"
+        self, request: "ReassemblyRequest", rollout_metrics: dict[str, Any]
     ) -> Optional["FinalizedGroup"]:
         """Finalize and index one group atomically with respect to TQ saves.
 
         Returns the committed FinalizedGroup once the group is committed to
-        the replay buffer (callers may read valid_row_count/total_row_count
-        off it to decide whether the group is worth keeping), or None when
+        the replay buffer (callers use logical-owner counts for forests, or row
+        counts for ordinary capture, to decide whether to keep it), or None when
         the finalizer itself dropped it as a structural outcome (ownership
         already cleaned up; the caller credits the step short). A low
-        valid-row fraction is no longer a finalizer-side drop -- the caller
+        valid-rollout fraction is no longer a finalizer-side drop -- the caller
         decides that, since only the caller can source a replacement.
         """
         self._finalizer_waiters += 1
@@ -2033,19 +2245,43 @@ class SingleControllerActor:
                         f"{request.group_id}"
                     )
                 else:
+                    extra_env_info: dict[str, Any] = {}
+                    if request.attribution_key is not None:
+                        extra_env_info["attribution_key"] = request.attribution_key
+                    if request.resolved_agent_name is not None:
+                        extra_env_info["agent_ref"] = {
+                            "name": request.resolved_agent_name
+                        }
                     try:
+                        meta = finalized.meta
+                        # Gym rollout metrics and the finalizer's verified token
+                        # metrics are disjoint; one sidecar carries both.
+                        overlap = (
+                            rollout_metrics.keys() & finalized.token_metrics.keys()
+                        )
+                        if overlap:
+                            raise RuntimeError(
+                                f"group {request.group_id}: rollout and finalizer "
+                                f"metrics both report {sorted(overlap)!r}"
+                            )
+                        group_metrics = {**rollout_metrics, **finalized.token_metrics}
+                        if group_metrics:
+                            # Same ROLLOUT_METRICS sidecar the echo path's commit writes.
+                            meta = replace(
+                                meta,
+                                extra_info={
+                                    **meta.extra_info,
+                                    ROLLOUT_METRICS: [group_metrics],
+                                },
+                            )
                         await self._buffer.commit_finalized(
                             cut,
                             request.group_id,
-                            finalized.meta,
+                            meta,
                             finalized.group_min_wv,
                             finalized.group_max_wv,
                             staging_keys=finalized.staging_keys,
-                            extra_env_info=(
-                                {"agent_ref": {"name": request.resolved_agent_name}}
-                                if request.resolved_agent_name is not None
-                                else None
-                            ),
+                            extra_env_info=extra_env_info or None,
                         )
                     except BaseException as commit_error:
                         try:
@@ -2176,6 +2412,9 @@ class SingleControllerActor:
         tag is missing anyway; doing it here fails one stage earlier in the
         same iteration.
         """
+        if has_logical_owners(meta):
+            assert meta.tags is not None
+            return list(dict.fromkeys(tag["dispatch_group_id"] for tag in meta.tags))
         return list(dict.fromkeys(row_group_ids(meta)))
 
     # ── the three pumps + the inline advantage stage ───────────────────────
@@ -2245,13 +2484,13 @@ class SingleControllerActor:
                             # spans under it must be gated on PER_PROMPT.
                             with per_prompt_scope():
                                 if lineage_group_id is None:
-                                    request = await self._rollout_manager.generate_for_finalization(
+                                    captured = await self._rollout_manager.generate_for_finalization(
                                         prompt,
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
                                     )
                                 else:
-                                    request = await self._rollout_manager.generate_for_finalization(
+                                    captured = await self._rollout_manager.generate_for_finalization(
                                         prompt,
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
@@ -2263,7 +2502,7 @@ class SingleControllerActor:
                             if not generation_permit_released:
                                 sem.release()
                                 generation_permit_released = True
-                            if request is None:
+                            if captured is None:
                                 # Dropped within the infra budget: nothing was
                                 # committed, so the train pump will never release
                                 # this permit, and the step it was stamped for
@@ -2283,7 +2522,10 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return
-                            finalized = await self._finalize_with_actor(request)
+                            request, rollout_metrics = captured
+                            finalized = await self._finalize_with_actor(
+                                request, rollout_metrics
+                            )
                             if finalized is None:
                                 # Finalizer dropped the group as a structural
                                 # outcome (e.g. router replay with no routed
@@ -2295,19 +2537,35 @@ class SingleControllerActor:
                                 self._credit_shortfall(target_step)
                                 return
                             min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
-                            below_threshold = (
-                                min_valid_fraction is not None
-                                and finalized.total_row_count > 0
-                                and finalized.valid_row_count
-                                / finalized.total_row_count
-                                < min_valid_fraction
-                            )
+                            valid_count = total_count = 0
+                            below_threshold = False
+                            if min_valid_fraction is not None:
+                                if self._master_config.token_capture.forest_training:
+                                    # Compaction expands owners into unequal row
+                                    # counts; use the finalizer's owner totals.
+                                    valid_count = int(
+                                        finalized.metrics[
+                                            "finalize/valid_logical_owner_count"
+                                        ]
+                                    )
+                                    total_count = int(
+                                        finalized.metrics[
+                                            "finalize/logical_owner_count"
+                                        ]
+                                    )
+                                else:
+                                    valid_count = finalized.valid_row_count
+                                    total_count = finalized.total_row_count
+                                below_threshold = (
+                                    total_count > 0
+                                    and valid_count / total_count < min_valid_fraction
+                                )
                             if not below_threshold:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
                                 break
-                            # Enough rows verified to publish, but too few to
-                            # be worth training on. Unlike the finalizer's own
+                            # Publication succeeded, but too few rollouts verified
+                            # to be worth training on. Unlike the finalizer's own
                             # structural drops above, this is a policy call
                             # only the controller can act on: it is the one
                             # component that can source a replacement.
@@ -2323,8 +2581,7 @@ class SingleControllerActor:
                             print(
                                 f"  finalize: group {request.group_id} below "
                                 "min_valid_fraction_per_group "
-                                f"({finalized.valid_row_count}/"
-                                f"{finalized.total_row_count} < "
+                                f"({valid_count}/{total_count} < "
                                 f"{min_valid_fraction}); seeking a replacement",
                                 flush=True,
                             )
@@ -2872,68 +3129,6 @@ class SingleControllerActor:
             )
         return target
 
-    def _streaming_ppo_selection_kwargs(self) -> dict[str, int]:
-        """Derive aligned chunks and the tail floor without changing other samplers.
-
-        Both models must accept every selected row. Packed execution requires
-        complete data-parallel shards; static execution also requires complete
-        local microbatches. Reject an incompatible full batch before claiming it.
-        """
-        if not self._streaming_ppo:
-            return {}
-        assert self._value is not None
-        # Both forward paths shard by sample count before packing. Keep
-        # whole prompt groups and leave any unaligned ready tail in the
-        # sampler instead of padding canonical data-plane rows.
-        policy_cfg = self._master_config.policy
-        value_cfg = self._master_config.value
-        assert value_cfg is not None
-        policy_dp_size = self._trainer.sharding_annotations.get_axis_size(
-            "data_parallel"
-        )
-        value_dp_size = self._value.sharding_annotations.get_axis_size("data_parallel")
-
-        # Packed/dynamic batching only needs complete DP shards. Static
-        # batching also needs complete local microbatches to avoid dropping rows.
-        policy_training_mbs = policy_logprob_mbs = 1
-        if not (
-            policy_cfg.get("dynamic_batching", {}).get("enabled", False)
-            or policy_cfg.get("sequence_packing", {}).get("enabled", False)
-        ):
-            policy_training_mbs = policy_cfg["train_micro_batch_size"]
-            policy_logprob_mbs = policy_cfg.get(
-                "logprob_batch_size", policy_training_mbs
-            )
-        value_logprob_mbs = 1
-        if not (
-            value_cfg.get("dynamic_batching", {}).get("enabled", False)
-            or value_cfg.get("sequence_packing", {}).get("enabled", False)
-        ):
-            value_logprob_mbs = value_cfg.get(
-                "logprob_batch_size", value_cfg["train_micro_batch_size"]
-            )
-
-        policy_sample_multiple = policy_dp_size * math.lcm(
-            policy_training_mbs, policy_logprob_mbs
-        )
-        value_sample_multiple = value_dp_size * value_logprob_mbs
-        sample_multiple = math.lcm(policy_sample_multiple, value_sample_multiple)
-        group_multiple = sample_multiple // math.gcd(
-            sample_multiple, self._algo_cfg.num_generations_per_prompt
-        )
-        if self._algo_cfg.num_prompts_per_step % group_multiple:
-            raise ValueError(
-                "Streaming PPO requires ppo.num_prompts_per_step to be a "
-                f"multiple of {group_multiple} prompt groups for the policy "
-                "and value data-parallel layouts."
-            )
-        return {
-            "group_multiple": group_multiple,
-            # Heuristic: half the minimum streaming chunk size, rounded up.
-            "min_remaining_groups": (self._async_cfg.min_groups_for_streaming_train + 1)
-            // 2,
-        }
-
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
 
@@ -2982,7 +3177,15 @@ class SingleControllerActor:
         policy_training_start_step = (
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
-        selection_kwargs = self._streaming_ppo_selection_kwargs()
+        forest_training = self._master_config.token_capture.forest_training
+        selection_kwargs = (
+            {
+                "group_multiple": self._ppo_group_multiple,
+                "min_remaining_groups": self._ppo_min_remaining_groups,
+            }
+            if self._streaming_ppo
+            else {}
+        )
 
         while self._train_steps < self._algo_cfg.max_num_steps:
             maybe_gpu_profile_step(self._trainer, self._train_steps + 1)
@@ -3013,6 +3216,7 @@ class SingleControllerActor:
             consumed_training_claim_ids: list[str] = []
             consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
+            logical_owners: set[str] = set()
             step_finalizer_rewards: list[FinalizedReward] = []
             step_finalizer_group_ids: set[str] = set()
 
@@ -3179,6 +3383,21 @@ class SingleControllerActor:
                         consumed_metas.append(train_meta)
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
                         consumed_group_count += num_groups
+                        if forest_training:
+                            if (
+                                not has_logical_owners(train_meta)
+                                or len(train_meta.tags or []) != train_meta.size
+                                or any(
+                                    type(tag.get("weight_version")) is not int
+                                    or type(tag.get("is_execution_padding")) is not bool
+                                    or type(tag.get("uses_borrowed_input")) is not bool
+                                    for tag in train_meta.tags or []
+                                )
+                            ):
+                                raise ValueError(
+                                    "Forest optimizer batch requires logical rows with padding flags, borrowed-input flags, and integer generation versions"
+                                )
+
                         for group_id in selected_group_ids:
                             if group_id in step_finalizer_group_ids:
                                 continue
@@ -3314,6 +3533,25 @@ class SingleControllerActor:
                             train_meta,
                             has_valid_training_tokens,
                         ) = await self._advantage_stage(train_meta)
+                    if forest_training:
+                        # The advantage stage has verified every owner/segment.
+                        # Count those owners, not the physical rows or sampler tally.
+                        assert train_meta.tags is not None
+                        chunk_owners = {
+                            tag["logical_rollout_id"]
+                            for tag in train_meta.tags
+                            if not tag["is_execution_padding"]
+                        }
+                        if (
+                            len(selected_group_ids) != num_groups
+                            or len(chunk_owners)
+                            != num_groups * self._algo_cfg.num_generations_per_prompt
+                            or logical_owners.intersection(chunk_owners)
+                        ):
+                            raise ValueError(
+                                "Forest sampler chunk must contain new, complete logical groups"
+                            )
+                        logical_owners.update(chunk_owners)
 
                     step_has_valid_training_tokens |= has_valid_training_tokens
                     if self._is_ppo:
@@ -3397,7 +3635,7 @@ class SingleControllerActor:
                                         # identity before the first irreversible
                                         # optimizer update, as on the streaming path.
                                         async with self._checkpoint_save_lock:
-                                            self._optimizer_commit_in_progress = True
+                                            self._begin_optimizer_commit()
                                         policy_result = await asyncio.to_thread(
                                             self._trainer.finish_train_step
                                         )
@@ -3532,7 +3770,7 @@ class SingleControllerActor:
                     # Future snapshots see the flag under this same lock and
                     # skip until the critic and batch consumption finish.
                     async with self._checkpoint_save_lock:
-                        self._optimizer_commit_in_progress = True
+                        self._begin_optimizer_commit()
                     if is_policy_training_step and self._streaming_ppo:
                         assert step_open
                         with (
@@ -3586,14 +3824,11 @@ class SingleControllerActor:
                         if self._gen.blocks_training():
                             await asyncio.to_thread(self._trainer.finish_inference)
                     # GAE has produced the frozen predictions and targets for
-                    # every row. Critic epochs always see the full original batch.
-                    value_train_meta = value_train_metas[0].concat(
-                        *value_train_metas[1:]
-                    )
+                    # every row. Critic epochs replay every selected chunk.
                     log.info(
-                        "PPO: step %d critic train: %d samples, %d full-batch epochs",
+                        "PPO: step %d critic train: %d samples, %d epochs",
                         version_during_step,
-                        value_train_meta.size,
+                        sum(meta.size for meta in value_train_metas),
                         self._critic_ppo_epochs,
                     )
                     with (
@@ -3606,10 +3841,19 @@ class SingleControllerActor:
                         ),
                     ):
                         value_result = await self._value_train_epochs(
-                            value_train_meta,
+                            value_train_metas,
                             num_epochs=self._critic_ppo_epochs,
                         )
                 else:
+                    if forest_training and (
+                        groups_dispatched
+                        != self._target_groups_for_step(version_during_step)
+                        or len(logical_owners)
+                        != groups_dispatched * self._algo_cfg.num_generations_per_prompt
+                    ):
+                        raise ValueError(
+                            "Forest optimizer step requires complete retained logical groups"
+                        )
                     if not step_open:
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
@@ -3629,7 +3873,7 @@ class SingleControllerActor:
                         policy_result = await asyncio.to_thread(
                             self._trainer.finish_train_step
                         )
-                    self._optimizer_commit_in_progress = True
+                    self._begin_optimizer_commit()
 
                 # Aggregate step metrics
                 step_metrics = {}
@@ -3654,7 +3898,11 @@ class SingleControllerActor:
                         for name, values in step_finalizer_metrics.items()
                         if values
                         and not name.startswith(
-                            ("finalize/penalty_count/", "finalize/effort/")
+                            (
+                                "finalize/penalty_count/",
+                                "finalize/effort/",
+                                "finalize/truncated_count",
+                            )
                         )
                     }
                 )
@@ -4603,6 +4851,7 @@ class SingleControllerActor:
         return CaptureRewardSettings.from_configs(
             self._master_config.reward_penalties,
             get_effort_config(self._master_config.env),
+            get_nemo_gym_thinking_tags(self._master_config.env),
         )
 
     async def _capture_rollout_checkpoint_cut(
@@ -4618,6 +4867,7 @@ class SingleControllerActor:
         """
         cut.require_live()
         dataloader_state = self._dataloader.state_dict()
+        next_nemo_gym_task_index = self._rollout_manager.get_next_nemo_gym_task_index()
         replacement_reserve = list(self._replacement_reserve)
         training_owned_groups = self._buffer.training_owned_replay_groups()
         replay_metadata = self._buffer.metadata_state_dict(
@@ -4665,6 +4915,7 @@ class SingleControllerActor:
         return _RolloutCheckpointCut(
             dataloader_state=dataloader_state,
             sampler_dispatch_index=self._sampler.dispatch_index,
+            next_nemo_gym_task_index=next_nemo_gym_task_index,
             replacement_reserve=replacement_reserve,
             replay_metadata=replay_metadata,
             rollout_recovery_payload=recovery_payload,
@@ -4675,6 +4926,353 @@ class SingleControllerActor:
             mutation_version=self._data_plane_checkpoint_barrier.mutation_version,
             tq_save_seconds=tq_save_seconds,
         )
+
+    def _gym_checkpoint_inventory(
+        self, coordinator: GymCheckpointCoordinator
+    ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
+        """Return the Gym-owned episode attempts of every live deployment."""
+        return self._rollout_recovery_ledger.gym_checkpoint_inventory(
+            coordinator.instance_ids
+        )
+
+    def _queued_gym_retirements(
+        self, coordinator: GymCheckpointCoordinator
+    ) -> dict[str, frozenset[GymCheckpointEpisode]]:
+        """Return dropped episodes Gym may still hold, awaiting their retire."""
+        return {
+            instance_id: frozenset(episodes)
+            for instance_id, episodes in (
+                self._rollout_recovery_ledger.gym_checkpoint_retirements(
+                    coordinator.instance_ids
+                ).items()
+            )
+        }
+
+    async def _retire_dropped_gym_episodes(
+        self,
+        coordinator: GymCheckpointCoordinator,
+        checkpoint_id: str,
+    ) -> None:
+        """Retire episodes RL dropped while Gym may still be running them.
+
+        Abandoning or discarding a group leaves an admitted episode running in
+        Gym, which would export it at commit, outside the candidate set. Gym
+        accepts a retire only while idle, so this runs before prepare. A drop
+        recorded after it stays queued: this checkpoint commits it in scope but
+        leaves it out of the saved manifest, and a later retire stops it.
+        """
+        ledger = self._rollout_recovery_ledger
+        retirements = ledger.gym_checkpoint_retirements(coordinator.instance_ids)
+        if any(retirements.values()):
+            await coordinator.retire(checkpoint_id, retirements)
+            # Only what was retired: a drop recorded meanwhile stays for next time.
+            ledger.mark_gym_retired(retirements)
+        await self._forget_finished_gym_rollouts(coordinator, checkpoint_id)
+
+    async def _forget_finished_gym_rollouts(
+        self,
+        coordinator: GymCheckpointCoordinator,
+        checkpoint_id: str,
+    ) -> None:
+        """Let Gym drop its marks for rollouts RL will never send again.
+
+        Gym refuses a retired or restored rollout by ID until it is forgotten,
+        so each finished one would otherwise stay on every participant for the
+        rest of the run. Gym refuses a forget while a checkpoint is open, so this
+        runs right after the retire. A deployment that refuses, for example
+        because a retire has not finished freeing a rollout, gets the retire
+        again and then the forget. Forget is best effort: a mark costs one small
+        entry, so a deployment that still refuses keeps its rollouts queued for
+        the next snapshot instead of failing this one.
+        """
+        ledger = self._rollout_recovery_ledger
+        forgets = ledger.gym_checkpoint_forgets(coordinator.instance_ids)
+        if not any(forgets.values()):
+            return
+        try:
+            await coordinator.forget(checkpoint_id, forgets)
+        except GymCheckpointOperationError as error:
+            refused = {
+                instance_id: forgets[instance_id] for instance_id in error.failures
+            }
+            ledger.mark_gym_forgotten(
+                {
+                    instance_id: episodes
+                    for instance_id, episodes in forgets.items()
+                    if instance_id not in refused
+                }
+            )
+            try:
+                await coordinator.retire(
+                    checkpoint_id,
+                    {
+                        instance_id: refused.get(instance_id, ())
+                        for instance_id in coordinator.instance_ids
+                    },
+                )
+                await coordinator.forget(checkpoint_id, refused)
+            except GymCheckpointOperationError as retry_error:
+                warnings.warn(
+                    "Gym could not forget finished rollouts on "
+                    f"{sorted(retry_error.failures)!r}; they stay queued for the next "
+                    f"snapshot: {retry_error}",
+                    stacklevel=2,
+                )
+                return
+            ledger.mark_gym_forgotten(refused)
+            return
+        ledger.mark_gym_forgotten(forgets)
+
+    async def _check_restart_only_gym_servers(self) -> None:
+        """Refuse, or warn about, Gym servers whose rollouts start over after a crash.
+
+        Such a server's in-flight rollouts are reported as restarts at every
+        checkpoint, so turn-level recovery would quietly become
+        restart-from-task for them.
+        """
+        coordinator = self._gym_checkpoint_coordinator
+        if coordinator is None:
+            return
+        allowed = self._master_config.rollout_recovery.allow_restart_only_gym_servers
+        restart_only = {
+            instance_id: servers
+            for instance_id, servers in (
+                await coordinator.restart_only_servers()
+            ).items()
+            if servers
+        }
+        if restart_only and not allowed:
+            raise ValueError(
+                "rollout_recovery.target_level='turn' cannot continue rollouts on "
+                "these restart-only Gym servers, which start every in-flight "
+                f"rollout over after a crash: {restart_only!r}. Set "
+                "rollout_recovery.allow_restart_only_gym_servers=true to accept "
+                "that, or use target_level='sibling'."
+            )
+        if restart_only:
+            warnings.warn(
+                "rollout_recovery.allow_restart_only_gym_servers=true: in-flight "
+                "rollouts on these restart-only Gym servers start over after a "
+                f"crash: {restart_only!r}",
+                stacklevel=2,
+            )
+        elif allowed:
+            warnings.warn(
+                "rollout_recovery.allow_restart_only_gym_servers=true, but no Gym "
+                "server is restart-only; the setting has no effect",
+                stacklevel=2,
+            )
+
+    async def _drain_non_exported_gym_candidates(
+        self,
+        coordinator: GymCheckpointCoordinator,
+        candidates: dict[str, tuple[GymCheckpointEpisode, ...]],
+        commit: GymCheckpointCommitResult,
+    ) -> None:
+        """Wait for on-wire replies that Gym did not retain in its checkpoint.
+
+        A restart is still running in Gym, parked until resume, so it is not
+        waited for: the snapshot records it as starting over.
+        """
+        pending = {
+            instance_id: set(candidates[instance_id])
+            - set(commit.manifest.instances[instance_id])
+            - set(commit.manifest.restarts[instance_id])
+            for instance_id in coordinator.instance_ids
+        }
+        if not any(pending.values()):
+            return
+        # Only an episode whose reply is already on the wire can resolve here. A
+        # session Gym still holds is parked by prepare, so waiting would only time out.
+        stranded = {
+            instance_id: pending[instance_id].intersection(
+                commit.instances[instance_id].unowned_live_episodes
+            )
+            for instance_id in coordinator.instance_ids
+        }
+        if any(stranded.values()):
+            raise RuntimeError(
+                "Gym checkpoint holds parked agent sessions that are not an "
+                "agent's own /run episode, "
+                "so they can neither be restored nor finish while the deployment is "
+                f"prepared: stranded={_summarize_gym_episodes(stranded)}"
+            )
+
+        # Only the pending episodes are checked: rescanning every live rollout
+        # on each poll would block the event loop that delivers the replies
+        # this waits for.
+        ledger = self._rollout_recovery_ledger
+        waiting = pending
+        deadline = time.monotonic() + coordinator.control_timeout_s
+        while True:
+            waiting = ledger.gym_episodes_still_held(waiting)
+            if not any(waiting.values()):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Gym checkpoint could not classify every candidate before the "
+                    f"drain deadline: unresolved={_summarize_gym_episodes(waiting)}"
+                )
+            await asyncio.sleep(min(0.05, remaining))
+
+    async def _validate_gym_checkpoint_cut(
+        self,
+        cut: DataPlaneMutationCut,
+        commit: GymCheckpointCommitResult,
+        *,
+        checkpoint_path: PathLike,
+    ) -> None:
+        """Require Gym ownership and referenced staging rows to match this cut.
+
+        Gym may have exported episodes RL dropped while it was prepared: it
+        refuses their retire until resume, so they are still queued for one.
+        They and their staged rows are left out of the saved manifest, since
+        restore requires it to match RL's inventory and RL no longer continues
+        them; a dropped group may already have cleaned those rows up.
+        """
+        cut.require_live()
+        coordinator = self._gym_checkpoint_coordinator
+        if coordinator is None:
+            raise RuntimeError("Gym commit exists without a live Gym coordinator")
+
+        actual = self._gym_checkpoint_inventory(coordinator)
+        expected = commit.manifest.instances
+        dropped = self._queued_gym_retirements(coordinator)
+        mismatches = {}
+        kept: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
+        kept_restarts: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
+        for instance_id in coordinator.instance_ids:
+            owned = set(actual[instance_id])
+            exported = set(expected[instance_id])
+            restarted = set(commit.manifest.restarts[instance_id])
+            if (
+                owned - exported - restarted
+                or not exported - owned <= dropped[instance_id]
+            ):
+                mismatches[instance_id] = {
+                    "expected": sorted(exported, key=repr),
+                    "restarts": sorted(restarted, key=repr),
+                    "actual": sorted(owned, key=repr),
+                }
+            kept[instance_id] = tuple(
+                episode for episode in expected[instance_id] if episode in owned
+            )
+            # A restart that finished during the snapshot is no longer RL's.
+            kept_restarts[instance_id] = tuple(
+                episode
+                for episode in commit.manifest.restarts[instance_id]
+                if episode in owned
+            )
+        if mismatches:
+            raise RuntimeError(
+                "Gym episode ownership changed after commit and before the TQ cut: "
+                f"{mismatches!r}"
+            )
+        staging_keys = {
+            instance_id: staging_keys_of(
+                commit.instances[instance_id], kept[instance_id]
+            )
+            for instance_id in coordinator.instance_ids
+        }
+        if kept != expected or kept_restarts != commit.manifest.restarts:
+            await asyncio.to_thread(
+                write_gym_checkpoint_manifest,
+                Path(checkpoint_path),
+                replace(
+                    commit.manifest,
+                    instances=kept,
+                    staging_keys=staging_keys,
+                    restarts=kept_restarts,
+                ),
+            )
+
+        expected_staging_keys = {key for keys in staging_keys.values() for key in keys}
+        if not expected_staging_keys:
+            return
+        actual_staging_keys = set(
+            await self._call_dp(
+                "list_sample_ids",
+                partition_id=self._master_config.token_capture.staging_partition,
+            )
+        )
+        missing = sorted(expected_staging_keys - actual_staging_keys)
+        if missing:
+            raise RuntimeError(
+                "Gym checkpoint references staging rows missing from live TQ state: "
+                f"missing={missing[:10]!r} (total={len(missing)})"
+            )
+
+    @contextlib.asynccontextmanager
+    async def _prepared_gym_checkpoint(
+        self,
+        checkpoint_path: PathLike,
+        *,
+        checkpoint_id: str,
+    ) -> AsyncIterator[GymCheckpointCommitResult | None]:
+        """Close Gym admission, commit owned episodes, and drain on-wire replies."""
+        coordinator = self._gym_checkpoint_coordinator
+        if coordinator is None:
+            yield None
+            return
+        gate = self._rollout_dispatch_admission_gate
+        if gate is None:
+            raise RuntimeError(
+                "Gym checkpoint coordinator has no dispatch admission gate"
+            )
+
+        async with gate.checkpoint():
+            # Gym parks every live rollout until resume, so the wait must not
+            # count against their deadlines. A separate holder keeps a
+            # colocated engine's own pause intact when this one ends.
+            self._rollout_manager.suspend_request_deadlines(
+                _GYM_CHECKPOINT_DEADLINE_HOLDER
+            )
+            try:
+                # Gym refuses a retire once a checkpoint is open, so retire while
+                # it is still idle; dispatch is already closed, so nothing new
+                # races in.
+                await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
+                async with coordinator.prepared(checkpoint_id) as restarts:
+                    candidates = self._gym_checkpoint_inventory(coordinator)
+                    # A row dropped since that retire is still running in Gym,
+                    # which exports it; naming it keeps the export in scope, and
+                    # the cut leaves it out of the saved manifest.
+                    dropped = self._queued_gym_retirements(coordinator)
+                    # Gym refuses a commit that names an episode it cannot
+                    # capture; those start over after a crash instead.
+                    scope = {
+                        instance_id: tuple(
+                            episode
+                            for episode in episodes
+                            + tuple(sorted(dropped[instance_id] - set(episodes)))
+                            if episode not in restarts[instance_id]
+                        )
+                        for instance_id, episodes in candidates.items()
+                    }
+                    commit = await coordinator.commit(
+                        checkpoint_id,
+                        Path(checkpoint_path),
+                        scope,
+                        restarts={
+                            instance_id: tuple(
+                                episode
+                                for episode in episodes
+                                if episode in restarts[instance_id]
+                            )
+                            for instance_id, episodes in candidates.items()
+                        },
+                    )
+                    await self._drain_non_exported_gym_candidates(
+                        coordinator,
+                        candidates,
+                        commit,
+                    )
+                    yield commit
+            finally:
+                self._rollout_manager.resume_request_deadlines(
+                    _GYM_CHECKPOINT_DEADLINE_HOLDER
+                )
 
     async def _write_rollout_checkpoint_sidecars(
         self,
@@ -4690,14 +5288,11 @@ class SingleControllerActor:
             dataloader_path,
         )
         written_paths.append(dataloader_path)
-        if cut.replacement_reserve:
-            replacement_reserve_path = checkpoint_path / REPLACEMENT_RESERVE_FILENAME
-            await asyncio.to_thread(
-                torch.save,
-                cut.replacement_reserve,
-                replacement_reserve_path,
-            )
-            written_paths.append(replacement_reserve_path)
+        replacement_reserve_path = checkpoint_path / REPLACEMENT_RESERVE_FILENAME
+        await asyncio.to_thread(
+            torch.save, cut.replacement_reserve, replacement_reserve_path
+        )
+        written_paths.append(replacement_reserve_path)
         if cut.replay_metadata is not None:
             replay_metadata_path = checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME
             await asyncio.to_thread(
@@ -4729,6 +5324,42 @@ class SingleControllerActor:
             lambda: sum(path.stat().st_size for path in written_paths)
         )
 
+    def _begin_optimizer_commit(self) -> None:
+        """Mark the step's optimizer update as applied until its counters publish."""
+        self._optimizer_commit_in_progress = True
+        self._optimizer_commit_started.set()
+
+    async def _enter_gym_phase_unless_a_step_commits(
+        self,
+        stack: contextlib.AsyncExitStack,
+        gym_phase: contextlib.AbstractAsyncContextManager[
+            GymCheckpointCommitResult | None
+        ],
+    ) -> tuple[bool, GymCheckpointCommitResult | None]:
+        """Enter the Gym phase on ``stack``, or stop it once a train step commits.
+
+        The snapshot would be thrown away at the trainer-state check anyway, so
+        Gym is not kept parked through prepare, commit and drain for it.
+        Cancelling the entry leaves no cleanup: the phase resumes Gym and reopens
+        dispatch on any exception. Returns whether the phase was entered; a phase
+        that finished entering is on ``stack``, and the trainer-state check
+        decides whether its snapshot is kept.
+        """
+        enter = asyncio.ensure_future(stack.enter_async_context(gym_phase))
+        commit_started = asyncio.ensure_future(self._optimizer_commit_started.wait())
+        try:
+            await asyncio.wait(
+                {enter, commit_started}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            commit_started.cancel()
+            if not enter.done():
+                enter.cancel()
+                await asyncio.gather(enter, return_exceptions=True)
+        if enter.cancelled():
+            return False, None
+        return True, enter.result()
+
     async def _save_rollout_checkpoint(
         self, *, force: bool = False
     ) -> _RolloutCheckpointSaveResult:
@@ -4739,6 +5370,8 @@ class SingleControllerActor:
                     saved=False,
                     reason="optimizer_commit_in_progress",
                 )
+            # Only a step that starts committing during this attempt stops it.
+            self._optimizer_commit_started.clear()
             if (
                 not force
                 and self._last_rollout_snapshot_mutation_version
@@ -4807,24 +5440,49 @@ class SingleControllerActor:
                 prepare_snapshot_paths, anchor
             )
             try:
-                barrier_requested = time.monotonic()
-                async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
-                    barrier_acquired = time.monotonic()
-                    if (
-                        self._optimizer_commit_in_progress
-                        or self._train_steps != expected_train_step
-                        or self._trainer_version != expected_trainer_version
-                    ):
+                gym_park_started = time.monotonic()
+                async with contextlib.AsyncExitStack() as gym_phase:
+                    (
+                        entered,
+                        gym_commit,
+                    ) = await self._enter_gym_phase_unless_a_step_commits(
+                        gym_phase,
+                        self._prepared_gym_checkpoint(
+                            tmp_path,
+                            checkpoint_id=f"rollout-{uuid.uuid4().hex}",
+                        ),
+                    )
+                    if not entered:
                         await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
                         return _RolloutCheckpointSaveResult(
                             saved=False,
                             reason="trainer_state_changed",
                         )
-                    snapshot_epoch = self._current_epoch
-                    snapshot_cut = await self._capture_rollout_checkpoint_cut(
-                        cut, tmp_path
-                    )
-                barrier_released = time.monotonic()
+                    barrier_requested = time.monotonic()
+                    async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
+                        barrier_acquired = time.monotonic()
+                        if (
+                            self._optimizer_commit_in_progress
+                            or self._train_steps != expected_train_step
+                            or self._trainer_version != expected_trainer_version
+                        ):
+                            await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                            return _RolloutCheckpointSaveResult(
+                                saved=False,
+                                reason="trainer_state_changed",
+                            )
+                        snapshot_epoch = self._current_epoch
+                        if gym_commit is not None:
+                            await self._validate_gym_checkpoint_cut(
+                                cut, gym_commit, checkpoint_path=tmp_path
+                            )
+                        snapshot_cut = await self._capture_rollout_checkpoint_cut(
+                            cut, tmp_path
+                        )
+                    barrier_released = time.monotonic()
+                # Dispatch reopens and Gym resumes when that block exits, so this
+                # spans every second new rollouts could not start.
+                gym_parked_seconds = time.monotonic() - gym_park_started
 
                 sidecar_save_started = time.monotonic()
                 controller_sidecar_bytes = (
@@ -4839,6 +5497,7 @@ class SingleControllerActor:
                     trainer_version=expected_trainer_version,
                     current_epoch=snapshot_epoch,
                     sampler_dispatch_index=snapshot_cut.sampler_dispatch_index,
+                    next_nemo_gym_task_index=snapshot_cut.next_nemo_gym_task_index,
                     mutation_version=snapshot_cut.mutation_version,
                     rolled_back_train_group_count=(
                         snapshot_cut.rolled_back_train_group_count
@@ -4893,6 +5552,16 @@ class SingleControllerActor:
                 ),
                 "controller_sidecar_bytes": float(controller_sidecar_bytes),
             }
+            gym_restarts = (
+                sum(len(episodes) for episodes in gym_commit.manifest.restarts.values())
+                if gym_commit is not None
+                else 0
+            )
+            if gym_commit is not None:
+                checkpoint_metrics["gym_parked_seconds"] = gym_parked_seconds
+                # Episodes Gym could not capture; they start over after a crash.
+                checkpoint_metrics["gym_restarted_episodes"] = float(gym_restarts)
+                self._warn_if_gym_parked_past_interval(gym_parked_seconds)
             self._log_telemetry_metrics(
                 checkpoint_metrics,
                 step=expected_train_step,
@@ -4903,12 +5572,49 @@ class SingleControllerActor:
                 f"{final_path} (step={expected_train_step}, "
                 f"trainer_version={expected_trainer_version}, "
                 f"ledger_groups={snapshot_cut.rollout_recovery_group_count or 0}, "
+                f"gym_restarted_episodes={gym_restarts}, "
                 f"total_save_seconds={checkpoint_metrics['total_save_seconds']:.2f}, "
                 "exclusive_hold_seconds="
                 f"{checkpoint_metrics['exclusive_hold_seconds']:.2f})",
                 flush=True,
             )
             return _RolloutCheckpointSaveResult(saved=True, reason="completed")
+
+    def _warn_if_gym_snapshots_keep_losing_to_train_steps(
+        self, consecutive_discards: int
+    ) -> None:
+        """Warn once per streak when train steps keep discarding Gym snapshots."""
+        if self._gym_checkpoint_coordinator is None:
+            return
+        limit = self._master_config.rollout_checkpointing.max_consecutive_failures
+        if consecutive_discards != limit:
+            return
+        warnings.warn(
+            f"{consecutive_discards} turn snapshots in a row were thrown away "
+            "because a train step finished during the Gym phase; turn-level "
+            "recovery is saving no Gym state. Shorten Gym steps or use "
+            "rollout_recovery.target_level: sibling.",
+            stacklevel=2,
+        )
+
+    def _warn_if_gym_parked_past_interval(self, gym_parked_seconds: float) -> None:
+        """Warn when a snapshot held rollouts longer than the snapshot interval.
+
+        Rollouts then spend more time parked than running between snapshots.
+        """
+        interval_s = (
+            self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
+        )
+        if interval_s is None or gym_parked_seconds <= interval_s:
+            return
+        warnings.warn(
+            f"Gym rollout snapshot held new rollout dispatch for "
+            f"{gym_parked_seconds:.1f}s, longer than "
+            f"rollout_checkpointing.snapshot_attempt_interval_s={interval_s:g}s; "
+            "rollouts spend more time parked than running between snapshots. "
+            "Raise the interval or check timing/rollout_checkpoint/gym_parked_seconds.",
+            stacklevel=2,
+        )
 
     def _log_rollout_checkpoint_outcome(
         self,
@@ -4959,8 +5665,16 @@ class SingleControllerActor:
         if snapshot_attempt_interval_s is None:
             raise RuntimeError("rollout checkpoint pump started while disabled")
         consecutive_failures = 0
+        consecutive_discards = 0
         while True:
-            await asyncio.sleep(snapshot_attempt_interval_s)
+            try:
+                await asyncio.wait_for(
+                    self._rollout_checkpoint_wakeup.wait(),
+                    timeout=snapshot_attempt_interval_s,
+                )
+            except TimeoutError:
+                pass
+            self._rollout_checkpoint_wakeup.clear()
             attempt_started = time.monotonic()
             deadline_due = self._train_steps == 0 and self._timeout.would_save()
             try:
@@ -4970,6 +5684,10 @@ class SingleControllerActor:
                     failure_reason: RolloutCheckpointAttemptReason = "timeout"
                 elif isinstance(error, OSError):
                     failure_reason = "io_error"
+                elif is_transient_gym_checkpoint_failure(error):
+                    # Gym was resumed, or its lease reopens it; nothing RL
+                    # holds changed, so the next attempt can simply retry.
+                    failure_reason = "gym_unavailable"
                 else:
                     failure_reason = "invariant_error"
                 self._log_rollout_checkpoint_outcome(
@@ -4977,7 +5695,7 @@ class SingleControllerActor:
                     reason=failure_reason,
                     attempt_duration_seconds=time.monotonic() - attempt_started,
                 )
-                if not isinstance(error, (OSError, TimeoutError)):
+                if failure_reason == "invariant_error":
                     raise
                 if deadline_due:
                     raise RuntimeError(
@@ -5006,6 +5724,12 @@ class SingleControllerActor:
                 reason=result.reason,
                 attempt_duration_seconds=time.monotonic() - attempt_started,
             )
+            consecutive_discards = (
+                consecutive_discards + 1
+                if result.reason == "trainer_state_changed"
+                else 0
+            )
+            self._warn_if_gym_snapshots_keep_losing_to_train_steps(consecutive_discards)
             if deadline_due and result.saved and self._timeout.check_save():
                 print(
                     "Checkpoint deadline reached before the first train step; "
@@ -5254,7 +5978,8 @@ class SingleControllerActor:
         # all take the mutation side of this barrier. Capture every restart-facing
         # controller artifact under the exclusive side so the checkpoint cannot
         # contain a cursor without its prompt owner, or two durable owners for one
-        # canonical group.
+        # canonical group. Gym keeps running: its state lives only in rollout
+        # snapshots taken after this checkpoint.
         async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
             save_state.current_step = self._train_steps
             save_state.total_steps = self._train_steps
@@ -5265,6 +5990,9 @@ class SingleControllerActor:
             _save_adaptive_loss_state(save_state, self._loss_fn)
             save_state.sampler_name = self._async_cfg.sampler.name
             save_state.sampler_dispatch_index = self._sampler.dispatch_index
+            save_state.next_nemo_gym_task_index = (
+                self._rollout_manager.get_next_nemo_gym_task_index()
+            )
             dataloader_state = self._dataloader.state_dict()
             # The spare pool and dataloader advance together under the same mutation
             # cut in recovery-enabled dispatch, so preserve them in this cut too.
@@ -5336,9 +6064,12 @@ class SingleControllerActor:
                         else None
                     ),
                 )
-                self._last_rollout_snapshot_mutation_version = (
-                    self._data_plane_checkpoint_barrier.mutation_version
-                )
+                # A turn-level trainer checkpoint holds no Gym state, so it
+                # does not stand in for the next rollout snapshot.
+                if self._gym_checkpoint_coordinator is None:
+                    self._last_rollout_snapshot_mutation_version = (
+                        self._data_plane_checkpoint_barrier.mutation_version
+                    )
 
         # Save value model
         if self._is_ppo:
@@ -5384,12 +6115,11 @@ class SingleControllerActor:
         await asyncio.to_thread(
             save_dataloader_state, dataloader_state, checkpoint_path
         )
-        if reserve_state:
-            await asyncio.to_thread(
-                save_checkpoint_object,
-                reserve_state,
-                os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
-            )
+        await asyncio.to_thread(
+            save_checkpoint_object,
+            reserve_state,
+            os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
+        )
         if replay_metadata is not None:
             await asyncio.to_thread(
                 save_checkpoint_object,
@@ -5430,6 +6160,10 @@ class SingleControllerActor:
             self._checkpointer,
             last_checkpoint_step=self._train_steps,
         )
+        if self._gym_checkpoint_coordinator is not None:
+            # The rollout snapshot waits for this checkpoint to be durable, off
+            # the training loop, and then captures Gym anchored to it.
+            self._rollout_checkpoint_wakeup.set()
 
     async def _finish_pending_save(self, *, blocking: bool) -> None:
         """Finalize and publish a save deferred by defer_async_checkpoint_finalize.
@@ -5459,6 +6193,10 @@ class SingleControllerActor:
                 self._checkpointer,
                 last_checkpoint_step=step,
             )
+        if self._gym_checkpoint_coordinator is not None:
+            # As in _publish_when_policy_write_done: the rollout snapshot
+            # captures Gym anchored to this now-published checkpoint.
+            self._rollout_checkpoint_wakeup.set()
 
     # Grace on top of the workers' own refit deadline, so their attributable error wins
     # the race against this bound. They need to hit the deadline, abort, unwind, raise,
@@ -5752,22 +6490,30 @@ class SingleControllerActor:
         return meta.with_fields([self._advantage_cfg.values_field])
 
     async def _value_train_epochs(
-        self, meta: KVBatchMeta, *, num_epochs: int
+        self, metas: list[KVBatchMeta], *, num_epochs: int
     ) -> dict[str, Any]:
-        """Run consecutive critic epochs under one model onload/offload cycle.
-
-        Returns:
-            The final epoch's ``train_from_meta`` output; earlier epochs'
-            results are discarded.
-        """
+        """Replay all step chunks per critic epoch under one residency cycle."""
+        value_loss_fn = self._value_loss_fn
+        if value_loss_fn is None:
+            raise RuntimeError("PPO value training requires a value loss function")
         await asyncio.to_thread(self._value.prepare_for_training)
         result: dict[str, Any] | None = None
-        for _ in range(num_epochs):
-            result = await asyncio.to_thread(
-                self._value.train_from_meta,
-                meta,
-                self._value_loss_fn,  # pyrefly: ignore
-            )
+        if self._algo_cfg.value_training_mode == "whole_batch":
+            full_meta = metas[0].concat(*metas[1:])
+            for _ in range(num_epochs):
+                result = await asyncio.to_thread(
+                    self._value.train_from_meta, full_meta, value_loss_fn
+                )
+        else:
+            # Split prepares the API for per-chunk value streaming in a later PR;
+            # this controller still trains the critic after policy refit.
+            for _ in range(num_epochs):
+                await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
+                for meta in metas:
+                    await asyncio.to_thread(
+                        self._value.train_microbatches_from_meta, meta
+                    )
+                result = await asyncio.to_thread(self._value.finish_train_step)
         await asyncio.to_thread(self._value.finish_training)
         assert result is not None
         return result
@@ -5789,6 +6535,18 @@ class SingleControllerActor:
             for key in VIOLATION_TAG_KEYS:
                 self._step_log_dict.setdefault(key, []).append(int(tag.get(key, 0)))
 
+        logical = has_logical_owners(meta)
+        if logical:
+            if (
+                self._is_ppo
+                or not isinstance(self._algo_cfg, GRPOConfig)
+                or self._algo_cfg.adv_estimator.name != "grpo"
+                or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+            ):
+                raise ValueError(
+                    "Forest logical owners require the standard GRPO estimator"
+                )
+            validate_forest_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:
             return meta, True
 
@@ -5886,6 +6644,10 @@ class SingleControllerActor:
         if outcome.seq_logprob_error_metrics is not None:
             self._step_log_dict["seq_logprob_error_metrics"].append(
                 outcome.seq_logprob_error_metrics
+            )
+        if outcome.sample_mask_metrics is not None:
+            self._step_log_dict.setdefault("sample_mask_metrics", []).append(
+                outcome.sample_mask_metrics
             )
         self._opd_stat_sum += outcome.opd_stat_sum
         self._opd_stat_sumsq += outcome.opd_stat_sumsq

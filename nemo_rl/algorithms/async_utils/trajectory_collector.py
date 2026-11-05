@@ -1377,7 +1377,7 @@ class AsyncTrajectoryCollector:
     def _compute_teacher_logprobs(
         self,
         input_ids: torch.Tensor,
-        agent_refs: list[dict[str, Any]],
+        agent_refs: list[dict[str, Any]] | list[str],
         input_lengths: Optional[torch.Tensor] = None,
         multimodal_data: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, float]:
@@ -1387,7 +1387,7 @@ class AsyncTrajectoryCollector:
 
         Args:
             input_ids: [B, S] tokenized input tensor
-            agent_refs: list of B agent reference dicts
+            agent_refs: B attribution keys or legacy agent reference dicts
             input_lengths: [B] per-sample lengths (required for sequence packing)
             multimodal_data: batch-level multimodal inputs, row-aligned with
                 ``input_ids`` and sliced per teacher
@@ -1400,9 +1400,8 @@ class AsyncTrajectoryCollector:
         default_teacher_alias = opd_cfg.get("default_teacher_alias")
         strict = opd_cfg.get("strict_agent_name_match", False)
 
-        # Resolve each sample's agent -> the teacher alias it should be distilled
-        # from: the agent name is looked up in teacher_model_by_agent_name; unmapped
-        # agents fall back to default_teacher_alias (or raise if strict_agent_name_match).
+        # Route tasksets and flat-row agent names through the existing teacher map.
+        # Unmapped keys fall back to default_teacher_alias (or raise if strict_agent_name_match).
         # Returns one alias per sample, index-aligned with agent_refs.
         reference_aliases = resolve_reference_aliases(
             agent_refs,
@@ -1712,8 +1711,12 @@ class AsyncTrajectoryCollector:
 
         # Teacher inference is blocking. Keep it off this worker's event loop so
         # other completed prompt groups can continue moving toward the buffer.
-        if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
-            agent_refs = final_batch_cpu["agent_ref"]
+        if self._has_distillation_teachers and (
+            "attribution_key" in final_batch_cpu or "agent_ref" in final_batch_cpu
+        ):
+            agent_refs = final_batch_cpu.get(
+                "attribution_key", final_batch_cpu.get("agent_ref")
+            )
             if isinstance(agent_refs, list):
                 from nemo_rl.data.llm_message_utils import (
                     batched_message_log_to_flat_message,

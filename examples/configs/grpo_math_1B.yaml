@@ -129,6 +129,9 @@ loss_fn:
   # Keep full diagnostics; use "minimal" to skip diagnostic-only kernels.
   metrics_level: "full"
   enable_torch_compile: false
+  # Score centering (https://arxiv.org/abs/2609.20807): subtract the sampler-expected
+  # score per token, using the captured top-k (needs policy.generation.top_logprobs > 0).
+  score_centering: false
 
 checkpointing:
   enabled: true
@@ -219,6 +222,7 @@ policy:
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
     # Compute next-token logprobs directly from hidden states with a chunked
     # linear cross-entropy fusion, avoiding materialization of the full
     # [batch, seq_len, vocab_size] logit tensor. Reduces peak memory and extends
@@ -233,6 +237,8 @@ policy:
     manual_gc: false
     manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
     cuda_graph_impl: "none"
     cuda_graph_modules: []
@@ -474,6 +480,7 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    top_logprobs: 0  # Sampler candidates per token for score centering; 0 disables collection.
     # Validation-only sampling; defaults follow the train values above.
     val_temperature: ${.temperature}
     val_top_p: ${.top_p}
@@ -569,9 +576,11 @@ policy:
       precision: ${policy.precision}
       # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
       refit_prequantize: false
+      # auto, fp8, fp8_e4m3, fp8_ds_mla, or fp8_per_token_head.
+      # fp8_per_token_head requires precision=fp8 and a compatible backend (TRITON_ATTN).
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
-      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute vLLM logits with an fp32 LM head.
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
       refit_with_reload_api: false
       tensor_parallel_size: 1
@@ -588,6 +597,8 @@ policy:
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
+      flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
+      output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
       http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.
       reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).
@@ -735,6 +746,10 @@ data_plane:
                                      # serialized groups and cost throughput;
                                      # higher buys little at linear HBM cost.
                                      # GDR needs that headroom to pay off.
+    gdr_keep_teacher_payload_on_gpu: true  # MOPD + use_gdr only: the teacher PUTs what it writes
+                                           # (logprobs; full-vocab hidden states or logits) straight
+                                           # from GPU, holding it in GPU memory until the PUT.
+                                           # false = copy to CPU first.
   observability:                      # per-op data-plane timing/volume
     enabled: true                     # per-op timing/volume; cost is below measurement noise
     verify_tensor_hash: false         # debug: per-row hash of each row's values+dtype+shape, wire-in vs wire-out
