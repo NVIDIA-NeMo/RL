@@ -43,8 +43,8 @@ uv_cache_restore() {
 
 # Sync new downloads back to the durable store and, if STRIP_UV_CACHE is set,
 # delete the materialized copy before this RUN's layer commits. Pass "prune"
-# only on the first uv-writing RUN in a stage, so cleanup performed there (uv
-# cache clean, the aiohttp/yarl removal) is reflected in the store. Later
+# only on the first uv-writing RUN in a stage, so cleanup performed there (the
+# lockfile prune, the aiohttp/yarl removal) is reflected in the store. Later
 # RUNs must NOT prune: the store can hold entries this RUN never copied in,
 # and --delete there would discard them from the next build's seed.
 #
