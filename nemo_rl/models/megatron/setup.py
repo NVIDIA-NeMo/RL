@@ -308,7 +308,10 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
         )
 
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
@@ -2101,6 +2104,16 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
                 "policy.megatron_cfg.reuse_logits_storage=true requires "
                 "sequence_packing.enabled=true, sequence_packing.fuse_loss=true and "
                 "a positive policy.logprob_chunk_size"
+            )
+        # Training top-k/top-p turns chunking off, which would silently drop the reuse.
+        generation = config.get("generation")
+        if generation is not None and need_top_k_or_top_p_filtering(
+            TrainingSamplingParams(top_k=generation["top_k"], top_p=generation["top_p"])
+        ):
+            raise ValueError(
+                "policy.megatron_cfg.reuse_logits_storage=true does not apply with "
+                "training top-k/top-p filtering; set policy.generation.top_k=null "
+                "and policy.generation.top_p=1.0, or disable the reuse"
             )
 
 
