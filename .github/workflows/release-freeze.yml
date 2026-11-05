@@ -45,6 +45,10 @@ jobs:
       next-dev: ""
       use-pat: true
     secrets:
-      SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
+      # SLACK_RELEASE_ENDPOINT posts to #swdl-nemo-reinforcer-github-ci-alerts
+      # -- a stale channel from the project's old "Reinforcer" name. Use the
+      # same webhook the cherry-pick bot uses instead, which is confirmed
+      # posting to #swdl-nemo-rl-alerts.
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
       PAT: ${{ secrets.PAT }}
